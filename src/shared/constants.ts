@@ -1,0 +1,9 @@
+export const PROXY_ORIGIN = "http://localhost:8787";
+export const RESUME_ENDPOINT = `${PROXY_ORIGIN}/api/resume`;
+export const STORAGE_KEY = "smalltalk.resume.bookmark.store";
+export const ACTIVE_SESSION_KEY = "smalltalk.resume.bookmark.activeSessionId";
+export const MAX_STORED_EVENTS = 900;
+export const MAX_STORED_CHUNKS = 420;
+export const MAX_DOSSIER_CHARS_PER_PAGE = 2200;
+export const MAX_DOSSIER_PAGES = 12;
+export const CONTENT_MIN_CHARS = 45;
