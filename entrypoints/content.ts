@@ -1,6 +1,14 @@
 import { browser } from "wxt/browser";
 import { chunkTextBlocks, normalizeWhitespace, scoreTextMatch } from "../src/shared/chunking";
-import type { AttentionEvent, ExtensionMessage, ExtensionResponse, PageSnapshot, ResumeTarget } from "../src/shared/types";
+import type {
+  AppType,
+  AttentionEvent,
+  CapturedMessage,
+  ExtensionMessage,
+  ExtensionResponse,
+  PageSnapshot,
+  ResumeTarget
+} from "../src/shared/types";
 
 let captureEnabled = false;
 let lastCursorSent = 0;
@@ -17,6 +25,11 @@ export default defineContentScript({
       if (message.type === "CAPTURE_PAGE_SNAPSHOT") {
         captureEnabled = true;
         return Promise.resolve({ ok: true, snapshot: capturePageSnapshot() });
+      }
+      if (message.type === "SET_CAPTURE_ENABLED") {
+        captureEnabled = message.enabled;
+        if (!captureEnabled) lastSelection = "";
+        return Promise.resolve({ ok: true });
       }
       if (message.type === "APPLY_RESUME_HIGHLIGHT") {
         const applied = applyResumeHighlight(message.target);
@@ -41,14 +54,25 @@ export default defineContentScript({
     window.addEventListener("keyup", handleSelection, { passive: true });
     document.addEventListener("click", handleClick, true);
     document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("pagehide", handlePageHide, { passive: true });
   }
 });
 
 function capturePageSnapshot(): PageSnapshot {
   const blocks = collectTextBlocks();
+  const appType = inferAppType(location.href);
+  const selectedText = normalizeWhitespace(document.getSelection()?.toString() ?? "");
+  const centerElement = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight * 0.45));
+  const centerReadable = nearestReadableElement(centerElement);
+
   return {
     url: location.href,
     title: document.title,
+    appType,
+    visibleText: blocks.map((block) => block.text).join("\n").slice(0, 4200),
+    activeMessage: captureActiveMessage(appType),
+    selectedText: selectedText.length >= 18 ? selectedText.slice(0, 800) : undefined,
+    centerText: centerReadable ? normalizeWhitespace(centerReadable.innerText || centerReadable.textContent || "").slice(0, 900) : undefined,
     chunks: chunkTextBlocks(blocks).map((chunk) => ({
       ...chunk,
       title: document.title,
@@ -184,11 +208,24 @@ function handleVisibility() {
     scrollY: window.scrollY,
     viewportHeight: window.innerHeight
   });
+
+  if (document.visibilityState === "hidden") sendSnapshot();
+}
+
+function handlePageHide() {
+  if (!captureEnabled) return;
+  sendSnapshot();
 }
 
 function sendAttention(event: Omit<AttentionEvent, "id" | "sessionId" | "visitId" | "tabId">) {
   browser.runtime
     .sendMessage({ type: "RECORD_ATTENTION_EVENT", event } satisfies ExtensionMessage)
+    .catch(() => undefined);
+}
+
+function sendSnapshot() {
+  browser.runtime
+    .sendMessage({ type: "PAGE_SNAPSHOT_CAPTURED", snapshot: capturePageSnapshot() } satisfies ExtensionMessage)
     .catch(() => undefined);
 }
 
@@ -323,6 +360,59 @@ function selectorFor(element: HTMLElement): string {
 
 function findNearestHeading(root: HTMLElement): HTMLElement | undefined {
   return root.querySelector<HTMLElement>("h1,h2,h3,h4") ?? undefined;
+}
+
+function captureActiveMessage(appType: AppType): CapturedMessage | undefined {
+  if (appType === "chatgpt") {
+    const messages = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-message-author-role], article, [data-testid^="conversation-turn"]')
+    )
+      .filter((element) => isVisible(element) && !isChromeLike(element))
+      .map((element) => ({
+        element,
+        distance: distanceFromViewportCenter(element),
+        text: normalizeWhitespace(element.innerText || element.textContent || "")
+      }))
+      .filter((item) => item.text.length >= 20)
+      .sort((a, b) => a.distance - b.distance);
+    const nearest = messages[0];
+    if (!nearest) return undefined;
+    const role = nearest.element.getAttribute("data-message-author-role");
+    return {
+      role: role === "user" || role === "assistant" ? role : "unknown",
+      text: nearest.text.slice(0, 1800),
+      selector: selectorFor(nearest.element)
+    };
+  }
+
+  const centerElement = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight * 0.45));
+  const readable = nearestReadableElement(centerElement);
+  if (!readable) return undefined;
+  return {
+    role: "unknown",
+    text: normalizeWhitespace(readable.innerText || readable.textContent || "").slice(0, 1200),
+    selector: selectorFor(readable)
+  };
+}
+
+function inferAppType(url: string): AppType {
+  try {
+    const host = new URL(url).hostname;
+    if (host.includes("chatgpt.com")) return "chatgpt";
+    if (host.includes("github.com")) return "github";
+    if (host.includes("notion.so")) return "notion";
+    if (host.includes("mail.google.com")) return "email";
+    if (host.includes("docs.google.com") || host.includes("developer.chrome.com")) return "docs";
+  } catch {
+    return "other";
+  }
+  return "other";
+}
+
+function distanceFromViewportCenter(element: HTMLElement): number {
+  const rect = element.getBoundingClientRect();
+  const elementCenter = rect.top + rect.height / 2;
+  return Math.abs(elementCenter - window.innerHeight * 0.45);
 }
 
 function isVisible(element: HTMLElement): boolean {

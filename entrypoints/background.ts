@@ -1,7 +1,7 @@
 import { browser } from "wxt/browser";
-import { RESUME_ENDPOINT } from "../src/shared/constants";
+import { PROXY_ORIGIN, RESUME_ENDPOINT } from "../src/shared/constants";
 import { applyAttentionScores, matchEventToChunk } from "../src/shared/attention";
-import { buildHeuristicResumeCard, buildResumeDossier } from "../src/shared/dossier";
+import { buildResumeDossier } from "../src/shared/dossier";
 import { readStore, writeStore } from "../src/shared/storage";
 import type {
   AttentionEvent,
@@ -13,6 +13,7 @@ import type {
   PageVisit,
   ResearchSession,
   ResumeCard,
+  ResumeTarget,
   ResumeStore,
   SessionState
 } from "../src/shared/types";
@@ -28,6 +29,12 @@ const pendingClicksByTab = new Map<number, PendingClick>();
 type NavigationDetails = Pick<chrome.webNavigation.WebNavigationTransitionCallbackDetails, "frameId" | "tabId" | "url"> & {
   transitionType?: string;
 };
+interface ProxyHealth {
+  ok: boolean;
+  model?: string;
+  hasKey?: boolean;
+  error?: string;
+}
 
 export default defineBackground(() => {
   browser.runtime.onMessage.addListener((message: unknown, sender: unknown): Promise<ExtensionResponse> => {
@@ -40,6 +47,10 @@ export default defineBackground(() => {
   browser.webNavigation.onCommitted.addListener((details) => {
     void recordNavigation(details as NavigationDetails);
   });
+
+  browser.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    void recordNavigation({ ...(details as NavigationDetails), transitionType: "history_state" });
+  });
 });
 
 async function handleMessage(message: ExtensionMessage, sender: chrome.runtime.MessageSender): Promise<ExtensionResponse> {
@@ -49,6 +60,8 @@ async function handleMessage(message: ExtensionMessage, sender: chrome.runtime.M
     case "STOP_SESSION":
       await stopSession();
       return { ok: true, state: await getSessionState() };
+    case "SET_CAPTURE_ENABLED":
+      return { ok: false, error: "SET_CAPTURE_ENABLED is handled by the content script." };
     case "GET_SESSION_STATE":
       return { ok: true, state: await getSessionState() };
     case "PAGE_SNAPSHOT_CAPTURED":
@@ -62,6 +75,9 @@ async function handleMessage(message: ExtensionMessage, sender: chrome.runtime.M
       return { ok: true };
     case "ANALYZE_RESUME":
       return { ok: true, card: await analyzeResume() };
+    case "OPEN_RESUME_TARGET":
+      await openAndHighlight(message.target);
+      return { ok: true };
     case "APPLY_RESUME_HIGHLIGHT":
     case "CAPTURE_PAGE_SNAPSHOT":
       return { ok: false, error: `${message.type} is handled by the content script.` };
@@ -106,14 +122,17 @@ async function startSession(tabId?: number): Promise<ResearchSession> {
 
 async function stopSession(): Promise<void> {
   const store = await readStore(browser.storage);
-  if (!store.activeSessionId) return;
-  const session = store.sessions[store.activeSessionId];
-  if (session) {
-    session.status = "stopped";
-    session.stoppedAt = Date.now();
+  if (store.activeSessionId) {
+    const session = store.sessions[store.activeSessionId];
+    if (session) {
+      session.status = "stopped";
+      session.stoppedAt = Date.now();
+    }
+    store.activeSessionId = undefined;
+    await writeStore(browser.storage, store);
   }
-  store.activeSessionId = undefined;
-  await writeStore(browser.storage, store);
+  const tabIds = await allWebTabIds();
+  await setCaptureEnabled(tabIds, false);
 }
 
 async function getSessionState(): Promise<SessionState> {
@@ -121,15 +140,28 @@ async function getSessionState(): Promise<SessionState> {
   const activeSession = store.activeSessionId ? store.sessions[store.activeSessionId] : undefined;
   const sessionId = activeSession?.id;
   const cards = Object.values(store.cards)
-    .filter((card) => !sessionId || card.sessionId === sessionId)
+    .filter((card) => Boolean(sessionId) && card.sessionId === sessionId)
     .sort((a, b) => b.createdAt - a.createdAt);
+  const savedSession = latestStoppedSession(store);
+  const savedCard = savedSession
+    ? Object.values(store.cards)
+        .filter((card) => card.sessionId === savedSession.id)
+        .sort((a, b) => b.createdAt - a.createdAt)[0]
+    : undefined;
 
+  const health = await getProxyHealth();
   return {
     activeSession,
     latestCard: cards[0],
+    savedSession,
+    savedCard,
     visitCount: sessionId ? countSessionItems(store.visits, sessionId) : 0,
     eventCount: sessionId ? countSessionItems(store.events, sessionId) : 0,
-    chunkCount: sessionId ? countSessionItems(store.chunks, sessionId) : 0
+    chunkCount: sessionId ? countSessionItems(store.chunks, sessionId) : 0,
+    proxyReachable: health.ok,
+    proxyHasKey: Boolean(health.hasKey),
+    proxyModel: health.model,
+    proxyError: health.error
   };
 }
 
@@ -147,12 +179,79 @@ async function requestSnapshot(tabId: number, sessionId: string, visitId: string
   }
 }
 
+async function setCaptureEnabled(tabIds: number[], enabled: boolean): Promise<void> {
+  await Promise.all(
+    tabIds.map((tabId) =>
+      browser.tabs
+        .sendMessage(tabId, {
+          type: "SET_CAPTURE_ENABLED",
+          enabled
+        } satisfies ExtensionMessage)
+        .catch(() => undefined)
+    )
+  );
+}
+
+async function allWebTabIds(): Promise<number[]> {
+  const tabs = await browser.tabs.query({});
+  return tabs
+    .filter((tab) => typeof tab.id === "number" && isWebUrl(tab.url))
+    .map((tab) => tab.id!);
+}
+
+async function getProxyHealth(): Promise<ProxyHealth> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 900);
+  try {
+    const response = await fetch(`${PROXY_ORIGIN}/health`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    const payload = (await response.json().catch(() => ({}))) as Partial<ProxyHealth>;
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: typeof payload.error === "string" ? payload.error : `Proxy health returned ${response.status}`
+      };
+    }
+    return {
+      ok: true,
+      model: typeof payload.model === "string" ? payload.model : undefined,
+      hasKey: Boolean(payload.hasKey)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Proxy offline"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function recordSnapshot(snapshot: PageSnapshot, tabId?: number): Promise<void> {
   const store = await readStore(browser.storage);
   const sessionId = store.activeSessionId;
   if (!sessionId) return;
+  const session = store.sessions[sessionId];
+  if (!session) return;
 
   const visit = ensureVisit(store, sessionId, tabId, snapshot.url, snapshot.title);
+  if (sameLogicalUrl(snapshot.url, session.originUrl)) {
+    session.originSnapshot = {
+      url: snapshot.url,
+      title: snapshot.title,
+      appType: snapshot.appType,
+      visibleText: snapshot.visibleText,
+      activeMessage: snapshot.activeMessage,
+      selectedText: snapshot.selectedText,
+      centerText: snapshot.centerText,
+      scrollY: snapshot.scrollY,
+      capturedAt: snapshot.capturedAt
+    };
+    session.originTitle = snapshot.title || session.originTitle;
+  }
+
   const existingIds = new Set(
     Object.values(store.chunks)
       .filter((chunk) => chunk.visitId === visit.id)
@@ -273,25 +372,26 @@ async function analyzeResume(): Promise<ResumeCard> {
   const freshStore = await readStore(browser.storage);
   const dossier = buildResumeDossier(freshStore, sessionId);
 
-  let card: ResumeCard;
-  try {
-    const response = await fetch(RESUME_ENDPOINT, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(dossier)
-    });
-    if (!response.ok) throw new Error(`Proxy returned ${response.status}`);
-    card = (await response.json()) as ResumeCard;
-    card.id ||= `card_${Date.now()}`;
-    card.sessionId = sessionId;
-    card.createdAt ||= Date.now();
-  } catch (error) {
-    card = buildHeuristicResumeCard(freshStore, sessionId, error instanceof Error ? error.message : "Proxy unavailable.");
+  const response = await fetch(RESUME_ENDPOINT, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(dossier)
+  }).catch((error) => {
+    throw new Error(`AI proxy is offline at ${RESUME_ENDPOINT}: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = typeof payload.error === "string" ? payload.error : `Proxy returned ${response.status}`;
+    throw new Error(message);
   }
+
+  const card = payload as ResumeCard;
+  card.id ||= `card_${Date.now()}`;
+  card.sessionId = sessionId;
+  card.createdAt ||= Date.now();
 
   freshStore.cards[card.id] = card;
   await writeStore(browser.storage, freshStore);
-  await focusAndHighlight(card);
   return card;
 }
 
@@ -309,9 +409,9 @@ async function captureKnownTabs(store: ResumeStore, sessionId: string): Promise<
   );
 }
 
-async function focusAndHighlight(card: ResumeCard): Promise<void> {
-  const tabs = await browser.tabs.query({ url: card.resumeTarget.url });
-  const tab = tabs[0] ?? (await browser.tabs.create({ url: card.resumeTarget.url, active: true }));
+async function openAndHighlight(target: ResumeTarget): Promise<void> {
+  const tabs = await browser.tabs.query({ url: target.url });
+  const tab = tabs[0] ?? (await browser.tabs.create({ url: target.url, active: true }));
   if (tab.id) {
     if (tab.windowId) await browser.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
     await browser.tabs.update(tab.id, { active: true }).catch(() => undefined);
@@ -319,7 +419,7 @@ async function focusAndHighlight(card: ResumeCard): Promise<void> {
       void browser.tabs
         .sendMessage(tab.id!, {
           type: "APPLY_RESUME_HIGHLIGHT",
-          target: card.resumeTarget
+          target
         } satisfies ExtensionMessage)
         .catch(() => undefined);
     }, 450);
@@ -405,6 +505,12 @@ function latestSessionId(store: ResumeStore): string | undefined {
   return Object.values(store.sessions).sort((a, b) => b.startedAt - a.startedAt)[0]?.id;
 }
 
+function latestStoppedSession(store: ResumeStore): ResearchSession | undefined {
+  return Object.values(store.sessions)
+    .filter((session) => session.status === "stopped")
+    .sort((a, b) => (b.stoppedAt ?? b.startedAt) - (a.stoppedAt ?? a.startedAt))[0];
+}
+
 function classifyOpen(pending: PendingClick | undefined, transitionType: string | undefined, url: string): NavigationEdge["openedBy"] {
   if (pending?.targetHref && urlsRoughlyMatch(pending.targetHref, url)) return "clicked";
   if (transitionType === "typed" || transitionType === "generated") return "typed";
@@ -421,6 +527,21 @@ function urlsRoughlyMatch(a: string, b: string): boolean {
   } catch {
     return a === b;
   }
+}
+
+function sameLogicalUrl(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    return a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
+  } catch {
+    return left === right;
+  }
+}
+
+function isWebUrl(url: string | undefined): boolean {
+  return Boolean(url?.startsWith("http://") || url?.startsWith("https://"));
 }
 
 function hashText(value: string): string {

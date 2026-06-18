@@ -8,6 +8,7 @@ export interface ResearchSession {
   originTabId?: number;
   originUrl?: string;
   originTitle?: string;
+  originSnapshot?: OriginSnapshot;
   visitCount: number;
   eventCount: number;
   chunkCount: number;
@@ -109,12 +110,40 @@ export interface ResumeCard {
   summary: string;
   confidence: number;
   evidence: string[];
-  resumeTarget: ResumeTarget;
+  branchFindings: string[];
+  suggestedNextMessage: string;
+  instrumentationWarnings: string[];
+  resumeTarget: ResumeTarget | null;
+}
+
+export type AppType = "chatgpt" | "docs" | "email" | "notion" | "github" | "other";
+
+export interface CapturedMessage {
+  role: "user" | "assistant" | "unknown";
+  text: string;
+  selector?: string;
+}
+
+export interface OriginSnapshot {
+  url: string;
+  title: string;
+  appType: AppType;
+  visibleText: string;
+  activeMessage?: CapturedMessage;
+  selectedText?: string;
+  centerText?: string;
+  scrollY?: number;
+  capturedAt: number;
 }
 
 export interface PageSnapshot {
   url: string;
   title: string;
+  appType: AppType;
+  visibleText: string;
+  activeMessage?: CapturedMessage;
+  selectedText?: string;
+  centerText?: string;
   chunks: Array<Omit<PageChunk, "id" | "sessionId" | "visitId" | "attentionScore" | "capturedAt">>;
   capturedAt: number;
   scrollY: number;
@@ -133,10 +162,15 @@ export interface ResumeStore {
 export interface SessionState {
   activeSession?: ResearchSession;
   latestCard?: ResumeCard;
+  savedSession?: ResearchSession;
+  savedCard?: ResumeCard;
   visitCount: number;
   eventCount: number;
   chunkCount: number;
-  isProxyReachable?: boolean;
+  proxyReachable: boolean;
+  proxyHasKey: boolean;
+  proxyModel?: string;
+  proxyError?: string;
 }
 
 export interface DossierPage {
@@ -160,23 +194,47 @@ export interface DossierPage {
   }>;
 }
 
+export interface DepartureEvent {
+  url: string;
+  title?: string;
+  targetHref?: string;
+  targetText?: string;
+  textQuote?: string;
+  timestamp: number;
+}
+
+export interface ReturnEvent {
+  type: "returned_to_origin";
+  url: string;
+  title?: string;
+  timestamp: number;
+  sourceUrl?: string;
+}
+
 export interface ResumeDossier {
+  mode: "origin_only" | "away_from_origin" | "returned_to_origin";
   session: Pick<ResearchSession, "id" | "startedAt" | "stoppedAt" | "originUrl" | "originTitle">;
-  pages: DossierPage[];
+  origin: OriginSnapshot;
+  departure?: DepartureEvent;
+  returnEvent?: ReturnEvent;
+  branchVisits: DossierPage[];
   navigation: Array<Pick<NavigationEdge, "fromUrl" | "toUrl" | "openedBy" | "transitionType" | "createdAt">>;
-  candidateResumeTargets: ResumeTarget[];
+  candidateOriginAnchors: ResumeTarget[];
+  instrumentationWarnings: string[];
   evidence: string[];
 }
 
 export type ExtensionMessage =
   | { type: "START_SESSION"; tabId?: number }
   | { type: "STOP_SESSION" }
+  | { type: "SET_CAPTURE_ENABLED"; enabled: boolean }
   | { type: "GET_SESSION_STATE" }
   | { type: "CAPTURE_PAGE_SNAPSHOT"; sessionId?: string; visitId?: string }
   | { type: "PAGE_SNAPSHOT_CAPTURED"; snapshot: PageSnapshot }
   | { type: "RECORD_ATTENTION_EVENT"; event: Omit<AttentionEvent, "id" | "sessionId" | "visitId" | "tabId"> }
   | { type: "RECORD_LINK_CLICK"; event: Omit<AttentionEvent, "id" | "sessionId" | "visitId" | "tabId" | "kind"> & { kind?: "link_click" } }
   | { type: "ANALYZE_RESUME" }
+  | { type: "OPEN_RESUME_TARGET"; target: ResumeTarget }
   | { type: "APPLY_RESUME_HIGHLIGHT"; target: ResumeTarget };
 
 export type ExtensionResponse =

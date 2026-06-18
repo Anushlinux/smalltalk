@@ -4,6 +4,7 @@ import type { ResumeStore } from "./types";
 interface LocalStorageLike {
   get(keys: string[]): Promise<Record<string, unknown>>;
   set(values: Record<string, unknown>): Promise<void>;
+  remove(keys: string | string[]): Promise<void>;
 }
 
 interface BrowserStorageLike {
@@ -44,8 +45,10 @@ export async function readStore(storage: BrowserStorageLike): Promise<ResumeStor
 
 export async function writeStore(storage: BrowserStorageLike, store: ResumeStore): Promise<void> {
   const pruned = pruneStore(store);
-  await storage.local.set({
-    [STORAGE_KEY]: pruned,
-    [ACTIVE_SESSION_KEY]: pruned.activeSessionId
-  });
+  await storage.local.set({ [STORAGE_KEY]: pruned });
+  if (pruned.activeSessionId) {
+    await storage.local.set({ [ACTIVE_SESSION_KEY]: pruned.activeSessionId });
+  } else {
+    await storage.local.remove(ACTIVE_SESSION_KEY);
+  }
 }
