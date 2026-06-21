@@ -1137,7 +1137,7 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
         }));
     }
 
-    let status = capture_status(app, state)?;
+    let status = capture_status(app.clone(), state)?;
     crate::session_island::update_session_island_from_status(
         &status,
         crate::session_island::SessionIslandState::RecordingCompact,
@@ -1178,11 +1178,12 @@ pub fn stop_capture(
         export = Some(summary);
     }
 
-    let status = capture_status(app, state)?;
+    let status = capture_status(app.clone(), state)?;
     crate::session_island::update_session_island_from_status(
         &status,
         crate::session_island::SessionIslandState::StoppedToast,
     );
+    crate::session_island::return_to_ready_after_stop(app.clone());
     let preview = stopped_session
         .as_ref()
         .zip(export.as_ref())
@@ -1276,6 +1277,11 @@ pub fn delete_all_frames(
 
     let status = capture_status_snapshot(&app, &state)?;
     let _ = app.emit("capture-status", status.clone());
+    crate::session_island::update_session_island_from_status(
+        &status,
+        crate::session_island::SessionIslandState::Ready,
+    );
+    crate::session_island::show_session_island();
     Ok(status)
 }
 

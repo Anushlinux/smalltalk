@@ -32,6 +32,7 @@ pub struct SessionIslandSnapshot {
 #[allow(dead_code)]
 pub enum SessionIslandState {
     Hidden,
+    Ready,
     Starting,
     RecordingCompact,
     RecordingExpanded,
@@ -48,7 +49,9 @@ struct SessionIslandAction {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SessionIslandActionKind {
+    StartCapture,
     StopCapture,
+    CaptureOnce,
     OpenMainWindow,
     ResumeMe,
     ToggleExpanded,
@@ -72,6 +75,13 @@ impl SessionIslandSnapshot {
         }
     }
 
+    pub fn ready() -> Self {
+        Self {
+            state: SessionIslandState::Ready,
+            ..Self::hidden()
+        }
+    }
+
     pub fn starting() -> Self {
         Self {
             state: SessionIslandState::Starting,
@@ -89,12 +99,29 @@ impl SessionIslandSnapshot {
 }
 
 pub fn init_session_island(app: AppHandle) {
-    let _ = APP_HANDLE.set(app);
+    let _ = APP_HANDLE.set(app.clone());
 
     #[cfg(target_os = "macos")]
     unsafe {
         smalltalk_island_init();
         smalltalk_island_set_action_callback(handle_native_action);
+    }
+
+    match crate::capture::capture_status(app.clone(), app.state::<crate::capture::CaptureState>()) {
+        Ok(status) => {
+            let state = if status.running {
+                SessionIslandState::RecordingCompact
+            } else {
+                SessionIslandState::Ready
+            };
+            update_session_island_from_status(&status, state);
+            show_session_island();
+        }
+        Err(error) => {
+            eprintln!("[session_island] initial status unavailable: {}", error);
+            update_session_island(SessionIslandSnapshot::ready());
+            show_session_island();
+        }
     }
 }
 
@@ -131,6 +158,25 @@ pub fn update_session_island_from_status(status: &CaptureStatus, state: SessionI
     update_session_island(snapshot_from_status(status, state));
 }
 
+pub fn return_to_ready_after_stop(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1700));
+        let state = app.state::<crate::capture::CaptureState>();
+        match crate::capture::capture_status(app.clone(), state) {
+            Ok(status) => {
+                let island_state = if status.running {
+                    SessionIslandState::RecordingCompact
+                } else {
+                    SessionIslandState::Ready
+                };
+                update_session_island_from_status(&status, island_state);
+                show_session_island();
+            }
+            Err(error) => update_session_island(SessionIslandSnapshot::error(error)),
+        }
+    });
+}
+
 pub fn show_session_island() {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -138,6 +184,7 @@ pub fn show_session_island() {
     }
 }
 
+#[allow(dead_code)]
 pub fn hide_session_island() {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -265,7 +312,9 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
     };
 
     match action.action {
+        SessionIslandActionKind::StartCapture => start_capture_from_island(),
         SessionIslandActionKind::StopCapture => stop_capture_from_island(),
+        SessionIslandActionKind::CaptureOnce => capture_once_from_island(),
         SessionIslandActionKind::OpenMainWindow => open_main_window(),
         SessionIslandActionKind::ResumeMe => {
             open_main_window();
@@ -276,6 +325,30 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
         SessionIslandActionKind::ToggleExpanded => toggle_expanded_from_native(),
         SessionIslandActionKind::Collapse => set_session_island_expanded(false),
     }
+}
+
+fn start_capture_from_island() {
+    let Some(app) = APP_HANDLE.get().cloned() else {
+        eprintln!("[session_island] start requested before AppHandle was ready");
+        return;
+    };
+
+    update_session_island(SessionIslandSnapshot::starting());
+    show_session_island();
+
+    thread::spawn(move || {
+        let state = app.state::<crate::capture::CaptureState>();
+        match crate::capture::start_capture(app.clone(), state) {
+            Ok(status) => {
+                let _ = app.emit("capture-status", status.clone());
+                update_session_island_from_status(&status, SessionIslandState::RecordingCompact);
+            }
+            Err(error) => {
+                eprintln!("[session_island] start_capture failed: {}", error);
+                update_session_island(SessionIslandSnapshot::error(error));
+            }
+        }
+    });
 }
 
 fn stop_capture_from_island() {
@@ -295,12 +368,41 @@ fn stop_capture_from_island() {
         match crate::capture::stop_capture(app.clone(), state) {
             Ok(output) => {
                 let _ = app.emit("capture-status", output.status.clone());
-                update_session_island_from_status(&output.status, SessionIslandState::StoppedToast);
-                thread::sleep(Duration::from_millis(1700));
-                hide_session_island();
             }
             Err(error) => {
                 eprintln!("[session_island] stop_capture failed: {}", error);
+                update_session_island(SessionIslandSnapshot::error(error));
+            }
+        }
+    });
+}
+
+fn capture_once_from_island() {
+    let Some(app) = APP_HANDLE.get().cloned() else {
+        eprintln!("[session_island] capture requested before AppHandle was ready");
+        return;
+    };
+
+    thread::spawn(move || {
+        let state = app.state::<crate::capture::CaptureState>();
+        match crate::capture::capture_once(app.clone(), state) {
+            Ok(_) => {
+                let state = app.state::<crate::capture::CaptureState>();
+                match crate::capture::capture_status(app.clone(), state) {
+                    Ok(status) => {
+                        let _ = app.emit("capture-status", status.clone());
+                        let island_state = if status.running {
+                            SessionIslandState::RecordingCompact
+                        } else {
+                            SessionIslandState::Ready
+                        };
+                        update_session_island_from_status(&status, island_state);
+                    }
+                    Err(error) => update_session_island(SessionIslandSnapshot::error(error)),
+                }
+            }
+            Err(error) => {
+                eprintln!("[session_island] capture_once failed: {}", error);
                 update_session_island(SessionIslandSnapshot::error(error));
             }
         }
