@@ -12,6 +12,7 @@ reference/
 node_modules
 dist
 dist-ssr
+output/
 *.local
 
 # Editor directories and files

@@ -1,9 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type CaptureFrame = {
   id: number;
+  session_id?: string | null;
   captured_at: number;
   snapshot_path: string;
   app_name?: string | null;
@@ -18,14 +27,88 @@ type CaptureFrame = {
   full_text?: string | null;
   content_hash?: string | null;
   image_hash?: string | null;
+  capture_provider?: string | null;
+  scope?: string | null;
+  display_id?: string | null;
+  window_id?: number | null;
+  app_pid?: number | null;
+  app_bundle_id?: string | null;
+  screen_scale?: number | null;
+  pixel_width?: number | null;
+  pixel_height?: number | null;
+  full_screenshot_path?: string | null;
+  active_window_crop_path?: string | null;
+  active_element_crop_path?: string | null;
+  phash?: string | null;
+  privacy_status?: string | null;
+  capture_trigger_id?: string | null;
+  previous_frame_id?: string | null;
+};
+
+type SessionCounts = {
+  frames: number;
+  events: number;
+  triggers: number;
+  transitions: number;
+  content_units: number;
+  ax_nodes: number;
+  ocr_text_rows: number;
+  ocr_spans: number;
+  app_contexts: number;
+  window_snapshots: number;
+  windows: number;
+  frame_diffs: number;
+  clipboard_events: number;
+  typing_bursts: number;
+  presence_samples: number;
+  sensitive_regions: number;
+};
+
+type CaptureSession = {
+  id: string;
+  sequence: number;
+  started_at: number;
+  stopped_at?: number | null;
+  status: string;
+  export_path?: string | null;
+  counts: SessionCounts;
+};
+
+type SessionExportSummary = {
+  session_id: string;
+  session_sequence: number;
+  generated_at: number;
+  kind: string;
+  folder_name: string;
+  path: string;
+  byte_size: number;
+  file_count: number;
+  warning_count: number;
+  counts: SessionCounts;
+};
+
+type StopCaptureOutput = {
+  status: CaptureStatus;
+  session?: CaptureSession | null;
+  export?: SessionExportSummary | null;
+  preview?: unknown;
 };
 
 type CaptureStatus = {
   running: boolean;
   frame_count: number;
+  event_count: number;
+  transition_count: number;
+  content_unit_count: number;
+  session_count: number;
+  active_session?: CaptureSession | null;
+  latest_session?: CaptureSession | null;
+  last_export?: SessionExportSummary | null;
   started_at?: number | null;
   last_error?: string | null;
   latest_frame?: CaptureFrame | null;
+  skipped_samples: number;
+  last_skipped_at?: number | null;
   data_dir: string;
   database_path: string;
   screenshot_tool: boolean;
@@ -39,9 +122,130 @@ type SearchResult = {
   rank: number;
 };
 
+type TimelineEvent = {
+  id: string;
+  ts_ms: number;
+  event_type: string;
+  app_name?: string | null;
+  window_title?: string | null;
+  key_category?: string | null;
+  payload_json?: string | null;
+};
+
+type CaptureTriggerSummary = {
+  id: string;
+  ts_ms: number;
+  trigger_type: string;
+  caused_by_event_ids: string;
+  pre_frame_id?: string | null;
+  post_frame_id?: string | null;
+  status: string;
+};
+
+type TransitionSummary = {
+  id: string;
+  trigger_id: string;
+  primary_event_id?: string | null;
+  pre_frame_id?: string | null;
+  post_frame_id?: string | null;
+  ts_start_ms: number;
+  ts_end_ms: number;
+  transition_type?: string | null;
+  confidence?: number | null;
+  summary?: string | null;
+};
+
+type Timeline = {
+  events: TimelineEvent[];
+  triggers: CaptureTriggerSummary[];
+  transitions: TransitionSummary[];
+  frames: CaptureFrame[];
+};
+
+type BoxLike = {
+  id: string;
+  text?: string | null;
+  bounds_x?: number | null;
+  bounds_y?: number | null;
+  bounds_w?: number | null;
+  bounds_h?: number | null;
+  source?: string | null;
+  unit_type?: string | null;
+  semantic_role?: string | null;
+  role?: string | null;
+  region_type?: string | null;
+  confidence?: number | null;
+};
+
+type AppContextSummary = {
+  id: string;
+  adapter_id: string;
+  object_type: string;
+  title?: string | null;
+  url?: string | null;
+  file_path?: string | null;
+  selected_text?: string | null;
+  focused_object?: string | null;
+  confidence?: number | null;
+};
+
+type WindowSummary = {
+  cg_window_id?: number | null;
+  owner_name?: string | null;
+  bundle_id?: string | null;
+  window_title?: string | null;
+  is_active: boolean;
+};
+
+type VerificationSignals = {
+  screenshot_present: boolean;
+  has_ax: boolean;
+  has_ocr: boolean;
+  has_content_units: boolean;
+  has_app_context: boolean;
+  has_window_graph: boolean;
+  has_transition: boolean;
+  has_event_provenance: boolean;
+  has_sensitive_regions: boolean;
+  ax_node_count: number;
+  ocr_span_count: number;
+  content_unit_count: number;
+  app_context_count: number;
+  window_count: number;
+  transition_count: number;
+  event_count: number;
+  missing_signals: string[];
+  trust_label: string;
+  trust_score: number;
+};
+
+type FrameDetail = {
+  frame: CaptureFrame;
+  verification: VerificationSignals;
+  events: TimelineEvent[];
+  ax_nodes: BoxLike[];
+  ocr_spans: BoxLike[];
+  content_units: BoxLike[];
+  app_contexts: AppContextSummary[];
+  sensitive_regions: BoxLike[];
+  windows: WindowSummary[];
+  transitions: TransitionSummary[];
+};
+
+type OverlayMode = "units" | "ocr" | "ax" | "privacy";
+type EvidenceTab = "text" | "events" | "context" | "paths";
+
 const initialStatus: CaptureStatus = {
   running: false,
   frame_count: 0,
+  event_count: 0,
+  transition_count: 0,
+  content_unit_count: 0,
+  session_count: 0,
+  active_session: null,
+  latest_session: null,
+  last_export: null,
+  skipped_samples: 0,
   data_dir: "",
   database_path: "",
   screenshot_tool: false,
@@ -49,18 +253,37 @@ const initialStatus: CaptureStatus = {
   ocr_tool: false,
 };
 
+const emptyTimeline: Timeline = {
+  events: [],
+  triggers: [],
+  transitions: [],
+  frames: [],
+};
+
 function App() {
   const [status, setStatus] = useState<CaptureStatus>(initialStatus);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [selectedFrame, setSelectedFrame] = useState<CaptureFrame | null>(null);
+  const [frameDetail, setFrameDetail] = useState<FrameDetail | null>(null);
+  const [timeline, setTimeline] = useState<Timeline>(emptyTimeline);
+  const [overlayMode, setOverlayMode] = useState<OverlayMode>("units");
+  const [evidenceTab, setEvidenceTab] = useState<EvidenceTab>("text");
+  const [highlightedBoxId, setHighlightedBoxId] = useState<string | null>(null);
   const [imageData, setImageData] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [lastStopOutput, setLastStopOutput] = useState<StopCaptureOutput | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const storeGenerationRef = useRef(0);
+  const isDeleting = busyAction === "delete_all_frames";
+  const currentSession = status.active_session || status.latest_session || null;
+  const currentSessionId = currentSession?.id || null;
 
   const refreshStatus = useCallback(async () => {
+    const requestGeneration = storeGenerationRef.current;
     try {
       const nextStatus = await invoke<CaptureStatus>("capture_status");
+      if (requestGeneration !== storeGenerationRef.current) return;
       setStatus(nextStatus);
       setError(null);
       if (!selectedFrame && nextStatus.latest_frame) {
@@ -72,12 +295,15 @@ function App() {
   }, [selectedFrame]);
 
   const runSearch = useCallback(
-    async (nextQuery = query) => {
+    async (nextQuery = query, sessionId = currentSessionId) => {
+      const requestGeneration = storeGenerationRef.current;
       try {
         const rows = await invoke<SearchResult[]>("search_captures", {
           query: nextQuery,
-          limit: 40,
+          limit: 48,
+          sessionId,
         });
+        if (requestGeneration !== storeGenerationRef.current) return;
         setResults(rows);
         setError(null);
         if (!selectedFrame && rows[0]) {
@@ -87,18 +313,39 @@ function App() {
         setError(String(err));
       }
     },
-    [query, selectedFrame],
+    [currentSessionId, query, selectedFrame],
   );
+
+  const refreshTimeline = useCallback(async (sessionId = currentSessionId) => {
+    const requestGeneration = storeGenerationRef.current;
+    try {
+      const nextTimeline = await invoke<Timeline>("get_recent_timeline", {
+        rangeMs: 10 * 60 * 1000,
+        sessionId,
+      });
+      if (requestGeneration !== storeGenerationRef.current) return;
+      setTimeline(nextTimeline);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, [currentSessionId]);
 
   const selectFrame = useCallback(async (frame: CaptureFrame) => {
     setSelectedFrame(frame);
+    setFrameDetail(null);
+    setHighlightedBoxId(null);
     try {
       const freshFrame = await invoke<CaptureFrame | null>("get_frame", {
         frameId: frame.id,
       });
-      if (freshFrame) {
-        setSelectedFrame(freshFrame);
-      }
+      const frameForDetail = freshFrame || frame;
+      setSelectedFrame(frameForDetail);
+
+      const detail = await invoke<FrameDetail | null>("get_frame_detail", {
+        frameId: frameForDetail.id,
+      });
+      setFrameDetail(detail);
+      setError(null);
     } catch (err) {
       setError(String(err));
     }
@@ -109,38 +356,112 @@ function App() {
       setBusyAction(action);
       setError(null);
       try {
+        if (action === "stop_capture") {
+          const response = await invoke<StopCaptureOutput>(action);
+          const stoppedSessionId =
+            response.session?.id ||
+            response.status.latest_session?.id ||
+            currentSessionId;
+          setLastStopOutput(response);
+          setStatus(response.status);
+          await refreshStatus();
+          await runSearch(query, stoppedSessionId);
+          await refreshTimeline(stoppedSessionId);
+          return;
+        }
+
         const response = await invoke<CaptureStatus | CaptureFrame>(action);
         if (action === "capture_once") {
-          setSelectedFrame(response as CaptureFrame);
+          await selectFrame(response as CaptureFrame);
         } else {
-          setStatus(response as CaptureStatus);
+          const nextStatus = response as CaptureStatus;
+          setLastStopOutput(null);
+          setSelectedFrame(null);
+          setFrameDetail(null);
+          setImageData(null);
+          setTimeline(emptyTimeline);
+          setStatus(nextStatus);
+          const nextSessionId =
+            nextStatus.active_session?.id ||
+            nextStatus.latest_session?.id ||
+            currentSessionId;
+          await refreshStatus();
+          await runSearch(query, nextSessionId);
+          await refreshTimeline(nextSessionId);
+          return;
         }
         await refreshStatus();
-        await runSearch();
+        await runSearch(query, currentSessionId);
+        await refreshTimeline(currentSessionId);
       } catch (err) {
         setError(String(err));
       } finally {
         setBusyAction(null);
       }
     },
-    [refreshStatus, runSearch],
+    [currentSessionId, query, refreshStatus, refreshTimeline, runSearch, selectFrame],
   );
+
+  const deleteAllFrames = useCallback(async () => {
+    const confirmed = window.confirm(
+      "Delete all stored frames and screenshots? This creates a clean slate.",
+    );
+    if (!confirmed) return;
+
+    setBusyAction("delete_all_frames");
+    setError(null);
+    storeGenerationRef.current += 1;
+    try {
+      const nextStatus = await invoke<CaptureStatus>("delete_all_frames");
+      storeGenerationRef.current += 1;
+      setResults([]);
+      setSelectedFrame(null);
+      setImageData(null);
+      setFrameDetail(null);
+      setTimeline(emptyTimeline);
+      setQuery("");
+      setLastStopOutput(null);
+      setStatus({
+        ...nextStatus,
+        running: false,
+        frame_count: 0,
+        event_count: 0,
+        transition_count: 0,
+        content_unit_count: 0,
+        latest_frame: null,
+        active_session: null,
+        latest_session: null,
+        last_export: null,
+        session_count: 0,
+        skipped_samples: 0,
+        last_skipped_at: null,
+        last_error: null,
+      });
+    } catch (err) {
+      setError(`Delete all failed: ${String(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }, []);
 
   useEffect(() => {
     void refreshStatus();
     void runSearch("");
+    void refreshTimeline();
   }, []);
 
   useEffect(() => {
     const id = window.setInterval(() => {
+      if (isDeleting) return;
       void refreshStatus();
       if (status.running) {
         void runSearch();
+        void refreshTimeline();
       }
-    }, status.running ? 3500 : 6000);
+    }, status.running ? 1500 : 6000);
 
     return () => window.clearInterval(id);
-  }, [refreshStatus, runSearch, status.running]);
+  }, [isDeleting, refreshStatus, refreshTimeline, runSearch, status.running]);
 
   useEffect(() => {
     let cancelled = false;
@@ -152,20 +473,40 @@ function App() {
 
       setImageData(null);
       try {
-        const dataUrl = await invoke<string | null>("get_frame_image", {
+        const dataUrl = await invoke<string | null>("get_frame_image_variant", {
           frameId: selectedFrame.id,
+          variant: "full",
         });
-        if (!cancelled) {
-          setImageData(dataUrl);
-        }
+        if (!cancelled) setImageData(dataUrl);
       } catch (err) {
-        if (!cancelled) {
-          setError(String(err));
-        }
+        if (!cancelled) setError(String(err));
       }
     }
 
     void loadImage();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFrame?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadDetail() {
+      if (!selectedFrame) {
+        setFrameDetail(null);
+        return;
+      }
+      try {
+        const detail = await invoke<FrameDetail | null>("get_frame_detail", {
+          frameId: selectedFrame.id,
+        });
+        if (!cancelled) setFrameDetail(detail);
+      } catch (err) {
+        if (!cancelled) setError(String(err));
+      }
+    }
+
+    void loadDetail();
     return () => {
       cancelled = true;
     };
@@ -179,182 +520,628 @@ function App() {
     ).trim();
   }, [selectedFrame]);
 
+  const overlayItems = useMemo(() => {
+    if (!frameDetail) return [];
+    if (overlayMode === "ocr") return frameDetail.ocr_spans;
+    if (overlayMode === "ax") return frameDetail.ax_nodes;
+    if (overlayMode === "privacy") return frameDetail.sensitive_regions;
+    return frameDetail.content_units;
+  }, [frameDetail, overlayMode]);
+
+  const selectedVerification = frameDetail?.verification;
+  const captureStateLabel = isDeleting
+    ? "Deleting"
+    : status.running
+      ? "Session active"
+      : "Ready";
+  const hasFrames = status.frame_count > 0;
+  const hasQuery = query.trim().length > 0;
+  const latestFrameLabel = status.latest_frame
+    ? formatTime(status.latest_frame.captured_at)
+    : "None yet";
+  const sessionLabel = currentSession
+    ? `${currentSession.status} session-${String(currentSession.sequence).padStart(3, "0")}`
+    : "No session";
+  const exportLabel = lastStopOutput?.export
+    ? lastStopOutput.export.folder_name
+    : status.last_export
+      ? status.last_export.folder_name
+      : "None";
+  const activeContext = frameDetail?.app_contexts[0];
+  const activeTransition = frameDetail?.transitions[0];
+  const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No frame selected";
+  const openExportFolder = useCallback(async () => {
+    const path = lastStopOutput?.export?.path || status.last_export?.path;
+    if (!path) return;
+    try {
+      await openPath(path);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, [lastStopOutput?.export?.path, status.last_export?.path]);
+
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-block">
-          <p className="label">smalltalk</p>
-          <h1>Local capture</h1>
+    <main className="capture-shell">
+      <header className="capture-topbar">
+        <div className="identity-block">
+          <div className="brand-mark" aria-hidden="true">S</div>
+          <div>
+            <p className="product-kicker">Smalltalk</p>
+            <h1>Session Capture</h1>
+          </div>
         </div>
 
-        <div className="control-stack" aria-label="Capture controls">
+        <form
+          className="search-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void runSearch(query);
+          }}
+        >
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="Search captured text, app names, URLs"
+            aria-label="Search captured evidence"
+          />
+          <button type="submit" disabled={busyAction !== null}>Search</button>
+        </form>
+
+        <div className="control-strip" aria-label="Capture controls">
           <button
             className="primary-button"
             disabled={status.running || busyAction !== null}
+            aria-busy={busyAction === "start_capture"}
             onClick={() => void runAction("start_capture")}
           >
-            Start
+            {busyAction === "start_capture" ? "Starting" : "Start session"}
           </button>
           <button
             className="secondary-button"
             disabled={!status.running || busyAction !== null}
+            aria-busy={busyAction === "stop_capture"}
             onClick={() => void runAction("stop_capture")}
           >
-            Stop
+            {busyAction === "stop_capture" ? "Exporting" : "Stop & export"}
           </button>
           <button
-            className="secondary-button warm"
-            disabled={busyAction !== null}
+            className="secondary-button"
+            disabled={!status.running || busyAction !== null}
+            aria-busy={busyAction === "capture_once"}
             onClick={() => void runAction("capture_once")}
           >
-            Capture now
+            {busyAction === "capture_once" ? "Capturing" : "Capture now"}
+          </button>
+          <button
+            className="danger-button"
+            disabled={busyAction !== null}
+            aria-busy={isDeleting}
+            onClick={() => void deleteAllFrames()}
+          >
+            {isDeleting ? "Deleting" : "Delete all"}
           </button>
         </div>
+      </header>
 
-        <section className="status-panel" aria-label="Capture status">
-          <div className="status-row">
-            <span>Status</span>
-            <strong>{status.running ? "Running" : "Stopped"}</strong>
+      {error || status.last_error ? (
+        <div className="error-box" role="alert">{error || status.last_error}</div>
+      ) : null}
+
+      {lastStopOutput?.export ? (
+        <section className="session-output" aria-label="Stopped session output">
+          <div className="session-output-main">
+            <div>
+              <p className="product-kicker">Stop output</p>
+              <h2>Folder export ready</h2>
+            </div>
+            <dl>
+              <div>
+                <dt>Session</dt>
+                <dd>{lastStopOutput.export.folder_name}</dd>
+              </div>
+              <div>
+                <dt>Frames</dt>
+                <dd>{lastStopOutput.export.counts.frames}</dd>
+              </div>
+              <div>
+                <dt>Events</dt>
+                <dd>{lastStopOutput.export.counts.events}</dd>
+              </div>
+              <div>
+                <dt>Files</dt>
+                <dd>{lastStopOutput.export.file_count}</dd>
+              </div>
+              <div>
+                <dt>Warnings</dt>
+                <dd>{lastStopOutput.export.warning_count}</dd>
+              </div>
+            </dl>
           </div>
-          <div className="status-row">
-            <span>Frames</span>
-            <strong>{status.frame_count}</strong>
+          <div className="export-path">
+            <span>{lastStopOutput.export.path}</span>
           </div>
-          <div className="status-row">
-            <span>Screen</span>
-            <strong>{status.screenshot_tool ? "Ready" : "Missing"}</strong>
+          <button
+            className="secondary-button open-output-button"
+            type="button"
+            onClick={() => void openExportFolder()}
+          >
+            Open output folder
+          </button>
+          <pre>{formatStopPreview(lastStopOutput)}</pre>
+        </section>
+      ) : null}
+
+      <section className="health-strip" aria-label="Capture health">
+        <StatusPill label="State" value={captureStateLabel} tone={status.running ? "good" : "quiet"} />
+        <StatusPill label="Session" value={sessionLabel} tone={status.running ? "good" : "quiet"} />
+        <StatusPill label="Exports" value={exportLabel} />
+        <StatusPill label="Frames" value={status.frame_count} />
+        <StatusPill label="Events" value={status.event_count} />
+        <StatusPill label="Transitions" value={status.transition_count} />
+        <StatusPill label="Units" value={status.content_unit_count} />
+        <StatusPill label="Total sessions" value={status.session_count} />
+        <StatusPill label="Latest" value={latestFrameLabel} />
+        <StatusPill label="Screen" value={status.screenshot_tool ? "ready" : "missing"} tone={status.screenshot_tool ? "good" : "bad"} />
+        <StatusPill label="A11y" value={status.accessibility_tool ? "ready" : "missing"} tone={status.accessibility_tool ? "good" : "bad"} />
+        <StatusPill label="OCR" value={status.ocr_tool ? "ready" : "missing"} tone={status.ocr_tool ? "good" : "bad"} />
+      </section>
+
+      <section className="inspector-grid">
+        <aside className="timeline-pane" aria-label="Captured frames">
+          <div className="pane-heading">
+            <div>
+              <h2>Evidence timeline</h2>
+              <p>{hasQuery ? "Filtered frames" : "Most recent local captures"}</p>
+            </div>
+            <span>{results.length}</span>
           </div>
-          <div className="status-row">
-            <span>A11y</span>
-            <strong>{status.accessibility_tool ? "Ready" : "Missing"}</strong>
+
+          <div className="frame-list">
+            {results.length === 0 ? (
+              <EmptyCaptureState hasFrames={hasFrames} hasQuery={hasQuery} />
+            ) : (
+              results.map((result) => (
+                <FrameRow
+                  key={result.frame.id}
+                  frame={result.frame}
+                  active={selectedFrame?.id === result.frame.id}
+                  snippet={result.snippet || result.frame.full_text}
+                  onSelect={() => void selectFrame(result.frame)}
+                />
+              ))
+            )}
           </div>
-          <div className="status-row">
-            <span>OCR</span>
-            <strong>{status.ocr_tool ? "Ready" : "Missing"}</strong>
+
+          <div className="event-feed">
+            <div className="feed-heading">
+              <h3>Raw event stream</h3>
+              <span>{timeline.events.length}</span>
+            </div>
+            {timeline.events.slice(0, 8).map((event) => (
+              <div className="event-row" key={event.id}>
+                <time>{formatTime(event.ts_ms)}</time>
+                <strong>{event.event_type}</strong>
+                <span>{event.app_name || event.window_title || event.key_category || "event"}</span>
+              </div>
+            ))}
+            {timeline.events.length === 0 ? (
+              <p className="feed-empty">No raw events in the last 10 minutes.</p>
+            ) : null}
+          </div>
+        </aside>
+
+        <section className="viewer-pane" aria-label="Frame inspector">
+          <div className="viewer-toolbar">
+            <div>
+              <p className="product-kicker">{selectedFrame?.capture_trigger || "waiting"}</p>
+              <h2>{selectedTitle}</h2>
+            </div>
+            <span className={`trust-badge ${selectedVerification?.trust_label || "unknown"}`}>
+              {selectedVerification
+                ? `${selectedVerification.trust_label} ${Math.round(selectedVerification.trust_score * 100)}%`
+                : "unverified"}
+            </span>
+          </div>
+
+          <div className="viewer-stage">
+            {selectedFrame && imageData ? (
+              <div className="screenshot-stage" style={stageStyle(selectedFrame)}>
+                <img src={imageData} alt={frameTitle(selectedFrame)} />
+                <div className={`overlay-layer ${overlayMode}`} aria-hidden="true">
+                  {overlayItems
+                    .filter(hasBounds)
+                    .slice(0, 140)
+                    .map((item) => (
+                      <span
+                        className={
+                          highlightedBoxId === item.id
+                            ? "overlay-box active"
+                            : "overlay-box"
+                        }
+                        key={item.id}
+                        style={boxStyle(item, selectedFrame)}
+                        title={overlayLabel(item)}
+                      />
+                    ))}
+                </div>
+              </div>
+            ) : selectedFrame ? (
+              <div className="viewer-empty">
+                <strong>Loading screenshot</strong>
+                <span>{selectedTitle}</span>
+              </div>
+            ) : (
+              <div className="viewer-empty">
+                <strong>No frame selected</strong>
+                <span>Choose a frame or capture now to inspect the screenshot, sources, and transitions.</span>
+              </div>
+            )}
+          </div>
+
+          <div className="overlay-toolbar" aria-label="Overlay controls">
+            {(["units", "ocr", "ax", "privacy"] as const).map((mode) => (
+              <button
+                key={mode}
+                className={overlayMode === mode ? "active" : ""}
+                type="button"
+                onClick={() => {
+                  setOverlayMode(mode);
+                  setHighlightedBoxId(null);
+                }}
+              >
+                <span>{overlayLabelForMode(mode)}</span>
+                <strong>{overlayCount(frameDetail, mode)}</strong>
+              </button>
+            ))}
+          </div>
+
+          <div className="legend-row">
+            <span><i className="legend-dot units" /> content units</span>
+            <span><i className="legend-dot ocr" /> OCR spans</span>
+            <span><i className="legend-dot ax" /> AX nodes</span>
+            <span><i className="legend-dot privacy" /> privacy regions</span>
           </div>
         </section>
 
-        {error || status.last_error ? (
-          <div className="error-box">{error || status.last_error}</div>
-        ) : null}
-      </aside>
-
-      <section className="workspace">
-        <header className="workspace-header">
-          <div>
-            <p className="label">Search</p>
-            <h2>Screen memory</h2>
-          </div>
-          <form
-            className="search-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void runSearch(query);
-            }}
-          >
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.currentTarget.value)}
-              placeholder="Search captured text"
-            />
-            <button type="submit" disabled={busyAction !== null}>
-              Search
-            </button>
-          </form>
-        </header>
-
-        <div className="content-grid">
-          <section className="results-panel" aria-label="Search results">
-            <div className="panel-heading">
-              <h3>Frames</h3>
-              <span>{results.length}</span>
+        <aside className="evidence-pane" aria-label="Verification drawer">
+          <section className="verification-card">
+            <div className="pane-heading compact">
+              <div>
+                <h2>Last capture</h2>
+                <p>{selectedFrame ? formatTime(selectedFrame.captured_at) : "Nothing selected"}</p>
+              </div>
+              <span>{selectedFrame?.text_source || "visual"}</span>
             </div>
-            <div className="result-list">
-              {results.length === 0 ? (
-                <div className="empty-state">No frames yet</div>
-              ) : (
-                results.map((result) => (
-                  <button
-                    key={result.frame.id}
-                    className={
-                      selectedFrame?.id === result.frame.id
-                        ? "result-item active"
-                        : "result-item"
-                    }
-                    onClick={() => void selectFrame(result.frame)}
-                  >
-                    <span>{formatTime(result.frame.captured_at)}</span>
-                    <strong>{frameTitle(result.frame)}</strong>
-                    <small>{cleanSnippet(result.snippet || result.frame.full_text)}</small>
-                  </button>
-                ))
-              )}
+
+            <div className="signal-grid">
+              <Signal label="Screenshot" ok={selectedVerification?.screenshot_present} />
+              <Signal label="AX" ok={selectedVerification?.has_ax} count={selectedVerification?.ax_node_count} />
+              <Signal label="OCR" ok={selectedVerification?.has_ocr} count={selectedVerification?.ocr_span_count} />
+              <Signal label="Units" ok={selectedVerification?.has_content_units} count={selectedVerification?.content_unit_count} />
+              <Signal label="Window graph" ok={selectedVerification?.has_window_graph} count={selectedVerification?.window_count} />
+              <Signal label="Transition" ok={selectedVerification?.has_transition} count={selectedVerification?.transition_count} />
             </div>
-          </section>
 
-          <section className="detail-panel" aria-label="Frame detail">
-            {selectedFrame ? (
-              <>
-                <div className="preview-wrap">
-                  {imageData ? (
-                    <img src={imageData} alt={frameTitle(selectedFrame)} />
-                  ) : (
-                    <div className="preview-empty">Loading frame</div>
-                  )}
-                </div>
-
-                <div className="detail-header">
-                  <div>
-                    <p className="label">{selectedFrame.capture_trigger}</p>
-                    <h3>{frameTitle(selectedFrame)}</h3>
-                  </div>
-                  <span className="source-badge">
-                    {selectedFrame.text_source || "visual"}
-                  </span>
-                </div>
-
-                <dl className="metadata-grid">
-                  <div>
-                    <dt>Captured</dt>
-                    <dd>{formatTime(selectedFrame.captured_at)}</dd>
-                  </div>
-                  <div>
-                    <dt>App</dt>
-                    <dd>{selectedFrame.app_name || "Unknown"}</dd>
-                  </div>
-                  <div>
-                    <dt>Window</dt>
-                    <dd>{selectedFrame.window_name || "Unknown"}</dd>
-                  </div>
-                  <div>
-                    <dt>URL</dt>
-                    <dd>{selectedFrame.browser_url || "None"}</dd>
-                  </div>
-                  <div>
-                    <dt>Document</dt>
-                    <dd>{selectedFrame.document_path || "None"}</dd>
-                  </div>
-                  <div>
-                    <dt>Snapshot</dt>
-                    <dd>{selectedFrame.snapshot_path}</dd>
-                  </div>
-                </dl>
-
-                <div className="text-panel">
-                  <div className="panel-heading">
-                    <h3>Text</h3>
-                    <span>{selectedText.length}</span>
-                  </div>
-                  <pre>{selectedText || "No text stored"}</pre>
-                </div>
-              </>
+            {selectedVerification?.missing_signals.length ? (
+              <div className="missing-box">
+                <strong>Missing signals</strong>
+                {selectedVerification.missing_signals.slice(0, 5).map((signal) => (
+                  <span key={signal}>{signal}</span>
+                ))}
+              </div>
             ) : (
-              <div className="detail-empty">No frame selected</div>
+              <div className="complete-box">All core verification signals are present for this frame.</div>
             )}
           </section>
-        </div>
+
+          <section className="resume-card">
+            <div className="pane-heading compact">
+              <div>
+                <h2>Resume cue</h2>
+                <p>Evidence-backed readout</p>
+              </div>
+            </div>
+            <dl className="resume-facts">
+              <div>
+                <dt>Current surface</dt>
+                <dd>{activeContext?.title || selectedTitle}</dd>
+              </div>
+              <div>
+                <dt>Likely object</dt>
+                <dd>{activeContext?.object_type || "unknown"}</dd>
+              </div>
+              <div>
+                <dt>Transition</dt>
+                <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
+              </div>
+              <div>
+                <dt>Focus now</dt>
+                <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to infer focus."}</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section className="detail-drawer">
+            <div className="drawer-tabs" role="tablist" aria-label="Evidence tabs">
+              {(["text", "events", "context", "paths"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  className={evidenceTab === tab ? "active" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={evidenceTab === tab}
+                  onClick={() => setEvidenceTab(tab)}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+
+            <EvidencePanel
+              tab={evidenceTab}
+              frame={selectedFrame}
+              detail={frameDetail}
+              selectedText={selectedText}
+              onHighlight={(item, mode) => {
+                setOverlayMode(mode);
+                setHighlightedBoxId(item.id);
+              }}
+            />
+          </section>
+        </aside>
       </section>
     </main>
+  );
+}
+
+function StatusPill({
+  label,
+  value,
+  tone = "quiet",
+}: {
+  label: string;
+  value: string | number;
+  tone?: "quiet" | "good" | "bad";
+}) {
+  return (
+    <div className={`status-pill ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function FrameRow({
+  frame,
+  active,
+  snippet,
+  onSelect,
+}: {
+  frame: CaptureFrame;
+  active: boolean;
+  snippet?: string | null;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      aria-pressed={active}
+      className={active ? "frame-row active" : "frame-row"}
+      onClick={onSelect}
+      type="button"
+    >
+      <FrameThumbnail frame={frame} />
+      <span className="frame-row-main">
+        <span className="row-meta">
+          <time>{formatTime(frame.captured_at)}</time>
+          <b>{frame.capture_trigger}</b>
+        </span>
+        <strong>{frameTitle(frame)}</strong>
+        <small>{cleanSnippet(snippet || frame.full_text)}</small>
+        <span className="badge-row">
+          <EvidenceBadge label="screen" ok={Boolean(frame.snapshot_path)} />
+          <EvidenceBadge label={frame.text_source || "visual"} ok={Boolean(frame.text_source)} />
+          <EvidenceBadge label={frame.privacy_status || "normal"} ok={frame.privacy_status !== "skipped_sensitive"} />
+          <EvidenceBadge label="transition" ok={Boolean(frame.capture_trigger_id || frame.previous_frame_id)} />
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function FrameThumbnail({ frame }: { frame: CaptureFrame }) {
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const dataUrl = await invoke<string | null>("get_frame_image_variant", {
+          frameId: frame.id,
+          variant: "preview",
+        });
+        if (!cancelled) setSrc(dataUrl);
+      } catch {
+        if (!cancelled) setSrc(null);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [frame.id]);
+
+  return (
+    <span className="frame-thumb" aria-hidden="true">
+      {src ? <img src={src} alt="" /> : <span />}
+    </span>
+  );
+}
+
+function EvidenceBadge({ label, ok }: { label: string; ok: boolean }) {
+  return <span className={ok ? "evidence-badge ok" : "evidence-badge"}>{label}</span>;
+}
+
+function Signal({
+  label,
+  ok,
+  count,
+}: {
+  label: string;
+  ok?: boolean;
+  count?: number;
+}) {
+  return (
+    <div className={ok ? "signal ok" : "signal"}>
+      <span>{label}</span>
+      <strong>{typeof count === "number" ? count : ok ? "yes" : "no"}</strong>
+    </div>
+  );
+}
+
+function EmptyCaptureState({
+  hasFrames,
+  hasQuery,
+}: {
+  hasFrames: boolean;
+  hasQuery: boolean;
+}) {
+  return (
+    <div className="empty-state">
+      <strong>{hasFrames && hasQuery ? "No matching evidence" : "No captured frames yet"}</strong>
+      <span>
+        {hasFrames && hasQuery
+          ? "Clear the search or use a broader term to inspect existing captures."
+          : "Start a session to collect screenshots, events, text sources, and missing-signal checks."}
+      </span>
+    </div>
+  );
+}
+
+function EvidencePanel({
+  tab,
+  frame,
+  detail,
+  selectedText,
+  onHighlight,
+}: {
+  tab: EvidenceTab;
+  frame: CaptureFrame | null;
+  detail: FrameDetail | null;
+  selectedText: string;
+  onHighlight: (item: BoxLike, mode: OverlayMode) => void;
+}) {
+  if (!frame) {
+    return (
+      <div className="drawer-empty">
+        <strong>No frame selected</strong>
+        <span>Select a frame to inspect stored evidence.</span>
+      </div>
+    );
+  }
+
+  if (tab === "events") {
+    return (
+      <div className="drawer-list">
+        {detail?.events.length ? (
+          detail.events.map((event) => (
+            <div className="drawer-row" key={event.id}>
+              <strong>{event.event_type}</strong>
+              <span>{formatTime(event.ts_ms)}</span>
+              <small>{event.app_name || event.window_title || event.key_category || event.id}</small>
+            </div>
+          ))
+        ) : (
+          <div className="drawer-empty">
+            <strong>No raw event linked</strong>
+            <span>Manual captures may not have event provenance.</span>
+          </div>
+        )}
+        {detail?.transitions.map((transition) => (
+          <div className="drawer-row transition" key={transition.id}>
+            <strong>{transition.transition_type || "transition"}</strong>
+            <span>{transition.summary || transition.trigger_id}</span>
+            <small>
+              {transition.pre_frame_id || "none"}{" -> "}{transition.post_frame_id || "none"}
+            </small>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (tab === "context") {
+    return (
+      <div className="drawer-list">
+        {detail?.app_contexts.map((context) => (
+          <div className="drawer-row" key={context.id}>
+            <strong>{context.object_type}</strong>
+            <span>{context.title || context.url || context.file_path || context.adapter_id}</span>
+            <small>{confidenceLabel(context.confidence)} via {context.adapter_id}</small>
+          </div>
+        ))}
+        {detail?.content_units.slice(0, 8).map((unit) => (
+          <button
+            className="drawer-row selectable"
+            key={unit.id}
+            type="button"
+            onClick={() => onHighlight(unit, "units")}
+          >
+            <strong>{unit.semantic_role || unit.unit_type || unit.source}</strong>
+            <span>{cleanSnippet(unit.text)}</span>
+            <small>{confidenceLabel(unit.confidence)} content unit</small>
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  if (tab === "paths") {
+    return (
+      <dl className="path-list">
+        <div>
+          <dt>Snapshot</dt>
+          <dd>{frame.snapshot_path}</dd>
+        </div>
+        <div>
+          <dt>Window crop</dt>
+          <dd>{frame.active_window_crop_path || "None"}</dd>
+        </div>
+        <div>
+          <dt>Database</dt>
+          <dd>{frame.capture_trigger_id || "No trigger id"}</dd>
+        </div>
+        <div>
+          <dt>Session</dt>
+          <dd>{frame.session_id || "No session id"}</dd>
+        </div>
+        <div>
+          <dt>App bundle</dt>
+          <dd>{frame.app_bundle_id || "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>URL / document</dt>
+          <dd>{frame.browser_url || frame.document_path || "None"}</dd>
+        </div>
+      </dl>
+    );
+  }
+
+  return (
+    <div className="text-reader">
+      <div className="source-stack">
+        {detail?.content_units.slice(0, 6).map((unit) => (
+          <button
+            key={unit.id}
+            type="button"
+            onClick={() => onHighlight(unit, "units")}
+          >
+            <strong>{unit.semantic_role || unit.unit_type || unit.source}</strong>
+            <span>{cleanSnippet(unit.text)}</span>
+          </button>
+        ))}
+      </div>
+      <pre>{selectedText || "No text stored for this frame."}</pre>
+    </div>
   );
 }
 
@@ -373,9 +1160,87 @@ function formatTime(value?: number | null) {
   }).format(new Date(value));
 }
 
+function formatStopPreview(output: StopCaptureOutput) {
+  return JSON.stringify(
+    output.preview || {
+      session: output.session,
+      export: output.export,
+    },
+    null,
+    2,
+  );
+}
+
 function cleanSnippet(value?: string | null) {
   if (!value) return "No text";
   return value.replace(/\[/g, "").replace(/\]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function hasBounds(item: BoxLike) {
+  return (
+    typeof item.bounds_x === "number" &&
+    typeof item.bounds_y === "number" &&
+    typeof item.bounds_w === "number" &&
+    typeof item.bounds_h === "number" &&
+    item.bounds_w > 1 &&
+    item.bounds_h > 1
+  );
+}
+
+function stageStyle(frame: CaptureFrame): CSSProperties {
+  const width = frame.pixel_width || 16;
+  const height = frame.pixel_height || 9;
+  return {
+    aspectRatio: `${width} / ${height}`,
+    "--frame-aspect": `${width / height}`,
+  } as CSSProperties;
+}
+
+function boxStyle(item: BoxLike, frame: CaptureFrame): CSSProperties {
+  const width = frame.pixel_width || 1;
+  const height = frame.pixel_height || 1;
+  return {
+    left: `${((item.bounds_x || 0) / width) * 100}%`,
+    top: `${((item.bounds_y || 0) / height) * 100}%`,
+    width: `${((item.bounds_w || 0) / width) * 100}%`,
+    height: `${((item.bounds_h || 0) / height) * 100}%`,
+  };
+}
+
+function overlayLabel(item: BoxLike) {
+  return (
+    item.semantic_role ||
+    item.unit_type ||
+    item.role ||
+    item.region_type ||
+    item.source ||
+    cleanSnippet(item.text)
+  );
+}
+
+function overlayLabelForMode(mode: OverlayMode) {
+  if (mode === "ocr") return "OCR";
+  if (mode === "ax") return "AX";
+  if (mode === "privacy") return "Privacy";
+  return "Units";
+}
+
+function overlayCount(detail: FrameDetail | null, mode: OverlayMode) {
+  if (!detail) return 0;
+  if (mode === "ocr") return detail.ocr_spans.length;
+  if (mode === "ax") return detail.ax_nodes.length;
+  if (mode === "privacy") return detail.sensitive_regions.length;
+  return detail.content_units.length;
+}
+
+function confidenceLabel(value?: number | null) {
+  if (typeof value !== "number") return "unscored";
+  return `${Math.round(value * 100)}%`;
+}
+
+function topContentUnit(detail: FrameDetail | null) {
+  if (!detail) return null;
+  return detail.content_units.find((unit) => unit.text && unit.text.length > 24) || detail.content_units[0] || null;
 }
 
 export default App;
