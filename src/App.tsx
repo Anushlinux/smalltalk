@@ -232,6 +232,38 @@ type FrameDetail = {
   transitions: TransitionSummary[];
 };
 
+type NativeResumeCard = {
+  generated_at_ms: number;
+  lookback_minutes: number;
+  what_was_i_doing: string;
+  what_was_i_reading?: string | null;
+  focus_now: string;
+  why_this_focus: string;
+  continue_from: {
+    frame_id?: string | null;
+    app_name?: string | null;
+    window_name?: string | null;
+    title?: string | null;
+    url?: string | null;
+    document_path?: string | null;
+    quote?: string | null;
+    reason: string;
+  };
+  what_changed: string[];
+  useful_evidence: string[];
+  likely_distractions: string[];
+  behavior_read: {
+    mode: string;
+    confidence: number;
+    notes: string[];
+  };
+  next_action: string;
+  confidence: number;
+  evidence_frame_ids: string[];
+  evidence_transition_ids: string[];
+  warnings: string[];
+};
+
 type OverlayMode = "units" | "ocr" | "ax" | "privacy";
 type EvidenceTab = "text" | "events" | "context" | "paths";
 
@@ -273,6 +305,7 @@ function App() {
   const [imageData, setImageData] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [lastStopOutput, setLastStopOutput] = useState<StopCaptureOutput | null>(null);
+  const [resumeCard, setResumeCard] = useState<NativeResumeCard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const storeGenerationRef = useRef(0);
   const isDeleting = busyAction === "delete_all_frames";
@@ -379,6 +412,7 @@ function App() {
           setSelectedFrame(null);
           setFrameDetail(null);
           setImageData(null);
+          setResumeCard(null);
           setTimeline(emptyTimeline);
           setStatus(nextStatus);
           const nextSessionId =
@@ -421,6 +455,7 @@ function App() {
       setTimeline(emptyTimeline);
       setQuery("");
       setLastStopOutput(null);
+      setResumeCard(null);
       setStatus({
         ...nextStatus,
         running: false,
@@ -559,6 +594,25 @@ function App() {
       setError(String(err));
     }
   }, [lastStopOutput?.export?.path, status.last_export?.path]);
+
+  const generateResumeCard = useCallback(async () => {
+    setBusyAction("get_native_resume_card");
+    setError(null);
+    try {
+      const card = await invoke<NativeResumeCard>("get_native_resume_card", {
+        input: {
+          lookback_minutes: 20,
+          current_frame_id: selectedFrame?.id ?? null,
+          max_keyframes: 10,
+        },
+      });
+      setResumeCard(card);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [selectedFrame?.id]);
 
   return (
     <main className="capture-shell">
@@ -838,27 +892,83 @@ function App() {
             <div className="pane-heading compact">
               <div>
                 <h2>Resume cue</h2>
-                <p>Evidence-backed readout</p>
+                <p>
+                  {resumeCard
+                    ? `Last ${resumeCard.lookback_minutes} minutes`
+                    : "Safe native resume card"}
+                </p>
               </div>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null || !hasFrames}
+                aria-busy={busyAction === "get_native_resume_card"}
+                onClick={() => void generateResumeCard()}
+              >
+                {busyAction === "get_native_resume_card" ? "Reading" : "Resume me"}
+              </button>
             </div>
-            <dl className="resume-facts">
-              <div>
-                <dt>Current surface</dt>
-                <dd>{activeContext?.title || selectedTitle}</dd>
+            {resumeCard ? (
+              <div className="native-resume-card">
+                <strong>{resumeCard.focus_now}</strong>
+                <p>{resumeCard.what_was_i_doing}</p>
+                {resumeCard.what_was_i_reading ? (
+                  <p>{resumeCard.what_was_i_reading}</p>
+                ) : null}
+                <dl className="resume-facts">
+                  <div>
+                    <dt>Continue from</dt>
+                    <dd>
+                      {resumeCard.continue_from.title ||
+                        resumeCard.continue_from.window_name ||
+                        resumeCard.continue_from.app_name ||
+                        "No safe frame"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Why</dt>
+                    <dd>{resumeCard.why_this_focus}</dd>
+                  </div>
+                  <div>
+                    <dt>Next action</dt>
+                    <dd>{resumeCard.next_action}</dd>
+                  </div>
+                  <div>
+                    <dt>Confidence</dt>
+                    <dd>{confidenceLabel(resumeCard.confidence)}</dd>
+                  </div>
+                </dl>
+                {resumeCard.continue_from.quote ? (
+                  <blockquote>{resumeCard.continue_from.quote}</blockquote>
+                ) : null}
+                {resumeCard.warnings.length ? (
+                  <div className="resume-warning">
+                    {resumeCard.warnings.slice(0, 2).map((warning) => (
+                      <span key={warning}>{warning}</span>
+                    ))}
+                  </div>
+                ) : null}
               </div>
-              <div>
-                <dt>Likely object</dt>
-                <dd>{activeContext?.object_type || "unknown"}</dd>
-              </div>
-              <div>
-                <dt>Transition</dt>
-                <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
-              </div>
-              <div>
-                <dt>Focus now</dt>
-                <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to infer focus."}</dd>
-              </div>
-            </dl>
+            ) : (
+              <dl className="resume-facts">
+                <div>
+                  <dt>Current surface</dt>
+                  <dd>{activeContext?.title || selectedTitle}</dd>
+                </div>
+                <div>
+                  <dt>Likely object</dt>
+                  <dd>{activeContext?.object_type || "unknown"}</dd>
+                </div>
+                <div>
+                  <dt>Transition</dt>
+                  <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
+                </div>
+                <div>
+                  <dt>Focus now</dt>
+                  <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to infer focus."}</dd>
+                </div>
+              </dl>
+            )}
           </section>
 
           <section className="detail-drawer">

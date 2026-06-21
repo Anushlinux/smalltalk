@@ -1,10 +1,15 @@
 mod capture;
+mod session_island;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            session_island::init_session_island(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             capture::start_capture,
             capture::stop_capture,
@@ -21,8 +26,14 @@ pub fn run() {
             capture::get_frame_v2,
             capture::get_recent_timeline,
             capture::get_frame_detail,
+            capture::validate_frame_consistency,
             capture::get_transition,
             capture::search_content_units,
+            capture::build_safe_ai_export,
+            capture::get_native_storyboard_dossier,
+            capture::classify_episode_transitions,
+            capture::get_native_resume_card,
+            capture::run_resume_eval,
             capture::export_debug_episode,
             capture::get_episode_dossier,
             capture::add_exclusion_rule,

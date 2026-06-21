@@ -478,6 +478,13 @@ h3 {
   font-weight: 760;
 }
 
+.pane-heading > button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
 .frame-list {
   display: grid;
   align-content: start;
@@ -976,6 +983,51 @@ h3 {
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
+}
+
+.native-resume-card {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.native-resume-card > strong {
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.32;
+}
+
+.native-resume-card p,
+.native-resume-card blockquote {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.native-resume-card blockquote {
+  border-left: 3px solid rgba(23, 106, 88, 0.3);
+  padding-left: 9px;
+  color: var(--muted);
+}
+
+.native-resume-card .resume-facts {
+  padding: 0;
+}
+
+.resume-warning {
+  display: grid;
+  gap: 5px;
+  border: 1px solid rgba(138, 90, 19, 0.24);
+  border-radius: 8px;
+  padding: 8px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .drawer-tabs {

@@ -158,6 +158,74 @@ const VISION_OCR_SWIFT: &str = include_str!("../scripts/vision_ocr.swift");
 const ACCESSIBILITY_SNAPSHOT_SWIFT: &str = include_str!("../scripts/accessibility_snapshot.swift");
 const CAPTURE_EVENTS_SWIFT: &str = include_str!("../scripts/capture_events.swift");
 const WINDOW_SNAPSHOT_SWIFT: &str = include_str!("../scripts/window_snapshot.swift");
+const IMAGE_MASK_SWIFT: &str = r#"
+import AppKit
+import Foundation
+
+struct MaskRect: Decodable {
+    let x: Double
+    let y: Double
+    let w: Double
+    let h: Double
+}
+
+let args = CommandLine.arguments
+guard args.count >= 4 else {
+    fputs("usage: image_mask <input> <output> <rects-json>\n", stderr)
+    exit(2)
+}
+
+let input = URL(fileURLWithPath: args[1])
+let output = URL(fileURLWithPath: args[2])
+let rectData = args[3].data(using: .utf8) ?? Data()
+let rects = (try? JSONDecoder().decode([MaskRect].self, from: rectData)) ?? []
+
+guard let image = NSImage(contentsOf: input) else {
+    fputs("could not load input image\n", stderr)
+    exit(3)
+}
+
+let size = image.size
+guard let bitmap = NSBitmapImageRep(
+    bitmapDataPlanes: nil,
+    pixelsWide: max(1, Int(size.width.rounded())),
+    pixelsHigh: max(1, Int(size.height.rounded())),
+    bitsPerSample: 8,
+    samplesPerPixel: 4,
+    hasAlpha: true,
+    isPlanar: false,
+    colorSpaceName: .deviceRGB,
+    bytesPerRow: 0,
+    bitsPerPixel: 0
+) else {
+    fputs("could not create bitmap\n", stderr)
+    exit(4)
+}
+
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+image.draw(in: NSRect(origin: .zero, size: size))
+NSColor.black.setFill()
+for rect in rects {
+    let x = max(0.0, min(rect.x, size.width))
+    let y = max(0.0, min(rect.y, size.height))
+    let w = max(0.0, min(rect.w, size.width - x))
+    let h = max(0.0, min(rect.h, size.height - y))
+    NSBezierPath(rect: NSRect(x: x, y: size.height - y - h, width: w, height: h)).fill()
+}
+NSGraphicsContext.restoreGraphicsState()
+
+guard let png = bitmap.representation(using: .png, properties: [:]) else {
+    fputs("could not encode png\n", stderr)
+    exit(5)
+}
+
+try FileManager.default.createDirectory(
+    at: output.deletingLastPathComponent(),
+    withIntermediateDirectories: true
+)
+try png.write(to: output)
+"#;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -742,6 +810,24 @@ pub struct FrameDetail {
     pub transitions: Vec<TransitionSummary>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameConsistencyReport {
+    pub frame_id: String,
+    pub warnings: Vec<FrameQualityWarning>,
+    pub confidence_adjustment: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameQualityWarning {
+    pub id: String,
+    pub frame_id: String,
+    pub warning_type: String,
+    pub severity: String,
+    pub message: String,
+    pub evidence_json: String,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureConfig {
     pub capture_v2_enabled: Option<bool>,
@@ -764,6 +850,227 @@ pub struct ExclusionRule {
     pub action: String,
     pub enabled: bool,
     pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SafeAiExportInput {
+    pub lookback_minutes: Option<i64>,
+    pub range_ms: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+    pub include_images: Option<bool>,
+    pub max_frames: Option<u32>,
+    pub export_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeAiExportBundle {
+    pub id: String,
+    pub generated_at_ms: i64,
+    pub export_type: String,
+    pub lookback_start_ms: i64,
+    pub lookback_end_ms: i64,
+    pub input_frame_count: usize,
+    pub exported_frame_count: usize,
+    pub excluded_frame_count: usize,
+    pub masked_image_count: usize,
+    pub redacted_text_count: usize,
+    pub frames: Vec<SafeAiFrame>,
+    pub transitions: Vec<TransitionSummary>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeAiFrame {
+    pub frame_id: String,
+    pub captured_at_ms: i64,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub window_name: Option<String>,
+    pub window_id: Option<i64>,
+    pub browser_url: Option<String>,
+    pub document_path: Option<String>,
+    pub phash: Option<String>,
+    pub app_context_id: Option<String>,
+    pub app_context_object_type: Option<String>,
+    pub image_path_safe: Option<String>,
+    pub active_window_crop_path_safe: Option<String>,
+    pub top_content_units: Vec<CompactContentUnit>,
+    pub text_source: Option<String>,
+    pub text: Option<String>,
+    pub evidence_strength: f64,
+    pub privacy_status: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactContentUnit {
+    pub id: String,
+    pub source: String,
+    pub unit_type: String,
+    pub semantic_role: Option<String>,
+    pub text: String,
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NativeStoryboardInput {
+    pub lookback_minutes: Option<i64>,
+    pub max_keyframes: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+    pub include_images: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeStoryboardDossier {
+    pub generated_at_ms: i64,
+    pub lookback_start_ms: i64,
+    pub lookback_end_ms: i64,
+    pub current_frame_id: Option<String>,
+    pub keyframes: Vec<StoryboardKeyframe>,
+    pub transitions: Vec<StoryboardTransition>,
+    pub dominant_surfaces: Vec<SurfaceSummary>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryboardKeyframe {
+    pub frame_id: String,
+    pub kind: String,
+    pub captured_at_ms: i64,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub document_path: Option<String>,
+    pub app_context_id: Option<String>,
+    pub app_context_object_type: Option<String>,
+    pub image_path_safe: Option<String>,
+    pub active_window_crop_path_safe: Option<String>,
+    pub top_content_units: Vec<CompactContentUnit>,
+    pub text_source: Option<String>,
+    pub evidence_strength: f64,
+    pub selection_reason: String,
+    pub privacy_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryboardTransition {
+    pub id: String,
+    pub transition_type: String,
+    pub pre_frame_id: Option<String>,
+    pub post_frame_id: Option<String>,
+    pub evidence_frame_ids: Vec<String>,
+    pub evidence_event_ids: Vec<String>,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransitionClassifierInput {
+    pub lookback_minutes: Option<i64>,
+    pub range_ms: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifiedTransition {
+    pub id: String,
+    pub transition_type: String,
+    pub pre_frame_id: Option<String>,
+    pub post_frame_id: Option<String>,
+    pub return_score: Option<f64>,
+    pub evidence_frame_ids: Vec<String>,
+    pub evidence_event_ids: Vec<String>,
+    pub reason: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SurfaceSummary {
+    pub surface_key: String,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub url_or_document: Option<String>,
+    pub frame_count: usize,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NativeResumeInput {
+    pub lookback_minutes: Option<i64>,
+    pub max_keyframes: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeResumeCard {
+    pub generated_at_ms: i64,
+    pub lookback_minutes: i64,
+    pub what_was_i_doing: String,
+    pub what_was_i_reading: Option<String>,
+    pub focus_now: String,
+    pub why_this_focus: String,
+    pub continue_from: ResumeContinueFrom,
+    pub what_changed: Vec<String>,
+    pub useful_evidence: Vec<String>,
+    pub likely_distractions: Vec<String>,
+    pub behavior_read: ResumeBehaviorRead,
+    pub next_action: String,
+    pub confidence: f64,
+    pub evidence_frame_ids: Vec<String>,
+    pub evidence_transition_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeContinueFrom {
+    pub frame_id: Option<String>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub document_path: Option<String>,
+    pub quote: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeBehaviorRead {
+    pub mode: String,
+    pub confidence: f64,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeEvalReport {
+    pub evaluated_at_ms: i64,
+    pub case_count: usize,
+    pub average_task_identification_score: f64,
+    pub average_resume_target_score: f64,
+    pub average_hallucination_control_score: f64,
+    pub warnings_frequency: f64,
+    pub unknown_transition_frequency: f64,
+    pub redacted_frame_handling_correctness: f64,
+    pub cases: Vec<ResumeEvalCaseReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeEvalCaseReport {
+    pub session_id: Option<String>,
+    pub task_identification: f64,
+    pub reading_identification: f64,
+    pub resume_target: f64,
+    pub why_explanation: f64,
+    pub distraction_handling: f64,
+    pub hallucination_control: f64,
+    pub warnings_count: usize,
+    pub unknown_transition_count: usize,
+    pub redacted_frame_handling_ok: bool,
 }
 
 struct CaptureEventSource {
@@ -792,9 +1099,19 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
     {
         let runtime = lock_runtime(state.inner())?;
         if runtime.running {
-            return capture_status(app, state);
+            let status = capture_status(app, state)?;
+            crate::session_island::update_session_island_from_status(
+                &status,
+                crate::session_island::SessionIslandState::RecordingCompact,
+            );
+            return Ok(status);
         }
     }
+
+    crate::session_island::update_session_island(
+        crate::session_island::SessionIslandSnapshot::starting(),
+    );
+    crate::session_island::show_session_island();
 
     let session = create_capture_session(&app)?;
 
@@ -820,7 +1137,12 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
         }));
     }
 
-    capture_status(app, state)
+    let status = capture_status(app, state)?;
+    crate::session_island::update_session_island_from_status(
+        &status,
+        crate::session_island::SessionIslandState::RecordingCompact,
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -828,6 +1150,13 @@ pub fn stop_capture(
     app: AppHandle,
     state: State<CaptureState>,
 ) -> Result<StopCaptureOutput, String> {
+    if let Ok(status) = capture_status_snapshot(&app, &state) {
+        crate::session_island::update_session_island_from_status(
+            &status,
+            crate::session_island::SessionIslandState::Processing,
+        );
+    }
+
     let session_id = {
         let runtime = lock_runtime(state.inner())?;
         runtime.active_session_id.clone()
@@ -850,6 +1179,10 @@ pub fn stop_capture(
     }
 
     let status = capture_status(app, state)?;
+    crate::session_island::update_session_island_from_status(
+        &status,
+        crate::session_island::SessionIslandState::StoppedToast,
+    );
     let preview = stopped_session
         .as_ref()
         .zip(export.as_ref())
@@ -905,7 +1238,13 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
         runtime.last_frame = Some(frame.clone());
     }
 
-    let _ = app.emit("capture-status", capture_status_snapshot(&app, &state));
+    if let Ok(status) = capture_status_snapshot(&app, &state) {
+        let _ = app.emit("capture-status", status.clone());
+        crate::session_island::update_session_island_from_status(
+            &status,
+            crate::session_island::SessionIslandState::RecordingCompact,
+        );
+    }
     Ok(frame)
 }
 
@@ -1143,6 +1482,18 @@ pub fn get_frame_detail(app: AppHandle, frame_id: i64) -> Result<Option<FrameDet
 }
 
 #[tauri::command]
+pub fn validate_frame_consistency(
+    app: AppHandle,
+    frame_id: i64,
+) -> Result<Option<FrameConsistencyReport>, String> {
+    let Some(frame) = get_frame(app.clone(), frame_id)? else {
+        return Ok(None);
+    };
+    let conn = open_db(&app)?;
+    Ok(Some(validate_frame_consistency_inner(&conn, &frame)?))
+}
+
+#[tauri::command]
 pub fn get_transition(
     app: AppHandle,
     transition_id: String,
@@ -1279,22 +1630,1963 @@ pub fn delete_recent_captures(app: AppHandle, range_ms: i64) -> Result<i64, Stri
 
 #[tauri::command]
 pub fn export_debug_episode(app: AppHandle, range_ms: Option<i64>) -> Result<Value, String> {
-    let timeline = get_recent_timeline(app, range_ms, None)?;
-    serde_json::to_value(timeline).map_err(to_string)
+    let bundle = build_safe_ai_export(
+        app,
+        SafeAiExportInput {
+            lookback_minutes: None,
+            range_ms,
+            current_frame_id: None,
+            include_images: Some(false),
+            max_frames: Some(120),
+            export_type: Some("debug_episode".to_string()),
+        },
+    )?;
+    serde_json::to_value(bundle).map_err(to_string)
 }
 
 #[tauri::command]
 pub fn get_episode_dossier(app: AppHandle, range_ms: Option<i64>) -> Result<Value, String> {
-    let timeline = get_recent_timeline(app, range_ms, None)?;
-    let latest = timeline.frames.first();
-    Ok(serde_json::json!({
-        "generatedAtMs": now_millis(),
-        "timeRange": { "rangeMs": range_ms.unwrap_or(10 * 60 * 1000) },
-        "currentSurface": latest,
-        "keyframes": timeline.frames.into_iter().take(12).collect::<Vec<_>>(),
-        "transitions": timeline.transitions,
-        "warnings": ["episode dossier is v1/local-debug only"],
-    }))
+    let input = NativeStoryboardInput {
+        lookback_minutes: range_ms.map(|value| (value / 60_000).max(1)),
+        max_keyframes: Some(12),
+        current_frame_id: None,
+        include_images: Some(true),
+    };
+    serde_json::to_value(get_native_storyboard_dossier(app, Some(input))?).map_err(to_string)
+}
+
+#[tauri::command]
+pub fn build_safe_ai_export(
+    app: AppHandle,
+    input: SafeAiExportInput,
+) -> Result<SafeAiExportBundle, String> {
+    let paths = capture_paths(&app)?;
+    let conn = open_db(&app)?;
+    let output_dir = paths.root_dir.join("safe-ai-exports");
+    build_safe_ai_export_from_conn(&conn, &output_dir, input)
+}
+
+#[tauri::command]
+pub fn get_native_storyboard_dossier(
+    app: AppHandle,
+    input: Option<NativeStoryboardInput>,
+) -> Result<NativeStoryboardDossier, String> {
+    let paths = capture_paths(&app)?;
+    let conn = open_db(&app)?;
+    get_native_storyboard_dossier_from_conn(&conn, &paths.root_dir.join("safe-ai-exports"), input)
+}
+
+fn get_native_storyboard_dossier_from_conn(
+    conn: &Connection,
+    output_root: &Path,
+    input: Option<NativeStoryboardInput>,
+) -> Result<NativeStoryboardDossier, String> {
+    let input = input.unwrap_or(NativeStoryboardInput {
+        lookback_minutes: None,
+        max_keyframes: None,
+        current_frame_id: None,
+        include_images: None,
+    });
+    let max_keyframes = input.max_keyframes.unwrap_or(10).clamp(1, 12) as usize;
+    let lookback_minutes = input.lookback_minutes.unwrap_or(20).max(1);
+    let bundle = build_safe_ai_export_from_conn(
+        conn,
+        output_root,
+        SafeAiExportInput {
+            lookback_minutes: Some(lookback_minutes),
+            range_ms: None,
+            current_frame_id: input.current_frame_id,
+            include_images: input.include_images.or(Some(true)),
+            max_frames: Some(120),
+            export_type: Some("native_storyboard".to_string()),
+        },
+    )?;
+    Ok(build_storyboard_from_safe_export(bundle, max_keyframes))
+}
+
+#[tauri::command]
+pub fn classify_episode_transitions(
+    app: AppHandle,
+    input: Option<TransitionClassifierInput>,
+) -> Result<Vec<ClassifiedTransition>, String> {
+    let input = input.unwrap_or(TransitionClassifierInput {
+        lookback_minutes: None,
+        range_ms: None,
+        current_frame_id: None,
+    });
+    let bundle = build_safe_ai_export(
+        app,
+        SafeAiExportInput {
+            lookback_minutes: input.lookback_minutes.or(Some(20)),
+            range_ms: input.range_ms,
+            current_frame_id: input.current_frame_id,
+            include_images: Some(false),
+            max_frames: Some(160),
+            export_type: Some("transition_classifier".to_string()),
+        },
+    )?;
+    Ok(classify_safe_episode_transitions(
+        &bundle.frames,
+        &bundle.transitions,
+    ))
+}
+
+#[tauri::command]
+pub fn get_native_resume_card(
+    app: AppHandle,
+    input: Option<NativeResumeInput>,
+) -> Result<NativeResumeCard, String> {
+    let paths = capture_paths(&app)?;
+    let conn = open_db(&app)?;
+    get_native_resume_card_from_conn(&conn, &paths.root_dir.join("safe-ai-exports"), input)
+}
+
+fn get_native_resume_card_from_conn(
+    conn: &Connection,
+    output_root: &Path,
+    input: Option<NativeResumeInput>,
+) -> Result<NativeResumeCard, String> {
+    let input = input.unwrap_or(NativeResumeInput {
+        lookback_minutes: None,
+        max_keyframes: None,
+        current_frame_id: None,
+    });
+    let lookback_minutes = input.lookback_minutes.unwrap_or(20).max(1);
+    let dossier = get_native_storyboard_dossier_from_conn(
+        conn,
+        output_root,
+        Some(NativeStoryboardInput {
+            lookback_minutes: Some(lookback_minutes),
+            max_keyframes: input.max_keyframes.or(Some(10)),
+            current_frame_id: input.current_frame_id,
+            include_images: Some(true),
+        }),
+    )?;
+    Ok(build_resume_card_from_storyboard(dossier, lookback_minutes))
+}
+
+#[tauri::command]
+pub fn run_resume_eval(app: AppHandle, eval_file_path: String) -> Result<ResumeEvalReport, String> {
+    let raw = fs::read_to_string(&eval_file_path).map_err(to_string)?;
+    let parsed: Value = serde_json::from_str(&raw).map_err(to_string)?;
+    let cases = match parsed {
+        Value::Array(cases) => cases,
+        Value::Object(_) => vec![parsed],
+        _ => return Err("eval file must contain a JSON object or array".to_string()),
+    };
+    let mut reports = Vec::new();
+    for case in cases {
+        reports.push(run_resume_eval_case(&app, &case)?);
+    }
+    Ok(summarize_resume_eval_reports(reports))
+}
+
+fn build_safe_ai_export_from_conn(
+    conn: &Connection,
+    output_root: &Path,
+    input: SafeAiExportInput,
+) -> Result<SafeAiExportBundle, String> {
+    ensure_ai_export_audit_table(conn)?;
+    let generated_at_ms = now_millis();
+    let export_id = next_id("ai-export");
+    let export_type = input.export_type.unwrap_or_else(|| "ai_export".to_string());
+    let include_images = input.include_images.unwrap_or(true);
+    let lookback_ms = input
+        .range_ms
+        .or_else(|| input.lookback_minutes.map(|minutes| minutes * 60_000))
+        .unwrap_or(20 * 60_000)
+        .max(1_000);
+    let lookback_end_ms = input
+        .current_frame_id
+        .and_then(|id| frame_captured_at(conn, id).ok().flatten())
+        .unwrap_or(generated_at_ms);
+    let lookback_start_ms = lookback_end_ms.saturating_sub(lookback_ms);
+    let max_frames = input.max_frames.unwrap_or(120).clamp(1, 240);
+    let frames = query_frames_between(conn, lookback_start_ms, lookback_end_ms, max_frames)?;
+    let transitions = query_transitions_between(conn, lookback_start_ms, lookback_end_ms)?;
+    let export_dir = output_root.join(&export_id);
+    fs::create_dir_all(&export_dir).map_err(to_string)?;
+
+    let mut warnings = Vec::new();
+    let mut safe_frames = Vec::new();
+    let mut excluded_frame_count = 0_usize;
+    let mut masked_image_count = 0_usize;
+    let mut redacted_text_count = 0_usize;
+
+    for frame in frames.iter() {
+        let frame_key = frame.id.to_string();
+        let sensitive_regions = query_sensitive_regions(conn, &frame_key)?;
+        let app_contexts = query_app_contexts(conn, &frame_key)?;
+        let content_units = query_content_units_for_frame(conn, &frame_key)?;
+        let quality_warnings = query_frame_quality_warnings(conn, &frame_key).unwrap_or_default();
+        let privacy = export_privacy_for_frame(frame, &sensitive_regions);
+        if privacy.exclude_all {
+            excluded_frame_count += 1;
+            warnings.push(format!(
+                "frame {} excluded by {}",
+                frame.id, privacy.exclude_reason
+            ));
+            continue;
+        }
+
+        let mut frame_warnings = Vec::new();
+        let context = app_contexts.first();
+        let mut text_was_redacted = false;
+        let redacted_text = frame.full_text.as_deref().and_then(|text| {
+            let redacted = redact_text_for_ai(text);
+            if redacted != text {
+                text_was_redacted = true;
+            }
+            non_empty(redacted)
+        });
+        let compact_units = compact_content_units_for_ai(&content_units, &mut text_was_redacted);
+        if privacy.redact_text && redacted_text.is_some() {
+            text_was_redacted = true;
+        }
+        if text_was_redacted {
+            redacted_text_count += 1;
+            frame_warnings.push("text redacted before AI export".to_string());
+        }
+        for warning in &quality_warnings {
+            frame_warnings.push(format!(
+                "quality warning {}: {}",
+                warning.warning_type, warning.message
+            ));
+        }
+
+        let (image_path_safe, active_window_crop_path_safe) = if include_images {
+            let mut snapshot_safe = None;
+            let mut window_safe = None;
+            if privacy.mask_images {
+                if let Some(path) = derive_safe_image_for_export(
+                    &export_dir,
+                    frame.id,
+                    "full_screenshot",
+                    frame
+                        .full_screenshot_path
+                        .as_deref()
+                        .unwrap_or(&frame.snapshot_path),
+                    &sensitive_regions,
+                    &mut frame_warnings,
+                )? {
+                    snapshot_safe = Some(path);
+                    masked_image_count += 1;
+                }
+                if let Some(path) = frame.active_window_crop_path.as_deref() {
+                    if let Some(path) = derive_safe_image_for_export(
+                        &export_dir,
+                        frame.id,
+                        "active_window",
+                        path,
+                        &sensitive_regions,
+                        &mut frame_warnings,
+                    )? {
+                        window_safe = Some(path);
+                        masked_image_count += 1;
+                    }
+                }
+            } else {
+                snapshot_safe = copy_safe_image_for_export(
+                    &export_dir,
+                    frame.id,
+                    "full_screenshot",
+                    frame
+                        .full_screenshot_path
+                        .as_deref()
+                        .unwrap_or(&frame.snapshot_path),
+                    &mut frame_warnings,
+                )?;
+                if let Some(path) = frame.active_window_crop_path.as_deref() {
+                    window_safe = copy_safe_image_for_export(
+                        &export_dir,
+                        frame.id,
+                        "active_window",
+                        path,
+                        &mut frame_warnings,
+                    )?;
+                }
+            }
+            (snapshot_safe, window_safe)
+        } else {
+            (None, None)
+        };
+
+        warnings.extend(
+            frame_warnings
+                .iter()
+                .map(|warning| format!("frame {}: {}", frame.id, warning)),
+        );
+        safe_frames.push(SafeAiFrame {
+            frame_id: frame.id.to_string(),
+            captured_at_ms: frame.captured_at,
+            app_name: frame.app_name.clone(),
+            app_bundle_id: frame.app_bundle_id.clone(),
+            window_name: frame.window_name.clone(),
+            window_id: frame.window_id,
+            browser_url: redact_url_for_ai(frame.browser_url.as_deref(), &mut redacted_text_count),
+            document_path: redact_path_for_ai(
+                frame.document_path.as_deref(),
+                &mut redacted_text_count,
+            ),
+            phash: frame.phash.clone(),
+            app_context_id: context.map(|context| context.id.clone()),
+            app_context_object_type: context.map(|context| context.object_type.clone()),
+            image_path_safe,
+            active_window_crop_path_safe,
+            top_content_units: compact_units,
+            text_source: frame.text_source.clone(),
+            text: if privacy.redact_text {
+                redacted_text
+            } else {
+                redacted_text.or_else(|| frame.full_text.clone().and_then(non_empty))
+            },
+            evidence_strength: apply_quality_adjustment(
+                evidence_strength(frame, &content_units, &app_contexts),
+                &quality_warnings,
+            ),
+            privacy_status: privacy.status,
+            warnings: frame_warnings,
+        });
+    }
+
+    if excluded_frame_count > 0 {
+        warnings.push(format!(
+            "{} frames excluded by privacy policy",
+            excluded_frame_count
+        ));
+    }
+    if masked_image_count > 0 {
+        warnings.push(format!(
+            "{} screenshots pixel-masked before export",
+            masked_image_count
+        ));
+    }
+    if redacted_text_count > 0 {
+        warnings.push(format!(
+            "{} frame/url/text fields redacted before export",
+            redacted_text_count
+        ));
+    }
+
+    let bundle = SafeAiExportBundle {
+        id: export_id.clone(),
+        generated_at_ms,
+        export_type: export_type.clone(),
+        lookback_start_ms,
+        lookback_end_ms,
+        input_frame_count: frames.len(),
+        exported_frame_count: safe_frames.len(),
+        excluded_frame_count,
+        masked_image_count,
+        redacted_text_count,
+        frames: safe_frames,
+        transitions,
+        warnings,
+    };
+    insert_ai_export_audit(conn, &bundle)?;
+    write_json_pretty(
+        &export_dir.join("safe-ai-export.json"),
+        &serde_json::to_value(&bundle).map_err(to_string)?,
+    )?;
+    Ok(bundle)
+}
+
+#[derive(Debug)]
+struct FrameExportPrivacy {
+    status: String,
+    mask_images: bool,
+    redact_text: bool,
+    exclude_all: bool,
+    exclude_reason: String,
+}
+
+fn export_privacy_for_frame(
+    frame: &CaptureFrame,
+    sensitive_regions: &[SensitiveRegionSummary],
+) -> FrameExportPrivacy {
+    let frame_status = frame
+        .privacy_status
+        .as_deref()
+        .unwrap_or("normal")
+        .to_string();
+    let actions = sensitive_regions
+        .iter()
+        .filter_map(|region| region.action_taken.as_deref())
+        .collect::<Vec<_>>();
+    let exclude_all = frame_status.contains("skipped")
+        || actions.iter().any(|action| {
+            matches!(
+                *action,
+                "skip_capture" | "never_send_to_ai" | "excluded_app"
+            )
+        });
+    let redact = frame_status == "redacted"
+        || !sensitive_regions.is_empty()
+        || actions.iter().any(|action| action.contains("redact"));
+    FrameExportPrivacy {
+        status: if exclude_all {
+            "excluded".to_string()
+        } else if redact {
+            "redacted".to_string()
+        } else {
+            frame_status.clone()
+        },
+        mask_images: redact,
+        redact_text: redact,
+        exclude_all,
+        exclude_reason: if actions.iter().any(|action| *action == "never_send_to_ai") {
+            "never_send_to_ai".to_string()
+        } else if frame_status.contains("skipped") {
+            "skip_capture".to_string()
+        } else {
+            "privacy rule".to_string()
+        },
+    }
+}
+
+fn build_storyboard_from_safe_export(
+    bundle: SafeAiExportBundle,
+    max_keyframes: usize,
+) -> NativeStoryboardDossier {
+    let mut frames = bundle.frames.clone();
+    frames.sort_by_key(|frame| frame.captured_at_ms);
+    let mut selected: Vec<(String, SafeAiFrame, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(current) = frames.last() {
+        push_storyboard_selection(
+            &mut selected,
+            &mut seen,
+            "current_frame",
+            current.clone(),
+            "latest captured frame in the lookback window",
+        );
+    }
+    if let Some(first) = frames.first() {
+        push_storyboard_selection(
+            &mut selected,
+            &mut seen,
+            "session_start",
+            first.clone(),
+            "earliest exported frame in the lookback window",
+        );
+    }
+    for pair in frames.windows(2).rev() {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if surface_key_for_safe_frame(previous) != surface_key_for_safe_frame(current) {
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "last_major_app_or_window_switch",
+                previous.clone(),
+                "last frame before the current surface changed",
+            );
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "branch_landing",
+                current.clone(),
+                "first frame on a changed app/window/url surface",
+            );
+            break;
+        }
+    }
+    for frame in frames.iter().rev() {
+        let text = frame
+            .top_content_units
+            .iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.len() > 400 {
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "last_high_attention_reading_frame",
+                frame.clone(),
+                "substantial visible text/content units",
+            );
+            break;
+        }
+    }
+    for transition in bundle.transitions.iter().take(40) {
+        let transition_type = transition.transition_type.as_deref().unwrap_or("unknown");
+        let target_id = transition
+            .post_frame_id
+            .as_deref()
+            .or(transition.pre_frame_id.as_deref());
+        let Some(target_id) = target_id else {
+            continue;
+        };
+        let Some(frame) = frames.iter().find(|frame| frame.frame_id == target_id) else {
+            continue;
+        };
+        if transition_type.contains("typing") {
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "last_typing_pause_or_commit",
+                frame.clone(),
+                "linked to a typing transition",
+            );
+        } else if transition_type.contains("clipboard") {
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "last_clipboard_source",
+                frame.clone(),
+                "linked to clipboard evidence",
+            );
+        } else if transition_type.contains("scroll") {
+            push_storyboard_selection(
+                &mut selected,
+                &mut seen,
+                "last_scroll_stop_focus_frame",
+                frame.clone(),
+                "linked to a scroll/focus transition",
+            );
+        }
+        if selected.len() >= max_keyframes {
+            break;
+        }
+    }
+    let classified_transitions =
+        classify_safe_episode_transitions(&bundle.frames, &bundle.transitions);
+    for transition in &classified_transitions {
+        if selected.len() >= max_keyframes {
+            break;
+        }
+        let kind = match transition.transition_type.as_str() {
+            "returning_to_previous_task" => "return_to_previous_surface",
+            "possible_distraction" | "background_media" => "possible_distraction",
+            _ => continue,
+        };
+        let target_id = transition
+            .post_frame_id
+            .as_deref()
+            .or_else(|| transition.evidence_frame_ids.last().map(String::as_str));
+        let Some(target_id) = target_id else {
+            continue;
+        };
+        let Some(frame) = frames.iter().find(|frame| frame.frame_id == target_id) else {
+            continue;
+        };
+        push_storyboard_selection(
+            &mut selected,
+            &mut seen,
+            kind,
+            frame.clone(),
+            &transition.reason,
+        );
+    }
+    while selected.len() < max_keyframes {
+        let Some(frame) = frames.pop() else {
+            break;
+        };
+        push_storyboard_selection(
+            &mut selected,
+            &mut seen,
+            "resume_candidate",
+            frame,
+            "recent non-duplicate exported evidence",
+        );
+    }
+    selected.truncate(max_keyframes);
+    selected.sort_by_key(|(_, frame, _)| frame.captured_at_ms);
+
+    let keyframes = selected
+        .into_iter()
+        .map(|(kind, frame, reason)| StoryboardKeyframe {
+            frame_id: frame.frame_id,
+            kind,
+            captured_at_ms: frame.captured_at_ms,
+            app_name: frame.app_name,
+            app_bundle_id: frame.app_bundle_id,
+            window_name: frame.window_name,
+            browser_url: frame.browser_url,
+            document_path: frame.document_path,
+            app_context_id: frame.app_context_id,
+            app_context_object_type: frame.app_context_object_type,
+            image_path_safe: frame.image_path_safe,
+            active_window_crop_path_safe: frame.active_window_crop_path_safe,
+            top_content_units: frame.top_content_units,
+            text_source: frame.text_source,
+            evidence_strength: frame.evidence_strength,
+            selection_reason: reason,
+            privacy_status: frame.privacy_status,
+        })
+        .collect::<Vec<_>>();
+    let storyboard_transitions =
+        classify_storyboard_transitions(&bundle.frames, &bundle.transitions);
+    let dominant_surfaces = dominant_surfaces(&bundle.frames);
+    NativeStoryboardDossier {
+        generated_at_ms: bundle.generated_at_ms,
+        lookback_start_ms: bundle.lookback_start_ms,
+        lookback_end_ms: bundle.lookback_end_ms,
+        current_frame_id: keyframes.last().map(|frame| frame.frame_id.clone()),
+        keyframes,
+        transitions: storyboard_transitions,
+        dominant_surfaces,
+        warnings: bundle.warnings,
+    }
+}
+
+fn build_resume_card_from_storyboard(
+    dossier: NativeStoryboardDossier,
+    lookback_minutes: i64,
+) -> NativeResumeCard {
+    let current = dossier
+        .keyframes
+        .iter()
+        .rev()
+        .find(|frame| frame.kind == "current_frame")
+        .or_else(|| dossier.keyframes.last());
+    let reading = dossier
+        .keyframes
+        .iter()
+        .rev()
+        .find(|frame| {
+            frame.kind == "last_high_attention_reading_frame"
+                || frame
+                    .app_context_object_type
+                    .as_deref()
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "browser_tab" | "chat_conversation" | "pdf" | "notes_doc"
+                        )
+                    })
+        })
+        .or(current);
+    let classifier_target_id = resume_target_frame_id_from_transitions(&dossier);
+    let classifier_target = classifier_target_id
+        .as_deref()
+        .and_then(|id| dossier.keyframes.iter().find(|frame| frame.frame_id == id));
+    let continue_from = classifier_target
+        .or_else(|| {
+            dossier
+                .keyframes
+                .iter()
+                .rev()
+                .find(|frame| frame.kind == "return_to_previous_surface")
+        })
+        .or(reading)
+        .or(current);
+    let evidence_frame_ids = dossier
+        .keyframes
+        .iter()
+        .map(|frame| frame.frame_id.clone())
+        .collect::<Vec<_>>();
+    let evidence_transition_ids = dossier
+        .transitions
+        .iter()
+        .map(|transition| transition.id.clone())
+        .collect::<Vec<_>>();
+    let surface_names = dossier
+        .dominant_surfaces
+        .iter()
+        .take(3)
+        .map(|surface| surface.surface_key.clone())
+        .collect::<Vec<_>>();
+    let reading_quote = continue_from.and_then(best_quote_for_keyframe);
+    let title = continue_from.and_then(|frame| {
+        frame
+            .window_name
+            .clone()
+            .or_else(|| frame.browser_url.clone())
+            .or_else(|| frame.document_path.clone())
+    });
+    let what_was_i_reading = reading
+        .and_then(best_quote_for_keyframe)
+        .or_else(|| title.clone());
+    let what_was_i_doing = if let Some(frame) = current {
+        format!(
+            "You were working in {}{}.",
+            frame.app_name.as_deref().unwrap_or("the current app"),
+            frame
+                .window_name
+                .as_deref()
+                .map(|name| format!(" on {}", name))
+                .unwrap_or_default()
+        )
+    } else {
+        "There is not enough exported evidence to identify the current task.".to_string()
+    };
+    let focus_now = if let Some(frame) = continue_from {
+        format!(
+            "Continue from {}{}.",
+            frame
+                .app_name
+                .as_deref()
+                .unwrap_or("the strongest evidence frame"),
+            frame
+                .window_name
+                .as_deref()
+                .map(|name| format!(": {}", name))
+                .unwrap_or_default()
+        )
+    } else {
+        "Capture a fresh frame, then ask for a resume card again.".to_string()
+    };
+    let why_this_focus = if dossier.transitions.iter().any(|transition| {
+        transition.transition_type == "returning_to_previous_task"
+            || transition.transition_type == "verification_branch"
+    }) {
+        "The recent surfaces look like a branch followed by a return to a previous work surface."
+            .to_string()
+    } else if dossier.keyframes.len() >= 2 {
+        "This is the strongest recent surface with readable exported evidence.".to_string()
+    } else {
+        "The exported evidence is thin, so this cue stays conservative.".to_string()
+    };
+    let behavior_mode = infer_behavior_mode(&dossier);
+    let confidence = (dossier
+        .keyframes
+        .iter()
+        .map(|frame| frame.evidence_strength)
+        .sum::<f64>()
+        / dossier.keyframes.len().max(1) as f64)
+        .min(0.86);
+    NativeResumeCard {
+        generated_at_ms: now_millis(),
+        lookback_minutes,
+        what_was_i_doing,
+        what_was_i_reading,
+        focus_now,
+        why_this_focus,
+        continue_from: ResumeContinueFrom {
+            frame_id: continue_from.map(|frame| frame.frame_id.clone()),
+            app_name: continue_from.and_then(|frame| frame.app_name.clone()),
+            window_name: continue_from.and_then(|frame| frame.window_name.clone()),
+            title,
+            url: continue_from.and_then(|frame| frame.browser_url.clone()),
+            document_path: continue_from.and_then(|frame| frame.document_path.clone()),
+            quote: reading_quote,
+            reason: continue_from
+                .map(|frame| frame.selection_reason.clone())
+                .unwrap_or_else(|| "no safe keyframe available".to_string()),
+        },
+        what_changed: surface_names,
+        useful_evidence: dossier
+            .keyframes
+            .iter()
+            .take(6)
+            .map(|frame| format!("frame {}: {}", frame.frame_id, frame.selection_reason))
+            .collect(),
+        likely_distractions: likely_distractions(&dossier),
+        behavior_read: ResumeBehaviorRead {
+            mode: behavior_mode,
+            confidence,
+            notes: vec!["Inference is based on screen/app evidence, not mental state.".to_string()],
+        },
+        next_action:
+            "Resume from the cited frame and continue the last meaningful reading or writing step."
+                .to_string(),
+        confidence,
+        evidence_frame_ids,
+        evidence_transition_ids,
+        warnings: dossier.warnings,
+    }
+}
+
+fn resume_target_frame_id_from_transitions(dossier: &NativeStoryboardDossier) -> Option<String> {
+    if let Some(return_transition) = dossier
+        .transitions
+        .iter()
+        .find(|transition| transition.transition_type == "returning_to_previous_task")
+    {
+        return return_transition
+            .post_frame_id
+            .clone()
+            .or_else(|| return_transition.evidence_frame_ids.last().cloned());
+    }
+    if let Some(distraction) = dossier.transitions.iter().find(|transition| {
+        matches!(
+            transition.transition_type.as_str(),
+            "possible_distraction" | "background_media"
+        )
+    }) {
+        return distraction.pre_frame_id.clone();
+    }
+    None
+}
+
+fn query_frames_between(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    limit: u32,
+) -> Result<Vec<CaptureFrame>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}
+             FROM frames
+             WHERE captured_at >= ?1 AND captured_at <= ?2
+             ORDER BY captured_at DESC, id DESC
+             LIMIT ?3",
+            FRAME_COLUMNS
+        ))
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![start_ms, end_ms, limit], frame_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_transitions_between(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransitionSummary>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
+                    ts_start_ms, ts_end_ms, transition_type, confidence, summary
+             FROM event_transitions
+             WHERE ts_start_ms >= ?1 AND ts_start_ms <= ?2
+             ORDER BY ts_start_ms DESC
+             LIMIT 160",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![start_ms, end_ms], transition_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn frame_captured_at(conn: &Connection, frame_id: i64) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT captured_at FROM frames WHERE id = ?1",
+        params![frame_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn compact_content_units_for_ai(
+    content_units: &[ContentUnitSummary],
+    text_was_redacted: &mut bool,
+) -> Vec<CompactContentUnit> {
+    let mut units = content_units
+        .iter()
+        .filter(|unit| !is_low_signal_content_unit(unit))
+        .collect::<Vec<_>>();
+    units.sort_by(|left, right| {
+        content_role_priority(right)
+            .cmp(&content_role_priority(left))
+            .then_with(|| {
+                right
+                    .confidence
+                    .partial_cmp(&left.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    units
+        .into_iter()
+        .take(12)
+        .filter_map(|unit| {
+            let text = unit.text.as_deref()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let redacted = redact_text_for_ai(text);
+            if redacted != text {
+                *text_was_redacted = true;
+            }
+            non_empty(redacted).map(|text| CompactContentUnit {
+                id: unit.id.clone(),
+                source: unit.source.clone(),
+                unit_type: unit.unit_type.clone(),
+                semantic_role: unit.semantic_role.clone(),
+                text,
+                confidence: unit.confidence,
+            })
+        })
+        .collect()
+}
+
+fn is_low_signal_content_unit(unit: &ContentUnitSummary) -> bool {
+    let role = unit.semantic_role.as_deref().unwrap_or("").to_lowercase();
+    let unit_type = unit.unit_type.to_lowercase();
+    let text = unit.text.as_deref().unwrap_or("").trim();
+    text.len() < 3
+        || role.contains("browser_chrome")
+        || role.contains("toolbar")
+        || role.contains("system_menu")
+        || role.contains("sidebar")
+        || unit_type.contains("button")
+}
+
+fn content_role_priority(unit: &ContentUnitSummary) -> i32 {
+    match unit.semantic_role.as_deref().unwrap_or("") {
+        "main_content" => 80,
+        "chat_message" => 78,
+        "composer" => 74,
+        "code_editor" => 72,
+        "terminal_output" => 70,
+        "search_result" => 55,
+        "browser_chrome" | "toolbar" | "system_menu" | "app_sidebar" => 0,
+        _ => 40,
+    }
+}
+
+fn evidence_strength(
+    frame: &CaptureFrame,
+    content_units: &[ContentUnitSummary],
+    app_contexts: &[AppContextSummary],
+) -> f64 {
+    let mut score = 0.18_f64;
+    if Path::new(&frame.snapshot_path).exists() {
+        score += 0.18;
+    }
+    if frame
+        .full_text
+        .as_deref()
+        .is_some_and(|text| text.len() > 120)
+    {
+        score += 0.18;
+    }
+    if !content_units.is_empty() {
+        score += 0.24;
+    }
+    if !app_contexts.is_empty() {
+        score += 0.12;
+    }
+    if frame.browser_url.is_some() || frame.document_path.is_some() {
+        score += 0.1;
+    }
+    score.min(1.0)
+}
+
+fn apply_quality_adjustment(score: f64, warnings: &[FrameQualityWarning]) -> f64 {
+    let penalty = warnings
+        .iter()
+        .map(|warning| match warning.severity.as_str() {
+            "high" => 0.18,
+            "medium" => 0.1,
+            _ => 0.04,
+        })
+        .sum::<f64>()
+        .min(0.32);
+    (score - penalty).max(0.0)
+}
+
+fn redact_url_for_ai(value: Option<&str>, redacted_count: &mut usize) -> Option<String> {
+    value.and_then(|value| {
+        let mut redacted = redact_text_for_ai(value);
+        for needle in [
+            "checkout", "payment", "bank", "health", "medical", "login", "auth",
+        ] {
+            if redacted.to_lowercase().contains(needle) {
+                redacted = "[REDACTED_URL]".to_string();
+                *redacted_count += 1;
+                break;
+            }
+        }
+        non_empty(redacted)
+    })
+}
+
+fn redact_path_for_ai(value: Option<&str>, redacted_count: &mut usize) -> Option<String> {
+    value.and_then(|value| {
+        let redacted = redact_text_for_ai(value);
+        if redacted != value {
+            *redacted_count += 1;
+        }
+        non_empty(redacted)
+    })
+}
+
+fn redact_text_for_ai(input: &str) -> String {
+    let mut output = Vec::new();
+    for raw_token in input.split_whitespace() {
+        let token = raw_token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+        let lower = token.to_lowercase();
+        let replacement = if looks_like_email(token) {
+            Some("[REDACTED_EMAIL]")
+        } else if looks_like_phone(token) {
+            Some("[REDACTED_PHONE]")
+        } else if looks_like_long_number(token) {
+            Some("[REDACTED_NUMBER]")
+        } else if looks_like_secret(token, &lower) {
+            Some("[REDACTED_SECRET]")
+        } else if looks_like_sensitive_surface(&lower) {
+            Some("[REDACTED_SENSITIVE_SURFACE]")
+        } else {
+            None
+        };
+        output.push(replacement.unwrap_or(raw_token).to_string());
+    }
+    output.join(" ")
+}
+
+fn looks_like_email(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && domain.len() >= 4
+}
+
+fn looks_like_phone(token: &str) -> bool {
+    let digits = token.chars().filter(|char| char.is_ascii_digit()).count();
+    digits >= 10
+        && token
+            .chars()
+            .all(|char| char.is_ascii_digit() || "+-(). ".contains(char))
+}
+
+fn looks_like_long_number(token: &str) -> bool {
+    token.chars().filter(|char| char.is_ascii_digit()).count() >= 12
+}
+
+fn looks_like_secret(token: &str, lower: &str) -> bool {
+    lower.starts_with("sk-")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("bearer")
+        || (lower.contains("secret") && token.len() > 8)
+        || (token.len() >= 28
+            && token.chars().any(|char| char.is_ascii_uppercase())
+            && token.chars().any(|char| char.is_ascii_digit()))
+}
+
+fn looks_like_sensitive_surface(lower: &str) -> bool {
+    [
+        "password", "passcode", "banking", "checkout", "payment", "medical", "health",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn derive_safe_image_for_export(
+    export_dir: &Path,
+    frame_id: i64,
+    label: &str,
+    source: &str,
+    sensitive_regions: &[SensitiveRegionSummary],
+    warnings: &mut Vec<String>,
+) -> Result<Option<String>, String> {
+    if source.trim().is_empty() {
+        warnings.push(format!("{} image path missing", label));
+        return Ok(None);
+    }
+    let source_path = Path::new(source);
+    let safe_dir = export_dir.join("images");
+    fs::create_dir_all(&safe_dir).map_err(to_string)?;
+    let output_path = safe_dir.join(format!("frame-{:06}-safe_{}.png", frame_id, label));
+    let rects = mask_rects_for_export(sensitive_regions);
+    if source_path.exists()
+        && !rects.is_empty()
+        && mask_image_with_swift(&safe_dir, source_path, &output_path, &rects).is_ok()
+    {
+        return Ok(Some(output_path.to_string_lossy().to_string()));
+    }
+
+    if !source_path.exists() {
+        warnings.push(format!("source image for {} does not exist", label));
+    } else if rects.is_empty() {
+        warnings.push(format!(
+            "{} had no bounded sensitive regions; wrote fully redacted placeholder",
+            label
+        ));
+    } else {
+        warnings.push(format!(
+            "{} masking helper failed; wrote fully redacted placeholder",
+            label
+        ));
+    }
+    write_fully_redacted_png(&output_path)?;
+    warnings.push(format!(
+        "frame {} safe {} image is fully redacted",
+        frame_id, label
+    ));
+    Ok(Some(output_path.to_string_lossy().to_string()))
+}
+
+fn copy_safe_image_for_export(
+    export_dir: &Path,
+    frame_id: i64,
+    label: &str,
+    source: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<String>, String> {
+    if source.trim().is_empty() {
+        warnings.push(format!("{} image path missing", label));
+        return Ok(None);
+    }
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        warnings.push(format!("source image for {} does not exist", label));
+        return Ok(None);
+    }
+    let safe_dir = export_dir.join("images");
+    fs::create_dir_all(&safe_dir).map_err(to_string)?;
+    let output_path = safe_dir.join(format!("frame-{:06}-safe_{}.png", frame_id, label));
+    let extension = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension == "png" {
+        fs::copy(source_path, &output_path).map_err(to_string)?;
+    } else if convert_image_to_png(source_path, &output_path).is_err() {
+        write_fully_redacted_png(&output_path)?;
+        warnings.push(format!(
+            "{} safe image fully redacted because PNG conversion failed",
+            label
+        ));
+    }
+    Ok(Some(output_path.to_string_lossy().to_string()))
+}
+
+fn mask_rects_for_export(sensitive_regions: &[SensitiveRegionSummary]) -> Vec<Rect> {
+    sensitive_regions
+        .iter()
+        .filter_map(|region| {
+            Some(Rect {
+                x: region.bounds_x?,
+                y: region.bounds_y?,
+                w: region.bounds_w?,
+                h: region.bounds_h?,
+            })
+        })
+        .filter(|rect| rect.w > 0.0 && rect.h > 0.0)
+        .collect()
+}
+
+fn mask_image_with_swift(
+    helper_dir: &Path,
+    source_path: &Path,
+    output_path: &Path,
+    rects: &[Rect],
+) -> Result<(), String> {
+    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/swiftc").exists() {
+        return Err("image masking helper unavailable".to_string());
+    }
+    let helper =
+        ensure_export_swift_helper(helper_dir, "image_mask", IMAGE_MASK_SWIFT, &["AppKit"])?;
+    let rect_json = serde_json::to_string(rects).map_err(to_string)?;
+    let output = Command::new(helper)
+        .arg(source_path)
+        .arg(output_path)
+        .arg(rect_json)
+        .output()
+        .map_err(|error| format!("image mask helper failed to start: {}", error))?;
+    if output.status.success() && output_path.exists() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "image mask helper failed".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
+fn ensure_export_swift_helper(
+    helper_dir: &Path,
+    name: &str,
+    source: &str,
+    frameworks: &[&str],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(helper_dir).map_err(to_string)?;
+    let source_path = helper_dir.join(format!("{}.swift", name));
+    let helper_path = helper_dir.join(name);
+    let should_write = fs::read_to_string(&source_path)
+        .map(|existing| existing != source)
+        .unwrap_or(true);
+    if should_write {
+        fs::write(&source_path, source).map_err(to_string)?;
+        let _ = fs::remove_file(&helper_path);
+    }
+    if !helper_path.exists() {
+        let mut command = Command::new("/usr/bin/swiftc");
+        command.arg("-O").arg(&source_path);
+        for framework in frameworks {
+            command.arg("-framework").arg(framework);
+        }
+        command.arg("-o").arg(&helper_path);
+        let output = command
+            .output()
+            .map_err(|error| format!("swiftc failed: {}", error))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    }
+    Ok(helper_path)
+}
+
+fn write_fully_redacted_png(path: &Path) -> Result<(), String> {
+    const BLACK_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 96, 96, 96, 248, 15,
+        0, 1, 5, 1, 2, 154, 45, 66, 181, 0, 0, 0, 0, 73, 69, 68, 174, 66, 96, 130,
+    ];
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+    fs::write(path, BLACK_PNG).map_err(to_string)
+}
+
+fn push_storyboard_selection(
+    selected: &mut Vec<(String, SafeAiFrame, String)>,
+    seen: &mut HashSet<String>,
+    kind: &str,
+    frame: SafeAiFrame,
+    reason: &str,
+) {
+    if seen.insert(frame.frame_id.clone()) {
+        selected.push((kind.to_string(), frame, reason.to_string()));
+    }
+}
+
+fn surface_key_for_safe_frame(frame: &SafeAiFrame) -> String {
+    [
+        frame.app_bundle_id.as_deref(),
+        frame.app_name.as_deref(),
+        frame.browser_url.as_deref(),
+        frame.document_path.as_deref(),
+        frame.window_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .unwrap_or("unknown")
+    .to_lowercase()
+}
+
+fn classify_storyboard_transitions(
+    frames: &[SafeAiFrame],
+    transitions: &[TransitionSummary],
+) -> Vec<StoryboardTransition> {
+    classify_safe_episode_transitions(frames, transitions)
+        .into_iter()
+        .map(|transition| StoryboardTransition {
+            id: transition.id,
+            transition_type: transition.transition_type,
+            pre_frame_id: transition.pre_frame_id,
+            post_frame_id: transition.post_frame_id,
+            evidence_frame_ids: transition.evidence_frame_ids,
+            evidence_event_ids: transition.evidence_event_ids,
+            confidence: transition.confidence,
+            reason: transition.reason,
+        })
+        .collect()
+}
+
+fn classify_safe_episode_transitions(
+    frames: &[SafeAiFrame],
+    transitions: &[TransitionSummary],
+) -> Vec<ClassifiedTransition> {
+    let by_id = frames
+        .iter()
+        .map(|frame| (frame.frame_id.as_str(), frame))
+        .collect::<HashMap<_, _>>();
+    let chronological = sorted_safe_frames(frames);
+    let mut classified = transitions
+        .iter()
+        .take(80)
+        .map(|transition| {
+            let base = transition.transition_type.as_deref().unwrap_or("unknown");
+            let pre = transition
+                .pre_frame_id
+                .as_deref()
+                .and_then(|id| by_id.get(id).copied());
+            let post = transition
+                .post_frame_id
+                .as_deref()
+                .and_then(|id| by_id.get(id).copied());
+            let classified =
+                classify_transition_with_episode_context(base, pre, post, &chronological);
+            ClassifiedTransition {
+                id: transition.id.clone(),
+                transition_type: classified.transition_type,
+                pre_frame_id: transition.pre_frame_id.clone(),
+                post_frame_id: transition.post_frame_id.clone(),
+                return_score: classified.return_score,
+                evidence_frame_ids: evidence_frame_ids_for_transition(
+                    pre,
+                    post,
+                    classified.match_frame,
+                ),
+                evidence_event_ids: transition.primary_event_id.clone().into_iter().collect(),
+                confidence: classified.confidence,
+                reason: classified.reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    promote_verification_branches(&mut classified);
+    classified
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeClassification {
+    transition_type: String,
+    reason: String,
+    confidence: f64,
+    return_score: Option<f64>,
+    match_frame: Option<String>,
+}
+
+fn classify_transition_with_episode_context(
+    base: &str,
+    pre: Option<&SafeAiFrame>,
+    post: Option<&SafeAiFrame>,
+    chronological: &[&SafeAiFrame],
+) -> EpisodeClassification {
+    let Some(pre) = pre else {
+        return EpisodeClassification {
+            transition_type: base.to_string(),
+            reason: "missing pre-frame evidence".to_string(),
+            confidence: 0.35,
+            return_score: None,
+            match_frame: None,
+        };
+    };
+    let Some(post) = post else {
+        return EpisodeClassification {
+            transition_type: base.to_string(),
+            reason: "missing post-frame evidence".to_string(),
+            confidence: 0.35,
+            return_score: None,
+            match_frame: None,
+        };
+    };
+    if let Some((matched, score)) = best_return_match(post, chronological) {
+        if score >= 0.72 && has_intervening_different_surface(matched, post, chronological) {
+            return EpisodeClassification {
+                transition_type: "returning_to_previous_task".to_string(),
+                reason: format!(
+                    "return score {:.2} matched earlier frame {} after an intervening surface",
+                    score, matched.frame_id
+                ),
+                confidence: score.min(0.92),
+                return_score: Some(score),
+                match_frame: Some(matched.frame_id.clone()),
+            };
+        }
+    }
+    let same_surface = surface_key_for_safe_frame(pre) == surface_key_for_safe_frame(post);
+    let overlap = text_overlap_score(pre, post);
+    if same_surface && base.contains("scroll") {
+        EpisodeClassification {
+            transition_type: "continued_reading".to_string(),
+            reason: "same surface with scroll/focus movement".to_string(),
+            confidence: 0.68,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if base.contains("typing") {
+        EpisodeClassification {
+            transition_type: "entered_input".to_string(),
+            reason: "transition was linked to typing/input activity".to_string(),
+            confidence: 0.66,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if base.contains("clipboard") || base.contains("copy") {
+        EpisodeClassification {
+            transition_type: "copied_evidence".to_string(),
+            reason: "transition was linked to clipboard activity".to_string(),
+            confidence: 0.62,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if !same_surface && overlap >= 0.22 {
+        EpisodeClassification {
+            transition_type: "branching_for_research".to_string(),
+            reason: "surface changed but exported text shares terms".to_string(),
+            confidence: 0.62,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if same_surface {
+        EpisodeClassification {
+            transition_type: "continuing_same_task".to_string(),
+            reason: "same app/window/url surface".to_string(),
+            confidence: 0.58,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if is_media_surface(post) {
+        EpisodeClassification {
+            transition_type: "background_media".to_string(),
+            reason: "media-like destination surface".to_string(),
+            confidence: 0.56,
+            return_score: None,
+            match_frame: None,
+        }
+    } else if overlap < 0.06 {
+        EpisodeClassification {
+            transition_type: "possible_distraction".to_string(),
+            reason: "surface changed with low text overlap".to_string(),
+            confidence: 0.5,
+            return_score: None,
+            match_frame: None,
+        }
+    } else {
+        EpisodeClassification {
+            transition_type: base.to_string(),
+            reason: "kept original transition label with limited evidence".to_string(),
+            confidence: 0.42,
+            return_score: None,
+            match_frame: None,
+        }
+    }
+}
+
+fn evidence_frame_ids_for_transition(
+    pre: Option<&SafeAiFrame>,
+    post: Option<&SafeAiFrame>,
+    matched: Option<String>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [
+        pre.map(|frame| frame.frame_id.clone()),
+        post.map(|frame| frame.frame_id.clone()),
+        matched,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ids.iter().any(|existing| existing == &id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn promote_verification_branches(transitions: &mut [ClassifiedTransition]) {
+    for index in 0..transitions.len() {
+        if transitions[index].transition_type != "returning_to_previous_task" {
+            continue;
+        }
+        let returned_to = transitions[index]
+            .evidence_frame_ids
+            .last()
+            .cloned()
+            .or_else(|| transitions[index].post_frame_id.clone());
+        let Some(returned_to) = returned_to else {
+            continue;
+        };
+        for prior in transitions.iter_mut().skip(index + 1) {
+            if prior.transition_type == "branching_for_research"
+                && prior.pre_frame_id.as_deref() == Some(returned_to.as_str())
+            {
+                prior.transition_type = "verification_branch".to_string();
+                prior
+                    .reason
+                    .push_str("; later transition returned to the prior surface");
+                prior.confidence = prior.confidence.max(0.7);
+                break;
+            }
+        }
+    }
+}
+
+fn sorted_safe_frames(frames: &[SafeAiFrame]) -> Vec<&SafeAiFrame> {
+    let mut sorted = frames.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|frame| (frame.captured_at_ms, frame.frame_id.clone()));
+    sorted
+}
+
+fn best_return_match<'a>(
+    post: &SafeAiFrame,
+    chronological: &[&'a SafeAiFrame],
+) -> Option<(&'a SafeAiFrame, f64)> {
+    chronological
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.captured_at_ms < post.captured_at_ms)
+        .filter(|candidate| candidate.frame_id != post.frame_id)
+        .map(|candidate| (candidate, return_score(candidate, post)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn has_intervening_different_surface(
+    earlier: &SafeAiFrame,
+    post: &SafeAiFrame,
+    chronological: &[&SafeAiFrame],
+) -> bool {
+    let earlier_surface = surface_key_for_safe_frame(earlier);
+    chronological.iter().any(|candidate| {
+        candidate.captured_at_ms > earlier.captured_at_ms
+            && candidate.captured_at_ms < post.captured_at_ms
+            && surface_key_for_safe_frame(candidate) != earlier_surface
+    })
+}
+
+fn return_score(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    (0.25 * app_context_similarity(a, b))
+        + (0.20 * url_or_document_similarity(a, b))
+        + (0.20 * visible_text_anchor_similarity(a, b))
+        + (0.15 * text_overlap_score(a, b))
+        + (0.10 * phash_similarity(a, b))
+        + (0.10 * window_identity_similarity(a, b))
+}
+
+fn app_context_similarity(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    let same_object_type = a.app_context_object_type.is_some()
+        && a.app_context_object_type == b.app_context_object_type;
+    let same_app = a.app_bundle_id.is_some() && a.app_bundle_id == b.app_bundle_id;
+    match (same_object_type, same_app) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => 0.65,
+        _ => 0.0,
+    }
+}
+
+fn url_or_document_similarity(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    let a_target = a.browser_url.as_deref().or(a.document_path.as_deref());
+    let b_target = b.browser_url.as_deref().or(b.document_path.as_deref());
+    match (a_target, b_target) {
+        (Some(left), Some(right)) if left == right => 1.0,
+        (Some(left), Some(right))
+            if url_host(left) == url_host(right) && url_host(left).is_some() =>
+        {
+            0.65
+        }
+        (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
+            token_jaccard(left, right)
+        }
+        _ => 0.0,
+    }
+}
+
+fn visible_text_anchor_similarity(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    text_overlap_score(a, b)
+}
+
+fn phash_similarity(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    match (a.phash.as_deref(), b.phash.as_deref()) {
+        (Some(left), Some(right)) if left == right => 1.0,
+        (Some(left), Some(right)) => normalized_hex_similarity(left, right),
+        _ => 0.0,
+    }
+}
+
+fn window_identity_similarity(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    if a.window_id.is_some() && a.window_id == b.window_id {
+        1.0
+    } else if a.window_name.is_some() && a.window_name == b.window_name {
+        1.0
+    } else if a.app_name.is_some() && a.app_name == b.app_name {
+        0.45
+    } else {
+        0.0
+    }
+}
+
+fn normalized_hex_similarity(left: &str, right: &str) -> f64 {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let compared = left.len().min(right.len());
+    if compared == 0 {
+        return 0.0;
+    }
+    let equal = left
+        .chars()
+        .zip(right.chars())
+        .take(compared)
+        .filter(|(left, right)| left == right)
+        .count();
+    equal as f64 / left.len().max(right.len()) as f64
+}
+
+fn url_host(value: &str) -> Option<String> {
+    let after_scheme = value.split("://").nth(1).unwrap_or(value);
+    after_scheme
+        .split('/')
+        .next()
+        .map(str::to_lowercase)
+        .filter(|host| !host.is_empty())
+}
+
+fn token_jaccard(left: &str, right: &str) -> f64 {
+    let left_terms = text_terms(left);
+    let right_terms = text_terms(right);
+    if left_terms.is_empty() || right_terms.is_empty() {
+        return 0.0;
+    }
+    let overlap = left_terms.intersection(&right_terms).count();
+    let union = left_terms.union(&right_terms).count();
+    overlap as f64 / union.max(1) as f64
+}
+
+fn text_terms(value: &str) -> HashSet<String> {
+    value
+        .split(|char: char| !char.is_ascii_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| term.len() >= 4)
+        .collect()
+}
+
+fn text_overlap_score(a: &SafeAiFrame, b: &SafeAiFrame) -> f64 {
+    let a_terms = significant_terms(a);
+    let b_terms = significant_terms(b);
+    if a_terms.is_empty() || b_terms.is_empty() {
+        return 0.0;
+    }
+    let overlap = a_terms.intersection(&b_terms).count();
+    overlap as f64 / a_terms.len().min(b_terms.len()).max(1) as f64
+}
+
+fn significant_terms(frame: &SafeAiFrame) -> HashSet<String> {
+    let text = frame
+        .top_content_units
+        .iter()
+        .map(|unit| unit.text.as_str())
+        .chain(frame.text.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ");
+    text.split(|char: char| !char.is_ascii_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| term.len() >= 5)
+        .take(80)
+        .collect()
+}
+
+fn is_media_surface(frame: &SafeAiFrame) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        frame.app_name.as_deref().unwrap_or(""),
+        frame.window_name.as_deref().unwrap_or(""),
+        frame.browser_url.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    ["youtube", "spotify", "netflix", "music", "video", "podcast"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+}
+
+fn dominant_surfaces(frames: &[SafeAiFrame]) -> Vec<SurfaceSummary> {
+    let mut by_surface: HashMap<String, SurfaceSummary> = HashMap::new();
+    for frame in frames {
+        let key = surface_key_for_safe_frame(frame);
+        by_surface
+            .entry(key.clone())
+            .and_modify(|surface| {
+                surface.frame_count += 1;
+                surface.first_seen_ms = surface.first_seen_ms.min(frame.captured_at_ms);
+                surface.last_seen_ms = surface.last_seen_ms.max(frame.captured_at_ms);
+            })
+            .or_insert_with(|| SurfaceSummary {
+                surface_key: key,
+                app_name: frame.app_name.clone(),
+                window_name: frame.window_name.clone(),
+                url_or_document: frame.browser_url.clone().or(frame.document_path.clone()),
+                frame_count: 1,
+                first_seen_ms: frame.captured_at_ms,
+                last_seen_ms: frame.captured_at_ms,
+            });
+    }
+    let mut surfaces = by_surface.into_values().collect::<Vec<_>>();
+    surfaces.sort_by(|a, b| b.frame_count.cmp(&a.frame_count));
+    surfaces
+}
+
+fn best_quote_for_keyframe(frame: &StoryboardKeyframe) -> Option<String> {
+    frame
+        .top_content_units
+        .iter()
+        .find(|unit| unit.text.len() >= 30)
+        .map(|unit| truncate_chars(&unit.text, 220))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        let mut out = value
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        out.push_str("...");
+        out
+    }
+}
+
+fn infer_behavior_mode(dossier: &NativeStoryboardDossier) -> String {
+    if dossier
+        .transitions
+        .iter()
+        .any(|transition| transition.transition_type == "possible_distraction")
+    {
+        "switching".to_string()
+    } else if dossier
+        .keyframes
+        .iter()
+        .any(|frame| frame.kind == "last_typing_pause_or_commit")
+    {
+        "writing".to_string()
+    } else if dossier
+        .keyframes
+        .iter()
+        .any(|frame| frame.kind == "last_high_attention_reading_frame")
+    {
+        "focused_reading".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn likely_distractions(dossier: &NativeStoryboardDossier) -> Vec<String> {
+    dossier
+        .transitions
+        .iter()
+        .filter(|transition| transition.transition_type == "possible_distraction")
+        .map(|transition| transition.reason.clone())
+        .take(4)
+        .collect()
+}
+
+fn ensure_ai_export_audit_table(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ai_export_audit (
+          id TEXT PRIMARY KEY,
+          created_at_ms INTEGER NOT NULL,
+          export_type TEXT NOT NULL,
+          lookback_start_ms INTEGER,
+          lookback_end_ms INTEGER,
+          input_frame_count INTEGER NOT NULL,
+          exported_frame_count INTEGER NOT NULL,
+          excluded_frame_count INTEGER NOT NULL,
+          masked_image_count INTEGER NOT NULL,
+          redacted_text_count INTEGER NOT NULL,
+          warnings_json TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn ensure_frame_quality_warnings_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS frame_quality_warnings (
+          id TEXT PRIMARY KEY,
+          frame_id TEXT NOT NULL,
+          warning_type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          message TEXT NOT NULL,
+          evidence_json TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_frame_quality_warnings_frame
+          ON frame_quality_warnings(frame_id);
+        ",
+    )
+    .map_err(to_string)
+}
+
+fn insert_ai_export_audit(conn: &Connection, bundle: &SafeAiExportBundle) -> Result<(), String> {
+    ensure_ai_export_audit_table(conn)?;
+    let warnings_json = serde_json::to_string(&bundle.warnings).map_err(to_string)?;
+    conn.execute(
+        "INSERT INTO ai_export_audit (
+            id, created_at_ms, export_type, lookback_start_ms, lookback_end_ms,
+            input_frame_count, exported_frame_count, excluded_frame_count,
+            masked_image_count, redacted_text_count, warnings_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            bundle.id,
+            bundle.generated_at_ms,
+            bundle.export_type,
+            bundle.lookback_start_ms,
+            bundle.lookback_end_ms,
+            bundle.input_frame_count as i64,
+            bundle.exported_frame_count as i64,
+            bundle.excluded_frame_count as i64,
+            bundle.masked_image_count as i64,
+            bundle.redacted_text_count as i64,
+            warnings_json,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn run_resume_eval_case(app: &AppHandle, case: &Value) -> Result<ResumeEvalCaseReport, String> {
+    let human = case.get("human_label").unwrap_or(&Value::Null);
+    let model_output = match case.get("model_output") {
+        Some(value) if !value.is_null() && value != &serde_json::json!({}) => value.clone(),
+        _ => serde_json::to_value(get_native_resume_card(
+            app.clone(),
+            Some(NativeResumeInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id: None,
+            }),
+        )?)
+        .map_err(to_string)?,
+    };
+    let what_was_i_doing = model_output
+        .get("what_was_i_doing")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let what_was_i_reading = model_output
+        .get("what_was_i_reading")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let focus_now = model_output
+        .get("focus_now")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let why_this_focus = model_output
+        .get("why_this_focus")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let warnings_count = model_output
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let evidence_transition_ids = model_output
+        .get("evidence_transition_ids")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let unknown_transition_count = if evidence_transition_ids == 0 { 1 } else { 0 };
+    let model_all_text = serde_json::to_string(&model_output).map_err(to_string)?;
+    let must_not_say_ok = human
+        .get("must_not_say")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().filter_map(Value::as_str).all(|forbidden| {
+                !model_all_text
+                    .to_lowercase()
+                    .contains(&forbidden.to_lowercase())
+            })
+        })
+        .unwrap_or(true);
+    Ok(ResumeEvalCaseReport {
+        session_id: case
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        task_identification: label_score(human, "what_was_i_doing", what_was_i_doing),
+        reading_identification: label_score(human, "what_was_i_reading", what_was_i_reading),
+        resume_target: resume_target_score(human, &model_output),
+        why_explanation: label_score(human, "focus_now", focus_now).max(label_score(
+            human,
+            "why_explanation",
+            why_this_focus,
+        )),
+        distraction_handling: distraction_score(human, &model_output),
+        hallucination_control: if must_not_say_ok { 1.0 } else { 0.0 },
+        warnings_count,
+        unknown_transition_count,
+        redacted_frame_handling_ok: !model_all_text.contains("sk-")
+            && !model_all_text.contains("@example.com")
+            && !model_all_text.to_lowercase().contains("password"),
+    })
+}
+
+fn summarize_resume_eval_reports(cases: Vec<ResumeEvalCaseReport>) -> ResumeEvalReport {
+    let count = cases.len().max(1) as f64;
+    ResumeEvalReport {
+        evaluated_at_ms: now_millis(),
+        case_count: cases.len(),
+        average_task_identification_score: cases
+            .iter()
+            .map(|case| case.task_identification)
+            .sum::<f64>()
+            / count,
+        average_resume_target_score: cases.iter().map(|case| case.resume_target).sum::<f64>()
+            / count,
+        average_hallucination_control_score: cases
+            .iter()
+            .map(|case| case.hallucination_control)
+            .sum::<f64>()
+            / count,
+        warnings_frequency: cases.iter().filter(|case| case.warnings_count > 0).count() as f64
+            / count,
+        unknown_transition_frequency: cases
+            .iter()
+            .filter(|case| case.unknown_transition_count > 0)
+            .count() as f64
+            / count,
+        redacted_frame_handling_correctness: cases
+            .iter()
+            .filter(|case| case.redacted_frame_handling_ok)
+            .count() as f64
+            / count,
+        cases,
+    }
+}
+
+fn label_score(human: &Value, field: &str, actual: &str) -> f64 {
+    let expected = human.get(field).and_then(Value::as_str).unwrap_or("");
+    if expected.trim().is_empty() {
+        return 0.0;
+    }
+    token_jaccard(expected, actual)
+}
+
+fn resume_target_score(human: &Value, model_output: &Value) -> f64 {
+    let expected = human
+        .get("continue_from_frame_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if expected.trim().is_empty() {
+        return label_score(
+            human,
+            "focus_now",
+            model_output
+                .get("focus_now")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+    }
+    let actual = model_output
+        .get("continue_from")
+        .and_then(|value| value.get("frame_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if actual == expected {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn distraction_score(human: &Value, model_output: &Value) -> f64 {
+    let expected = human
+        .get("distractions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    if expected.trim().is_empty() {
+        return 1.0;
+    }
+    let actual = model_output
+        .get("likely_distractions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    token_jaccard(&expected, &actual)
 }
 
 fn capture_loop(
@@ -1312,14 +3604,15 @@ fn capture_loop(
     let mut previous_semantic_fingerprint: Option<SemanticFingerprint> = None;
     let mut pending_trigger: Option<PendingTrigger> = None;
     let mut typing_burst = TypingBurstState::default();
-    let mut event_source =
-        match capture_paths(&app).and_then(|paths| start_capture_event_source(&paths)) {
-            Ok(source) => Some(source),
-            Err(error) => {
-                update_error(&state, format!("event source unavailable: {}", error));
-                None
-            }
-        };
+    let mut event_source = match capture_paths(&app)
+        .and_then(|paths| start_capture_event_source(&paths))
+    {
+        Ok(source) => Some(source),
+        Err(error) => {
+            update_error_and_island(&app, &state, format!("event source unavailable: {}", error));
+            None
+        }
+    };
 
     if capture_and_emit(
         &app,
@@ -1350,12 +3643,12 @@ fn capture_loop(
                         &mut typing_burst,
                         &raw_trigger,
                     ) {
-                        update_error(&state, error);
+                        update_error_and_island(&app, &state, error);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    update_error(&state, "event source stopped".to_string());
+                    update_error_and_island(&app, &state, "event source stopped".to_string());
                     event_source = None;
                 }
             }
@@ -1372,7 +3665,7 @@ fn capture_loop(
                     &mut typing_burst,
                     &raw_trigger,
                 ) {
-                    update_error(&state, error);
+                    update_error_and_island(&app, &state, error);
                 }
             }
         }
@@ -1403,7 +3696,7 @@ fn capture_loop(
                     }
                     Err(error) => {
                         let _ = mark_capture_trigger_failed(&app, &trigger.id, &error);
-                        update_error(&state, error)
+                        update_error_and_island(&app, &state, error)
                     }
                 }
             }
@@ -1433,7 +3726,7 @@ fn capture_loop(
                         last_capture_at = Instant::now();
                     }
                 }
-                Err(error) => update_error(&state, error),
+                Err(error) => update_error_and_island(&app, &state, error),
             }
         }
     }
@@ -1505,6 +3798,12 @@ fn capture_and_emit(
     if let Some(frame) = outcome.frame {
         update_success(state, frame.clone());
         let _ = app.emit("capture-frame", frame);
+        if let Ok(status) = capture_status_snapshot_inner(app, state) {
+            crate::session_island::update_session_island_from_status(
+                &status,
+                crate::session_island::SessionIslandState::RecordingCompact,
+            );
+        }
         Ok(true)
     } else {
         update_skip(state);
@@ -2395,6 +4694,43 @@ fn capture_frame(
     )?;
     persist_sensitive_regions(&conn, frame_id, &context, &privacy)?;
     persist_presence_sample(&conn, session_id, &context)?;
+    let _ = validate_frame_consistency_inner(
+        &conn,
+        &CaptureFrame {
+            id: frame_id,
+            captured_at,
+            snapshot_path: snapshot_path.to_string_lossy().to_string(),
+            app_name: context.app_name.clone(),
+            window_name: context.window_name.clone(),
+            browser_url: context.browser_url.clone(),
+            document_path: context.document_path.clone(),
+            focused: true,
+            capture_trigger: capture_trigger.to_string(),
+            text_source: text_source.map(str::to_string),
+            accessibility_text: accessibility_text.clone(),
+            accessibility_tree_json: None,
+            full_text: full_text.clone(),
+            content_hash: content_hash.clone(),
+            image_hash: None,
+            capture_provider: Some(metadata.capture_provider.clone()),
+            scope: Some(metadata.scope.clone()),
+            display_id: metadata.display_id.clone(),
+            window_id: metadata.window_id,
+            app_pid: metadata.app_pid,
+            app_bundle_id: metadata.app_bundle_id.clone(),
+            screen_scale: Some(metadata.screen_scale),
+            pixel_width: metadata.pixel_width,
+            pixel_height: metadata.pixel_height,
+            full_screenshot_path: Some(metadata.full_screenshot_path.clone()),
+            active_window_crop_path: metadata.active_window_crop_path.clone(),
+            active_element_crop_path: metadata.active_element_crop_path.clone(),
+            phash: metadata.phash.clone(),
+            privacy_status: Some(metadata.privacy_status.clone()),
+            capture_trigger_id: capture_trigger_id.map(str::to_string),
+            previous_frame_id: previous_frame_id.map(str::to_string),
+            session_id: Some(session_id.to_string()),
+        },
+    );
     if let Some(previous) = previous_frame_id {
         persist_frame_diff(
             &conn,
@@ -2939,12 +5275,27 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
     let url = url.unwrap_or("").to_lowercase();
     if is_browser_app(&app) {
         if url.contains("chatgpt.com") || url.contains("chat.openai.com") {
-            return ("chat_adapter", "chat_conversation", 0.74);
+            return ("chatgpt_browser_adapter", "chat_conversation", 0.9);
         }
-        if url.contains("claude.ai") {
-            return ("chat_adapter", "chat_conversation", 0.74);
+        if url.contains("claude.ai") || url.contains("perplexity.ai") {
+            return ("ai_chat_browser_adapter", "chat_conversation", 0.86);
+        }
+        if url.contains("notion.so") || url.contains("notion.site") {
+            return ("notion_browser_adapter", "notes_doc", 0.86);
+        }
+        if url.contains("linear.app") {
+            return ("linear_browser_adapter", "notes_doc", 0.82);
+        }
+        if is_media_url(&url) {
+            return ("media_browser_adapter", "media", 0.86);
+        }
+        if url.ends_with(".pdf") || url.contains("/pdf") {
+            return ("pdf_browser_adapter", "pdf", 0.78);
         }
         return ("browser_adapter", "browser_tab", 0.82);
+    }
+    if app.contains("chatgpt") || app.contains("claude") || app.contains("perplexity") {
+        return ("native_chat_adapter", "chat_conversation", 0.86);
     }
     if app.contains("cursor")
         || app.contains("visual studio code")
@@ -2962,6 +5313,9 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
     }
     if app.contains("finder") {
         return ("finder_adapter", "finder", 0.7);
+    }
+    if app.contains("youtube") || app.contains("spotify") || app.contains("music") {
+        return ("media_app_adapter", "media", 0.8);
     }
     if app.contains("slack")
         || app.contains("discord")
@@ -2982,6 +5336,19 @@ fn is_browser_app(app: &str) -> bool {
     ]
     .iter()
     .any(|needle| app.contains(needle))
+}
+
+fn is_media_url(url: &str) -> bool {
+    [
+        "youtube.com",
+        "youtu.be",
+        "spotify.com",
+        "music.apple.com",
+        "netflix.com",
+        "twitch.tv",
+    ]
+    .iter()
+    .any(|needle| url.contains(needle))
 }
 
 fn unit_type_from_role(role: &str) -> &'static str {
@@ -3010,6 +5377,26 @@ fn unit_type_from_role(role: &str) -> &'static str {
 fn semantic_role_for_text(text: &str, role: &str) -> Option<String> {
     let lower = text.to_lowercase();
     let role = role.to_lowercase();
+    if role.contains("toolbar") || role.contains("menubar") || role.contains("menu") {
+        return Some("toolbar".to_string());
+    }
+    if lower.contains("address and search bar")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower == "back"
+        || lower == "forward"
+        || lower == "reload"
+        || lower == "new tab"
+    {
+        return Some("browser_chrome".to_string());
+    }
+    if lower.contains("history")
+        || lower.contains("settings")
+        || lower.contains("sidebar")
+        || lower.contains("workspace")
+    {
+        return Some("app_sidebar".to_string());
+    }
     if role.contains("textfield") || role.contains("text area") {
         return Some("composer".to_string());
     }
@@ -3024,12 +5411,15 @@ fn semantic_role_for_text(text: &str, role: &str) -> Option<String> {
         || lower.contains("let ")
         || lower.contains("class ")
     {
-        return Some("code".to_string());
+        return Some("code_editor".to_string());
+    }
+    if lower.contains("$ ") || lower.contains("error:") || lower.contains("warning:") {
+        return Some("terminal_output".to_string());
     }
     if lower.contains("assistant") || lower.contains("chatgpt") || lower.contains("claude") {
-        return Some("assistant_answer".to_string());
+        return Some("chat_message".to_string());
     }
-    None
+    Some("main_content".to_string())
 }
 
 fn node_text(node: &AccessibilityNode) -> String {
@@ -3776,6 +6166,186 @@ fn build_verification_signals(
         trust_label,
         trust_score,
     }
+}
+
+fn validate_frame_consistency_inner(
+    conn: &Connection,
+    frame: &CaptureFrame,
+) -> Result<FrameConsistencyReport, String> {
+    ensure_frame_quality_warnings_table(conn)?;
+    let frame_key = frame.id.to_string();
+    conn.execute(
+        "DELETE FROM frame_quality_warnings WHERE frame_id = ?1",
+        params![frame_key],
+    )
+    .map_err(to_string)?;
+
+    let app_contexts = query_app_contexts(conn, &frame.id.to_string())?;
+    let windows = query_windows_for_frame(conn, &frame.id.to_string()).unwrap_or_default();
+    let content_units =
+        query_content_units_for_frame(conn, &frame.id.to_string()).unwrap_or_default();
+    let mut warnings = Vec::new();
+    let text = frame.full_text.as_deref().unwrap_or("").to_lowercase();
+    let app_name = frame.app_name.as_deref().unwrap_or("").to_lowercase();
+    let window_name = frame.window_name.as_deref().unwrap_or("").to_lowercase();
+    let url = frame.browser_url.as_deref().unwrap_or("").to_lowercase();
+    let context_object = app_contexts
+        .first()
+        .map(|context| context.object_type.as_str());
+
+    if frame.active_window_crop_path.is_some() && frame.window_id.is_none() {
+        warnings.push(make_frame_quality_warning(
+            &frame_key,
+            "active_window_id_missing",
+            "medium",
+            "active-window crop exists but frame has no active window id",
+            serde_json::json!({ "active_window_crop_path": frame.active_window_crop_path }),
+        ));
+    }
+    if is_browser_app(&app_name) && frame.browser_url.is_none() {
+        warnings.push(make_frame_quality_warning(
+            &frame_key,
+            "browser_url_missing",
+            "medium",
+            "browser-like app did not provide a browser_url",
+            serde_json::json!({ "app_name": frame.app_name, "window_name": frame.window_name }),
+        ));
+    }
+    if let Some(active) = windows.iter().find(|window| window.is_active) {
+        let active_app = active.owner_name.as_deref().unwrap_or("").to_lowercase();
+        if !active_app.is_empty()
+            && !app_name.is_empty()
+            && !active_app.contains(&app_name)
+            && !app_name.contains(&active_app)
+        {
+            warnings.push(make_frame_quality_warning(
+                &frame_key,
+                "active_app_mismatch",
+                "high",
+                "window graph active app differs from frame app metadata",
+                serde_json::json!({ "frame_app": frame.app_name, "window_owner": active.owner_name }),
+            ));
+        }
+    }
+    if text.contains("chatgpt") && context_object == Some("unknown") {
+        warnings.push(make_frame_quality_warning(
+            &frame_key,
+            "chat_surface_unknown_adapter",
+            "medium",
+            "visible text suggests ChatGPT but app_context is unknown",
+            serde_json::json!({ "object_type": context_object }),
+        ));
+    }
+    if (url.contains("chatgpt") || window_name.contains("chatgpt"))
+        && context_object != Some("chat_conversation")
+    {
+        warnings.push(make_frame_quality_warning(
+            &frame_key,
+            "chat_adapter_mismatch",
+            "medium",
+            "metadata suggests a chat conversation but adapter did not classify it that way",
+            serde_json::json!({ "url": frame.browser_url, "window_name": frame.window_name, "object_type": context_object }),
+        ));
+    }
+    let chromeish_units = content_units
+        .iter()
+        .filter(|unit| {
+            unit.semantic_role.as_deref().is_some_and(|role| {
+                matches!(
+                    role,
+                    "browser_chrome" | "toolbar" | "app_sidebar" | "system_menu"
+                )
+            })
+        })
+        .count();
+    if !content_units.is_empty() && chromeish_units as f64 / content_units.len() as f64 > 0.55 {
+        warnings.push(make_frame_quality_warning(
+            &frame_key,
+            "browser_chrome_dominated_text",
+            "medium",
+            "frame text is dominated by browser/app chrome content units",
+            serde_json::json!({ "chromeish_units": chromeish_units, "content_units": content_units.len() }),
+        ));
+    }
+
+    for warning in &warnings {
+        conn.execute(
+            "INSERT OR REPLACE INTO frame_quality_warnings (
+                id, frame_id, warning_type, severity, message, evidence_json, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                warning.id,
+                warning.frame_id,
+                warning.warning_type,
+                warning.severity,
+                warning.message,
+                warning.evidence_json,
+                warning.created_at_ms,
+            ],
+        )
+        .map_err(to_string)?;
+    }
+    let adjustment = warnings
+        .iter()
+        .map(|warning| match warning.severity.as_str() {
+            "high" => 0.18,
+            "medium" => 0.1,
+            _ => 0.04,
+        })
+        .sum::<f64>()
+        .min(0.32);
+    Ok(FrameConsistencyReport {
+        frame_id: frame_key,
+        warnings,
+        confidence_adjustment: -adjustment,
+    })
+}
+
+fn make_frame_quality_warning(
+    frame_id: &str,
+    warning_type: &str,
+    severity: &str,
+    message: &str,
+    evidence: Value,
+) -> FrameQualityWarning {
+    FrameQualityWarning {
+        id: next_id("quality"),
+        frame_id: frame_id.to_string(),
+        warning_type: warning_type.to_string(),
+        severity: severity.to_string(),
+        message: message.to_string(),
+        evidence_json: evidence.to_string(),
+        created_at_ms: now_millis(),
+    }
+}
+
+fn query_frame_quality_warnings(
+    conn: &Connection,
+    frame_id: &str,
+) -> Result<Vec<FrameQualityWarning>, String> {
+    ensure_frame_quality_warnings_table(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, frame_id, warning_type, severity, message, evidence_json, created_at_ms
+             FROM frame_quality_warnings
+             WHERE frame_id = ?1
+             ORDER BY created_at_ms ASC, id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id], |row| {
+            Ok(FrameQualityWarning {
+                id: row.get(0)?,
+                frame_id: row.get(1)?,
+                warning_type: row.get(2)?,
+                severity: row.get(3)?,
+                message: row.get(4)?,
+                evidence_json: row.get(5)?,
+                created_at_ms: row.get(6)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
 
 fn frame_from_row(row: &Row<'_>) -> rusqlite::Result<CaptureFrame> {
@@ -4936,6 +7506,29 @@ fn sql_value_to_json(value: SqlValueRef<'_>) -> Value {
     }
 }
 
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("frame id number must be an integer"))
+            .map(Some),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => value
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("frame id string must contain an integer")),
+        _ => Err(serde::de::Error::custom(
+            "frame id must be null, an integer, or an integer string",
+        )),
+    }
+}
+
 fn ensure_db(app: &AppHandle) -> Result<(), String> {
     let conn = open_db(app)?;
     init_db(&conn)
@@ -4958,6 +7551,8 @@ fn clear_capture_db(conn: &Connection) -> Result<(), String> {
         DELETE FROM episode_nodes;
         DELETE FROM episodes;
         DELETE FROM embeddings;
+        DELETE FROM ai_export_audit;
+        DELETE FROM frame_quality_warnings;
         DELETE FROM sensitive_regions;
         DELETE FROM exclusion_rules;
         DELETE FROM presence_samples;
@@ -5404,6 +7999,32 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           confidence REAL,
           action_taken TEXT,
           metadata_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS frame_quality_warnings (
+          id TEXT PRIMARY KEY,
+          frame_id TEXT NOT NULL,
+          warning_type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          message TEXT NOT NULL,
+          evidence_json TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_frame_quality_warnings_frame
+          ON frame_quality_warnings(frame_id);
+
+        CREATE TABLE IF NOT EXISTS ai_export_audit (
+          id TEXT PRIMARY KEY,
+          created_at_ms INTEGER NOT NULL,
+          export_type TEXT NOT NULL,
+          lookback_start_ms INTEGER,
+          lookback_end_ms INTEGER,
+          input_frame_count INTEGER NOT NULL,
+          exported_frame_count INTEGER NOT NULL,
+          excluded_frame_count INTEGER NOT NULL,
+          masked_image_count INTEGER NOT NULL,
+          redacted_text_count INTEGER NOT NULL,
+          warnings_json TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS embeddings (
@@ -6361,6 +8982,16 @@ fn update_error(state: &Arc<Mutex<CaptureRuntime>>, error: String) {
     }
 }
 
+fn update_error_and_island(app: &AppHandle, state: &Arc<Mutex<CaptureRuntime>>, error: String) {
+    update_error(state, error);
+    if let Ok(status) = capture_status_snapshot_inner(app, state) {
+        crate::session_island::update_session_island_from_status(
+            &status,
+            crate::session_island::SessionIslandState::Error,
+        );
+    }
+}
+
 fn update_skip(state: &Arc<Mutex<CaptureRuntime>>) {
     if let Ok(mut runtime) = state.lock() {
         runtime.skipped_samples += 1;
@@ -6727,6 +9358,146 @@ mod tests {
         frame_id
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn insert_resume_test_frame(
+        conn: &Connection,
+        session_id: &str,
+        image_path: &str,
+        captured_at: i64,
+        app_name: &str,
+        bundle_id: &str,
+        window_name: &str,
+        browser_url: &str,
+        object_type: &str,
+        text: &str,
+        phash: &str,
+        previous_frame_id: Option<i64>,
+    ) -> i64 {
+        let trigger_id = format!("trigger-{}", captured_at);
+        conn.execute(
+            INSERT_FRAME_SQL,
+            params![
+                captured_at,
+                image_path,
+                Some(app_name),
+                Some(window_name),
+                Some(browser_url),
+                Option::<String>::None,
+                true,
+                "navigation",
+                "hybrid",
+                Some(text),
+                Some(r#"[{"role":"AXWindow","text":"resume"}]"#),
+                Some(text),
+                Some(stable_hash_bytes(text.as_bytes())),
+                Some(phash),
+                captured_at,
+                "screencapture_cli",
+                "active_window",
+                Some("main"),
+                Some(42_i64),
+                Some(123_i64),
+                Some(bundle_id),
+                1.0_f64,
+                Some(1_i64),
+                Some(1_i64),
+                image_path,
+                Option::<String>::None,
+                Option::<String>::None,
+                Some(phash),
+                "normal",
+                Some(trigger_id.clone()),
+                previous_frame_id.map(|id| id.to_string()),
+                Some(session_id),
+            ],
+        )
+        .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO content_units (
+                id, frame_id, source, unit_type, text, text_hash, semantic_role,
+                confidence, created_at_ms
+             ) VALUES (?1, ?2, 'test', 'paragraph', ?3, ?4, 'main_content', 0.92, ?5)",
+            params![
+                format!("unit-{}", frame_id),
+                frame_id.to_string(),
+                text,
+                stable_hash_bytes(text.as_bytes()),
+                captured_at,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_contexts (
+                id, frame_id, adapter_id, object_type, primary_id, title, url,
+                confidence, metadata_json
+             ) VALUES (?1, ?2, 'test_adapter', ?3, ?4, ?5, ?4, 0.95, '{}')",
+            params![
+                format!("ctx-{}", frame_id),
+                frame_id.to_string(),
+                object_type,
+                browser_url,
+                window_name,
+            ],
+        )
+        .unwrap();
+        frame_id
+    }
+
+    fn insert_resume_test_transition(
+        conn: &Connection,
+        session_id: &str,
+        id: &str,
+        pre_frame_id: i64,
+        post_frame_id: i64,
+        ts: i64,
+        transition_type: &str,
+    ) {
+        let event_id = format!("event-{}", id);
+        conn.execute(
+            "INSERT INTO ui_events (
+                id, session_id, ts_ms, event_type, app_name, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'click', 'test', ?3)",
+            params![event_id, session_id, ts],
+        )
+        .unwrap();
+        let trigger_id = format!("trigger-{}", id);
+        conn.execute(
+            "INSERT INTO capture_triggers (
+                id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                settle_delay_ms, dedupe_policy, pre_frame_id, post_frame_id, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'test', ?6, ?7, 'captured')",
+            params![
+                trigger_id,
+                session_id,
+                ts,
+                transition_type,
+                serde_json::json!([event_id.clone()]).to_string(),
+                pre_frame_id.to_string(),
+                post_frame_id.to_string(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event_transitions (
+                id, session_id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
+                ts_start_ms, ts_end_ms, transition_type, confidence, summary
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0.6, 'test transition')",
+            params![
+                id,
+                session_id,
+                format!("trigger-{}", id),
+                event_id,
+                pre_frame_id.to_string(),
+                post_frame_id.to_string(),
+                ts,
+                ts + 1,
+                transition_type,
+            ],
+        )
+        .unwrap();
+    }
+
     fn tiny_png() -> &'static [u8] {
         &[
             137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
@@ -6783,6 +9554,572 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
             .unwrap();
         assert_eq!(frames, 1);
+    }
+
+    #[test]
+    fn text_redaction_removes_common_secrets_and_contact_data() {
+        let redacted = redact_text_for_ai(
+            "email person@example.com with sk-abc123SECRET456 or call +1-415-555-1212",
+        );
+        assert!(redacted.contains("[REDACTED_EMAIL]"));
+        assert!(redacted.contains("[REDACTED_SECRET]"));
+        assert!(redacted.contains("[REDACTED_PHONE]"));
+        assert!(!redacted.contains("person@example.com"));
+        assert!(!redacted.contains("sk-abc123SECRET456"));
+    }
+
+    #[test]
+    fn safe_ai_export_excludes_never_send_frames_completely() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-safe-export-exclude-{}", now_millis()));
+        let image_path = output_root.join("source.png");
+        fs::create_dir_all(&output_root).unwrap();
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        conn.execute(
+            "INSERT INTO sensitive_regions (
+                id, frame_id, region_type, source, confidence, action_taken
+             ) VALUES ('region-never', ?1, 'api_key', 'test', 1.0, 'never_send_to_ai')",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+
+        let bundle = build_safe_ai_export_from_conn(
+            &conn,
+            &output_root,
+            SafeAiExportInput {
+                lookback_minutes: None,
+                range_ms: Some(1_000),
+                current_frame_id: Some(frame_id),
+                include_images: Some(true),
+                max_frames: Some(10),
+                export_type: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.input_frame_count, 1);
+        assert_eq!(bundle.exported_frame_count, 0);
+        assert_eq!(bundle.excluded_frame_count, 1);
+        assert!(bundle
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("never_send_to_ai")));
+        let audits: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_export_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audits, 1);
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn safe_ai_export_derives_safe_image_for_redacted_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-safe-export-mask-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        conn.execute(
+            "UPDATE frames SET privacy_status = 'redacted' WHERE id = ?1",
+            params![frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sensitive_regions (
+                id, frame_id, region_type, bounds_x, bounds_y, bounds_w, bounds_h,
+                source, confidence, action_taken
+             ) VALUES ('region-mask', ?1, 'password_field', 0.0, 0.0, 1.0, 1.0,
+                       'test', 1.0, 'store_redacted')",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+
+        let bundle = build_safe_ai_export_from_conn(
+            &conn,
+            &output_root,
+            SafeAiExportInput {
+                lookback_minutes: None,
+                range_ms: Some(1_000),
+                current_frame_id: Some(frame_id),
+                include_images: Some(true),
+                max_frames: Some(10),
+                export_type: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.exported_frame_count, 1);
+        assert_eq!(bundle.masked_image_count, 1);
+        let safe_path = bundle.frames[0].image_path_safe.as_ref().unwrap();
+        assert_ne!(safe_path, &image_path.to_string_lossy().to_string());
+        assert!(Path::new(safe_path).exists());
+        assert_eq!(bundle.frames[0].privacy_status, "redacted");
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn safe_ai_export_uses_derived_image_for_normal_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-safe-export-normal-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let bundle = build_safe_ai_export_from_conn(
+            &conn,
+            &output_root,
+            SafeAiExportInput {
+                lookback_minutes: None,
+                range_ms: Some(1_000),
+                current_frame_id: Some(frame_id),
+                include_images: Some(true),
+                max_frames: Some(10),
+                export_type: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        let safe_path = bundle.frames[0].image_path_safe.as_ref().unwrap();
+        assert_ne!(safe_path, &image_path.to_string_lossy().to_string());
+        assert!(safe_path.contains("ai-export"));
+        assert!(safe_path.ends_with("safe_full_screenshot.png"));
+        assert!(Path::new(safe_path).exists());
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn synthetic_twenty_minute_loop_produces_resume_card() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-resume-card-e2e-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let origin_text = "Smalltalk native resume engine return task detection transition graph. The user is refining the trustworthy resume cue and needs a branch-aware answer about where to continue.";
+        let branch_text = "Return task detection transition graph paper verification branch. This article supports using previous surface similarity and keyframes to identify resume targets.";
+        let returned_text = "Smalltalk native resume engine return task detection transition graph. Continue implementing the trustworthy resume cue from the native return classifier.";
+
+        let frame1 = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "ChatGPT",
+            "com.openai.chat",
+            "Smalltalk native resume engine",
+            "https://chatgpt.com/c/native-resume",
+            "chat_conversation",
+            origin_text,
+            "aaaabbbbcccc1111",
+            None,
+        );
+        let frame2 = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            6 * 60_000,
+            "Chrome",
+            "com.google.Chrome",
+            "Return task detection paper",
+            "https://example.com/return-task-detection",
+            "browser_tab",
+            branch_text,
+            "ffffeeee11112222",
+            Some(frame1),
+        );
+        let frame3 = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            12 * 60_000,
+            "ChatGPT",
+            "com.openai.chat",
+            "Smalltalk native resume engine",
+            "https://chatgpt.com/c/native-resume",
+            "chat_conversation",
+            returned_text,
+            "aaaabbbbcccc1111",
+            Some(frame2),
+        );
+        insert_resume_test_transition(
+            &conn,
+            &session.id,
+            "branch",
+            frame1,
+            frame2,
+            6 * 60_000,
+            "navigation",
+        );
+        insert_resume_test_transition(
+            &conn,
+            &session.id,
+            "return",
+            frame2,
+            frame3,
+            12 * 60_000,
+            "navigation",
+        );
+
+        let dossier = get_native_storyboard_dossier_from_conn(
+            &conn,
+            &output_root,
+            Some(NativeStoryboardInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id: Some(frame3),
+                include_images: Some(true),
+            }),
+        )
+        .unwrap();
+        let card = get_native_resume_card_from_conn(
+            &conn,
+            &output_root,
+            Some(NativeResumeInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id: Some(frame3),
+            }),
+        )
+        .unwrap();
+
+        assert!(dossier.keyframes.len() <= 12);
+        assert!(dossier
+            .transitions
+            .iter()
+            .any(|transition| transition.transition_type == "verification_branch"));
+        assert!(dossier
+            .transitions
+            .iter()
+            .any(|transition| transition.transition_type == "returning_to_previous_task"));
+        assert_eq!(card.continue_from.frame_id, Some(frame3.to_string()));
+        assert!(card.focus_now.contains("ChatGPT"));
+        assert!(card.what_was_i_doing.contains("ChatGPT"));
+        assert!(card
+            .what_was_i_reading
+            .as_deref()
+            .unwrap_or("")
+            .contains("resume"));
+        assert!(card.next_action.contains("Resume"));
+        assert!(card.evidence_frame_ids.contains(&frame1.to_string()));
+        assert!(card.evidence_frame_ids.contains(&frame3.to_string()));
+        assert!(card.evidence_transition_ids.contains(&"return".to_string()));
+        for keyframe in &dossier.keyframes {
+            if let Some(path) = keyframe.image_path_safe.as_deref() {
+                assert_ne!(path, image_path.to_string_lossy());
+                assert!(Path::new(path).exists());
+            }
+        }
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn live_capture_store_native_resume_card_smoke_when_env_set() {
+        let Ok(live_db_path) = std::env::var("SMALLTALK_LIVE_DB_PATH") else {
+            return;
+        };
+        let source = PathBuf::from(live_db_path);
+        if !source.exists() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smalltalk-live-card-{}", now_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let db_copy = root.join("smalltalk-capture.sqlite");
+        fs::copy(&source, &db_copy).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", source.to_string_lossy()));
+        if wal.exists() {
+            let _ = fs::copy(&wal, root.join("smalltalk-capture.sqlite-wal"));
+        }
+        let shm = PathBuf::from(format!("{}-shm", source.to_string_lossy()));
+        if shm.exists() {
+            let _ = fs::copy(&shm, root.join("smalltalk-capture.sqlite-shm"));
+        }
+
+        let conn = Connection::open(&db_copy).unwrap();
+        init_db(&conn).unwrap();
+        let latest_frame_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM frames ORDER BY captured_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let Some(latest_frame_id) = latest_frame_id else {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        };
+
+        let card = get_native_resume_card_from_conn(
+            &conn,
+            &root.join("safe-ai-exports"),
+            Some(NativeResumeInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id: Some(latest_frame_id),
+            }),
+        )
+        .unwrap();
+
+        assert!(!card.what_was_i_doing.trim().is_empty());
+        assert!(!card.focus_now.trim().is_empty());
+        assert!(!card.next_action.trim().is_empty());
+        assert!(!card.evidence_frame_ids.is_empty());
+        assert!(card.confidence >= 0.0 && card.confidence <= 1.0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn safe_frame_for_transition(
+        id: &str,
+        ts: i64,
+        app: &str,
+        url: &str,
+        text: &str,
+    ) -> SafeAiFrame {
+        SafeAiFrame {
+            frame_id: id.to_string(),
+            captured_at_ms: ts,
+            app_name: Some(app.to_string()),
+            app_bundle_id: Some(format!("com.example.{}", sanitize_id(app))),
+            window_name: Some(app.to_string()),
+            window_id: Some(42),
+            browser_url: Some(url.to_string()),
+            document_path: None,
+            phash: Some(format!("phash-{}", sanitize_id(url))),
+            app_context_id: Some(format!("ctx-{}", id)),
+            app_context_object_type: Some("chat_conversation".to_string()),
+            image_path_safe: None,
+            active_window_crop_path_safe: None,
+            top_content_units: vec![CompactContentUnit {
+                id: format!("unit-{}", id),
+                source: "test".to_string(),
+                unit_type: "text".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: text.to_string(),
+                confidence: Some(0.9),
+            }],
+            text_source: Some("hybrid".to_string()),
+            text: Some(text.to_string()),
+            evidence_strength: 0.8,
+            privacy_status: "normal".to_string(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn transition_for_test(
+        id: &str,
+        pre: &str,
+        post: &str,
+        ts: i64,
+        base_type: &str,
+    ) -> TransitionSummary {
+        TransitionSummary {
+            id: id.to_string(),
+            trigger_id: format!("trigger-{}", id),
+            primary_event_id: Some(format!("event-{}", id)),
+            pre_frame_id: Some(pre.to_string()),
+            post_frame_id: Some(post.to_string()),
+            ts_start_ms: ts,
+            ts_end_ms: ts + 1,
+            transition_type: Some(base_type.to_string()),
+            confidence: Some(0.5),
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn classifier_marks_research_branch_then_return_to_previous_task() {
+        let frames = vec![
+            safe_frame_for_transition(
+                "1",
+                100,
+                "ChatGPT",
+                "https://chatgpt.com/c/native-resume",
+                "native resume engine return task detection transition graph",
+            ),
+            safe_frame_for_transition(
+                "2",
+                200,
+                "Chrome",
+                "https://example.com/paper",
+                "return task detection transition graph paper verification",
+            ),
+            safe_frame_for_transition(
+                "3",
+                300,
+                "ChatGPT",
+                "https://chatgpt.com/c/native-resume",
+                "native resume engine return task detection transition graph",
+            ),
+        ];
+        let transitions = vec![
+            transition_for_test("t2", "2", "3", 300, "navigation"),
+            transition_for_test("t1", "1", "2", 200, "navigation"),
+        ];
+
+        let classified = classify_safe_episode_transitions(&frames, &transitions);
+
+        assert_eq!(classified[0].transition_type, "returning_to_previous_task");
+        assert_eq!(classified[1].transition_type, "verification_branch");
+        assert!(classified[0].return_score.unwrap() >= 0.72);
+        assert!(classified[0].evidence_frame_ids.contains(&"1".to_string()));
+        assert!(classified[0]
+            .evidence_event_ids
+            .contains(&"event-t2".to_string()));
+    }
+
+    #[test]
+    fn classifier_marks_unrelated_media_as_background_media() {
+        let frames = vec![
+            safe_frame_for_transition(
+                "1",
+                100,
+                "ChatGPT",
+                "https://chatgpt.com/c/native-resume",
+                "native resume engine transition graph",
+            ),
+            safe_frame_for_transition(
+                "2",
+                200,
+                "Chrome",
+                "https://youtube.com/watch?v=test",
+                "playlist music video",
+            ),
+        ];
+        let transitions = vec![transition_for_test("t1", "1", "2", 200, "navigation")];
+
+        let classified = classify_safe_episode_transitions(&frames, &transitions);
+
+        assert_eq!(classified[0].transition_type, "background_media");
+    }
+
+    #[test]
+    fn phash_similarity_contributes_to_return_score() {
+        let mut first = safe_frame_for_transition(
+            "1",
+            100,
+            "Chrome",
+            "https://example.com/a",
+            "shared visible task anchors",
+        );
+        let mut second = safe_frame_for_transition(
+            "2",
+            200,
+            "Chrome",
+            "https://example.com/b",
+            "shared visible task anchors",
+        );
+        first.phash = Some("abcdef123456".to_string());
+        second.phash = Some("abcdef123456".to_string());
+
+        assert_eq!(phash_similarity(&first, &second), 1.0);
+        assert!(return_score(&first, &second) > 0.1);
+    }
+
+    #[test]
+    fn native_inputs_accept_string_or_numeric_current_frame_id() {
+        let from_string: NativeResumeInput =
+            serde_json::from_value(serde_json::json!({ "current_frame_id": "42" })).unwrap();
+        let from_number: NativeResumeInput =
+            serde_json::from_value(serde_json::json!({ "current_frame_id": 43 })).unwrap();
+
+        assert_eq!(from_string.current_frame_id, Some(42));
+        assert_eq!(from_number.current_frame_id, Some(43));
+    }
+
+    #[test]
+    fn app_context_adapters_classify_common_resume_surfaces() {
+        assert_eq!(
+            classify_app_context("Google Chrome", Some("https://chatgpt.com/c/abc")).1,
+            "chat_conversation"
+        );
+        assert_eq!(
+            classify_app_context("Arc", Some("https://www.notion.so/page")).1,
+            "notes_doc"
+        );
+        assert_eq!(
+            classify_app_context("Safari", Some("https://youtube.com/watch?v=1")).1,
+            "media"
+        );
+        assert_eq!(classify_app_context("Cursor", None).1, "code_editor");
+        assert_eq!(classify_app_context("Warp", None).1, "terminal");
+    }
+
+    #[test]
+    fn frame_consistency_warning_persists_for_browser_without_url() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            INSERT_FRAME_SQL,
+            params![
+                1_i64,
+                "/tmp/smalltalk-frame.jpg",
+                Some("Google Chrome"),
+                Some("Untitled"),
+                Option::<String>::None,
+                Option::<String>::None,
+                true,
+                "manual",
+                "accessibility",
+                Some("visible text"),
+                Option::<String>::None,
+                Some("visible text searchable"),
+                Some("content-hash"),
+                Some("image-hash"),
+                1_i64,
+                "screencapture_cli",
+                "active_display",
+                Some("main"),
+                Option::<i64>::None,
+                Some(123_i64),
+                Some("com.google.Chrome"),
+                1.0_f64,
+                Some(1440_i64),
+                Some(900_i64),
+                "/tmp/smalltalk-frame.jpg",
+                Option::<String>::None,
+                Option::<String>::None,
+                Some("phash"),
+                "normal",
+                Some("trigger-1"),
+                Option::<String>::None,
+                Some("session-1"),
+            ],
+        )
+        .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        let frame = conn
+            .query_row(
+                &format!("SELECT {} FROM frames WHERE id = ?1", FRAME_COLUMNS),
+                params![frame_id],
+                frame_from_row,
+            )
+            .unwrap();
+        let report = validate_frame_consistency_inner(&conn, &frame).unwrap();
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.warning_type == "browser_url_missing"));
+        let persisted = query_frame_quality_warnings(&conn, &frame_id.to_string()).unwrap();
+        assert_eq!(persisted.len(), report.warnings.len());
     }
 
     #[test]
