@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::capture::CaptureStatus;
+use crate::capture::{CaptureStatus, NativeResumeInput};
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static EXPANDED: AtomicBool = AtomicBool::new(false);
@@ -18,11 +18,20 @@ pub struct SessionIslandSnapshot {
     pub session_id: Option<String>,
     pub elapsed_ms: u64,
     pub frame_count: u64,
+    pub trail_app_count: u64,
+    pub trail_moment_count: u64,
+    pub trail_labels: Vec<String>,
+    pub last_frame_id: Option<i64>,
     pub current_app: Option<String>,
     pub current_window: Option<String>,
     pub current_surface_kind: Option<String>,
     pub last_trigger: Option<String>,
+    pub last_capture_at_ms: Option<i64>,
+    pub capture_pulse_nonce: Option<u64>,
     pub last_error: Option<String>,
+    pub resume_headline: Option<String>,
+    pub resume_detail: Option<String>,
+    pub resume_point: Option<String>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
 }
@@ -38,6 +47,8 @@ pub enum SessionIslandState {
     RecordingExpanded,
     Processing,
     StoppedToast,
+    TrailReconstructing,
+    ResumeReady,
     Error,
 }
 
@@ -52,6 +63,9 @@ enum SessionIslandActionKind {
     StartCapture,
     StopCapture,
     CaptureOnce,
+    ReconstructTrail,
+    ShowTrail,
+    OpenResumePoint,
     OpenMainWindow,
     ResumeMe,
     ToggleExpanded,
@@ -65,11 +79,20 @@ impl SessionIslandSnapshot {
             session_id: None,
             elapsed_ms: 0,
             frame_count: 0,
+            trail_app_count: 0,
+            trail_moment_count: 0,
+            trail_labels: Vec::new(),
+            last_frame_id: None,
             current_app: None,
             current_window: None,
             current_surface_kind: None,
             last_trigger: None,
+            last_capture_at_ms: None,
+            capture_pulse_nonce: None,
             last_error: None,
+            resume_headline: None,
+            resume_detail: None,
+            resume_point: None,
             privacy_label: None,
             is_sensitive: false,
         }
@@ -131,6 +154,7 @@ pub fn update_session_island(snapshot: SessionIslandSnapshot) {
         SessionIslandState::Hidden
             | SessionIslandState::Starting
             | SessionIslandState::Processing
+            | SessionIslandState::TrailReconstructing
             | SessionIslandState::StoppedToast
     ) {
         EXPANDED.store(false, Ordering::Relaxed);
@@ -254,6 +278,10 @@ fn snapshot_from_status(
         session_id,
         elapsed_ms,
         frame_count: status.frame_count.max(0) as u64,
+        trail_app_count: status.recent_app_labels.len() as u64,
+        trail_moment_count: status.frame_count.max(0) as u64,
+        trail_labels: status.recent_app_labels.clone(),
+        last_frame_id: frame.map(|frame| frame.id),
         current_app: if is_sensitive {
             None
         } else {
@@ -272,7 +300,14 @@ fn snapshot_from_status(
                 .and_then(|value| clean_one_line(Some(value)))
         }),
         last_trigger: frame.and_then(|frame| clean_one_line(Some(&frame.capture_trigger))),
+        last_capture_at_ms: frame.map(|frame| frame.captured_at),
+        capture_pulse_nonce: frame
+            .map(|frame| frame.id.max(0) as u64)
+            .filter(|nonce| *nonce > 0),
         last_error: status.last_error.clone(),
+        resume_headline: None,
+        resume_detail: None,
+        resume_point: None,
         privacy_label,
         is_sensitive,
     }
@@ -315,15 +350,83 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
         SessionIslandActionKind::StartCapture => start_capture_from_island(),
         SessionIslandActionKind::StopCapture => stop_capture_from_island(),
         SessionIslandActionKind::CaptureOnce => capture_once_from_island(),
+        SessionIslandActionKind::ReconstructTrail => reconstruct_trail_from_island(),
+        SessionIslandActionKind::ShowTrail => open_main_window(),
+        SessionIslandActionKind::OpenResumePoint => open_resume_point_from_island(),
         SessionIslandActionKind::OpenMainWindow => open_main_window(),
-        SessionIslandActionKind::ResumeMe => {
-            open_main_window();
-            if let Some(app) = APP_HANDLE.get() {
-                let _ = app.emit("session-island-resume-requested", serde_json::json!({}));
-            }
-        }
+        SessionIslandActionKind::ResumeMe => open_resume_point_from_island(),
         SessionIslandActionKind::ToggleExpanded => toggle_expanded_from_native(),
         SessionIslandActionKind::Collapse => set_session_island_expanded(false),
+    }
+}
+
+fn reconstruct_trail_from_island() {
+    let Some(app) = APP_HANDLE.get().cloned() else {
+        eprintln!("[session_island] reconstruct requested before AppHandle was ready");
+        return;
+    };
+
+    let state = app.state::<crate::capture::CaptureState>();
+    match crate::capture::capture_status(app.clone(), state) {
+        Ok(status) => {
+            update_session_island_from_status(&status, SessionIslandState::TrailReconstructing);
+            show_session_island();
+        }
+        Err(error) => update_session_island(SessionIslandSnapshot::error(error)),
+    }
+
+    thread::spawn(move || {
+        let state = app.state::<crate::capture::CaptureState>();
+        let status = match crate::capture::capture_status(app.clone(), state) {
+            Ok(status) => status,
+            Err(error) => {
+                update_session_island(SessionIslandSnapshot::error(error));
+                return;
+            }
+        };
+        let current_frame_id = status.latest_frame.as_ref().map(|frame| frame.id);
+        match crate::capture::get_native_resume_card(
+            app.clone(),
+            Some(NativeResumeInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id,
+            }),
+        ) {
+            Ok(card) => {
+                let state = app.state::<crate::capture::CaptureState>();
+                let next_status = crate::capture::capture_status(app.clone(), state).unwrap_or(status);
+                let mut snapshot = snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
+                snapshot.resume_headline = clean_one_line(Some(&card.focus_now));
+                snapshot.resume_detail = clean_one_line(Some(&card.what_was_i_doing));
+                snapshot.resume_point = resume_point_label(&card);
+                update_session_island(snapshot);
+                show_session_island();
+            }
+            Err(error) => {
+                eprintln!("[session_island] reconstruct_trail failed: {}", error);
+                update_session_island(SessionIslandSnapshot::error(error));
+            }
+        }
+    });
+}
+
+fn resume_point_label(card: &crate::capture::NativeResumeCard) -> Option<String> {
+    clean_one_line(
+        card.continue_from
+            .title
+            .as_deref()
+            .or(card.continue_from.window_name.as_deref())
+            .or(card.continue_from.app_name.as_deref())
+            .or(card.continue_from.url.as_deref())
+            .or(card.continue_from.document_path.as_deref()),
+    )
+}
+
+fn open_resume_point_from_island() {
+    open_main_window();
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit("session-island-resume-requested", serde_json::json!({}));
     }
 }
 

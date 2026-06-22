@@ -260,6 +260,7 @@ struct CaptureRuntime {
 pub struct CaptureStatus {
     pub running: bool,
     pub frame_count: i64,
+    pub recent_app_labels: Vec<String>,
     pub event_count: i64,
     pub transition_count: i64,
     pub content_unit_count: i64,
@@ -5610,10 +5611,15 @@ fn capture_status_snapshot_inner(
         .ok()
         .flatten()
     });
+    let recent_app_labels = conn
+        .as_ref()
+        .and_then(|conn| recent_app_labels(conn, scoped_session_id).ok())
+        .unwrap_or_default();
 
     Ok(CaptureStatus {
         running,
         frame_count: counts.frames,
+        recent_app_labels,
         event_count: counts.events,
         transition_count: counts.transitions,
         content_unit_count: counts.content_units,
@@ -5634,6 +5640,44 @@ fn capture_status_snapshot_inner(
             || Path::new("/usr/bin/swift").exists()
             || command_in_path("tesseract"),
     })
+}
+
+fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT app_name
+             FROM frames
+             WHERE (?1 IS NULL OR session_id = ?1)
+               AND app_name IS NOT NULL
+               AND TRIM(app_name) != ''
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 24",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .map_err(to_string)?;
+    let mut newest_first = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        let label = clean_label(&row.map_err(to_string)?);
+        if label.is_empty() {
+            continue;
+        }
+        let key = label.to_lowercase();
+        if seen.insert(key) {
+            newest_first.push(label);
+        }
+        if newest_first.len() >= 5 {
+            break;
+        }
+    }
+    newest_first.reverse();
+    Ok(newest_first)
+}
+
+fn clean_label(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn latest_frames(

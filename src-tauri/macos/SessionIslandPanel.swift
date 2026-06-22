@@ -10,13 +10,33 @@ private struct IslandSnapshot: Decodable {
     var state: String = "hidden"
     var elapsedMs: Int64 = 0
     var frameCount: Int64 = 0
+    var trailAppCount: Int64?
+    var trailMomentCount: Int64?
+    var trailLabels: [String]?
+    var lastFrameId: Int64?
+    var lastTrigger: String?
+    var lastCaptureAtMs: Int64?
+    var capturePulseNonce: UInt64?
     var lastError: String?
+    var resumeHeadline: String?
+    var resumeDetail: String?
+    var resumePoint: String?
 
     enum CodingKeys: String, CodingKey {
         case state
         case elapsedMs = "elapsed_ms"
         case frameCount = "frame_count"
+        case trailAppCount = "trail_app_count"
+        case trailMomentCount = "trail_moment_count"
+        case trailLabels = "trail_labels"
+        case lastFrameId = "last_frame_id"
+        case lastTrigger = "last_trigger"
+        case lastCaptureAtMs = "last_capture_at_ms"
+        case capturePulseNonce = "capture_pulse_nonce"
         case lastError = "last_error"
+        case resumeHeadline = "resume_headline"
+        case resumeDetail = "resume_detail"
+        case resumePoint = "resume_point"
     }
 }
 
@@ -27,6 +47,10 @@ private struct OverlayMetrics {
 }
 
 private enum Brand {
+    static func swiftUIFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        Font.system(size: size, weight: weight, design: .default)
+    }
+
     static func swiftUIMonoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         let name: String
         switch weight {
@@ -41,6 +65,82 @@ private enum Brand {
             return Font.custom(name, fixedSize: size)
         }
         return Font.system(size: size, weight: weight, design: .monospaced)
+    }
+}
+
+private enum IslandMotion {
+    static func quick(_ reduceMotion: Bool) -> Animation {
+        .timingCurve(0.25, 1, 0.5, 1, duration: reduceMotion ? 0.01 : 0.14)
+    }
+
+    static func settle(_ reduceMotion: Bool) -> Animation {
+        .timingCurve(0.20, 0.88, 0.20, 1, duration: reduceMotion ? 0.01 : 0.26)
+    }
+
+    static func reveal(_ reduceMotion: Bool) -> Animation {
+        .timingCurve(0.18, 0.92, 0.18, 1, duration: reduceMotion ? 0.01 : 0.34)
+    }
+
+    static func panelTimingFunction() -> CAMediaTimingFunction {
+        CAMediaTimingFunction(controlPoints: 0.18, 0.92, 0.18, 1.0)
+    }
+
+    static func microTransition(_ reduceMotion: Bool) -> AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.74, blur: 6, y: -3),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            ),
+            removal: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.82, blur: 7, y: 2),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            )
+        )
+    }
+
+    static func compactTransition(_ reduceMotion: Bool) -> AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.72, blur: 8, y: 4),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            ),
+            removal: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.92, blur: 6, y: -2),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            )
+        )
+    }
+
+    static func expandedTransition(_ reduceMotion: Bool) -> AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.88, blur: 8, y: -5),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            ),
+            removal: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: 0.96, blur: 5, y: 3),
+                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
+            )
+        )
+    }
+}
+
+@available(macOS 13.0, *)
+private struct IslandMorphModifier: ViewModifier {
+    let opacity: Double
+    let scale: CGFloat
+    let blur: CGFloat
+    let y: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(opacity)
+            .scaleEffect(scale, anchor: .top)
+            .blur(radius: blur)
+            .offset(y: y)
     }
 }
 
@@ -67,55 +167,259 @@ private final class AnimationTick: ObservableObject {
 }
 
 @available(macOS 13.0, *)
-private struct ScreenMatrixView: View {
+private struct EvidenceTapeView: View {
     let active: Bool
-    let captureFps: Double
+    let processing: Bool
+    let error: Bool
+    let frameCount: Int64
+    let pulseNonce: UInt64?
+    let density: Double
+    let scale: CGFloat
+    let width: CGFloat
+    let height: CGFloat
+    let cornerRadius: CGFloat
+    let compact: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var anim = AnimationTick.shared
+    @State private var lastPulseNonce: UInt64?
+    @State private var pulseStartedAt: Double?
 
     var body: some View {
-        Canvas { context, size in
-            let tick = anim.value
-            let fill = active ? min(1, captureFps / 2.0) : 0.0
-            let speed = active ? 0.003 + fill * 0.007 : 0.001
-            let sweepX = fmod(tick * speed * 60, 1.0) * size.width
+        let shape = RoundedRectangle(cornerRadius: cornerRadius * scale, style: .continuous)
+        let pulseAge = pulseStartedAt.map { max(0, anim.value - $0) } ?? 999
+        let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.46)
+        let pulseStrength = max(0, 1 - pulseProgress)
+        let heat = active ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
 
-            let capturedAlpha = active ? 0.06 + fill * 0.06 : 0.02
-            context.fill(
-                Path(CGRect(x: 0, y: 0, width: sweepX, height: size.height)),
-                with: .color(.white.opacity(capturedAlpha))
-            )
-            context.fill(
-                Path(CGRect(x: sweepX, y: 0, width: size.width - sweepX, height: size.height)),
-                with: .color(.white.opacity(0.015))
-            )
-            let barAlpha = active ? 0.5 + fill * 0.2 : 0.08
-            context.fill(
-                Path(CGRect(x: round(sweepX), y: 0, width: 1, height: size.height)),
-                with: .color(.white.opacity(barAlpha))
-            )
-            for index in 1..<5 {
-                let y = round(Double(index) * size.height / 5.0)
-                context.fill(
-                    Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                    with: .color(.black.opacity(0.35))
-                )
-            }
+        Canvas { context, size in
+            drawTape(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
         }
+        .frame(width: width * scale, height: height * scale)
+        .background(
+            shape.fill(
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.018, green: 0.020, blue: 0.024).opacity(0.96),
+                        Color(red: 0.045, green: 0.048, blue: 0.056).opacity(0.94),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+        )
+        .overlay(
+            shape.stroke(
+                error
+                    ? Color(red: 1.0, green: 0.62, blue: 0.24).opacity(0.40)
+                    : active
+                        ? Color(red: 1.0, green: 0.28, blue: 0.22).opacity(0.18 + 0.08 * heat)
+                        : Color.white.opacity(0.10),
+                lineWidth: 0.7
+            )
+        )
+        .overlay(alignment: .top) {
+            shape
+                .stroke(Color.white.opacity(active ? 0.08 : 0.055), lineWidth: 1)
+                .blur(radius: 0.25)
+                .offset(y: -0.5 * scale)
+        }
+        .overlay(
+            shape.fill(
+                Color(red: 1, green: 0.22, blue: 0.16)
+                    .opacity(pulseStrength * (compact ? 0.13 : 0.11))
+            )
+        )
+        .shadow(
+            color: error
+                ? Color(red: 1.0, green: 0.56, blue: 0.18).opacity(0.14)
+                : active
+                    ? Color(red: 1.0, green: 0.18, blue: 0.14).opacity(0.10 + 0.06 * heat)
+                    : Color.clear,
+            radius: 9 * scale,
+            x: 0,
+            y: 0
+        )
+        .clipShape(shape)
         .drawingGroup()
+        .onAppear {
+            lastPulseNonce = pulseNonce
+        }
+        .onChange(of: pulseNonce) { next in
+            guard next != nil, next != lastPulseNonce else {
+                lastPulseNonce = next
+                return
+            }
+            lastPulseNonce = next
+            pulseStartedAt = anim.value
+        }
+        .animation(IslandMotion.settle(reduceMotion), value: active)
+        .animation(IslandMotion.settle(reduceMotion), value: processing)
+        .animation(IslandMotion.settle(reduceMotion), value: error)
+    }
+
+    private func drawTape(
+        context: inout GraphicsContext,
+        size: CGSize,
+        pulseStrength: Double,
+        heat: Double
+    ) {
+        let tick = anim.value
+        let tapeRect = CGRect(origin: .zero, size: size)
+
+        context.fill(Path(tapeRect), with: .color(.black.opacity(0.18)))
+
+        let phase = scanPhase(tick)
+        let scanX = round(phase * size.width)
+        let red = Color(red: 1.0, green: 0.22, blue: 0.16)
+        let amber = Color(red: 1.0, green: 0.62, blue: 0.24)
+
+        let rows = max(3, Int(round(density)))
+        for index in 1..<rows {
+            let offset = index % 2 == 0 ? 0.18 : -0.08
+            let y = round((Double(index) + offset) * size.height / Double(rows))
+            context.fill(
+                Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
+                with: .color(.white.opacity(active ? 0.040 : 0.028))
+            )
+        }
+
+        let columns = max(4, Int(round(density + 2)))
+        for index in 1..<columns {
+            let skew = (index % 3 == 0 ? 0.30 : index % 2 == 0 ? -0.16 : 0.06)
+            let x = round((Double(index) + skew) * size.width / Double(columns))
+            context.fill(
+                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
+                with: .color(.white.opacity(active ? 0.028 : 0.017))
+            )
+        }
+
+        if active || pulseStrength > 0 {
+            let filledWidth = max(0, min(size.width, scanX))
+            context.fill(
+                Path(CGRect(x: 0, y: 0, width: filledWidth, height: size.height)),
+                with: .color(red.opacity(active ? 0.035 + 0.025 * heat : 0.018 * pulseStrength))
+            )
+        }
+
+        drawFrameTicks(context: &context, size: size, red: red, pulseStrength: pulseStrength)
+
+        if active || pulseStrength > 0 || processing {
+            let width = processing ? max(2, 2 * scale) : max(1, 1.2 * scale)
+            context.fill(
+                Path(CGRect(x: scanX, y: 1 * scale, width: width, height: max(1, size.height - 2 * scale))),
+                with: .color((processing ? Color.white : red).opacity(processing ? 0.30 : 0.48 + 0.20 * heat))
+            )
+        }
+
+        if pulseStrength > 0 {
+            let bloomX = max(0, min(size.width - 2 * scale, scanX - 1 * scale))
+            let bloomRect = CGRect(
+                x: max(0, bloomX - size.width * 0.22),
+                y: 0,
+                width: min(size.width * 0.44, size.width),
+                height: size.height
+            )
+            let bloom = GraphicsContext.Shading.linearGradient(
+                Gradient(stops: [
+                    .init(color: .white.opacity(0), location: 0.0),
+                    .init(color: .white.opacity(0.24 * pulseStrength), location: 0.42),
+                    .init(color: red.opacity(0.24 * pulseStrength), location: 0.58),
+                    .init(color: .white.opacity(0), location: 1.0),
+                ]),
+                startPoint: CGPoint(x: bloomRect.minX, y: bloomRect.midY),
+                endPoint: CGPoint(x: bloomRect.maxX, y: bloomRect.midY)
+            )
+            context.fill(Path(bloomRect), with: bloom)
+        }
+
+        if processing {
+            let shimmerPhase = reduceMotion ? 0.72 : fmod(tick * 0.82, 1.0)
+            let shimmerRect = CGRect(
+                x: shimmerPhase * (size.width + size.width * 0.32) - size.width * 0.28,
+                y: 0,
+                width: size.width * 0.28,
+                height: size.height
+            )
+            let shimmer = GraphicsContext.Shading.linearGradient(
+                Gradient(stops: [
+                    .init(color: .white.opacity(0), location: 0),
+                    .init(color: .white.opacity(0.18), location: 0.52),
+                    .init(color: .white.opacity(0), location: 1),
+                ]),
+                startPoint: CGPoint(x: shimmerRect.minX, y: shimmerRect.midY),
+                endPoint: CGPoint(x: shimmerRect.maxX, y: shimmerRect.midY)
+            )
+            context.fill(Path(shimmerRect), with: shimmer)
+        }
+
+        if error {
+            let y = round(size.height * 0.63)
+            context.fill(
+                Path(CGRect(x: size.width * 0.12, y: y, width: size.width * 0.76, height: max(1, 1 * scale))),
+                with: .color(amber.opacity(0.50))
+            )
+            context.fill(
+                Path(CGRect(x: size.width * 0.58, y: max(0, y - 3 * scale), width: max(1, 1 * scale), height: min(size.height, 6 * scale))),
+                with: .color(amber.opacity(0.72))
+            )
+        }
+    }
+
+    private func drawFrameTicks(
+        context: inout GraphicsContext,
+        size: CGSize,
+        red: Color,
+        pulseStrength: Double
+    ) {
+        let count = max(0, frameCount)
+        guard count > 0 else { return }
+        let tickCount = Int(min(count, compact ? 9 : 18))
+        let first = count - Int64(tickCount) + 1
+
+        for offset in 0..<tickCount {
+            let frameOrdinal = first + Int64(offset)
+            let fraction = tickFraction(frameOrdinal)
+            let tickHeight = size.height * (0.34 + 0.10 * Double((frameOrdinal % 3 + 3) % 3))
+            let x = round(max(1, min(size.width - 2, fraction * size.width)))
+            let y = round((size.height - tickHeight) / 2.0)
+            let isNewest = offset == tickCount - 1
+            let alpha = isNewest ? 0.55 + 0.32 * pulseStrength : 0.20 + 0.07 * Double(offset % 3)
+            let color = isNewest && (active || pulseStrength > 0) ? red.opacity(alpha) : Color.white.opacity(alpha)
+            context.fill(
+                Path(CGRect(x: x, y: y, width: max(1, 1 * scale), height: tickHeight)),
+                with: .color(color)
+            )
+        }
+    }
+
+    private func scanPhase(_ tick: Double) -> Double {
+        if processing {
+            return 0.78
+        }
+        if reduceMotion {
+            return active ? 0.62 : 0.38
+        }
+        let speed = active ? 0.18 : 0.030
+        return fmod(tick * speed + (active ? 0.12 : 0.04), 1.0)
+    }
+
+    private func tickFraction(_ value: Int64) -> Double {
+        let raw = fmod(Double(value) * 0.61803398875 + Double((value % 7 + 7) % 7) * 0.031, 1.0)
+        return 0.08 + raw * 0.84
     }
 }
 
-private let kBaseCollapsedW: CGFloat = 150
-private let kBaseCollapsedH: CGFloat = 34
+private let kBaseCollapsedW: CGFloat = 222
+private let kBaseCollapsedH: CGFloat = 48
 private let kBaseMicroHitW: CGFloat = 86
 private let kBaseMicroHitH: CGFloat = 24
 private let kBaseMicroVisualW: CGFloat = 58
 private let kBaseMicroVisualH: CGFloat = 10
-private let kBaseExpandedW: CGFloat = 352
-private let kBaseExpandedH: CGFloat = 112
+private let kBaseExpandedW: CGFloat = 356
+private let kBaseExpandedH: CGFloat = 178
 private let kAnimDur = 0.2
 private let kIdleMicroDelay: TimeInterval = 5.0
-private let kPanelFrameAnimDur = 0.18
+private let kPanelFrameAnimDur = 0.32
 
 private enum IslandPresentation: Equatable {
     case micro
@@ -131,6 +435,8 @@ private struct SessionIslandView: View {
     let onAction: (String) -> Void
     @Binding var presentation: IslandPresentation
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var anim = AnimationTick.shared
+    @State private var signalHovered = false
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
@@ -143,70 +449,174 @@ private struct SessionIslandView: View {
     }
 
     private var isBusy: Bool {
-        snapshot.state == "starting" || snapshot.state == "processing"
+        snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
     }
 
-    private var statusText: String {
-        if snapshot.lastError != nil {
-            return "ERROR"
+    private var isProcessing: Bool {
+        snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
+    }
+
+    private var hasError: Bool {
+        snapshot.lastError != nil || snapshot.state == "error"
+    }
+
+    private var primaryDisplayText: String {
+        if hasError {
+            return "Needs attention"
         }
         switch snapshot.state {
         case "starting":
-            return "STARTING"
+            return "Starting trail"
         case "recording_compact", "recording_expanded":
-            return "REC"
+            return "Following work"
         case "processing":
-            return "SAVING"
+            return "Saving trail"
         case "stopped_toast":
-            return "SAVED"
+            return "Where was I?"
+        case "trail_reconstructing":
+            return "Reconstructing your trail..."
+        case "resume_ready":
+            return "Find my resume point"
         default:
-            return "READY"
+            return hasMoments ? "Where was I?" : "Ready to follow"
         }
     }
 
-    private var elapsedText: String {
-        let totalSeconds = max(0, snapshot.elapsedMs / 1000)
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
-        let seconds = totalSeconds % 60
-        if hours > 0 {
-            return String(format: "%lld:%02lld:%02lld", hours, minutes, seconds)
-        }
-        return String(format: "%02lld:%02lld", minutes, seconds)
-    }
-
-    private var frameText: String {
-        let count = snapshot.frameCount
-        if count == 1 {
-            return "1 frame"
-        }
-        if count >= 1_000_000 {
-            return String(format: "%.1fm frames", Double(count) / 1_000_000)
-        }
-        if count >= 10_000 {
-            return String(format: "%.1fk frames", Double(count) / 1_000)
-        }
-        return "\(count) frames"
-    }
-
-    private var detailText: String {
-        if snapshot.lastError != nil {
+    private var secondaryDisplayText: String {
+        if hasError {
             return "Capture needs attention"
         }
-        if isRecording || snapshot.state == "starting" || snapshot.state == "processing" {
-            return "\(elapsedText) · \(frameText)"
+        switch snapshot.state {
+        case "recording_compact", "recording_expanded":
+            return trailSummary
+        case "starting":
+            return "Start a work trail"
+        case "processing":
+            return trailSummary
+        case "trail_reconstructing":
+            return "Finding intent and resume point"
+        case "resume_ready":
+            return resumePointLine
+        default:
+            return hasMoments ? "Ready to resume" : "Start a work trail"
         }
-        return frameText
     }
 
     private var primaryActionLabel: String {
         if snapshot.state == "starting" {
             return "Starting"
         }
-        if snapshot.state == "processing" {
-            return "Saving"
+        if snapshot.state == "processing" || snapshot.state == "trail_reconstructing" {
+            return snapshot.state == "trail_reconstructing" ? "Rebuilding" : "Saving"
         }
-        return isRecording ? "Stop" : "Start"
+        if snapshot.state == "resume_ready" {
+            return "Open resume point"
+        }
+        if isRecording {
+            return "Save moment"
+        }
+        if hasMoments {
+            return "What was I doing?"
+        }
+        return "Start trail"
+    }
+
+    private var secondaryActionLabel: String {
+        if snapshot.state == "resume_ready" {
+            return "Show trail"
+        }
+        if isRecording {
+            return "Pause"
+        }
+        return "View trail"
+    }
+
+    private var primaryActionDisabled: Bool {
+        isBusy || (hasError && !isRecording)
+    }
+
+    private var secondaryActionDisabled: Bool {
+        isBusy || (!hasMoments && !isRecording && snapshot.state != "resume_ready")
+    }
+
+    private var primaryButtonAction: String {
+        if snapshot.state == "resume_ready" {
+            return "open_resume_point"
+        }
+        if isRecording {
+            return "capture_once"
+        }
+        if hasMoments {
+            return "reconstruct_trail"
+        }
+        return "toggle_meeting"
+    }
+
+    private var secondaryButtonAction: String {
+        if snapshot.state == "resume_ready" {
+            return "show_trail"
+        }
+        if isRecording {
+            return "toggle_meeting"
+        }
+        return "show_trail"
+    }
+
+    private var hasMoments: Bool {
+        trailMomentCount > 0
+    }
+
+    private var trailMomentCount: Int64 {
+        max(0, snapshot.trailMomentCount ?? snapshot.frameCount)
+    }
+
+    private var trailAppCount: Int64 {
+        max(0, snapshot.trailAppCount ?? Int64(snapshot.trailLabels?.count ?? 0))
+    }
+
+    private var trailSummary: String {
+        if trailAppCount > 0 && trailMomentCount > 0 {
+            return "\(trailAppCount) \(trailAppCount == 1 ? "app" : "apps") · \(momentLabel)"
+        }
+        if trailMomentCount > 0 {
+            return momentLabel
+        }
+        return "Building trail"
+    }
+
+    private var momentLabel: String {
+        "\(trailMomentCount) \(trailMomentCount == 1 ? "moment" : "moments")"
+    }
+
+    private var resumePointLine: String {
+        let point = trimmed(snapshot.resumePoint)
+        guard !point.isEmpty else { return "Resume point found" }
+        return "Continue at \(point)"
+    }
+
+    private var resumeDetailLine: String {
+        let detail = trimmed(snapshot.resumeDetail)
+        if !detail.isEmpty {
+            return detail
+        }
+        let headline = trimmed(snapshot.resumeHeadline)
+        return headline.isEmpty ? "Smalltalk rebuilt your recent work trail." : headline
+    }
+
+    private func trimmed(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var displayTrailLabels: [String] {
+        let labels = (snapshot.trailLabels ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return Array(labels.suffix(4))
+    }
+
+    private var activeBreath: Double {
+        guard captureActive && !reduceMotion else { return 0 }
+        return 0.5 + 0.5 * sin(anim.value * 3.8)
     }
 
     var body: some View {
@@ -214,19 +624,23 @@ private struct SessionIslandView: View {
             switch presentation {
             case .micro:
                 microView
-                    .transition(.opacity.combined(with: .scale(scale: 0.90, anchor: .center)))
+                    .transition(IslandMotion.microTransition(reduceMotion))
             case .compact:
                 collapsedView
-                    .transition(.opacity.combined(with: .scale(scale: 1.03, anchor: .center)))
+                    .transition(IslandMotion.compactTransition(reduceMotion))
             case .expanded:
                 expandedView
-                    .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .center)))
+                    .transition(IslandMotion.expandedTransition(reduceMotion))
             }
         }
         .fixedSize()
+        .background(Color.clear)
         .accessibilityHidden(true)
-        .animation(.easeOut(duration: reduceMotion ? 0.01 : kAnimDur), value: presentation)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .animation(IslandMotion.reveal(reduceMotion), value: presentation)
+        .animation(IslandMotion.settle(reduceMotion), value: primaryDisplayText)
+        .animation(IslandMotion.settle(reduceMotion), value: captureActive)
+        .animation(IslandMotion.settle(reduceMotion), value: metrics.screenActive)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private var microView: some View {
@@ -261,41 +675,105 @@ private struct SessionIslandView: View {
     }
 
     private var collapsedView: some View {
-        Button {
-            onAction("open_expanded")
-        } label: {
-            HStack(spacing: s(8)) {
-                LiveDot(active: isRecording, state: snapshot.state, scale: scale)
+        HStack(spacing: s(7)) {
+            PlayPauseButton(
+                isActive: isRecording,
+                scale: scale,
+                disabled: isBusy
+            ) {
+                onAction("toggle_meeting")
+            }
 
-                VStack(alignment: .leading, spacing: s(1)) {
-                    Text(statusText)
-                        .font(Brand.swiftUIMonoFont(size: s(7.5), weight: .semibold))
-                        .foregroundColor(.white.opacity(0.88))
-                    Text(captureActive ? elapsedText : frameText)
-                        .font(Brand.swiftUIMonoFont(size: s(9.5), weight: .medium))
-                        .foregroundColor(.white.opacity(0.64))
-                        .lineLimit(1)
-                        .fixedSize()
-                }
+            VStack(alignment: .leading, spacing: s(1)) {
+                Text(primaryDisplayText)
+                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(1)
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
+                    .id("compact-primary-\(primaryDisplayText)")
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                Text(secondaryDisplayText)
+                    .font(Brand.swiftUIFont(size: s(10.5), weight: .medium))
+                    .foregroundColor(.white.opacity(0.54))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .id("compact-secondary-\(secondaryDisplayText)")
+                    .transition(.opacity)
+            }
+            .frame(width: s(96), alignment: .leading)
 
-                Spacer(minLength: s(4))
+            Spacer(minLength: s(2))
 
-                ScreenActivityBadge(
-                    active: metrics.screenActive,
-                    captureFps: metrics.captureFps,
-                    scale: scale
+            Button {
+                onAction("open_expanded")
+            } label: {
+                EvidenceTapeView(
+                    active: isRecording,
+                    processing: isProcessing,
+                    error: hasError,
+                    frameCount: snapshot.frameCount,
+                    pulseNonce: snapshot.capturePulseNonce,
+                    density: 4,
+                    scale: scale,
+                    width: 60,
+                    height: 18,
+                    cornerRadius: 6,
+                    compact: true
+                )
+                .scaleEffect(signalHovered ? 1.035 : 1)
+                .shadow(
+                    color: isRecording
+                        ? Color(red: 1, green: 0.20, blue: 0.16).opacity(signalHovered ? 0.22 : 0.12)
+                        : Color.white.opacity(signalHovered ? 0.08 : 0),
+                    radius: s(signalHovered ? 10 : 7),
+                    x: 0,
+                    y: 0
                 )
             }
-            .padding(.horizontal, s(10))
-            .frame(width: kBaseCollapsedW * scale, height: kBaseCollapsedH * scale)
-            .contentShape(Capsule())
+            .buttonStyle(.plain)
+            .frame(width: s(64), height: s(30))
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                withAnimation(IslandMotion.quick(reduceMotion)) {
+                    signalHovered = hovering
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .background(.ultraThinMaterial)
+        .padding(.leading, s(7))
+        .padding(.trailing, s(7))
+        .frame(width: kBaseCollapsedW * scale, height: kBaseCollapsedH * scale)
         .background(capsuleFill(active: captureActive))
         .overlay(capsuleStroke(active: captureActive))
+        .overlay(alignment: .top) {
+            Capsule()
+                .fill(Color.white.opacity(captureActive ? 0.07 + 0.035 * activeBreath : 0.08))
+                .frame(height: max(1, 1 * scale))
+                .padding(.horizontal, s(18))
+                .padding(.top, s(1))
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottom) {
+            Capsule()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.clear,
+                            Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.08 + 0.04 * activeBreath : 0),
+                            Color.clear,
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: s(8))
+                .blur(radius: s(4))
+                .padding(.horizontal, s(20))
+                .allowsHitTesting(false)
+        }
         .clipShape(Capsule())
-        .shadow(color: .black.opacity(0.18), radius: s(16), x: 0, y: s(8))
+        .shadow(color: .black.opacity(0.24), radius: s(13), x: 0, y: s(7))
+        .shadow(color: Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.06 + 0.025 * activeBreath : 0), radius: s(10), x: 0, y: 0)
         .onHover { hovering in
             if hovering {
                 onAction("keep_compact")
@@ -305,79 +783,132 @@ private struct SessionIslandView: View {
 
     private var expandedView: some View {
         VStack(alignment: .leading, spacing: s(14)) {
-            HStack(alignment: .center, spacing: s(9)) {
-                LiveDot(active: isRecording, state: snapshot.state, scale: scale)
+            HStack(alignment: .center, spacing: s(11)) {
+                PlayPauseButton(
+                    isActive: isRecording,
+                    scale: scale,
+                    disabled: isBusy
+                ) {
+                    onAction("toggle_meeting")
+                }
 
                 VStack(alignment: .leading, spacing: s(3)) {
-                    Text(statusText)
-                        .font(Brand.swiftUIMonoFont(size: s(9), weight: .semibold))
+                    Text(primaryDisplayText)
+                        .font(Brand.swiftUIFont(size: s(13.5), weight: .semibold))
                         .foregroundColor(.white.opacity(0.94))
                         .lineLimit(1)
-                    Text(detailText)
-                        .font(Brand.swiftUIMonoFont(size: s(11), weight: .medium))
-                        .foregroundColor(.white.opacity(0.68))
+                        .monospacedDigit()
+                        .fixedSize(horizontal: true, vertical: false)
+                        .id("expanded-primary-\(primaryDisplayText)")
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    Text(secondaryDisplayText)
+                        .font(Brand.swiftUIFont(size: s(11.5), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
                         .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .transition(.opacity)
                 }
 
                 Spacer(minLength: s(8))
 
-                ScreenActivityBadge(
-                    active: metrics.screenActive,
-                    captureFps: metrics.captureFps,
-                    scale: scale
+                EvidenceTapeView(
+                    active: isRecording,
+                    processing: isProcessing,
+                    error: hasError,
+                    frameCount: snapshot.frameCount,
+                    pulseNonce: snapshot.capturePulseNonce,
+                    density: 5,
+                    scale: scale,
+                    width: 112,
+                    height: 30,
+                    cornerRadius: 7,
+                    compact: false
                 )
             }
+
+            if snapshot.state != "resume_ready", !displayTrailLabels.isEmpty {
+                TrailRouteView(labels: displayTrailLabels, scale: scale)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            if snapshot.state == "resume_ready" {
+                Text(resumeDetailLine)
+                    .font(Brand.swiftUIFont(size: s(11), weight: .medium))
+                    .foregroundColor(.white.opacity(0.70))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            Rectangle()
+                .fill(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.02), Color.white.opacity(0.095), Color.white.opacity(0.02)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: max(1, 1 * scale))
+                .padding(.horizontal, s(1))
 
             HStack(spacing: s(9)) {
                 GlassActionButton(
                     label: primaryActionLabel,
                     scale: scale,
                     prominent: true,
-                    disabled: isBusy
+                    disabled: primaryActionDisabled
                 ) {
-                    onAction("toggle_meeting")
+                    onAction(primaryButtonAction)
                 }
 
                 GlassActionButton(
-                    label: "Capture now",
+                    label: secondaryActionLabel,
                     scale: scale,
                     prominent: false,
-                    disabled: !isRecording || isBusy
+                    disabled: secondaryActionDisabled
                 ) {
-                    onAction("capture_once")
+                    onAction(secondaryButtonAction)
                 }
             }
         }
         .padding(.horizontal, s(16))
-        .padding(.vertical, s(14))
+        .padding(.vertical, s(15))
         .frame(width: kBaseExpandedW * scale, height: kBaseExpandedH * scale)
-        .background(.ultraThinMaterial)
         .background(expandedGlassFill(active: captureActive))
         .overlay(expandedGlassStroke(active: captureActive))
-        .clipShape(RoundedRectangle(cornerRadius: s(24), style: .continuous))
-        .shadow(color: .black.opacity(0.28), radius: s(28), x: 0, y: s(14))
+        .clipShape(RoundedRectangle(cornerRadius: s(18), style: .continuous))
+        .shadow(color: .black.opacity(0.34), radius: s(22), x: 0, y: s(12))
+        .shadow(color: Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.08 + 0.035 * activeBreath : 0), radius: s(22), x: 0, y: 0)
     }
 
     private func capsuleFill(active: Bool) -> some ShapeStyle {
         LinearGradient(
             colors: active
-                ? [Color.white.opacity(0.22), Color(red: 0.55, green: 0.09, blue: 0.07).opacity(0.16), Color.black.opacity(0.45)]
-                : [Color.white.opacity(0.20), Color.black.opacity(0.32), Color.black.opacity(0.46)],
-            startPoint: .leading,
-            endPoint: .trailing
+                ? [
+                    Color(red: 0.18, green: 0.15, blue: 0.15).opacity(0.98),
+                    Color(red: 0.09, green: 0.095, blue: 0.105).opacity(0.98),
+                ]
+                : [
+                    Color(red: 0.12, green: 0.125, blue: 0.135).opacity(0.98),
+                    Color(red: 0.075, green: 0.08, blue: 0.09).opacity(0.98),
+                ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
         )
     }
 
     private func capsuleStroke(active: Bool) -> some View {
         Capsule()
             .stroke(
-                active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.42) : Color.white.opacity(0.24),
-                lineWidth: 0.5
+                active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.34) : Color.white.opacity(0.16),
+                lineWidth: 0.7
             )
             .overlay(
                 Capsule()
-                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                    .blur(radius: 0.5)
+                    .stroke(Color.black.opacity(0.44), lineWidth: 1)
+                    .offset(y: s(0.5))
+                    .blur(radius: 0.4)
             )
     }
 
@@ -385,14 +916,12 @@ private struct SessionIslandView: View {
         LinearGradient(
             colors: active
                 ? [
-                    Color.white.opacity(0.30),
-                    Color(red: 0.22, green: 0.05, blue: 0.045).opacity(0.30),
-                    Color.black.opacity(0.54),
+                    Color(red: 0.15, green: 0.13, blue: 0.13).opacity(0.99),
+                    Color(red: 0.075, green: 0.08, blue: 0.09).opacity(0.99),
                 ]
                 : [
-                    Color.white.opacity(0.28),
-                    Color.black.opacity(0.28),
-                    Color.black.opacity(0.50),
+                    Color(red: 0.115, green: 0.12, blue: 0.13).opacity(0.99),
+                    Color(red: 0.065, green: 0.07, blue: 0.08).opacity(0.99),
                 ],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
@@ -400,26 +929,19 @@ private struct SessionIslandView: View {
     }
 
     private func expandedGlassStroke(active: Bool) -> some View {
-        let shape = RoundedRectangle(cornerRadius: s(24), style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: s(18), style: .continuous)
         return shape
-            .stroke(active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.36) : Color.white.opacity(0.22), lineWidth: 0.7)
+            .stroke(active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.32) : Color.white.opacity(0.14), lineWidth: 0.8)
             .overlay(
                 shape
-                    .stroke(Color.white.opacity(0.20), lineWidth: 1)
-                    .blur(radius: 0.7)
+                    .stroke(Color.black.opacity(0.48), lineWidth: 1)
+                    .offset(y: s(0.5))
+                    .blur(radius: 0.5)
             )
             .overlay(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: s(20), style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color.white.opacity(0.36), Color.white.opacity(0.04), Color.clear],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(height: s(38))
-                    .padding(.horizontal, s(8))
-                    .padding(.top, s(5))
+                shape
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    .frame(height: kBaseExpandedH * scale)
                     .allowsHitTesting(false)
             }
     }
@@ -456,23 +978,14 @@ private struct LiveDot: View {
 }
 
 @available(macOS 13.0, *)
-private struct ScreenActivityBadge: View {
-    let active: Bool
-    let captureFps: Double
-    let scale: CGFloat
+private struct IslandPressButtonStyle: ButtonStyle {
+    let reduceMotion: Bool
+    let pressedScale: CGFloat
 
-    var body: some View {
-        ScreenMatrixView(active: active, captureFps: captureFps)
-            .frame(width: 34 * scale, height: 10 * scale)
-            .background(
-                RoundedRectangle(cornerRadius: 3 * scale, style: .continuous)
-                    .fill(Color.white.opacity(0.055))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 3 * scale, style: .continuous)
-                    .stroke(Color.white.opacity(active ? 0.18 : 0.08), lineWidth: 0.5)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 3 * scale, style: .continuous))
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
+            .animation(IslandMotion.quick(reduceMotion), value: configuration.isPressed)
     }
 }
 
@@ -497,6 +1010,46 @@ private struct EvidenceChip: View {
                 Capsule()
                     .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
             )
+    }
+}
+
+@available(macOS 13.0, *)
+private struct TrailRouteView: View {
+    let labels: [String]
+    let scale: CGFloat
+
+    var body: some View {
+        HStack(spacing: 5 * scale) {
+            ForEach(Array(labels.enumerated()), id: \.offset) { index, label in
+                Text(label)
+                    .font(Brand.swiftUIFont(size: 9.5 * scale, weight: index == labels.count - 1 ? .semibold : .medium))
+                    .foregroundColor(.white.opacity(index == labels.count - 1 ? 0.82 : 0.58))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 68 * scale, alignment: .leading)
+                    .padding(.horizontal, 7 * scale)
+                    .frame(height: 20 * scale)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(index == labels.count - 1 ? 0.085 : 0.045))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(index == labels.count - 1 ? 0.13 : 0.07), lineWidth: 0.6)
+                    )
+
+                if index < labels.count - 1 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 6.5 * scale, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.30))
+                        .frame(width: 6 * scale)
+                }
+            }
+        }
+        .frame(height: 20 * scale)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
+        .allowsHitTesting(false)
     }
 }
 
@@ -538,6 +1091,7 @@ private struct GlassActionButton: View {
     let disabled: Bool
     let action: () -> Void
     @State private var hovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Button {
@@ -546,34 +1100,47 @@ private struct GlassActionButton: View {
             }
         } label: {
             Text(label)
-                .font(Brand.swiftUIMonoFont(size: 10 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(disabled ? 0.38 : hovered ? 0.98 : 0.86))
+                .font(Brand.swiftUIFont(size: 11 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(disabled ? 0.34 : prominent ? 0.92 : hovered ? 0.86 : 0.66))
                 .lineLimit(1)
                 .fixedSize()
                 .frame(maxWidth: .infinity)
-                .frame(height: 32 * scale)
+                .frame(height: 30 * scale)
                 .background(buttonFill)
                 .overlay(buttonStroke)
-                .clipShape(Capsule())
-                .contentShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+                .scaleEffect(hovered && !disabled && !reduceMotion ? 1.015 : 1)
+                .shadow(
+                    color: prominent && !disabled
+                        ? Color.white.opacity(hovered ? 0.08 : 0.025)
+                        : Color.clear,
+                    radius: 7 * scale,
+                    x: 0,
+                    y: 0
+                )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.965))
         .disabled(disabled)
-        .onHover { hovered = $0 }
+        .onHover { hovering in
+            withAnimation(IslandMotion.quick(reduceMotion)) {
+                hovered = hovering
+            }
+        }
     }
 
     private var buttonFill: some View {
-        Capsule()
+        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
             .fill(
                 prominent
-                    ? Color.white.opacity(disabled ? 0.08 : hovered ? 0.24 : 0.18)
-                    : Color.white.opacity(disabled ? 0.04 : hovered ? 0.14 : 0.09)
+                    ? Color.white.opacity(disabled ? 0.055 : hovered ? 0.16 : 0.115)
+                    : Color.white.opacity(disabled ? 0.025 : hovered ? 0.075 : 0.045)
             )
     }
 
     private var buttonStroke: some View {
-        Capsule()
-            .stroke(Color.white.opacity(disabled ? 0.06 : hovered ? 0.24 : 0.13), lineWidth: 0.6)
+        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+            .stroke(Color.white.opacity(disabled ? 0.045 : prominent ? hovered ? 0.20 : 0.13 : hovered ? 0.13 : 0.075), lineWidth: 0.7)
     }
 }
 
@@ -581,31 +1148,55 @@ private struct GlassActionButton: View {
 private struct PlayPauseButton: View {
     let isActive: Bool
     let scale: CGFloat
+    let disabled: Bool
     let action: () -> Void
     @State private var hovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            if !disabled {
+                action()
+            }
+        } label: {
             ZStack {
                 Circle()
                     .fill(
                         isActive
-                            ? Color(red: 0.92, green: 0.12, blue: 0.09).opacity(hovered ? 1.0 : 0.92)
-                            : Color.white.opacity(hovered ? 0.16 : 0.09)
+                            ? Color(red: 0.92, green: 0.12, blue: 0.09).opacity(disabled ? 0.38 : hovered ? 0.96 : 0.86)
+                            : Color.white.opacity(disabled ? 0.045 : hovered ? 0.12 : 0.075)
                     )
                 Circle()
-                    .stroke(Color.white.opacity(isActive ? 0.22 : 0.10), lineWidth: 0.5)
+                    .stroke(Color.white.opacity(disabled ? 0.055 : isActive ? 0.22 : hovered ? 0.16 : 0.09), lineWidth: 0.6)
 
                 Image(systemName: isActive ? "pause.fill" : "play.fill")
-                    .font(.system(size: 10 * scale, weight: .semibold))
-                    .foregroundColor(isActive ? .white : (hovered ? .white.opacity(0.92) : .white.opacity(0.62)))
+                    .font(.system(size: 9.5 * scale, weight: .semibold))
+                    .foregroundColor(disabled ? .white.opacity(0.32) : isActive ? .white.opacity(0.94) : (hovered ? .white.opacity(0.82) : .white.opacity(0.58)))
                     .offset(x: isActive ? 0 : 0.7 * scale)
+                    .rotationEffect(.degrees(isActive || reduceMotion ? 0 : hovered ? -4 : 0))
+                    .animation(IslandMotion.quick(reduceMotion), value: isActive)
             }
-            .frame(width: 26 * scale, height: 26 * scale)
+            .frame(width: 28 * scale, height: 28 * scale)
+            .frame(width: 32 * scale, height: 32 * scale)
             .contentShape(Circle())
+            .scaleEffect(hovered && !disabled && !reduceMotion ? 1.045 : 1)
+            .shadow(
+                color: isActive
+                    ? Color(red: 1, green: 0.20, blue: 0.16).opacity(hovered ? 0.28 : 0.16)
+                    : Color.white.opacity(hovered ? 0.08 : 0),
+                radius: 8 * scale,
+                x: 0,
+                y: 0
+            )
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.92))
+        .disabled(disabled)
+        .onHover { hovering in
+            withAnimation(IslandMotion.quick(reduceMotion)) {
+                hovered = hovering
+            }
+        }
+        .animation(IslandMotion.settle(reduceMotion), value: isActive)
     }
 }
 
@@ -842,6 +1433,7 @@ private final class SessionIslandController: NSObject {
         panel.sharingType = .readOnly
 
         let tracking = IslandTrackingView(frame: NSRect(x: 0, y: 0, width: Int(size.width), height: Int(size.height)))
+        tracking.configureTransparentLayer()
         tracking.autoresizingMask = [.width, .height]
         panel.contentView = tracking
         trackingView = tracking
@@ -849,7 +1441,7 @@ private final class SessionIslandController: NSObject {
     }
 
     private func positionPanel(preserveCurrentAnchor: Bool, animated: Bool) {
-        guard let panel else { return }
+        guard panel != nil else { return }
         setPanelFrame(
             resolvedPanelFrame(preserveCurrentAnchor: preserveCurrentAnchor),
             animated: animated
@@ -918,7 +1510,7 @@ private final class SessionIslandController: NSObject {
         if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = kPanelFrameAnimDur
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                context.timingFunction = IslandMotion.panelTimingFunction()
                 panel.animator().setFrame(frame, display: visible)
             }
         } else {
@@ -949,6 +1541,7 @@ private final class SessionIslandController: NSObject {
             hosting.onDragBegan = { [weak self] in
                 self?.markPanelDragBegan()
             }
+            hosting.configureTransparentLayer()
             hosting.frame = contentView.bounds
             hosting.autoresizingMask = [.width, .height]
             contentView.addSubview(hosting)
@@ -964,6 +1557,13 @@ private final class SessionIslandController: NSObject {
             sendAction("resume_me")
         case "open_search":
             sendAction("open_main_window")
+        case "reconstruct_trail":
+            setPresentation(.expanded, resetIdleTimer: false)
+            sendAction("reconstruct_trail")
+        case "show_trail":
+            sendAction("show_trail")
+        case "open_resume_point":
+            sendAction("open_resume_point")
         case "open_expanded":
             openExpandedFromCompact()
         case "toggle_meeting":
@@ -1044,6 +1644,19 @@ private final class SessionIslandController: NSObject {
 
 @available(macOS 13.0, *)
 private final class IslandTrackingView: NSView {
+    override var isOpaque: Bool { false }
+
+    func configureTransparentLayer() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureTransparentLayer()
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }
@@ -1082,10 +1695,23 @@ private final class DraggableHostingView<Content: View>: NSHostingView<Content> 
     private var dragMonitor: Any?
     private var dragStartLocation = NSPoint.zero
 
+    override var isOpaque: Bool { false }
+
     deinit {
         if let dragMonitor {
             NSEvent.removeMonitor(dragMonitor)
         }
+    }
+
+    func configureTransparentLayer() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureTransparentLayer()
     }
 
     override func mouseDown(with event: NSEvent) {

@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -97,6 +98,7 @@ type StopCaptureOutput = {
 type CaptureStatus = {
   running: boolean;
   frame_count: number;
+  recent_app_labels: string[];
   event_count: number;
   transition_count: number;
   content_unit_count: number;
@@ -270,6 +272,7 @@ type EvidenceTab = "text" | "events" | "context" | "paths";
 const initialStatus: CaptureStatus = {
   running: false,
   frame_count: 0,
+  recent_app_labels: [],
   event_count: 0,
   transition_count: 0,
   content_unit_count: 0,
@@ -613,6 +616,28 @@ function App() {
       setBusyAction(null);
     }
   }, [selectedFrame?.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    listen("session-island-resume-requested", () => {
+      void generateResumeCard();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch((err) => setError(String(err)));
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [generateResumeCard]);
 
   return (
     <main className="capture-shell">
