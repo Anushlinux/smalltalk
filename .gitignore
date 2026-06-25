@@ -7,15 +7,23 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-reference/
+# Local secrets
+.env
+.env.*
+!.env.example
+
 
 node_modules
 dist
 dist-ssr
-output/
 *.local
 target/
 
+reference/
+
+resume_query_exports/
+
+cloud_resume_exports/
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

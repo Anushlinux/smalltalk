@@ -1,6 +1,6 @@
 # Smalltalk Product And Technical Snapshot
 
-Last updated: 2026-06-21
+Last updated: 2026-06-25
 
 Smalltalk is currently a desktop-first, local screen-memory app built with Tauri, Rust, React, and SQLite. The older Chrome extension still exists in `browser-extension/`, but the active product direction is the native app in the repo root.
 
@@ -12,7 +12,7 @@ Smalltalk has two product lanes in this repo.
 
 | Lane | Status | Purpose | Main files |
 | --- | --- | --- | --- |
-| Native desktop capture | Active | Capture screen/app evidence locally, inspect it, search it, export complete session folders, and generate a conservative native resume cue. | `src/`, `src-tauri/src/capture.rs`, `src-tauri/scripts/` |
+| Native desktop capture | Active | Capture screen/app evidence locally, inspect it, search it, prepare cloud-ready resume bundles, and generate resume cues. | `src/`, `src-tauri/src/capture.rs`, `src-tauri/scripts/` |
 | Browser extension resume flow | Older but still present | Capture explicit browser research sessions and ask a local OpenAI proxy for a return-to-origin resume card. | `browser-extension/` |
 
 The native lane should be treated as the main product unless we explicitly reopen the browser-extension lane.
@@ -22,7 +22,7 @@ The native lane should be treated as the main product unless we explicitly reope
 - Root Tauri desktop app with app id `com.smalltalk.app`.
 - React UI called `Session Capture` with:
   - `Start session`
-  - `Stop & export`
+  - `Stop session`
   - `Capture now`
   - `Delete all`
   - text search over captured evidence
@@ -31,12 +31,12 @@ The native lane should be treated as the main product unless we explicitly reope
   - overlays for content units, OCR spans, Accessibility nodes, and privacy regions
   - frame verification panel
   - native `Resume me` card
-  - export summary and `Open output folder`
+  - cloud-ready stop bundle summary and `Open bundle JSON`
 - Native Rust capture backend in `src-tauri/src/capture.rs`.
 - Swift helpers for macOS Accessibility, OCR, window graph capture, and native event capture.
 - Local SQLite store with FTS search, sessions, frames, OCR, Accessibility nodes, UI events, transitions, content units, privacy metadata, and export audit data.
-- Per-session folder export under repo-root `output/session-001`, `output/session-002`, etc.
-- Full export bundles with copied images, PNG conversions, raw table dumps, timeline rows, frame-level evidence folders, schema dump, SQLite snapshot, and warnings.
+- Stop-time cloud-ready resume query bundles under repo-root `resume_query_exports/`.
+- Compact cloud bundles with selected safe keyframe images, episode cards, resume candidate metadata, quality flags, redactions, and missing-evidence notes.
 - Clean-slate delete path that stops capture, clears frames/sessions/events/search rows, removes snapshots, and resets the runtime UI state.
 - Safe AI export path for native evidence that redacts text/URLs/paths, masks sensitive images where possible, excludes `never_send_to_ai` frames, and writes an audit row.
 - Native storyboard/resume-card builder based on local evidence, not a remote model call in the native path.
@@ -49,9 +49,9 @@ The native lane should be treated as the main product unless we explicitly reope
 4. While the session is running, native UI events schedule captures after short settle delays.
 5. The user can click `Capture now` for an explicit manual frame.
 6. The UI continuously refreshes status, search results, recent timeline, frame details, and screenshot previews.
-7. The user clicks `Stop & export`.
-8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, writes an exhaustive session folder under `output/session-XXX`, stores `export_path`, and returns an export summary.
-9. The user can inspect the folder, upload the zip elsewhere for evaluation, or use the native `Resume me` cue inside the app.
+7. The user clicks `Stop session`.
+8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `resume_query_exports/`, and returns the bundle summary.
+9. The user can inspect the compact bundle, ask OpenAI from the app, or use the native `Resume me` cue inside the app.
 
 ## Runtime Storage
 
@@ -70,12 +70,12 @@ The UI gets the exact live paths from `capture_status`:
 - `data_dir`
 - `database_path`
 
-The exported session folders are different from the live app-data store. They are written to the project output root:
+The stop-time cloud bundles are different from the live app-data store. They are written to the project resume-query root:
 
 ```text
-/Users/bhaskarpandit/Documents/smalltalk/output/session-001/
-/Users/bhaskarpandit/Documents/smalltalk/output/session-002/
-/Users/bhaskarpandit/Documents/smalltalk/output/session-003/
+/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-041-resume-query-.../
+  resume-query-bundle.json
+  images/
 ```
 
 ## Capture Triggers
@@ -409,58 +409,26 @@ Results include:
 - snippet from SQLite FTS
 - BM25 rank
 
-## Session Export
+## Cloud-Ready Stop Bundle
 
-`Stop & export` writes a deterministic folder:
+`Stop session` writes only the compact model-facing bundle:
 
 ```text
-output/session-001/
-  session.json
-  export_warnings.json
-  raw/
-    smalltalk-capture.sqlite
-    schema.sql
-    tables/
-      *.json
-      *.ndjson
-  timeline/
-    frames.json
-    frames.ndjson
-    ui_events.json
-    ui_events.ndjson
-    capture_triggers.json
-    capture_triggers.ndjson
-    event_transitions.json
-    event_transitions.ndjson
-    frame_diffs.json
-    frame_diffs.ndjson
-  frames/
-    frame-000001/
-      frame.json
-      frame_row.json
-      images/
-      text/
-      ocr/
-      accessibility/
-      content/
-      context/
-      windows/
-      events/
-      privacy/
+resume_query_exports/session-041-resume-query-.../
+  resume-query-bundle.json
+  images/
+    frame-000269-resume-candidate.jpg
+    frame-000251-origin.jpg
 ```
 
-Export details:
+Bundle details:
 
-- `raw/smalltalk-capture.sqlite` is produced via SQLite `VACUUM INTO`.
-- `raw/schema.sql` is a schema dump.
-- `raw/tables` dumps every SQLite table as JSON and NDJSON.
-- `timeline` dumps session-scoped timeline tables.
-- each frame folder contains row-level evidence and copied image artifacts.
-- JPEG screenshots are copied in original form and converted to PNG through `/usr/bin/sips` when possible.
-- `export_warnings.json` records missing images, copy failures, PNG conversion failures, and similar export issues.
-- `session.json` is the top-level manifest with counts, paths, warnings, and frame manifests.
+- `resume-query-bundle.json` is the payload intended for cloud resume inference.
+- It includes session timing, a compact session index, candidate episodes, the chosen resume candidate, selected keyframes, transition labels, privacy metadata, quality flags, and missing-evidence notes.
+- Images are capped and copied only for selected cloud-safe evidence frames.
+- Raw table dumps, SQLite snapshots, full per-frame folders, PNG duplicates, and repo-root `output/session-*` folders are no longer produced by the Stop path.
 
-This export shape is intentionally exhaustive because the exported session is the artifact we use to judge whether Smalltalk captured enough evidence to understand the work.
+The old exhaustive `output/` folder is a legacy/debug artifact. Runtime Stop behavior should now preserve only the compact data that is ready for cloud use.
 
 ## Native Resume Card
 

@@ -21,6 +21,10 @@ private struct IslandSnapshot: Decodable {
     var resumeHeadline: String?
     var resumeDetail: String?
     var resumePoint: String?
+    var resumeSource: String?
+    var resumeModel: String?
+    var resumeResponseId: String?
+    var resumeWarning: String?
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -37,6 +41,10 @@ private struct IslandSnapshot: Decodable {
         case resumeHeadline = "resume_headline"
         case resumeDetail = "resume_detail"
         case resumePoint = "resume_point"
+        case resumeSource = "resume_source"
+        case resumeModel = "resume_model"
+        case resumeResponseId = "resume_response_id"
+        case resumeWarning = "resume_warning"
     }
 }
 
@@ -415,8 +423,8 @@ private let kBaseMicroHitW: CGFloat = 86
 private let kBaseMicroHitH: CGFloat = 24
 private let kBaseMicroVisualW: CGFloat = 58
 private let kBaseMicroVisualH: CGFloat = 10
-private let kBaseExpandedW: CGFloat = 356
-private let kBaseExpandedH: CGFloat = 178
+private let kBaseExpandedW: CGFloat = 520
+private let kBaseExpandedH: CGFloat = 268
 private let kAnimDur = 0.2
 private let kIdleMicroDelay: TimeInterval = 5.0
 private let kPanelFrameAnimDur = 0.32
@@ -474,9 +482,9 @@ private struct SessionIslandView: View {
         case "stopped_toast":
             return "Where was I?"
         case "trail_reconstructing":
-            return "Reconstructing your trail..."
+            return "Asking OpenAI"
         case "resume_ready":
-            return "Find my resume point"
+            return resumeReadyTitle
         default:
             return hasMoments ? "Where was I?" : "Ready to follow"
         }
@@ -494,7 +502,7 @@ private struct SessionIslandView: View {
         case "processing":
             return trailSummary
         case "trail_reconstructing":
-            return "Finding intent and resume point"
+            return "Sending safe resume bundle"
         case "resume_ready":
             return resumePointLine
         default:
@@ -507,7 +515,7 @@ private struct SessionIslandView: View {
             return "Starting"
         }
         if snapshot.state == "processing" || snapshot.state == "trail_reconstructing" {
-            return snapshot.state == "trail_reconstructing" ? "Rebuilding" : "Saving"
+            return snapshot.state == "trail_reconstructing" ? "Asking" : "Saving"
         }
         if snapshot.state == "resume_ready" {
             return "Open resume point"
@@ -516,7 +524,7 @@ private struct SessionIslandView: View {
             return "Save moment"
         }
         if hasMoments {
-            return "What was I doing?"
+            return "Ask OpenAI"
         }
         return "Start trail"
     }
@@ -594,6 +602,17 @@ private struct SessionIslandView: View {
         return "Continue at \(point)"
     }
 
+    private var resumeReadyTitle: String {
+        if trimmed(snapshot.resumeSource) == "cloud" {
+            return "OpenAI answered"
+        }
+        let warning = trimmed(snapshot.resumeWarning).lowercased()
+        if warning.contains("openai_api_key") || warning.contains("key") {
+            return "OpenAI key missing"
+        }
+        return "OpenAI unavailable"
+    }
+
     private var resumeDetailLine: String {
         let detail = trimmed(snapshot.resumeDetail)
         if !detail.isEmpty {
@@ -601,6 +620,19 @@ private struct SessionIslandView: View {
         }
         let headline = trimmed(snapshot.resumeHeadline)
         return headline.isEmpty ? "Smalltalk rebuilt your recent work trail." : headline
+    }
+
+    private var resumeProvenanceLine: String {
+        if trimmed(snapshot.resumeSource) == "cloud" {
+            let model = trimmed(snapshot.resumeModel)
+            let response = trimmed(snapshot.resumeResponseId)
+            if !model.isEmpty && !response.isEmpty {
+                return "\(model) · \(response)"
+            }
+            return model.isEmpty ? "Cloud resume" : model
+        }
+        let warning = trimmed(snapshot.resumeWarning)
+        return warning.isEmpty ? "No OpenAI answer generated" : warning
     }
 
     private func trimmed(_ value: String?) -> String {
@@ -782,7 +814,7 @@ private struct SessionIslandView: View {
     }
 
     private var expandedView: some View {
-        VStack(alignment: .leading, spacing: s(14)) {
+        VStack(alignment: .leading, spacing: s(13)) {
             HStack(alignment: .center, spacing: s(11)) {
                 PlayPauseButton(
                     isActive: isRecording,
@@ -797,17 +829,20 @@ private struct SessionIslandView: View {
                         .font(Brand.swiftUIFont(size: s(13.5), weight: .semibold))
                         .foregroundColor(.white.opacity(0.94))
                         .lineLimit(1)
+                        .truncationMode(.tail)
                         .monospacedDigit()
-                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .id("expanded-primary-\(primaryDisplayText)")
                         .transition(.opacity.combined(with: .move(edge: .top)))
                     Text(secondaryDisplayText)
                         .font(Brand.swiftUIFont(size: s(11.5), weight: .medium))
                         .foregroundColor(.white.opacity(0.58))
                         .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .transition(.opacity)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 Spacer(minLength: s(8))
 
@@ -824,6 +859,7 @@ private struct SessionIslandView: View {
                     cornerRadius: 7,
                     compact: false
                 )
+                .frame(width: s(112), alignment: .trailing)
             }
 
             if snapshot.state != "resume_ready", !displayTrailLabels.isEmpty {
@@ -832,12 +868,33 @@ private struct SessionIslandView: View {
             }
 
             if snapshot.state == "resume_ready" {
-                Text(resumeDetailLine)
-                    .font(Brand.swiftUIFont(size: s(11), weight: .medium))
-                    .foregroundColor(.white.opacity(0.70))
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: s(7)) {
+                    Text(resumeDetailLine)
+                        .font(Brand.swiftUIFont(size: s(12), weight: .medium))
+                        .foregroundColor(.white.opacity(0.74))
+                        .lineLimit(4)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Text(resumeProvenanceLine)
+                        .font(Brand.swiftUIMonoFont(size: s(10), weight: .semibold))
+                        .foregroundColor(.white.opacity(0.54))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                    .padding(.horizontal, s(10))
+                    .padding(.vertical, s(10))
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: s(11), style: .continuous)
+                            .fill(Color.white.opacity(0.055))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: s(11), style: .continuous)
+                            .stroke(Color.white.opacity(0.075), lineWidth: 0.7)
+                    )
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
@@ -872,8 +929,8 @@ private struct SessionIslandView: View {
                 }
             }
         }
-        .padding(.horizontal, s(16))
-        .padding(.vertical, s(15))
+        .padding(.horizontal, s(18))
+        .padding(.vertical, s(17))
         .frame(width: kBaseExpandedW * scale, height: kBaseExpandedH * scale)
         .background(expandedGlassFill(active: captureActive))
         .overlay(expandedGlassStroke(active: captureActive))

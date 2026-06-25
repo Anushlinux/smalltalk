@@ -2,15 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::capture::{CaptureStatus, NativeResumeInput};
+use crate::capture::{CaptureStatus, CloudResumeInput, CloudResumeResult, OpenResumePointInput};
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static EXPANDED: AtomicBool = AtomicBool::new(false);
+static LAST_CLOUD_RESUME_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionIslandSnapshot {
@@ -32,6 +33,10 @@ pub struct SessionIslandSnapshot {
     pub resume_headline: Option<String>,
     pub resume_detail: Option<String>,
     pub resume_point: Option<String>,
+    pub resume_source: Option<String>,
+    pub resume_model: Option<String>,
+    pub resume_response_id: Option<String>,
+    pub resume_warning: Option<String>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
 }
@@ -93,6 +98,10 @@ impl SessionIslandSnapshot {
             resume_headline: None,
             resume_detail: None,
             resume_point: None,
+            resume_source: None,
+            resume_model: None,
+            resume_response_id: None,
+            resume_warning: None,
             privacy_label: None,
             is_sensitive: false,
         }
@@ -308,6 +317,10 @@ fn snapshot_from_status(
         resume_headline: None,
         resume_detail: None,
         resume_point: None,
+        resume_source: None,
+        resume_model: None,
+        resume_response_id: None,
+        resume_warning: None,
         privacy_label,
         is_sensitive,
     }
@@ -385,21 +398,27 @@ fn reconstruct_trail_from_island() {
             }
         };
         let current_frame_id = status.latest_frame.as_ref().map(|frame| frame.id);
-        match crate::capture::get_native_resume_card(
+        match crate::capture::run_cloud_resume(
             app.clone(),
-            Some(NativeResumeInput {
-                lookback_minutes: Some(20),
-                max_keyframes: Some(10),
+            Some(CloudResumeInput {
+                session_id: status
+                    .active_session
+                    .as_ref()
+                    .or(status.latest_session.as_ref())
+                    .map(|session| session.id.clone()),
                 current_frame_id,
+                allow_followup: Some(true),
             }),
         ) {
-            Ok(card) => {
+            Ok(result) => {
+                remember_cloud_resume_output_path(&result);
                 let state = app.state::<crate::capture::CaptureState>();
-                let next_status = crate::capture::capture_status(app.clone(), state).unwrap_or(status);
-                let mut snapshot = snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
-                snapshot.resume_headline = clean_one_line(Some(&card.focus_now));
-                snapshot.resume_detail = clean_one_line(Some(&card.what_was_i_doing));
-                snapshot.resume_point = resume_point_label(&card);
+                let next_status =
+                    crate::capture::capture_status(app.clone(), state).unwrap_or(status);
+                let mut snapshot =
+                    snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
+                apply_cloud_resume_to_snapshot(&mut snapshot, &result);
+                let _ = app.emit("session-island-cloud-resume-ready", result.clone());
                 update_session_island(snapshot);
                 show_session_island();
             }
@@ -411,11 +430,106 @@ fn reconstruct_trail_from_island() {
     });
 }
 
+fn apply_cloud_resume_to_snapshot(
+    snapshot: &mut SessionIslandSnapshot,
+    result: &CloudResumeResult,
+) {
+    snapshot.resume_source = Some(result.source.clone());
+    snapshot.resume_model = result.model.clone();
+    snapshot.resume_response_id = result.response_id.clone();
+    snapshot.resume_warning = result
+        .warnings
+        .iter()
+        .find_map(|warning| clean_one_line(Some(warning)));
+
+    if result.source == "cloud" {
+        let current_label = cloud_target_label(&result.current_focus);
+        let return_label = cloud_target_label(&result.resume_target_if_returning);
+        let split_targets = current_label.is_some()
+            && return_label.is_some()
+            && current_label != return_label
+            && result.decision == "ambiguous_current_focus_vs_prior_task";
+        snapshot.resume_headline = if split_targets {
+            Some("Trail split: current focus vs return target".to_string())
+        } else {
+            cloud_answer_text(result, "focus_now")
+                .or_else(|| clean_one_line(Some(&result.local_card.focus_now)))
+        };
+        snapshot.resume_detail = if split_targets {
+            Some(format!(
+                "Current: {}. Return: {}.",
+                current_label
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                return_label
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ))
+        } else {
+            cloud_answer_text(result, "what_was_i_doing")
+                .or_else(|| clean_one_line(Some(&result.local_card.what_was_i_doing)))
+        };
+        snapshot.resume_point =
+            cloud_resume_point_label(result).or_else(|| resume_point_label(&result.local_card));
+    } else {
+        let warning = snapshot
+            .resume_warning
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        snapshot.resume_headline = Some(
+            if warning.contains("openai_api_key") || warning.contains("key") {
+                "OpenAI key missing"
+            } else {
+                "OpenAI unavailable"
+            }
+            .to_string(),
+        );
+        snapshot.resume_detail = snapshot
+            .resume_warning
+            .clone()
+            .or_else(|| clean_one_line(Some(&result.local_card.what_was_i_doing)));
+        snapshot.resume_point = resume_point_label(&result.local_card);
+    }
+}
+
+fn cloud_answer_text(result: &CloudResumeResult, key: &str) -> Option<String> {
+    result
+        .answer
+        .get(key)
+        .and_then(|value| value.as_str())
+        .and_then(|value| clean_one_line(Some(value)))
+}
+
+fn cloud_resume_point_label(result: &CloudResumeResult) -> Option<String> {
+    cloud_target_label(&result.resume_target_if_returning)
+        .or_else(|| cloud_target_label(&result.resume_target))
+}
+
+fn cloud_target_label(target: &serde_json::Value) -> Option<String> {
+    target
+        .get("line_anchor")
+        .and_then(|value| value.get("quote"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            target
+                .get("exact_visible_words")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| target.get("exact_words").and_then(|value| value.as_str()))
+        .or_else(|| target.get("title").and_then(|value| value.as_str()))
+        .or_else(|| target.get("app").and_then(|value| value.as_str()))
+        .and_then(|value| clean_one_line(Some(value)))
+}
+
 fn resume_point_label(card: &crate::capture::NativeResumeCard) -> Option<String> {
     clean_one_line(
         card.continue_from
-            .title
-            .as_deref()
+            .line_anchor
+            .as_ref()
+            .and_then(|anchor| anchor.quote.as_deref())
+            .or(card.continue_from.quote.as_deref())
+            .or(card.continue_from.title.as_deref())
             .or(card.continue_from.window_name.as_deref())
             .or(card.continue_from.app_name.as_deref())
             .or(card.continue_from.url.as_deref())
@@ -424,10 +538,57 @@ fn resume_point_label(card: &crate::capture::NativeResumeCard) -> Option<String>
 }
 
 fn open_resume_point_from_island() {
-    open_main_window();
-    if let Some(app) = APP_HANDLE.get() {
-        let _ = app.emit("session-island-resume-requested", serde_json::json!({}));
+    let Some(app) = APP_HANDLE.get().cloned() else {
+        eprintln!("[session_island] open resume point requested before AppHandle was ready");
+        return;
+    };
+    let output_path = remembered_cloud_resume_output_path();
+    thread::spawn(move || {
+        match crate::capture::open_resume_point(
+            app.clone(),
+            Some(OpenResumePointInput {
+                output_path,
+                session_id: None,
+                current_frame_id: None,
+                target_frame_id: None,
+            }),
+        ) {
+            Ok(result) => {
+                if !result.warnings.is_empty() {
+                    eprintln!(
+                        "[session_island] open_resume_point warnings: {}",
+                        result.warnings.join(" | ")
+                    );
+                }
+                if result.strategy.starts_with("smalltalk_") {
+                    open_main_window();
+                }
+            }
+            Err(error) => {
+                eprintln!("[session_island] open_resume_point failed: {}", error);
+                open_main_window();
+            }
+        }
+    });
+}
+
+fn remember_cloud_resume_output_path(result: &CloudResumeResult) {
+    if let Some(path) = result
+        .output_path
+        .as_ref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        if let Ok(mut slot) = LAST_CLOUD_RESUME_OUTPUT_PATH.lock() {
+            *slot = Some(path.clone());
+        }
     }
+}
+
+fn remembered_cloud_resume_output_path() -> Option<String> {
+    LAST_CLOUD_RESUME_OUTPUT_PATH
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
 }
 
 fn start_capture_from_island() {

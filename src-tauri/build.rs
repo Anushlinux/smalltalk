@@ -57,11 +57,7 @@ fn build_session_island_panel() {
             "-module-cache-path",
         ])
         .arg(&module_cache_path)
-        .args([
-            "-O",
-            "-whole-module-optimization",
-            "-o",
-        ])
+        .args(["-O", "-whole-module-optimization", "-o"])
         .arg(&lib_path)
         .arg(&swift_src)
         .output()

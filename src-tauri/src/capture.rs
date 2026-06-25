@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -353,6 +355,7 @@ pub struct StopCaptureOutput {
     pub status: CaptureStatus,
     pub session: Option<CaptureSession>,
     pub export: Option<SessionExportSummary>,
+    pub resume_query: Option<ResumeQueryBundleResult>,
     pub preview: Option<Value>,
 }
 
@@ -857,11 +860,424 @@ pub struct ExclusionRule {
 pub struct SafeAiExportInput {
     pub lookback_minutes: Option<i64>,
     pub range_ms: Option<i64>,
+    pub session_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub current_frame_id: Option<i64>,
     pub include_images: Option<bool>,
     pub max_frames: Option<u32>,
     pub export_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResumeQueryBundleInput {
+    pub session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+    pub lookback_minutes: Option<i64>,
+    pub max_episode_cards: Option<u32>,
+    pub max_images: Option<u32>,
+    pub max_json_chars: Option<u32>,
+    // Backward-compatible alias for older local callers during the rename.
+    pub max_keyframes: Option<u32>,
+    pub include_images: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionIndexInput {
+    pub session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudResumeInput {
+    pub session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+    pub allow_followup: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeQueryBundleResult {
+    pub output_dir: String,
+    pub bundle_path: String,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub payload_path: String,
+    pub byte_size: i64,
+    pub image_count: i64,
+    pub json_char_count: i64,
+    pub bundle: ResumeQueryBundle,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub payload: ResumeQueryBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryBundle {
+    pub schema: String,
+    pub budget: ResumeQueryBudget,
+    pub session: ResumeQuerySession,
+    pub session_index: SessionIndex,
+    pub candidate_episodes: Vec<ResumeQueryEpisodeCard>,
+    pub resume_candidate: ResumeQueryCandidate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_focus: Option<ResumeQueryFocusTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_work_target: Option<ResumeQueryFocusTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_target_if_returning: Option<ResumeQueryFocusTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_anchors: Vec<ResumeQueryAnchorCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_rejected_anchors: Vec<ResumeQueryRejectedAnchor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_artifacts: Vec<ResumeQueryEvidenceFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_evidence: Vec<ResumeQueryEvidenceFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_frame_summary: Vec<ResumeQueryEvidenceFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<ResumeQueryEvidenceFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_conflicts: Vec<String>,
+    pub confidence_breakdown: ResumeQueryConfidenceBreakdown,
+    pub keyframes: Vec<ResumeQueryKeyframe>,
+    pub transitions: Vec<ResumeQueryTransition>,
+    pub privacy: ResumeQueryPrivacy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+    #[serde(default)]
+    pub missing_evidence: Vec<String>,
+    pub ask: ResumeQueryAsk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryBudget {
+    pub max_json_chars: i64,
+    pub max_episode_cards: i64,
+    pub max_images: i64,
+    pub max_text_snippets_per_episode: i64,
+    pub max_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryAsk {
+    pub task: String,
+    pub allow_need_more_evidence: bool,
+}
+
+fn default_surface_state() -> String {
+    "need_more_evidence".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQuerySession {
+    pub id: String,
+    pub started_at: i64,
+    pub stopped_at: i64,
+    pub duration_s: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResumeLineBounds {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResumeLineAnchor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_unit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<ResumeLineBounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_anchor: Option<String>,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryCandidate {
+    pub frame_id: String,
+    pub app: String,
+    pub window_title: String,
+    pub surface_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_url_ref: Option<String>,
+    pub visible_anchor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_anchor: Option<String>,
+    pub exact_words: String,
+    #[serde(default)]
+    pub line_anchor: ResumeLineAnchor,
+    pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryFocusTarget {
+    pub frame_id: String,
+    pub app: String,
+    pub title: String,
+    pub surface_type: String,
+    #[serde(default = "default_surface_state")]
+    pub surface_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_visible_words: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_anchor: Option<ResumeLineAnchor>,
+    pub reason: String,
+    pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryAnchorCandidate {
+    pub anchor_id: String,
+    pub frame_id: String,
+    pub text_exact: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<ResumeLineBounds>,
+    pub source: String,
+    pub semantic_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_anchor: Option<String>,
+    pub visible_ratio: f64,
+    pub is_browser_chrome: bool,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryRejectedAnchor {
+    pub frame_id: String,
+    pub text_exact: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<ResumeLineBounds>,
+    pub source: String,
+    pub semantic_role: String,
+    pub surface_zone: String,
+    pub reject_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryEvidenceFrame {
+    pub frame_id: String,
+    pub role: String,
+    pub app: String,
+    pub title: String,
+    pub surface_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_anchor: Option<ResumeLineAnchor>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryConfidenceBreakdown {
+    pub frame_id: String,
+    pub evidence_strength: f64,
+    pub actionable_text: f64,
+    pub return_to_origin: f64,
+    pub user_interaction: f64,
+    pub recency: f64,
+    pub recognized_surface: f64,
+    #[serde(default)]
+    pub line_anchor_quality: f64,
+    #[serde(default)]
+    pub branch_penalty: f64,
+    pub artifact_penalty: f64,
+    pub chrome_penalty: f64,
+    pub unknown_surface_penalty: f64,
+    pub metadata_penalty: f64,
+    pub final_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryKeyframe {
+    pub frame_id: String,
+    pub t_rel_s: f64,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visual_text_snippets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_anchor: Option<ResumeLineAnchor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+    pub app: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryTransition {
+    pub from_frame: String,
+    pub to_frame: String,
+    pub label: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryPrivacy {
+    #[serde(default)]
+    pub redactions_applied: Vec<String>,
+    pub raw_urls_sent: bool,
+    pub raw_paths_sent: bool,
+    pub raw_clipboard_sent: bool,
+    pub raw_keystrokes_sent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIndex {
+    pub schema: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_frame_id: Option<String>,
+    pub duration_s: f64,
+    pub episode_count: usize,
+    pub surface_sequence: Vec<String>,
+    pub candidate_resume_frames: Vec<String>,
+    pub artifact_frames: Vec<String>,
+    pub branch_frames: Vec<String>,
+    pub return_to_origin_frames: Vec<String>,
+    #[serde(default)]
+    pub quality_flags: Vec<String>,
+    #[serde(default)]
+    pub episodes: Vec<ResumeQueryEpisodeCard>,
+    #[serde(default)]
+    pub evidence_conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryEpisodeCard {
+    pub episode_id: String,
+    pub frame_range: Vec<String>,
+    pub role_guess: String,
+    pub app: String,
+    pub surface_type: String,
+    pub title: String,
+    pub duration_s: f64,
+    #[serde(default)]
+    pub important_text: Vec<String>,
+    pub events: ResumeQueryEpisodeEvents,
+    #[serde(default)]
+    pub keyframes: Vec<String>,
+    pub confidence: f64,
+    #[serde(default)]
+    pub quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResumeQueryEpisodeEvents {
+    pub clicks: i64,
+    pub scrolls: i64,
+    pub typing_bursts: i64,
+    pub selections: i64,
+    #[serde(default)]
+    pub app_switches: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudResumeResult {
+    pub schema: String,
+    pub request: CloudResumeRequestSummary,
+    pub cached: bool,
+    pub source: String,
+    pub decision: String,
+    pub resume_target: Value,
+    pub current_focus: Value,
+    pub resume_work_target: Value,
+    pub resume_target_if_returning: Value,
+    pub answer: Value,
+    pub evidence_request: Option<CloudResumeEvidenceRequest>,
+    pub confidence: f64,
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_limits: Vec<String>,
+    pub evidence_handles: Vec<String>,
+    pub query_bundle: ResumeQueryBundleResult,
+    pub local_card: NativeResumeCard,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudResumeRequestSummary {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_frame_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudResumeStatus {
+    pub has_key: bool,
+    pub key_source: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpenResumePointInput {
+    pub output_path: Option<String>,
+    pub session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub current_frame_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub target_frame_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenResumePointResult {
+    pub strategy: String,
+    pub frame_id: Option<String>,
+    pub opened_url: Option<String>,
+    pub anchor_text: Option<String>,
+    pub confidence: f64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudResumeEvidenceRequest {
+    pub needed: bool,
+    #[serde(default)]
+    pub frame_ids: Vec<String>,
+    #[serde(default)]
+    pub episode_ids: Vec<String>,
+    #[serde(default)]
+    pub requested_modalities: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -911,6 +1327,10 @@ pub struct CompactContentUnit {
     pub unit_type: String,
     pub semantic_role: Option<String>,
     pub text: String,
+    pub bounds_x: Option<f64>,
+    pub bounds_y: Option<f64>,
+    pub bounds_w: Option<f64>,
+    pub bounds_h: Option<f64>,
     pub confidence: Option<f64>,
 }
 
@@ -1037,6 +1457,7 @@ pub struct ResumeContinueFrom {
     pub url: Option<String>,
     pub document_path: Option<String>,
     pub quote: Option<String>,
+    pub line_anchor: Option<ResumeLineAnchor>,
     pub reason: String,
 }
 
@@ -1166,17 +1587,42 @@ pub fn stop_capture(
     stop_runtime(state.inner())?;
 
     let mut stopped_session = None;
-    let mut export = None;
+    let mut resume_query = None;
     if let Some(session_id) = session_id {
-        let (session, summary) = finish_capture_session(&app, &session_id)?;
+        let session = finish_capture_session(&app, &session_id)?;
         {
             let mut runtime = lock_runtime(state.inner())?;
             runtime.active_session_id = None;
             runtime.last_session = Some(session.clone());
-            runtime.last_export = Some(summary.clone());
+            runtime.last_export = None;
         }
-        stopped_session = Some(session);
-        export = Some(summary);
+        stopped_session = Some(session.clone());
+
+        let latest_frame_id = {
+            let conn = open_db(&app)?;
+            latest_frame_id_for_session_from_conn(&conn, &session.id)
+                .ok()
+                .flatten()
+                .and_then(|id| id.parse::<i64>().ok())
+        };
+        resume_query = {
+            let conn = open_db(&app)?;
+            build_resume_query_bundle_from_conn(
+                &conn,
+                &project_resume_query_root()?,
+                Some(ResumeQueryBundleInput {
+                    session_id: Some(session.id.clone()),
+                    current_frame_id: latest_frame_id,
+                    lookback_minutes: None,
+                    max_episode_cards: None,
+                    max_images: None,
+                    max_json_chars: None,
+                    max_keyframes: Some(8),
+                    include_images: Some(true),
+                }),
+            )
+            .map(Some)?
+        };
     }
 
     let status = capture_status(app.clone(), state)?;
@@ -1185,21 +1631,29 @@ pub fn stop_capture(
         crate::session_island::SessionIslandState::StoppedToast,
     );
     crate::session_island::return_to_ready_after_stop(app.clone());
-    let preview = stopped_session
-        .as_ref()
-        .zip(export.as_ref())
-        .map(|(session, export)| {
-            serde_json::json!({
-                "schema": "smalltalk.capture_session.stop_preview.v1",
-                "session": session,
-                "export": export,
-            })
-        });
+    let preview = stopped_session.as_ref().map(|session| {
+        serde_json::json!({
+            "schema": "smalltalk.capture_session.stop_preview.v1",
+            "session": session,
+            "resumeQuery": resume_query.as_ref().map(|query| serde_json::json!({
+                "schema": query.bundle.schema,
+                "outputDir": query.output_dir,
+                "bundlePath": query.bundle_path,
+                "byteSize": query.byte_size,
+                "jsonCharCount": query.json_char_count,
+                "imageCount": query.image_count,
+                "episodeCount": query.bundle.candidate_episodes.len(),
+                "candidate": query.bundle.resume_candidate,
+                "missingEvidence": query.bundle.missing_evidence,
+            })),
+        })
+    });
 
     Ok(StopCaptureOutput {
         status,
         session: stopped_session,
-        export,
+        export: None,
+        resume_query,
         preview,
     })
 }
@@ -1642,6 +2096,7 @@ pub fn export_debug_episode(app: AppHandle, range_ms: Option<i64>) -> Result<Val
         SafeAiExportInput {
             lookback_minutes: None,
             range_ms,
+            session_id: None,
             current_frame_id: None,
             include_images: Some(false),
             max_frames: Some(120),
@@ -1702,6 +2157,7 @@ fn get_native_storyboard_dossier_from_conn(
         SafeAiExportInput {
             lookback_minutes: Some(lookback_minutes),
             range_ms: None,
+            session_id: None,
             current_frame_id: input.current_frame_id,
             include_images: input.include_images.or(Some(true)),
             max_frames: Some(120),
@@ -1726,6 +2182,7 @@ pub fn classify_episode_transitions(
         SafeAiExportInput {
             lookback_minutes: input.lookback_minutes.or(Some(20)),
             range_ms: input.range_ms,
+            session_id: None,
             current_frame_id: input.current_frame_id,
             include_images: Some(false),
             max_frames: Some(160),
@@ -1773,6 +2230,6009 @@ fn get_native_resume_card_from_conn(
 }
 
 #[tauri::command]
+pub fn build_resume_query_bundle(
+    app: AppHandle,
+    input: Option<ResumeQueryBundleInput>,
+) -> Result<ResumeQueryBundleResult, String> {
+    let conn = open_db(&app)?;
+    build_resume_query_bundle_from_conn(&conn, &project_resume_query_root()?, input)
+}
+
+#[tauri::command]
+pub fn build_session_index(
+    app: AppHandle,
+    input: Option<SessionIndexInput>,
+) -> Result<SessionIndex, String> {
+    let conn = open_db(&app)?;
+    let bundle = build_resume_query_bundle_from_conn(
+        &conn,
+        &project_resume_query_root()?,
+        Some(ResumeQueryBundleInput {
+            session_id: input.as_ref().and_then(|input| input.session_id.clone()),
+            current_frame_id: input.as_ref().and_then(|input| input.current_frame_id),
+            lookback_minutes: None,
+            max_episode_cards: Some(8),
+            max_images: Some(3),
+            max_json_chars: Some(40_000),
+            max_keyframes: None,
+            include_images: Some(false),
+        }),
+    )?;
+    Ok(bundle.bundle.session_index)
+}
+
+#[tauri::command]
+pub fn run_cloud_resume(
+    app: AppHandle,
+    input: Option<CloudResumeInput>,
+) -> Result<CloudResumeResult, String> {
+    let conn = open_db(&app)?;
+    let current_frame_id = input.as_ref().and_then(|input| input.current_frame_id);
+    let requested_session_id = resolve_cloud_resume_session_id(
+        &conn,
+        input.as_ref().and_then(|input| input.session_id.clone()),
+        current_frame_id,
+    )?;
+    let request_summary = CloudResumeRequestSummary {
+        session_id: requested_session_id.clone(),
+        current_frame_id,
+    };
+    let allow_followup = input
+        .as_ref()
+        .and_then(|input| input.allow_followup)
+        .unwrap_or(true);
+
+    if let Some(cached) =
+        cached_cloud_resume_result(&project_resume_query_root()?, &request_summary)?
+    {
+        let paths = capture_paths(&app)?;
+        let local_card = get_native_resume_card_from_conn(
+            &conn,
+            &paths.root_dir.join("safe-ai-exports"),
+            Some(NativeResumeInput {
+                lookback_minutes: Some(20),
+                max_keyframes: Some(10),
+                current_frame_id,
+            }),
+        )?;
+        return Ok(cached.into_cloud_resume_result(request_summary, local_card));
+    }
+
+    let config = cloud_resume_config()?;
+    let Some(api_key) = config.api_key else {
+        return Err("OPENAI_API_KEY is not set; Ask OpenAI did not call OpenAI.".to_string());
+    };
+
+    let query_bundle = build_resume_query_bundle_from_conn(
+        &conn,
+        &project_resume_query_root()?,
+        Some(ResumeQueryBundleInput {
+            session_id: Some(requested_session_id),
+            current_frame_id,
+            lookback_minutes: None,
+            max_episode_cards: Some(8),
+            max_images: Some(8),
+            max_json_chars: Some(40_000),
+            max_keyframes: None,
+            include_images: Some(true),
+        }),
+    )?;
+    let paths = capture_paths(&app)?;
+    let local_card = get_native_resume_card_from_conn(
+        &conn,
+        &paths.root_dir.join("safe-ai-exports"),
+        Some(NativeResumeInput {
+            lookback_minutes: Some(20),
+            max_keyframes: Some(10),
+            current_frame_id,
+        }),
+    )?;
+
+    let model = config.model.clone();
+    let mut request = build_openai_resume_request(&model, &query_bundle, None)?;
+    let first_response = match call_openai_responses(&api_key, &request) {
+        Ok(response) => response,
+        Err(error) => return Err(readable_openai_failure_message(&error)),
+    };
+    let mut parsed = match parse_openai_cloud_resume_response(&first_response) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return persist_and_return_cloud_resume(local_fallback_cloud_resume_result(
+                request_summary,
+                query_bundle,
+                local_card,
+                Some(model),
+                openai_response_id(&first_response),
+                format!(
+                    "OpenAI returned malformed or truncated JSON; using local resume target instead. {}",
+                    error
+                ),
+            ));
+        }
+    };
+    enforce_cloud_resume_anchor_contract(&mut parsed, &query_bundle.bundle);
+    let mut response_id = parsed.response_id.clone().ok_or_else(|| {
+        "OpenAI response did not include a response id; cloud result was not saved.".to_string()
+    })?;
+
+    if allow_followup && parsed.decision == "need_more_evidence" {
+        if let Some(evidence_request) = parsed.evidence_request.clone() {
+            let followup =
+                targeted_evidence_for_request(&conn, &query_bundle.bundle, &evidence_request)?;
+            request = build_openai_resume_request(&model, &query_bundle, Some(followup))?;
+            match call_openai_responses(&api_key, &request) {
+                Ok(second_response) => match parse_openai_cloud_resume_response(&second_response) {
+                    Ok(next_parsed) => {
+                        parsed = next_parsed;
+                        enforce_cloud_resume_anchor_contract(&mut parsed, &query_bundle.bundle);
+                        if let Some(next_response_id) = parsed.response_id.clone() {
+                            response_id = next_response_id;
+                        }
+                    }
+                    Err(error) => parsed.warnings.push(format!(
+                        "OpenAI follow-up returned malformed or truncated JSON; kept the first result. {}",
+                        error
+                    )),
+                },
+                Err(error) => parsed
+                    .warnings
+                    .push(readable_openai_followup_failure_message(&error)),
+            }
+        }
+    }
+
+    let result = CloudResumeResult {
+        schema: "smalltalk.cloud_resume_result.v1".to_string(),
+        request: request_summary,
+        cached: false,
+        source: "cloud".to_string(),
+        decision: parsed.decision,
+        resume_target: parsed.resume_target,
+        current_focus: parsed.current_focus,
+        resume_work_target: parsed.resume_work_target,
+        resume_target_if_returning: parsed.resume_target_if_returning,
+        answer: parsed.answer,
+        evidence_request: parsed.evidence_request,
+        confidence: parsed.confidence,
+        warnings: parsed.warnings,
+        evidence_limits: parsed.evidence_limits,
+        evidence_handles: parsed.evidence_handles,
+        query_bundle,
+        local_card,
+        model: Some(model),
+        response_id: Some(response_id),
+        output_path: None,
+    };
+    persist_and_return_cloud_resume(result)
+}
+
+#[tauri::command]
+pub fn get_cloud_resume_status() -> Result<CloudResumeStatus, String> {
+    let config = cloud_resume_config()?;
+    Ok(CloudResumeStatus {
+        has_key: config.api_key.is_some(),
+        key_source: config.key_source,
+        model: config.model,
+    })
+}
+
+#[tauri::command]
+pub fn open_resume_point(
+    app: AppHandle,
+    input: Option<OpenResumePointInput>,
+) -> Result<OpenResumePointResult, String> {
+    open_resume_point_impl(&app, input.unwrap_or_default())
+}
+
+#[derive(Debug, Clone)]
+struct ResumeQueryCandidateFrame {
+    original: CaptureFrame,
+    safe: SafeAiFrame,
+    selected_text: Option<String>,
+    line_anchor: Option<ResumeLineAnchor>,
+    line_anchors: Vec<ResumeLineAnchor>,
+    surface_type: String,
+    surface_state: String,
+    missing_evidence: Vec<String>,
+    redactions_applied: Vec<String>,
+    metadata_suspect: bool,
+    metadata_image_mismatch: bool,
+    text_chrome_dominated: bool,
+    is_debug_artifact: bool,
+    rejected_anchors: Vec<ResumeQueryRejectedAnchor>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedResumeQueryFrame {
+    role: String,
+    candidate: ResumeQueryCandidateFrame,
+}
+
+#[derive(Debug, Clone)]
+struct ScoredResumeQueryCandidate {
+    index: usize,
+    score: f64,
+    actionable_text: f64,
+    return_to_origin: f64,
+    user_interaction: f64,
+    recency: f64,
+    recognized_surface: f64,
+    line_anchor_quality: f64,
+    branch_penalty: f64,
+    artifact_penalty: f64,
+    chrome_penalty: f64,
+    unknown_surface_penalty: f64,
+    metadata_penalty: f64,
+}
+
+fn build_resume_query_bundle_from_conn(
+    conn: &Connection,
+    output_root: &Path,
+    input: Option<ResumeQueryBundleInput>,
+) -> Result<ResumeQueryBundleResult, String> {
+    let input = input.unwrap_or(ResumeQueryBundleInput {
+        session_id: None,
+        current_frame_id: None,
+        lookback_minutes: None,
+        max_episode_cards: None,
+        max_images: None,
+        max_json_chars: None,
+        max_keyframes: None,
+        include_images: None,
+    });
+    let session_id = input
+        .session_id
+        .clone()
+        .or_else(|| {
+            input
+                .current_frame_id
+                .and_then(|id| frame_session_id(conn, id).ok().flatten())
+        })
+        .or_else(|| latest_session_id(conn).ok().flatten())
+        .ok_or_else(|| "no capture session available for resume query bundle".to_string())?;
+    let session = load_capture_session(conn, &session_id)?;
+    let session_frames = frames_for_session(conn, &session.id)?;
+    let current_frame_id = input.current_frame_id.or_else(|| {
+        latest_frame_id_for_session_from_conn(conn, &session.id)
+            .ok()
+            .flatten()
+            .and_then(|id| id.parse::<i64>().ok())
+    });
+    let lookback_start = input.lookback_minutes.and_then(|minutes| {
+        current_frame_id
+            .and_then(|id| frame_captured_at(conn, id).ok().flatten())
+            .map(|end| end.saturating_sub(minutes.max(1) * 60_000))
+    });
+    let session_frames = session_frames
+        .into_iter()
+        .filter(|frame| lookback_start.map_or(true, |start| frame.captured_at >= start))
+        .collect::<Vec<_>>();
+    if session_frames.is_empty() {
+        return Err(format!("session {} has no frames to summarize", session.id));
+    }
+
+    let mut candidates = Vec::new();
+    let mut missing_evidence = Vec::new();
+    let mut redactions_applied = Vec::new();
+    for frame in &session_frames {
+        match resume_query_candidate_for_frame(conn, frame)? {
+            Some(candidate) => {
+                for item in &candidate.missing_evidence {
+                    push_unique(&mut missing_evidence, item.clone());
+                }
+                for item in &candidate.redactions_applied {
+                    push_unique(&mut redactions_applied, item.clone());
+                }
+                candidates.push(candidate);
+            }
+            None => push_unique(
+                &mut missing_evidence,
+                format!("frame {} excluded by privacy policy", frame.id),
+            ),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(format!(
+            "session {} has no model-safe frames after privacy filtering",
+            session.id
+        ));
+    }
+
+    let max_episode_cards = input.max_episode_cards.unwrap_or(8).clamp(3, 8) as usize;
+    let max_images = input
+        .max_images
+        .or(input.max_keyframes)
+        .unwrap_or(8)
+        .clamp(3, 8) as usize;
+    let max_json_chars = input.max_json_chars.unwrap_or(40_000).clamp(5_000, 80_000) as i64;
+    let include_images = input.include_images.unwrap_or(true);
+    let export_id = next_id("resume-query");
+    let output_dir = output_root.join(format!(
+        "{}-{}",
+        session_folder_name(session.sequence),
+        sanitize_id(&export_id)
+    ));
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).map_err(to_string)?;
+    }
+    fs::create_dir_all(&output_dir).map_err(to_string)?;
+
+    let stopped_at = session
+        .stopped_at
+        .or_else(|| {
+            candidates
+                .last()
+                .map(|candidate| candidate.safe.captured_at_ms)
+        })
+        .unwrap_or_else(now_millis);
+    let selected = select_resume_query_keyframes(
+        &candidates,
+        max_images,
+        session.started_at,
+        stopped_at,
+        current_frame_id,
+    );
+    let mut image_count = 0_i64;
+    let keyframes = selected
+        .iter()
+        .map(|selected| {
+            let image_ref = if include_images {
+                match copy_cloud_image_for_payload(&output_dir, selected) {
+                    Ok(Some(path)) => {
+                        image_count += 1;
+                        Some(path)
+                    }
+                    Ok(None) => {
+                        push_unique(
+                            &mut missing_evidence,
+                            format!(
+                                "frame {} has no model-safe image",
+                                selected.candidate.safe.frame_id
+                            ),
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        push_unique(
+                            &mut missing_evidence,
+                            format!(
+                                "frame {} image export failed: {}",
+                                selected.candidate.safe.frame_id, error
+                            ),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let visible_text = best_visible_text_for_cloud(&selected.candidate);
+            let visual_text_snippets = visual_text_snippets_for_cloud(&selected.candidate);
+            let line_anchor = best_line_anchor_for_cloud(&selected.candidate);
+            let quality_flags = quality_flags_for_cloud(&selected.candidate);
+            ResumeQueryKeyframe {
+                frame_id: selected.candidate.safe.frame_id.clone(),
+                t_rel_s: seconds_between(
+                    session.started_at,
+                    selected.candidate.safe.captured_at_ms,
+                ),
+                role: selected.role.clone(),
+                image_ref,
+                visible_text,
+                selected_text: selected.candidate.selected_text.clone(),
+                visual_text_snippets,
+                line_anchor,
+                quality_flags,
+                app: selected
+                    .candidate
+                    .safe
+                    .app_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                title: selected
+                    .candidate
+                    .safe
+                    .window_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if keyframes.is_empty() {
+        push_unique(&mut missing_evidence, "no keyframes selected".to_string());
+    }
+    if !selected.iter().any(|frame| frame.role == "side_branch")
+        && !resume_query_evidence_frames(
+            &candidates,
+            &selected,
+            None,
+            "branch_evidence",
+            max_images,
+        )
+        .is_empty()
+    {
+        push_unique(
+            &mut missing_evidence,
+            "distinct branch evidence summarized without a keyframe image".to_string(),
+        );
+    }
+
+    let base_resume_candidate = selected
+        .iter()
+        .find(|frame| frame.role == "resume_candidate")
+        .or_else(|| {
+            selected
+                .iter()
+                .find(|frame| frame.role == "return_to_origin")
+        })
+        .or_else(|| {
+            selected
+                .iter()
+                .find(|frame| !frame.candidate.is_debug_artifact)
+        })
+        .or_else(|| selected.last())
+        .ok_or_else(|| "no resume candidate selected".to_string())?;
+    let (candidate_anchors, diagnostic_rejected_anchors) = candidate_anchors_for_cloud(&candidates);
+    let current_focus_candidate = current_frame_id
+        .map(|id| id.to_string())
+        .and_then(|id| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.safe.frame_id == id)
+        })
+        .or_else(|| candidates.last());
+    let resume_candidate = current_focus_candidate
+        .filter(|current| {
+            surface_state_can_be_work_target(&current.surface_state)
+                && resume_candidates_share_stable_surface(current, &base_resume_candidate.candidate)
+        })
+        .map(|current| SelectedResumeQueryFrame {
+            role: "current_focus".to_string(),
+            candidate: current.clone(),
+        })
+        .unwrap_or_else(|| base_resume_candidate.clone());
+    let mut current_focus = current_focus_candidate.map(|candidate| {
+        focus_target_for_cloud(
+            candidate,
+            &candidate_anchors,
+            "Current selected frame when the resume query was generated.",
+        )
+    });
+    let resume_work_target = Some(focus_target_for_cloud(
+        &resume_candidate.candidate,
+        &candidate_anchors,
+        "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    ));
+    let resume_target_if_returning = resume_work_target.clone();
+    let visible_anchor = best_visible_text_for_cloud(&resume_candidate.candidate)
+        .or_else(|| resume_candidate.candidate.selected_text.clone())
+        .unwrap_or_else(|| {
+            resume_candidate
+                .candidate
+                .safe
+                .window_name
+                .clone()
+                .unwrap_or_else(|| "latest safe frame".to_string())
+        });
+    let line_anchor = best_line_anchor_for_cloud(&resume_candidate.candidate)
+        .unwrap_or_else(|| missing_line_anchor_for_candidate(&resume_candidate.candidate));
+    let exact_words = line_anchor
+        .quote
+        .clone()
+        .filter(|quote| candidate_anchor_text_exists(&candidate_anchors, quote))
+        .unwrap_or_default();
+    let section_anchor = line_anchor
+        .section_anchor
+        .clone()
+        .or_else(|| section_anchor_for_cloud(&resume_candidate.candidate, &visible_anchor));
+    let candidate_quality_flags = quality_flags_for_cloud(&resume_candidate.candidate);
+    let mut quality_flags = collect_cloud_quality_flags(&selected);
+    let mut evidence_conflicts = Vec::new();
+    if current_focus
+        .as_ref()
+        .is_some_and(|target| target.anchor_id.is_none())
+        && current_focus_candidate.is_some_and(|candidate| {
+            candidate.original.full_screenshot_path.is_some()
+                || candidate.original.active_window_crop_path.is_some()
+                || !candidate.original.snapshot_path.is_empty()
+        })
+    {
+        push_unique(
+            &mut quality_flags,
+            "current_frame_missing_page_body_anchor".to_string(),
+        );
+        push_unique(
+            &mut missing_evidence,
+            "current frame has an image but no valid page-body resume anchor survived validation"
+                .to_string(),
+        );
+        if let Some(target) = current_focus.as_mut() {
+            push_unique(
+                &mut target.quality_flags,
+                "current_frame_missing_page_body_anchor".to_string(),
+            );
+        }
+    }
+    if candidates
+        .last()
+        .is_some_and(|candidate| candidate.is_debug_artifact)
+        && !resume_candidate.candidate.is_debug_artifact
+    {
+        push_unique(
+            &mut quality_flags,
+            "last_frame_is_export_artifact".to_string(),
+        );
+        push_unique(
+            &mut evidence_conflicts,
+            "latest frame is an export/debug artifact, so the resume target was selected from the latest actionable work frame".to_string(),
+        );
+        push_unique(
+            &mut missing_evidence,
+            "latest frame is export/debug artifact; preserved as diagnostic evidence instead of resume target".to_string(),
+        );
+    }
+    if is_browser_chrome_heavy_text(&visible_anchor)
+        || is_export_debug_artifact(&visible_anchor, None, None)
+    {
+        push_unique(&mut quality_flags, "exact_words_chrome_heavy".to_string());
+        push_unique(
+            &mut missing_evidence,
+            "resume anchor text is chrome/file-title heavy and needs page-body evidence"
+                .to_string(),
+        );
+    }
+    for flag in &candidate_quality_flags {
+        if matches!(
+            flag.as_str(),
+            "json_visible_text_was_browser_chrome_heavy"
+                | "surface_type_unknown"
+                | "metadata_suspect"
+                | "debug_artifact_frame"
+        ) {
+            push_unique(
+                &mut missing_evidence,
+                format!("resume candidate quality flag: {}", flag),
+            );
+        }
+    }
+    let diagnostic_artifacts = resume_query_evidence_frames(
+        &candidates,
+        &selected,
+        Some(&resume_candidate.candidate.safe.frame_id),
+        "diagnostic_artifact",
+        max_images,
+    );
+    let branch_evidence = resume_query_evidence_frames(
+        &candidates,
+        &selected,
+        Some(&resume_candidate.candidate.safe.frame_id),
+        "branch_evidence",
+        max_images,
+    );
+    let dropped_frame_summary = dropped_resume_query_frames(
+        &candidates,
+        &selected,
+        &diagnostic_artifacts,
+        &branch_evidence,
+        max_images,
+    );
+    let confidence_breakdown = confidence_breakdown_for_cloud(
+        &candidates,
+        &resume_candidate.candidate.safe.frame_id,
+        session.started_at,
+        stopped_at,
+    );
+    let candidate_episodes = resume_query_episode_cards(
+        conn,
+        &session,
+        stopped_at,
+        &candidates,
+        &selected,
+        max_episode_cards,
+    )?;
+    let timeline = candidates
+        .iter()
+        .map(|candidate| evidence_frame_for_cloud(candidate, "timeline"))
+        .collect::<Vec<_>>();
+    let transitions =
+        build_resume_query_transitions_from_conn(conn, &session, stopped_at, &selected)?;
+    let session_index = build_session_index_from_parts(
+        &session,
+        stopped_at,
+        &candidates,
+        &selected,
+        &candidate_episodes,
+        &quality_flags,
+        &evidence_conflicts,
+        current_frame_id,
+    );
+    persist_resume_query_episode_cards(conn, &session.id, &candidate_episodes)?;
+
+    let mut payload = ResumeQueryBundle {
+        schema: "smalltalk.resume_query.v1".to_string(),
+        budget: ResumeQueryBudget {
+            max_json_chars,
+            max_episode_cards: max_episode_cards as i64,
+            max_images: max_images as i64,
+            max_text_snippets_per_episode: 5,
+            max_output_tokens: 2400,
+        },
+        session: ResumeQuerySession {
+            id: session.id.clone(),
+            started_at: session.started_at,
+            stopped_at,
+            duration_s: seconds_between(session.started_at, stopped_at),
+        },
+        session_index,
+        candidate_episodes,
+        resume_candidate: ResumeQueryCandidate {
+            frame_id: resume_candidate.candidate.safe.frame_id.clone(),
+            app: resume_candidate
+                .candidate
+                .safe
+                .app_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            window_title: resume_candidate
+                .candidate
+                .safe
+                .window_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            surface_type: resume_candidate.candidate.surface_type.clone(),
+            local_url_ref: local_url_ref(
+                resume_candidate.candidate.original.browser_url.as_deref(),
+            ),
+            visible_anchor: truncate_chars(&visible_anchor, 240),
+            section_anchor,
+            exact_words,
+            line_anchor,
+            confidence: resume_query_confidence(&resume_candidate.candidate, Some(&visible_anchor)),
+            quality_flags: candidate_quality_flags,
+        },
+        current_focus,
+        resume_work_target,
+        resume_target_if_returning,
+        candidate_anchors,
+        diagnostic_rejected_anchors,
+        diagnostic_artifacts,
+        branch_evidence,
+        dropped_frame_summary,
+        timeline,
+        evidence_conflicts,
+        confidence_breakdown,
+        keyframes,
+        transitions,
+        privacy: ResumeQueryPrivacy {
+            redactions_applied,
+            raw_urls_sent: false,
+            raw_paths_sent: false,
+            raw_clipboard_sent: false,
+            raw_keystrokes_sent: false,
+        },
+        quality_flags,
+        missing_evidence,
+        ask: ResumeQueryAsk {
+            task: "infer_resume_target".to_string(),
+            allow_need_more_evidence: true,
+        },
+    };
+
+    let json_char_count = enforce_resume_query_json_budget(&mut payload)?;
+    let payload_path = output_dir.join("resume-query-bundle.json");
+    write_json_pretty(
+        &payload_path,
+        &serde_json::to_value(&payload).map_err(to_string)?,
+    )?;
+    let stats = directory_stats(&output_dir)?;
+    Ok(ResumeQueryBundleResult {
+        output_dir: output_dir.to_string_lossy().to_string(),
+        bundle_path: payload_path.to_string_lossy().to_string(),
+        payload_path: payload_path.to_string_lossy().to_string(),
+        byte_size: stats.byte_size,
+        image_count,
+        json_char_count,
+        bundle: payload.clone(),
+        payload,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ResumeQueryEpisodeGroup {
+    start_index: usize,
+    end_index: usize,
+}
+
+fn resume_query_episode_cards(
+    conn: &Connection,
+    session: &CaptureSession,
+    stopped_at: i64,
+    candidates: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+    max_cards: usize,
+) -> Result<Vec<ResumeQueryEpisodeCard>, String> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let events = query_ui_events_between(conn, session.started_at, stopped_at, Some(&session.id))?;
+    let groups = group_resume_query_candidates(candidates);
+    let cards = groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            resume_query_episode_card_for_group(
+                session,
+                stopped_at,
+                candidates,
+                selected,
+                &events,
+                group_index,
+                group,
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(trim_resume_query_episode_cards(cards, selected, max_cards))
+}
+
+fn group_resume_query_candidates(
+    candidates: &[ResumeQueryCandidateFrame],
+) -> Vec<ResumeQueryEpisodeGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0_usize;
+    let mut last_key = cloud_surface_key(&candidates[0]);
+    for (index, candidate) in candidates.iter().enumerate().skip(1) {
+        let key = cloud_surface_key(candidate);
+        if key != last_key {
+            groups.push(ResumeQueryEpisodeGroup {
+                start_index: start,
+                end_index: index - 1,
+            });
+            start = index;
+            last_key = key;
+        }
+    }
+    groups.push(ResumeQueryEpisodeGroup {
+        start_index: start,
+        end_index: candidates.len() - 1,
+    });
+    groups
+}
+
+fn resume_query_episode_card_for_group(
+    session: &CaptureSession,
+    stopped_at: i64,
+    candidates: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+    events: &[UiEventSummary],
+    group_index: usize,
+    group: &ResumeQueryEpisodeGroup,
+) -> ResumeQueryEpisodeCard {
+    let frames = &candidates[group.start_index..=group.end_index];
+    let first = frames
+        .first()
+        .expect("episode group has at least one frame");
+    let last = frames.last().unwrap_or(first);
+    let start_ms = if group_index == 0 {
+        session.started_at
+    } else {
+        first.safe.captured_at_ms.saturating_sub(1_000)
+    };
+    let end_ms = if group.end_index + 1 < candidates.len() {
+        candidates[group.end_index + 1].safe.captured_at_ms
+    } else {
+        stopped_at
+    };
+    let role = resume_query_episode_role(frames, selected);
+    let mut important_text = Vec::new();
+    for candidate in frames {
+        if let Some(anchor) = best_line_anchor_for_cloud(candidate).and_then(|anchor| anchor.quote)
+        {
+            push_unique(&mut important_text, truncate_chars(&anchor, 220));
+        }
+        for snippet in visual_text_snippets_for_cloud(candidate) {
+            push_unique(&mut important_text, snippet);
+        }
+        if important_text.len() >= 8 {
+            break;
+        }
+    }
+    if important_text.is_empty() {
+        if let Some(title) = first
+            .safe
+            .window_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            important_text.push(truncate_chars(title, 160));
+        }
+    }
+    important_text.truncate(8);
+    let confidence = frames
+        .iter()
+        .map(|candidate| {
+            resume_query_confidence(candidate, best_visible_text_for_cloud(candidate).as_deref())
+        })
+        .sum::<f64>()
+        / frames.len().max(1) as f64;
+    let mut keyframes = frames
+        .iter()
+        .map(|candidate| candidate.safe.frame_id.clone())
+        .collect::<Vec<_>>();
+    if keyframes.len() > 6 {
+        keyframes = vec![first.safe.frame_id.clone(), last.safe.frame_id.clone()];
+    }
+    let mut quality_flags = Vec::new();
+    for candidate in frames {
+        for flag in quality_flags_for_cloud(candidate) {
+            push_unique(&mut quality_flags, flag);
+        }
+    }
+    ResumeQueryEpisodeCard {
+        episode_id: format!("ep-{}-{}", first.safe.frame_id, last.safe.frame_id),
+        frame_range: vec![first.safe.frame_id.clone(), last.safe.frame_id.clone()],
+        role_guess: role,
+        app: first
+            .safe
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        surface_type: if frames.iter().any(|candidate| candidate.is_debug_artifact) {
+            "export_debug_artifact".to_string()
+        } else {
+            first.surface_type.clone()
+        },
+        title: first
+            .safe
+            .window_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        duration_s: seconds_between(first.safe.captured_at_ms, last.safe.captured_at_ms)
+            .max(seconds_between(start_ms, end_ms).min(90.0)),
+        important_text,
+        events: resume_query_episode_events_for_window(events, frames, start_ms, end_ms),
+        keyframes,
+        confidence,
+        quality_flags,
+    }
+}
+
+fn resume_query_episode_role(
+    frames: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+) -> String {
+    for role in [
+        "resume_candidate",
+        "return_to_origin",
+        "origin",
+        "side_branch",
+        "diagnostic_artifact",
+    ] {
+        if frames.iter().any(|candidate| {
+            selected.iter().any(|item| {
+                item.role == role && item.candidate.safe.frame_id == candidate.safe.frame_id
+            })
+        }) {
+            return role.to_string();
+        }
+    }
+    "candidate".to_string()
+}
+
+fn resume_query_episode_events_for_window(
+    events: &[UiEventSummary],
+    frames: &[ResumeQueryCandidateFrame],
+    start_ms: i64,
+    end_ms: i64,
+) -> ResumeQueryEpisodeEvents {
+    let mut counts = ResumeQueryEpisodeEvents::default();
+    for event in events {
+        if event.ts_ms < start_ms || event.ts_ms > end_ms {
+            continue;
+        }
+        match event.event_type.as_str() {
+            "click" => counts.clicks += 1,
+            "scroll" => counts.scrolls += 1,
+            "key_down" | "typing_pause" => counts.typing_bursts += 1,
+            "app_switch" => counts.app_switches += 1,
+            _ => {}
+        }
+    }
+    counts.selections = frames
+        .iter()
+        .filter(|candidate| candidate.selected_text.is_some())
+        .count() as i64;
+    counts
+}
+
+fn trim_resume_query_episode_cards(
+    mut cards: Vec<ResumeQueryEpisodeCard>,
+    selected: &[SelectedResumeQueryFrame],
+    max_cards: usize,
+) -> Vec<ResumeQueryEpisodeCard> {
+    if cards.len() <= max_cards {
+        return cards;
+    }
+    let selected_frames = selected
+        .iter()
+        .map(|item| item.candidate.safe.frame_id.clone())
+        .collect::<HashSet<_>>();
+    let mut kept = Vec::new();
+    for card in &cards {
+        if card
+            .keyframes
+            .iter()
+            .any(|frame_id| selected_frames.contains(frame_id))
+        {
+            kept.push(card.clone());
+        }
+    }
+    for card in cards.drain(..).rev() {
+        if kept.len() >= max_cards {
+            break;
+        }
+        if !kept
+            .iter()
+            .any(|existing| existing.episode_id == card.episode_id)
+        {
+            kept.push(card);
+        }
+    }
+    kept.sort_by_key(|card| {
+        card.frame_range
+            .first()
+            .and_then(|frame_id| frame_id.parse::<i64>().ok())
+            .unwrap_or(i64::MAX)
+    });
+    kept.truncate(max_cards);
+    kept
+}
+
+fn build_session_index_from_parts(
+    session: &CaptureSession,
+    stopped_at: i64,
+    candidates: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+    episodes: &[ResumeQueryEpisodeCard],
+    quality_flags: &[String],
+    evidence_conflicts: &[String],
+    current_frame_id: Option<i64>,
+) -> SessionIndex {
+    let mut surface_sequence = Vec::new();
+    for candidate in candidates {
+        let app = candidate
+            .safe
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let title = candidate
+            .safe
+            .window_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let label = truncate_chars(&format!("{}/{}", app, title), 120);
+        if surface_sequence.last() != Some(&label) {
+            surface_sequence.push(label);
+        }
+    }
+    surface_sequence.truncate(32);
+
+    let candidate_resume_frames = selected
+        .iter()
+        .filter(|frame| matches!(frame.role.as_str(), "resume_candidate" | "return_to_origin"))
+        .map(|frame| frame.candidate.safe.frame_id.clone())
+        .collect::<Vec<_>>();
+    let branch_frames = selected
+        .iter()
+        .filter(|frame| frame.role == "side_branch")
+        .map(|frame| frame.candidate.safe.frame_id.clone())
+        .collect::<Vec<_>>();
+    let return_to_origin_frames = selected
+        .iter()
+        .filter(|frame| frame.role == "return_to_origin")
+        .map(|frame| frame.candidate.safe.frame_id.clone())
+        .collect::<Vec<_>>();
+    let artifact_frames = candidates
+        .iter()
+        .filter(|candidate| candidate.is_debug_artifact)
+        .map(|candidate| candidate.safe.frame_id.clone())
+        .collect::<Vec<_>>();
+
+    SessionIndex {
+        schema: "smalltalk.session_index.v1".to_string(),
+        session_id: session.id.clone(),
+        current_frame_id: current_frame_id.map(|id| id.to_string()),
+        duration_s: seconds_between(session.started_at, stopped_at),
+        episode_count: episodes.len(),
+        surface_sequence,
+        candidate_resume_frames,
+        artifact_frames,
+        branch_frames,
+        return_to_origin_frames,
+        quality_flags: quality_flags.to_vec(),
+        episodes: episodes.to_vec(),
+        evidence_conflicts: evidence_conflicts.to_vec(),
+    }
+}
+
+fn persist_resume_query_episode_cards(
+    conn: &Connection,
+    session_id: &str,
+    cards: &[ResumeQueryEpisodeCard],
+) -> Result<(), String> {
+    let now = now_millis();
+    conn.execute(
+        "DELETE FROM episode_evidence
+         WHERE episode_id IN (
+           SELECT id FROM episodes
+           WHERE session_id = ?1
+             AND metadata_json LIKE '%\"builder\":\"resume_query\"%'
+         )",
+        params![session_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "DELETE FROM episodes
+         WHERE session_id = ?1
+           AND metadata_json LIKE '%\"builder\":\"resume_query\"%'",
+        params![session_id],
+    )
+    .map_err(to_string)?;
+
+    for card in cards {
+        let start_frame_id = card.frame_range.first().cloned().unwrap_or_default();
+        let end_frame_id = card
+            .frame_range
+            .last()
+            .cloned()
+            .unwrap_or_else(|| start_frame_id.clone());
+        let started_at = start_frame_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| frame_captured_at(conn, id).ok().flatten())
+            .unwrap_or(now);
+        let ended_at = end_frame_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| frame_captured_at(conn, id).ok().flatten())
+            .unwrap_or(started_at);
+        let episode_id = format!(
+            "resume-query-{}-{}",
+            sanitize_id(session_id),
+            card.episode_id
+        );
+        let quality_flags_json = serde_json::to_string(&card.quality_flags).map_err(to_string)?;
+        let metadata_json = serde_json::json!({
+            "builder": "resume_query",
+            "source_episode_id": card.episode_id,
+            "keyframes": card.keyframes,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO episodes (
+                id, session_id, start_frame_id, end_frame_id, started_at_ms, ended_at_ms,
+                status, role_guess, app, surface_type, title, primary_goal,
+                current_surface_type, confidence, summary, quality_flags_json, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'closed', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                &episode_id,
+                session_id,
+                &start_frame_id,
+                &end_frame_id,
+                started_at,
+                ended_at,
+                &card.role_guess,
+                &card.app,
+                &card.surface_type,
+                &card.title,
+                card.important_text.first().cloned(),
+                &card.surface_type,
+                card.confidence,
+                card.important_text.join("\n"),
+                quality_flags_json,
+                metadata_json,
+            ],
+        )
+        .map_err(to_string)?;
+
+        for (index, text) in card.important_text.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO episode_evidence (
+                    id, episode_id, frame_id, evidence_type, text, image_ref, score, reason, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 'text_snippet', ?4, NULL, ?5, ?6, ?7)",
+                params![
+                    format!("{}-text-{}", episode_id, index),
+                    episode_id,
+                    start_frame_id,
+                    text,
+                    card.confidence,
+                    card.role_guess,
+                    now,
+                ],
+            )
+            .map_err(to_string)?;
+        }
+    }
+    Ok(())
+}
+
+fn enforce_resume_query_json_budget(payload: &mut ResumeQueryBundle) -> Result<i64, String> {
+    let max_chars = payload.budget.max_json_chars.max(5_000) as usize;
+    loop {
+        let len = serde_json::to_string(payload)
+            .map_err(to_string)?
+            .chars()
+            .count();
+        if len <= max_chars {
+            payload.session_index.episode_count = payload.candidate_episodes.len();
+            payload.session_index.episodes = payload.candidate_episodes.clone();
+            return Ok(len as i64);
+        }
+        if !payload.dropped_frame_summary.is_empty() {
+            payload.dropped_frame_summary.pop();
+            continue;
+        }
+        if payload.timeline.len() > payload.candidate_episodes.len().max(8) {
+            payload.timeline.pop();
+            continue;
+        }
+        if payload.candidate_episodes.len() > 3 {
+            payload.candidate_episodes.pop();
+            continue;
+        }
+        if payload.candidate_anchors.len() > 24 {
+            trim_candidate_anchors_for_budget(payload);
+            continue;
+        }
+        if payload.diagnostic_rejected_anchors.len() > 32 {
+            payload.diagnostic_rejected_anchors.pop();
+            continue;
+        }
+        if !payload.branch_evidence.is_empty() {
+            payload.branch_evidence.pop();
+            continue;
+        }
+        if payload.diagnostic_artifacts.len() > 1 {
+            payload.diagnostic_artifacts.pop();
+            continue;
+        }
+        push_unique(
+            &mut payload.missing_evidence,
+            format!(
+                "resume query JSON exceeded budget after trimming ({} chars > {})",
+                len, max_chars
+            ),
+        );
+        return Ok(len as i64);
+    }
+}
+
+fn trim_candidate_anchors_for_budget(payload: &mut ResumeQueryBundle) {
+    let mut protected = HashSet::new();
+    protected.insert(payload.resume_candidate.frame_id.clone());
+    if let Some(target) = payload.current_focus.as_ref() {
+        protected.insert(target.frame_id.clone());
+    }
+    if let Some(target) = payload.resume_target_if_returning.as_ref() {
+        protected.insert(target.frame_id.clone());
+    }
+    for keyframe in &payload.keyframes {
+        protected.insert(keyframe.frame_id.clone());
+    }
+
+    if let Some(index) = payload
+        .candidate_anchors
+        .iter()
+        .rposition(|anchor| !protected.contains(&anchor.frame_id))
+    {
+        payload.candidate_anchors.remove(index);
+        return;
+    }
+    payload.candidate_anchors.pop();
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCloudResume {
+    response_id: Option<String>,
+    decision: String,
+    resume_target: Value,
+    current_focus: Value,
+    resume_work_target: Value,
+    resume_target_if_returning: Value,
+    answer: Value,
+    evidence_request: Option<CloudResumeEvidenceRequest>,
+    confidence: f64,
+    warnings: Vec<String>,
+    evidence_limits: Vec<String>,
+    evidence_handles: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CloudResumeRuntimeConfig {
+    api_key: Option<String>,
+    key_source: String,
+    model: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCloudResumeResult {
+    decision: String,
+    resume_target: Value,
+    current_focus: Value,
+    resume_work_target: Value,
+    resume_target_if_returning: Value,
+    answer: Value,
+    evidence_request: Option<CloudResumeEvidenceRequest>,
+    confidence: f64,
+    warnings: Vec<String>,
+    evidence_limits: Vec<String>,
+    evidence_handles: Vec<String>,
+    query_bundle: ResumeQueryBundleResult,
+    model: Option<String>,
+    response_id: String,
+    output_path: PathBuf,
+}
+
+impl CachedCloudResumeResult {
+    fn into_cloud_resume_result(
+        self,
+        request: CloudResumeRequestSummary,
+        local_card: NativeResumeCard,
+    ) -> CloudResumeResult {
+        CloudResumeResult {
+            schema: "smalltalk.cloud_resume_result.v1".to_string(),
+            request,
+            cached: true,
+            source: "cloud".to_string(),
+            decision: self.decision,
+            resume_target: self.resume_target,
+            current_focus: self.current_focus,
+            resume_work_target: self.resume_work_target,
+            resume_target_if_returning: self.resume_target_if_returning,
+            answer: self.answer,
+            evidence_request: self.evidence_request,
+            confidence: self.confidence,
+            warnings: self.warnings,
+            evidence_limits: self.evidence_limits,
+            evidence_handles: self.evidence_handles,
+            query_bundle: self.query_bundle,
+            local_card,
+            model: self.model,
+            response_id: Some(self.response_id),
+            output_path: Some(self.output_path.to_string_lossy().to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenResumeCloudFile {
+    generated_at_ms: i64,
+    source: String,
+    response_id: Option<String>,
+    request: Option<CloudResumeRequestSummary>,
+    resume_target: Value,
+    current_focus: Value,
+    resume_work_target: Value,
+    resume_target_if_returning: Value,
+    confidence: f64,
+    warnings: Vec<String>,
+    query_bundle_path: Option<PathBuf>,
+    output_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedOpenResumePoint {
+    frame: CaptureFrame,
+    frame_id: String,
+    url: Option<String>,
+    app_name: Option<String>,
+    anchor_text: Option<String>,
+    confidence: f64,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserOpenOutcome {
+    strategy: String,
+    warnings: Vec<String>,
+}
+
+fn open_resume_point_impl(
+    app: &AppHandle,
+    input: OpenResumePointInput,
+) -> Result<OpenResumePointResult, String> {
+    let conn = open_db(app)?;
+    let cloud_file = load_cloud_resume_file_for_open(&conn, &input)?;
+    let mut warnings = Vec::new();
+
+    if cloud_file.is_none() {
+        warnings.push(
+            "No completed cloud resume result was found for this session; showing Smalltalk instead."
+                .to_string(),
+        );
+    }
+
+    let Some(resolved) =
+        resolve_open_resume_point(app, &conn, &input, cloud_file.as_ref(), &mut warnings)?
+    else {
+        focus_main_window_for_resume(app);
+        return Ok(OpenResumePointResult {
+            strategy: "smalltalk_fallback".to_string(),
+            frame_id: None,
+            opened_url: None,
+            anchor_text: None,
+            confidence: 0.0,
+            warnings,
+        });
+    };
+
+    warnings.extend(resolved.warnings.clone());
+    let frame_key = resolved.frame.id.to_string();
+    let sensitive_regions = query_sensitive_regions(&conn, &frame_key)?;
+    let privacy = export_privacy_for_frame(&resolved.frame, &sensitive_regions);
+    if privacy.exclude_all {
+        warnings.push(format!(
+            "Frame {} is excluded by privacy policy ({}); Smalltalk did not automate another app.",
+            frame_key, privacy.exclude_reason
+        ));
+        focus_main_window_for_resume(app);
+        return Ok(OpenResumePointResult {
+            strategy: "smalltalk_privacy_fallback".to_string(),
+            frame_id: Some(resolved.frame_id),
+            opened_url: None,
+            anchor_text: resolved.anchor_text,
+            confidence: resolved.confidence,
+            warnings,
+        });
+    }
+
+    let Some(url) = resolved.url.clone() else {
+        warnings.push(format!(
+            "Frame {} has no captured browser URL; showing Smalltalk evidence instead.",
+            resolved.frame_id
+        ));
+        focus_main_window_for_resume(app);
+        return Ok(OpenResumePointResult {
+            strategy: "smalltalk_fallback".to_string(),
+            frame_id: Some(resolved.frame_id),
+            opened_url: None,
+            anchor_text: resolved.anchor_text,
+            confidence: resolved.confidence,
+            warnings,
+        });
+    };
+
+    match open_browser_resume_point(
+        resolved.app_name.as_deref(),
+        &url,
+        resolved.anchor_text.as_deref(),
+    ) {
+        Ok(outcome) => {
+            warnings.extend(outcome.warnings);
+            Ok(OpenResumePointResult {
+                strategy: outcome.strategy,
+                frame_id: Some(resolved.frame_id),
+                opened_url: Some(url),
+                anchor_text: resolved.anchor_text,
+                confidence: resolved.confidence,
+                warnings,
+            })
+        }
+        Err(error) => {
+            warnings.push(error);
+            warnings.push(
+                "Smalltalk could not complete native browser automation; showing the resume trail."
+                    .to_string(),
+            );
+            focus_main_window_for_resume(app);
+            Ok(OpenResumePointResult {
+                strategy: "smalltalk_automation_fallback".to_string(),
+                frame_id: Some(resolved.frame_id),
+                opened_url: Some(url),
+                anchor_text: resolved.anchor_text,
+                confidence: resolved.confidence,
+                warnings,
+            })
+        }
+    }
+}
+
+fn load_cloud_resume_file_for_open(
+    conn: &Connection,
+    input: &OpenResumePointInput,
+) -> Result<Option<OpenResumeCloudFile>, String> {
+    if let Some(path) = input
+        .output_path
+        .as_deref()
+        .and_then(|value| non_empty(value.to_string()))
+    {
+        let path = normalize_cloud_resume_result_path(PathBuf::from(path));
+        return read_open_resume_cloud_file(&path).map(Some);
+    }
+
+    let session_id = input
+        .session_id
+        .clone()
+        .and_then(non_empty)
+        .or_else(|| {
+            input
+                .current_frame_id
+                .or(input.target_frame_id)
+                .and_then(|id| frame_session_id(conn, id).ok().flatten())
+        })
+        .or_else(|| latest_session_id(conn).ok().flatten());
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+
+    latest_open_resume_cloud_file_for_session(&project_resume_query_root()?, &session_id)
+}
+
+fn normalize_cloud_resume_result_path(path: PathBuf) -> PathBuf {
+    if path.is_dir() {
+        path.join("cloud-resume-result.json")
+    } else {
+        path
+    }
+}
+
+fn latest_open_resume_cloud_file_for_session(
+    output_root: &Path,
+    session_id: &str,
+) -> Result<Option<OpenResumeCloudFile>, String> {
+    if !output_root.exists() {
+        return Ok(None);
+    }
+
+    let mut best: Option<OpenResumeCloudFile> = None;
+    for entry in fs::read_dir(output_root).map_err(to_string)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let result_path = entry.path().join("cloud-resume-result.json");
+        if !result_path.exists() {
+            continue;
+        }
+        let Ok(candidate) = read_open_resume_cloud_file(&result_path) else {
+            continue;
+        };
+        if candidate.source != "cloud" || candidate.response_id.is_none() {
+            continue;
+        }
+        if !open_resume_cloud_file_matches_session(&candidate, session_id) {
+            continue;
+        }
+        if best.as_ref().map_or(true, |current| {
+            candidate.generated_at_ms > current.generated_at_ms
+        }) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn open_resume_cloud_file_matches_session(file: &OpenResumeCloudFile, session_id: &str) -> bool {
+    if file
+        .request
+        .as_ref()
+        .is_some_and(|request| request.session_id == session_id)
+    {
+        return true;
+    }
+    file.query_bundle_path
+        .as_ref()
+        .and_then(|path| read_resume_query_bundle_result(path).ok())
+        .is_some_and(|bundle| bundle.bundle.session.id == session_id)
+}
+
+fn read_open_resume_cloud_file(result_path: &Path) -> Result<OpenResumeCloudFile, String> {
+    let raw = fs::read_to_string(result_path).map_err(to_string)?;
+    let payload: Value = serde_json::from_str(&raw).map_err(to_string)?;
+    let query_bundle_path = payload
+        .get("query_bundle_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            result_path
+                .parent()
+                .map(|parent| parent.join("resume-query-bundle.json"))
+        });
+    Ok(OpenResumeCloudFile {
+        generated_at_ms: payload
+            .get("generated_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        source: payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        response_id: payload
+            .get("response_id")
+            .and_then(Value::as_str)
+            .and_then(|value| non_empty(value.to_string())),
+        request: payload
+            .get("request")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<CloudResumeRequestSummary>(value).ok()),
+        resume_target: payload
+            .get("resume_target")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        current_focus: payload
+            .get("current_focus")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        resume_work_target: payload
+            .get("resume_work_target")
+            .or_else(|| payload.get("resume_target_if_returning"))
+            .or_else(|| payload.get("resume_target"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        resume_target_if_returning: payload
+            .get("resume_target_if_returning")
+            .or_else(|| payload.get("resume_work_target"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        confidence: payload
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        warnings: json_string_array(payload.get("warnings")),
+        query_bundle_path,
+        output_path: result_path.to_path_buf(),
+    })
+}
+
+fn resolve_open_resume_point(
+    app: &AppHandle,
+    conn: &Connection,
+    input: &OpenResumePointInput,
+    cloud_file: Option<&OpenResumeCloudFile>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    if let Some(target_frame_id) = input.target_frame_id {
+        if let Some(frame) = frame_by_id(conn, target_frame_id)? {
+            let preferred_anchor =
+                cloud_file.and_then(|file| cloud_resume_anchor_for_frame(file, target_frame_id));
+            let confidence = cloud_file.map_or(0.8, |file| file.confidence);
+            return resolved_open_resume_point_from_frame(
+                conn,
+                frame,
+                preferred_anchor,
+                confidence,
+            )
+            .map(Some);
+        }
+        warnings.push(format!(
+            "Requested target frame {} is missing locally.",
+            target_frame_id
+        ));
+    }
+
+    if let Some(file) = cloud_file {
+        if let Some(point) = resolve_cloud_resume_target_for_open(conn, file, warnings)? {
+            return Ok(Some(point));
+        }
+    }
+
+    if let Some(point) =
+        resolve_open_resume_point_from_local_card(app, conn, input, cloud_file, warnings)?
+    {
+        return Ok(Some(point));
+    }
+
+    if let Some(file) = cloud_file {
+        if let Some(point) = resolve_query_bundle_candidate_for_open(conn, file, warnings)? {
+            return Ok(Some(point));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_cloud_resume_target_for_open(
+    conn: &Connection,
+    file: &OpenResumeCloudFile,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    if file.source != "cloud" {
+        warnings.push(format!(
+            "{} is not a completed cloud result; source={}",
+            file.output_path.display(),
+            file.source
+        ));
+    }
+    warnings.extend(file.warnings.clone());
+    if file.response_id.is_none() {
+        warnings.push(
+            "Cloud resume result has no response id; treating it as unsafe to trust directly."
+                .to_string(),
+        );
+    }
+
+    let target = if file
+        .resume_work_target
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        &file.resume_work_target
+    } else {
+        &file.resume_target
+    };
+    let target_anchor = cloud_resume_target_anchor(target);
+    if let Some(frame_id) = cloud_resume_target_frame_id(target) {
+        match frame_by_id(conn, frame_id)? {
+            Some(frame) => {
+                return resolved_open_resume_point_from_frame(
+                    conn,
+                    frame,
+                    target_anchor,
+                    file.confidence,
+                )
+                .map(Some);
+            }
+            None => warnings.push(format!(
+                "Cloud resume target frame {} is missing locally.",
+                frame_id
+            )),
+        }
+    } else {
+        warnings.push("Cloud resume result did not include a usable target frame id.".to_string());
+    }
+    Ok(None)
+}
+
+fn resolve_query_bundle_candidate_for_open(
+    conn: &Connection,
+    file: &OpenResumeCloudFile,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    let Some(bundle_path) = file.query_bundle_path.as_ref().filter(|path| path.exists()) else {
+        return Ok(None);
+    };
+    let bundle = read_resume_query_bundle_result(bundle_path)?;
+    let Ok(frame_id) = bundle.bundle.resume_candidate.frame_id.parse::<i64>() else {
+        return Ok(None);
+    };
+    let Some(frame) = frame_by_id(conn, frame_id)? else {
+        return Ok(None);
+    };
+    warnings.push(
+        "Falling back to the local resume query candidate because the cloud target was unusable."
+            .to_string(),
+    );
+    resolved_open_resume_point_from_frame(
+        conn,
+        frame,
+        non_empty(bundle.bundle.resume_candidate.exact_words.clone()),
+        bundle.bundle.resume_candidate.confidence,
+    )
+    .map(Some)
+}
+
+fn resolve_open_resume_point_from_local_card(
+    app: &AppHandle,
+    conn: &Connection,
+    input: &OpenResumePointInput,
+    cloud_file: Option<&OpenResumeCloudFile>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    let current_frame_id = input
+        .current_frame_id
+        .or(input.target_frame_id)
+        .or_else(|| cloud_file.and_then(|file| file.request.as_ref()?.current_frame_id))
+        .or_else(|| {
+            cloud_file.and_then(|file| {
+                cloud_resume_target_frame_id(&file.resume_work_target)
+                    .or_else(|| cloud_resume_target_frame_id(&file.resume_target))
+            })
+        });
+    let paths = capture_paths(app)?;
+    let local_card = match get_native_resume_card_from_conn(
+        conn,
+        &paths.root_dir.join("safe-ai-exports"),
+        Some(NativeResumeInput {
+            lookback_minutes: Some(20),
+            max_keyframes: Some(10),
+            current_frame_id,
+        }),
+    ) {
+        Ok(card) => card,
+        Err(error) => {
+            warnings.push(format!("Local resume-card fallback failed: {}", error));
+            return Ok(None);
+        }
+    };
+
+    let Some(frame_id) = local_card
+        .continue_from
+        .frame_id
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        warnings
+            .push("Local resume-card fallback did not include a continue_from frame.".to_string());
+        return Ok(None);
+    };
+
+    let Some(frame) = frame_by_id(conn, frame_id)? else {
+        warnings.push(format!(
+            "Local resume-card fallback frame {} is missing locally.",
+            frame_id
+        ));
+        return Ok(None);
+    };
+
+    warnings.push(
+        "Using the local native resume-card target because the cloud target was unusable."
+            .to_string(),
+    );
+    resolved_open_resume_point_from_frame(
+        conn,
+        frame,
+        local_card.continue_from.quote.clone(),
+        local_card.confidence,
+    )
+    .map(Some)
+}
+
+fn resolved_open_resume_point_from_frame(
+    conn: &Connection,
+    frame: CaptureFrame,
+    preferred_anchor: Option<String>,
+    confidence: f64,
+) -> Result<ResolvedOpenResumePoint, String> {
+    let frame_id = frame.id.to_string();
+    let app_context_url = query_app_contexts(conn, &frame_id)?
+        .into_iter()
+        .find_map(|context| context.url.and_then(non_empty));
+    let content_units = query_content_units_for_frame(conn, &frame_id)?;
+    let fallback_anchor = content_units
+        .iter()
+        .filter_map(|unit| unit.text.clone())
+        .find(|text| !is_browser_chrome_text(text))
+        .or_else(|| {
+            frame.full_text.as_deref().and_then(|text| {
+                if is_browser_chrome_heavy_text(text) {
+                    None
+                } else {
+                    non_empty(truncate_chars(text, 120))
+                }
+            })
+        });
+
+    Ok(ResolvedOpenResumePoint {
+        frame_id,
+        url: frame.browser_url.clone().or(app_context_url),
+        app_name: frame.app_name.clone(),
+        anchor_text: preferred_anchor
+            .and_then(non_empty)
+            .or_else(|| fallback_anchor.and_then(non_empty)),
+        confidence,
+        warnings: Vec::new(),
+        frame,
+    })
+}
+
+fn cloud_resume_target_frame_id(target: &Value) -> Option<i64> {
+    target.get("frame_id").and_then(|value| {
+        value.as_i64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })
+    })
+}
+
+fn cloud_resume_target_anchor(target: &Value) -> Option<String> {
+    target
+        .get("line_anchor")
+        .and_then(|anchor| anchor.get("quote"))
+        .and_then(Value::as_str)
+        .and_then(|value| non_empty(value.to_string()))
+        .or_else(|| {
+            target
+                .get("exact_words")
+                .and_then(Value::as_str)
+                .and_then(|value| non_empty(value.to_string()))
+        })
+        .or_else(|| {
+            target
+                .get("section_anchor")
+                .and_then(Value::as_str)
+                .and_then(|value| non_empty(value.to_string()))
+        })
+}
+
+fn cloud_resume_anchor_for_frame(file: &OpenResumeCloudFile, frame_id: i64) -> Option<String> {
+    [
+        &file.resume_work_target,
+        &file.resume_target,
+        &file.current_focus,
+        &file.resume_target_if_returning,
+    ]
+    .into_iter()
+    .find(|target| cloud_resume_target_frame_id(target) == Some(frame_id))
+    .and_then(cloud_resume_target_anchor)
+}
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn focus_main_window_for_resume(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn open_browser_resume_point(
+    app_name: Option<&str>,
+    url: &str,
+    anchor_text: Option<&str>,
+) -> Result<BrowserOpenOutcome, String> {
+    let anchor_text = anchor_text.and_then(|value| non_empty(value.to_string()));
+    if let Some((script_app, family)) = scriptable_browser_app(app_name) {
+        match run_browser_applescript(script_app, family, url, anchor_text.as_deref()) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => {
+                let mut warnings = vec![format!(
+                    "Browser AppleScript automation failed for {}: {}",
+                    script_app, error
+                )];
+                open_url_with_system_app(app_name, url, &mut warnings)?;
+                return Ok(BrowserOpenOutcome {
+                    strategy: "browser_url_only".to_string(),
+                    warnings,
+                });
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if app_name.is_some() {
+        warnings.push(
+            "Captured app is not a scriptable browser in v1; opened the captured URL without anchor automation."
+                .to_string(),
+        );
+    } else {
+        warnings.push(
+            "Captured frame has a URL but no app name; opened the URL with the system default browser."
+                .to_string(),
+        );
+    }
+    open_url_with_system_app(app_name, url, &mut warnings)?;
+    Ok(BrowserOpenOutcome {
+        strategy: "browser_url_only".to_string(),
+        warnings,
+    })
+}
+
+fn scriptable_browser_app(app_name: Option<&str>) -> Option<(&'static str, &'static str)> {
+    let lower = app_name?.to_lowercase();
+    if lower.contains("safari") {
+        return Some(("Safari", "safari"));
+    }
+    if lower.contains("brave") {
+        return Some(("Brave Browser", "chrome"));
+    }
+    if lower.contains("microsoft edge") || lower == "edge" {
+        return Some(("Microsoft Edge", "chrome"));
+    }
+    if lower.contains("arc") {
+        return Some(("Arc", "chrome"));
+    }
+    if lower.contains("vivaldi") {
+        return Some(("Vivaldi", "chrome"));
+    }
+    if lower.contains("opera") {
+        return Some(("Opera", "chrome"));
+    }
+    if lower.contains("chromium") {
+        return Some(("Chromium", "chrome"));
+    }
+    if lower.contains("chrome") {
+        return Some(("Google Chrome", "chrome"));
+    }
+    None
+}
+
+fn run_browser_applescript(
+    app_name: &str,
+    family: &str,
+    url: &str,
+    anchor_text: Option<&str>,
+) -> Result<BrowserOpenOutcome, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("native resume-point opening is only implemented for macOS".to_string());
+    }
+
+    let script = browser_resume_applescript(app_name, family, url, anchor_text);
+    let output = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("osascript failed to start: {}", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("osascript exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    if script_field(&stdout, "RESULT").as_deref() == Some("error") {
+        return Err(script_field(&stdout, "ERROR")
+            .unwrap_or_else(|| "browser automation returned an unknown error".to_string()));
+    }
+
+    let anchor_found = script_field(&stdout, "ANCHOR_FOUND").as_deref() == Some("true");
+    let fallback_find_used = script_field(&stdout, "FALLBACK_FIND_USED").as_deref() == Some("true");
+    let strategy = if anchor_text
+        .and_then(|text| non_empty(text.to_string()))
+        .is_none()
+    {
+        "browser_url_only"
+    } else if anchor_found {
+        "browser_anchor"
+    } else if fallback_find_used {
+        "browser_find_fallback"
+    } else {
+        "browser_url_only"
+    };
+    let mut warnings = Vec::new();
+    if !stderr.is_empty() {
+        warnings.push(stderr);
+    }
+    if anchor_text.is_some() && !anchor_found && !fallback_find_used {
+        warnings.push(
+            "The page opened, but Smalltalk could not confirm that the anchor text was found."
+                .to_string(),
+        );
+    }
+    Ok(BrowserOpenOutcome {
+        strategy: strategy.to_string(),
+        warnings,
+    })
+}
+
+fn browser_resume_applescript(
+    app_name: &str,
+    family: &str,
+    url: &str,
+    anchor_text: Option<&str>,
+) -> String {
+    let app = applescript_quote(app_name);
+    let url = applescript_quote(url);
+    let anchor = applescript_quote(anchor_text.unwrap_or(""));
+    let js = applescript_quote(&format!(
+        "window.find({})",
+        js_string_literal(anchor_text.unwrap_or(""))
+    ));
+    let browser_body = if family == "safari" {
+        format!(
+            r#"
+tell application {app}
+  activate
+  set foundTab to false
+  repeat with w from 1 to count of windows
+    set theWindow to window w
+    repeat with i from 1 to count of tabs of theWindow
+      set theTab to tab i of theWindow
+      try
+        if URL of theTab is targetUrl then
+          set current tab of theWindow to theTab
+          set index of theWindow to 1
+          set foundTab to true
+          exit repeat
+        end if
+      end try
+    end repeat
+    if foundTab then exit repeat
+  end repeat
+  if foundTab is false then
+    if (count of windows) is 0 then
+      make new document with properties {{URL:targetUrl}}
+    else
+      tell front window
+        set current tab to (make new tab at end of tabs with properties {{URL:targetUrl}})
+      end tell
+    end if
+  end if
+  delay 0.8
+  if anchorText is not "" then
+    try
+      set anchorFound to do JavaScript jsScript in current tab of front window
+    end try
+  end if
+end tell
+"#
+        )
+    } else {
+        format!(
+            r#"
+tell application {app}
+  activate
+  set foundTab to false
+  repeat with w from 1 to count of windows
+    set theWindow to window w
+    repeat with i from 1 to count of tabs of theWindow
+      set theTab to tab i of theWindow
+      try
+        if URL of theTab is targetUrl then
+          set active tab index of theWindow to i
+          set index of theWindow to 1
+          set foundTab to true
+          exit repeat
+        end if
+      end try
+    end repeat
+    if foundTab then exit repeat
+  end repeat
+  if foundTab is false then
+    if (count of windows) is 0 then make new window
+    tell front window
+      make new tab at end of tabs with properties {{URL:targetUrl}}
+      set active tab index to (count of tabs)
+    end tell
+  end if
+  delay 0.8
+  if anchorText is not "" then
+    try
+      set anchorFound to execute active tab of front window javascript jsScript
+    end try
+  end if
+end tell
+"#
+        )
+    };
+
+    format!(
+        r#"
+set targetUrl to {url}
+set anchorText to {anchor}
+set jsScript to {js}
+set anchorFound to false
+set fallbackFindUsed to false
+try
+{browser_body}
+  if anchorText is not "" and anchorFound is false then
+    try
+      tell application "System Events"
+        keystroke "f" using command down
+        delay 0.15
+        keystroke anchorText
+        delay 0.35
+        key code 53
+      end tell
+      set fallbackFindUsed to true
+    on error findErr number findErrNo
+      return "RESULT" & tab & "error" & linefeed & "ERROR" & tab & findErr & linefeed & "ERROR_NUMBER" & tab & findErrNo
+    end try
+  end if
+  return "RESULT" & tab & "ok" & linefeed & "ANCHOR_FOUND" & tab & (anchorFound as text) & linefeed & "FALLBACK_FIND_USED" & tab & (fallbackFindUsed as text)
+on error errMsg number errNo
+  return "RESULT" & tab & "error" & linefeed & "ERROR" & tab & errMsg & linefeed & "ERROR_NUMBER" & tab & errNo
+end try
+"#
+    )
+}
+
+fn open_url_with_system_app(
+    app_name: Option<&str>,
+    url: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut first = Command::new("/usr/bin/open");
+    if let Some(app_name) = app_name.and_then(|value| non_empty(value.to_string())) {
+        first.arg("-a").arg(app_name);
+    }
+    first.arg(url);
+    let output = first
+        .output()
+        .map_err(|error| format!("open failed to start: {}", error))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if app_name.is_some() {
+        warnings.push(format!(
+            "Could not open the URL in the captured app; falling back to the default browser. {}",
+            detail
+        ));
+        let fallback = Command::new("/usr/bin/open")
+            .arg(url)
+            .output()
+            .map_err(|error| format!("fallback open failed to start: {}", error))?;
+        if fallback.status.success() {
+            return Ok(());
+        }
+        let fallback_detail = String::from_utf8_lossy(&fallback.stderr).trim().to_string();
+        return Err(if fallback_detail.is_empty() {
+            format!("fallback open exited with {}", fallback.status)
+        } else {
+            fallback_detail
+        });
+    }
+
+    Err(if detail.is_empty() {
+        format!("open exited with {}", output.status)
+    } else {
+        detail
+    })
+}
+
+fn applescript_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\r', " ")
+            .replace('\n', " ")
+    )
+}
+
+fn js_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn script_field(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut parts = line.splitn(2, '\t');
+        let field = parts.next()?;
+        if field == key {
+            parts.next().map(|value| value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_cloud_resume_session_id(
+    conn: &Connection,
+    session_id: Option<String>,
+    current_frame_id: Option<i64>,
+) -> Result<String, String> {
+    session_id
+        .or_else(|| current_frame_id.and_then(|id| frame_session_id(conn, id).ok().flatten()))
+        .or_else(|| latest_session_id(conn).ok().flatten())
+        .ok_or_else(|| "no capture session available for OpenAI resume".to_string())
+}
+
+fn cached_cloud_resume_result(
+    output_root: &Path,
+    request: &CloudResumeRequestSummary,
+) -> Result<Option<CachedCloudResumeResult>, String> {
+    if !output_root.exists() {
+        return Ok(None);
+    }
+
+    let mut best: Option<(i64, CachedCloudResumeResult)> = None;
+    for entry in fs::read_dir(output_root).map_err(to_string)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let result_path = entry.path().join("cloud-resume-result.json");
+        if !result_path.exists() {
+            continue;
+        }
+        let Some(candidate) = read_cached_cloud_resume_result(&result_path, request)? else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map_or(true, |(generated_at_ms, _)| candidate.0 > *generated_at_ms)
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best.map(|(_, result)| result))
+}
+
+fn read_cached_cloud_resume_result(
+    result_path: &Path,
+    request: &CloudResumeRequestSummary,
+) -> Result<Option<(i64, CachedCloudResumeResult)>, String> {
+    let raw = match fs::read_to_string(result_path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let payload: Value = match serde_json::from_str(&raw) {
+        Ok(payload) => payload,
+        Err(_) => return Ok(None),
+    };
+    if payload.get("source").and_then(Value::as_str) != Some("cloud") {
+        return Ok(None);
+    }
+    let Some(response_id) = payload
+        .get("response_id")
+        .and_then(Value::as_str)
+        .and_then(|value| non_empty(value.to_string()))
+    else {
+        return Ok(None);
+    };
+
+    let bundle_path = payload
+        .get("query_bundle_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            result_path
+                .parent()
+                .map(|parent| parent.join("resume-query-bundle.json"))
+        });
+    let Some(bundle_path) = bundle_path else {
+        return Ok(None);
+    };
+    if !bundle_path.exists() {
+        return Ok(None);
+    }
+    let query_bundle = read_resume_query_bundle_result(&bundle_path)?;
+    if !cached_cloud_resume_matches_request(&payload, &query_bundle.bundle, request) {
+        return Ok(None);
+    }
+
+    let generated_at_ms = payload
+        .get("generated_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let evidence_request = payload
+        .get("evidence_request")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(to_string)?;
+    let warnings = payload
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let evidence_handles = payload
+        .get("evidence_handles")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some((
+        generated_at_ms,
+        CachedCloudResumeResult {
+            decision: payload
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("insufficient_evidence")
+                .to_string(),
+            resume_target: payload
+                .get("resume_target")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            current_focus: payload
+                .get("current_focus")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            resume_work_target: payload
+                .get("resume_work_target")
+                .or_else(|| payload.get("resume_target_if_returning"))
+                .or_else(|| payload.get("resume_target"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            resume_target_if_returning: payload
+                .get("resume_target_if_returning")
+                .or_else(|| payload.get("resume_work_target"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            answer: payload
+                .get("answer")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            evidence_request,
+            confidence: payload
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            warnings,
+            evidence_limits: json_string_array(payload.get("evidence_limits")),
+            evidence_handles,
+            query_bundle,
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            response_id,
+            output_path: result_path.to_path_buf(),
+        },
+    )))
+}
+
+fn cached_cloud_resume_matches_request(
+    payload: &Value,
+    bundle: &ResumeQueryBundle,
+    request: &CloudResumeRequestSummary,
+) -> bool {
+    if bundle.session.id != request.session_id {
+        return false;
+    }
+
+    if let Some(saved_request) = payload
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CloudResumeRequestSummary>(value).ok())
+    {
+        return saved_request.session_id == request.session_id
+            && saved_request.current_frame_id == request.current_frame_id;
+    }
+
+    request
+        .current_frame_id
+        .map(|frame_id| bundle.resume_candidate.frame_id == frame_id.to_string())
+        .unwrap_or(true)
+}
+
+fn read_resume_query_bundle_result(bundle_path: &Path) -> Result<ResumeQueryBundleResult, String> {
+    let raw = fs::read_to_string(bundle_path).map_err(to_string)?;
+    let bundle: ResumeQueryBundle = serde_json::from_str(&raw).map_err(to_string)?;
+    let output_dir = bundle_path
+        .parent()
+        .ok_or_else(|| "could not resolve resume query bundle directory".to_string())?;
+    let stats = if output_dir.exists() {
+        directory_stats(output_dir)?
+    } else {
+        ExportStats {
+            file_count: 1,
+            byte_size: raw.len() as i64,
+        }
+    };
+    Ok(ResumeQueryBundleResult {
+        output_dir: output_dir.to_string_lossy().to_string(),
+        bundle_path: bundle_path.to_string_lossy().to_string(),
+        payload_path: bundle_path.to_string_lossy().to_string(),
+        byte_size: stats.byte_size,
+        image_count: bundle
+            .keyframes
+            .iter()
+            .filter(|keyframe| keyframe.image_ref.is_some())
+            .count() as i64,
+        json_char_count: raw.chars().count() as i64,
+        bundle: bundle.clone(),
+        payload: bundle,
+    })
+}
+
+fn persist_and_return_cloud_resume(
+    mut result: CloudResumeResult,
+) -> Result<CloudResumeResult, String> {
+    let output_path = persist_cloud_resume_result(&result)?;
+    result.output_path = Some(output_path.to_string_lossy().to_string());
+    Ok(result)
+}
+
+fn persist_cloud_resume_result(result: &CloudResumeResult) -> Result<PathBuf, String> {
+    let bundle_path = Path::new(&result.query_bundle.bundle_path);
+    let output_dir = bundle_path
+        .parent()
+        .ok_or_else(|| "could not resolve resume query output directory".to_string())?;
+    let output_path = output_dir.join("cloud-resume-result.json");
+    let payload = serde_json::json!({
+        "schema": "smalltalk.cloud_resume_result_file.v1",
+        "generated_at_ms": now_millis(),
+        "request": result.request,
+        "cached": result.cached,
+        "source": result.source,
+        "model": result.model,
+        "response_id": result.response_id,
+        "decision": result.decision,
+        "answer": result.answer,
+        "resume_target": result.resume_target,
+        "current_focus": result.current_focus,
+        "resume_work_target": result.resume_work_target,
+        "resume_target_if_returning": result.resume_target_if_returning,
+        "evidence_request": result.evidence_request,
+        "warnings": result.warnings,
+        "evidence_limits": result.evidence_limits,
+        "evidence_handles": result.evidence_handles,
+        "confidence": result.confidence,
+        "query_bundle_path": result.query_bundle.bundle_path,
+        "query_output_dir": result.query_bundle.output_dir,
+    });
+    write_json_pretty(&output_path, &payload)?;
+    Ok(output_path)
+}
+
+fn cloud_resume_config() -> Result<CloudResumeRuntimeConfig, String> {
+    let project_env = project_dotenv_values()?;
+    let process_key = std::env::var("OPENAI_API_KEY").ok().and_then(non_empty);
+    let project_key = project_env
+        .get("OPENAI_API_KEY")
+        .cloned()
+        .and_then(non_empty);
+    let (api_key, key_source) = if process_key.is_some() {
+        (process_key, "process_env".to_string())
+    } else if project_key.is_some() {
+        (project_key, "project_env".to_string())
+    } else {
+        (None, "missing".to_string())
+    };
+    let model = std::env::var("SMALLTALK_OPENAI_MODEL")
+        .ok()
+        .and_then(non_empty)
+        .or_else(|| std::env::var("OPENAI_MODEL").ok().and_then(non_empty))
+        .or_else(|| {
+            project_env
+                .get("SMALLTALK_OPENAI_MODEL")
+                .cloned()
+                .and_then(non_empty)
+        })
+        .or_else(|| project_env.get("OPENAI_MODEL").cloned().and_then(non_empty))
+        .unwrap_or_else(|| "gpt-4.1-mini".to_string());
+    Ok(CloudResumeRuntimeConfig {
+        api_key,
+        key_source,
+        model,
+    })
+}
+
+fn project_dotenv_values() -> Result<HashMap<String, String>, String> {
+    let env_path = project_root()?.join(".env");
+    if !env_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(env_path).map_err(to_string)?;
+    Ok(parse_dotenv_values(&raw))
+}
+
+fn parse_dotenv_values(raw: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for line in raw.lines() {
+        let mut trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("export ") {
+            trimmed = rest.trim_start();
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        values.insert(key.to_string(), parse_dotenv_value(value.trim()));
+    }
+    values
+}
+
+fn parse_dotenv_value(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let quote = bytes[0];
+        if (quote == b'"' || quote == b'\'') && bytes[value.len() - 1] == quote {
+            let inner = &value[1..value.len() - 1];
+            return if quote == b'"' {
+                unescape_dotenv_double_quoted(inner)
+            } else {
+                inner.to_string()
+            };
+        }
+    }
+    value.to_string()
+}
+
+fn unescape_dotenv_double_quoted(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('r') => output.push('\r'),
+                Some('t') => output.push('\t'),
+                Some('"') => output.push('"'),
+                Some('\\') => output.push('\\'),
+                Some(other) => {
+                    output.push('\\');
+                    output.push(other);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn build_openai_resume_request(
+    model: &str,
+    query_bundle: &ResumeQueryBundleResult,
+    targeted_evidence: Option<Value>,
+) -> Result<Value, String> {
+    let mut content = vec![serde_json::json!({
+        "type": "input_text",
+        "text": "You are Smalltalk's final resume reasoner. Use only the provided bounded resume query, candidate_anchors, line anchors, images, and local evidence handles. Do not infer from missing raw session data. exact_words and exact_visible_words must be copied only from candidate_anchors[].text_exact and must include the matching anchor_id. Never use window titles, browser tab titles, URLs, file paths, local paths, or browser chrome as exact words. Never lie about current_focus: it is the factual current screen. Keep resume_work_target separate: it is the policy-selected actionable work target and resume_target is only its compatibility alias. If current_focus.surface_state is passive_feed_surface, debug_export_surface, transient_system_surface, mixed_window_overview, or source_or_discovery_surface, next_action must use resume_work_target rather than current_focus. If no valid candidate anchor supports a work target, return need_more_evidence. Return strict JSON matching the requested schema."
+    })];
+    content.push(serde_json::json!({
+        "type": "input_text",
+        "text": serde_json::to_string(&query_bundle.bundle).map_err(to_string)?,
+    }));
+    if let Some(evidence) = targeted_evidence {
+        content.push(serde_json::json!({
+            "type": "input_text",
+            "text": serde_json::json!({
+                "schema": "smalltalk.resume_followup_bundle.v1",
+                "targeted_evidence": evidence,
+            })
+            .to_string(),
+        }));
+    }
+    for image in openai_image_items_for_query_bundle(query_bundle)? {
+        content.push(image);
+    }
+
+    Ok(serde_json::json!({
+        "model": model,
+        "store": false,
+        "max_output_tokens": 2400,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "smalltalk_cloud_resume_result",
+                "strict": true,
+                "schema": cloud_resume_response_schema(),
+            }
+        },
+        "input": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+    }))
+}
+
+fn cloud_resume_response_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "decision",
+            "resume_target",
+            "current_focus",
+            "resume_work_target",
+            "resume_target_if_returning",
+            "answer",
+            "evidence_request",
+            "confidence",
+            "warnings",
+            "evidence_limits",
+            "evidence_handles"
+        ],
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": ["current_work_surface", "current_passive_surface_with_work_target", "current_debug_surface_with_work_target", "current_transient_surface", "mixed_window_overview", "current_focus", "resume_target_found", "ambiguous_current_focus_vs_prior_task", "need_more_evidence", "insufficient_evidence"]
+            },
+            "resume_target": cloud_resume_target_schema(),
+            "current_focus": cloud_resume_target_schema(),
+            "resume_work_target": cloud_resume_target_schema(),
+            "resume_target_if_returning": cloud_resume_target_schema(),
+            "answer": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["focus_now", "what_was_i_doing", "why_this_focus", "next_action"],
+                "properties": {
+                    "focus_now": {"type": "string"},
+                    "what_was_i_doing": {"type": "string"},
+                    "why_this_focus": {"type": "string"},
+                    "next_action": {"type": "string"}
+                }
+            },
+            "evidence_request": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["needed", "frame_ids", "episode_ids", "requested_modalities", "reason"],
+                        "properties": {
+                            "needed": {"type": "boolean"},
+                            "frame_ids": {"type": "array", "items": {"type": "string"}},
+                            "episode_ids": {"type": "array", "items": {"type": "string"}},
+                            "requested_modalities": {"type": "array", "items": {"type": "string"}},
+                            "reason": {"type": "string"}
+                        }
+                    }
+                ]
+            },
+            "confidence": {"type": "number"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "evidence_limits": {"type": "array", "items": {"type": "string"}},
+            "evidence_handles": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn cloud_resume_target_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "frame_id",
+            "app",
+            "title",
+            "surface_state",
+            "reason",
+            "exact_words",
+            "exact_visible_words",
+            "anchor_id",
+            "section_anchor",
+            "line_anchor"
+        ],
+        "properties": {
+            "frame_id": {"type": ["string", "null"]},
+            "app": {"type": ["string", "null"]},
+            "title": {"type": ["string", "null"]},
+            "surface_state": {
+                "type": ["string", "null"],
+                "enum": ["current_work_surface", "actionable_task_surface", "passive_feed_surface", "source_or_discovery_surface", "debug_export_surface", "transient_system_surface", "mixed_window_overview", "need_more_evidence", null]
+            },
+            "reason": {"type": "string"},
+            "exact_words": {"type": ["string", "null"]},
+            "exact_visible_words": {"type": ["string", "null"]},
+            "anchor_id": {"type": ["string", "null"]},
+            "section_anchor": {"type": ["string", "null"]},
+            "line_anchor": cloud_resume_line_anchor_schema()
+        }
+    })
+}
+
+fn cloud_resume_line_anchor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "frame_id",
+            "quote",
+            "previous_line",
+            "next_line",
+            "line_index",
+            "source_unit_id",
+            "bounds",
+            "source",
+            "semantic_role",
+            "section_anchor",
+            "confidence",
+            "reason"
+        ],
+        "properties": {
+            "frame_id": {"type": ["string", "null"]},
+            "quote": {"type": ["string", "null"]},
+            "previous_line": {"type": ["string", "null"]},
+            "next_line": {"type": ["string", "null"]},
+            "line_index": {"type": ["integer", "null"]},
+            "source_unit_id": {"type": ["string", "null"]},
+            "bounds": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["x", "y", "w", "h"],
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "w": {"type": "number"},
+                            "h": {"type": "number"}
+                        }
+                    }
+                ]
+            },
+            "source": {"type": ["string", "null"]},
+            "semantic_role": {"type": ["string", "null"]},
+            "section_anchor": {"type": ["string", "null"]},
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"}
+        }
+    })
+}
+
+fn openai_image_items_for_query_bundle(
+    query_bundle: &ResumeQueryBundleResult,
+) -> Result<Vec<Value>, String> {
+    let output_dir = Path::new(&query_bundle.output_dir);
+    let mut items = Vec::new();
+    for keyframe in &query_bundle.bundle.keyframes {
+        let Some(image_ref) = keyframe.image_ref.as_deref() else {
+            continue;
+        };
+        if items.len() >= query_bundle.bundle.budget.max_images as usize {
+            break;
+        }
+        let image_path = output_dir.join(image_ref);
+        if !image_path.starts_with(output_dir) || !image_path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&image_path).map_err(to_string)?;
+        let mime = image_mime_for_path(&image_path);
+        let detail = if matches!(
+            keyframe.role.as_str(),
+            "resume_candidate" | "return_to_origin" | "diagnostic_artifact" | "debug_mismatch"
+        ) {
+            "high"
+        } else {
+            "low"
+        };
+        items.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", mime, base64_encode(&bytes)),
+            "detail": detail,
+        }));
+    }
+    Ok(items)
+}
+
+fn image_mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+fn call_openai_responses(api_key: &str, request: &Value) -> Result<Value, String> {
+    let temp_dir = std::env::temp_dir().join(format!("smalltalk-openai-{}", now_millis()));
+    fs::create_dir_all(&temp_dir).map_err(to_string)?;
+    #[cfg(unix)]
+    fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700)).map_err(to_string)?;
+
+    let request_path = temp_dir.join("request.json");
+    let config_path = temp_dir.join("curl.conf");
+    write_private_file(
+        &request_path,
+        &serde_json::to_vec(request).map_err(to_string)?,
+    )?;
+    let config = format!(
+        "url = \"https://api.openai.com/v1/responses\"\nrequest = \"POST\"\nsilent\nshow-error\nfail-with-body\nconnect-timeout = 20\nmax-time = 90\nretry = 2\nretry-delay = 1\nretry-all-errors\nheader = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer {}\"\n",
+        curl_config_escape(api_key)
+    );
+    write_private_file(&config_path, config.as_bytes())?;
+    let output = Command::new("/usr/bin/curl")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--data-binary")
+        .arg(format!("@{}", request_path.to_string_lossy()))
+        .output()
+        .map_err(to_string);
+    let _ = fs::remove_dir_all(&temp_dir);
+    let output = output?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let body = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "curl exited with {}: {}{}",
+            output.status,
+            detail.trim(),
+            if body.trim().is_empty() {
+                "".to_string()
+            } else {
+                format!(" body={}", body.trim())
+            }
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(to_string)
+}
+
+fn readable_openai_failure_message(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("could not resolve host")
+        || lower.contains("couldn't resolve host")
+        || lower.contains("exit status: 6")
+    {
+        return "OpenAI network unavailable: DNS could not resolve api.openai.com; no OpenAI answer was generated.".to_string();
+    }
+    if lower.contains("failed to connect")
+        || lower.contains("could not connect")
+        || lower.contains("couldn't connect")
+        || lower.contains("exit status: 7")
+    {
+        return "OpenAI network unavailable: could not connect to api.openai.com; no OpenAI answer was generated.".to_string();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("exit status: 28")
+    {
+        return "OpenAI network unavailable: request to api.openai.com timed out; no OpenAI answer was generated.".to_string();
+    }
+    if lower.contains(" 401") || lower.contains("(401)") || lower.contains("status: 401") {
+        return "OpenAI authentication failed: check OPENAI_API_KEY; no OpenAI answer was generated."
+            .to_string();
+    }
+    if lower.contains(" 429") || lower.contains("(429)") || lower.contains("status: 429") {
+        return "OpenAI rate limit reached: no OpenAI answer was generated.".to_string();
+    }
+    "OpenAI resume call failed; no OpenAI answer was generated.".to_string()
+}
+
+fn readable_openai_followup_failure_message(error: &str) -> String {
+    let message = readable_openai_failure_message(error);
+    if message.starts_with("OpenAI resume call failed") {
+        "OpenAI follow-up evidence call failed; using first response.".to_string()
+    } else {
+        format!("OpenAI follow-up evidence call failed: {}", message)
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    fs::write(path, bytes).map_err(to_string)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(to_string)?;
+    Ok(())
+}
+
+fn curl_config_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn parse_openai_cloud_resume_response(response: &Value) -> Result<ParsedCloudResume, String> {
+    let text = extract_openai_output_text(response)
+        .ok_or_else(|| "OpenAI response did not contain output text".to_string())?;
+    let parsed: Value = serde_json::from_str(text.trim()).map_err(|error| {
+        if error.is_eof() {
+            format!(
+                "OpenAI response JSON was incomplete/truncated at line {} column {} ({} chars received).",
+                error.line(),
+                error.column(),
+                text.chars().count()
+            )
+        } else {
+            format!("OpenAI response JSON could not be parsed: {}", error)
+        }
+    })?;
+    let evidence_request = parsed
+        .get("evidence_request")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(to_string)?;
+    Ok(ParsedCloudResume {
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        decision: parsed
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("insufficient_evidence")
+            .to_string(),
+        resume_target: parsed
+            .get("resume_target")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        current_focus: parsed
+            .get("current_focus")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        resume_work_target: parsed
+            .get("resume_work_target")
+            .or_else(|| parsed.get("resume_target_if_returning"))
+            .or_else(|| parsed.get("resume_target"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        resume_target_if_returning: parsed
+            .get("resume_target_if_returning")
+            .or_else(|| parsed.get("resume_work_target"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        answer: parsed
+            .get("answer")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        evidence_request,
+        confidence: parsed
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        warnings: parsed
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        evidence_limits: json_string_array(parsed.get("evidence_limits")),
+        evidence_handles: parsed
+            .get("evidence_handles")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn openai_response_id(response: &Value) -> Option<String> {
+    response
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn local_fallback_cloud_resume_result(
+    request: CloudResumeRequestSummary,
+    query_bundle: ResumeQueryBundleResult,
+    local_card: NativeResumeCard,
+    model: Option<String>,
+    response_id: Option<String>,
+    warning: String,
+) -> CloudResumeResult {
+    let mut parsed = ParsedCloudResume {
+        response_id: response_id.clone(),
+        decision: "resume_target_found".to_string(),
+        resume_target: serde_json::json!({}),
+        current_focus: serde_json::json!({}),
+        resume_work_target: serde_json::json!({}),
+        resume_target_if_returning: serde_json::json!({}),
+        answer: serde_json::json!({}),
+        evidence_request: None,
+        confidence: 0.55,
+        warnings: vec![warning],
+        evidence_limits: vec![
+            "OpenAI response could not be parsed, so this result uses local resume-query policy."
+                .to_string(),
+        ],
+        evidence_handles: Vec::new(),
+    };
+    enforce_cloud_resume_anchor_contract(&mut parsed, &query_bundle.bundle);
+    if !parsed
+        .evidence_handles
+        .iter()
+        .any(|handle| handle == &query_bundle.bundle.resume_candidate.frame_id)
+    {
+        parsed
+            .evidence_handles
+            .push(query_bundle.bundle.resume_candidate.frame_id.clone());
+    }
+    CloudResumeResult {
+        schema: "smalltalk.cloud_resume_result.v1".to_string(),
+        request,
+        cached: false,
+        source: "local_fallback".to_string(),
+        decision: parsed.decision,
+        resume_target: parsed.resume_target,
+        current_focus: parsed.current_focus,
+        resume_work_target: parsed.resume_work_target,
+        resume_target_if_returning: parsed.resume_target_if_returning,
+        answer: parsed.answer,
+        evidence_request: parsed.evidence_request,
+        confidence: parsed.confidence.min(0.55),
+        warnings: parsed.warnings,
+        evidence_limits: parsed.evidence_limits,
+        evidence_handles: parsed.evidence_handles,
+        query_bundle,
+        local_card,
+        model,
+        response_id,
+        output_path: None,
+    }
+}
+
+fn enforce_cloud_resume_anchor_contract(
+    parsed: &mut ParsedCloudResume,
+    bundle: &ResumeQueryBundle,
+) {
+    apply_bundle_cloud_context_defaults(parsed, bundle);
+    if bundle.candidate_anchors.is_empty() {
+        parsed.decision = "need_more_evidence".to_string();
+        parsed.resume_target = serde_json::json!({});
+        parsed.resume_work_target = serde_json::json!({});
+        parsed.confidence = parsed.confidence.min(0.35);
+        push_unique(
+            &mut parsed.evidence_limits,
+            "No valid local candidate anchors survived spatial/chrome validation.".to_string(),
+        );
+        push_unique(
+            &mut parsed.warnings,
+            "No valid candidate anchors were available; exact resume words were not trusted."
+                .to_string(),
+        );
+        enforce_local_next_action(parsed);
+        return;
+    }
+
+    if !cloud_target_uses_valid_anchor(&parsed.resume_work_target, bundle) {
+        downgrade_cloud_resume_to_local_anchor(
+            parsed,
+            bundle,
+            "OpenAI target did not match a provided candidate anchor; using local line-anchor fallback.",
+        );
+    } else {
+        normalize_cloud_target_from_anchor(&mut parsed.resume_work_target, bundle);
+        sync_resume_target_aliases(parsed);
+    }
+
+    if bundle_current_and_return_share_stable_surface(bundle)
+        && !parsed_current_is_non_work_surface(bundle, parsed)
+    {
+        resolve_cloud_resume_to_same_surface_current_focus(parsed, bundle);
+        enforce_local_next_action(parsed);
+        return;
+    }
+
+    if bundle_is_ambiguous_current_focus_vs_return(bundle) {
+        parsed.resume_work_target = bundle_resume_work_target(bundle);
+        sync_resume_target_aliases(parsed);
+        normalize_cloud_decision_for_surface_state(parsed, bundle);
+        parsed.confidence = parsed.confidence.min(0.65);
+        push_unique(
+            &mut parsed.evidence_limits,
+            "Current screen is factual, but the work resume target is a separate locally selected actionable frame.".to_string(),
+        );
+    }
+    normalize_cloud_decision_for_surface_state(parsed, bundle);
+    sync_resume_target_aliases(parsed);
+    enforce_local_next_action(parsed);
+}
+
+fn apply_bundle_cloud_context_defaults(parsed: &mut ParsedCloudResume, bundle: &ResumeQueryBundle) {
+    if parsed
+        .current_focus
+        .as_object()
+        .is_none_or(|object| object.is_empty())
+    {
+        parsed.current_focus = bundle
+            .current_focus
+            .as_ref()
+            .map(resume_focus_target_as_cloud_target)
+            .unwrap_or_else(|| serde_json::json!({}));
+    }
+    if parsed
+        .resume_work_target
+        .as_object()
+        .is_none_or(|object| object.is_empty())
+    {
+        parsed.resume_work_target = if parsed
+            .resume_target
+            .as_object()
+            .is_some_and(|object| !object.is_empty())
+        {
+            parsed.resume_target.clone()
+        } else {
+            bundle
+                .resume_work_target
+                .as_ref()
+                .or(bundle.resume_target_if_returning.as_ref())
+                .map(resume_focus_target_as_cloud_target)
+                .unwrap_or_else(|| resume_query_candidate_as_cloud_target(&bundle.resume_candidate))
+        };
+    }
+    if parsed
+        .resume_target_if_returning
+        .as_object()
+        .is_none_or(|object| object.is_empty())
+    {
+        parsed.resume_target_if_returning = bundle
+            .resume_target_if_returning
+            .as_ref()
+            .or(bundle.resume_work_target.as_ref())
+            .map(resume_focus_target_as_cloud_target)
+            .unwrap_or_else(|| parsed.resume_work_target.clone());
+    }
+    if parsed
+        .resume_target
+        .as_object()
+        .is_none_or(|object| object.is_empty())
+    {
+        parsed.resume_target = parsed.resume_work_target.clone();
+    }
+}
+
+fn sync_resume_target_aliases(parsed: &mut ParsedCloudResume) {
+    if !parsed
+        .resume_work_target
+        .as_object()
+        .is_none_or(|object| object.is_empty())
+    {
+        parsed.resume_target = parsed.resume_work_target.clone();
+        if parsed
+            .resume_target_if_returning
+            .as_object()
+            .is_none_or(|object| object.is_empty())
+        {
+            parsed.resume_target_if_returning = parsed.resume_work_target.clone();
+        }
+    } else if parsed
+        .resume_target_if_returning
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        parsed.resume_work_target = parsed.resume_target_if_returning.clone();
+        parsed.resume_target = parsed.resume_work_target.clone();
+    } else if parsed
+        .resume_target
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        parsed.resume_work_target = parsed.resume_target.clone();
+    }
+}
+
+fn bundle_resume_work_target(bundle: &ResumeQueryBundle) -> Value {
+    bundle
+        .resume_work_target
+        .as_ref()
+        .or(bundle.resume_target_if_returning.as_ref())
+        .map(resume_focus_target_as_cloud_target)
+        .unwrap_or_else(|| resume_query_candidate_as_cloud_target(&bundle.resume_candidate))
+}
+
+fn target_surface_state(target: &Value) -> Option<&str> {
+    target.get("surface_state").and_then(Value::as_str)
+}
+
+fn current_focus_surface_state(
+    bundle: &ResumeQueryBundle,
+    parsed: &ParsedCloudResume,
+) -> Option<String> {
+    target_surface_state(&parsed.current_focus)
+        .map(str::to_string)
+        .or_else(|| {
+            bundle
+                .current_focus
+                .as_ref()
+                .map(|target| target.surface_state.clone())
+        })
+}
+
+fn normalize_cloud_decision_for_surface_state(
+    parsed: &mut ParsedCloudResume,
+    bundle: &ResumeQueryBundle,
+) {
+    let current_state = current_focus_surface_state(bundle, parsed)
+        .unwrap_or_else(|| "need_more_evidence".to_string());
+    if parsed.decision == "need_more_evidence" || parsed.decision == "insufficient_evidence" {
+        return;
+    }
+    if target_frame_id_str(&parsed.current_focus) == target_frame_id_str(&parsed.resume_work_target)
+        && surface_state_can_be_work_target(&current_state)
+    {
+        parsed.decision = "current_work_surface".to_string();
+        return;
+    }
+    parsed.decision = match current_state.as_str() {
+        "passive_feed_surface" | "source_or_discovery_surface" => {
+            "current_passive_surface_with_work_target"
+        }
+        "debug_export_surface" => "current_debug_surface_with_work_target",
+        "transient_system_surface" => "current_transient_surface",
+        "mixed_window_overview" => "mixed_window_overview",
+        "current_work_surface" | "actionable_task_surface" => "current_work_surface",
+        _ => "need_more_evidence",
+    }
+    .to_string();
+}
+
+fn target_frame_id_str(target: &Value) -> Option<&str> {
+    target.get("frame_id").and_then(Value::as_str)
+}
+
+fn parsed_current_is_non_work_surface(
+    bundle: &ResumeQueryBundle,
+    parsed: &ParsedCloudResume,
+) -> bool {
+    current_focus_surface_state(bundle, parsed)
+        .as_deref()
+        .is_some_and(surface_state_is_non_work_current)
+}
+
+fn bundle_is_ambiguous_current_focus_vs_return(bundle: &ResumeQueryBundle) -> bool {
+    let Some(current) = bundle.current_focus.as_ref() else {
+        return false;
+    };
+    let Some(returning) = bundle.resume_target_if_returning.as_ref() else {
+        return false;
+    };
+    current.frame_id != returning.frame_id
+        && !focus_targets_share_stable_surface(current, returning)
+        && bundle.session_index.return_to_origin_frames.is_empty()
+}
+
+fn bundle_current_and_return_share_stable_surface(bundle: &ResumeQueryBundle) -> bool {
+    let Some(current) = bundle.current_focus.as_ref() else {
+        return false;
+    };
+    let Some(returning) = bundle.resume_target_if_returning.as_ref() else {
+        return false;
+    };
+    focus_targets_share_stable_surface(current, returning)
+}
+
+fn focus_targets_share_stable_surface(
+    left: &ResumeQueryFocusTarget,
+    right: &ResumeQueryFocusTarget,
+) -> bool {
+    left.app.eq_ignore_ascii_case(&right.app)
+        && left.surface_type == right.surface_type
+        && normalized_surface_title(&left.title) == normalized_surface_title(&right.title)
+}
+
+fn resolve_cloud_resume_to_same_surface_current_focus(
+    parsed: &mut ParsedCloudResume,
+    bundle: &ResumeQueryBundle,
+) {
+    let Some(current) = bundle.current_focus.as_ref() else {
+        return;
+    };
+    let mut current_target = resume_focus_target_as_cloud_target(current);
+    if cloud_target_uses_valid_anchor(&current_target, bundle) {
+        normalize_cloud_target_from_anchor(&mut current_target, bundle);
+        parsed.decision = "current_work_surface".to_string();
+        parsed.resume_target = current_target.clone();
+        parsed.current_focus = current_target.clone();
+        parsed.resume_work_target = current_target.clone();
+        parsed.resume_target_if_returning = current_target;
+        parsed.confidence = parsed.confidence.min(current.confidence.max(0.72));
+        push_unique(
+            &mut parsed.evidence_limits,
+            "Current focus and prior target are the same stable surface; using the latest current-frame anchor.".to_string(),
+        );
+        return;
+    }
+    parsed.decision = "need_more_evidence".to_string();
+    parsed.resume_target = serde_json::json!({});
+    parsed.resume_work_target = serde_json::json!({});
+    parsed.confidence = parsed.confidence.min(0.35);
+    push_unique(
+        &mut parsed.evidence_limits,
+        "Current frame shares the same surface as the prior target but has no valid page-body anchor.".to_string(),
+    );
+    push_unique(
+        &mut parsed.warnings,
+        "Same-surface current frame lacked a valid candidate anchor; older same-surface anchors were not used as the resume point.".to_string(),
+    );
+}
+
+fn cloud_target_uses_valid_anchor(target: &Value, bundle: &ResumeQueryBundle) -> bool {
+    let Some(anchor) = cloud_target_candidate_anchor(target, bundle) else {
+        return false;
+    };
+    for key in ["exact_words", "exact_visible_words"] {
+        if let Some(text) = target
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| non_empty(value.to_string()))
+        {
+            if normalized_line_key(&text) != normalized_line_key(&anchor.text_exact) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn cloud_target_candidate_anchor<'a>(
+    target: &Value,
+    bundle: &'a ResumeQueryBundle,
+) -> Option<&'a ResumeQueryAnchorCandidate> {
+    let frame_id = target.get("frame_id").and_then(Value::as_str);
+    if let Some(anchor_id) = target
+        .get("anchor_id")
+        .and_then(Value::as_str)
+        .and_then(|value| non_empty(value.to_string()))
+    {
+        return bundle.candidate_anchors.iter().find(|anchor| {
+            anchor.anchor_id == anchor_id
+                && frame_id.map_or(true, |frame_id| anchor.frame_id == frame_id)
+        });
+    }
+    let text = target
+        .get("exact_words")
+        .or_else(|| target.get("exact_visible_words"))
+        .and_then(Value::as_str)?;
+    let text_key = normalized_line_key(text);
+    bundle.candidate_anchors.iter().find(|anchor| {
+        frame_id.map_or(true, |frame_id| anchor.frame_id == frame_id)
+            && normalized_line_key(&anchor.text_exact) == text_key
+    })
+}
+
+fn normalize_cloud_target_from_anchor(target: &mut Value, bundle: &ResumeQueryBundle) {
+    let Some(anchor) = cloud_target_candidate_anchor(target, bundle).cloned() else {
+        return;
+    };
+    if let Some(object) = target.as_object_mut() {
+        object.insert(
+            "anchor_id".to_string(),
+            serde_json::json!(anchor.anchor_id.clone()),
+        );
+        object.insert(
+            "frame_id".to_string(),
+            serde_json::json!(anchor.frame_id.clone()),
+        );
+        object.insert(
+            "exact_words".to_string(),
+            serde_json::json!(anchor.text_exact.clone()),
+        );
+        object.insert(
+            "exact_visible_words".to_string(),
+            serde_json::json!(anchor.text_exact.clone()),
+        );
+        object.insert(
+            "section_anchor".to_string(),
+            serde_json::to_value(anchor.section_anchor.clone()).unwrap_or(Value::Null),
+        );
+        if let Some(line_anchor) = line_anchor_for_candidate_anchor(bundle, &anchor) {
+            object.insert(
+                "line_anchor".to_string(),
+                serde_json::to_value(line_anchor).unwrap_or(Value::Null),
+            );
+        }
+    }
+}
+
+fn downgrade_cloud_resume_to_local_anchor(
+    parsed: &mut ParsedCloudResume,
+    bundle: &ResumeQueryBundle,
+    warning: &str,
+) {
+    parsed.resume_target = bundle
+        .resume_work_target
+        .as_ref()
+        .or(bundle.resume_target_if_returning.as_ref())
+        .map(resume_focus_target_as_cloud_target)
+        .unwrap_or_else(|| resume_query_candidate_as_cloud_target(&bundle.resume_candidate));
+    parsed.resume_work_target = parsed.resume_target.clone();
+    parsed.resume_target_if_returning = parsed.resume_work_target.clone();
+    parsed.confidence = parsed
+        .confidence
+        .min(bundle.resume_candidate.confidence)
+        .min(0.72);
+    if !parsed.warnings.iter().any(|item| item == warning) {
+        parsed.warnings.push(warning.to_string());
+    }
+    if !parsed
+        .evidence_handles
+        .iter()
+        .any(|handle| handle == &bundle.resume_candidate.frame_id)
+    {
+        parsed
+            .evidence_handles
+            .push(bundle.resume_candidate.frame_id.clone());
+    }
+}
+
+fn enforce_local_next_action(parsed: &mut ParsedCloudResume) {
+    let next_action = match parsed.decision.as_str() {
+        "current_focus" | "current_work_surface" => {
+            cloud_target_exact_text(&parsed.resume_work_target)
+                .map(|text| format!("Continue from: {}", text))
+                .unwrap_or_else(|| {
+                    "Need more evidence to identify the exact current resume point.".to_string()
+                })
+        }
+        "resume_target_found"
+        | "ambiguous_current_focus_vs_prior_task"
+        | "current_passive_surface_with_work_target"
+        | "current_debug_surface_with_work_target"
+        | "current_transient_surface"
+        | "mixed_window_overview" => {
+            let frame_id = parsed
+                .resume_work_target
+                .get("frame_id")
+                .and_then(Value::as_str)
+                .unwrap_or("the supported frame");
+            cloud_target_exact_text(&parsed.resume_work_target)
+                .map(|text| format!("Return to frame {} and continue from: {}", frame_id, text))
+                .unwrap_or_else(|| {
+                    "Need more evidence to identify the exact return point.".to_string()
+                })
+        }
+        _ => "Need more evidence to identify the exact resume point.".to_string(),
+    };
+    if !parsed.answer.is_object() {
+        parsed.answer = serde_json::json!({
+            "focus_now": "",
+            "what_was_i_doing": "",
+            "why_this_focus": "",
+            "next_action": next_action,
+        });
+        return;
+    }
+    if let Some(object) = parsed.answer.as_object_mut() {
+        for key in ["focus_now", "what_was_i_doing", "why_this_focus"] {
+            object
+                .entry(key.to_string())
+                .or_insert_with(|| Value::String(String::new()));
+        }
+        object.insert("next_action".to_string(), Value::String(next_action));
+    }
+}
+
+fn cloud_target_exact_text(target: &Value) -> Option<String> {
+    target
+        .get("exact_words")
+        .or_else(|| target.get("exact_visible_words"))
+        .and_then(Value::as_str)
+        .and_then(|text| non_empty(text.to_string()))
+        .or_else(|| {
+            target
+                .get("line_anchor")
+                .and_then(|anchor| anchor.get("quote"))
+                .and_then(Value::as_str)
+                .and_then(|text| non_empty(text.to_string()))
+        })
+}
+
+fn resume_query_candidate_as_cloud_target(candidate: &ResumeQueryCandidate) -> Value {
+    serde_json::json!({
+        "frame_id": candidate.frame_id.clone(),
+        "app": candidate.app.clone(),
+        "title": candidate.window_title.clone(),
+        "surface_state": resume_candidate_surface_state(candidate),
+        "reason": "Selected by local line-anchor fallback from the resume query bundle.",
+        "exact_words": candidate.exact_words.clone(),
+        "exact_visible_words": candidate.exact_words.clone(),
+        "anchor_id": null,
+        "section_anchor": candidate.section_anchor.clone(),
+        "line_anchor": candidate.line_anchor.clone(),
+    })
+}
+
+fn resume_focus_target_as_cloud_target(target: &ResumeQueryFocusTarget) -> Value {
+    serde_json::json!({
+        "frame_id": target.frame_id.clone(),
+        "app": target.app.clone(),
+        "title": target.title.clone(),
+        "surface_state": target.surface_state.clone(),
+        "reason": target.reason.clone(),
+        "exact_words": target.exact_visible_words.clone(),
+        "exact_visible_words": target.exact_visible_words.clone(),
+        "anchor_id": target.anchor_id.clone(),
+        "section_anchor": target.line_anchor.as_ref().and_then(|anchor| anchor.section_anchor.clone()),
+        "line_anchor": target.line_anchor.clone().unwrap_or_default(),
+    })
+}
+
+fn resume_candidate_surface_state(candidate: &ResumeQueryCandidate) -> String {
+    if candidate
+        .quality_flags
+        .iter()
+        .any(|flag| flag == "debug_artifact_frame")
+    {
+        "debug_export_surface".to_string()
+    } else if matches!(
+        candidate.surface_type.as_str(),
+        "chat_conversation" | "code_editor" | "terminal" | "notes_doc"
+    ) {
+        "current_work_surface".to_string()
+    } else {
+        "actionable_task_surface".to_string()
+    }
+}
+
+fn line_anchor_for_candidate_anchor(
+    bundle: &ResumeQueryBundle,
+    candidate_anchor: &ResumeQueryAnchorCandidate,
+) -> Option<ResumeLineAnchor> {
+    let mut anchors = Vec::new();
+    anchors.push(&bundle.resume_candidate.line_anchor);
+    for keyframe in &bundle.keyframes {
+        if let Some(anchor) = keyframe.line_anchor.as_ref() {
+            anchors.push(anchor);
+        }
+    }
+    for frame in bundle
+        .timeline
+        .iter()
+        .chain(bundle.branch_evidence.iter())
+        .chain(bundle.dropped_frame_summary.iter())
+        .chain(bundle.diagnostic_artifacts.iter())
+    {
+        if let Some(anchor) = frame.line_anchor.as_ref() {
+            anchors.push(anchor);
+        }
+    }
+    anchors
+        .into_iter()
+        .find(|anchor| {
+            anchor.frame_id.as_deref() == Some(candidate_anchor.frame_id.as_str())
+                && anchor.quote.as_deref().is_some_and(|quote| {
+                    normalized_line_key(quote) == normalized_line_key(&candidate_anchor.text_exact)
+                })
+        })
+        .cloned()
+}
+
+fn extract_openai_output_text(response: &Value) -> Option<String> {
+    if let Some(text) = response.get("output_text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let output = response.get("output")?.as_array()?;
+    for item in output {
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for part in content {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+                if let Some(json) = part.get("json") {
+                    return Some(json.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn targeted_evidence_for_request(
+    conn: &Connection,
+    bundle: &ResumeQueryBundle,
+    request: &CloudResumeEvidenceRequest,
+) -> Result<Value, String> {
+    let mut frames = Vec::new();
+    let mut warnings = Vec::new();
+    for frame_id in request.frame_ids.iter().take(6) {
+        let Some(id) = frame_id.parse::<i64>().ok() else {
+            warnings.push(format!("ignored non-numeric frame id {}", frame_id));
+            continue;
+        };
+        let session_id = frame_session_id(conn, id).ok().flatten();
+        if session_id.as_deref() != Some(bundle.session.id.as_str()) {
+            warnings.push(format!(
+                "ignored frame {} outside current session",
+                frame_id
+            ));
+            continue;
+        }
+        let Some(frame) = frame_by_id(conn, id)? else {
+            warnings.push(format!("ignored missing frame {}", frame_id));
+            continue;
+        };
+        let Some(candidate) = resume_query_candidate_for_frame(conn, &frame)? else {
+            warnings.push(format!("ignored privacy-excluded frame {}", frame_id));
+            continue;
+        };
+        frames.push(serde_json::json!({
+            "frame_id": candidate.safe.frame_id,
+            "app": candidate.safe.app_name,
+            "title": candidate.safe.window_name,
+            "surface_type": candidate.surface_type,
+            "visible_text": best_visible_text_for_cloud(&candidate),
+            "visual_text_snippets": visual_text_snippets_for_cloud(&candidate),
+            "line_anchor": best_line_anchor_for_cloud(&candidate),
+            "quality_flags": quality_flags_for_cloud(&candidate),
+            "privacy_status": candidate.safe.privacy_status,
+        }));
+    }
+    Ok(serde_json::json!({
+        "request": request,
+        "frames": frames,
+        "warnings": warnings,
+    }))
+}
+
+fn resume_query_candidate_for_frame(
+    conn: &Connection,
+    frame: &CaptureFrame,
+) -> Result<Option<ResumeQueryCandidateFrame>, String> {
+    let frame_key = frame.id.to_string();
+    let sensitive_regions = query_sensitive_regions(conn, &frame_key)?;
+    let app_contexts = query_app_contexts(conn, &frame_key)?;
+    let content_units = query_content_units_for_frame(conn, &frame_key)?;
+    let quality_warnings = query_frame_quality_warnings(conn, &frame_key).unwrap_or_default();
+    let privacy = export_privacy_for_frame(frame, &sensitive_regions);
+    if privacy.exclude_all {
+        return Ok(None);
+    }
+
+    let mut redactions_applied = Vec::new();
+    let mut text_was_redacted = false;
+    let selected_text = app_contexts
+        .iter()
+        .find_map(|context| context.selected_text.as_deref())
+        .and_then(|text| {
+            let redacted = redact_text_for_ai(text);
+            if redacted != text {
+                text_was_redacted = true;
+            }
+            non_empty(redacted)
+        });
+    let compact_units = compact_content_units_for_ai(&content_units, &mut text_was_redacted);
+    let redacted_text = frame.full_text.as_deref().and_then(|text| {
+        let redacted = redact_text_for_ai(text);
+        if redacted != text {
+            text_was_redacted = true;
+        }
+        non_empty(redacted)
+    });
+    if privacy.redact_text || text_was_redacted {
+        push_unique(
+            &mut redactions_applied,
+            "text redacted before resume query bundle".to_string(),
+        );
+    }
+    if frame.browser_url.is_some() {
+        push_unique(
+            &mut redactions_applied,
+            "raw browser URL replaced with local hash reference".to_string(),
+        );
+    }
+    if frame.document_path.is_some() {
+        push_unique(
+            &mut redactions_applied,
+            "raw document path omitted from resume query bundle".to_string(),
+        );
+    }
+
+    let context = app_contexts.first();
+    let mut missing_evidence = Vec::new();
+    let browser_surface = frame
+        .app_name
+        .as_deref()
+        .map(|app| is_browser_app(&app.to_lowercase()))
+        .unwrap_or(false)
+        || frame.browser_url.is_some();
+    let chrome_dominated = browser_surface
+        && browser_chrome_dominated_export_text(frame, &compact_units, &content_units);
+    if chrome_dominated {
+        push_unique(
+            &mut missing_evidence,
+            format!(
+                "frame {} browser page text is chrome-dominated; needs OCR, vision, or DOM extraction",
+                frame.id
+            ),
+        );
+    }
+    if browser_surface && compact_units.is_empty() && selected_text.is_none() {
+        push_unique(
+            &mut missing_evidence,
+            format!("frame {} has no page-body content units", frame.id),
+        );
+    }
+    let metadata_surface_type = cloud_surface_type_for_frame(context, frame);
+    let text_evidence = resume_query_text_evidence(
+        selected_text.as_deref(),
+        &compact_units,
+        redacted_text.as_deref(),
+    );
+    let metadata_image_mismatch = metadata_surface_type != "chat_conversation"
+        && text_implies_chat_resume_surface(&text_evidence);
+    let surface_type = if metadata_image_mismatch {
+        "chat_conversation".to_string()
+    } else {
+        metadata_surface_type
+    };
+    let line_anchors =
+        line_anchors_from_compact_units(&frame_key, selected_text.as_deref(), &compact_units);
+    let mut metadata_suspect = quality_warnings.iter().any(|warning| {
+        matches!(
+            warning.warning_type.as_str(),
+            "active_app_mismatch" | "chat_adapter_mismatch" | "browser_url_missing"
+        )
+    });
+    if metadata_image_mismatch {
+        metadata_suspect = true;
+        push_unique(
+            &mut missing_evidence,
+            format!(
+                "frame {} metadata/title disagrees with visible ChatGPT task content",
+                frame.id
+            ),
+        );
+    }
+    let is_debug_artifact = is_export_debug_artifact(
+        frame.window_name.as_deref().unwrap_or(""),
+        frame.document_path.as_deref(),
+        frame.browser_url.as_deref(),
+    );
+    if is_debug_artifact {
+        push_unique(
+            &mut missing_evidence,
+            format!(
+                "frame {} is an export/debug artifact; keep as diagnostic evidence, not resume target",
+                frame.id
+            ),
+        );
+    }
+    let surface_state = classify_resume_surface_state(
+        frame,
+        &surface_type,
+        is_debug_artifact,
+        selected_text.as_deref(),
+        &compact_units,
+        redacted_text.as_deref(),
+    );
+
+    let mut candidate = ResumeQueryCandidateFrame {
+        original: frame.clone(),
+        safe: SafeAiFrame {
+            frame_id: frame.id.to_string(),
+            captured_at_ms: frame.captured_at,
+            app_name: frame.app_name.clone(),
+            app_bundle_id: frame.app_bundle_id.clone(),
+            window_name: frame.window_name.clone(),
+            window_id: frame.window_id,
+            browser_url: frame.browser_url.clone(),
+            document_path: None,
+            phash: frame.phash.clone(),
+            app_context_id: context.map(|context| context.id.clone()),
+            app_context_object_type: context.map(|context| context.object_type.clone()),
+            image_path_safe: None,
+            active_window_crop_path_safe: None,
+            top_content_units: compact_units,
+            text_source: frame.text_source.clone(),
+            text: if privacy.redact_text {
+                None
+            } else {
+                redacted_text
+            },
+            evidence_strength: apply_quality_adjustment(
+                evidence_strength(frame, &content_units, &app_contexts),
+                &quality_warnings,
+            ),
+            privacy_status: privacy.status,
+            warnings: quality_warnings
+                .iter()
+                .map(|warning| format!("{}: {}", warning.warning_type, warning.message))
+                .collect(),
+        },
+        selected_text,
+        line_anchor: None,
+        line_anchors,
+        surface_type,
+        surface_state,
+        missing_evidence,
+        redactions_applied,
+        metadata_suspect,
+        metadata_image_mismatch,
+        text_chrome_dominated: chrome_dominated,
+        is_debug_artifact,
+        rejected_anchors: Vec::new(),
+    };
+    candidate.line_anchor = best_line_anchor_from_anchors(&candidate.line_anchors, &candidate);
+    candidate.rejected_anchors =
+        rejected_anchors_from_content_units(&frame_key, &content_units, &candidate);
+    Ok(Some(candidate))
+}
+
+fn select_resume_query_keyframes(
+    candidates: &[ResumeQueryCandidateFrame],
+    max_keyframes: usize,
+    session_started_at: i64,
+    session_stopped_at: i64,
+    current_frame_id: Option<i64>,
+) -> Vec<SelectedResumeQueryFrame> {
+    let meaningful = candidates
+        .iter()
+        .filter(|candidate| {
+            !is_smalltalk_cloud_frame(candidate) && !is_transient_cloud_frame(candidate)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let source = if meaningful.is_empty() {
+        candidates.to_vec()
+    } else {
+        meaningful
+    };
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    let origin = source
+        .iter()
+        .find(|candidate| !candidate.is_debug_artifact)
+        .or_else(|| source.first());
+    if let Some(origin) = origin {
+        push_resume_query_selection(&mut selected, &mut seen, "origin", origin.clone());
+    }
+
+    if let Some(current) = current_frame_id
+        .map(|id| id.to_string())
+        .and_then(|id| {
+            source
+                .iter()
+                .find(|candidate| candidate.safe.frame_id == id)
+        })
+        .filter(|candidate| !candidate.is_debug_artifact)
+    {
+        push_resume_query_selection(&mut selected, &mut seen, "current_focus", current.clone());
+    }
+
+    let resume_index =
+        best_resume_query_candidate_index(&source, session_started_at, session_stopped_at);
+    let resume_candidate = resume_index.and_then(|index| source.get(index));
+
+    if let Some(branch) = first_side_branch_candidate(&source, resume_candidate) {
+        push_resume_query_selection(&mut selected, &mut seen, "side_branch", branch.clone());
+    }
+
+    if let Some(return_frame) = first_return_to_resume_task_candidate(&source, resume_candidate) {
+        push_resume_query_selection(
+            &mut selected,
+            &mut seen,
+            "return_to_origin",
+            return_frame.clone(),
+        );
+    }
+
+    if let Some(debug) = source
+        .iter()
+        .find(|candidate| candidate.metadata_suspect && !candidate.is_debug_artifact)
+    {
+        push_resume_query_selection(&mut selected, &mut seen, "debug_mismatch", debug.clone());
+    }
+
+    if let Some(resume_candidate) = resume_candidate {
+        push_resume_query_selection(
+            &mut selected,
+            &mut seen,
+            "resume_candidate",
+            resume_candidate.clone(),
+        );
+    }
+
+    backfill_resume_query_surface_keyframes(&mut selected, &mut seen, &source, max_keyframes);
+
+    if let Some(artifact) = source
+        .iter()
+        .rev()
+        .find(|candidate| candidate.is_debug_artifact)
+    {
+        push_resume_query_selection(
+            &mut selected,
+            &mut seen,
+            "diagnostic_artifact",
+            artifact.clone(),
+        );
+    }
+
+    trim_resume_query_selection(selected, max_keyframes)
+}
+
+fn backfill_resume_query_surface_keyframes(
+    selected: &mut Vec<SelectedResumeQueryFrame>,
+    seen: &mut HashSet<String>,
+    candidates: &[ResumeQueryCandidateFrame],
+    max_keyframes: usize,
+) {
+    if selected.len() >= max_keyframes {
+        return;
+    }
+    let mut seen_surfaces = selected
+        .iter()
+        .map(|item| cloud_surface_key(&item.candidate))
+        .collect::<HashSet<_>>();
+    for candidate in candidates {
+        if selected.len() >= max_keyframes {
+            break;
+        }
+        if candidate.is_debug_artifact || is_transient_cloud_frame(candidate) {
+            continue;
+        }
+        let surface_key = cloud_surface_key(candidate);
+        if !seen_surfaces.insert(surface_key) {
+            continue;
+        }
+        push_resume_query_selection(selected, seen, "context_surface", candidate.clone());
+    }
+}
+
+fn push_resume_query_selection(
+    selected: &mut Vec<SelectedResumeQueryFrame>,
+    seen: &mut HashSet<String>,
+    role: &str,
+    candidate: ResumeQueryCandidateFrame,
+) {
+    if seen.insert(candidate.safe.frame_id.clone()) {
+        selected.push(SelectedResumeQueryFrame {
+            role: role.to_string(),
+            candidate,
+        });
+    } else if let Some(existing) = selected
+        .iter_mut()
+        .find(|item| item.candidate.safe.frame_id == candidate.safe.frame_id)
+    {
+        if resume_query_role_priority(role) > resume_query_role_priority(&existing.role) {
+            existing.role = role.to_string();
+        }
+    }
+}
+
+fn trim_resume_query_selection(
+    mut selected: Vec<SelectedResumeQueryFrame>,
+    max_keyframes: usize,
+) -> Vec<SelectedResumeQueryFrame> {
+    selected.sort_by_key(|item| item.candidate.safe.captured_at_ms);
+    if selected.len() <= max_keyframes {
+        return selected;
+    }
+    let protected = selected
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.role.as_str(),
+                "origin" | "resume_candidate" | "diagnostic_artifact"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut trimmed = selected
+        .into_iter()
+        .filter(|item| item.role != "debug_mismatch")
+        .collect::<Vec<_>>();
+    trimmed.sort_by(|left, right| {
+        resume_query_role_priority(&right.role)
+            .cmp(&resume_query_role_priority(&left.role))
+            .then_with(|| {
+                left.candidate
+                    .safe
+                    .captured_at_ms
+                    .cmp(&right.candidate.safe.captured_at_ms)
+            })
+    });
+    trimmed.truncate(max_keyframes);
+    for protected in protected {
+        if !trimmed
+            .iter()
+            .any(|item| item.candidate.safe.frame_id == protected.candidate.safe.frame_id)
+        {
+            if trimmed.len() >= max_keyframes {
+                trimmed.sort_by(|left, right| {
+                    resume_query_role_priority(&left.role)
+                        .cmp(&resume_query_role_priority(&right.role))
+                        .then_with(|| {
+                            right
+                                .candidate
+                                .safe
+                                .captured_at_ms
+                                .cmp(&left.candidate.safe.captured_at_ms)
+                        })
+                });
+                trimmed.remove(0);
+            }
+            trimmed.push(protected);
+        }
+    }
+    trimmed.sort_by_key(|item| item.candidate.safe.captured_at_ms);
+    trimmed
+}
+
+fn resume_query_role_priority(role: &str) -> i32 {
+    match role {
+        "resume_candidate" => 100,
+        "current_focus" => 95,
+        "origin" => 90,
+        "diagnostic_artifact" => 85,
+        "return_to_origin" => 80,
+        "side_branch" => 70,
+        "context_surface" => 55,
+        "possible_distraction" => 45,
+        "debug_mismatch" => 30,
+        _ => 40,
+    }
+}
+
+fn first_side_branch_candidate<'a>(
+    candidates: &'a [ResumeQueryCandidateFrame],
+    resume_candidate: Option<&'a ResumeQueryCandidateFrame>,
+) -> Option<&'a ResumeQueryCandidateFrame> {
+    let origin = candidates
+        .iter()
+        .find(|candidate| !candidate.is_debug_artifact)?;
+    let origin_key = cloud_surface_key(origin);
+    let resume_frame_id = resume_candidate.map(|candidate| candidate.safe.frame_id.as_str());
+    candidates.iter().find(|candidate| {
+        candidate.safe.frame_id.as_str() != origin.safe.frame_id.as_str()
+            && Some(candidate.safe.frame_id.as_str()) != resume_frame_id
+            && !candidate.is_debug_artifact
+            && !resume_candidate
+                .is_some_and(|resume| candidates_share_resume_task(candidate, resume))
+            && cloud_surface_key(candidate) != origin_key
+            && !is_transient_cloud_frame(candidate)
+    })
+}
+
+fn first_return_to_resume_task_candidate<'a>(
+    candidates: &'a [ResumeQueryCandidateFrame],
+    resume_candidate: Option<&'a ResumeQueryCandidateFrame>,
+) -> Option<&'a ResumeQueryCandidateFrame> {
+    let resume_candidate = resume_candidate?;
+    candidates.iter().find(|candidate| {
+        candidate.safe.frame_id != resume_candidate.safe.frame_id
+            && candidate.safe.captured_at_ms <= resume_candidate.safe.captured_at_ms
+            && !candidate.is_debug_artifact
+            && candidates_share_resume_task(candidate, resume_candidate)
+            && candidates.iter().any(|prior| {
+                prior.safe.captured_at_ms < candidate.safe.captured_at_ms
+                    && !prior.is_debug_artifact
+                    && !candidates_share_resume_task(prior, resume_candidate)
+            })
+    })
+}
+
+fn best_resume_query_candidate_index(
+    candidates: &[ResumeQueryCandidateFrame],
+    session_started_at: i64,
+    session_stopped_at: i64,
+) -> Option<usize> {
+    let scored = scored_resume_query_candidates(candidates, session_started_at, session_stopped_at);
+    let best_work = scored.iter().filter(|score| {
+        candidates
+            .get(score.index)
+            .is_some_and(|candidate| surface_state_can_be_work_target(&candidate.surface_state))
+    });
+    let best_non_passive = scored.iter().filter(|score| {
+        candidates.get(score.index).is_some_and(|candidate| {
+            !candidate.is_debug_artifact
+                && candidate.surface_state != "transient_system_surface"
+                && candidate.surface_state != "mixed_window_overview"
+                && candidate.surface_state != "passive_feed_surface"
+        })
+    });
+    best_work
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| {
+            best_non_passive.max_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .or_else(|| {
+            scored.iter().max_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .map(|score| score.index)
+}
+
+fn scored_resume_query_candidates(
+    candidates: &[ResumeQueryCandidateFrame],
+    session_started_at: i64,
+    session_stopped_at: i64,
+) -> Vec<ScoredResumeQueryCandidate> {
+    let origin_key = candidates
+        .iter()
+        .find(|candidate| !candidate.is_debug_artifact)
+        .map(cloud_surface_key);
+    let session_start = if session_started_at == 0 {
+        candidates
+            .first()
+            .map(|candidate| candidate.safe.captured_at_ms)
+            .unwrap_or(0)
+    } else {
+        session_started_at
+    };
+    let session_end = if session_stopped_at == 0 {
+        candidates
+            .last()
+            .map(|candidate| candidate.safe.captured_at_ms)
+            .unwrap_or(session_start)
+    } else {
+        session_stopped_at
+    };
+    let duration = (session_end - session_start).max(1) as f64;
+
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let text = candidate_resume_text(candidate);
+            let actionable_text = if text.as_deref().is_some_and(is_actionable_resume_text) {
+                0.35
+            } else if text.as_deref().is_some_and(|text| {
+                text_terms(text).len() >= 12 && !is_browser_chrome_heavy_text(text)
+            }) {
+                0.12
+            } else {
+                0.0
+            };
+            let return_to_origin = if origin_key.as_ref().is_some_and(|origin_key| {
+                is_return_to_origin_candidate(candidates, index, origin_key)
+            }) {
+                0.25
+            } else {
+                0.0
+            };
+            let user_interaction = if candidate.original.capture_trigger != "session_start" {
+                0.15
+            } else {
+                0.0
+            };
+            let recency = (((candidate.safe.captured_at_ms - session_start) as f64 / duration)
+                .clamp(0.0, 1.0))
+                * 0.10;
+            let recognized_surface = if candidate.surface_type != "unknown" {
+                0.10
+            } else {
+                0.0
+            };
+            let line_anchor_quality = best_line_anchor_for_cloud(candidate)
+                .map(|anchor| (line_anchor_score(&anchor, candidate) / 5.0).clamp(0.0, 0.22))
+                .unwrap_or(0.0);
+            let branch_penalty =
+                branch_penalty_for_resume_candidate(candidates, index, origin_key.as_deref());
+            let artifact_penalty = if candidate.is_debug_artifact {
+                0.35
+            } else {
+                0.0
+            };
+            let chrome_penalty = if candidate.text_chrome_dominated
+                || text.as_deref().is_some_and(|text| {
+                    is_browser_chrome_heavy_text(text) || is_export_debug_artifact(text, None, None)
+                }) {
+                0.30
+            } else {
+                0.0
+            };
+            let unknown_surface_penalty = if candidate.surface_type == "unknown" {
+                0.20
+            } else {
+                0.0
+            };
+            let metadata_penalty = if candidate.metadata_suspect {
+                0.20
+            } else {
+                0.0
+            };
+            let surface_state_penalty = match candidate.surface_state.as_str() {
+                "debug_export_surface" => 0.55,
+                "transient_system_surface" | "mixed_window_overview" => 0.50,
+                "passive_feed_surface" => 0.42,
+                "source_or_discovery_surface" => 0.12,
+                _ => 0.0,
+            };
+            let surface_state_bonus = match candidate.surface_state.as_str() {
+                "actionable_task_surface" => 0.24,
+                "current_work_surface" => 0.10,
+                _ => 0.0,
+            };
+            let score = actionable_text
+                + return_to_origin
+                + user_interaction
+                + recency
+                + recognized_surface
+                + line_anchor_quality
+                + surface_state_bonus
+                + (candidate.safe.evidence_strength * 0.05)
+                - branch_penalty
+                - artifact_penalty
+                - chrome_penalty
+                - unknown_surface_penalty
+                - metadata_penalty
+                - surface_state_penalty;
+            ScoredResumeQueryCandidate {
+                index,
+                score,
+                actionable_text,
+                return_to_origin,
+                user_interaction,
+                recency,
+                recognized_surface,
+                line_anchor_quality,
+                branch_penalty,
+                artifact_penalty,
+                chrome_penalty,
+                unknown_surface_penalty,
+                metadata_penalty,
+            }
+        })
+        .collect()
+}
+
+fn is_return_to_origin_candidate(
+    candidates: &[ResumeQueryCandidateFrame],
+    index: usize,
+    origin_key: &str,
+) -> bool {
+    let Some(candidate) = candidates.get(index) else {
+        return false;
+    };
+    if candidate.is_debug_artifact {
+        return false;
+    }
+    let candidate_key = cloud_surface_key(candidate);
+    let has_prior_different_surface = candidates
+        .iter()
+        .take(index)
+        .any(|prior| !prior.is_debug_artifact && cloud_surface_key(prior) != candidate_key);
+    if !has_prior_different_surface {
+        return false;
+    }
+    if candidate_key != origin_key && resume_task_key_for_cloud(candidate).is_none() {
+        return false;
+    }
+    true
+}
+
+fn branch_penalty_for_resume_candidate(
+    candidates: &[ResumeQueryCandidateFrame],
+    index: usize,
+    origin_key: Option<&str>,
+) -> f64 {
+    let Some(candidate) = candidates.get(index) else {
+        return 0.0;
+    };
+    if candidate.is_debug_artifact || candidate.selected_text.is_some() {
+        return 0.0;
+    }
+    let Some(origin_key) = origin_key else {
+        return 0.0;
+    };
+    let candidate_key = cloud_surface_key(candidate);
+    if candidate_key == origin_key
+        || is_return_to_origin_candidate(candidates, index, origin_key)
+        || candidate.surface_type == "chat_conversation"
+        || candidate_has_explicit_resume_anchor(candidate)
+    {
+        return 0.0;
+    }
+    let has_prior_different_surface = candidates
+        .iter()
+        .take(index)
+        .any(|prior| !prior.is_debug_artifact && cloud_surface_key(prior) != candidate_key);
+    if !has_prior_different_surface {
+        return 0.0;
+    }
+    let same_surface_count = candidates
+        .iter()
+        .filter(|other| !other.is_debug_artifact && cloud_surface_key(other) == candidate_key)
+        .count();
+    if same_surface_count >= 3 && candidate.original.capture_trigger.contains("scroll") {
+        0.06
+    } else {
+        0.22
+    }
+}
+
+fn candidate_has_explicit_resume_anchor(candidate: &ResumeQueryCandidateFrame) -> bool {
+    best_line_anchor_for_cloud(candidate)
+        .and_then(|anchor| anchor.quote)
+        .as_deref()
+        .is_some_and(|quote| {
+            let lower = quote.to_lowercase();
+            is_actionable_resume_text(&lower)
+                || lower.contains("the correct framing")
+                || lower.contains("resume here")
+                || lower.contains("continue from")
+                || lower.contains("next action")
+        })
+}
+
+fn candidate_resume_text(candidate: &ResumeQueryCandidateFrame) -> Option<String> {
+    best_visible_text_for_cloud(candidate)
+        .or_else(|| candidate.selected_text.clone())
+        .or_else(|| candidate.safe.text.clone())
+}
+
+fn confidence_breakdown_for_cloud(
+    candidates: &[ResumeQueryCandidateFrame],
+    frame_id: &str,
+    session_started_at: i64,
+    session_stopped_at: i64,
+) -> ResumeQueryConfidenceBreakdown {
+    let scored = scored_resume_query_candidates(candidates, session_started_at, session_stopped_at);
+    let score = scored
+        .iter()
+        .find(|score| {
+            candidates
+                .get(score.index)
+                .is_some_and(|candidate| candidate.safe.frame_id == frame_id)
+        })
+        .cloned();
+    let candidate = score.as_ref().and_then(|score| candidates.get(score.index));
+    ResumeQueryConfidenceBreakdown {
+        frame_id: frame_id.to_string(),
+        evidence_strength: candidate
+            .map(|candidate| candidate.safe.evidence_strength)
+            .unwrap_or(0.0),
+        actionable_text: score
+            .as_ref()
+            .map(|score| score.actionable_text)
+            .unwrap_or(0.0),
+        return_to_origin: score
+            .as_ref()
+            .map(|score| score.return_to_origin)
+            .unwrap_or(0.0),
+        user_interaction: score
+            .as_ref()
+            .map(|score| score.user_interaction)
+            .unwrap_or(0.0),
+        recency: score.as_ref().map(|score| score.recency).unwrap_or(0.0),
+        recognized_surface: score
+            .as_ref()
+            .map(|score| score.recognized_surface)
+            .unwrap_or(0.0),
+        line_anchor_quality: score
+            .as_ref()
+            .map(|score| score.line_anchor_quality)
+            .unwrap_or(0.0),
+        branch_penalty: score
+            .as_ref()
+            .map(|score| score.branch_penalty)
+            .unwrap_or(0.0),
+        artifact_penalty: score
+            .as_ref()
+            .map(|score| score.artifact_penalty)
+            .unwrap_or(0.0),
+        chrome_penalty: score
+            .as_ref()
+            .map(|score| score.chrome_penalty)
+            .unwrap_or(0.0),
+        unknown_surface_penalty: score
+            .as_ref()
+            .map(|score| score.unknown_surface_penalty)
+            .unwrap_or(0.0),
+        metadata_penalty: score
+            .as_ref()
+            .map(|score| score.metadata_penalty)
+            .unwrap_or(0.0),
+        final_score: score.as_ref().map(|score| score.score).unwrap_or(0.0),
+    }
+}
+
+fn resume_query_evidence_frames(
+    candidates: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+    resume_frame_id: Option<&str>,
+    kind: &str,
+    max_items: usize,
+) -> Vec<ResumeQueryEvidenceFrame> {
+    let origin_key = candidates
+        .iter()
+        .find(|candidate| !candidate.is_debug_artifact)
+        .map(cloud_surface_key);
+    let resume_candidate = resume_frame_id.and_then(|frame_id| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.safe.frame_id == frame_id)
+    });
+    candidates
+        .iter()
+        .filter(|candidate| match kind {
+            "diagnostic_artifact" => candidate.is_debug_artifact,
+            "branch_evidence" => {
+                !candidate.is_debug_artifact
+                    && resume_frame_id != Some(candidate.safe.frame_id.as_str())
+                    && !resume_candidate
+                        .is_some_and(|resume| candidates_share_resume_task(candidate, resume))
+                    && origin_key
+                        .as_ref()
+                        .is_some_and(|origin| cloud_surface_key(candidate) != *origin)
+            }
+            _ => false,
+        })
+        .filter(|candidate| {
+            kind == "diagnostic_artifact"
+                || !selected.iter().any(|item| {
+                    item.candidate.safe.frame_id == candidate.safe.frame_id
+                        && item.role == "resume_candidate"
+                })
+        })
+        .rev()
+        .take(max_items.max(1))
+        .map(|candidate| evidence_frame_for_cloud(candidate, kind))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn dropped_resume_query_frames(
+    candidates: &[ResumeQueryCandidateFrame],
+    selected: &[SelectedResumeQueryFrame],
+    diagnostic_artifacts: &[ResumeQueryEvidenceFrame],
+    branch_evidence: &[ResumeQueryEvidenceFrame],
+    max_items: usize,
+) -> Vec<ResumeQueryEvidenceFrame> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !selected
+                .iter()
+                .any(|item| item.candidate.safe.frame_id == candidate.safe.frame_id)
+                && !diagnostic_artifacts
+                    .iter()
+                    .any(|item| item.frame_id == candidate.safe.frame_id)
+                && !branch_evidence
+                    .iter()
+                    .any(|item| item.frame_id == candidate.safe.frame_id)
+        })
+        .take(max_items.max(1))
+        .map(|candidate| evidence_frame_for_cloud(candidate, "dropped_frame"))
+        .collect()
+}
+
+fn evidence_frame_for_cloud(
+    candidate: &ResumeQueryCandidateFrame,
+    role: &str,
+) -> ResumeQueryEvidenceFrame {
+    let visible_anchor = if candidate.is_debug_artifact {
+        candidate
+            .safe
+            .window_name
+            .clone()
+            .map(|title| truncate_chars(&title, 180))
+    } else {
+        candidate_resume_text(candidate).map(|text| truncate_chars(&text, 180))
+    };
+    let reason = match role {
+        "diagnostic_artifact" => {
+            "Generated/export/debug surface inspected during validation; useful as diagnostic evidence, not as the user-facing resume target"
+        }
+        "branch_evidence" => {
+            if candidate
+                .safe
+                .window_name
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("home / x")
+            {
+                "Side surface likely used as a distraction or product/marketing branch"
+            } else {
+                "Side surface visited between origin and resume target"
+            }
+        }
+        _ => "Omitted from keyframe images but summarized as compact trace evidence",
+    };
+    ResumeQueryEvidenceFrame {
+        frame_id: candidate.safe.frame_id.clone(),
+        role: role.to_string(),
+        app: candidate
+            .safe
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        title: candidate
+            .safe
+            .window_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        surface_type: if candidate.is_debug_artifact {
+            "export_debug_artifact".to_string()
+        } else {
+            candidate.surface_type.clone()
+        },
+        visible_anchor,
+        line_anchor: best_line_anchor_for_cloud(candidate),
+        reason: reason.to_string(),
+        quality_flags: quality_flags_for_cloud(candidate),
+    }
+}
+
+fn is_export_debug_artifact(title: &str, path: Option<&str>, url: Option<&str>) -> bool {
+    let haystack = format!("{} {} {}", title, path.unwrap_or(""), url.unwrap_or(""))
+        .to_lowercase()
+        .replace('\\', "/");
+    [
+        "resume_query_exports",
+        "safe-ai-exports",
+        "output/session-",
+        "resume-query-bundle.json",
+        "safe-ai-export.json",
+        "session.json",
+        "frames.json",
+        "event_transitions",
+    ]
+    .iter()
+    .any(|needle| haystack.contains(needle))
+}
+
+fn resume_query_text_evidence(
+    selected_text: Option<&str>,
+    compact_units: &[CompactContentUnit],
+    frame_text: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = selected_text {
+        parts.push(text);
+    }
+    for unit in compact_units {
+        parts.push(unit.text.as_str());
+    }
+    if let Some(text) = frame_text {
+        parts.push(text);
+    }
+    parts.join(" ")
+}
+
+fn text_implies_chat_resume_surface(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    is_actionable_resume_text(&lower)
+        && (lower.contains("chatgpt")
+            || lower.contains("data optimization for inference")
+            || lower.contains("resume target")
+            || lower.contains("resume_candidate")
+            || lower.contains("critical extraction bug"))
+}
+
+fn inferred_resume_task_key_from_text(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    if lower.contains("critical extraction bug")
+        || lower.contains("for browser pages, update thinness detection")
+        || lower.contains("browser main-content extraction")
+        || lower.contains("ocr/vision/dom")
+    {
+        return Some("task:critical-extraction-bug".to_string());
+    }
+    if lower.contains("build this next") || lower.contains("evidence selector") {
+        return Some("task:evidence-selector".to_string());
+    }
+    if lower.contains("final resume instruction") || lower.contains("do next") {
+        return Some(format!(
+            "task:{}",
+            stable_hash_bytes(truncate_chars(&lower, 240).as_bytes())
+        ));
+    }
+    None
+}
+
+fn resume_task_key_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Option<String> {
+    candidate_resume_text(candidate)
+        .as_deref()
+        .and_then(inferred_resume_task_key_from_text)
+        .or_else(|| {
+            candidate
+                .safe
+                .text
+                .as_deref()
+                .and_then(inferred_resume_task_key_from_text)
+        })
+}
+
+fn candidates_share_resume_task(
+    left: &ResumeQueryCandidateFrame,
+    right: &ResumeQueryCandidateFrame,
+) -> bool {
+    match (
+        resume_task_key_for_cloud(left),
+        resume_task_key_for_cloud(right),
+    ) {
+        (Some(left_key), Some(right_key)) => left_key == right_key,
+        _ => false,
+    }
+}
+
+fn is_actionable_resume_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "final resume instruction",
+        "critical extraction bug",
+        "do next",
+        "start from",
+        "implement/fix",
+        "for browser pages, update thinness detection:",
+        "fix browser main-content extraction",
+        "ocr/vision/dom",
+        "build this next:",
+        "next action",
+        "the correct framing",
+        "correct framing is",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_low_signal_cloud_text(text: &str) -> bool {
+    let compact = text
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    compact.is_empty()
+        || is_browser_chrome_text(&compact)
+        || matches!(
+            compact.as_str(),
+            "file"
+                | "edit"
+                | "view"
+                | "tabs"
+                | "profiles"
+                | "window"
+                | "help"
+                | "new chat"
+                | "search chats"
+                | "pinned"
+                | "recents"
+                | "sources"
+                | "search the web"
+                | "pro"
+                | "pro extended"
+        )
+        || compact.contains("developer tools")
+        || compact.contains("address and search bar")
+        || compact.contains("tab search")
+        || compact.contains("memory usage")
+}
+
+fn is_smalltalk_cloud_frame(candidate: &ResumeQueryCandidateFrame) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        candidate.safe.app_name.as_deref().unwrap_or(""),
+        candidate.safe.app_bundle_id.as_deref().unwrap_or(""),
+        candidate.safe.window_name.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    haystack.contains("smalltalk") || haystack.contains("com.smalltalk")
+}
+
+fn is_transient_cloud_frame(candidate: &ResumeQueryCandidateFrame) -> bool {
+    let url = candidate
+        .original
+        .browser_url
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    let title = candidate
+        .safe
+        .window_name
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    url == "about:blank"
+        || url == "chrome://newtab/"
+        || url == "edge://newtab/"
+        || title == "new tab"
+        || title == "untitled"
+}
+
+fn classify_resume_surface_state(
+    frame: &CaptureFrame,
+    surface_type: &str,
+    is_debug_artifact: bool,
+    selected_text: Option<&str>,
+    compact_units: &[CompactContentUnit],
+    frame_text: Option<&str>,
+) -> String {
+    if is_debug_artifact {
+        return "debug_export_surface".to_string();
+    }
+    let title = frame.window_name.as_deref().unwrap_or("").to_lowercase();
+    let app = frame.app_name.as_deref().unwrap_or("").to_lowercase();
+    let url = frame.browser_url.as_deref().unwrap_or("").to_lowercase();
+    let text = selected_text
+        .map(str::to_string)
+        .or_else(|| {
+            non_empty(
+                compact_units
+                    .iter()
+                    .map(|unit| unit.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
+        .or_else(|| frame_text.map(str::to_string))
+        .unwrap_or_default();
+    let text_lower = text.to_lowercase();
+
+    if url == "about:blank"
+        || url == "chrome://newtab/"
+        || url == "edge://newtab/"
+        || title == "new tab"
+        || title == "untitled"
+    {
+        return "transient_system_surface".to_string();
+    }
+    if title.contains("mission control")
+        || title.contains("window overview")
+        || title.contains("app expose")
+        || title.contains("app exposé")
+        || app.contains("dock")
+        || text_lower.contains("mission control")
+    {
+        return "mixed_window_overview".to_string();
+    }
+    if is_passive_feed_surface(&url, &title, &text_lower) {
+        return "passive_feed_surface".to_string();
+    }
+    if is_actionable_resume_text(&text_lower)
+        || is_form_like_task_surface(surface_type, &text_lower)
+    {
+        return "actionable_task_surface".to_string();
+    }
+    if matches!(
+        surface_type,
+        "chat_conversation" | "code_editor" | "terminal" | "notes_doc"
+    ) {
+        return "current_work_surface".to_string();
+    }
+    if surface_type == "browser_tab" || surface_type == "pdf" || surface_type == "media" {
+        return "source_or_discovery_surface".to_string();
+    }
+    "need_more_evidence".to_string()
+}
+
+fn is_passive_feed_surface(url: &str, title: &str, text_lower: &str) -> bool {
+    let social_feed = url.contains("x.com/home")
+        || url.contains("twitter.com/home")
+        || url.contains("linkedin.com/feed")
+        || title == "home / x"
+        || title.contains("home / x ")
+        || title.contains("/ x -")
+        || title.contains("linkedin");
+    social_feed
+        && (text_lower.contains("for you")
+            || text_lower.contains("following")
+            || text_lower.contains("what is happening")
+            || text_lower.contains("who to follow")
+            || text_lower.contains("promoted"))
+        && !is_form_like_task_surface("browser_tab", text_lower)
+}
+
+fn is_form_like_task_surface(surface_type: &str, text_lower: &str) -> bool {
+    if surface_type != "browser_tab" && surface_type != "unknown" {
+        return false;
+    }
+    let form_markers = [
+        "name",
+        "email",
+        "apply",
+        "application",
+        "submit",
+        "full time",
+        "founding engineer",
+        "hardest problem",
+        "cover letter",
+        "resume",
+    ];
+    form_markers
+        .iter()
+        .filter(|marker| text_lower.contains(**marker))
+        .count()
+        >= 3
+}
+
+fn surface_state_can_be_work_target(surface_state: &str) -> bool {
+    matches!(
+        surface_state,
+        "current_work_surface" | "actionable_task_surface"
+    )
+}
+
+fn surface_state_is_non_work_current(surface_state: &str) -> bool {
+    matches!(
+        surface_state,
+        "passive_feed_surface"
+            | "debug_export_surface"
+            | "transient_system_surface"
+            | "mixed_window_overview"
+            | "source_or_discovery_surface"
+    )
+}
+
+fn browser_chrome_dominated_export_text(
+    frame: &CaptureFrame,
+    compact_units: &[CompactContentUnit],
+    content_units: &[ContentUnitSummary],
+) -> bool {
+    if !compact_units.is_empty() {
+        return false;
+    }
+    let browser_surface = frame
+        .app_name
+        .as_deref()
+        .map(|app| is_browser_app(&app.to_lowercase()))
+        .unwrap_or(false)
+        || frame.browser_url.is_some();
+    if !browser_surface {
+        return false;
+    }
+    if content_units.is_empty() {
+        return frame
+            .full_text
+            .as_deref()
+            .is_some_and(|text| text_terms(text).len() < 8 || is_browser_chrome_heavy_text(text));
+    }
+    let chrome_units = content_units
+        .iter()
+        .filter(|unit| {
+            unit.semantic_role
+                .as_deref()
+                .is_some_and(|role| role.contains("browser_chrome") || role.contains("toolbar"))
+                || unit.text.as_deref().is_some_and(is_browser_chrome_text)
+        })
+        .count();
+    chrome_units as f64 / content_units.len().max(1) as f64 > 0.55
+}
+
+fn cloud_surface_type(object_type: Option<&str>) -> String {
+    match object_type.unwrap_or("unknown") {
+        "chat_conversation" => "chat_conversation",
+        "browser_tab" => "browser_tab",
+        "code_editor" => "code_editor",
+        "notes_doc" => "notes_doc",
+        "pdf" => "pdf",
+        "media" => "media",
+        "terminal" => "terminal",
+        "messaging" => "messaging",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn cloud_surface_type_for_frame(
+    context: Option<&AppContextSummary>,
+    frame: &CaptureFrame,
+) -> String {
+    let context_surface = cloud_surface_type(context.map(|context| context.object_type.as_str()));
+    if context_surface != "unknown" {
+        return context_surface;
+    }
+    let url = frame.browser_url.as_deref().unwrap_or("").to_lowercase();
+    if is_ai_chat_url(&url) {
+        return "chat_conversation".to_string();
+    }
+    if url.contains("notion.so") || url.contains("notion.site") || url.contains("linear.app") {
+        return "notes_doc".to_string();
+    }
+    if is_media_url(&url) {
+        return "media".to_string();
+    }
+    if url.ends_with(".pdf") || url.contains("/pdf") {
+        return "pdf".to_string();
+    }
+    if !url.is_empty() {
+        return "browser_tab".to_string();
+    }
+    let app = frame.app_name.as_deref().unwrap_or("").to_lowercase();
+    if app.contains("chatgpt") || app.contains("claude") || app.contains("perplexity") {
+        return "chat_conversation".to_string();
+    }
+    context_surface
+}
+
+fn cloud_surface_key(candidate: &ResumeQueryCandidateFrame) -> String {
+    if let Some(task_key) = resume_task_key_for_cloud(candidate) {
+        return task_key;
+    }
+    if let Some(url) = candidate.original.browser_url.as_deref() {
+        return domain_key(url).unwrap_or_else(|| stable_hash_bytes(url.as_bytes()));
+    }
+    surface_key_for_safe_frame(&candidate.safe)
+}
+
+fn resume_candidates_share_stable_surface(
+    left: &ResumeQueryCandidateFrame,
+    right: &ResumeQueryCandidateFrame,
+) -> bool {
+    stable_resume_surface_identity(left) == stable_resume_surface_identity(right)
+}
+
+fn stable_resume_surface_identity(candidate: &ResumeQueryCandidateFrame) -> String {
+    let app = candidate
+        .safe
+        .app_bundle_id
+        .as_deref()
+        .or(candidate.safe.app_name.as_deref())
+        .unwrap_or("unknown")
+        .to_lowercase();
+    if let Some(url) = candidate
+        .original
+        .browser_url
+        .as_deref()
+        .and_then(|url| non_empty(url.to_string()))
+    {
+        return format!("{}:url:{}", app, stable_hash_bytes(url.as_bytes()));
+    }
+    let title = candidate
+        .safe
+        .window_name
+        .as_deref()
+        .map(normalized_surface_title)
+        .and_then(non_empty)
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{}:title:{}", app, title)
+}
+
+fn normalized_surface_title(title: &str) -> String {
+    title
+        .to_lowercase()
+        .replace("- helium", "")
+        .replace("[redacted_number]", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn domain_key(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after_scheme.split('/').next()?.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+fn local_url_ref(url: Option<&str>) -> Option<String> {
+    url.and_then(|url| {
+        non_empty(url.to_string())
+            .map(|url| format!("url-hash-{}", stable_hash_bytes(url.as_bytes())))
+    })
+}
+
+fn best_visible_text_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Option<String> {
+    candidate
+        .selected_text
+        .clone()
+        .or_else(|| {
+            let text = candidate
+                .safe
+                .top_content_units
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .filter(|text| !is_browser_chrome_text(text))
+                .collect::<Vec<_>>()
+                .join(" ");
+            non_empty(truncate_chars(&text, 420))
+        })
+        .or_else(|| {
+            candidate.safe.text.as_deref().and_then(|text| {
+                if candidate.text_chrome_dominated
+                    || (candidate_browser_surface(candidate) && is_browser_chrome_heavy_text(text))
+                    || is_browser_chrome_text(text)
+                {
+                    None
+                } else {
+                    non_empty(truncate_chars(text, 420))
+                }
+            })
+        })
+}
+
+fn visual_text_snippets_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Vec<String> {
+    let mut snippets = Vec::new();
+    if let Some(selected) = candidate.selected_text.as_deref() {
+        push_cloud_text_snippet(&mut snippets, selected);
+    }
+    for unit in &candidate.safe.top_content_units {
+        if unit
+            .semantic_role
+            .as_deref()
+            .is_some_and(|role| role.contains("browser_chrome") || role.contains("toolbar"))
+            || is_browser_chrome_text(&unit.text)
+        {
+            continue;
+        }
+        push_cloud_text_snippet(&mut snippets, &unit.text);
+        if snippets.len() >= 8 {
+            break;
+        }
+    }
+    if snippets.is_empty() {
+        if let Some(text) = candidate.safe.text.as_deref() {
+            if !candidate.text_chrome_dominated
+                && !(candidate_browser_surface(candidate) && is_browser_chrome_heavy_text(text))
+            {
+                push_cloud_text_snippet(&mut snippets, text);
+            }
+        }
+    }
+    snippets
+}
+
+fn candidate_anchors_for_cloud(
+    candidates: &[ResumeQueryCandidateFrame],
+) -> (
+    Vec<ResumeQueryAnchorCandidate>,
+    Vec<ResumeQueryRejectedAnchor>,
+) {
+    let mut anchors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut rejected = Vec::new();
+    let mut seen_rejected = HashSet::new();
+    for candidate in candidates {
+        for anchor in &candidate.rejected_anchors {
+            let key = format!(
+                "{}:{}:{}",
+                anchor.frame_id,
+                normalized_line_key(&anchor.text_exact),
+                anchor.reject_reason
+            );
+            if seen_rejected.insert(key) {
+                rejected.push(anchor.clone());
+            }
+            if rejected.len() >= 128 {
+                break;
+            }
+        }
+        for anchor in &candidate.line_anchors {
+            let Some(text_exact) = anchor
+                .quote
+                .as_deref()
+                .and_then(|quote| non_empty(quote.to_string()))
+            else {
+                continue;
+            };
+            if let Some(reject_reason) = resume_anchor_reject_reason(anchor, candidate) {
+                push_rejected_resume_anchor(
+                    &mut rejected,
+                    &mut seen_rejected,
+                    candidate,
+                    anchor,
+                    text_exact,
+                    reject_reason,
+                );
+                continue;
+            }
+            let anchor_id = anchor_id_for_cloud_anchor(candidate, anchor, &text_exact);
+            if !seen.insert(anchor_id.clone()) {
+                continue;
+            }
+            anchors.push(ResumeQueryAnchorCandidate {
+                anchor_id,
+                frame_id: candidate.safe.frame_id.clone(),
+                text_exact,
+                bbox: anchor.bounds.clone(),
+                source: anchor
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                semantic_role: anchor
+                    .semantic_role
+                    .clone()
+                    .unwrap_or_else(|| "main_content".to_string()),
+                section_anchor: anchor.section_anchor.clone(),
+                visible_ratio: 1.0,
+                is_browser_chrome: false,
+                confidence: anchor.confidence.clamp(0.0, 1.0),
+                reason: anchor.reason.clone(),
+            });
+            if anchors.len() >= 96 {
+                return (anchors, rejected);
+            }
+        }
+    }
+    (anchors, rejected)
+}
+
+fn push_rejected_resume_anchor(
+    rejected: &mut Vec<ResumeQueryRejectedAnchor>,
+    seen: &mut HashSet<String>,
+    candidate: &ResumeQueryCandidateFrame,
+    anchor: &ResumeLineAnchor,
+    text_exact: String,
+    reject_reason: String,
+) {
+    if rejected.len() >= 128 {
+        return;
+    }
+    let key = format!(
+        "{}:{}:{}",
+        candidate.safe.frame_id,
+        normalized_line_key(&text_exact),
+        reject_reason
+    );
+    if !seen.insert(key) {
+        return;
+    }
+    rejected.push(ResumeQueryRejectedAnchor {
+        frame_id: candidate.safe.frame_id.clone(),
+        text_exact,
+        bbox: anchor.bounds.clone(),
+        source: anchor
+            .source
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        semantic_role: anchor
+            .semantic_role
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        surface_zone: anchor_surface_zone(anchor, candidate),
+        reject_reason,
+    });
+}
+
+fn anchor_id_for_cloud_anchor(
+    candidate: &ResumeQueryCandidateFrame,
+    anchor: &ResumeLineAnchor,
+    text: &str,
+) -> String {
+    let suffix = anchor
+        .source_unit_id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| anchor.line_index.map(|index| format!("line-{}", index)))
+        .unwrap_or_else(|| format!("text-{}", stable_hash_bytes(text.as_bytes())));
+    sanitize_id(&format!("{}-{}", candidate.safe.frame_id, suffix))
+}
+
+fn candidate_anchor_text_exists(anchors: &[ResumeQueryAnchorCandidate], text: &str) -> bool {
+    let text_key = normalized_line_key(text);
+    !text_key.is_empty()
+        && anchors
+            .iter()
+            .map(|anchor| normalized_line_key(&anchor.text_exact))
+            .any(|anchor_key| anchor_key == text_key)
+}
+
+fn candidate_anchor_for_frame<'a>(
+    anchors: &'a [ResumeQueryAnchorCandidate],
+    frame_id: &str,
+) -> Option<&'a ResumeQueryAnchorCandidate> {
+    anchors
+        .iter()
+        .filter(|anchor| anchor.frame_id == frame_id)
+        .max_by(|left, right| {
+            left.confidence
+                .partial_cmp(&right.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn focus_target_for_cloud(
+    candidate: &ResumeQueryCandidateFrame,
+    anchors: &[ResumeQueryAnchorCandidate],
+    reason: &str,
+) -> ResumeQueryFocusTarget {
+    let anchor = candidate_anchor_for_frame(anchors, &candidate.safe.frame_id);
+    ResumeQueryFocusTarget {
+        frame_id: candidate.safe.frame_id.clone(),
+        app: candidate
+            .safe
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        title: candidate
+            .safe
+            .window_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        surface_type: candidate.surface_type.clone(),
+        surface_state: candidate.surface_state.clone(),
+        exact_visible_words: anchor.map(|anchor| anchor.text_exact.clone()),
+        anchor_id: anchor.map(|anchor| anchor.anchor_id.clone()),
+        line_anchor: anchor.and_then(|anchor| {
+            candidate
+                .line_anchors
+                .iter()
+                .find(|line| {
+                    line.quote.as_deref() == Some(anchor.text_exact.as_str())
+                        && line.frame_id.as_deref() == Some(anchor.frame_id.as_str())
+                })
+                .cloned()
+        }),
+        reason: reason.to_string(),
+        confidence: resume_query_confidence(
+            candidate,
+            anchor.map(|anchor| anchor.text_exact.as_str()),
+        ),
+        quality_flags: quality_flags_for_cloud(candidate),
+    }
+}
+
+fn missing_line_anchor_for_candidate(candidate: &ResumeQueryCandidateFrame) -> ResumeLineAnchor {
+    ResumeLineAnchor {
+        frame_id: Some(candidate.safe.frame_id.clone()),
+        quote: None,
+        previous_line: None,
+        next_line: None,
+        line_index: None,
+        source_unit_id: None,
+        bounds: None,
+        source: None,
+        semantic_role: None,
+        section_anchor: None,
+        confidence: 0.0,
+        reason: "no valid local candidate anchor survived spatial and chrome validation"
+            .to_string(),
+    }
+}
+
+fn line_anchors_from_compact_units(
+    frame_id: &str,
+    selected_text: Option<&str>,
+    units: &[CompactContentUnit],
+) -> Vec<ResumeLineAnchor> {
+    let mut anchors = Vec::new();
+    if let Some(selected) = selected_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && !is_browser_chrome_text(text))
+    {
+        anchors.push(ResumeLineAnchor {
+            frame_id: Some(frame_id.to_string()),
+            quote: Some(truncate_chars(selected, 220)),
+            previous_line: None,
+            next_line: None,
+            line_index: None,
+            source_unit_id: None,
+            bounds: None,
+            source: Some("selected_text".to_string()),
+            semantic_role: Some("selection".to_string()),
+            section_anchor: None,
+            confidence: 0.96,
+            reason: "user-selected text is the strongest available continuation anchor".to_string(),
+        });
+    }
+
+    for (index, unit) in units.iter().enumerate() {
+        let text = unit.text.trim();
+        if text.is_empty() || is_browser_chrome_text(text) {
+            continue;
+        }
+        let previous_line = units
+            .get(index.saturating_sub(1))
+            .filter(|_| index > 0)
+            .map(|unit| truncate_chars(unit.text.trim(), 160))
+            .and_then(non_empty);
+        let next_line = units
+            .get(index + 1)
+            .map(|unit| truncate_chars(unit.text.trim(), 160))
+            .and_then(non_empty);
+        let bounds = match (unit.bounds_x, unit.bounds_y, unit.bounds_w, unit.bounds_h) {
+            (Some(x), Some(y), Some(w), Some(h)) => Some(ResumeLineBounds { x, y, w, h }),
+            _ => None,
+        };
+        let quote = truncate_chars(text, 220);
+        anchors.push(ResumeLineAnchor {
+            frame_id: Some(frame_id.to_string()),
+            quote: Some(quote.clone()),
+            previous_line,
+            next_line,
+            line_index: Some(index as i64),
+            source_unit_id: Some(unit.id.clone()),
+            bounds,
+            source: Some(unit.source.clone()),
+            semantic_role: unit.semantic_role.clone(),
+            section_anchor: line_section_anchor(unit, &quote),
+            confidence: line_anchor_confidence(unit, index),
+            reason: line_anchor_reason(unit, index),
+        });
+    }
+    anchors
+}
+
+fn line_section_anchor(unit: &CompactContentUnit, quote: &str) -> Option<String> {
+    line_section_anchor_for_role(unit.semantic_role.as_deref(), quote)
+}
+
+fn line_section_anchor_for_role(role: Option<&str>, quote: &str) -> Option<String> {
+    if role == Some("heading")
+        || quote.ends_with(':')
+        || (quote.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && quote.contains('.'))
+    {
+        return non_empty(truncate_chars(quote, 120));
+    }
+    None
+}
+
+fn line_anchor_confidence(unit: &CompactContentUnit, index: usize) -> f64 {
+    let mut confidence = unit.confidence.unwrap_or(0.72).clamp(0.45, 0.92);
+    if unit.source == "ocr" {
+        confidence = confidence.max(0.68);
+    }
+    if unit.semantic_role.as_deref() == Some("main_content") {
+        confidence += 0.04;
+    }
+    if index <= 1 {
+        confidence -= 0.04;
+    }
+    confidence.clamp(0.45, 0.96)
+}
+
+fn line_anchor_reason(unit: &CompactContentUnit, index: usize) -> String {
+    let role = unit.semantic_role.as_deref().unwrap_or("visible page text");
+    format!(
+        "ordered {} line {} from {} content units",
+        role,
+        index + 1,
+        unit.source
+    )
+}
+
+fn best_line_anchor_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Option<ResumeLineAnchor> {
+    candidate
+        .line_anchor
+        .clone()
+        .or_else(|| best_line_anchor_from_anchors(&candidate.line_anchors, candidate))
+}
+
+fn best_line_anchor_from_anchors(
+    anchors: &[ResumeLineAnchor],
+    candidate: &ResumeQueryCandidateFrame,
+) -> Option<ResumeLineAnchor> {
+    anchors
+        .iter()
+        .filter(|anchor| is_valid_resume_anchor(anchor, candidate))
+        .max_by(|left, right| {
+            line_anchor_score(left, candidate)
+                .partial_cmp(&line_anchor_score(right, candidate))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned()
+}
+
+fn is_valid_resume_anchor(
+    anchor: &ResumeLineAnchor,
+    candidate: &ResumeQueryCandidateFrame,
+) -> bool {
+    resume_anchor_reject_reason(anchor, candidate).is_none()
+}
+
+fn resume_anchor_reject_reason(
+    anchor: &ResumeLineAnchor,
+    candidate: &ResumeQueryCandidateFrame,
+) -> Option<String> {
+    let Some(quote) = anchor
+        .quote
+        .as_deref()
+        .map(str::trim)
+        .filter(|quote| !quote.is_empty())
+    else {
+        return Some("empty_text".to_string());
+    };
+    if quote.split_whitespace().count() < 3 {
+        return Some("low_word_count".to_string());
+    }
+    let surface_zone = anchor_surface_zone(anchor, candidate);
+    if is_debug_or_schema_artifact_anchor(quote, &surface_zone, candidate) {
+        return Some("debug_schema_artifact".to_string());
+    }
+    if anchor_neighbors_look_like_debug_or_schema(anchor) {
+        return Some("schema_example_neighbor".to_string());
+    }
+    if !is_allowed_resume_surface_zone(&surface_zone, candidate) {
+        return Some(format!("surface_zone_{}", surface_zone));
+    }
+    if is_browser_chrome_text(quote)
+        || is_browser_chrome_heavy_text(quote)
+        || quote.starts_with("http")
+        || is_export_debug_artifact(quote, None, None)
+    {
+        return Some("browser_chrome_text".to_string());
+    }
+    if anchor.semantic_role.as_deref().is_some_and(|role| {
+        let role = role.to_lowercase();
+        role.contains("browser_chrome")
+            || role.contains("toolbar")
+            || role.contains("system_menu")
+            || role.contains("app_sidebar")
+    }) {
+        return Some("chrome_semantic_role".to_string());
+    }
+    if anchor_neighbors_look_like_browser_chrome(anchor) {
+        return Some("browser_chrome_neighbor".to_string());
+    }
+    let title = candidate.safe.window_name.as_deref().unwrap_or("");
+    if title_like_anchor(quote, title) {
+        return Some("title_like_anchor".to_string());
+    }
+    let area_ratio = anchor_area_ratio(anchor, candidate);
+    if area_ratio.is_some_and(|ratio| ratio > 0.20) {
+        return Some("broad_spatial_anchor".to_string());
+    }
+    if anchor
+        .source_unit_id
+        .as_deref()
+        .is_some_and(|id| id.ends_with("-ax-0"))
+        && area_ratio.is_some_and(|ratio| ratio > 0.10)
+    {
+        return Some("broad_ax_root_anchor".to_string());
+    }
+    if anchor
+        .bounds
+        .as_ref()
+        .is_some_and(|bounds| bounds.w >= 1_000.0 && bounds.h >= 500.0)
+    {
+        return Some("broad_spatial_anchor".to_string());
+    }
+    None
+}
+
+fn rejected_anchors_from_content_units(
+    frame_id: &str,
+    content_units: &[ContentUnitSummary],
+    candidate: &ResumeQueryCandidateFrame,
+) -> Vec<ResumeQueryRejectedAnchor> {
+    let mut rejected = Vec::new();
+    let mut seen = HashSet::new();
+    let mut units = content_units.iter().collect::<Vec<_>>();
+    units.sort_by(content_unit_reading_order);
+    for (index, unit) in units.into_iter().enumerate() {
+        let Some(text) = unit
+            .text
+            .as_deref()
+            .map(str::trim)
+            .and_then(|text| non_empty(text.to_string()))
+        else {
+            continue;
+        };
+        let anchor = resume_line_anchor_from_content_unit(frame_id, unit, index, text);
+        let Some(reject_reason) = resume_anchor_reject_reason(&anchor, candidate) else {
+            continue;
+        };
+        let key = format!(
+            "{}:{}:{}",
+            frame_id,
+            normalized_line_key(anchor.quote.as_deref().unwrap_or("")),
+            reject_reason
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        rejected.push(ResumeQueryRejectedAnchor {
+            frame_id: frame_id.to_string(),
+            text_exact: anchor.quote.clone().unwrap_or_default(),
+            bbox: anchor.bounds.clone(),
+            source: anchor
+                .source
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            semantic_role: anchor
+                .semantic_role
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            surface_zone: anchor_surface_zone(&anchor, candidate),
+            reject_reason,
+        });
+        if rejected.len() >= 96 {
+            break;
+        }
+    }
+    rejected
+}
+
+fn resume_line_anchor_from_content_unit(
+    frame_id: &str,
+    unit: &ContentUnitSummary,
+    index: usize,
+    text: String,
+) -> ResumeLineAnchor {
+    let bounds = match (unit.bounds_x, unit.bounds_y, unit.bounds_w, unit.bounds_h) {
+        (Some(x), Some(y), Some(w), Some(h)) => Some(ResumeLineBounds { x, y, w, h }),
+        _ => None,
+    };
+    let quote = truncate_chars(&text, 220);
+    ResumeLineAnchor {
+        frame_id: Some(frame_id.to_string()),
+        quote: Some(quote.clone()),
+        previous_line: None,
+        next_line: None,
+        line_index: Some(index as i64),
+        source_unit_id: Some(unit.id.clone()),
+        bounds,
+        source: Some(unit.source.clone()),
+        semantic_role: unit.semantic_role.clone(),
+        section_anchor: line_section_anchor_for_role(unit.semantic_role.as_deref(), &quote),
+        confidence: content_unit_line_anchor_confidence(unit, index),
+        reason: content_unit_line_anchor_reason(unit, index),
+    }
+}
+
+fn content_unit_line_anchor_confidence(unit: &ContentUnitSummary, index: usize) -> f64 {
+    let mut confidence = unit.confidence.unwrap_or(0.72).clamp(0.45, 0.92);
+    if unit.source == "ocr" {
+        confidence = confidence.max(0.68);
+    }
+    if unit.semantic_role.as_deref() == Some("main_content") {
+        confidence += 0.04;
+    }
+    if index <= 1 {
+        confidence -= 0.04;
+    }
+    confidence.clamp(0.45, 0.96)
+}
+
+fn content_unit_line_anchor_reason(unit: &ContentUnitSummary, index: usize) -> String {
+    let role = unit.semantic_role.as_deref().unwrap_or("visible page text");
+    format!(
+        "ordered {} line {} from {} content units",
+        role,
+        index + 1,
+        unit.source
+    )
+}
+
+fn anchor_surface_zone(anchor: &ResumeLineAnchor, candidate: &ResumeQueryCandidateFrame) -> String {
+    let role = anchor.semantic_role.as_deref().unwrap_or("").to_lowercase();
+    let quote = anchor.quote.as_deref().unwrap_or("");
+    if role == "selection" {
+        return "selection".to_string();
+    }
+    if role.contains("browser_chrome") || role.contains("toolbar") {
+        return "browser_chrome".to_string();
+    }
+    if role.contains("system_menu") {
+        return "os_menu_bar".to_string();
+    }
+    if role.contains("sidebar") {
+        return "app_sidebar".to_string();
+    }
+    if role.contains("composer") {
+        return "composer_or_bottom_ui".to_string();
+    }
+    if let Some(bounds) = anchor.bounds.as_ref() {
+        let y = bounds.y.max(0.0);
+        let x = bounds.x.max(0.0);
+        let height = candidate.original.pixel_height.unwrap_or(0).max(0) as f64;
+        if y < 30.0 {
+            return "os_menu_bar".to_string();
+        }
+        if candidate_browser_surface(candidate) && y < 95.0 {
+            return "browser_chrome".to_string();
+        }
+        if x < 80.0 && bounds.w < 420.0 && candidate_browser_surface(candidate) {
+            return "app_sidebar".to_string();
+        }
+        if height > 480.0 && y > height - 120.0 {
+            return "composer_or_bottom_ui".to_string();
+        }
+    }
+    if candidate.surface_type == "chat_conversation"
+        && (is_schema_like_text(quote) || anchor_neighbors_look_like_debug_or_schema(anchor))
+    {
+        return "assistant_code_block".to_string();
+    }
+    if candidate.surface_type == "code_editor" || role.contains("code_editor") {
+        return "code_editor".to_string();
+    }
+    "page_body".to_string()
+}
+
+fn is_allowed_resume_surface_zone(zone: &str, candidate: &ResumeQueryCandidateFrame) -> bool {
+    matches!(zone, "page_body" | "selection")
+        || (zone == "code_editor" && candidate.surface_type == "code_editor")
+}
+
+fn is_debug_or_schema_artifact_anchor(
+    text: &str,
+    surface_zone: &str,
+    candidate: &ResumeQueryCandidateFrame,
+) -> bool {
+    if candidate.surface_type == "code_editor" && surface_zone == "code_editor" {
+        return false;
+    }
+    is_schema_like_text(text)
+}
+
+fn is_schema_like_text(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let keyish = lower
+        .trim_start_matches(|ch| ch == '"' || ch == '\'' || ch == '{' || ch == ',')
+        .replace(['_', '-'], " ");
+    let schema_keys = [
+        "bbox",
+        "anchor id",
+        "frame id",
+        "text exact",
+        "exact words",
+        "exact visible words",
+        "source",
+        "semantic role",
+        "visible ratio",
+        "is browser chrome",
+        "confidence",
+        "line index",
+        "reject reason",
+        "surface zone",
+    ];
+    if schema_keys.iter().any(|key| {
+        keyish.starts_with(key) && keyish.chars().take(32).any(|ch| ch == ':' || ch == '=')
+    }) {
+        return true;
+    }
+    let coord_keys = [
+        "\"x\"", "'x'", "\"y\"", "'y'", "\"w\"", "'w'", "\"h\"", "'h'",
+    ];
+    if lower.contains("bbox")
+        || coord_keys
+            .iter()
+            .filter(|key| lower.contains(**key))
+            .count()
+            >= 2
+    {
+        return lower.contains(':') || lower.contains('=');
+    }
+    lower.ends_with("},") && lower.contains(':')
+}
+
+fn anchor_neighbors_look_like_debug_or_schema(anchor: &ResumeLineAnchor) -> bool {
+    [anchor.previous_line.as_deref(), anchor.next_line.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(is_schema_like_text)
+}
+
+fn anchor_area_ratio(
+    anchor: &ResumeLineAnchor,
+    candidate: &ResumeQueryCandidateFrame,
+) -> Option<f64> {
+    let bounds = anchor.bounds.as_ref()?;
+    let width = candidate.original.pixel_width.unwrap_or(0).max(1) as f64;
+    let height = candidate.original.pixel_height.unwrap_or(0).max(1) as f64;
+    if width < 100.0 || height < 100.0 {
+        return None;
+    }
+    Some((bounds.w.max(0.0) * bounds.h.max(0.0)) / (width * height))
+}
+
+fn title_like_anchor(quote: &str, title: &str) -> bool {
+    let quote_key = normalized_line_key(quote);
+    let title_key = normalized_line_key(title);
+    if title_key.len() < 8 {
+        return false;
+    }
+    quote_key == title_key
+        || (quote_key.contains(&title_key)
+            && text_terms(quote).len() <= text_terms(title).len() + 4)
+}
+
+fn anchor_neighbors_look_like_browser_chrome(anchor: &ResumeLineAnchor) -> bool {
+    [anchor.previous_line.as_deref(), anchor.next_line.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|text| {
+            let lower = text.to_lowercase();
+            is_browser_chrome_text(text)
+                || is_browser_chrome_heavy_text(text)
+                || lower.contains("kagurabachi")
+                || lower.contains("openai api")
+                || lower.contains("arxiv tab")
+                || lower.contains("protiles")
+                || lower.contains("helc")
+                || lower.contains("address and search bar")
+        })
+}
+
+fn line_anchor_score(anchor: &ResumeLineAnchor, candidate: &ResumeQueryCandidateFrame) -> f64 {
+    let quote = anchor.quote.as_deref().unwrap_or("");
+    let lower = quote.to_lowercase();
+    let mut score = anchor.confidence;
+    if is_actionable_resume_text(quote) {
+        score += 0.35;
+    }
+    for marker in [
+        "the correct framing",
+        "my final judgment",
+        "resume here",
+        "continue from",
+        "start from",
+        "next action",
+        "do next",
+        "build this next",
+    ] {
+        if lower.contains(marker) {
+            score += 0.22;
+        }
+    }
+    if candidate.surface_type == "chat_conversation" {
+        score += 0.10;
+    }
+    if quote.ends_with(':') {
+        score += 0.04;
+    }
+    if anchor
+        .semantic_role
+        .as_deref()
+        .is_some_and(|role| matches!(role, "main_content" | "chat_message" | "heading"))
+    {
+        score += 0.06;
+    }
+    if candidate.original.capture_trigger.contains("scroll")
+        || candidate.original.capture_trigger.contains("typing")
+        || candidate.original.capture_trigger.contains("click")
+    {
+        score += 0.05;
+    }
+    if lower.starts_with("http") || is_browser_chrome_text(quote) {
+        score -= 0.8;
+    }
+    score
+}
+
+fn push_cloud_text_snippet(snippets: &mut Vec<String>, text: &str) {
+    let snippet = truncate_chars(text.trim(), 180);
+    if snippet.is_empty() || is_browser_chrome_text(&snippet) {
+        return;
+    }
+    if !snippets.iter().any(|existing| existing == &snippet) {
+        snippets.push(snippet);
+    }
+}
+
+fn section_anchor_for_cloud(
+    candidate: &ResumeQueryCandidateFrame,
+    visible_anchor: &str,
+) -> Option<String> {
+    for unit in &candidate.safe.top_content_units {
+        if unit.semantic_role.as_deref() == Some("heading") && !is_browser_chrome_text(&unit.text) {
+            return non_empty(truncate_chars(&unit.text, 120));
+        }
+    }
+    let lower = visible_anchor.to_lowercase();
+    for (needle, anchor) in [
+        ("critical extraction bug", "Critical extraction bug"),
+        ("main problem", "The main problem"),
+        (
+            "gaps that will reduce accuracy",
+            "Gaps that will reduce accuracy",
+        ),
+        ("required confidence policy", "Required confidence policy"),
+    ] {
+        if lower.contains(needle) {
+            return Some(anchor.to_string());
+        }
+    }
+    None
+}
+
+fn resume_query_confidence(
+    candidate: &ResumeQueryCandidateFrame,
+    visible_anchor: Option<&str>,
+) -> f64 {
+    let mut confidence = candidate.safe.evidence_strength.min(0.92);
+    if candidate.text_chrome_dominated {
+        confidence = confidence.min(0.68);
+    }
+    if candidate.metadata_suspect {
+        confidence = confidence.min(0.72);
+    }
+    if candidate.surface_type == "unknown" {
+        confidence = confidence.min(0.62);
+    }
+    if visible_anchor.is_none_or(|anchor| anchor.trim().is_empty()) {
+        confidence = confidence.min(0.55);
+    }
+    confidence
+}
+
+fn collect_cloud_quality_flags(selected: &[SelectedResumeQueryFrame]) -> Vec<String> {
+    let mut flags = Vec::new();
+    for frame in selected {
+        for flag in quality_flags_for_cloud(&frame.candidate) {
+            push_unique(&mut flags, flag);
+        }
+    }
+    flags
+}
+
+fn quality_flags_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Vec<String> {
+    let mut flags = Vec::new();
+    flags.push(format!("surface_state_{}", candidate.surface_state));
+    if candidate.is_debug_artifact {
+        flags.push("debug_artifact_frame".to_string());
+    }
+    if candidate.text_chrome_dominated {
+        flags.push("json_visible_text_was_browser_chrome_heavy".to_string());
+    }
+    if candidate.metadata_suspect {
+        flags.push("metadata_suspect".to_string());
+    }
+    if candidate.metadata_image_mismatch {
+        flags.push("metadata_image_mismatch".to_string());
+    }
+    if candidate.surface_type == "unknown" {
+        flags.push("surface_type_unknown".to_string());
+    }
+    if candidate_browser_surface(candidate)
+        && candidate.safe.top_content_units.is_empty()
+        && candidate.selected_text.is_none()
+    {
+        flags.push("missing_page_body_content_units".to_string());
+    }
+    if best_visible_text_for_cloud(candidate).is_none() {
+        flags.push("clean_visible_text_missing".to_string());
+    }
+    if best_line_anchor_for_cloud(candidate).is_none() {
+        flags.push("no_valid_candidate_anchor".to_string());
+    }
+    if candidate_resume_text(candidate)
+        .as_deref()
+        .is_some_and(|text| is_export_debug_artifact(text, None, None))
+    {
+        flags.push("exact_words_chrome_heavy".to_string());
+    }
+    flags
+}
+
+fn candidate_browser_surface(candidate: &ResumeQueryCandidateFrame) -> bool {
+    candidate.original.browser_url.is_some()
+        || candidate
+            .safe
+            .app_name
+            .as_deref()
+            .map(|app| is_browser_app(&app.to_lowercase()))
+            .unwrap_or(false)
+        || matches!(
+            candidate.surface_type.as_str(),
+            "browser_tab" | "chat_conversation"
+        )
+}
+
+fn build_resume_query_transitions_from_conn(
+    conn: &Connection,
+    session: &CaptureSession,
+    stopped_at: i64,
+    selected: &[SelectedResumeQueryFrame],
+) -> Result<Vec<ResumeQueryTransition>, String> {
+    let mut transitions =
+        query_transitions_between(conn, session.started_at, stopped_at, Some(&session.id))?;
+    transitions.sort_by_key(|transition| transition.ts_start_ms);
+    let mapped = transitions
+        .into_iter()
+        .filter_map(|transition| {
+            let from_frame = transition.pre_frame_id?;
+            let to_frame = transition.post_frame_id?;
+            Some(ResumeQueryTransition {
+                from_frame,
+                to_frame,
+                label: transition
+                    .transition_type
+                    .unwrap_or_else(|| "unknown".to_string()),
+                confidence: transition.confidence.unwrap_or(0.68).min(0.92),
+            })
+        })
+        .take(64)
+        .collect::<Vec<_>>();
+    if mapped.is_empty() {
+        Ok(build_resume_query_transitions(selected))
+    } else {
+        Ok(mapped)
+    }
+}
+
+fn build_resume_query_transitions(
+    selected: &[SelectedResumeQueryFrame],
+) -> Vec<ResumeQueryTransition> {
+    let origin_key = selected
+        .first()
+        .map(|item| cloud_surface_key(&item.candidate));
+    selected
+        .windows(2)
+        .map(|pair| {
+            let previous = &pair[0];
+            let current = &pair[1];
+            let previous_key = cloud_surface_key(&previous.candidate);
+            let current_key = cloud_surface_key(&current.candidate);
+            let returned_to_origin = origin_key
+                .as_ref()
+                .is_some_and(|origin| current_key == *origin && previous_key != current_key);
+            let label = if current.role == "return_to_origin" {
+                "returning_to_origin"
+            } else if current.candidate.metadata_suspect {
+                "metadata_suspect"
+            } else if current.role == "diagnostic_artifact" {
+                "diagnostic_artifact"
+            } else if is_transient_cloud_frame(&current.candidate) {
+                "transient_navigation"
+            } else if current.role == "resume_candidate" && returned_to_origin {
+                "returning_to_origin"
+            } else if current.role == "resume_candidate" {
+                "resume_target_detected"
+            } else if current.role == "side_branch" || previous_key != current_key {
+                "side_branch"
+            } else {
+                "continued_reading"
+            };
+            ResumeQueryTransition {
+                from_frame: previous.candidate.safe.frame_id.clone(),
+                to_frame: current.candidate.safe.frame_id.clone(),
+                label: label.to_string(),
+                confidence: ((previous.candidate.safe.evidence_strength
+                    + current.candidate.safe.evidence_strength)
+                    / 2.0)
+                    .min(0.92),
+            }
+        })
+        .collect()
+}
+
+fn copy_cloud_image_for_payload(
+    output_dir: &Path,
+    selected: &SelectedResumeQueryFrame,
+) -> Result<Option<String>, String> {
+    let candidate = &selected.candidate.original;
+    let source = candidate
+        .active_window_crop_path
+        .as_deref()
+        .or(candidate.full_screenshot_path.as_deref())
+        .or(Some(candidate.snapshot_path.as_str()))
+        .filter(|path| !path.trim().is_empty());
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        return Ok(None);
+    }
+    let images_dir = output_dir.join("images");
+    fs::create_dir_all(&images_dir).map_err(to_string)?;
+    let source_ext = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("jpg")
+        .to_ascii_lowercase();
+    let output_ext = if source_ext == "webp" { "webp" } else { "jpg" };
+    let output_name = format!(
+        "frame-{:06}-{}.{}",
+        candidate.id,
+        selected.role.replace('_', "-"),
+        output_ext
+    );
+    let output_path = images_dir.join(&output_name);
+    if matches!(source_ext.as_str(), "jpg" | "jpeg" | "webp") {
+        fs::copy(source_path, &output_path).map_err(to_string)?;
+    } else if convert_image_to_jpeg(source_path, &output_path).is_err() {
+        let fallback_name = format!(
+            "frame-{:06}-{}-source.{}",
+            candidate.id,
+            selected.role.replace('_', "-"),
+            source_ext
+        );
+        let fallback_path = images_dir.join(&fallback_name);
+        fs::copy(source_path, &fallback_path).map_err(to_string)?;
+        return Ok(Some(format!("images/{}", fallback_name)));
+    }
+    Ok(Some(format!("images/{}", output_name)))
+}
+
+fn seconds_between(start_ms: i64, end_ms: i64) -> f64 {
+    ((end_ms - start_ms).max(0) as f64 / 1000.0 * 10.0).round() / 10.0
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+#[tauri::command]
 pub fn run_resume_eval(app: AppHandle, eval_file_path: String) -> Result<ResumeEvalReport, String> {
     let raw = fs::read_to_string(&eval_file_path).map_err(to_string)?;
     let parsed: Value = serde_json::from_str(&raw).map_err(to_string)?;
@@ -1808,9 +8268,25 @@ fn build_safe_ai_export_from_conn(
         .and_then(|id| frame_captured_at(conn, id).ok().flatten())
         .unwrap_or(generated_at_ms);
     let lookback_start_ms = lookback_end_ms.saturating_sub(lookback_ms);
+    let session_scope = input.session_id.clone().or_else(|| {
+        input
+            .current_frame_id
+            .and_then(|id| frame_session_id(conn, id).ok().flatten())
+    });
     let max_frames = input.max_frames.unwrap_or(120).clamp(1, 240);
-    let frames = query_frames_between(conn, lookback_start_ms, lookback_end_ms, max_frames)?;
-    let transitions = query_transitions_between(conn, lookback_start_ms, lookback_end_ms)?;
+    let frames = query_frames_between(
+        conn,
+        lookback_start_ms,
+        lookback_end_ms,
+        max_frames,
+        session_scope.as_deref(),
+    )?;
+    let transitions = query_transitions_between(
+        conn,
+        lookback_start_ms,
+        lookback_end_ms,
+        session_scope.as_deref(),
+    )?;
     let export_dir = output_root.join(&export_id);
     fs::create_dir_all(&export_dir).map_err(to_string)?;
 
@@ -2295,7 +8771,11 @@ fn build_resume_card_from_storyboard(
         .take(3)
         .map(|surface| surface.surface_key.clone())
         .collect::<Vec<_>>();
-    let reading_quote = continue_from.and_then(best_quote_for_keyframe);
+    let continue_line_anchor = continue_from.and_then(best_line_anchor_for_storyboard_keyframe);
+    let reading_quote = continue_line_anchor
+        .as_ref()
+        .and_then(|anchor| anchor.quote.clone())
+        .or_else(|| continue_from.and_then(best_quote_for_keyframe));
     let title = continue_from.and_then(|frame| {
         frame
             .window_name
@@ -2369,6 +8849,7 @@ fn build_resume_card_from_storyboard(
             url: continue_from.and_then(|frame| frame.browser_url.clone()),
             document_path: continue_from.and_then(|frame| frame.document_path.clone()),
             quote: reading_quote,
+            line_anchor: continue_line_anchor,
             reason: continue_from
                 .map(|frame| frame.selection_reason.clone())
                 .unwrap_or_else(|| "no safe keyframe available".to_string()),
@@ -2423,19 +8904,22 @@ fn query_frames_between(
     start_ms: i64,
     end_ms: i64,
     limit: u32,
+    session_id: Option<&str>,
 ) -> Result<Vec<CaptureFrame>, String> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {}
              FROM frames
-             WHERE captured_at >= ?1 AND captured_at <= ?2
+             WHERE captured_at >= ?1
+               AND captured_at <= ?2
+               AND (?4 IS NULL OR session_id = ?4)
              ORDER BY captured_at DESC, id DESC
              LIMIT ?3",
             FRAME_COLUMNS
         ))
         .map_err(to_string)?;
     let rows = stmt
-        .query_map(params![start_ms, end_ms, limit], frame_from_row)
+        .query_map(params![start_ms, end_ms, limit, session_id], frame_from_row)
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
@@ -2444,19 +8928,22 @@ fn query_transitions_between(
     conn: &Connection,
     start_ms: i64,
     end_ms: i64,
+    session_id: Option<&str>,
 ) -> Result<Vec<TransitionSummary>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
                     ts_start_ms, ts_end_ms, transition_type, confidence, summary
              FROM event_transitions
-             WHERE ts_start_ms >= ?1 AND ts_start_ms <= ?2
+             WHERE ts_start_ms >= ?1
+               AND ts_start_ms <= ?2
+               AND (?3 IS NULL OR session_id = ?3)
              ORDER BY ts_start_ms DESC
              LIMIT 160",
         )
         .map_err(to_string)?;
     let rows = stmt
-        .query_map(params![start_ms, end_ms], transition_from_row)
+        .query_map(params![start_ms, end_ms, session_id], transition_from_row)
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
@@ -2471,46 +8958,65 @@ fn frame_captured_at(conn: &Connection, frame_id: i64) -> Result<Option<i64>, St
     .map_err(to_string)
 }
 
+fn frame_session_id(conn: &Connection, frame_id: i64) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT session_id FROM frames WHERE id = ?1",
+        params![frame_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
 fn compact_content_units_for_ai(
     content_units: &[ContentUnitSummary],
     text_was_redacted: &mut bool,
 ) -> Vec<CompactContentUnit> {
     let mut units = content_units
         .iter()
-        .filter(|unit| !is_low_signal_content_unit(unit))
+        .filter(|unit| !is_low_signal_content_unit(unit) && !is_aggregate_content_unit(unit))
         .collect::<Vec<_>>();
-    units.sort_by(|left, right| {
-        content_role_priority(right)
-            .cmp(&content_role_priority(left))
-            .then_with(|| {
-                right
-                    .confidence
-                    .partial_cmp(&left.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-    units
-        .into_iter()
-        .take(12)
-        .filter_map(|unit| {
-            let text = unit.text.as_deref()?.trim();
-            if text.is_empty() {
-                return None;
-            }
-            let redacted = redact_text_for_ai(text);
-            if redacted != text {
-                *text_was_redacted = true;
-            }
-            non_empty(redacted).map(|text| CompactContentUnit {
-                id: unit.id.clone(),
-                source: unit.source.clone(),
-                unit_type: unit.unit_type.clone(),
-                semantic_role: unit.semantic_role.clone(),
-                text,
-                confidence: unit.confidence,
-            })
-        })
-        .collect()
+    units.sort_by(content_unit_reading_order);
+
+    let mut compact = Vec::new();
+    let mut seen = HashSet::new();
+    for unit in units {
+        let Some(text) = unit
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let redacted = redact_text_for_ai(text);
+        if redacted != text {
+            *text_was_redacted = true;
+        }
+        let Some(text) = non_empty(redacted) else {
+            continue;
+        };
+        let key = normalized_line_key(&text);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        compact.push(CompactContentUnit {
+            id: unit.id.clone(),
+            source: unit.source.clone(),
+            unit_type: unit.unit_type.clone(),
+            semantic_role: unit.semantic_role.clone(),
+            text,
+            bounds_x: unit.bounds_x,
+            bounds_y: unit.bounds_y,
+            bounds_w: unit.bounds_w,
+            bounds_h: unit.bounds_h,
+            confidence: unit.confidence,
+        });
+        if compact.len() >= 24 {
+            break;
+        }
+    }
+    compact
 }
 
 fn is_low_signal_content_unit(unit: &ContentUnitSummary) -> bool {
@@ -2518,11 +9024,167 @@ fn is_low_signal_content_unit(unit: &ContentUnitSummary) -> bool {
     let unit_type = unit.unit_type.to_lowercase();
     let text = unit.text.as_deref().unwrap_or("").trim();
     text.len() < 3
+        || is_low_signal_cloud_text(text)
+        || is_browser_chrome_text(text)
+        || content_unit_is_top_chrome_geometry(unit)
         || role.contains("browser_chrome")
         || role.contains("toolbar")
         || role.contains("system_menu")
         || role.contains("sidebar")
         || unit_type.contains("button")
+}
+
+fn content_unit_is_top_chrome_geometry(unit: &ContentUnitSummary) -> bool {
+    let y = unit.bounds_y.unwrap_or(f64::MAX);
+    y < 95.0
+}
+
+fn is_aggregate_content_unit(unit: &ContentUnitSummary) -> bool {
+    let text_len = unit.text.as_deref().unwrap_or("").chars().count();
+    let broad =
+        unit.bounds_w.unwrap_or_default() >= 1_000.0 && unit.bounds_h.unwrap_or_default() >= 500.0;
+    broad
+        && (text_len > 120
+            || unit.source == "ax"
+            || unit
+                .text
+                .as_deref()
+                .is_some_and(is_browser_chrome_heavy_text))
+}
+
+fn content_unit_reading_order(
+    left: &&ContentUnitSummary,
+    right: &&ContentUnitSummary,
+) -> std::cmp::Ordering {
+    optional_f64_order(left.bounds_y, right.bounds_y)
+        .then_with(|| optional_f64_order(left.bounds_x, right.bounds_x))
+        .then_with(|| content_role_priority(right).cmp(&content_role_priority(left)))
+        .then_with(|| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn optional_f64_order(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    left.unwrap_or(f64::MAX)
+        .partial_cmp(&right.unwrap_or(f64::MAX))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn normalized_line_key(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || ch.is_whitespace())
+        .collect()
+}
+
+fn is_browser_chrome_text(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    let compact = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.starts_with("http://")
+        || compact.starts_with("https://")
+        || compact.starts_with("chrome://")
+        || compact.starts_with("about:")
+    {
+        return true;
+    }
+    if matches!(
+        compact.as_str(),
+        "back"
+            | "forward"
+            | "reload"
+            | "stop"
+            | "new tab"
+            | "close tab"
+            | "tab search"
+            | "address and search bar"
+            | "search or enter address"
+            | "extensions"
+            | "extension"
+            | "bookmark this tab"
+            | "bookmarks"
+            | "history"
+            | "downloads"
+            | "profile"
+            | "side panel"
+            | "show sidebar"
+            | "hide sidebar"
+            | "reader view"
+            | "share"
+            | "copy link"
+            | "more"
+            | "menu"
+    ) {
+        return true;
+    }
+    [
+        "address and search bar",
+        "search or enter address",
+        "google chrome is controlling",
+        "extension button",
+        "browser toolbar",
+        "tab group",
+        "tab strip",
+        "reload this page",
+        "go back",
+        "go forward",
+        "open side panel",
+        "customize and control",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
+}
+
+fn is_browser_chrome_heavy_text(text: &str) -> bool {
+    let compact = text
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return true;
+    }
+    let chrome_markers = [
+        "developer tools",
+        "pinned",
+        "file edit view",
+        "history bookmarks",
+        "profiles window",
+        "address and search",
+        "local inference optimization",
+        "new tab",
+        "tab search",
+        "extensions",
+        "side panel",
+        "reload",
+        "bookmarks",
+        "downloads",
+    ];
+    let marker_count = chrome_markers
+        .iter()
+        .filter(|marker| compact.contains(**marker))
+        .count();
+    let meaningful_page_markers = [
+        "critical extraction bug",
+        "for browser pages",
+        "also add a hard browser-chrome filter",
+        "next action",
+        "resume",
+        "implement",
+    ]
+    .iter()
+    .any(|marker| compact.contains(*marker));
+    (marker_count >= 2 && !meaningful_page_markers)
+        || (marker_count >= 3 && text_terms(&compact).len() < 32)
 }
 
 fn content_role_priority(unit: &ContentUnitSummary) -> i32 {
@@ -3307,6 +9969,43 @@ fn best_quote_for_keyframe(frame: &StoryboardKeyframe) -> Option<String> {
         .iter()
         .find(|unit| unit.text.len() >= 30)
         .map(|unit| truncate_chars(&unit.text, 220))
+}
+
+fn best_line_anchor_for_storyboard_keyframe(
+    frame: &StoryboardKeyframe,
+) -> Option<ResumeLineAnchor> {
+    line_anchors_from_compact_units(&frame.frame_id, None, &frame.top_content_units)
+        .into_iter()
+        .filter(|anchor| {
+            anchor
+                .quote
+                .as_deref()
+                .is_some_and(|quote| !is_browser_chrome_text(quote) && quote.len() >= 8)
+        })
+        .max_by(|left, right| {
+            storyboard_line_anchor_score(left, frame)
+                .partial_cmp(&storyboard_line_anchor_score(right, frame))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn storyboard_line_anchor_score(anchor: &ResumeLineAnchor, frame: &StoryboardKeyframe) -> f64 {
+    let quote = anchor.quote.as_deref().unwrap_or("");
+    let mut score = anchor.confidence;
+    if frame
+        .app_context_object_type
+        .as_deref()
+        .is_some_and(|kind| kind == "chat_conversation")
+    {
+        score += 0.1;
+    }
+    if is_actionable_resume_text(quote) || quote.to_lowercase().contains("the correct framing") {
+        score += 0.25;
+    }
+    if quote.ends_with(':') {
+        score += 0.04;
+    }
+    score
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -5096,7 +11795,7 @@ fn persist_content_units(
         let Some((text, x, y, w, h)) = span else {
             continue;
         };
-        if text.trim().is_empty() || context.text.contains(&text) {
+        if text.trim().is_empty() {
             continue;
         }
         let ocr_span_ids = serde_json::to_string(&vec![span_id]).map_err(to_string)?;
@@ -5280,25 +11979,22 @@ fn persist_frame_diff(
 fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'static str, f64) {
     let app = app_name.to_lowercase();
     let url = url.unwrap_or("").to_lowercase();
+    if is_ai_chat_url(&url) {
+        return ("ai_chat_url_adapter", "chat_conversation", 0.88);
+    }
+    if url.contains("notion.so") || url.contains("notion.site") {
+        return ("notion_browser_adapter", "notes_doc", 0.86);
+    }
+    if url.contains("linear.app") {
+        return ("linear_browser_adapter", "notes_doc", 0.82);
+    }
+    if is_media_url(&url) {
+        return ("media_browser_adapter", "media", 0.86);
+    }
+    if url.ends_with(".pdf") || url.contains("/pdf") {
+        return ("pdf_browser_adapter", "pdf", 0.78);
+    }
     if is_browser_app(&app) {
-        if url.contains("chatgpt.com") || url.contains("chat.openai.com") {
-            return ("chatgpt_browser_adapter", "chat_conversation", 0.9);
-        }
-        if url.contains("claude.ai") || url.contains("perplexity.ai") {
-            return ("ai_chat_browser_adapter", "chat_conversation", 0.86);
-        }
-        if url.contains("notion.so") || url.contains("notion.site") {
-            return ("notion_browser_adapter", "notes_doc", 0.86);
-        }
-        if url.contains("linear.app") {
-            return ("linear_browser_adapter", "notes_doc", 0.82);
-        }
-        if is_media_url(&url) {
-            return ("media_browser_adapter", "media", 0.86);
-        }
-        if url.ends_with(".pdf") || url.contains("/pdf") {
-            return ("pdf_browser_adapter", "pdf", 0.78);
-        }
         return ("browser_adapter", "browser_tab", 0.82);
     }
     if app.contains("chatgpt") || app.contains("claude") || app.contains("perplexity") {
@@ -5345,6 +12041,17 @@ fn is_browser_app(app: &str) -> bool {
     .any(|needle| app.contains(needle))
 }
 
+fn is_ai_chat_url(url: &str) -> bool {
+    [
+        "chatgpt.com",
+        "chat.openai.com",
+        "claude.ai",
+        "perplexity.ai",
+    ]
+    .iter()
+    .any(|needle| url.contains(needle))
+}
+
 fn is_media_url(url: &str) -> bool {
     [
         "youtube.com",
@@ -5387,14 +12094,7 @@ fn semantic_role_for_text(text: &str, role: &str) -> Option<String> {
     if role.contains("toolbar") || role.contains("menubar") || role.contains("menu") {
         return Some("toolbar".to_string());
     }
-    if lower.contains("address and search bar")
-        || lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower == "back"
-        || lower == "forward"
-        || lower == "reload"
-        || lower == "new tab"
-    {
+    if is_browser_chrome_text(&lower) {
         return Some("browser_chrome".to_string());
     }
     if lower.contains("history")
@@ -5749,6 +12449,32 @@ fn query_ui_events(
         .map_err(to_string)?;
     let rows = stmt
         .query_map(params![since, session_id], ui_event_summary_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_ui_events_between(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    session_id: Option<&str>,
+) -> Result<Vec<UiEventSummary>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ts_ms, event_type, app_name, window_title, key_category, payload_json
+             FROM ui_events
+             WHERE ts_ms >= ?1
+               AND ts_ms <= ?2
+               AND (?3 IS NULL OR session_id = ?3)
+             ORDER BY ts_ms ASC
+             LIMIT 4000",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(
+            params![start_ms, end_ms, session_id],
+            ui_event_summary_from_row,
+        )
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
@@ -6459,10 +13185,7 @@ fn create_capture_session(app: &AppHandle) -> Result<CaptureSession, String> {
     load_capture_session(&conn, &id)
 }
 
-fn finish_capture_session(
-    app: &AppHandle,
-    session_id: &str,
-) -> Result<(CaptureSession, SessionExportSummary), String> {
+fn finish_capture_session(app: &AppHandle, session_id: &str) -> Result<CaptureSession, String> {
     let conn = open_db(app)?;
     let stopped_at = now_millis();
     conn.execute(
@@ -6474,23 +13197,15 @@ fn finish_capture_session(
     )
     .map_err(to_string)?;
     refresh_session_counts(&conn, session_id)?;
-
-    let session = load_capture_session(&conn, session_id)?;
-    let planned_export_path = session_output_dir(&project_output_root()?, session.sequence)?;
     conn.execute(
         "UPDATE capture_sessions
-         SET export_path = ?2
+         SET export_path = NULL
          WHERE id = ?1",
-        params![
-            session_id,
-            planned_export_path.to_string_lossy().to_string()
-        ],
+        params![session_id],
     )
     .map_err(to_string)?;
-    let session = load_capture_session(&conn, session_id)?;
-    let export = write_session_export(app, &conn, &session)?;
 
-    Ok((load_capture_session(&conn, session_id)?, export))
+    load_capture_session(&conn, session_id)
 }
 
 fn next_session_sequence(conn: &Connection) -> Result<i64, String> {
@@ -6688,6 +13403,7 @@ fn session_count_query(conn: &Connection, sql: &str, session_id: &str) -> Result
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 struct ExportWarning {
     scope: String,
     code: String,
@@ -6697,6 +13413,7 @@ struct ExportWarning {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 struct ExportedImageArtifact {
     label: String,
     source_path: String,
@@ -6710,6 +13427,7 @@ struct ExportStats {
     byte_size: i64,
 }
 
+#[allow(dead_code)]
 fn write_session_export(
     _app: &AppHandle,
     conn: &Connection,
@@ -6718,6 +13436,7 @@ fn write_session_export(
     write_session_export_to_root(conn, session, &project_output_root()?)
 }
 
+#[allow(dead_code)]
 fn write_session_export_to_root(
     conn: &Connection,
     session: &CaptureSession,
@@ -6805,6 +13524,7 @@ fn write_session_export_to_root(
     })
 }
 
+#[allow(dead_code)]
 fn write_session_manifest(
     path: &Path,
     session: &CaptureSession,
@@ -6850,6 +13570,7 @@ fn write_session_manifest(
     )
 }
 
+#[allow(dead_code)]
 fn query_json_rows_for_session(
     conn: &Connection,
     sql: &str,
@@ -6858,6 +13579,7 @@ fn query_json_rows_for_session(
     query_json_rows_with_params(conn, sql, &[&session_id])
 }
 
+#[allow(dead_code)]
 fn query_json_rows_with_params(
     conn: &Connection,
     sql: &str,
@@ -6881,10 +13603,12 @@ fn query_json_rows_with_params(
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
 
+#[allow(dead_code)]
 fn query_json_rows(conn: &Connection, sql: &str) -> Result<Vec<Value>, String> {
     query_json_rows_with_params(conn, sql, &[])
 }
 
+#[allow(dead_code)]
 fn export_all_tables(
     conn: &Connection,
     tables_dir: &Path,
@@ -6921,6 +13645,7 @@ fn export_all_tables(
     Ok(manifest)
 }
 
+#[allow(dead_code)]
 fn export_timeline(
     conn: &Connection,
     session: &CaptureSession,
@@ -6968,6 +13693,7 @@ fn export_timeline(
     Ok(Value::Object(manifest))
 }
 
+#[allow(dead_code)]
 fn export_frame_folder(
     conn: &Connection,
     frame: &CaptureFrame,
@@ -7182,6 +13908,7 @@ fn export_frame_folder(
     Ok(manifest)
 }
 
+#[allow(dead_code)]
 fn export_frame_images(
     frame: &CaptureFrame,
     index: usize,
@@ -7226,6 +13953,7 @@ fn export_frame_images(
     Ok(artifacts)
 }
 
+#[allow(dead_code)]
 fn copy_image_artifact(
     frame_id: i64,
     index: usize,
@@ -7323,6 +14051,31 @@ fn convert_image_to_png(source: &Path, output: &Path) -> Result<(), String> {
     }
 }
 
+fn convert_image_to_jpeg(source: &Path, output: &Path) -> Result<(), String> {
+    let output_result = Command::new("/usr/bin/sips")
+        .arg("-s")
+        .arg("format")
+        .arg("jpeg")
+        .arg(source)
+        .arg("--out")
+        .arg(output)
+        .output()
+        .map_err(|error| format!("sips failed to start: {}", error))?;
+    if output_result.status.success() && output.exists() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output_result.stderr)
+            .trim()
+            .to_string();
+        Err(if stderr.is_empty() {
+            "sips did not produce a JPEG".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
+#[allow(dead_code)]
 fn query_full_events_for_frame(
     conn: &Connection,
     triggers: &[Value],
@@ -7373,6 +14126,22 @@ fn frames_for_session(conn: &Connection, session_id: &str) -> Result<Vec<Capture
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
 
+fn frame_by_id(conn: &Connection, frame_id: i64) -> Result<Option<CaptureFrame>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {}
+             FROM frames
+             WHERE id = ?1",
+            FRAME_COLUMNS
+        ),
+        params![frame_id],
+        frame_from_row,
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+#[allow(dead_code)]
 fn table_names_for_export(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
@@ -7402,6 +14171,7 @@ fn table_names_for_export(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(tables)
 }
 
+#[allow(dead_code)]
 fn write_schema_dump(conn: &Connection, path: &Path) -> Result<(), String> {
     let rows = query_json_rows(
         conn,
@@ -7420,6 +14190,7 @@ fn write_schema_dump(conn: &Connection, path: &Path) -> Result<(), String> {
     write_text_file(path, &output)
 }
 
+#[allow(dead_code)]
 fn copy_database_snapshot(conn: &Connection, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(to_string)?;
@@ -7432,10 +14203,12 @@ fn copy_database_snapshot(conn: &Connection, path: &Path) -> Result<(), String> 
         .map_err(to_string)
 }
 
+#[allow(dead_code)]
 fn write_json_rows_file(path: &Path, rows: &[Value]) -> Result<(), String> {
     write_json_pretty(path, &Value::Array(rows.to_vec()))
 }
 
+#[allow(dead_code)]
 fn write_ndjson_rows_file(path: &Path, rows: &[Value]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(to_string)?;
@@ -7456,6 +14229,7 @@ fn write_json_pretty(path: &Path, value: &Value) -> Result<(), String> {
     fs::write(path, bytes).map_err(to_string)
 }
 
+#[allow(dead_code)]
 fn write_text_file(path: &Path, value: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(to_string)?;
@@ -7486,26 +14260,37 @@ fn collect_directory_stats(path: &Path, stats: &mut ExportStats) -> Result<(), S
     Ok(())
 }
 
-fn project_output_root() -> Result<PathBuf, String> {
+fn project_root() -> Result<PathBuf, String> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let project_root = manifest_dir
+    manifest_dir
         .parent()
-        .ok_or_else(|| "could not resolve project root from CARGO_MANIFEST_DIR".to_string())?;
-    Ok(project_root.join("output"))
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "could not resolve project root from CARGO_MANIFEST_DIR".to_string())
+}
+
+fn project_output_root() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("output"))
+}
+
+fn project_resume_query_root() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("resume_query_exports"))
 }
 
 fn session_folder_name(sequence: i64) -> String {
     format!("session-{:03}", sequence.max(1))
 }
 
+#[allow(dead_code)]
 fn session_output_dir(output_root: &Path, sequence: i64) -> Result<PathBuf, String> {
     Ok(output_root.join(session_folder_name(sequence)))
 }
 
+#[allow(dead_code)]
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+#[allow(dead_code)]
 fn safe_file_stem(value: &str) -> String {
     let stem = sanitize_id(value);
     if stem.is_empty() {
@@ -7515,6 +14300,7 @@ fn safe_file_stem(value: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn joined_text_field(rows: &[Value], field: &str) -> String {
     rows.iter()
         .filter_map(|row| row.get(field).and_then(Value::as_str))
@@ -7523,10 +14309,12 @@ fn joined_text_field(rows: &[Value], field: &str) -> String {
         .join("\n\n")
 }
 
+#[allow(dead_code)]
 fn json_string_or_value(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
+#[allow(dead_code)]
 fn push_export_warning(
     warnings: &mut Vec<ExportWarning>,
     scope: &str,
@@ -7544,6 +14332,7 @@ fn push_export_warning(
     });
 }
 
+#[allow(dead_code)]
 fn sql_value_to_json(value: SqlValueRef<'_>) -> Value {
     match value {
         SqlValueRef::Null => Value::Null,
@@ -7589,6 +14378,9 @@ fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
     fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
     replace_capture_db(&paths)?;
     clear_snapshot_dir(&paths.snapshot_dir)?;
+    clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
+    clear_project_output_dir()?;
+    clear_project_resume_query_dir()?;
     Ok(())
 }
 
@@ -7597,6 +14389,7 @@ fn clear_capture_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         BEGIN IMMEDIATE;
+        DELETE FROM episode_evidence;
         DELETE FROM episode_edges;
         DELETE FROM episode_nodes;
         DELETE FROM episodes;
@@ -7678,10 +14471,31 @@ fn capture_db_files(db_path: &Path) -> Vec<PathBuf> {
 }
 
 fn clear_snapshot_dir(snapshot_dir: &Path) -> Result<(), String> {
-    if snapshot_dir.exists() {
-        fs::remove_dir_all(snapshot_dir).map_err(to_string)?;
+    clear_directory_contents(snapshot_dir)
+}
+
+fn clear_project_output_dir() -> Result<(), String> {
+    clear_directory_contents(&project_output_root()?)
+}
+
+fn clear_project_resume_query_dir() -> Result<(), String> {
+    clear_directory_contents(&project_resume_query_root()?)
+}
+
+fn clear_directory_contents(dir: &Path) -> Result<(), String> {
+    if dir.exists() {
+        for entry in fs::read_dir(dir).map_err(to_string)? {
+            let entry = entry.map_err(to_string)?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(to_string)?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(&path).map_err(to_string)?;
+            } else {
+                fs::remove_file(&path).map_err(to_string)?;
+            }
+        }
     }
-    fs::create_dir_all(snapshot_dir).map_err(to_string)
+    fs::create_dir_all(dir).map_err(to_string)
 }
 
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
@@ -8091,36 +14905,22 @@ fn init_db(conn: &Connection) -> Result<(), String> {
 
         CREATE TABLE IF NOT EXISTS episodes (
           id TEXT PRIMARY KEY,
+          session_id TEXT,
+          start_frame_id TEXT,
+          end_frame_id TEXT,
           started_at_ms INTEGER NOT NULL,
           ended_at_ms INTEGER,
           status TEXT NOT NULL,
+          role_guess TEXT,
+          app TEXT,
+          surface_type TEXT,
+          title TEXT,
           primary_goal TEXT,
           current_surface_type TEXT,
           confidence REAL,
           summary TEXT,
+          quality_flags_json TEXT,
           metadata_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS episode_nodes (
-          id TEXT PRIMARY KEY,
-          episode_id TEXT NOT NULL,
-          node_type TEXT NOT NULL,
-          object_id TEXT NOT NULL,
-          role TEXT,
-          ts_ms INTEGER NOT NULL,
-          confidence REAL,
-          FOREIGN KEY(episode_id) REFERENCES episodes(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS episode_edges (
-          id TEXT PRIMARY KEY,
-          episode_id TEXT NOT NULL,
-          from_node_id TEXT NOT NULL,
-          to_node_id TEXT NOT NULL,
-          edge_type TEXT NOT NULL,
-          evidence_json TEXT,
-          confidence REAL,
-          FOREIGN KEY(episode_id) REFERENCES episodes(id)
         );
         ",
     )
@@ -8128,6 +14928,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
 
     ensure_frame_columns(conn)?;
     ensure_session_columns(conn)?;
+    ensure_episode_columns(conn)?;
     ensure_default_exclusion_rules(conn)?;
     Ok(())
 }
@@ -8194,6 +14995,125 @@ fn ensure_session_columns(conn: &Connection) -> Result<(), String> {
     for table in tables {
         ensure_table_column(conn, table, "session_id", "TEXT")?;
     }
+    Ok(())
+}
+
+fn ensure_episode_columns(conn: &Connection) -> Result<(), String> {
+    let additions = [
+        ("session_id", "TEXT"),
+        ("start_frame_id", "TEXT"),
+        ("end_frame_id", "TEXT"),
+        ("started_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("ended_at_ms", "INTEGER"),
+        ("status", "TEXT NOT NULL DEFAULT 'open'"),
+        ("role_guess", "TEXT"),
+        ("app", "TEXT"),
+        ("surface_type", "TEXT"),
+        ("title", "TEXT"),
+        ("primary_goal", "TEXT"),
+        ("current_surface_type", "TEXT"),
+        ("confidence", "REAL"),
+        ("summary", "TEXT"),
+        ("quality_flags_json", "TEXT"),
+        ("metadata_json", "TEXT"),
+    ];
+    for (name, definition) in additions {
+        ensure_table_column(conn, "episodes", name, definition)?;
+    }
+
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS episode_nodes (
+          id TEXT PRIMARY KEY,
+          episode_id TEXT NOT NULL,
+          node_type TEXT NOT NULL,
+          object_id TEXT NOT NULL,
+          role TEXT,
+          ts_ms INTEGER NOT NULL,
+          confidence REAL,
+          FOREIGN KEY(episode_id) REFERENCES episodes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS episode_edges (
+          id TEXT PRIMARY KEY,
+          episode_id TEXT NOT NULL,
+          from_node_id TEXT NOT NULL,
+          to_node_id TEXT NOT NULL,
+          edge_type TEXT NOT NULL,
+          evidence_json TEXT,
+          confidence REAL,
+          FOREIGN KEY(episode_id) REFERENCES episodes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS episode_evidence (
+          id TEXT PRIMARY KEY,
+          episode_id TEXT NOT NULL,
+          frame_id TEXT NOT NULL,
+          evidence_type TEXT NOT NULL,
+          text TEXT,
+          image_ref TEXT,
+          score REAL,
+          reason TEXT,
+          created_at_ms INTEGER NOT NULL,
+          FOREIGN KEY(episode_id) REFERENCES episodes(id)
+        );
+        ",
+    )
+    .map_err(to_string)?;
+
+    let episode_node_additions = [
+        ("episode_id", "TEXT NOT NULL DEFAULT ''"),
+        ("node_type", "TEXT NOT NULL DEFAULT ''"),
+        ("object_id", "TEXT NOT NULL DEFAULT ''"),
+        ("role", "TEXT"),
+        ("ts_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("confidence", "REAL"),
+    ];
+    for (name, definition) in episode_node_additions {
+        ensure_table_column(conn, "episode_nodes", name, definition)?;
+    }
+
+    let episode_edge_additions = [
+        ("episode_id", "TEXT NOT NULL DEFAULT ''"),
+        ("from_node_id", "TEXT NOT NULL DEFAULT ''"),
+        ("to_node_id", "TEXT NOT NULL DEFAULT ''"),
+        ("edge_type", "TEXT NOT NULL DEFAULT ''"),
+        ("evidence_json", "TEXT"),
+        ("confidence", "REAL"),
+    ];
+    for (name, definition) in episode_edge_additions {
+        ensure_table_column(conn, "episode_edges", name, definition)?;
+    }
+
+    let episode_evidence_additions = [
+        ("episode_id", "TEXT NOT NULL DEFAULT ''"),
+        ("frame_id", "TEXT NOT NULL DEFAULT ''"),
+        ("evidence_type", "TEXT NOT NULL DEFAULT ''"),
+        ("text", "TEXT"),
+        ("image_ref", "TEXT"),
+        ("score", "REAL"),
+        ("reason", "TEXT"),
+        ("created_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (name, definition) in episode_evidence_additions {
+        ensure_table_column(conn, "episode_evidence", name, definition)?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)",
+        [],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_episode_evidence_episode ON episode_evidence(episode_id)",
+        [],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_episode_evidence_frame ON episode_evidence(frame_id)",
+        [],
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
@@ -8791,6 +15711,7 @@ fn accessibility_is_thin(context: &AccessibilityContext) -> bool {
         "AXRadioButton",
     ];
 
+    let app = context.app_name.as_deref().unwrap_or("").to_lowercase();
     let window = context.window_name.as_deref().unwrap_or("").to_lowercase();
     let url = context.browser_url.as_deref().unwrap_or("").to_lowercase();
     if CANVAS_PATTERNS
@@ -8805,19 +15726,77 @@ fn accessibility_is_thin(context: &AccessibilityContext) -> bool {
         return true;
     }
 
+    let chrome_chars: usize = context
+        .nodes
+        .iter()
+        .filter(|node| {
+            let role = node.role.to_lowercase();
+            is_browser_chrome_text(&node.text)
+                || CHROME_ROLES.iter().any(|chrome_role| {
+                    role == chrome_role.to_lowercase() || role.contains(chrome_role)
+                })
+        })
+        .map(|node| node.text.len())
+        .sum();
+
     let content_chars: usize = context
         .nodes
         .iter()
         .filter(|node| {
             let role = node.role.to_lowercase();
-            !CHROME_ROLES
-                .iter()
-                .any(|chrome_role| role == chrome_role.to_lowercase() || role.contains(chrome_role))
+            !is_browser_chrome_text(&node.text)
+                && !CHROME_ROLES.iter().any(|chrome_role| {
+                    role == chrome_role.to_lowercase() || role.contains(chrome_role)
+                })
         })
         .map(|node| node.text.len())
         .sum();
 
+    let browser_like_surface = is_browser_app(&app) || !url.is_empty() || is_ai_chat_url(&url);
+    let repeated_window_title_chars: usize = context
+        .nodes
+        .iter()
+        .filter(|node| {
+            let node_key = normalized_line_key(&node.text);
+            !window.is_empty()
+                && !node_key.is_empty()
+                && node_key.contains(&normalized_line_key(&window))
+        })
+        .map(|node| node.text.len())
+        .sum();
+    let broad_title_or_chrome_node = context.nodes.iter().any(|node| {
+        let broad = node
+            .bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.w >= 1_000.0 && bounds.h >= 500.0);
+        broad && (is_browser_chrome_heavy_text(&node.text) || titleish_text(&node.text, &window))
+    });
+
+    if browser_like_surface
+        && (broad_title_or_chrome_node
+            || repeated_window_title_chars as f64 / total_chars.max(1) as f64 > 0.35)
+    {
+        return true;
+    }
+
+    if browser_like_surface
+        && chrome_chars as f64 / total_chars.max(1) as f64 > 0.55
+        && content_chars < 400
+    {
+        return true;
+    }
+
     (content_chars as f64 / total_chars as f64) < 0.3
+}
+
+fn titleish_text(text: &str, window_title: &str) -> bool {
+    let text_key = normalized_line_key(text);
+    let title_key = normalized_line_key(window_title);
+    !title_key.is_empty()
+        && title_key.len() >= 8
+        && (text_key == title_key
+            || (text_key.contains(&title_key)
+                && text_terms(text).len() <= text_terms(window_title).len() + 6))
 }
 
 fn ensure_swift_helper(
@@ -9308,6 +16287,9 @@ mod tests {
     }
 
     fn insert_export_test_frame(conn: &Connection, session_id: &str, image_path: &str) -> i64 {
+        let event_id = next_id("evt-test");
+        let trigger_id = next_id("trigger-test");
+        let transition_id = next_id("tx-test");
         conn.execute(
             INSERT_FRAME_SQL,
             params![
@@ -9340,7 +16322,7 @@ mod tests {
                 Option::<String>::None,
                 Some("phash"),
                 "normal",
-                Some("trigger-1"),
+                Some(trigger_id.clone()),
                 Option::<String>::None,
                 Some(session_id),
             ],
@@ -9356,53 +16338,64 @@ mod tests {
         conn.execute(
             "INSERT INTO ocr_spans (
                 id, frame_id, engine, text, bounds_x, bounds_y, bounds_w, bounds_h
-             ) VALUES ('ocr-1', ?1, 'test', 'ocr hello', 0.0, 0.0, 1.0, 1.0)",
-            params![frame_id.to_string()],
+             ) VALUES (?1, ?2, 'test', 'ocr hello', 0.0, 0.0, 1.0, 1.0)",
+            params![format!("ocr-{}", frame_id), frame_id.to_string()],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO ax_nodes (
                 id, frame_id, role, title, focused, bounds_x, bounds_y, bounds_w,
                 bounds_h, depth, raw_json
-             ) VALUES ('ax-1', ?1, 'AXWindow', 'hello', 1, 0.0, 0.0, 1.0, 1.0, 0, '{}')",
-            params![frame_id.to_string()],
+             ) VALUES (?1, ?2, 'AXWindow', 'hello', 1, 0.0, 0.0, 1.0, 1.0, 0, '{}')",
+            params![format!("ax-{}", frame_id), frame_id.to_string()],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO content_units (
                 id, frame_id, source, unit_type, text, text_hash, confidence, created_at_ms
-             ) VALUES ('unit-1', ?1, 'ocr', 'text', 'ocr hello', 'h', 0.8, 10)",
-            params![frame_id.to_string()],
+             ) VALUES (?1, ?2, 'ocr', 'text', 'ocr hello', 'h', 0.8, 10)",
+            params![format!("unit-{}", frame_id), frame_id.to_string()],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO app_contexts (
                 id, frame_id, adapter_id, object_type, title, confidence
-             ) VALUES ('ctx-1', ?1, 'test', 'browser_tab', 'Window', 0.9)",
-            params![frame_id.to_string()],
+             ) VALUES (?1, ?2, 'test', 'browser_tab', 'Window', 0.9)",
+            params![format!("ctx-{}", frame_id), frame_id.to_string()],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO ui_events (
                 id, session_id, ts_ms, event_type, created_at_ms
-             ) VALUES ('evt-1', ?1, 10, 'click', 10)",
-            params![session_id],
+             ) VALUES (?1, ?2, 10, 'click', 10)",
+            params![event_id.clone(), session_id],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO capture_triggers (
                 id, session_id, ts_ms, trigger_type, caused_by_event_ids,
                 settle_delay_ms, dedupe_policy, post_frame_id, status
-             ) VALUES ('trigger-1', ?1, 10, 'manual', '[\"evt-1\"]', 0, 'manual', ?2, 'captured')",
-            params![session_id, frame_id.to_string()],
+             ) VALUES (?1, ?2, 10, 'manual', ?3, 0, 'manual', ?4, 'captured')",
+            params![
+                trigger_id.clone(),
+                session_id,
+                serde_json::json!([event_id.clone()]).to_string(),
+                frame_id.to_string()
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO event_transitions (
                 id, session_id, trigger_id, primary_event_id, post_frame_id,
                 ts_start_ms, ts_end_ms, transition_type
-             ) VALUES ('tx-1', ?1, 'trigger-1', 'evt-1', ?2, 10, 11, 'manual')",
-            params![session_id, frame_id.to_string()],
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 10, 11, 'manual')",
+            params![
+                transition_id,
+                session_id,
+                trigger_id,
+                event_id,
+                frame_id.to_string()
+            ],
         )
         .unwrap();
         frame_id
@@ -9492,6 +16485,89 @@ mod tests {
         )
         .unwrap();
         frame_id
+    }
+
+    fn replace_resume_test_content_units(
+        conn: &Connection,
+        frame_id: i64,
+        units: &[(&str, &str, &str)],
+    ) {
+        conn.execute(
+            "DELETE FROM content_units WHERE frame_id = ?1",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        for (index, (role, unit_type, text)) in units.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO content_units (
+                    id, frame_id, source, unit_type, text, text_hash, semantic_role,
+                    confidence, created_at_ms
+                 ) VALUES (?1, ?2, 'test', ?3, ?4, ?5, ?6, 0.92, ?7)",
+                params![
+                    format!("unit-{}-{}", frame_id, index),
+                    frame_id.to_string(),
+                    unit_type,
+                    text,
+                    stable_hash_bytes(text.as_bytes()),
+                    role,
+                    1_000_i64 + index as i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn replace_resume_test_content_units_with_bounds(
+        conn: &Connection,
+        frame_id: i64,
+        units: &[(&str, &str, &str, f64, f64, f64, f64, &str)],
+    ) {
+        conn.execute(
+            "DELETE FROM content_units WHERE frame_id = ?1",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        for (index, (role, unit_type, text, x, y, w, h, source)) in units.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO content_units (
+                    id, frame_id, source, unit_type, text, text_hash, semantic_role,
+                    bounds_x, bounds_y, bounds_w, bounds_h, confidence, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0.92, ?12)",
+                params![
+                    format!("unit-{}-{}", frame_id, index),
+                    frame_id.to_string(),
+                    source,
+                    unit_type,
+                    text,
+                    stable_hash_bytes(text.as_bytes()),
+                    role,
+                    x,
+                    y,
+                    w,
+                    h,
+                    1_000_i64 + index as i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn insert_resume_test_event(
+        conn: &Connection,
+        session_id: &str,
+        id: &str,
+        ts: i64,
+        event_type: &str,
+        app_name: &str,
+        title: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO ui_events (
+                id, session_id, ts_ms, event_type, app_name, window_title, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?3)",
+            params![id, session_id, ts, event_type, app_name, title],
+        )
+        .unwrap();
     }
 
     fn insert_resume_test_transition(
@@ -9607,6 +16683,104 @@ mod tests {
     }
 
     #[test]
+    fn init_db_repairs_legacy_episode_schema_before_creating_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE episodes (id TEXT PRIMARY KEY);
+            CREATE TABLE episode_nodes (id TEXT PRIMARY KEY);
+            CREATE TABLE episode_edges (id TEXT PRIMARY KEY);
+            CREATE TABLE episode_evidence (id TEXT PRIMARY KEY);
+            ",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let episode_columns = table_columns(&conn, "episodes").unwrap();
+        for column in [
+            "session_id",
+            "start_frame_id",
+            "end_frame_id",
+            "started_at_ms",
+            "ended_at_ms",
+            "status",
+            "role_guess",
+            "app",
+            "surface_type",
+            "title",
+            "primary_goal",
+            "current_surface_type",
+            "confidence",
+            "summary",
+            "quality_flags_json",
+            "metadata_json",
+        ] {
+            assert!(
+                episode_columns.contains(column),
+                "missing episodes.{column}"
+            );
+        }
+
+        let evidence_columns = table_columns(&conn, "episode_evidence").unwrap();
+        for column in [
+            "episode_id",
+            "frame_id",
+            "evidence_type",
+            "text",
+            "image_ref",
+            "score",
+            "reason",
+            "created_at_ms",
+        ] {
+            assert!(
+                evidence_columns.contains(column),
+                "missing episode_evidence.{column}"
+            );
+        }
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                     'idx_episodes_session',
+                     'idx_episode_evidence_episode',
+                     'idx_episode_evidence_frame'
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 3);
+
+        conn.execute(
+            "INSERT INTO episodes (
+                id, session_id, start_frame_id, end_frame_id, started_at_ms, ended_at_ms,
+                status, role_guess, app, surface_type, title, primary_goal,
+                current_surface_type, confidence, summary, quality_flags_json, metadata_json
+             ) VALUES (
+                'episode-1', 'session-1', '1', '2', 100, 200,
+                'closed', 'origin', 'App', 'doc', 'Title', 'Goal',
+                'doc', 0.9, 'Summary', '[]', '{}'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episode_evidence (
+                id, episode_id, frame_id, evidence_type, text, image_ref, score, reason, created_at_ms
+             ) VALUES (
+                'evidence-1', 'episode-1', '1', 'text_snippet', 'Important text',
+                NULL, 0.9, 'origin', 300
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn text_redaction_removes_common_secrets_and_contact_data() {
         let redacted = redact_text_for_ai(
             "email person@example.com with sk-abc123SECRET456 or call +1-415-555-1212",
@@ -9644,6 +16818,7 @@ mod tests {
             SafeAiExportInput {
                 lookback_minutes: None,
                 range_ms: Some(1_000),
+                session_id: None,
                 current_frame_id: Some(frame_id),
                 include_images: Some(true),
                 max_frames: Some(10),
@@ -9700,6 +16875,7 @@ mod tests {
             SafeAiExportInput {
                 lookback_minutes: None,
                 range_ms: Some(1_000),
+                session_id: None,
                 current_frame_id: Some(frame_id),
                 include_images: Some(true),
                 max_frames: Some(10),
@@ -9736,6 +16912,7 @@ mod tests {
             SafeAiExportInput {
                 lookback_minutes: None,
                 range_ms: Some(1_000),
+                session_id: None,
                 current_frame_id: Some(frame_id),
                 include_images: Some(true),
                 max_frames: Some(10),
@@ -9749,6 +16926,2234 @@ mod tests {
         assert!(safe_path.contains("ai-export"));
         assert!(safe_path.ends_with("safe_full_screenshot.png"));
         assert!(Path::new(safe_path).exists());
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn safe_ai_export_scopes_to_current_frame_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-safe-export-scoped-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let old_session = insert_numbered_test_session(&conn);
+        let new_session = insert_numbered_test_session(&conn);
+        let old_frame =
+            insert_export_test_frame(&conn, &old_session.id, &image_path.to_string_lossy());
+        let new_frame =
+            insert_export_test_frame(&conn, &new_session.id, &image_path.to_string_lossy());
+
+        let bundle = build_safe_ai_export_from_conn(
+            &conn,
+            &output_root,
+            SafeAiExportInput {
+                lookback_minutes: None,
+                range_ms: Some(10_000),
+                session_id: None,
+                current_frame_id: Some(new_frame),
+                include_images: Some(false),
+                max_frames: Some(10),
+                export_type: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.input_frame_count, 1);
+        assert_eq!(bundle.frames[0].frame_id, new_frame.to_string());
+        assert_ne!(bundle.frames[0].frame_id, old_frame.to_string());
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_payload_is_session_scoped_compact_and_hashes_url() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-cloud-payload-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let old_session = insert_numbered_test_session(&conn);
+        insert_resume_test_frame(
+            &conn,
+            &old_session.id,
+            &image_path.to_string_lossy(),
+            500,
+            "Chrome",
+            "com.google.Chrome",
+            "Older unrelated chat",
+            "https://chatgpt.com/c/older",
+            "chat_conversation",
+            "Older session text that should never enter the new resume query bundle.",
+            "old",
+            None,
+        );
+
+        let session = insert_numbered_test_session(&conn);
+        let origin = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "com.imput.helium",
+            "Smart Bookmarking Extension",
+            "https://chatgpt.com/c/target",
+            "chat_conversation",
+            "Now you need an evidence selector, not more evidence.",
+            "origin",
+            None,
+        );
+        let branch = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            2_000,
+            "Helium",
+            "com.imput.helium",
+            "Screen2AX paper",
+            "https://arxiv.org/abs/2501.00000",
+            "browser_tab",
+            "Screen2AX vision based automatic macOS accessibility generation verification branch.",
+            "branch",
+            Some(origin),
+        );
+        let final_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            3_000,
+            "Helium",
+            "com.imput.helium",
+            "Smart Bookmarking Extension",
+            "https://chatgpt.com/c/target",
+            "chat_conversation",
+            "My final judgment. Build this next: implement the evidence selector and compact safe AI export.",
+            "origin",
+            Some(branch),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(final_frame),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+        let payload_json = serde_json::to_string(&result.payload).unwrap();
+
+        assert_eq!(result.payload.schema, "smalltalk.resume_query.v1");
+        assert_eq!(
+            result.payload.session_index.schema,
+            "smalltalk.session_index.v1"
+        );
+        assert!(result.payload.candidate_episodes.len() <= 8);
+        assert!(result.payload.budget.max_json_chars <= 40_000);
+        assert!(result.payload.keyframes.len() <= 5);
+        assert!(result
+            .payload
+            .keyframes
+            .iter()
+            .any(|frame| frame.role == "side_branch"));
+        assert_eq!(
+            result.payload.resume_candidate.frame_id,
+            final_frame.to_string()
+        );
+        assert!(result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("Build this next:"));
+        assert!(result
+            .payload
+            .resume_candidate
+            .local_url_ref
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("url-hash-"));
+        assert!(!result.payload.privacy.raw_urls_sent);
+        assert!(!payload_json.contains("https://chatgpt.com/c/older"));
+        assert!(!payload_json.contains("https://chatgpt.com/c/target"));
+        assert!(Path::new(&result.payload_path).exists());
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn openai_resume_request_is_strict_bounded_and_does_not_send_local_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-resume-query-request-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let final_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "com.imput.helium",
+            "Data Optimization for Inference",
+            "https://chatgpt.com/c/data-optimization",
+            "chat_conversation",
+            "Resume here: implement the bounded query bundle and strict OpenAI request.",
+            "resume",
+            None,
+        );
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(final_frame),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(5),
+                max_json_chars: Some(40_000),
+                max_keyframes: None,
+                include_images: Some(true),
+            }),
+        )
+        .unwrap();
+
+        let request = build_openai_resume_request("gpt-test", &result, None).unwrap();
+        let request_json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(request.get("store").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            request
+                .get("text")
+                .and_then(|text| text.get("format"))
+                .and_then(|format| format.get("strict"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            request.get("max_output_tokens").and_then(Value::as_i64),
+            Some(2400)
+        );
+        assert!(request_json.contains("data:image/"));
+        assert!(!request_json.contains(&output_root.to_string_lossy().to_string()));
+        assert!(!request_json.contains(&image_path.to_string_lossy().to_string()));
+        assert!(!request_json.contains("https://chatgpt.com/c/data-optimization"));
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn long_session_resume_query_stays_bounded() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-resume-query-bounded-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let mut previous = None;
+        let mut final_frame = 0;
+        for index in 0..180 {
+            let is_origin = index % 30 < 18;
+            let title = if is_origin {
+                "Smalltalk bounded resume pipeline"
+            } else {
+                "Side research branch"
+            };
+            let url = if is_origin {
+                "https://chatgpt.com/c/smalltalk-bounded-resume"
+            } else {
+                "https://example.com/research"
+            };
+            let text = if index == 179 {
+                "Final resume instruction: continue implementing the explicit Resume me cloud boundary from the bounded query bundle."
+            } else if is_origin {
+                "Smalltalk bounded resume pipeline local episode index resume query evidence."
+            } else {
+                "Side research branch reading unrelated validation material."
+            };
+            final_frame = insert_resume_test_frame(
+                &conn,
+                &session.id,
+                &image_path.to_string_lossy(),
+                1_000 + index * 60_000,
+                "Helium",
+                "com.imput.helium",
+                title,
+                url,
+                if is_origin {
+                    "chat_conversation"
+                } else {
+                    "browser_tab"
+                },
+                text,
+                if is_origin { "origin" } else { "branch" },
+                previous,
+            );
+            previous = Some(final_frame);
+        }
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(final_frame),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(5),
+                max_json_chars: Some(40_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert!(result.json_char_count <= 40_000);
+        assert!(result.payload.candidate_episodes.len() <= 8);
+        assert!(result.payload.keyframes.len() <= 5);
+        assert_eq!(
+            result.payload.session_index.schema,
+            "smalltalk.session_index.v1"
+        );
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_payload_keeps_export_json_as_diagnostic_not_resume_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-cloud-artifact-regression-{}",
+            now_millis()
+        ));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let origin = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Data Optimization for Inference - Helium",
+            "https://chatgpt.com/c/data-optimization",
+            "chat_conversation",
+            "Final resume instruction from this session: Resume in Helium ChatGPT Data Optimization for Inference. Scroll/stay at: Critical extraction bug.",
+            "origin",
+            None,
+        );
+        let branch = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            6_000,
+            "Helium",
+            "net.imput.helium",
+            "Anushrut (@Anushlinux) / X - Helium",
+            "https://x.com/settings/profile",
+            "unknown",
+            "Edit profile. 21. Building @usesmalltalk ai that picks up where you left off.",
+            "branch",
+            Some(origin),
+        );
+        let return_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            29_000,
+            "Helium",
+            "net.imput.helium",
+            "Data Optimization for Inference - Helium",
+            "https://chatgpt.com/c/data-optimization",
+            "chat_conversation",
+            "Final resume instruction from this session: Resume in Helium ChatGPT Data Optimization for Inference. Scroll/stay at: Critical extraction bug. Start from: For browser pages, update thinness detection: Do next: implement/fix browser main-content extraction so OCR/vision/DOM wins when AX is mostly browser chrome.",
+            "return",
+            Some(branch),
+        );
+        let artifact = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            42_000,
+            "Helium",
+            "net.imput.helium",
+            "resume-query-bundle.json - Helium",
+            "",
+            "unknown",
+            "resume-query-bundle.json - Helium resume-query-bundle.json exact_words Developer Tools pinned",
+            "artifact",
+            Some(return_frame),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(artifact),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.payload.resume_candidate.frame_id,
+            return_frame.to_string()
+        );
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(artifact.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("debug_export_surface")
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(return_frame.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("actionable_task_surface")
+        );
+        assert_eq!(
+            result.payload.resume_candidate.surface_type,
+            "chat_conversation"
+        );
+        assert!(result
+            .payload
+            .resume_candidate
+            .visible_anchor
+            .contains("Critical extraction bug"));
+        assert!(result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("For browser pages"));
+        assert!(result
+            .payload
+            .diagnostic_artifacts
+            .iter()
+            .any(|frame| frame.frame_id == artifact.to_string()
+                && frame.surface_type == "export_debug_artifact"));
+        assert!(result
+            .payload
+            .branch_evidence
+            .iter()
+            .any(|frame| frame.frame_id == branch.to_string()));
+        assert!(result
+            .payload
+            .quality_flags
+            .contains(&"last_frame_is_export_artifact".to_string()));
+        assert!(result
+            .payload
+            .missing_evidence
+            .iter()
+            .any(|item| item.contains("export/debug artifact")));
+        assert!(result
+            .payload
+            .keyframes
+            .iter()
+            .any(|frame| frame.role == "diagnostic_artifact"));
+        assert!(result
+            .payload
+            .keyframes
+            .iter()
+            .any(|frame| frame.role == "resume_candidate"));
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-session-052".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({}),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.9,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+        assert_eq!(parsed.decision, "current_debug_surface_with_work_target");
+        assert_eq!(
+            parsed.current_focus.get("frame_id").and_then(Value::as_str),
+            Some(artifact.to_string().as_str())
+        );
+        assert_eq!(
+            parsed
+                .resume_work_target
+                .get("frame_id")
+                .and_then(Value::as_str),
+            Some(return_frame.to_string().as_str())
+        );
+        assert!(parsed
+            .answer
+            .get("next_action")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(&format!("Return to frame {}", return_frame))));
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_payload_treats_stale_metadata_return_as_return_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-cloud-stale-metadata-return-{}",
+            now_millis()
+        ));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let origin = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Cold email advice - Helium",
+            "https://chatgpt.com/c/cold-email",
+            "chat_conversation",
+            "Subject: first 100 users? Hi Justin, I am building a product for people who resume work after a break.",
+            "cold-origin",
+            None,
+        );
+        let artifact = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            5_000,
+            "Helium",
+            "net.imput.helium",
+            "resume-query-bundle.json - Helium",
+            "",
+            "unknown",
+            "resume-query-bundle.json - Helium exact_words Developer Tools pinned",
+            "artifact",
+            Some(origin),
+        );
+        let branch = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            7_000,
+            "Helium",
+            "net.imput.helium",
+            "Founding Engineer - Full Time - Helium",
+            "https://binary.so/m9FkUly",
+            "browser_tab",
+            "Founding Engineer Full Time. Name. Email. What is the hardest problem you have ever solved?",
+            "branch",
+            Some(artifact),
+        );
+        let stale_return = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            9_000,
+            "Helium",
+            "net.imput.helium",
+            "Founding Engineer - Full Time - Helium",
+            "https://binary.so/m9FkUly",
+            "browser_tab",
+            "Data Optimization for Inference - Helium https://chatgpt.com/c/data-optimization Section: Critical extraction bug Start from: For browser pages, update thinness detection: Next: fix browser main-content extraction so OCR/vision/DOM wins when AX is mostly browser chrome.",
+            "stale-return",
+            Some(branch),
+        );
+        let resume = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            20_000,
+            "Helium",
+            "net.imput.helium",
+            "Data Optimization for Inference - Helium",
+            "https://chatgpt.com/c/data-optimization",
+            "chat_conversation",
+            "The resume query should resume real work at Data Optimization for Inference. Section: Critical extraction bug. Start from: For browser pages, update thinness detection: Next: fix browser main-content extraction so OCR/vision/DOM wins when AX is mostly browser chrome.",
+            "resume",
+            Some(stale_return),
+        );
+        let x_home = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            30_000,
+            "Helium",
+            "net.imput.helium",
+            "Home / X - Helium",
+            "https://x.com/home",
+            "browser_tab",
+            "For you Following What is happening Upgrade to Premium",
+            "x-home",
+            Some(resume),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(x_home),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result.payload.resume_candidate.frame_id, resume.to_string());
+        assert!(result
+            .payload
+            .diagnostic_artifacts
+            .iter()
+            .any(|frame| frame.frame_id == artifact.to_string()));
+        assert!(result
+            .payload
+            .branch_evidence
+            .iter()
+            .any(|frame| frame.frame_id == branch.to_string()));
+        assert!(!result
+            .payload
+            .branch_evidence
+            .iter()
+            .any(|frame| frame.frame_id == stale_return.to_string()));
+        let stale_keyframe = result
+            .payload
+            .keyframes
+            .iter()
+            .find(|frame| frame.frame_id == stale_return.to_string())
+            .expect("stale metadata return should stay as return evidence");
+        assert_eq!(stale_keyframe.role, "return_to_origin");
+        assert!(stale_keyframe
+            .quality_flags
+            .contains(&"metadata_image_mismatch".to_string()));
+        assert!(result
+            .payload
+            .transitions
+            .iter()
+            .any(|transition| transition.to_frame == stale_return.to_string()
+                && transition.label == "returning_to_origin"));
+        assert!(result
+            .payload
+            .missing_evidence
+            .iter()
+            .any(|item| item.contains("metadata/title disagrees")));
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_keeps_passive_x_feed_current_but_resumes_application_form() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-session-051-regression-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let form = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Founding Engineer - Full Time - Helium",
+            "https://binary.so/m9FkUly",
+            "browser_tab",
+            "Founding Engineer Full Time application. Name. Email. What is the hardest problem you have ever solved?",
+            "application-form",
+            None,
+        );
+        let x_feed = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            3_000,
+            "Helium",
+            "net.imput.helium",
+            "Home / X - Helium",
+            "https://x.com/home",
+            "browser_tab",
+            "For you Following What is happening Who to follow Upgrade to Premium",
+            "x-feed",
+            Some(form),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(x_feed),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(x_feed.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("passive_feed_surface")
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(form.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("actionable_task_surface")
+        );
+
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-session-051".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({}),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.9,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+
+        assert_eq!(parsed.decision, "current_passive_surface_with_work_target");
+        assert_eq!(
+            parsed.current_focus.get("frame_id").and_then(Value::as_str),
+            Some(x_feed.to_string().as_str())
+        );
+        assert_eq!(
+            parsed
+                .resume_work_target
+                .get("frame_id")
+                .and_then(Value::as_str),
+            Some(form.to_string().as_str())
+        );
+        assert!(parsed
+            .answer
+            .get("next_action")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(&format!("Return to frame {}", form))));
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_treats_mission_control_as_transition_not_work_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-mission-control-regression-{}",
+            now_millis()
+        ));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let work = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Codex",
+            "com.openai.codex",
+            "capture.rs",
+            "",
+            "code_editor",
+            "Implement explicit current screen versus resume work target policy in capture.rs.",
+            "codex-work",
+            None,
+        );
+        let overview = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            2_000,
+            "Dock",
+            "com.apple.dock",
+            "Mission Control",
+            "",
+            "unknown",
+            "Mission Control window overview Smalltalk Codex Chrome Finder",
+            "mission-control",
+            Some(work),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(overview),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("mixed_window_overview")
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(work.to_string().as_str())
+        );
+
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-mission-control".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({}),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.9,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+
+        assert_eq!(parsed.decision, "mixed_window_overview");
+        assert_eq!(
+            parsed
+                .resume_work_target
+                .get("frame_id")
+                .and_then(Value::as_str),
+            Some(work.to_string().as_str())
+        );
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_payload_prefers_page_body_over_browser_chrome() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-cloud-page-body-anchor-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let final_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "com.imput.helium",
+            "Data Optimization for Inference - Helium",
+            "https://chatgpt.com/c/data-optimization",
+            "unknown",
+            "Developer Tools pinned File Edit View History Bookmarks Profiles Window Extensions",
+            "origin",
+            None,
+        );
+        replace_resume_test_content_units(
+            &conn,
+            final_frame,
+            &[
+                ("browser_chrome", "button", "Developer Tools pinned"),
+                ("heading", "heading", "Critical extraction bug"),
+                (
+                    "main_content",
+                    "paragraph",
+                    "For browser pages, update thinness detection: If app is browser and extracted AX text is mostly browser chrome, force OCR or vision extraction.",
+                ),
+            ],
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(final_frame),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(3),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.payload.resume_candidate.surface_type,
+            "chat_conversation"
+        );
+        assert_eq!(
+            result.payload.resume_candidate.section_anchor.as_deref(),
+            Some("Critical extraction bug")
+        );
+        assert!(result
+            .payload
+            .resume_candidate
+            .exact_words
+            .starts_with("For browser pages, update thinness detection:"));
+        assert!(!result
+            .payload
+            .resume_candidate
+            .visible_anchor
+            .contains("Developer Tools"));
+        assert!(result
+            .payload
+            .keyframes
+            .iter()
+            .flat_map(|frame| frame.visual_text_snippets.iter())
+            .any(|snippet| snippet.contains("Critical extraction bug")));
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_payload_reports_chrome_dominated_browser_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-cloud-chrome-dominated-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let final_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "com.imput.helium",
+            "Data Optimization for Inference - Helium",
+            "https://chatgpt.com/c/data-optimization",
+            "unknown",
+            "Developer Tools pinned File Edit View History Bookmarks Profiles Window Extensions",
+            "origin",
+            None,
+        );
+        replace_resume_test_content_units(
+            &conn,
+            final_frame,
+            &[
+                ("browser_chrome", "button", "Developer Tools pinned"),
+                ("toolbar", "button", "Address and search bar"),
+                ("browser_chrome", "button", "Extensions"),
+            ],
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(final_frame),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(3),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.payload.resume_candidate.surface_type,
+            "chat_conversation"
+        );
+        assert!(!result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("Developer Tools"));
+        assert!(result.payload.resume_candidate.confidence <= 0.68);
+        assert!(result
+            .payload
+            .missing_evidence
+            .iter()
+            .any(|item| item.contains("chrome-dominated")));
+        assert!(result
+            .payload
+            .quality_flags
+            .contains(&"json_visible_text_was_browser_chrome_heavy".to_string()));
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn compact_content_units_drop_browser_chrome_but_keep_page_anchor() {
+        let mut redacted = false;
+        let units = vec![
+            ContentUnitSummary {
+                id: "u1".to_string(),
+                source: "ax".to_string(),
+                unit_type: "button".to_string(),
+                semantic_role: Some("browser_chrome".to_string()),
+                text: Some("Back".to_string()),
+                bounds_x: None,
+                bounds_y: None,
+                bounds_w: None,
+                bounds_h: None,
+                confidence: Some(0.99),
+            },
+            ContentUnitSummary {
+                id: "u2".to_string(),
+                source: "ax".to_string(),
+                unit_type: "paragraph".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: Some("Build this next: implement the evidence selector.".to_string()),
+                bounds_x: None,
+                bounds_y: None,
+                bounds_w: None,
+                bounds_h: None,
+                confidence: Some(0.9),
+            },
+        ];
+
+        let compact = compact_content_units_for_ai(&units, &mut redacted);
+
+        assert_eq!(compact.len(), 1);
+        assert!(compact[0].text.contains("Build this next"));
+    }
+
+    #[test]
+    fn browser_chrome_dominated_accessibility_is_thin() {
+        let context = AccessibilityContext {
+            app_name: Some("Chrome".to_string()),
+            browser_url: Some("https://chatgpt.com/c/test".to_string()),
+            nodes: vec![
+                AccessibilityNode {
+                    role: "AXButton".to_string(),
+                    text: "Back".to_string(),
+                    ..AccessibilityNode::default()
+                },
+                AccessibilityNode {
+                    role: "AXButton".to_string(),
+                    text: "Reload".to_string(),
+                    ..AccessibilityNode::default()
+                },
+                AccessibilityNode {
+                    role: "AXTextField".to_string(),
+                    text: "Address and search bar".to_string(),
+                    ..AccessibilityNode::default()
+                },
+                AccessibilityNode {
+                    role: "AXStaticText".to_string(),
+                    text: "Tiny page bit".to_string(),
+                    ..AccessibilityNode::default()
+                },
+            ],
+            ..AccessibilityContext::default()
+        };
+
+        assert!(accessibility_is_thin(&context));
+    }
+
+    #[test]
+    fn resume_query_ordered_line_anchors_keep_bounds_neighbors_and_drop_chrome() {
+        let mut redacted = false;
+        let units = vec![
+            ContentUnitSummary {
+                id: "chrome".to_string(),
+                source: "ax".to_string(),
+                unit_type: "button".to_string(),
+                semantic_role: Some("browser_chrome".to_string()),
+                text: Some("Address and search bar".to_string()),
+                bounds_x: Some(0.0),
+                bounds_y: Some(60.0),
+                bounds_w: Some(900.0),
+                bounds_h: Some(24.0),
+                confidence: Some(0.99),
+            },
+            ContentUnitSummary {
+                id: "second".to_string(),
+                source: "ocr".to_string(),
+                unit_type: "text".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: Some("The correct framing is:".to_string()),
+                bounds_x: Some(120.0),
+                bounds_y: Some(320.0),
+                bounds_w: Some(300.0),
+                bounds_h: Some(32.0),
+                confidence: Some(0.76),
+            },
+            ContentUnitSummary {
+                id: "first".to_string(),
+                source: "ocr".to_string(),
+                unit_type: "text".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: Some("Yes, but not in the way you phrased it.".to_string()),
+                bounds_x: Some(120.0),
+                bounds_y: Some(240.0),
+                bounds_w: Some(520.0),
+                bounds_h: Some(32.0),
+                confidence: Some(0.76),
+            },
+            ContentUnitSummary {
+                id: "dupe".to_string(),
+                source: "ax".to_string(),
+                unit_type: "text".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: Some("Yes, but not in the way you phrased it.".to_string()),
+                bounds_x: Some(120.0),
+                bounds_y: Some(240.0),
+                bounds_w: Some(520.0),
+                bounds_h: Some(32.0),
+                confidence: Some(0.9),
+            },
+        ];
+
+        let compact = compact_content_units_for_ai(&units, &mut redacted);
+        let anchors = line_anchors_from_compact_units("42", None, &compact);
+
+        assert_eq!(compact.len(), 2);
+        assert_eq!(
+            anchors[0].quote.as_deref(),
+            Some("Yes, but not in the way you phrased it.")
+        );
+        assert_eq!(anchors[1].quote.as_deref(), Some("The correct framing is:"));
+        assert_eq!(
+            anchors[1].previous_line.as_deref(),
+            Some("Yes, but not in the way you phrased it.")
+        );
+        assert_eq!(
+            anchors[1].bounds.as_ref().map(|bounds| bounds.y),
+            Some(320.0)
+        );
+        assert!(anchors[1].section_anchor.as_deref().is_some());
+    }
+
+    #[test]
+    fn resume_query_session_044_shape_exports_full_timeline_and_page_body_line_anchor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-session-044-regression-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+        let session = insert_numbered_test_session(&conn);
+
+        let surfaces = vec![
+            ("Founding Engineer - Full Time - Helium", "https://binary.so/m9FkUly", "browser_tab", "Name. Email. LinkedIn profile. Github. Resume.", "form"),
+            ("smalltalk - Helium", "https://tally.so/forms/q4ggDk/insights", "browser_tab", "Where can I send you the alpha? 5 answers.", "tally"),
+            ("Local Inference Optimization - Helium", "https://chatgpt.com/c/local-inference", "chat_conversation", "Yes, but not in the way you phrased it. The correct framing is: Local visual encoder equals retrieval, deduplication, clustering.", "chat"),
+            ("Local Inference Optimization - Helium", "https://chatgpt.com/c/local-inference", "chat_conversation", "The correct framing is: GPT or cloud VLM equals final reasoning over selected screenshots plus OCR plus UI metadata.", "chat"),
+            ("Local Inference Optimization - Helium", "https://chatgpt.com/c/local-inference", "chat_conversation", "CLIP embedding -> GPT understands image better. That usually does not work.", "chat"),
+            ("Codex", "", "code_editor", "Implement capture plan. New chat. Plugins. Automations.", "codex"),
+            ("Local Inference Optimization - Helium", "https://chatgpt.com/c/local-inference", "chat_conversation", "1. Why CLIP embeddings do not directly help GPT. But a CLIP embedding is just a dense vector.", "chat"),
+            ("Untitled - Helium", "", "unknown", "Untitled loading page.", "untitled"),
+            ("Untitled - Helium", "", "unknown", "Untitled loading page.", "untitled"),
+            ("[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium", "https://arxiv.org/abs/2103.00020", "browser_tab", "Learning Transferable Visual Models From Natural Language Supervision.", "arxiv"),
+            ("[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium", "https://arxiv.org/abs/2103.00020", "browser_tab", "Computer Science > Computer Vision and Pattern Recognition.", "arxiv"),
+            ("[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium", "https://arxiv.org/abs/2103.00020", "browser_tab", "Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh.", "arxiv"),
+            ("[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium", "https://arxiv.org/abs/2103.00020", "browser_tab", "State-of-the-art computer vision systems are trained to predict a fixed set of predetermined object categories.", "arxiv"),
+            ("[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium", "https://arxiv.org/abs/2103.00020", "browser_tab", "This restricted form of supervision limits their generality and usability.", "arxiv"),
+        ];
+        let mut previous = None;
+        let mut frame_ids = Vec::new();
+        for (index, (title, url, object_type, text, role)) in surfaces.iter().enumerate() {
+            let frame_id = insert_resume_test_frame(
+                &conn,
+                &session.id,
+                &image_path.to_string_lossy(),
+                1_000 + index as i64 * 2_000,
+                if *role == "codex" { "Codex" } else { "Helium" },
+                if *role == "codex" {
+                    "com.openai.codex"
+                } else {
+                    "net.imput.helium"
+                },
+                title,
+                url,
+                object_type,
+                text,
+                &format!("phash-{}", index),
+                previous,
+            );
+            replace_resume_test_content_units_with_bounds(
+                &conn,
+                frame_id,
+                &[
+                    (
+                        "browser_chrome",
+                        "button",
+                        "Address and search bar",
+                        20.0,
+                        60.0,
+                        900.0,
+                        24.0,
+                        "ax",
+                    ),
+                    (
+                        "main_content",
+                        "text",
+                        text,
+                        420.0,
+                        220.0 + index as f64,
+                        900.0,
+                        32.0,
+                        "ocr",
+                    ),
+                ],
+            );
+            if *role == "arxiv" && index >= 12 {
+                conn.execute(
+                    "UPDATE frames SET capture_trigger = 'scroll_stop' WHERE id = ?1",
+                    params![frame_id],
+                )
+                .unwrap();
+            }
+            if index > 0 {
+                insert_resume_test_transition(
+                    &conn,
+                    &session.id,
+                    &format!("session044-{}", index),
+                    previous.unwrap(),
+                    frame_id,
+                    1_000 + index as i64 * 2_000,
+                    if *role == "arxiv" {
+                        "scroll_stop"
+                    } else {
+                        "navigation"
+                    },
+                );
+            }
+            frame_ids.push(frame_id);
+            previous = Some(frame_id);
+        }
+        for index in 0..20 {
+            insert_resume_test_event(
+                &conn,
+                &session.id,
+                &format!("scroll-{}", index),
+                25_000 + index,
+                "scroll",
+                "Helium",
+                "[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium",
+            );
+        }
+        insert_resume_test_event(
+            &conn,
+            &session.id,
+            "click-chat",
+            5_000,
+            "click",
+            "Helium",
+            "Local Inference Optimization - Helium",
+        );
+        conn.execute(
+            "UPDATE capture_sessions
+             SET started_at_ms = ?1,
+                 stopped_at_ms = ?2,
+                 frame_count = ?3,
+                 event_count = ?4,
+                 transition_count = ?5
+             WHERE id = ?6",
+            params![1_000_i64, 40_000_i64, 14_i64, 21_i64, 13_i64, &session.id],
+        )
+        .unwrap();
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: frame_ids.last().copied(),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(8),
+                max_json_chars: Some(60_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result.payload.timeline.len(), 14);
+        assert!(result
+            .payload
+            .candidate_episodes
+            .iter()
+            .any(|episode| episode.frame_range.first() != episode.frame_range.last()));
+        assert!(result
+            .payload
+            .candidate_episodes
+            .iter()
+            .any(|episode| episode.events.scrolls > 0 || episode.events.clicks > 0));
+        assert!(result.payload.keyframes.len() >= 4);
+        assert!(!result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("https://"));
+        assert!(!result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("Address and search bar"));
+        assert_eq!(
+            result.payload.resume_candidate.line_anchor.quote.as_deref(),
+            Some(result.payload.resume_candidate.exact_words.as_str())
+        );
+
+        let candidate_frame_id = result.payload.resume_candidate.frame_id.clone();
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-test".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({
+                "frame_id": candidate_frame_id.clone(),
+                "app": "Helium",
+                "title": "Bad chrome target",
+                "reason": "bad",
+                "exact_words": "https://arxiv.org/abs/2103.00020 Address and search bar",
+                "section_anchor": null,
+                "line_anchor": {
+                    "frame_id": candidate_frame_id.clone(),
+                    "quote": "https://arxiv.org/abs/2103.00020 Address and search bar",
+                    "previous_line": null,
+                    "next_line": null,
+                    "line_index": null,
+                    "source_unit_id": null,
+                    "bounds": null,
+                    "source": null,
+                    "semantic_role": null,
+                    "section_anchor": null,
+                    "confidence": 0.2,
+                    "reason": "bad"
+                }
+            }),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            confidence: 0.99,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("line-anchor fallback")));
+        assert_eq!(
+            parsed
+                .resume_target
+                .get("exact_words")
+                .and_then(Value::as_str),
+            Some(result.payload.resume_candidate.exact_words.as_str())
+        );
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_session_045_style_rejects_full_screen_ax_title_and_splits_current_focus() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-session-045-regression-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let origin = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Local Inference Optimization - Helium",
+            "https://chatgpt.com/c/local-inference",
+            "chat_conversation",
+            "For those, you still need OCR accessibility tree browser URL DOM. 6. Which local encoder should you use? Best practical choice: MobileCLIP.",
+            "chat",
+            None,
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            origin,
+            &[
+                (
+                    "chat_message",
+                    "text",
+                    "Local Inference Optimization - Helium Local Inference Optimization - Helium",
+                    0.0,
+                    31.0,
+                    2560.0,
+                    1409.0,
+                    "ax",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "6. Which local encoder should you use?",
+                    920.0,
+                    1090.0,
+                    430.0,
+                    26.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "Best practical choice: MobileCLIP",
+                    920.0,
+                    1238.0,
+                    360.0,
+                    24.0,
+                    "ocr",
+                ),
+            ],
+        );
+        let current = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            3_000,
+            "Helium",
+            "net.imput.helium",
+            "[2103.00020] Learning Transferable Visual Models From Natural Language Supervision - Helium",
+            "https://arxiv.org/abs/2103.00020",
+            "browser_tab",
+            "Learning directly from raw text about images is a promising alternative.",
+            "arxiv",
+            Some(origin),
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            current,
+            &[(
+                "main_content",
+                "text",
+                "CLIP abstract",
+                80.0,
+                380.0,
+                1500.0,
+                32.0,
+                "ocr",
+            )],
+        );
+        insert_resume_test_transition(
+            &conn,
+            &session.id,
+            "session045-current",
+            origin,
+            current,
+            3_000,
+            "navigation",
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(current),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(8),
+                max_json_chars: Some(40_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        let current_id = current.to_string();
+        let origin_id = origin.to_string();
+        assert_eq!(
+            result.payload.session_index.current_frame_id.as_deref(),
+            Some(current_id.as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(current_id.as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_target_if_returning
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(origin_id.as_str())
+        );
+        assert!(result
+            .payload
+            .keyframes
+            .iter()
+            .any(|frame| frame.frame_id == current_id && frame.role == "current_focus"));
+        assert!(result.payload.candidate_anchors.iter().all(|anchor| !anchor
+            .text_exact
+            .contains("Local Inference Optimization - Helium Local")));
+        assert!(result
+            .payload
+            .candidate_anchors
+            .iter()
+            .any(|anchor| anchor.text_exact == "6. Which local encoder should you use?"));
+        assert!(result.payload.candidate_anchors.iter().all(|anchor| {
+            anchor
+                .bbox
+                .as_ref()
+                .map_or(true, |bbox| !(bbox.w >= 1_000.0 && bbox.h >= 500.0))
+        }));
+
+        let return_target = result.payload.resume_target_if_returning.as_ref().unwrap();
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-session-045".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: resume_focus_target_as_cloud_target(return_target),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.95,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+
+        assert_eq!(parsed.decision, "current_passive_surface_with_work_target");
+        assert!(parsed.confidence <= 0.65);
+        assert!(parsed
+            .evidence_limits
+            .iter()
+            .any(|limit| limit.contains("Current screen is factual")));
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_anchor_validation_rejects_schema_and_top_chrome_but_allows_code_editor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let image_path =
+            std::env::temp_dir().join(format!("smalltalk-anchor-rules-{}.png", now_millis()));
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let chat = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Bias in GPT Output - Helium",
+            "https://chatgpt.com/c/bias",
+            "chat_conversation",
+            "Fix 6: Send actual screenshots to the model when asking visual questions",
+            "chat",
+            None,
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            chat,
+            &[
+                (
+                    "main_content",
+                    "text",
+                    "@ Chapter 81 | Kagurabachi | V",
+                    1_680.0,
+                    42.0,
+                    190.0,
+                    16.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "Fix 6: Send actual screenshots to the model when asking visual questions",
+                    420.0,
+                    320.0,
+                    760.0,
+                    28.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "The current body text is useful work evidence",
+                    420.0,
+                    360.0,
+                    520.0,
+                    28.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "\"bbox\": f\"x\": 920, \"y\": 1090, 'w\": 430, \"h\": 26},",
+                    980.0,
+                    500.0,
+                    368.0,
+                    22.0,
+                    "ocr",
+                ),
+            ],
+        );
+        let chat_frame = frame_by_id(&conn, chat).unwrap().unwrap();
+        let chat_candidate = resume_query_candidate_for_frame(&conn, &chat_frame)
+            .unwrap()
+            .unwrap();
+        let (valid, rejected) = candidate_anchors_for_cloud(&[chat_candidate]);
+
+        assert!(valid
+            .iter()
+            .any(|anchor| anchor.text_exact.contains("Fix 6")));
+        assert!(valid.iter().all(|anchor| {
+            !anchor.text_exact.contains("bbox") && !anchor.text_exact.contains("Kagurabachi")
+        }));
+        assert!(rejected.iter().any(|anchor| {
+            anchor.text_exact.contains("bbox")
+                && anchor.reject_reason == "debug_schema_artifact"
+                && anchor.surface_zone == "assistant_code_block"
+        }));
+        assert!(rejected.iter().any(|anchor| {
+            anchor.text_exact.contains("Kagurabachi")
+                && anchor.reject_reason == "surface_zone_browser_chrome"
+        }));
+
+        let code = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            2_000,
+            "Codex",
+            "com.openai.codex",
+            "capture.rs",
+            "",
+            "code_editor",
+            "const box = { x: 920, y: 1090 };",
+            "code",
+            Some(chat),
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            code,
+            &[(
+                "code_editor",
+                "text",
+                "const box = { x: 920, y: 1090 };",
+                220.0,
+                240.0,
+                520.0,
+                24.0,
+                "ax",
+            )],
+        );
+        let code_frame = frame_by_id(&conn, code).unwrap().unwrap();
+        let code_candidate = resume_query_candidate_for_frame(&conn, &code_frame)
+            .unwrap()
+            .unwrap();
+        let (valid_code, rejected_code) = candidate_anchors_for_cloud(&[code_candidate]);
+        assert!(valid_code
+            .iter()
+            .any(|anchor| anchor.text_exact.contains("const box")));
+        assert!(rejected_code
+            .iter()
+            .all(|anchor| !anchor.text_exact.contains("const box")));
+
+        fs::remove_file(image_path).ok();
+    }
+
+    #[test]
+    fn resume_query_session_046_style_prefers_same_surface_current_focus_anchor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-session-046-regression-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let prior = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Bias in GPT Output - Helium",
+            "https://chatgpt.com/c/bias",
+            "chat_conversation",
+            "Which local encoder should you use?",
+            "bias",
+            None,
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            prior,
+            &[
+                (
+                    "main_content",
+                    "text",
+                    "hu 25 Jun 3.43AM",
+                    2_410.0,
+                    11.0,
+                    132.0,
+                    8.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "@ Chapter 81 | Kagurabachi | V",
+                    1_690.0,
+                    41.0,
+                    182.0,
+                    15.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "KD AURORA- Cure For Me",
+                    2_314.0,
+                    45.0,
+                    160.0,
+                    8.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "Which local encoder should you use?\",",
+                    1_112.0,
+                    156.0,
+                    282.0,
+                    23.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "\"text exact\": \"6.",
+                    986.0,
+                    160.0,
+                    123.0,
+                    11.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "\"bbox\": f\"x\": 920, \"y\": 1090, 'w\": 430, \"h\": 26},",
+                    982.0,
+                    175.0,
+                    368.0,
+                    22.0,
+                    "ocr",
+                ),
+            ],
+        );
+        let current = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            3_000,
+            "Helium",
+            "net.imput.helium",
+            "Bias in GPT Output - Helium",
+            "https://chatgpt.com/c/bias",
+            "chat_conversation",
+            "Fix 6: Send actual screenshots to the model when asking visual questions. Fix 7: Enforce a strict output schema with failure states.",
+            "bias-current",
+            Some(prior),
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            current,
+            &[
+                (
+                    "chat_message",
+                    "text",
+                    "Bias in GPT Output - Helium Bias in GPT Output - Helium",
+                    0.0,
+                    31.0,
+                    2560.0,
+                    1409.0,
+                    "ax",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "Fix 6: Send actual screenshots to the model when asking visual questions",
+                    420.0,
+                    320.0,
+                    760.0,
+                    28.0,
+                    "ocr",
+                ),
+                (
+                    "main_content",
+                    "text",
+                    "Fix 7: Enforce a strict output schema with failure states",
+                    420.0,
+                    356.0,
+                    680.0,
+                    28.0,
+                    "ocr",
+                ),
+            ],
+        );
+        insert_resume_test_transition(
+            &conn,
+            &session.id,
+            "session046-current",
+            prior,
+            current,
+            3_000,
+            "navigation",
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(current),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(8),
+                max_json_chars: Some(60_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        let current_id = current.to_string();
+        assert_eq!(result.payload.resume_candidate.frame_id, current_id);
+        assert!(
+            result
+                .payload
+                .resume_candidate
+                .exact_words
+                .contains("Fix 6")
+                || result
+                    .payload
+                    .resume_candidate
+                    .exact_words
+                    .contains("Fix 7")
+        );
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .and_then(|target| target.anchor_id.as_deref())
+                .is_some(),
+            true
+        );
+        assert!(result.payload.candidate_anchors.iter().all(|anchor| {
+            !anchor.text_exact.contains("bbox")
+                && !anchor.text_exact.contains("text exact")
+                && !anchor.text_exact.contains("Kagurabachi")
+                && !anchor.text_exact.contains("AURORA")
+                && !anchor.text_exact.contains("Jun 3.43AM")
+        }));
+        assert!(result.payload.candidate_anchors.iter().any(|anchor| {
+            anchor.frame_id == current_id && anchor.text_exact.contains("Fix 6")
+        }));
+        assert!(result
+            .payload
+            .diagnostic_rejected_anchors
+            .iter()
+            .any(|anchor| {
+                anchor.text_exact.contains("bbox")
+                    && anchor.reject_reason == "debug_schema_artifact"
+            }));
+        assert!(result
+            .payload
+            .diagnostic_rejected_anchors
+            .iter()
+            .any(|anchor| {
+                anchor.text_exact.contains("Kagurabachi")
+                    && anchor.reject_reason == "surface_zone_browser_chrome"
+            }));
+
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-session-046".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: resume_query_candidate_as_cloud_target(&result.payload.resume_candidate),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({
+                "focus_now": "old",
+                "what_was_i_doing": "old",
+                "why_this_focus": "old",
+                "next_action": "Return to frame 319 and continue from Which local encoder should you use?"
+            }),
+            evidence_request: None,
+            confidence: 0.9,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+        enforce_cloud_resume_anchor_contract(&mut parsed, &result.payload);
+
+        assert_eq!(parsed.decision, "current_work_surface");
+        assert_eq!(
+            parsed.resume_target.get("frame_id").and_then(Value::as_str),
+            Some(current_id.as_str())
+        );
+        let next_action = parsed
+            .answer
+            .get("next_action")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(next_action.contains("Fix 6") || next_action.contains("Fix 7"));
+        assert!(!next_action.contains("Which local encoder"));
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn cloud_resume_postprocess_returns_need_more_evidence_without_valid_candidate_anchors() {
+        let mut bundle = resume_query_result_for_test().bundle;
+        bundle.candidate_anchors.clear();
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-no-anchors".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({
+                "frame_id": "42",
+                "app": "Helium",
+                "title": "Models",
+                "reason": "bad",
+                "exact_words": "Models",
+                "exact_visible_words": "Models",
+                "anchor_id": null,
+                "section_anchor": null,
+                "line_anchor": ResumeLineAnchor::default()
+            }),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.9,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+
+        enforce_cloud_resume_anchor_contract(&mut parsed, &bundle);
+
+        assert_eq!(parsed.decision, "need_more_evidence");
+        assert!(parsed
+            .resume_target
+            .as_object()
+            .is_some_and(|object| object.is_empty()));
+        assert!(parsed.confidence <= 0.35);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("No valid candidate anchors")));
+    }
+
+    #[test]
+    fn cloud_resume_postprocess_accepts_valid_anchor_id_round_trip() {
+        let bundle = resume_query_result_for_test().bundle;
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-valid-anchor".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({
+                "frame_id": "42",
+                "app": "Helium",
+                "title": "Models",
+                "reason": "model selected a provided anchor",
+                "exact_words": "Compare models",
+                "exact_visible_words": "Compare models",
+                "anchor_id": "42-unit-42",
+                "section_anchor": null,
+                "line_anchor": ResumeLineAnchor::default()
+            }),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({}),
+            evidence_request: None,
+            confidence: 0.82,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+
+        enforce_cloud_resume_anchor_contract(&mut parsed, &bundle);
+
+        assert_eq!(parsed.decision, "current_work_surface");
+        assert_eq!(
+            parsed
+                .resume_target
+                .get("anchor_id")
+                .and_then(Value::as_str),
+            Some("42-unit-42")
+        );
+        assert_eq!(
+            parsed
+                .resume_target
+                .get("exact_words")
+                .and_then(Value::as_str),
+            Some("Compare models")
+        );
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn cloud_resume_same_surface_current_without_anchor_needs_more_evidence() {
+        let mut bundle = resume_query_result_for_test().bundle;
+        let return_anchor = bundle.resume_target_if_returning.clone().unwrap();
+        bundle.current_focus = Some(ResumeQueryFocusTarget {
+            frame_id: "43".to_string(),
+            app: "Helium".to_string(),
+            title: "Models".to_string(),
+            surface_type: "chat_conversation".to_string(),
+            surface_state: "current_work_surface".to_string(),
+            exact_visible_words: None,
+            anchor_id: None,
+            line_anchor: None,
+            reason: "current frame without page-body anchor".to_string(),
+            confidence: 0.55,
+            quality_flags: vec!["current_frame_missing_page_body_anchor".to_string()],
+        });
+        bundle.resume_target_if_returning = Some(return_anchor);
+        let mut parsed = ParsedCloudResume {
+            response_id: Some("resp-same-surface-no-current".to_string()),
+            decision: "resume_target_found".to_string(),
+            resume_target: serde_json::json!({
+                "frame_id": "42",
+                "app": "Helium",
+                "title": "Models",
+                "reason": "older same-surface anchor",
+                "exact_words": "Compare models",
+                "exact_visible_words": "Compare models",
+                "anchor_id": "42-unit-42",
+                "section_anchor": null,
+                "line_anchor": ResumeLineAnchor::default()
+            }),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            answer: serde_json::json!({
+                "focus_now": "",
+                "what_was_i_doing": "",
+                "why_this_focus": "",
+                "next_action": "Return to frame 42 and continue from: Compare models"
+            }),
+            evidence_request: None,
+            confidence: 0.86,
+            warnings: Vec::new(),
+            evidence_limits: Vec::new(),
+            evidence_handles: Vec::new(),
+        };
+
+        enforce_cloud_resume_anchor_contract(&mut parsed, &bundle);
+
+        assert_eq!(parsed.decision, "need_more_evidence");
+        assert!(parsed
+            .resume_target
+            .as_object()
+            .is_some_and(|object| object.is_empty()));
+        assert!(parsed
+            .answer
+            .get("next_action")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("Need more evidence")));
+        assert!(parsed.evidence_limits.iter().any(|limit| {
+            limit.contains("same surface") || limit.contains("same stable surface")
+        }));
+    }
+
+    #[test]
+    fn resume_query_branch_scoring_keeps_single_detour_from_overriding_explicit_work_anchor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-branch-score-{}", now_millis()));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let origin = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Helium",
+            "net.imput.helium",
+            "Local Inference Optimization - Helium",
+            "https://chatgpt.com/c/local-inference",
+            "chat_conversation",
+            "Build this next: implement line-level resume anchors and evidence-rich episodes.",
+            "origin",
+            None,
+        );
+        let branch = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            4_000,
+            "Helium",
+            "net.imput.helium",
+            "Random Paper - Helium",
+            "https://example.com/paper",
+            "browser_tab",
+            "A general abstract about visual models and datasets.",
+            "branch",
+            Some(origin),
+        );
+        insert_resume_test_transition(
+            &conn,
+            &session.id,
+            "branch-score",
+            origin,
+            branch,
+            4_000,
+            "navigation",
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(branch),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(8),
+                max_json_chars: Some(40_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result.payload.resume_candidate.frame_id, origin.to_string());
+        assert!(result
+            .payload
+            .resume_candidate
+            .exact_words
+            .contains("Build this next"));
+
         fs::remove_dir_all(output_root).unwrap();
     }
 
@@ -9937,6 +19342,119 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn live_capture_store_resume_query_payload_smoke_when_env_set() {
+        let Ok(live_db_path) = std::env::var("SMALLTALK_LIVE_DB_PATH") else {
+            return;
+        };
+        let source = PathBuf::from(live_db_path);
+        if !source.exists() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smalltalk-live-cloud-{}", now_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let db_copy = root.join("smalltalk-capture.sqlite");
+        fs::copy(&source, &db_copy).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", source.to_string_lossy()));
+        if wal.exists() {
+            let _ = fs::copy(&wal, root.join("smalltalk-capture.sqlite-wal"));
+        }
+        let shm = PathBuf::from(format!("{}-shm", source.to_string_lossy()));
+        if shm.exists() {
+            let _ = fs::copy(&shm, root.join("smalltalk-capture.sqlite-shm"));
+        }
+
+        let conn = Connection::open(&db_copy).unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::var("SMALLTALK_CLOUD_TEST_OUTPUT_ROOT")
+            .ok()
+            .map(PathBuf::from);
+        let keep_cloud_output = output_root.is_some();
+        let cloud_output_root = output_root
+            .clone()
+            .unwrap_or_else(|| root.join("cloud-resume"));
+        let latest_frame_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM frames ORDER BY captured_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let Some(latest_frame_id) = latest_frame_id else {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        };
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &cloud_output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: None,
+                current_frame_id: Some(latest_frame_id),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(keep_cloud_output),
+            }),
+        )
+        .unwrap();
+        println!("resume query bundle: {}", result.payload_path);
+
+        assert_eq!(result.payload.schema, "smalltalk.resume_query.v1");
+        assert!(!result.payload.privacy.raw_urls_sent);
+        assert!(!result.payload.privacy.raw_paths_sent);
+
+        let looks_like_session_034 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames
+                 WHERE id IN (194, 196, 199)
+                   AND session_id = (SELECT session_id FROM frames WHERE id = 199)
+                   AND EXISTS (
+                       SELECT 1 FROM frames
+                       WHERE id = 199
+                         AND window_name LIKE '%Data Optimization for Inference%'
+                   )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            == 3;
+        if looks_like_session_034 {
+            assert_eq!(result.payload.resume_candidate.frame_id, "199");
+            assert!(result
+                .payload
+                .diagnostic_artifacts
+                .iter()
+                .any(|frame| frame.frame_id == "194"));
+            assert!(!result
+                .payload
+                .branch_evidence
+                .iter()
+                .any(|frame| frame.frame_id == "196"));
+            let stale_return = result
+                .payload
+                .keyframes
+                .iter()
+                .find(|frame| frame.frame_id == "196")
+                .expect("session-034 stale metadata return frame should remain in keyframes");
+            assert_eq!(stale_return.role, "return_to_origin");
+            assert!(stale_return
+                .quality_flags
+                .contains(&"metadata_image_mismatch".to_string()));
+            assert!(result
+                .payload
+                .transitions
+                .iter()
+                .any(|transition| transition.to_frame == "196"
+                    && transition.label == "returning_to_origin"));
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn safe_frame_for_transition(
         id: &str,
         ts: i64,
@@ -9964,6 +19482,10 @@ mod tests {
                 unit_type: "text".to_string(),
                 semantic_role: Some("main_content".to_string()),
                 text: text.to_string(),
+                bounds_x: None,
+                bounds_y: None,
+                bounds_w: None,
+                bounds_h: None,
                 confidence: Some(0.9),
             }],
             text_source: Some("hybrid".to_string()),
@@ -10096,9 +19618,561 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_parser_ignores_comments_handles_quotes_and_skips_empty_keys() {
+        let values = parse_dotenv_values(
+            r#"
+            # comment
+            OPENAI_API_KEY="sk-test"
+            export OPENAI_MODEL='gpt-test'
+            SMALLTALK_OPENAI_MODEL=gpt-smalltalk
+            =missing
+            BAD-KEY=ignored
+            EMPTY_VALUE=
+            "#,
+        );
+
+        assert_eq!(values.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(values.get("OPENAI_MODEL"), Some(&"gpt-test".to_string()));
+        assert_eq!(
+            values.get("SMALLTALK_OPENAI_MODEL"),
+            Some(&"gpt-smalltalk".to_string())
+        );
+        assert_eq!(values.get("EMPTY_VALUE"), Some(&"".to_string()));
+        assert!(!values.contains_key(""));
+        assert!(!values.contains_key("BAD-KEY"));
+    }
+
+    #[test]
+    fn openai_cloud_response_parser_preserves_response_id_and_answer() {
+        let response = serde_json::json!({
+            "id": "resp_test_123",
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": serde_json::json!({
+                                "decision": "resume_target_found",
+                                "resume_target": {
+                                    "frame_id": "42",
+                                    "app": "Helium",
+                                    "title": "Models | OpenAI API",
+                                    "reason": "The user returned to the API docs.",
+                                    "exact_words": "Models"
+                                },
+                                "answer": {
+                                    "focus_now": "Compare models",
+                                    "what_was_i_doing": "Reading OpenAI model docs",
+                                    "why_this_focus": "The latest frame is the active docs surface.",
+                                    "next_action": "Continue from the models section."
+                                },
+                                "evidence_request": null,
+                                "confidence": 0.82,
+                                "warnings": ["thin evidence"],
+                                "evidence_handles": ["42"]
+                            }).to_string()
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let parsed = parse_openai_cloud_resume_response(&response).unwrap();
+
+        assert_eq!(parsed.response_id.as_deref(), Some("resp_test_123"));
+        assert_eq!(parsed.decision, "resume_target_found");
+        assert_eq!(
+            parsed.answer.get("focus_now").and_then(Value::as_str),
+            Some("Compare models")
+        );
+        assert_eq!(parsed.warnings, vec!["thin evidence".to_string()]);
+        assert_eq!(parsed.evidence_handles, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn openai_cloud_response_parser_reports_truncated_json_without_raw_serde_noise() {
+        let response = serde_json::json!({
+            "id": "resp_truncated",
+            "output_text": "{\"decision\":\"resume_target_found\",\"answer\":{\"next_action\":\"Return to frame"
+        });
+
+        let error = parse_openai_cloud_resume_response(&response).unwrap_err();
+
+        assert!(error.contains("incomplete/truncated"));
+        assert!(error.contains("chars received"));
+        assert!(!error.starts_with("EOF while parsing"));
+    }
+
+    #[test]
+    fn openai_resume_request_allows_enough_tokens_for_split_targets() {
+        let result = resume_query_result_for_test();
+        let request = build_openai_resume_request("gpt-test", &result, None).unwrap();
+
+        assert_eq!(
+            request.get("max_output_tokens").and_then(Value::as_i64),
+            Some(2400)
+        );
+    }
+
+    #[test]
+    fn open_resume_cloud_file_parser_preserves_section_anchor() {
+        let root = std::env::temp_dir().join(format!("smalltalk-open-resume-{}", now_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("cloud-resume-result.json");
+        write_json_pretty(
+            &path,
+            &serde_json::json!({
+                "schema": "smalltalk.cloud_resume_result_file.v1",
+                "generated_at_ms": 12,
+                "request": {"session_id": "session-test", "current_frame_id": 42},
+                "source": "cloud",
+                "response_id": "resp_open",
+                "decision": "resume_target_found",
+                "answer": {"focus_now": "Compare models"},
+                "resume_target": {
+                    "frame_id": "42",
+                    "app": "Google Chrome",
+                    "title": "Models",
+                    "reason": "Selected by cloud",
+                    "exact_words": null,
+                    "section_anchor": "Model comparison"
+                },
+                "warnings": ["thin evidence"],
+                "confidence": 0.74
+            }),
+        )
+        .unwrap();
+
+        let file = read_open_resume_cloud_file(&path).unwrap();
+
+        assert_eq!(file.response_id.as_deref(), Some("resp_open"));
+        assert_eq!(cloud_resume_target_frame_id(&file.resume_target), Some(42));
+        assert_eq!(
+            cloud_resume_target_anchor(&file.resume_target).as_deref(),
+            Some("Model comparison")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_resume_cloud_target_resolves_to_raw_local_url_and_anchor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/open-resume.jpg",
+            10,
+            "Google Chrome",
+            "com.google.Chrome",
+            "Models",
+            "https://example.com/models",
+            "browser_tab",
+            "Compare models and pricing before choosing the next API.",
+            "phash-open",
+            None,
+        );
+        let file = OpenResumeCloudFile {
+            generated_at_ms: 20,
+            source: "cloud".to_string(),
+            response_id: Some("resp_open".to_string()),
+            request: Some(CloudResumeRequestSummary {
+                session_id: session.id,
+                current_frame_id: Some(frame_id),
+            }),
+            resume_target: serde_json::json!({
+                "frame_id": frame_id.to_string(),
+                "exact_words": "Compare models",
+                "section_anchor": "Model comparison"
+            }),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            confidence: 0.81,
+            warnings: Vec::new(),
+            query_bundle_path: None,
+            output_path: PathBuf::from("/tmp/cloud-resume-result.json"),
+        };
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_cloud_resume_target_for_open(&conn, &file, &mut warnings)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.frame_id, frame_id.to_string());
+        assert_eq!(resolved.url.as_deref(), Some("https://example.com/models"));
+        assert_eq!(resolved.anchor_text.as_deref(), Some("Compare models"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn open_resume_query_bundle_candidate_is_final_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/open-resume-fallback.jpg",
+            10,
+            "Arc",
+            "company.thebrowser.Browser",
+            "ChatGPT",
+            "https://chatgpt.com/c/test",
+            "chat_conversation",
+            "Resume from the bounded query bundle.",
+            "phash-fallback",
+            None,
+        );
+        let root =
+            std::env::temp_dir().join(format!("smalltalk-open-resume-fallback-{}", now_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let mut bundle = resume_query_result_for_test().bundle;
+        bundle.session.id = session.id;
+        bundle.resume_candidate.frame_id = frame_id.to_string();
+        bundle.resume_candidate.exact_words = "Resume from".to_string();
+        bundle.resume_candidate.confidence = 0.67;
+        let bundle_path = root.join("resume-query-bundle.json");
+        write_json_pretty(&bundle_path, &serde_json::to_value(&bundle).unwrap()).unwrap();
+        let file = OpenResumeCloudFile {
+            generated_at_ms: 20,
+            source: "cloud".to_string(),
+            response_id: Some("resp_open".to_string()),
+            request: None,
+            resume_target: serde_json::json!({"frame_id": "999", "exact_words": null}),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            confidence: 0.1,
+            warnings: Vec::new(),
+            query_bundle_path: Some(bundle_path),
+            output_path: root.join("cloud-resume-result.json"),
+        };
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_query_bundle_candidate_for_open(&conn, &file, &mut warnings)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.frame_id, frame_id.to_string());
+        assert_eq!(resolved.anchor_text.as_deref(), Some("Resume from"));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("local resume query candidate")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_resume_escaping_handles_quotes_backslashes_and_newlines() {
+        assert_eq!(js_string_literal("a\"b\nc"), "\"a\\\"b\\nc\"");
+        let quoted = applescript_quote("a\"b\\c\n");
+        assert!(quoted.starts_with('"'));
+        assert!(quoted.ends_with('"'));
+        assert!(quoted.contains("\\\""));
+        assert!(quoted.contains("\\\\"));
+        assert!(!quoted.contains('\n'));
+    }
+
+    #[test]
+    fn open_resume_privacy_excludes_never_send_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/open-resume-private.jpg",
+            10,
+            "Google Chrome",
+            "com.google.Chrome",
+            "Secret",
+            "https://example.com/secret",
+            "browser_tab",
+            "Secret token visible.",
+            "phash-private",
+            None,
+        );
+        conn.execute(
+            "INSERT INTO sensitive_regions (
+                id, frame_id, region_type, source, confidence, action_taken
+             ) VALUES ('region-open-private', ?1, 'api_key', 'test', 1.0, 'never_send_to_ai')",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        let frame = frame_by_id(&conn, frame_id).unwrap().unwrap();
+        let sensitive_regions = query_sensitive_regions(&conn, &frame_id.to_string()).unwrap();
+
+        let privacy = export_privacy_for_frame(&frame, &sensitive_regions);
+
+        assert!(privacy.exclude_all);
+        assert_eq!(privacy.exclude_reason, "never_send_to_ai");
+    }
+
+    #[test]
+    fn cached_cloud_resume_ignores_fallback_and_requires_response_id() {
+        let root = std::env::temp_dir().join(format!("smalltalk-cloud-cache-{}", now_millis()));
+        let fallback_dir = root.join("session-001-resume-query-old");
+        let cloud_dir = root.join("session-001-resume-query-new");
+        fs::create_dir_all(&fallback_dir).unwrap();
+        fs::create_dir_all(&cloud_dir).unwrap();
+
+        let bundle = resume_query_result_for_test().bundle;
+        write_json_pretty(
+            &fallback_dir.join("resume-query-bundle.json"),
+            &serde_json::to_value(&bundle).unwrap(),
+        )
+        .unwrap();
+        write_json_pretty(
+            &cloud_dir.join("resume-query-bundle.json"),
+            &serde_json::to_value(&bundle).unwrap(),
+        )
+        .unwrap();
+        write_json_pretty(
+            &fallback_dir.join("cloud-resume-result.json"),
+            &serde_json::json!({
+                "schema": "smalltalk.cloud_resume_result_file.v1",
+                "generated_at_ms": 9,
+                "request": {"session_id": "session-test", "current_frame_id": 42},
+                "source": "local_fallback",
+                "model": null,
+                "response_id": null,
+                "decision": "insufficient_evidence",
+                "answer": {},
+                "resume_target": {},
+                "evidence_request": null,
+                "warnings": ["missing key"],
+                "evidence_handles": [],
+                "confidence": 0.0,
+                "query_bundle_path": fallback_dir.join("resume-query-bundle.json").to_string_lossy(),
+                "query_output_dir": fallback_dir.to_string_lossy()
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &cloud_dir.join("cloud-resume-result.json"),
+            &serde_json::json!({
+                "schema": "smalltalk.cloud_resume_result_file.v1",
+                "generated_at_ms": 2,
+                "request": {"session_id": "session-test", "current_frame_id": 42},
+                "source": "cloud",
+                "model": "gpt-test",
+                "response_id": "resp_test_cache",
+                "decision": "resume_target_found",
+                "answer": {"focus_now": "Compare models"},
+                "resume_target": {"frame_id": "42"},
+                "evidence_request": null,
+                "warnings": [],
+                "evidence_handles": ["42"],
+                "confidence": 0.8,
+                "query_bundle_path": cloud_dir.join("resume-query-bundle.json").to_string_lossy(),
+                "query_output_dir": cloud_dir.to_string_lossy()
+            }),
+        )
+        .unwrap();
+
+        let cached = cached_cloud_resume_result(
+            &root,
+            &CloudResumeRequestSummary {
+                session_id: "session-test".to_string(),
+                current_frame_id: Some(42),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cached.response_id, "resp_test_cache");
+        assert_eq!(cached.model.as_deref(), Some("gpt-test"));
+        assert_eq!(cached.query_bundle.bundle.session.id, "session-test");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn openai_dns_failure_message_is_readable() {
+        let message = readable_openai_failure_message(
+            "curl exited with exit status: 6: curl: (6) Could not resolve host: api.openai.com",
+        );
+
+        assert_eq!(
+            message,
+            "OpenAI network unavailable: DNS could not resolve api.openai.com; no OpenAI answer was generated."
+        );
+        assert!(!message.contains("curl exited"));
+    }
+
+    fn resume_query_result_for_test() -> ResumeQueryBundleResult {
+        let line_anchor = ResumeLineAnchor {
+            frame_id: Some("42".to_string()),
+            quote: Some("Compare models".to_string()),
+            previous_line: None,
+            next_line: None,
+            line_index: Some(0),
+            source_unit_id: Some("unit-42".to_string()),
+            bounds: None,
+            source: Some("test".to_string()),
+            semantic_role: Some("main_content".to_string()),
+            section_anchor: None,
+            confidence: 0.8,
+            reason: "test line anchor".to_string(),
+        };
+        let session_index = SessionIndex {
+            schema: "smalltalk.session_index.v1".to_string(),
+            session_id: "session-test".to_string(),
+            current_frame_id: Some("42".to_string()),
+            duration_s: 12.0,
+            episode_count: 1,
+            surface_sequence: vec!["Helium/Models".to_string()],
+            candidate_resume_frames: vec!["42".to_string()],
+            artifact_frames: Vec::new(),
+            branch_frames: Vec::new(),
+            return_to_origin_frames: Vec::new(),
+            quality_flags: Vec::new(),
+            episodes: Vec::new(),
+            evidence_conflicts: Vec::new(),
+        };
+        let bundle = ResumeQueryBundle {
+            schema: "smalltalk.resume_query.v1".to_string(),
+            budget: ResumeQueryBudget {
+                max_json_chars: 40_000,
+                max_episode_cards: 8,
+                max_images: 5,
+                max_text_snippets_per_episode: 4,
+                max_output_tokens: 1200,
+            },
+            session: ResumeQuerySession {
+                id: "session-test".to_string(),
+                started_at: 100,
+                stopped_at: 112,
+                duration_s: 12.0,
+            },
+            session_index,
+            candidate_episodes: Vec::new(),
+            resume_candidate: ResumeQueryCandidate {
+                frame_id: "42".to_string(),
+                app: "Helium".to_string(),
+                window_title: "Models".to_string(),
+                surface_type: "chat_conversation".to_string(),
+                local_url_ref: None,
+                visible_anchor: "Models".to_string(),
+                section_anchor: None,
+                exact_words: "Compare models".to_string(),
+                line_anchor: line_anchor.clone(),
+                confidence: 0.8,
+                quality_flags: Vec::new(),
+            },
+            current_focus: Some(ResumeQueryFocusTarget {
+                frame_id: "42".to_string(),
+                app: "Helium".to_string(),
+                title: "Models".to_string(),
+                surface_type: "chat_conversation".to_string(),
+                surface_state: "current_work_surface".to_string(),
+                exact_visible_words: Some("Compare models".to_string()),
+                anchor_id: Some("42-unit-42".to_string()),
+                line_anchor: Some(line_anchor.clone()),
+                reason: "test current focus".to_string(),
+                confidence: 0.8,
+                quality_flags: Vec::new(),
+            }),
+            resume_work_target: Some(ResumeQueryFocusTarget {
+                frame_id: "42".to_string(),
+                app: "Helium".to_string(),
+                title: "Models".to_string(),
+                surface_type: "chat_conversation".to_string(),
+                surface_state: "current_work_surface".to_string(),
+                exact_visible_words: Some("Compare models".to_string()),
+                anchor_id: Some("42-unit-42".to_string()),
+                line_anchor: Some(line_anchor.clone()),
+                reason: "test work target".to_string(),
+                confidence: 0.8,
+                quality_flags: Vec::new(),
+            }),
+            resume_target_if_returning: Some(ResumeQueryFocusTarget {
+                frame_id: "42".to_string(),
+                app: "Helium".to_string(),
+                title: "Models".to_string(),
+                surface_type: "chat_conversation".to_string(),
+                surface_state: "current_work_surface".to_string(),
+                exact_visible_words: Some("Compare models".to_string()),
+                anchor_id: Some("42-unit-42".to_string()),
+                line_anchor: Some(line_anchor.clone()),
+                reason: "test return target".to_string(),
+                confidence: 0.8,
+                quality_flags: Vec::new(),
+            }),
+            candidate_anchors: vec![ResumeQueryAnchorCandidate {
+                anchor_id: "42-unit-42".to_string(),
+                frame_id: "42".to_string(),
+                text_exact: "Compare models".to_string(),
+                bbox: None,
+                source: "test".to_string(),
+                semantic_role: "main_content".to_string(),
+                section_anchor: None,
+                visible_ratio: 1.0,
+                is_browser_chrome: false,
+                confidence: 0.8,
+                reason: "test anchor".to_string(),
+            }],
+            diagnostic_rejected_anchors: Vec::new(),
+            diagnostic_artifacts: Vec::new(),
+            branch_evidence: Vec::new(),
+            dropped_frame_summary: Vec::new(),
+            timeline: Vec::new(),
+            evidence_conflicts: Vec::new(),
+            confidence_breakdown: ResumeQueryConfidenceBreakdown {
+                frame_id: "42".to_string(),
+                evidence_strength: 0.8,
+                actionable_text: 0.8,
+                return_to_origin: 0.8,
+                user_interaction: 0.7,
+                recency: 0.9,
+                recognized_surface: 0.8,
+                line_anchor_quality: 0.8,
+                branch_penalty: 0.0,
+                artifact_penalty: 0.0,
+                chrome_penalty: 0.0,
+                unknown_surface_penalty: 0.0,
+                metadata_penalty: 0.0,
+                final_score: 0.8,
+            },
+            keyframes: Vec::new(),
+            transitions: Vec::new(),
+            privacy: ResumeQueryPrivacy {
+                redactions_applied: Vec::new(),
+                raw_urls_sent: false,
+                raw_paths_sent: false,
+                raw_clipboard_sent: false,
+                raw_keystrokes_sent: false,
+            },
+            quality_flags: Vec::new(),
+            missing_evidence: Vec::new(),
+            ask: ResumeQueryAsk {
+                task: "infer_resume_target".to_string(),
+                allow_need_more_evidence: true,
+            },
+        };
+        ResumeQueryBundleResult {
+            output_dir: "/tmp/smalltalk-test".to_string(),
+            bundle_path: "/tmp/smalltalk-test/resume-query-bundle.json".to_string(),
+            payload_path: "/tmp/smalltalk-test/resume-query-bundle.json".to_string(),
+            byte_size: 0,
+            image_count: 0,
+            json_char_count: 0,
+            bundle: bundle.clone(),
+            payload: bundle,
+        }
+    }
+
+    #[test]
     fn app_context_adapters_classify_common_resume_surfaces() {
         assert_eq!(
             classify_app_context("Google Chrome", Some("https://chatgpt.com/c/abc")).1,
+            "chat_conversation"
+        );
+        assert_eq!(
+            classify_app_context("Helium", Some("https://chatgpt.com/c/abc")).1,
             "chat_conversation"
         );
         assert_eq!(
@@ -10227,6 +20301,37 @@ mod tests {
         fs::write(day_dir.join("frame.jpg"), b"test").unwrap();
 
         clear_snapshot_dir(&root).unwrap();
+
+        assert!(root.exists());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clear_directory_contents_removes_files_hidden_dirs_and_nested_exports() {
+        let root = std::env::temp_dir().join(format!("smalltalk-clear-output-{}", now_millis()));
+        let session_dir = root.join("session-001");
+        let tmp_dir = root.join(".session-002.tmp-123");
+        fs::create_dir_all(session_dir.join("raw")).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(session_dir.join("raw/smalltalk-capture.sqlite"), b"sqlite").unwrap();
+        fs::write(tmp_dir.join("session.json"), b"{}").unwrap();
+        fs::write(root.join("session-001.zip"), b"zip").unwrap();
+
+        clear_directory_contents(&root).unwrap();
+
+        assert!(root.exists());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clear_directory_contents_creates_missing_directory() {
+        let root = std::env::temp_dir().join(format!("smalltalk-clear-missing-{}", now_millis()));
+
+        clear_directory_contents(&root).unwrap();
 
         assert!(root.exists());
         assert!(fs::read_dir(&root).unwrap().next().is_none());

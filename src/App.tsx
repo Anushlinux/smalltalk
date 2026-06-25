@@ -88,10 +88,53 @@ type SessionExportSummary = {
   counts: SessionCounts;
 };
 
+type ResumeLineAnchor = {
+  frame_id?: string | null;
+  quote?: string | null;
+  previous_line?: string | null;
+  next_line?: string | null;
+  line_index?: number | null;
+  source_unit_id?: string | null;
+  bounds?: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null;
+  source?: string | null;
+  semantic_role?: string | null;
+  section_anchor?: string | null;
+  confidence?: number | null;
+  reason?: string | null;
+};
+
+type ResumeQueryBundleResult = {
+  output_dir: string;
+  bundle_path: string;
+  byte_size: number;
+  image_count: number;
+  json_char_count: number;
+  bundle: {
+    schema: string;
+    candidate_episodes: unknown[];
+    resume_candidate?: {
+      frame_id: string;
+      app: string;
+      window_title: string;
+      confidence: number;
+      exact_words?: string;
+      line_anchor?: ResumeLineAnchor | null;
+      quality_flags?: string[];
+    };
+    missing_evidence?: string[];
+  };
+};
+
 type StopCaptureOutput = {
   status: CaptureStatus;
   session?: CaptureSession | null;
   export?: SessionExportSummary | null;
+  resume_query?: ResumeQueryBundleResult | null;
   preview?: unknown;
 };
 
@@ -249,6 +292,7 @@ type NativeResumeCard = {
     url?: string | null;
     document_path?: string | null;
     quote?: string | null;
+    line_anchor?: ResumeLineAnchor | null;
     reason: string;
   };
   what_changed: string[];
@@ -264,6 +308,61 @@ type NativeResumeCard = {
   evidence_frame_ids: string[];
   evidence_transition_ids: string[];
   warnings: string[];
+};
+
+type CloudResumeTarget = {
+  frame_id?: string | null;
+  app?: string | null;
+  title?: string | null;
+  reason?: string;
+  exact_words?: string | null;
+  exact_visible_words?: string | null;
+  anchor_id?: string | null;
+  section_anchor?: string | null;
+  line_anchor?: ResumeLineAnchor | null;
+};
+
+type CloudResumeResult = {
+  schema: string;
+  request?: {
+    session_id: string;
+    current_frame_id?: number | null;
+  };
+  cached?: boolean;
+  source: "cloud" | string;
+  decision: "current_focus" | "resume_target_found" | "ambiguous_current_focus_vs_prior_task" | "need_more_evidence" | "insufficient_evidence" | string;
+  resume_target?: CloudResumeTarget;
+  current_focus?: CloudResumeTarget;
+  resume_target_if_returning?: CloudResumeTarget;
+  answer?: {
+    focus_now?: string;
+    what_was_i_doing?: string;
+    why_this_focus?: string;
+    next_action?: string;
+  };
+  confidence: number;
+  warnings: string[];
+  evidence_limits?: string[];
+  evidence_handles: string[];
+  local_card: NativeResumeCard;
+  model?: string | null;
+  response_id?: string | null;
+  output_path?: string | null;
+};
+
+type OpenResumePointResult = {
+  strategy: string;
+  frame_id?: string | null;
+  opened_url?: string | null;
+  anchor_text?: string | null;
+  confidence: number;
+  warnings: string[];
+};
+
+type CloudResumeStatus = {
+  has_key: boolean;
+  key_source: "process_env" | "project_env" | "missing" | string;
+  model: string;
 };
 
 type OverlayMode = "units" | "ocr" | "ax" | "privacy";
@@ -309,6 +408,9 @@ function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [lastStopOutput, setLastStopOutput] = useState<StopCaptureOutput | null>(null);
   const [resumeCard, setResumeCard] = useState<NativeResumeCard | null>(null);
+  const [cloudResume, setCloudResume] = useState<CloudResumeResult | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<CloudResumeStatus | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const storeGenerationRef = useRef(0);
   const isDeleting = busyAction === "delete_all_frames";
@@ -329,6 +431,20 @@ function App() {
       setError(String(err));
     }
   }, [selectedFrame]);
+
+  const refreshCloudStatus = useCallback(async () => {
+    try {
+      const nextStatus = await invoke<CloudResumeStatus>("get_cloud_resume_status");
+      setCloudStatus(nextStatus);
+    } catch (err) {
+      setCloudStatus({
+        has_key: false,
+        key_source: "missing",
+        model: "gpt-4.1-mini",
+      });
+      setError(String(err));
+    }
+  }, []);
 
   const runSearch = useCallback(
     async (nextQuery = query, sessionId = currentSessionId) => {
@@ -416,6 +532,8 @@ function App() {
           setFrameDetail(null);
           setImageData(null);
           setResumeCard(null);
+          setCloudResume(null);
+          setCloudError(null);
           setTimeline(emptyTimeline);
           setStatus(nextStatus);
           const nextSessionId =
@@ -459,6 +577,8 @@ function App() {
       setQuery("");
       setLastStopOutput(null);
       setResumeCard(null);
+      setCloudResume(null);
+      setCloudError(null);
       setStatus({
         ...nextStatus,
         running: false,
@@ -484,6 +604,7 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void refreshCloudStatus();
     void runSearch("");
     void refreshTimeline();
   }, []);
@@ -580,25 +701,105 @@ function App() {
   const sessionLabel = currentSession
     ? `${currentSession.status} session-${String(currentSession.sequence).padStart(3, "0")}`
     : "No session";
-  const exportLabel = lastStopOutput?.export
-    ? lastStopOutput.export.folder_name
-    : status.last_export
-      ? status.last_export.folder_name
-      : "None";
+  const stopBundle = lastStopOutput?.resume_query || null;
+  const cloudBundleLabel = stopBundle ? pathBasename(stopBundle.output_dir) : "None";
   const activeContext = frameDetail?.app_contexts[0];
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No frame selected";
-  const openExportFolder = useCallback(async () => {
-    const path = lastStopOutput?.export?.path || status.last_export?.path;
+  const cloudStatusTitle = cloudResume?.source === "cloud"
+    ? "OpenAI answered"
+    : cloudError
+      ? "OpenAI request failed"
+      : cloudStatus?.has_key
+    ? "OpenAI key connected"
+    : "OpenAI key missing";
+  const cloudStatusDetail = cloudError
+    ? cloudError
+    : cloudStatus?.has_key
+    ? `Using ${cloudStatus.model} from ${cloudStatus.key_source === "process_env" ? "process env" : "project .env"}`
+    : "Ask OpenAI will fail clearly until OPENAI_API_KEY is available.";
+  const cloudResultSummary = cloudResume
+    ? cloudResume.source === "cloud"
+      ? cloudResume.cached
+        ? "Cached cloud answer"
+        : cloudResume.answer?.focus_now || "Cloud answer saved"
+      : "Rejected non-cloud result"
+    : cloudError
+      ? "No OpenAI answer generated"
+      : "No OpenAI answer yet";
+  const cloudCurrentFocus = cloudResume?.current_focus || null;
+  const cloudReturnTarget = cloudResume?.resume_target_if_returning || null;
+  const cloudTarget = cloudReturnTarget || cloudResume?.resume_target || null;
+  const cloudLineAnchor = cloudTarget?.line_anchor || null;
+  const cloudExactLine =
+    presentLine(cloudLineAnchor?.quote) ||
+    presentLine(cloudTarget?.exact_visible_words) ||
+    presentLine(cloudTarget?.exact_words);
+  const cloudCurrentLine =
+    presentLine(cloudCurrentFocus?.line_anchor?.quote) ||
+    presentLine(cloudCurrentFocus?.exact_visible_words) ||
+    presentLine(cloudCurrentFocus?.exact_words);
+  const cloudReturnLine =
+    presentLine(cloudReturnTarget?.line_anchor?.quote) ||
+    presentLine(cloudReturnTarget?.exact_visible_words) ||
+    presentLine(cloudReturnTarget?.exact_words);
+  const cloudEvidenceLine = lineAnchorEvidenceLabel(
+    cloudLineAnchor,
+    cloudTarget?.frame_id,
+  );
+  const cloudHasSplitTargets =
+    Boolean(cloudCurrentFocus?.frame_id && cloudReturnTarget?.frame_id) &&
+    cloudCurrentFocus?.frame_id !== cloudReturnTarget?.frame_id;
+  const resumeLineAnchor = resumeCard?.continue_from.line_anchor || null;
+  const resumeExactLine =
+    presentLine(resumeLineAnchor?.quote) ||
+    presentLine(resumeCard?.continue_from.quote);
+  const resumeEvidenceLine = lineAnchorEvidenceLabel(
+    resumeLineAnchor,
+    resumeCard?.continue_from.frame_id,
+  );
+  const openStopBundle = useCallback(async () => {
+    const path = lastStopOutput?.resume_query?.bundle_path;
     if (!path) return;
     try {
       await openPath(path);
     } catch (err) {
       setError(String(err));
     }
-  }, [lastStopOutput?.export?.path, status.last_export?.path]);
+  }, [lastStopOutput?.resume_query?.bundle_path]);
 
-  const generateResumeCard = useCallback(async () => {
+  const acceptCloudResumeResult = useCallback((result: CloudResumeResult) => {
+    if (result.source !== "cloud" || !result.response_id) {
+      setCloudResume(null);
+      setCloudError("OpenAI did not return a cloud response id; no OpenAI answer was shown.");
+      return;
+    }
+    setCloudResume(result);
+    setCloudError(null);
+    setError(null);
+  }, []);
+
+  const generateCloudResume = useCallback(async () => {
+    setBusyAction("run_cloud_resume");
+    setCloudResume(null);
+    setCloudError(null);
+    setError(null);
+    try {
+      const result = await invoke<CloudResumeResult>("run_cloud_resume", {
+        input: {
+          current_frame_id: selectedFrame?.id ?? null,
+          allow_followup: true,
+        },
+      });
+      acceptCloudResumeResult(result);
+    } catch (err) {
+      setCloudError(readableOpenAIError(String(err)));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [acceptCloudResumeResult, selectedFrame?.id]);
+
+  const generateNativeResumeCard = useCallback(async () => {
     setBusyAction("get_native_resume_card");
     setError(null);
     try {
@@ -617,27 +818,67 @@ function App() {
     }
   }, [selectedFrame?.id]);
 
+  const openCloudResumePoint = useCallback(async (targetFrameId?: string | null) => {
+    if (!cloudResume) return;
+    setBusyAction("open_resume_point");
+    setError(null);
+    const parsedTargetFrameId = targetFrameId ? Number(targetFrameId) : null;
+    const safeTargetFrameId =
+      parsedTargetFrameId !== null && Number.isFinite(parsedTargetFrameId)
+        ? parsedTargetFrameId
+        : null;
+    try {
+      const result = await invoke<OpenResumePointResult>("open_resume_point", {
+        input: {
+          output_path: cloudResume.output_path ?? null,
+          session_id: cloudResume.request?.session_id ?? null,
+          current_frame_id: selectedFrame?.id ?? cloudResume.request?.current_frame_id ?? null,
+          target_frame_id: safeTargetFrameId,
+        },
+      });
+      if (result.warnings.length > 0) {
+        setError(result.warnings.join(" "));
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [cloudResume, selectedFrame?.id]);
+
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | null = null;
+    const unlisteners: Array<() => void> = [];
 
     listen("session-island-resume-requested", () => {
-      void generateResumeCard();
+      void generateCloudResume();
     })
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
         } else {
-          unlisten = nextUnlisten;
+          unlisteners.push(nextUnlisten);
+        }
+      })
+      .catch((err) => setError(String(err)));
+
+    listen<CloudResumeResult>("session-island-cloud-resume-ready", (event) => {
+      acceptCloudResumeResult(event.payload);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisteners.push(nextUnlisten);
         }
       })
       .catch((err) => setError(String(err)));
 
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisteners.forEach((unlisten) => unlisten());
     };
-  }, [generateResumeCard]);
+  }, [acceptCloudResumeResult, generateCloudResume]);
 
   return (
     <main className="capture-shell">
@@ -681,7 +922,7 @@ function App() {
             aria-busy={busyAction === "stop_capture"}
             onClick={() => void runAction("stop_capture")}
           >
-            {busyAction === "stop_capture" ? "Exporting" : "Stop & export"}
+            {busyAction === "stop_capture" ? "Preparing" : "Stop session"}
           </button>
           <button
             className="secondary-button"
@@ -702,49 +943,179 @@ function App() {
         </div>
       </header>
 
+      <section
+        className={`cloud-resume-bar ${cloudResume?.source === "cloud" ? "ready" : cloudError || !cloudStatus?.has_key ? "missing" : "ready"}`}
+        aria-label="OpenAI resume output"
+      >
+        <div className="cloud-resume-status">
+          <p className="product-kicker">OpenAI resume</p>
+          <h2>{cloudStatusTitle}</h2>
+          <span>{cloudStatusDetail}</span>
+        </div>
+        <div className="cloud-resume-result">
+          <span>{cloudResultSummary}</span>
+          {cloudResume ? (
+            <strong>{cloudResumeProvenanceLabel(cloudResume)}</strong>
+          ) : (
+            <strong>Waiting for a resume request</strong>
+          )}
+        </div>
+        <div className="cloud-resume-actions">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busyAction !== null || !hasFrames}
+            aria-busy={busyAction === "run_cloud_resume"}
+            onClick={() => void generateCloudResume()}
+          >
+            {busyAction === "run_cloud_resume" ? "Asking OpenAI" : "Ask OpenAI"}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null || !cloudResume}
+            aria-busy={busyAction === "open_resume_point"}
+            onClick={() => void openCloudResumePoint(cloudTarget?.frame_id ?? null)}
+          >
+            {busyAction === "open_resume_point" ? "Opening" : "Open return target"}
+          </button>
+          {cloudHasSplitTargets ? (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null || !cloudResume}
+              aria-busy={busyAction === "open_resume_point"}
+              onClick={() => void openCloudResumePoint(cloudCurrentFocus?.frame_id ?? null)}
+            >
+              Open current focus
+            </button>
+          ) : null}
+        </div>
+        {cloudResume ? (
+          <div className="cloud-resume-details">
+            <dl className="resume-facts">
+              {cloudCurrentFocus ? (
+                <div>
+                  <dt>Current focus</dt>
+                  <dd>
+                    {[
+                      cloudCurrentFocus.frame_id ? `Frame ${cloudCurrentFocus.frame_id}` : null,
+                      cloudCurrentFocus.title || cloudCurrentFocus.app || null,
+                      cloudCurrentLine,
+                    ]
+                      .filter(Boolean)
+                      .join(" / ") || "No current focus returned"}
+                  </dd>
+                </div>
+              ) : null}
+              {cloudReturnTarget ? (
+                <div>
+                  <dt>Return target</dt>
+                  <dd>
+                    {[
+                      cloudReturnTarget.frame_id ? `Frame ${cloudReturnTarget.frame_id}` : null,
+                      cloudReturnTarget.title || cloudReturnTarget.app || null,
+                      cloudReturnLine,
+                    ]
+                      .filter(Boolean)
+                      .join(" / ") || "No return target returned"}
+                  </dd>
+                </div>
+              ) : null}
+              <div>
+                <dt>Exact line</dt>
+                <dd>{cloudExactLine || "No exact line returned"}</dd>
+              </div>
+              {presentLine(cloudLineAnchor?.previous_line) ? (
+                <div>
+                  <dt>Before</dt>
+                  <dd>{presentLine(cloudLineAnchor?.previous_line)}</dd>
+                </div>
+              ) : null}
+              {presentLine(cloudLineAnchor?.next_line) ? (
+                <div>
+                  <dt>After</dt>
+                  <dd>{presentLine(cloudLineAnchor?.next_line)}</dd>
+                </div>
+              ) : null}
+              <div>
+                <dt>Why</dt>
+                <dd>
+                  {[
+                    cloudResume.decision === "ambiguous_current_focus_vs_prior_task"
+                      ? "Current focus and return target are different."
+                      : null,
+                    cloudTarget?.reason || cloudResume.answer?.why_this_focus || null,
+                  ]
+                    .filter(Boolean)
+                    .join(" ") || "No reason returned"}
+                </dd>
+              </div>
+              {cloudResume.evidence_limits?.length ? (
+                <div>
+                  <dt>Limits</dt>
+                  <dd>{cloudResume.evidence_limits.slice(0, 3).join(" / ")}</dd>
+                </div>
+              ) : null}
+              <div>
+                <dt>Evidence</dt>
+                <dd>
+                  {[
+                    cloudEvidenceLine,
+                    cloudResume.evidence_handles.slice(0, 4).join(" / "),
+                  ]
+                    .filter(Boolean)
+                    .join(" / ") || "No evidence handles"}
+                </dd>
+              </div>
+            </dl>
+          </div>
+        ) : null}
+      </section>
+
       {error || status.last_error ? (
         <div className="error-box" role="alert">{error || status.last_error}</div>
       ) : null}
 
-      {lastStopOutput?.export ? (
+      {lastStopOutput?.resume_query ? (
         <section className="session-output" aria-label="Stopped session output">
           <div className="session-output-main">
             <div>
               <p className="product-kicker">Stop output</p>
-              <h2>Folder export ready</h2>
+              <h2>Cloud-ready bundle ready</h2>
             </div>
             <dl>
               <div>
                 <dt>Session</dt>
-                <dd>{lastStopOutput.export.folder_name}</dd>
+                <dd>
+                  {lastStopOutput.session
+                    ? `session-${String(lastStopOutput.session.sequence).padStart(3, "0")}`
+                    : pathBasename(lastStopOutput.resume_query.output_dir)}
+                </dd>
               </div>
               <div>
                 <dt>Frames</dt>
-                <dd>{lastStopOutput.export.counts.frames}</dd>
+                <dd>{lastStopOutput.session?.counts.frames ?? 0}</dd>
               </div>
               <div>
-                <dt>Events</dt>
-                <dd>{lastStopOutput.export.counts.events}</dd>
+                <dt>Images</dt>
+                <dd>{lastStopOutput.resume_query.image_count}</dd>
               </div>
               <div>
-                <dt>Files</dt>
-                <dd>{lastStopOutput.export.file_count}</dd>
-              </div>
-              <div>
-                <dt>Warnings</dt>
-                <dd>{lastStopOutput.export.warning_count}</dd>
+                <dt>Episodes</dt>
+                <dd>{lastStopOutput.resume_query.bundle.candidate_episodes.length}</dd>
               </div>
             </dl>
           </div>
-          <div className="export-path">
-            <span>{lastStopOutput.export.path}</span>
+          <div className="artifact-path">
+            <span>{lastStopOutput.resume_query.bundle_path}</span>
           </div>
           <button
-            className="secondary-button open-output-button"
+            className="secondary-button open-artifact-button"
             type="button"
-            onClick={() => void openExportFolder()}
+            onClick={() => void openStopBundle()}
           >
-            Open output folder
+            Open bundle JSON
           </button>
           <pre>{formatStopPreview(lastStopOutput)}</pre>
         </section>
@@ -753,7 +1124,7 @@ function App() {
       <section className="health-strip" aria-label="Capture health">
         <StatusPill label="State" value={captureStateLabel} tone={status.running ? "good" : "quiet"} />
         <StatusPill label="Session" value={sessionLabel} tone={status.running ? "good" : "quiet"} />
-        <StatusPill label="Exports" value={exportLabel} />
+        <StatusPill label="Cloud bundle" value={cloudBundleLabel} />
         <StatusPill label="Frames" value={status.frame_count} />
         <StatusPill label="Events" value={status.event_count} />
         <StatusPill label="Transitions" value={status.transition_count} />
@@ -919,7 +1290,7 @@ function App() {
                 <h2>Resume cue</h2>
                 <p>
                   {resumeCard
-                    ? `Last ${resumeCard.lookback_minutes} minutes`
+                    ? `Local / last ${resumeCard.lookback_minutes} minutes`
                     : "Safe native resume card"}
                 </p>
               </div>
@@ -928,7 +1299,7 @@ function App() {
                 type="button"
                 disabled={busyAction !== null || !hasFrames}
                 aria-busy={busyAction === "get_native_resume_card"}
-                onClick={() => void generateResumeCard()}
+                onClick={() => void generateNativeResumeCard()}
               >
                 {busyAction === "get_native_resume_card" ? "Reading" : "Resume me"}
               </button>
@@ -951,20 +1322,51 @@ function App() {
                     </dd>
                   </div>
                   <div>
+                    <dt>Exact line</dt>
+                    <dd>{resumeExactLine || "No exact line available"}</dd>
+                  </div>
+                  {presentLine(resumeLineAnchor?.previous_line) ? (
+                    <div>
+                      <dt>Before</dt>
+                      <dd>{presentLine(resumeLineAnchor?.previous_line)}</dd>
+                    </div>
+                  ) : null}
+                  {presentLine(resumeLineAnchor?.next_line) ? (
+                    <div>
+                      <dt>After</dt>
+                      <dd>{presentLine(resumeLineAnchor?.next_line)}</dd>
+                    </div>
+                  ) : null}
+                  <div>
                     <dt>Why</dt>
                     <dd>{resumeCard.why_this_focus}</dd>
+                  </div>
+                  <div>
+                    <dt>Target reason</dt>
+                    <dd>{resumeLineAnchor?.reason || resumeCard.continue_from.reason}</dd>
                   </div>
                   <div>
                     <dt>Next action</dt>
                     <dd>{resumeCard.next_action}</dd>
                   </div>
                   <div>
+                    <dt>Evidence</dt>
+                    <dd>
+                      {[
+                        resumeEvidenceLine,
+                        resumeCard.evidence_frame_ids.slice(0, 4).map((id) => `frame ${id}`).join(" / "),
+                      ]
+                        .filter(Boolean)
+                        .join(" / ") || "No evidence handles"}
+                    </dd>
+                  </div>
+                  <div>
                     <dt>Confidence</dt>
                     <dd>{confidenceLabel(resumeCard.confidence)}</dd>
                   </div>
                 </dl>
-                {resumeCard.continue_from.quote ? (
-                  <blockquote>{resumeCard.continue_from.quote}</blockquote>
+                {resumeExactLine ? (
+                  <blockquote>{resumeExactLine}</blockquote>
                 ) : null}
                 {resumeCard.warnings.length ? (
                   <div className="resume-warning">
@@ -1299,16 +1701,38 @@ function formatStopPreview(output: StopCaptureOutput) {
   return JSON.stringify(
     output.preview || {
       session: output.session,
-      export: output.export,
+      resumeQuery: output.resume_query,
     },
     null,
     2,
   );
 }
 
+function pathBasename(path?: string | null) {
+  if (!path) return "";
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
 function cleanSnippet(value?: string | null) {
   if (!value) return "No text";
   return value.replace(/\[/g, "").replace(/\]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function presentLine(value?: string | null) {
+  if (!value) return null;
+  const text = value.replace(/\[/g, "").replace(/\]/g, "").replace(/\s+/g, " ").trim();
+  return text || null;
+}
+
+function lineAnchorEvidenceLabel(anchor?: ResumeLineAnchor | null, frameId?: string | null) {
+  const resolvedFrameId = frameId || anchor?.frame_id || null;
+  const parts = [
+    resolvedFrameId ? `frame ${resolvedFrameId}` : null,
+    anchor?.source || null,
+    anchor?.semantic_role || null,
+    typeof anchor?.confidence === "number" ? confidenceLabel(anchor.confidence) : null,
+  ].filter(Boolean);
+  return parts.join(" / ");
 }
 
 function hasBounds(item: BoxLike) {
@@ -1371,6 +1795,34 @@ function overlayCount(detail: FrameDetail | null, mode: OverlayMode) {
 function confidenceLabel(value?: number | null) {
   if (typeof value !== "number") return "unscored";
   return `${Math.round(value * 100)}%`;
+}
+
+function cloudResumeProvenanceLabel(result: CloudResumeResult) {
+  if (result.source === "cloud") {
+    return ["Cloud", result.model, result.response_id].filter(Boolean).join(" / ");
+  }
+  return "Rejected non-cloud result";
+}
+
+function readableOpenAIError(error: string) {
+  const lower = error.toLowerCase();
+  if (lower.includes("openai_api_key")) {
+    return "OPENAI_API_KEY is not set; Ask OpenAI did not call OpenAI.";
+  }
+  if (
+    lower.includes("could not resolve host") ||
+    lower.includes("couldn't resolve host") ||
+    lower.includes("exit status: 6")
+  ) {
+    return "OpenAI network unavailable: DNS could not resolve api.openai.com; no OpenAI answer was generated.";
+  }
+  if (lower.includes("authentication")) {
+    return "OpenAI authentication failed: check OPENAI_API_KEY; no OpenAI answer was generated.";
+  }
+  if (lower.includes("rate limit")) {
+    return "OpenAI rate limit reached; no OpenAI answer was generated.";
+  }
+  return error.replace(/^Error:\s*/, "");
 }
 
 function topContentUnit(detail: FrameDetail | null) {

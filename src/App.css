@@ -314,7 +314,7 @@ h3 {
   white-space: nowrap;
 }
 
-.export-path {
+.artifact-path {
   display: flex;
   align-items: center;
   min-width: 0;
@@ -328,13 +328,13 @@ h3 {
   line-height: 1.35;
 }
 
-.export-path span {
+.artifact-path span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.open-output-button {
+.open-artifact-button {
   align-self: center;
   white-space: nowrap;
 }
@@ -354,6 +354,90 @@ h3 {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.cloud-resume-bar {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(220px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(251, 252, 253, 0.94);
+  box-shadow: 0 12px 34px rgba(25, 35, 33, 0.06);
+}
+
+.cloud-resume-bar.ready {
+  border-color: rgba(23, 106, 88, 0.3);
+  background: #f5fbf8;
+}
+
+.cloud-resume-bar.missing {
+  border-color: rgba(138, 90, 19, 0.28);
+  background: var(--warn-soft);
+}
+
+.cloud-resume-status,
+.cloud-resume-result {
+  min-width: 0;
+}
+
+.cloud-resume-status h2 {
+  overflow: hidden;
+  font-size: 16px;
+  font-weight: 760;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-resume-status span,
+.cloud-resume-result span {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-resume-result strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 780;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-resume-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cloud-resume-actions button {
+  white-space: nowrap;
+}
+
+.cloud-resume-details {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border-top: 1px solid rgba(23, 106, 88, 0.16);
+  padding-top: 8px;
+}
+
+.cloud-resume-details .resume-facts {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .health-strip {
@@ -1203,6 +1287,14 @@ h3 {
     grid-template-columns: 1fr;
   }
 
+  .cloud-resume-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .cloud-resume-details .resume-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .control-strip {
     justify-content: flex-start;
   }
@@ -1247,13 +1339,15 @@ h3 {
 
 @media (max-width: 560px) {
   .health-strip,
-  .control-strip {
+  .control-strip,
+  .cloud-resume-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .status-pill,
-  .control-strip button {
+  .control-strip button,
+  .cloud-resume-actions button {
     width: 100%;
   }
 
@@ -1261,6 +1355,7 @@ h3 {
   .frame-row,
   .session-output-main,
   .session-output dl,
+  .cloud-resume-details .resume-facts,
   .signal-grid,
   .drawer-tabs {
     grid-template-columns: 1fr;
