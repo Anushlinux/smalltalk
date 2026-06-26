@@ -1,4 +1,5 @@
 mod capture;
+mod capture_core;
 mod session_island;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

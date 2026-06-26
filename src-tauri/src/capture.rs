@@ -1,3 +1,12 @@
+use crate::capture_core::privacy::summarize_privacy_exclusions;
+use crate::capture_core::quality::{
+    evaluate_surface,
+    surface_state_can_be_resume_target as core_surface_state_can_be_resume_target,
+    surface_state_is_context_only as core_surface_state_is_context_only, SurfacePolicyInput,
+};
+use crate::capture_core::resume_dossier::{
+    bounded_json_chars, bounded_model_images, RESUME_QUERY_SCHEMA_V2,
+};
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
@@ -2514,6 +2523,7 @@ fn build_resume_query_bundle_from_conn(
     let mut candidates = Vec::new();
     let mut missing_evidence = Vec::new();
     let mut redactions_applied = Vec::new();
+    let mut privacy_excluded_frame_ids = Vec::new();
     for frame in &session_frames {
         match resume_query_candidate_for_frame(conn, frame)? {
             Some(candidate) => {
@@ -2525,11 +2535,11 @@ fn build_resume_query_bundle_from_conn(
                 }
                 candidates.push(candidate);
             }
-            None => push_unique(
-                &mut missing_evidence,
-                format!("frame {} excluded by privacy policy", frame.id),
-            ),
+            None => privacy_excluded_frame_ids.push(frame.id),
         }
+    }
+    if let Some(message) = summarize_privacy_exclusions(&privacy_excluded_frame_ids).message {
+        push_unique(&mut missing_evidence, message);
     }
     if candidates.is_empty() {
         return Err(format!(
@@ -2539,12 +2549,8 @@ fn build_resume_query_bundle_from_conn(
     }
 
     let max_episode_cards = input.max_episode_cards.unwrap_or(8).clamp(3, 8) as usize;
-    let max_images = input
-        .max_images
-        .or(input.max_keyframes)
-        .unwrap_or(8)
-        .clamp(3, 8) as usize;
-    let max_json_chars = input.max_json_chars.unwrap_or(40_000).clamp(5_000, 80_000) as i64;
+    let max_images = bounded_model_images(input.max_images.or(input.max_keyframes));
+    let max_json_chars = bounded_json_chars(input.max_json_chars);
     let include_images = input.include_images.unwrap_or(true);
     let export_id = next_id("resume-query");
     let output_dir = output_root.join(format!(
@@ -2682,16 +2688,33 @@ fn build_resume_query_bundle_from_conn(
                 .find(|candidate| candidate.safe.frame_id == id)
         })
         .or_else(|| candidates.last());
+    let fallback_resume_candidate =
+        if surface_state_can_be_work_target(&base_resume_candidate.candidate.surface_state) {
+            base_resume_candidate.clone()
+        } else {
+            candidates
+                .iter()
+                .rev()
+                .find(|candidate| surface_state_can_be_work_target(&candidate.surface_state))
+                .map(|candidate| SelectedResumeQueryFrame {
+                    role: "resume_candidate".to_string(),
+                    candidate: candidate.clone(),
+                })
+                .unwrap_or_else(|| base_resume_candidate.clone())
+        };
     let resume_candidate = current_focus_candidate
         .filter(|current| {
             surface_state_can_be_work_target(&current.surface_state)
-                && resume_candidates_share_stable_surface(current, &base_resume_candidate.candidate)
+                && resume_candidates_share_stable_surface(
+                    current,
+                    &fallback_resume_candidate.candidate,
+                )
         })
         .map(|current| SelectedResumeQueryFrame {
             role: "current_focus".to_string(),
             candidate: current.clone(),
         })
-        .unwrap_or_else(|| base_resume_candidate.clone());
+        .unwrap_or(fallback_resume_candidate);
     let mut current_focus = current_focus_candidate.map(|candidate| {
         focus_target_for_cloud(
             candidate,
@@ -2850,7 +2873,7 @@ fn build_resume_query_bundle_from_conn(
     persist_resume_query_episode_cards(conn, &session.id, &candidate_episodes)?;
 
     let mut payload = ResumeQueryBundle {
-        schema: "smalltalk.resume_query.v1".to_string(),
+        schema: RESUME_QUERY_SCHEMA_V2.to_string(),
         budget: ResumeQueryBudget {
             max_json_chars,
             max_episode_cards: max_episode_cards as i64,
@@ -3360,20 +3383,20 @@ fn persist_resume_query_episode_cards(
 fn enforce_resume_query_json_budget(payload: &mut ResumeQueryBundle) -> Result<i64, String> {
     let max_chars = payload.budget.max_json_chars.max(5_000) as usize;
     loop {
+        payload.session_index.episode_count = payload.candidate_episodes.len();
+        payload.session_index.episodes = payload.candidate_episodes.clone();
         let len = serde_json::to_string(payload)
             .map_err(to_string)?
             .chars()
             .count();
         if len <= max_chars {
-            payload.session_index.episode_count = payload.candidate_episodes.len();
-            payload.session_index.episodes = payload.candidate_episodes.clone();
             return Ok(len as i64);
         }
         if !payload.dropped_frame_summary.is_empty() {
             payload.dropped_frame_summary.pop();
             continue;
         }
-        if payload.timeline.len() > payload.candidate_episodes.len().max(8) {
+        if payload.timeline.len() > payload.candidate_episodes.len().max(5) {
             payload.timeline.pop();
             continue;
         }
@@ -6193,12 +6216,7 @@ fn trim_resume_query_selection(
     }
     let protected = selected
         .iter()
-        .filter(|item| {
-            matches!(
-                item.role.as_str(),
-                "origin" | "resume_candidate" | "diagnostic_artifact"
-            )
-        })
+        .filter(|item| matches!(item.role.as_str(), "origin" | "resume_candidate"))
         .cloned()
         .collect::<Vec<_>>();
     let mut trimmed = selected
@@ -6247,8 +6265,8 @@ fn resume_query_role_priority(role: &str) -> i32 {
         "resume_candidate" => 100,
         "current_focus" => 95,
         "origin" => 90,
+        "return_to_origin" => 88,
         "diagnostic_artifact" => 85,
-        "return_to_origin" => 80,
         "side_branch" => 70,
         "context_surface" => 55,
         "possible_distraction" => 45,
@@ -6309,9 +6327,7 @@ fn best_resume_query_candidate_index(
     let best_non_passive = scored.iter().filter(|score| {
         candidates.get(score.index).is_some_and(|candidate| {
             !candidate.is_debug_artifact
-                && candidate.surface_state != "transient_system_surface"
-                && candidate.surface_state != "mixed_window_overview"
-                && candidate.surface_state != "passive_feed_surface"
+                && !surface_state_is_non_work_current(&candidate.surface_state)
         })
     });
     best_work
@@ -6427,10 +6443,14 @@ fn scored_resume_query_candidates(
                 0.0
             };
             let surface_state_penalty = match candidate.surface_state.as_str() {
-                "debug_export_surface" => 0.55,
-                "transient_system_surface" | "mixed_window_overview" => 0.50,
-                "passive_feed_surface" => 0.42,
-                "source_or_discovery_surface" => 0.12,
+                "debug_export_surface" | "smalltalk_self_surface" | "privacy_excluded_surface" => {
+                    0.80
+                }
+                "system_monitor_surface" | "finder_overview_surface" => 0.68,
+                "transient_system_surface" | "mixed_window_overview" => 0.55,
+                "passive_feed_surface" => 0.50,
+                "need_more_evidence" => 0.45,
+                "source_or_discovery_surface" => 0.18,
                 _ => 0.0,
             };
             let surface_state_bonus = match candidate.surface_state.as_str() {
@@ -6937,12 +6957,6 @@ fn classify_resume_surface_state(
     compact_units: &[CompactContentUnit],
     frame_text: Option<&str>,
 ) -> String {
-    if is_debug_artifact {
-        return "debug_export_surface".to_string();
-    }
-    let title = frame.window_name.as_deref().unwrap_or("").to_lowercase();
-    let app = frame.app_name.as_deref().unwrap_or("").to_lowercase();
-    let url = frame.browser_url.as_deref().unwrap_or("").to_lowercase();
     let text = selected_text
         .map(str::to_string)
         .or_else(|| {
@@ -6956,101 +6970,51 @@ fn classify_resume_surface_state(
         })
         .or_else(|| frame_text.map(str::to_string))
         .unwrap_or_default();
-    let text_lower = text.to_lowercase();
-
-    if url == "about:blank"
-        || url == "chrome://newtab/"
-        || url == "edge://newtab/"
-        || title == "new tab"
-        || title == "untitled"
-    {
-        return "transient_system_surface".to_string();
-    }
-    if title.contains("mission control")
-        || title.contains("window overview")
-        || title.contains("app expose")
-        || title.contains("app exposé")
-        || app.contains("dock")
-        || text_lower.contains("mission control")
-    {
-        return "mixed_window_overview".to_string();
-    }
-    if is_passive_feed_surface(&url, &title, &text_lower) {
-        return "passive_feed_surface".to_string();
-    }
-    if is_actionable_resume_text(&text_lower)
-        || is_form_like_task_surface(surface_type, &text_lower)
-    {
-        return "actionable_task_surface".to_string();
-    }
-    if matches!(
-        surface_type,
-        "chat_conversation" | "code_editor" | "terminal" | "notes_doc"
-    ) {
-        return "current_work_surface".to_string();
-    }
-    if surface_type == "browser_tab" || surface_type == "pdf" || surface_type == "media" {
-        return "source_or_discovery_surface".to_string();
-    }
-    "need_more_evidence".to_string()
-}
-
-fn is_passive_feed_surface(url: &str, title: &str, text_lower: &str) -> bool {
-    let social_feed = url.contains("x.com/home")
-        || url.contains("twitter.com/home")
-        || url.contains("linkedin.com/feed")
-        || title == "home / x"
-        || title.contains("home / x ")
-        || title.contains("/ x -")
-        || title.contains("linkedin");
-    social_feed
-        && (text_lower.contains("for you")
-            || text_lower.contains("following")
-            || text_lower.contains("what is happening")
-            || text_lower.contains("who to follow")
-            || text_lower.contains("promoted"))
-        && !is_form_like_task_surface("browser_tab", text_lower)
-}
-
-fn is_form_like_task_surface(surface_type: &str, text_lower: &str) -> bool {
-    if surface_type != "browser_tab" && surface_type != "unknown" {
-        return false;
-    }
-    let form_markers = [
-        "name",
-        "email",
-        "apply",
-        "application",
-        "submit",
-        "full time",
-        "founding engineer",
-        "hardest problem",
-        "cover letter",
-        "resume",
-    ];
-    form_markers
+    let chrome_unit_count = compact_units
         .iter()
-        .filter(|marker| text_lower.contains(**marker))
-        .count()
-        >= 3
+        .filter(|unit| {
+            let role = unit.semantic_role.as_deref().unwrap_or("").to_lowercase();
+            role.contains("browser_chrome")
+                || role.contains("toolbar")
+                || role.contains("system_menu")
+                || role.contains("app_sidebar")
+                || is_browser_chrome_text(&unit.text)
+        })
+        .count();
+    let page_body_unit_count = compact_units
+        .iter()
+        .filter(|unit| {
+            let role = unit.semantic_role.as_deref().unwrap_or("").to_lowercase();
+            !role.contains("browser_chrome")
+                && !role.contains("toolbar")
+                && !role.contains("system_menu")
+                && !role.contains("app_sidebar")
+                && !is_browser_chrome_text(&unit.text)
+        })
+        .count();
+
+    evaluate_surface(&SurfacePolicyInput {
+        app_name: frame.app_name.clone().unwrap_or_default(),
+        app_bundle_id: frame.app_bundle_id.clone().unwrap_or_default(),
+        window_title: frame.window_name.clone().unwrap_or_default(),
+        browser_url: frame.browser_url.clone().unwrap_or_default(),
+        surface_type: surface_type.to_string(),
+        visible_text: text,
+        selected_text_present: selected_text.is_some(),
+        is_debug_artifact,
+        privacy_excluded: frame.privacy_status.as_deref() == Some("skipped_sensitive"),
+        page_body_unit_count,
+        chrome_unit_count,
+    })
+    .surface_state
 }
 
 fn surface_state_can_be_work_target(surface_state: &str) -> bool {
-    matches!(
-        surface_state,
-        "current_work_surface" | "actionable_task_surface"
-    )
+    core_surface_state_can_be_resume_target(surface_state)
 }
 
 fn surface_state_is_non_work_current(surface_state: &str) -> bool {
-    matches!(
-        surface_state,
-        "passive_feed_surface"
-            | "debug_export_surface"
-            | "transient_system_surface"
-            | "mixed_window_overview"
-            | "source_or_discovery_surface"
-    )
+    core_surface_state_is_context_only(surface_state)
 }
 
 fn browser_chrome_dominated_export_text(
@@ -17056,14 +17020,14 @@ mod tests {
         .unwrap();
         let payload_json = serde_json::to_string(&result.payload).unwrap();
 
-        assert_eq!(result.payload.schema, "smalltalk.resume_query.v1");
+        assert_eq!(result.payload.schema, "smalltalk.resume_query.v2");
         assert_eq!(
             result.payload.session_index.schema,
             "smalltalk.session_index.v1"
         );
         assert!(result.payload.candidate_episodes.len() <= 8);
-        assert!(result.payload.budget.max_json_chars <= 40_000);
-        assert!(result.payload.keyframes.len() <= 5);
+        assert!(result.payload.budget.max_json_chars <= 25_000);
+        assert!(result.payload.keyframes.len() <= 4);
         assert!(result
             .payload
             .keyframes
@@ -17229,7 +17193,7 @@ mod tests {
 
         assert!(result.json_char_count <= 40_000);
         assert!(result.payload.candidate_episodes.len() <= 8);
-        assert!(result.payload.keyframes.len() <= 5);
+        assert!(result.payload.keyframes.len() <= 4);
         assert_eq!(
             result.payload.session_index.schema,
             "smalltalk.session_index.v1"
@@ -17826,6 +17790,90 @@ mod tests {
     }
 
     #[test]
+    fn resume_query_treats_activity_monitor_as_context_not_resume_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-activity-monitor-regression-{}",
+            now_millis()
+        ));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let work = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Codex",
+            "com.openai.codex",
+            "capture.rs - smalltalk",
+            "",
+            "code_editor",
+            "Implement capture_core policy and resume target scoring for Smalltalk.",
+            "codex-work",
+            None,
+        );
+        let monitor = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            2_000,
+            "Activity Monitor",
+            "com.apple.ActivityMonitor",
+            "Activity Monitor - All Processes",
+            "",
+            "unknown",
+            "Activity Monitor All Processes WindowServer Code Helper (Plugin) 466.2 MB",
+            "activity-monitor",
+            Some(work),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(monitor),
+                lookback_minutes: None,
+                max_episode_cards: None,
+                max_images: None,
+                max_json_chars: None,
+                max_keyframes: Some(5),
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .payload
+                .current_focus
+                .as_ref()
+                .map(|target| target.surface_state.as_str()),
+            Some("system_monitor_surface")
+        );
+        assert_eq!(result.payload.resume_candidate.frame_id, work.to_string());
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(work.to_string().as_str())
+        );
+        assert_ne!(
+            result.payload.resume_candidate.frame_id,
+            monitor.to_string()
+        );
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
     fn resume_query_payload_prefers_page_body_over_browser_chrome() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -18126,7 +18174,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_query_session_044_shape_exports_full_timeline_and_page_body_line_anchor() {
+    fn resume_query_session_044_shape_exports_compact_timeline_and_page_body_line_anchor() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let output_root =
@@ -18273,7 +18321,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.payload.timeline.len(), 14);
+        assert!(result.json_char_count <= 25_000);
+        assert!(result.payload.timeline.len() <= 8);
         assert!(result
             .payload
             .candidate_episodes
@@ -19403,7 +19452,7 @@ mod tests {
         .unwrap();
         println!("resume query bundle: {}", result.payload_path);
 
-        assert_eq!(result.payload.schema, "smalltalk.resume_query.v1");
+        assert_eq!(result.payload.schema, "smalltalk.resume_query.v2");
         assert!(!result.payload.privacy.raw_urls_sent);
         assert!(!result.payload.privacy.raw_paths_sent);
 
@@ -20034,9 +20083,9 @@ mod tests {
             evidence_conflicts: Vec::new(),
         };
         let bundle = ResumeQueryBundle {
-            schema: "smalltalk.resume_query.v1".to_string(),
+            schema: "smalltalk.resume_query.v2".to_string(),
             budget: ResumeQueryBudget {
-                max_json_chars: 40_000,
+                max_json_chars: 25_000,
                 max_episode_cards: 8,
                 max_images: 5,
                 max_text_snippets_per_episode: 4,
