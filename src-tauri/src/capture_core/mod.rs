@@ -15,3 +15,5 @@ pub mod quality;
 pub mod resume_dossier;
 pub mod snapshot;
 pub mod store;
+pub mod workstate;
+pub mod workstate_store;

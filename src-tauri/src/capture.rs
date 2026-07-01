@@ -7,6 +7,10 @@ use crate::capture_core::quality::{
 use crate::capture_core::resume_dossier::{
     bounded_json_chars, bounded_model_images, RESUME_QUERY_SCHEMA_V2,
 };
+use crate::capture_core::workstate::AnswerabilityBundle;
+use crate::capture_core::workstate_store::{
+    self, EvidenceLink, SurfaceObservationInput, WorkstateIngestResult,
+};
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
@@ -688,6 +692,7 @@ struct PendingTrigger {
     pre_frame_id: Option<String>,
     settle_delay_ms: i64,
     ready_at: Instant,
+    evidence_link: Option<EvidenceLink>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -985,6 +990,8 @@ pub struct ResumeQueryBundle {
     pub schema: String,
     pub budget: ResumeQueryBudget,
     pub session: ResumeQuerySession,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answerability_bundle: Option<Value>,
     pub session_index: SessionIndex,
     pub candidate_episodes: Vec<ResumeQueryEpisodeCard>,
     pub resume_candidate: ResumeQueryCandidate,
@@ -1739,6 +1746,7 @@ pub fn stop_capture(
     let mut resume_query = None;
     if let Some(session_id) = session_id {
         let session = finish_capture_session(&app, &session_id)?;
+        let _ = record_system_workstate_observation(&app, &session_id, "session_stop");
         {
             let mut runtime = lock_runtime(state.inner())?;
             runtime.active_session_id = None;
@@ -1831,6 +1839,9 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
     let pre_frame_id = latest_frame_id_for_session(&app, &session_id)
         .ok()
         .flatten();
+    let evidence_link = record_system_workstate_observation(&app, &session_id, "manual")
+        .ok()
+        .map(|result| evidence_link_from_ingest(&result));
     let trigger_id =
         insert_system_capture_trigger(&app, &session_id, "manual", pre_frame_id.clone(), false)?;
     let outcome = capture_frame(
@@ -1849,6 +1860,17 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
         .frame
         .ok_or_else(|| "capture was skipped before a frame was stored".to_string())?;
     let _ = finalize_capture_trigger_by_id(&app, &trigger_id, true);
+    {
+        let conn = open_db(&app)?;
+        workstate_store::record_frame_artifact(
+            &conn,
+            &session_id,
+            &frame.id.to_string(),
+            "manual",
+            evidence_link.as_ref(),
+            frame.captured_at,
+        )?;
+    }
     {
         let mut runtime = lock_runtime(state.inner())?;
         runtime.last_error = None;
@@ -2683,6 +2705,12 @@ fn build_resume_query_bundle_from_conn(
         .or_else(|| latest_session_id(conn).ok().flatten())
         .ok_or_else(|| "no capture session available for resume query bundle".to_string())?;
     let session = load_capture_session(conn, &session_id)?;
+    let answerability_bundle = workstate_store::load_answerability_bundle(conn, &session.id)?;
+    let answerability_bundle_value = answerability_bundle
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(to_string)?;
     let session_frames = frames_for_session(conn, &session.id)?;
     let current_frame_id = input.current_frame_id.or_else(|| {
         latest_frame_id_for_session_from_conn(conn, &session.id)
@@ -2700,6 +2728,14 @@ fn build_resume_query_bundle_from_conn(
         .filter(|frame| lookback_start.map_or(true, |start| frame.captured_at >= start))
         .collect::<Vec<_>>();
     if session_frames.is_empty() {
+        if let Some(answerability) = answerability_bundle {
+            return build_memory_only_resume_query_bundle(
+                output_root,
+                &session,
+                answerability,
+                &input,
+            );
+        }
         return Err(format!("session {} has no frames to summarize", session.id));
     }
 
@@ -3067,6 +3103,7 @@ fn build_resume_query_bundle_from_conn(
             stopped_at,
             duration_s: seconds_between(session.started_at, stopped_at),
         },
+        answerability_bundle: answerability_bundle_value,
         session_index,
         candidate_episodes,
         resume_candidate: ResumeQueryCandidate {
@@ -3146,6 +3183,265 @@ fn build_resume_query_bundle_from_conn(
         payload_path: final_payload_path.to_string_lossy().to_string(),
         byte_size: stats.byte_size,
         image_count,
+        json_char_count,
+        bundle: payload.clone(),
+        payload,
+    })
+}
+
+fn build_memory_only_resume_query_bundle(
+    output_root: &Path,
+    session: &CaptureSession,
+    answerability: AnswerabilityBundle,
+    input: &ResumeQueryBundleInput,
+) -> Result<ResumeQueryBundleResult, String> {
+    let max_episode_cards = input.max_episode_cards.unwrap_or(8).clamp(3, 8) as i64;
+    let max_images = bounded_model_images(input.max_images.or(input.max_keyframes)) as i64;
+    let max_json_chars = bounded_json_chars(input.max_json_chars);
+    let stopped_at = session.stopped_at.unwrap_or_else(now_millis);
+    let export_id = next_id("resume-query");
+    fs::create_dir_all(output_root).map_err(to_string)?;
+    let output_name = format!(
+        "{}-{}",
+        session_folder_name(session.sequence),
+        sanitize_id(&export_id)
+    );
+    let final_output_dir = output_root.join(&output_name);
+    let output_dir = output_root.join(format!(".tmp-{}", output_name));
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).map_err(to_string)?;
+    }
+    fs::create_dir_all(&output_dir).map_err(to_string)?;
+    let _temp_export = ResumeQueryTempExport::new(output_dir.clone());
+
+    let target = answerability
+        .resume_work_target
+        .as_ref()
+        .or(answerability.current_focus.as_ref());
+    let activity = answerability.current_activity.as_ref();
+    let evidence_handle = target
+        .map(|target| target.evidence_handle.clone())
+        .or_else(|| {
+            answerability
+                .observations
+                .last()
+                .map(|observation| format!("observation:{}", observation.id))
+        })
+        .unwrap_or_else(|| "memory:unknown".to_string());
+    let app = target
+        .and_then(|target| target.app.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let title = target
+        .and_then(|target| target.title.clone())
+        .unwrap_or_else(|| "workstate memory".to_string());
+    let surface_type = target
+        .map(|target| target.surface_type.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let surface_state = target
+        .map(|target| target.surface_state.clone())
+        .unwrap_or_else(|| "need_more_evidence".to_string());
+    let anchor_text = target
+        .and_then(|target| target.anchor.clone())
+        .or_else(|| activity.map(|activity| activity.summary.clone()))
+        .unwrap_or_else(|| "No exact visual anchor captured yet.".to_string());
+    let line_anchor = ResumeLineAnchor {
+        frame_id: None,
+        quote: Some(anchor_text.clone()),
+        confidence: target.map(|target| target.confidence).unwrap_or(0.36),
+        reason: "Memory-only anchor from observations and surface state.".to_string(),
+        ..ResumeLineAnchor::default()
+    };
+    let focus_target = ResumeQueryFocusTarget {
+        frame_id: evidence_handle.clone(),
+        app: app.clone(),
+        title: title.clone(),
+        surface_type: surface_type.clone(),
+        identity_verdict: None,
+        route_eligibility: None,
+        surface_state: surface_state.clone(),
+        exact_visible_words: Some(anchor_text.clone()),
+        anchor_id: target.map(|target| target.evidence_handle.clone()),
+        line_anchor: Some(line_anchor.clone()),
+        reason: "Selected from workstate memory before proof-frame selection.".to_string(),
+        confidence: target.map(|target| target.confidence).unwrap_or(0.36),
+        quality_flags: vec!["memory_only_resume_target".to_string()],
+    };
+    let current_activity = activity.map(|activity| ResumeQueryActivityTarget {
+        frame_id: activity.evidence_handle.clone(),
+        app: app.clone(),
+        title: title.clone(),
+        surface_type: surface_type.clone(),
+        identity_verdict: None,
+        route_eligibility: None,
+        activity_type: activity.activity_type.clone(),
+        exact_visible_words: Some(activity.summary.clone()),
+        anchor_id: Some(activity.evidence_handle.clone()),
+        line_anchor: Some(ResumeLineAnchor {
+            frame_id: None,
+            quote: Some(activity.summary.clone()),
+            confidence: activity.confidence,
+            reason: activity.reason.clone(),
+            ..ResumeLineAnchor::default()
+        }),
+        reason: activity.reason.clone(),
+        confidence: activity.confidence,
+        quality_flags: vec!["memory_only_current_activity".to_string()],
+    });
+    let surface_sequence = answerability
+        .active_surfaces
+        .iter()
+        .map(|surface| {
+            truncate_chars(
+                &format!(
+                    "{}/{}",
+                    surface.app.clone().unwrap_or_else(|| "unknown".to_string()),
+                    surface
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| surface.surface_key.clone())
+                ),
+                120,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut missing_evidence = answerability.missing_evidence.clone();
+    push_unique(
+        &mut missing_evidence,
+        "Memory-first resume bundle built without selected keyframe images.".to_string(),
+    );
+    let answerability_value = serde_json::to_value(&answerability).map_err(to_string)?;
+    let mut payload = ResumeQueryBundle {
+        schema: RESUME_QUERY_SCHEMA_V2.to_string(),
+        budget: ResumeQueryBudget {
+            max_json_chars,
+            max_episode_cards,
+            max_images,
+            max_text_snippets_per_episode: 5,
+            max_output_tokens: 2400,
+        },
+        session: ResumeQuerySession {
+            id: session.id.clone(),
+            started_at: session.started_at,
+            stopped_at,
+            duration_s: seconds_between(session.started_at, stopped_at),
+        },
+        answerability_bundle: Some(answerability_value),
+        session_index: SessionIndex {
+            schema: "smalltalk.session_index.v1".to_string(),
+            session_id: session.id.clone(),
+            current_frame_id: None,
+            duration_s: seconds_between(session.started_at, stopped_at),
+            episode_count: answerability.workstreams.len(),
+            surface_sequence,
+            candidate_resume_frames: Vec::new(),
+            artifact_frames: answerability
+                .evidence_artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == "frame")
+                .map(|artifact| artifact.ref_id.clone())
+                .collect(),
+            branch_frames: Vec::new(),
+            return_to_origin_frames: Vec::new(),
+            quality_flags: vec!["memory_first_answerability_bundle".to_string()],
+            episodes: Vec::new(),
+            evidence_conflicts: Vec::new(),
+        },
+        candidate_episodes: Vec::new(),
+        resume_candidate: ResumeQueryCandidate {
+            frame_id: evidence_handle.clone(),
+            app: app.clone(),
+            window_title: title.clone(),
+            surface_type: surface_type.clone(),
+            identity_verdict: None,
+            route_eligibility: None,
+            local_url_ref: None,
+            visible_anchor: truncate_chars(&anchor_text, 240),
+            section_anchor: None,
+            exact_words: anchor_text.clone(),
+            line_anchor,
+            confidence: focus_target.confidence,
+            quality_flags: vec!["memory_only_resume_candidate".to_string()],
+        },
+        current_activity,
+        current_focus: answerability
+            .current_focus
+            .as_ref()
+            .map(|_| focus_target.clone()),
+        resume_work_target: Some(focus_target.clone()),
+        resume_target_if_returning: Some(focus_target.clone()),
+        return_target: Some(focus_target),
+        session_theme: Some(ResumeQuerySessionTheme {
+            summary: answerability
+                .workstreams
+                .first()
+                .map(|workstream| workstream.current_activity_summary.clone())
+                .unwrap_or_else(|| "Workstate memory from local observations.".to_string()),
+            evidence_frames: Vec::new(),
+            confidence: 0.44,
+        }),
+        candidate_anchors: Vec::new(),
+        diagnostic_rejected_anchors: Vec::new(),
+        diagnostic_artifacts: Vec::new(),
+        branch_evidence: Vec::new(),
+        dropped_frame_summary: Vec::new(),
+        timeline: Vec::new(),
+        evidence_conflicts: Vec::new(),
+        confidence_breakdown: ResumeQueryConfidenceBreakdown {
+            frame_id: evidence_handle,
+            evidence_strength: 0.36,
+            actionable_text: 0.32,
+            return_to_origin: 0.0,
+            user_interaction: 0.44,
+            recency: 0.64,
+            recognized_surface: 0.42,
+            line_anchor_quality: 0.25,
+            branch_penalty: 0.0,
+            artifact_penalty: 0.0,
+            chrome_penalty: 0.0,
+            unknown_surface_penalty: if surface_state == "need_more_evidence" {
+                0.3
+            } else {
+                0.0
+            },
+            metadata_penalty: 0.0,
+            final_score: 0.44,
+        },
+        keyframes: Vec::new(),
+        transitions: Vec::new(),
+        privacy: ResumeQueryPrivacy {
+            redactions_applied: vec![
+                "workstate memory stores redacted URL/path references".to_string()
+            ],
+            raw_urls_sent: false,
+            raw_paths_sent: false,
+            raw_clipboard_sent: false,
+            raw_keystrokes_sent: false,
+        },
+        quality_flags: vec!["memory_first_answerability_bundle".to_string()],
+        missing_evidence,
+        ask: ResumeQueryAsk {
+            task: "infer_resume_target".to_string(),
+            allow_need_more_evidence: true,
+        },
+    };
+    let json_char_count = enforce_resume_query_json_budget(&mut payload)?;
+    let payload_path = output_dir.join("resume-query-bundle.json");
+    write_json_pretty(
+        &payload_path,
+        &serde_json::to_value(&payload).map_err(to_string)?,
+    )?;
+    if final_output_dir.exists() {
+        fs::remove_dir_all(&final_output_dir).map_err(to_string)?;
+    }
+    fs::rename(&output_dir, &final_output_dir).map_err(to_string)?;
+    let final_payload_path = final_output_dir.join("resume-query-bundle.json");
+    let stats = directory_stats(&final_output_dir)?;
+    Ok(ResumeQueryBundleResult {
+        output_dir: final_output_dir.to_string_lossy().to_string(),
+        bundle_path: final_payload_path.to_string_lossy().to_string(),
+        payload_path: final_payload_path.to_string_lossy().to_string(),
+        byte_size: stats.byte_size,
+        image_count: 0,
         json_char_count,
         bundle: payload.clone(),
         payload,
@@ -12928,22 +13224,29 @@ fn capture_loop(
         }
     };
 
-    if capture_and_emit(
-        &app,
-        &state,
-        &session_id,
-        "session_start",
-        false,
-        &mut previous_image_hash,
-        &mut previous_content_hash,
-        &mut previous_semantic_fingerprint,
-        &stop_signal,
-        None,
-        None,
-    )
-    .is_ok()
-    {
-        last_capture_at = Instant::now();
+    match record_system_workstate_observation(&app, &session_id, "session_start") {
+        Ok(result) => {
+            if result.evidence_need.is_some()
+                && capture_and_emit(
+                    &app,
+                    &state,
+                    &session_id,
+                    "session_start",
+                    false,
+                    &mut previous_image_hash,
+                    &mut previous_content_hash,
+                    &mut previous_semantic_fingerprint,
+                    &stop_signal,
+                    None,
+                    None,
+                    Some(evidence_link_from_ingest(&result)),
+                )
+                .is_ok()
+            {
+                last_capture_at = Instant::now();
+            }
+        }
+        Err(error) => update_error_and_island(&app, &state, error),
     }
 
     while !stop_signal.load(Ordering::Relaxed) {
@@ -13001,6 +13304,7 @@ fn capture_loop(
                     &stop_signal,
                     Some(trigger.id.clone()),
                     trigger.pre_frame_id.clone(),
+                    trigger.evidence_link.clone(),
                 ) {
                     Ok(stored) => {
                         if stored {
@@ -13016,28 +13320,36 @@ fn capture_loop(
             }
         }
 
-        if last_idle_capture.elapsed() >= IDLE_CAPTURE_INTERVAL
-            && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL
-        {
-            match capture_and_emit(
-                &app,
-                &state,
-                &session_id,
-                "idle",
-                true,
-                &mut previous_image_hash,
-                &mut previous_content_hash,
-                &mut previous_semantic_fingerprint,
-                &stop_signal,
-                None,
-                latest_frame_id_for_session(&app, &session_id)
-                    .ok()
-                    .flatten(),
-            ) {
-                Ok(stored) => {
+        if last_idle_capture.elapsed() >= IDLE_CAPTURE_INTERVAL {
+            match record_system_workstate_observation(&app, &session_id, "idle") {
+                Ok(result) => {
                     last_idle_capture = Instant::now();
-                    if stored {
-                        last_capture_at = Instant::now();
+                    if result.evidence_need.is_some()
+                        && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL
+                    {
+                        match capture_and_emit(
+                            &app,
+                            &state,
+                            &session_id,
+                            "idle",
+                            true,
+                            &mut previous_image_hash,
+                            &mut previous_content_hash,
+                            &mut previous_semantic_fingerprint,
+                            &stop_signal,
+                            None,
+                            latest_frame_id_for_session(&app, &session_id)
+                                .ok()
+                                .flatten(),
+                            Some(evidence_link_from_ingest(&result)),
+                        ) {
+                            Ok(stored) => {
+                                if stored {
+                                    last_capture_at = Instant::now();
+                                }
+                            }
+                            Err(error) => update_error_and_island(&app, &state, error),
+                        }
                     }
                 }
                 Err(error) => update_error_and_island(&app, &state, error),
@@ -13073,6 +13385,7 @@ fn capture_and_emit(
     stop_signal: &AtomicBool,
     capture_trigger_id: Option<String>,
     pre_frame_id: Option<String>,
+    evidence_link: Option<EvidenceLink>,
 ) -> Result<bool, String> {
     let trigger_id = match capture_trigger_id {
         Some(id) => Some(id),
@@ -13110,6 +13423,15 @@ fn capture_and_emit(
     }
 
     if let Some(frame) = outcome.frame {
+        let conn = open_db(app)?;
+        workstate_store::record_frame_artifact(
+            &conn,
+            session_id,
+            &frame.id.to_string(),
+            capture_trigger,
+            evidence_link.as_ref(),
+            frame.captured_at,
+        )?;
         update_success(state, frame.clone());
         let _ = app.emit("capture-frame", frame);
         if let Ok(status) = capture_status_snapshot_inner(app, state) {
@@ -13122,6 +13444,135 @@ fn capture_and_emit(
     } else {
         update_skip(state);
         Ok(false)
+    }
+}
+
+fn record_system_workstate_observation(
+    app: &AppHandle,
+    session_id: &str,
+    event_type: &str,
+) -> Result<WorkstateIngestResult, String> {
+    let conn = open_db(app)?;
+    let context = collect_workstate_context(app);
+    let input =
+        surface_observation_input_from_context(app, session_id, event_type, None, None, &context);
+    workstate_store::ingest_observation(&conn, input)
+}
+
+fn ingest_event_observation(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: &str,
+    event: &UiEventRecord,
+) -> Result<WorkstateIngestResult, String> {
+    let context = collect_workstate_context(app);
+    let input = surface_observation_input_from_context(
+        app,
+        session_id,
+        &event.event_type,
+        Some(event.id.clone()),
+        Some(event),
+        &context,
+    );
+    workstate_store::ingest_observation(conn, input)
+}
+
+fn evidence_link_from_ingest(result: &WorkstateIngestResult) -> EvidenceLink {
+    EvidenceLink {
+        evidence_need_id: result.evidence_need.as_ref().map(|need| need.id.clone()),
+        observation_id: Some(result.observation_id.clone()),
+        surface_id: result.surface_id.clone(),
+        workstate_id: Some(result.workstate_id.clone()),
+        workstream_id: result.workstream_id.clone(),
+    }
+}
+
+fn collect_workstate_context(app: &AppHandle) -> AccessibilityContext {
+    capture_paths(app)
+        .map(|paths| collect_accessibility_context(&paths))
+        .unwrap_or_default()
+}
+
+fn surface_observation_input_from_context(
+    app: &AppHandle,
+    session_id: &str,
+    event_type: &str,
+    event_id: Option<String>,
+    event: Option<&UiEventRecord>,
+    context: &AccessibilityContext,
+) -> SurfaceObservationInput {
+    let privacy_state = privacy_decision(app, context)
+        .map(|decision| decision.status)
+        .unwrap_or_else(|_| "normal".to_string());
+    let payload = event
+        .and_then(|event| event.payload.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    SurfaceObservationInput {
+        session_id: session_id.to_string(),
+        ts_ms: event.map(|event| event.ts_ms).unwrap_or_else(now_millis),
+        event_id,
+        event_type: event_type.to_string(),
+        source: "native_workstate".to_string(),
+        app_pid: context
+            .app_pid
+            .or_else(|| event.and_then(|event| event.app_pid)),
+        app_bundle_id: context
+            .app_bundle_id
+            .clone()
+            .or_else(|| event.and_then(|event| event.app_bundle_id.clone())),
+        app_name: context
+            .app_name
+            .clone()
+            .or_else(|| event.and_then(|event| event.app_name.clone())),
+        window_id: context
+            .window_id
+            .or_else(|| event.and_then(|event| event.window_id)),
+        window_title: context
+            .window_name
+            .clone()
+            .or_else(|| event.and_then(|event| event.window_title.clone())),
+        browser_url: context.browser_url.clone(),
+        document_path: context.document_path.clone(),
+        focused_object: focused_object_from_context(context),
+        visible_text: non_empty(context.text.clone()),
+        selected_text: selected_text_from_context(context),
+        viewport_signature: viewport_signature_from_event(event),
+        privacy_state: Some(privacy_state),
+        payload: Some(payload),
+    }
+}
+
+fn focused_object_from_context(context: &AccessibilityContext) -> Option<String> {
+    context
+        .nodes
+        .iter()
+        .find(|node| node.focused == Some(true))
+        .and_then(|node| {
+            non_empty(
+                node.title
+                    .clone()
+                    .or_else(|| node.value.clone())
+                    .or_else(|| node.description.clone())
+                    .unwrap_or_default(),
+            )
+        })
+}
+
+fn selected_text_from_context(context: &AccessibilityContext) -> Option<String> {
+    context
+        .nodes
+        .iter()
+        .find_map(|node| node.selected_text.clone().and_then(non_empty))
+}
+
+fn viewport_signature_from_event(event: Option<&UiEventRecord>) -> Option<String> {
+    let event = event?;
+    match (event.scroll_dx, event.scroll_dy) {
+        (Some(dx), Some(dy)) => Some(format!("scroll:{:.1}:{:.1}", dx, dy)),
+        (None, Some(dy)) => Some(format!("scroll:0:{:.1}", dy)),
+        (Some(dx), None) => Some(format!("scroll:{:.1}:0", dx)),
+        _ => None,
     }
 }
 
@@ -13140,17 +13591,21 @@ fn queue_event_trigger(
         return Ok(());
     }
 
-    let (capture_trigger, settle_delay) = match normalize_event_trigger(&event.event_type) {
-        Some(value) => value,
-        None => return Ok(()),
-    };
-
     let conn = open_db(app)?;
     if event.id.is_empty() {
         event.id = next_id("evt");
     }
     insert_ui_event(&conn, session_id, &event)?;
     record_event_side_effects(&conn, session_id, &event, typing_burst)?;
+    let ingest = ingest_event_observation(app, &conn, session_id, &event)?;
+    let Some(evidence_need) = ingest.evidence_need.as_ref() else {
+        return Ok(());
+    };
+
+    let (capture_trigger, settle_delay) = match normalize_event_trigger(&event.event_type) {
+        Some(value) => value,
+        None => return Ok(()),
+    };
 
     let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
     let now = now_millis();
@@ -13172,6 +13627,13 @@ fn queue_event_trigger(
         pre_frame_id,
         settle_delay_ms: settle_delay.as_millis() as i64,
         ready_at: Instant::now() + settle_delay,
+        evidence_link: Some(EvidenceLink {
+            evidence_need_id: Some(evidence_need.id.clone()),
+            observation_id: Some(ingest.observation_id.clone()),
+            surface_id: ingest.surface_id.clone(),
+            workstate_id: Some(ingest.workstate_id.clone()),
+            workstream_id: ingest.workstream_id.clone(),
+        }),
     };
     insert_capture_trigger(&conn, session_id, &trigger, now, false, "event_bucket")?;
     *pending = Some(trigger);
@@ -13472,6 +13934,7 @@ fn insert_system_capture_trigger(
         pre_frame_id,
         settle_delay_ms: 0,
         ready_at: Instant::now(),
+        evidence_link: None,
     };
     insert_capture_trigger(
         &conn,
@@ -17633,6 +18096,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     ensure_frame_columns(conn)?;
     ensure_session_columns(conn)?;
     ensure_episode_columns(conn)?;
+    workstate_store::init_workstate_schema(conn)?;
     ensure_default_exclusion_rules(conn)?;
     Ok(())
 }
