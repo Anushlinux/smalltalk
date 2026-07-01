@@ -715,7 +715,7 @@ The privacy contract explicitly says:
 - `raw_clipboard_sent: false`
 - `raw_keystrokes_sent: false`
 
-The bundle may include selected safe keyframe images in an `images/` folder, copied from the active-window crop when available or full screenshot otherwise.
+The bundle may include selected safe keyframe images in an `images/` folder, copied from the active-window crop when available or full screenshot otherwise. Model-facing images are capped at 12 selected keyframes; raw local screenshots and native capture volume stay in the app-data store.
 
 ## Resume Target Selection
 

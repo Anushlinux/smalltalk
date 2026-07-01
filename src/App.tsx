@@ -332,8 +332,29 @@ type CloudResumeResult = {
   source: "cloud" | string;
   decision: "current_focus" | "resume_target_found" | "ambiguous_current_focus_vs_prior_task" | "need_more_evidence" | "insufficient_evidence" | string;
   resume_target?: CloudResumeTarget;
+  current_activity?: {
+    frame_id?: string | null;
+    app?: string | null;
+    title?: string | null;
+    activity_type?: string | null;
+    reason?: string;
+    exact_visible_words?: string | null;
+    anchor_id?: string | null;
+    line_anchor?: ResumeLineAnchor | null;
+  };
   current_focus?: CloudResumeTarget;
+  resume_work_target?: CloudResumeTarget;
   resume_target_if_returning?: CloudResumeTarget;
+  return_target?: CloudResumeTarget;
+  session_theme?: {
+    summary?: string;
+    evidence_frames?: string[];
+    confidence?: number;
+  };
+  rejected_input_target?: {
+    frame_id?: string | null;
+    reason?: string;
+  } | null;
   answer?: {
     focus_now?: string;
     what_was_i_doing?: string;

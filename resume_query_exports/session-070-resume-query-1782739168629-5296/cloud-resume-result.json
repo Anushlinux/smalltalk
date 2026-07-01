@@ -1,0 +1,249 @@
+{
+  "answer": {
+    "focus_now": "You’re currently on the ChatGPT/smalltalk conversation, with the visible line “A good mental model:” on screen.",
+    "next_action": "Continue from: 4 apps • 42 moments",
+    "what_was_i_doing": "Working on the Smalltalk product/thread about the UX and return-point model for resuming interrupted work.",
+    "why_this_focus": "The factual current screen is the ChatGPT conversation, but the policy-selected work target is the Codex workspace frame that best matches the resume candidate."
+  },
+  "cached": false,
+  "confidence": 0.65,
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1341-unit-1341-ocr-61",
+    "app": "Helium",
+    "exact_visible_words": "A good mental model:",
+    "frame_id": "1341",
+    "line_anchor": {
+      "bounds": {
+        "h": 34,
+        "w": 322.3255615234376,
+        "x": 933.4883860580484,
+        "y": 999.9999992140572
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1341",
+      "line_index": 23,
+      "next_line": null,
+      "previous_line": "why cua's suck",
+      "quote": "A good mental model:",
+      "reason": "ordered main_content line 24 from ocr content units",
+      "section_anchor": "A good mental model:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1341-ocr-61"
+    },
+    "reason": "Factual current user activity from the selected current frame; active draft/work content is visible on the current screen.",
+    "title": "ChatGPT - smalltalk - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1341-unit-1341-ocr-61",
+    "app": "Helium",
+    "exact_visible_words": "A good mental model:",
+    "exact_words": "A good mental model:",
+    "frame_id": "1341",
+    "line_anchor": {
+      "bounds": {
+        "h": 34,
+        "w": 322.3255615234376,
+        "x": 933.4883860580484,
+        "y": 999.9999992140572
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1341",
+      "line_index": 23,
+      "next_line": null,
+      "previous_line": "why cua's suck",
+      "quote": "A good mental model:",
+      "reason": "ordered main_content line 24 from ocr content units",
+      "section_anchor": "A good mental model:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1341-ocr-61"
+    },
+    "reason": "Current selected frame when the resume query was generated.",
+    "section_anchor": "A good mental model:",
+    "surface_state": "current_work_surface",
+    "title": "ChatGPT - smalltalk - Helium"
+  },
+  "decision": "current_work_surface",
+  "evidence_handles": [
+    "1341-unit-1341-ocr-61",
+    "1307-unit-1307-ocr-9"
+  ],
+  "evidence_limits": [
+    "Only one valid actionable resume anchor was supported by the bounded evidence.",
+    "No need for extra evidence because the provided candidate anchor in frame 1307 is sufficient.",
+    "Current screen is factual, but the work resume target is a separate locally selected actionable frame."
+  ],
+  "evidence_request": null,
+  "generated_at_ms": 1782739211207,
+  "model": "gpt-5.4-mini",
+  "query_bundle_path": "/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-070-resume-query-1782739168629-5296/resume-query-bundle.json",
+  "query_output_dir": "/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-070-resume-query-1782739168629-5296",
+  "rejected_input_target": null,
+  "request": {
+    "current_frame_id": 1341,
+    "session_id": "session-1782738766171-1"
+  },
+  "response_id": "resp_08a36ffd38923c99016a4270ff21a881a1b068faef2d9dc375",
+  "resume_target": {
+    "anchor_id": "1307-unit-1307-ocr-9",
+    "app": "Codex",
+    "exact_visible_words": "4 apps • 42 moments",
+    "exact_words": "4 apps • 42 moments",
+    "frame_id": "1307",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 26.000000000000068,
+        "w": 221.86045837402344,
+        "x": 1297.6744182781047,
+        "y": 121.00000016171337
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1307",
+      "line_index": 2,
+      "next_line": "C New chat",
+      "previous_line": "III 0",
+      "quote": "4 apps • 42 moments",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1307-ocr-9"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": null,
+    "surface_state": "actionable_task_surface",
+    "title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1307-unit-1307-ocr-9",
+    "app": "Codex",
+    "exact_visible_words": "4 apps • 42 moments",
+    "exact_words": "4 apps • 42 moments",
+    "frame_id": "1307",
+    "line_anchor": {
+      "bounds": {
+        "h": 26.000000000000068,
+        "w": 221.86045837402344,
+        "x": 1297.674418278105,
+        "y": 121.00000016171336
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1307",
+      "line_index": 2,
+      "next_line": "C New chat",
+      "previous_line": "III 0",
+      "quote": "4 apps • 42 moments",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "section_anchor": "III 0",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1307-ocr-9"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "III 0",
+    "surface_state": "actionable_task_surface",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "1307-unit-1307-ocr-9",
+    "app": "Codex",
+    "exact_visible_words": "4 apps • 42 moments",
+    "exact_words": "4 apps • 42 moments",
+    "frame_id": "1307",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 26.000000000000068,
+        "w": 221.86045837402344,
+        "x": 1297.6744182781047,
+        "y": 121.00000016171337
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1307",
+      "line_index": 2,
+      "next_line": "C New chat",
+      "previous_line": "III 0",
+      "quote": "4 apps • 42 moments",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1307-ocr-9"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": null,
+    "surface_state": "actionable_task_surface",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "1307-unit-1307-ocr-9",
+    "app": "Codex",
+    "exact_visible_words": "4 apps • 42 moments",
+    "exact_words": "4 apps • 42 moments",
+    "frame_id": "1307",
+    "line_anchor": {
+      "bounds": {
+        "h": 26.000000000000068,
+        "w": 221.86045837402344,
+        "x": 1297.674418278105,
+        "y": 121.00000016171336
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1307",
+      "line_index": 2,
+      "next_line": "C New chat",
+      "previous_line": "III 0",
+      "quote": "4 apps • 42 moments",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "section_anchor": "III 0",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1307-ocr-9"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "III 0",
+    "surface_state": "actionable_task_surface",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.cloud_resume_result_file.v1",
+  "session_theme": {
+    "confidence": 0.55,
+    "evidence_frames": [
+      "1341",
+      "1307",
+      "1335"
+    ],
+    "summary": "interrupted, returns cold, and Smalltalk quietly knows where the work thread was."
+  },
+  "source": "cloud",
+  "warnings": []
+}

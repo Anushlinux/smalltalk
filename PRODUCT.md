@@ -425,7 +425,7 @@ Bundle details:
 
 - `resume-query-bundle.json` is the payload intended for cloud resume inference.
 - It includes session timing, a compact session index, candidate episodes, the chosen resume candidate, selected keyframes, transition labels, privacy metadata, quality flags, and missing-evidence notes.
-- Images are capped and copied only for selected cloud-safe evidence frames.
+- Images are capped at 12 selected cloud-safe keyframes and copied only for those frames.
 - Raw table dumps, SQLite snapshots, full per-frame folders, PNG duplicates, and repo-root `output/session-*` folders are no longer produced by the Stop path.
 
 The old exhaustive `output/` folder is a legacy/debug artifact. Runtime Stop behavior should now preserve only the compact data that is ready for cloud use.

@@ -1,6 +1,6 @@
 pub const RESUME_QUERY_SCHEMA_V2: &str = "smalltalk.resume_query.v2";
 pub const DEFAULT_MAX_JSON_CHARS: u32 = 25_000;
-pub const DEFAULT_MAX_MODEL_IMAGES: u32 = 4;
+pub const DEFAULT_MAX_MODEL_IMAGES: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeDossierPolicy {
@@ -43,12 +43,12 @@ mod tests {
 
         assert_eq!(policy.schema, "smalltalk.resume_query.v2");
         assert_eq!(policy.max_json_chars, 25_000);
-        assert_eq!(policy.max_model_images, 4);
+        assert_eq!(policy.max_model_images, 12);
     }
 
     #[test]
     fn requested_limits_are_capped() {
         assert_eq!(bounded_json_chars(Some(80_000)), 25_000);
-        assert_eq!(bounded_model_images(Some(8)), 4);
+        assert_eq!(bounded_model_images(Some(40)), 12);
     }
 }

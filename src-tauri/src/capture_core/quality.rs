@@ -54,7 +54,7 @@ pub fn evaluate_surface(input: &SurfacePolicyInput) -> SurfacePolicyDecision {
         "actionable_task_surface"
     } else if matches!(
         input.surface_type.as_str(),
-        "chat_conversation" | "code_editor" | "terminal" | "notes_doc"
+        "chat_conversation" | "code_editor" | "ai_coding_workspace" | "terminal" | "notes_doc"
     ) {
         "current_work_surface"
     } else if matches!(input.surface_type.as_str(), "browser_tab" | "pdf" | "media") {
