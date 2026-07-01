@@ -1,3 +1,7 @@
+use crate::capture_core::evidence_arbiter::{
+    self, ArbiterOutcome, BudgetState, CaptureBudget, CaptureDecision, EvidenceInputs,
+    EvidenceSufficiency, UnresolvedLevel, VisualProofLevel,
+};
 use crate::capture_core::privacy::summarize_privacy_exclusions;
 use crate::capture_core::quality::{
     evaluate_surface,
@@ -20,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -266,6 +270,157 @@ struct CaptureRuntime {
     started_at: Option<i64>,
     skipped_samples: i64,
     last_skipped_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStatus {
+    pub running: bool,
+    pub mode: String,
+    pub active_session: Option<CaptureSession>,
+    pub latest_work: Option<WorkStateSummary>,
+    pub resume_card: MemoryResumeCard,
+    pub counts: MemoryCounts,
+    pub recent_work: Vec<WorkStateSummary>,
+    pub last_error: Option<String>,
+    pub data_dir: String,
+    pub database_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MemoryCounts {
+    pub saved_states: i64,
+    pub visual_proofs: i64,
+    pub skipped_screenshots: i64,
+    pub work_items: i64,
+    pub log_entries: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkStateSummary {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub ts_ms: i64,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub document_path: Option<String>,
+    pub work_key: String,
+    pub work_type: String,
+    pub activity: String,
+    pub privacy: String,
+    pub confidence: f64,
+    pub screenshot_decision: String,
+    pub screenshot_reason: String,
+    pub visual_proof_frame_id: Option<i64>,
+    #[serde(skip_serializing)]
+    pub visible_text_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkTrail {
+    pub items: Vec<WorkStateSummary>,
+    pub counts: MemoryCounts,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestLogEntry {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub session_id: Option<String>,
+    pub level: String,
+    pub event: String,
+    pub app_name: Option<String>,
+    pub work_key: Option<String>,
+    pub message: String,
+    pub detail_json: Option<String>,
+}
+
+/// The subset of evidence scores surfaced on the resume card (privacy risk is a
+/// gate, not resume evidence, so it is omitted here).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ResumeEvidenceScores {
+    pub location: f32,
+    pub content: f32,
+    pub action: f32,
+    pub progress: f32,
+    pub unresolved: f32,
+    pub reopenability: f32,
+    pub visual_proof: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryResumeCard {
+    pub headline: String,
+    pub detail: String,
+    pub continue_label: String,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+    pub missing: Vec<String>,
+    pub work_state_id: Option<i64>,
+    pub frame_id: Option<i64>,
+    pub evidence_scores: Option<ResumeEvidenceScores>,
+    pub missing_signals: Vec<String>,
+}
+
+impl Default for MemoryResumeCard {
+    fn default() -> Self {
+        Self {
+            headline: "Not enough evidence yet".to_string(),
+            detail: "Turn Memory On and keep working. Smalltalk will save lightweight work states before it saves screenshots.".to_string(),
+            continue_label: "No return target yet".to_string(),
+            confidence: 0.0,
+            evidence: Vec::new(),
+            missing: vec!["No saved work state yet".to_string()],
+            work_state_id: None,
+            frame_id: None,
+            evidence_scores: None,
+            missing_signals: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkStateDraft {
+    session_id: Option<String>,
+    ts_ms: i64,
+    source_event_ids: Vec<String>,
+    app_name: Option<String>,
+    bundle_id: Option<String>,
+    window_name: Option<String>,
+    browser_url: Option<String>,
+    document_path: Option<String>,
+    work_key: String,
+    work_type: String,
+    activity: String,
+    privacy: String,
+    confidence: f64,
+    focused_role: Option<String>,
+    focused_label_hash: Option<String>,
+    focused_value_hash: Option<String>,
+    selected_text_hash: Option<String>,
+    visible_text_hash: Option<String>,
+    text_chars: usize,
+    text_is_thin: bool,
+    raw_text_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkStateDelta {
+    same_work: bool,
+    app_changed: bool,
+    window_changed: bool,
+    location_changed: bool,
+    visible_text_changed: bool,
+    meaningful: bool,
+    score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenshotDecision {
+    save_screenshot: bool,
+    decision: String,
+    reason: String,
+    scope: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -927,8 +1082,14 @@ pub struct ResumeQueryBundleResult {
 pub struct ResumeQueryBundle {
     pub schema: String,
     pub budget: ResumeQueryBudget,
+    #[serde(default = "default_resume_query_evidence_policy")]
+    pub evidence_policy: ResumeQueryEvidencePolicy,
     pub session: ResumeQuerySession,
     pub session_index: SessionIndex,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_timeline: Vec<ResumeQueryWorkState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visual_timeline: Vec<ResumeQueryVisualAnchor>,
     pub candidate_episodes: Vec<ResumeQueryEpisodeCard>,
     pub resume_candidate: ResumeQueryCandidate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -981,6 +1142,75 @@ pub struct ResumeQueryBudget {
 pub struct ResumeQueryAsk {
     pub task: String,
     pub allow_need_more_evidence: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryEvidencePolicy {
+    pub schema: String,
+    pub source_of_truth: String,
+    pub primary_sources: Vec<String>,
+    pub visual_evidence_role: String,
+    pub model_contract: Vec<String>,
+}
+
+fn default_resume_query_evidence_policy() -> ResumeQueryEvidencePolicy {
+    ResumeQueryEvidencePolicy {
+        schema: "smalltalk.resume_query.evidence_policy.v1".to_string(),
+        source_of_truth: "none; infer from evolving work state and timestamped evidence"
+            .to_string(),
+        primary_sources: vec![
+            "work_timeline from accessibility/native app state".to_string(),
+            "candidate_anchors from selected_text/accessibility text before OCR".to_string(),
+            "ui_events, typing bursts, clipboard, and transition metadata".to_string(),
+        ],
+        visual_evidence_role:
+            "screenshots/keyframes are visual timeline and gap-fill evidence only".to_string(),
+        model_contract: vec![
+            "Do not treat screenshots as the source of truth when text/native state is available"
+                .to_string(),
+            "Use visual evidence to resolve missing text, identity conflicts, and timeline order"
+                .to_string(),
+            "Treat OCR-only anchors as lower confidence unless they have strong lexical signal"
+                .to_string(),
+            "Keep current_focus, current_activity, and resume_work_target separate".to_string(),
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryWorkState {
+    pub state_id: String,
+    pub t_rel_s: f64,
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub surface_type: String,
+    pub activity: String,
+    pub work_ref: String,
+    pub privacy: String,
+    pub confidence: f64,
+    pub text_chars: i64,
+    pub text_is_thin: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
+    pub screenshot_decision: String,
+    pub screenshot_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visual_frame_id: Option<String>,
+    pub source_event_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQueryVisualAnchor {
+    pub frame_id: String,
+    pub t_rel_s: f64,
+    pub role: String,
+    pub source: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_work_state_id: Option<String>,
+    pub evidence_role: String,
 }
 
 fn default_surface_state() -> String {
@@ -1714,6 +1944,27 @@ pub fn stop_capture(
                 }),
             ) {
                 Ok(query) => Some(query),
+                // A memory-first session can legitimately save few or zero
+                // screenshots. When there are no legacy frames to build a resume
+                // bundle from (none saved, all internal, or all privacy-filtered),
+                // that is not an error — the work_states + evidence_sufficiency
+                // resume card carries the resume instead. Every such guard in
+                // build_resume_query_bundle_from_conn phrases it as
+                // "session … has no … frames …", and this arm is scoped to the
+                // resume-bundle result, so matching both tokens is safe.
+                Err(error) if error.contains("has no") && error.contains("frame") => {
+                    let _ = insert_memory_log(
+                        &conn,
+                        Some(&session.id),
+                        "info",
+                        "resume_trail_state_only",
+                        None,
+                        None,
+                        "No screenshots this session; resume card is built from work state evidence.",
+                        serde_json::json!({ "detail": error }),
+                    );
+                    None
+                }
                 Err(error) => {
                     let message = format!(
                         "Stopped capture, but failed to save resume trail: {}",
@@ -1811,6 +2062,151 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
 #[tauri::command]
 pub fn capture_status(app: AppHandle, state: State<CaptureState>) -> Result<CaptureStatus, String> {
     capture_status_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn start_memory(app: AppHandle, state: State<CaptureState>) -> Result<MemoryStatus, String> {
+    let status = start_capture(app.clone(), state.clone())?;
+    let _ = insert_memory_log(
+        &open_db(&app)?,
+        status
+            .active_session
+            .as_ref()
+            .map(|session| session.id.as_str()),
+        "info",
+        "memory_started",
+        None,
+        None,
+        "Memory On",
+        serde_json::json!({ "running": status.running }),
+    );
+    memory_status_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn pause_memory(app: AppHandle, state: State<CaptureState>) -> Result<MemoryStatus, String> {
+    let session_id = {
+        let runtime = lock_runtime(state.inner())?;
+        runtime.active_session_id.clone()
+    };
+    stop_runtime(state.inner())?;
+    if let Some(session_id) = session_id {
+        let _ = finish_capture_session(&app, &session_id);
+        let conn = open_db(&app)?;
+        let _ = insert_memory_log(
+            &conn,
+            Some(&session_id),
+            "info",
+            "memory_paused",
+            None,
+            None,
+            "Memory paused without building a debug bundle",
+            serde_json::json!({ "session_id": session_id }),
+        );
+    }
+    {
+        let mut runtime = lock_runtime(state.inner())?;
+        runtime.running = false;
+        runtime.started_at = None;
+        runtime.active_session_id = None;
+    }
+    memory_status_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn save_screenshot(app: AppHandle, state: State<CaptureState>) -> Result<MemoryStatus, String> {
+    let running = {
+        let runtime = lock_runtime(state.inner())?;
+        runtime.running
+    };
+    if !running {
+        let _ = start_capture(app.clone(), state.clone())?;
+    }
+    let frame = capture_once(app.clone(), state.clone())?;
+    let conn = open_db(&app)?;
+    let work_state = latest_work_state(&conn, frame.session_id.as_deref())?;
+    let work_state_id = work_state.as_ref().map(|state| state.id);
+    insert_visual_proof(&conn, work_state_id, &frame, "manual", "full_screen")?;
+    if let Some(id) = work_state_id {
+        update_work_state_visual_proof(&conn, id, frame.id, "saved screenshot", "manual")?;
+    }
+    if let Some(work_key) = work_state.as_ref().map(|state| state.work_key.as_str()) {
+        update_work_item_after_visual_proof(&conn, work_key, frame.id)?;
+    }
+    let _ = insert_memory_log(
+        &conn,
+        frame.session_id.as_deref(),
+        "info",
+        "visual_proof_saved",
+        frame.app_name.as_deref(),
+        work_state.as_ref().map(|state| state.work_key.as_str()),
+        "Manual visual proof saved",
+        serde_json::json!({ "frame_id": frame.id, "reason": "manual" }),
+    );
+    memory_status_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn get_memory_status(
+    app: AppHandle,
+    state: State<CaptureState>,
+) -> Result<MemoryStatus, String> {
+    memory_status_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn get_work_trail(app: AppHandle, limit: Option<u32>) -> Result<WorkTrail, String> {
+    let conn = open_db(&app)?;
+    Ok(WorkTrail {
+        items: query_work_states(&conn, limit.unwrap_or(30).clamp(1, 120))?,
+        counts: memory_counts(&conn)?,
+    })
+}
+
+#[tauri::command]
+pub fn get_resume_card(app: AppHandle) -> Result<MemoryResumeCard, String> {
+    let conn = open_db(&app)?;
+    build_memory_resume_card(&conn)
+}
+
+#[tauri::command]
+pub fn get_test_logs(app: AppHandle, limit: Option<u32>) -> Result<Vec<TestLogEntry>, String> {
+    let conn = open_db(&app)?;
+    query_memory_logs(&conn, limit.unwrap_or(80).clamp(1, 300))
+}
+
+#[tauri::command]
+pub fn export_test_bundle(app: AppHandle) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    let root = project_memory_test_root()?;
+    fs::create_dir_all(&root).map_err(to_string)?;
+    let path = root.join(format!("memory-test-{}.json", now_millis()));
+    let bundle = serde_json::json!({
+        "schema": "smalltalk.memory_test_bundle.v1",
+        "generated_at_ms": now_millis(),
+        "status": {
+            "counts": memory_counts(&conn)?,
+            "resume_card": build_memory_resume_card(&conn)?,
+        },
+        "work_trail": query_work_states(&conn, 120)?,
+        "logs": query_memory_logs(&conn, 300)?,
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&bundle).map_err(to_string)?,
+    )
+    .map_err(to_string)?;
+    let _ = insert_memory_log(
+        &conn,
+        None,
+        "info",
+        "test_bundle_exported",
+        None,
+        None,
+        "Test bundle exported",
+        serde_json::json!({ "path": path.to_string_lossy() }),
+    );
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -2824,6 +3220,17 @@ fn build_resume_query_bundle_from_conn(
         include_images,
         &mut missing_evidence,
     );
+    let work_timeline =
+        query_resume_query_work_timeline(conn, &session.id, session.started_at, stopped_at, 48)?;
+    if work_timeline.is_empty() {
+        push_unique(
+            &mut missing_evidence,
+            "no work-state timeline rows were available; falling back to image-backed frames only"
+                .to_string(),
+        );
+    }
+    let visual_timeline =
+        build_resume_query_visual_timeline(session.started_at, &keyframes, &work_timeline);
 
     if keyframes.is_empty() {
         push_unique(&mut missing_evidence, "no keyframes selected".to_string());
@@ -3002,6 +3409,7 @@ fn build_resume_query_bundle_from_conn(
             max_text_snippets_per_episode: 5,
             max_output_tokens: 2400,
         },
+        evidence_policy: default_resume_query_evidence_policy(),
         session: ResumeQuerySession {
             id: session.id.clone(),
             started_at: session.started_at,
@@ -3009,6 +3417,8 @@ fn build_resume_query_bundle_from_conn(
             duration_s: seconds_between(session.started_at, stopped_at),
         },
         session_index,
+        work_timeline,
+        visual_timeline,
         candidate_episodes,
         resume_candidate: ResumeQueryCandidate {
             frame_id: resume_candidate.candidate.safe.frame_id.clone(),
@@ -4082,6 +4492,137 @@ fn build_session_index_from_parts(
     }
 }
 
+fn query_resume_query_work_timeline(
+    conn: &Connection,
+    session_id: &str,
+    session_started_at: i64,
+    stopped_at: i64,
+    limit: usize,
+) -> Result<Vec<ResumeQueryWorkState>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ts_ms, app_name, window_name, browser_url, document_path,
+                    work_key, work_type, activity, privacy, confidence, text_chars,
+                    text_is_thin, screenshot_decision, screenshot_reason,
+                    visual_proof_frame_id, raw_text_preview, source_event_ids
+             FROM (
+               SELECT id, ts_ms, app_name, window_name, browser_url, document_path,
+                      work_key, work_type, activity, privacy, confidence, text_chars,
+                      text_is_thin, screenshot_decision, screenshot_reason,
+                      visual_proof_frame_id, raw_text_preview, source_event_ids
+               FROM work_states
+               WHERE session_id = ?1
+                 AND ts_ms >= ?2
+                 AND ts_ms <= ?3
+               ORDER BY ts_ms DESC, id DESC
+               LIMIT ?4
+             )
+             ORDER BY ts_ms ASC, id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(
+            params![session_id, session_started_at, stopped_at, limit as i64],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let ts_ms: i64 = row.get(1)?;
+                let app: Option<String> = row.get(2)?;
+                let title: Option<String> = row.get(3)?;
+                let browser_url: Option<String> = row.get(4)?;
+                let document_path: Option<String> = row.get(5)?;
+                let work_key: String = row.get(6)?;
+                let work_type: String = row.get(7)?;
+                let activity: String = row.get(8)?;
+                let privacy: String = row.get(9)?;
+                let confidence: f64 = row.get(10)?;
+                let text_chars: i64 = row.get(11)?;
+                let text_is_thin: i64 = row.get(12)?;
+                let screenshot_decision: String = row.get(13)?;
+                let screenshot_reason: String = row.get(14)?;
+                let visual_proof_frame_id: Option<i64> = row.get(15)?;
+                let raw_text_preview: Option<String> = row.get(16)?;
+                let source_event_ids: String = row.get(17)?;
+                let location_ref = browser_url
+                    .as_deref()
+                    .or(document_path.as_deref())
+                    .map(|value| stable_hash_bytes(value.as_bytes()))
+                    .unwrap_or_else(|| stable_hash_bytes(work_key.as_bytes()));
+                let text_preview = if privacy == "normal" {
+                    raw_text_preview
+                        .and_then(|text| non_empty(redact_text_for_ai(&text)))
+                        .map(|text| truncate_chars(&text, 220))
+                } else {
+                    None
+                };
+                Ok(ResumeQueryWorkState {
+                    state_id: id.to_string(),
+                    t_rel_s: seconds_between(session_started_at, ts_ms),
+                    app,
+                    title,
+                    surface_type: work_type,
+                    activity,
+                    work_ref: format!("work-ref-{}", location_ref),
+                    privacy,
+                    confidence: confidence.clamp(0.0, 1.0),
+                    text_chars,
+                    text_is_thin: text_is_thin != 0,
+                    text_preview,
+                    screenshot_decision,
+                    screenshot_reason,
+                    visual_frame_id: visual_proof_frame_id.map(|id| id.to_string()),
+                    source_event_count: json_array_len(&source_event_ids),
+                })
+            },
+        )
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn json_array_len(raw: &str) -> i64 {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.as_array().map(|items| items.len() as i64))
+        .unwrap_or(0)
+}
+
+fn build_resume_query_visual_timeline(
+    _session_started_at: i64,
+    keyframes: &[ResumeQueryKeyframe],
+    work_timeline: &[ResumeQueryWorkState],
+) -> Vec<ResumeQueryVisualAnchor> {
+    keyframes
+        .iter()
+        .map(|keyframe| {
+            let linked_work_state_id = work_timeline
+                .iter()
+                .find(|state| state.visual_frame_id.as_deref() == Some(keyframe.frame_id.as_str()))
+                .map(|state| state.state_id.clone());
+            let image_sent = keyframe.image_ref.is_some();
+            ResumeQueryVisualAnchor {
+                frame_id: keyframe.frame_id.clone(),
+                t_rel_s: keyframe.t_rel_s,
+                role: keyframe.role.clone(),
+                source: if image_sent {
+                    "exported_screenshot".to_string()
+                } else {
+                    "selected_frame_without_exported_image".to_string()
+                },
+                reason: format!(
+                    "{} keyframe; use only to fill text/state gaps or confirm timeline ordering",
+                    keyframe.role
+                ),
+                image_ref: keyframe.image_ref.clone(),
+                linked_work_state_id,
+                evidence_role: if image_sent {
+                    "gap_fill_visual_context".to_string()
+                } else {
+                    "timeline_marker_no_image_sent".to_string()
+                },
+            }
+        })
+        .collect()
+}
+
 fn persist_resume_query_episode_cards(
     conn: &Connection,
     session_id: &str,
@@ -4212,6 +4753,16 @@ fn enforce_resume_query_json_budget(payload: &mut ResumeQueryBundle) -> Result<i
             return Ok(len);
         }
     }
+    if trim_resume_query_work_timeline_for_budget(payload, false) {
+        if let Some(len) = resume_query_len_if_within_budget(payload, max_chars)? {
+            return Ok(len);
+        }
+    }
+    if trim_resume_query_visual_timeline_for_budget(payload, false) {
+        if let Some(len) = resume_query_len_if_within_budget(payload, max_chars)? {
+            return Ok(len);
+        }
+    }
     if truncate_vec(&mut payload.dropped_frame_summary, 8) {
         if let Some(len) = resume_query_len_if_within_budget(payload, max_chars)? {
             return Ok(len);
@@ -4319,6 +4870,8 @@ fn compact_resume_query_payload_for_budget(
     changed |= trim_candidate_anchors_for_budget(payload, aggressive);
     changed |= trim_resume_query_anchor_text_for_budget(payload, aggressive);
     changed |= trim_resume_query_episode_text_for_budget(payload, aggressive);
+    changed |= trim_resume_query_work_timeline_for_budget(payload, aggressive);
+    changed |= trim_resume_query_visual_timeline_for_budget(payload, aggressive);
     changed |= truncate_vec(
         &mut payload.dropped_frame_summary,
         if aggressive { 0 } else { 8 },
@@ -4516,6 +5069,71 @@ fn trim_resume_query_episode_cards_for_budget(
         changed |= truncate_vec(&mut card.keyframes, 2);
     }
     changed
+}
+
+fn trim_resume_query_work_timeline_for_budget(
+    payload: &mut ResumeQueryBundle,
+    aggressive: bool,
+) -> bool {
+    let mut changed = false;
+    for state in &mut payload.work_timeline {
+        changed |=
+            trim_text_option_for_budget(&mut state.text_preview, if aggressive { 80 } else { 160 });
+        changed |= trim_string_for_budget(
+            &mut state.screenshot_reason,
+            if aggressive { 80 } else { 140 },
+        );
+    }
+
+    let max_states = if aggressive { 8 } else { 24 };
+    if payload.work_timeline.len() <= max_states {
+        return changed;
+    }
+
+    let protected_frames = protected_resume_query_frame_ids(payload);
+    let mut kept = Vec::new();
+    let mut seen = HashSet::new();
+    for state in &payload.work_timeline {
+        if state
+            .visual_frame_id
+            .as_ref()
+            .is_some_and(|frame_id| protected_frames.contains(frame_id))
+            && seen.insert(state.state_id.clone())
+        {
+            kept.push(state.clone());
+        }
+    }
+    if let Some(first) = payload.work_timeline.first() {
+        if seen.insert(first.state_id.clone()) {
+            kept.push(first.clone());
+        }
+    }
+    for state in payload.work_timeline.iter().rev() {
+        if kept.len() >= max_states {
+            break;
+        }
+        if seen.insert(state.state_id.clone()) {
+            kept.push(state.clone());
+        }
+    }
+    kept.sort_by(|left, right| {
+        left.t_rel_s
+            .partial_cmp(&right.t_rel_s)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    payload.work_timeline = kept;
+    true
+}
+
+fn trim_resume_query_visual_timeline_for_budget(
+    payload: &mut ResumeQueryBundle,
+    _aggressive: bool,
+) -> bool {
+    if payload.visual_timeline.is_empty() {
+        return false;
+    }
+    payload.visual_timeline.clear();
+    true
 }
 
 fn trim_resume_query_diagnostics_for_budget(
@@ -6349,7 +6967,7 @@ fn build_openai_resume_request(
 ) -> Result<Value, String> {
     let mut content = vec![serde_json::json!({
         "type": "input_text",
-        "text": "You are Smalltalk's final resume reasoner. Use only the provided bounded resume query, current_activity, session_theme, candidate_anchors, line anchors, images, and local evidence handles. Do not infer from missing raw session data. exact_words and exact_visible_words must be copied only from candidate_anchors[].text_exact and must include the matching anchor_id. Never use window titles, browser tab titles, URLs, file paths, local paths, browser chrome, app sidebars, or stale thread-history titles as exact words. Never lie about current_focus: it is the factual current screen. Keep current_activity, return_target, and session_theme separate: current_activity is what the user is doing now, return_target/resume_work_target is where to resume the actionable workstream, and session_theme is the broad session topic. resume_target is only a compatibility alias for resume_work_target. If you reject the provided local target, set rejected_input_target with frame_id and reason; do not silently return an empty resume_work_target. If current_focus.surface_state is passive_feed_surface, debug_export_surface, transient_system_surface, mixed_window_overview, or source_or_discovery_surface, next_action must use resume_work_target rather than current_focus. If no valid candidate anchor supports a work target, return need_more_evidence. Return strict JSON matching the requested schema."
+        "text": "You are Smalltalk's final resume reasoner. There is no single source of truth: infer from the evolving work context. Use work_timeline, current_activity, session_theme, candidate_anchors, line anchors, UI events, and transitions as the primary state evidence. Treat screenshots, keyframe images, and visual_timeline only as gap-filling timeline evidence for missing text, spatial identity conflicts, and ordering; never let a screenshot override stronger accessibility/native text state by itself. Treat OCR-only anchors as lower trust unless the bundle marks them as valid candidate_anchors with strong lexical signal. Do not infer from missing raw session data. exact_words and exact_visible_words must be copied only from candidate_anchors[].text_exact and must include the matching anchor_id. Never use window titles, browser tab titles, URLs, file paths, local paths, browser chrome, app sidebars, or stale thread-history titles as exact words. Never lie about current_focus: it is the factual current screen. Keep current_activity, return_target, and session_theme separate: current_activity is what the user is doing now, return_target/resume_work_target is where to resume the actionable workstream, and session_theme is the broad session topic. resume_target is only a compatibility alias for resume_work_target. If you reject the provided local target, set rejected_input_target with frame_id and reason; do not silently return an empty resume_work_target. If current_focus.surface_state is passive_feed_surface, debug_export_surface, transient_system_surface, mixed_window_overview, or source_or_discovery_surface, next_action must use resume_work_target rather than current_focus. If no valid candidate anchor supports a work target, return need_more_evidence. Return strict JSON matching the requested schema."
     })];
     content.push(serde_json::json!({
         "type": "input_text",
@@ -9076,6 +9694,170 @@ fn is_low_signal_cloud_text(text: &str) -> bool {
         || compact.contains("memory usage")
 }
 
+fn low_information_anchor_text(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    let terms = text_terms(&lower);
+    if lower.contains("[redacted_") && terms.len() <= 4 {
+        return true;
+    }
+    if terms.is_empty() {
+        return true;
+    }
+    terms.len() <= 3
+        && terms.iter().all(|term| {
+            matches!(
+                term.as_str(),
+                "file"
+                    | "files"
+                    | "link"
+                    | "links"
+                    | "window"
+                    | "windows"
+                    | "search"
+                    | "menu"
+                    | "home"
+                    | "open"
+                    | "view"
+                    | "title"
+                    | "source"
+                    | "sources"
+                    | "redacted"
+                    | "number"
+            )
+        })
+}
+
+fn looks_like_ocr_gibberish(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_ascii_alphabetic())
+                .to_lowercase()
+        })
+        .filter(|word| word.len() >= 3)
+        .collect::<Vec<_>>();
+    if words.len() < 5 || text_has_technical_signal(text) {
+        return false;
+    }
+    let known = words
+        .iter()
+        .filter(|word| is_common_or_work_term(word))
+        .count();
+    known == 0 || (words.len() >= 8 && known <= 1)
+}
+
+fn text_has_technical_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.chars().any(|ch| {
+        ch.is_ascii_digit() || matches!(ch, '_' | '/' | '\\' | '{' | '}' | '(' | ')' | '=' | ':')
+    }) || [
+        "api",
+        "json",
+        "rust",
+        "cargo",
+        "npm",
+        "code",
+        "codex",
+        "smalltalk",
+        "helium",
+        "chatgpt",
+        "openai",
+        "model",
+        "prompt",
+        "bundle",
+        "resume",
+        "capture",
+        "screenshot",
+        "accessibility",
+        "state",
+        "source",
+        "truth",
+        "context",
+        "thread",
+        "work",
+        "data",
+        "output",
+        "current",
+        "target",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn is_common_or_work_term(word: &str) -> bool {
+    matches!(
+        word,
+        "the"
+            | "this"
+            | "that"
+            | "there"
+            | "their"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "while"
+            | "with"
+            | "without"
+            | "from"
+            | "into"
+            | "through"
+            | "about"
+            | "because"
+            | "before"
+            | "after"
+            | "should"
+            | "would"
+            | "could"
+            | "must"
+            | "need"
+            | "needs"
+            | "using"
+            | "used"
+            | "user"
+            | "users"
+            | "work"
+            | "thread"
+            | "context"
+            | "state"
+            | "data"
+            | "text"
+            | "capture"
+            | "captured"
+            | "screenshot"
+            | "screenshots"
+            | "source"
+            | "truth"
+            | "json"
+            | "model"
+            | "resume"
+            | "target"
+            | "current"
+            | "focus"
+            | "action"
+            | "next"
+            | "output"
+            | "product"
+            | "design"
+            | "system"
+            | "reason"
+            | "evidence"
+            | "timeline"
+            | "accessibility"
+            | "inference"
+            | "implementation"
+            | "important"
+            | "relevant"
+            | "working"
+            | "change"
+            | "changes"
+            | "wrong"
+    )
+}
+
 fn is_smalltalk_cloud_frame(candidate: &ResumeQueryCandidateFrame) -> bool {
     is_internal_smalltalk_frame(&candidate.original)
 }
@@ -9874,7 +10656,10 @@ fn line_section_anchor_for_role(role: Option<&str>, quote: &str) -> Option<Strin
 fn line_anchor_confidence(unit: &CompactContentUnit, index: usize) -> f64 {
     let mut confidence = unit.confidence.unwrap_or(0.72).clamp(0.45, 0.92);
     if unit.source == "ocr" {
-        confidence = confidence.max(0.68);
+        confidence = confidence.min(0.62);
+        if looks_like_ocr_gibberish(&unit.text) || low_information_anchor_text(&unit.text) {
+            confidence = confidence.min(0.42);
+        }
     }
     if unit.semantic_role.as_deref() == Some("main_content") {
         confidence += 0.04;
@@ -9938,6 +10723,17 @@ fn resume_anchor_reject_reason(
     };
     if quote.split_whitespace().count() < 3 {
         return Some("low_word_count".to_string());
+    }
+    if low_information_anchor_text(quote) {
+        return Some("low_semantic_signal".to_string());
+    }
+    if anchor
+        .source
+        .as_deref()
+        .is_some_and(|source| source.eq_ignore_ascii_case("ocr"))
+        && looks_like_ocr_gibberish(quote)
+    {
+        return Some("ocr_low_lexical_signal".to_string());
     }
     let surface_zone = anchor_surface_zone(anchor, candidate);
     if is_debug_or_schema_artifact_anchor(quote, &surface_zone, candidate) {
@@ -10077,7 +10873,14 @@ fn resume_line_anchor_from_content_unit(
 fn content_unit_line_anchor_confidence(unit: &ContentUnitSummary, index: usize) -> f64 {
     let mut confidence = unit.confidence.unwrap_or(0.72).clamp(0.45, 0.92);
     if unit.source == "ocr" {
-        confidence = confidence.max(0.68);
+        confidence = confidence.min(0.62);
+        if unit
+            .text
+            .as_deref()
+            .is_some_and(|text| looks_like_ocr_gibberish(text) || low_information_anchor_text(text))
+        {
+            confidence = confidence.min(0.42);
+        }
     }
     if unit.semantic_role.as_deref() == Some("main_content") {
         confidence += 0.04;
@@ -10301,6 +11104,17 @@ fn line_anchor_score(anchor: &ResumeLineAnchor, candidate: &ResumeQueryCandidate
     let quote = anchor.quote.as_deref().unwrap_or("");
     let lower = quote.to_lowercase();
     let mut score = anchor.confidence;
+    match anchor.source.as_deref().unwrap_or("") {
+        "selected_text" => score += 0.22,
+        "ax" | "accessibility" => score += 0.10,
+        "ocr" => {
+            score -= 0.24;
+            if looks_like_ocr_gibberish(quote) || low_information_anchor_text(quote) {
+                score -= 0.35;
+            }
+        }
+        _ => {}
+    }
     if is_actionable_resume_text(quote) {
         score += 0.35;
     }
@@ -11751,20 +12565,20 @@ fn evidence_strength(
 ) -> f64 {
     let mut score = 0.18_f64;
     if Path::new(&frame.snapshot_path).exists() {
-        score += 0.18;
+        score += 0.06;
     }
     if frame
         .full_text
         .as_deref()
         .is_some_and(|text| text.len() > 120)
     {
-        score += 0.18;
+        score += 0.22;
     }
     if !content_units.is_empty() {
-        score += 0.24;
+        score += 0.30;
     }
     if !app_contexts.is_empty() {
-        score += 0.12;
+        score += 0.16;
     }
     if frame.browser_url.is_some() || frame.document_path.is_some() {
         score += 0.1;
@@ -12851,7 +13665,6 @@ fn capture_loop(
         .unwrap_or_else(Instant::now);
     let mut previous_image_hash: Option<String> = None;
     let mut previous_content_hash: Option<String> = None;
-    let mut previous_semantic_fingerprint: Option<SemanticFingerprint> = None;
     let mut pending_trigger: Option<PendingTrigger> = None;
     let mut typing_burst = TypingBurstState::default();
     let mut event_source = match capture_paths(&app)
@@ -12864,7 +13677,7 @@ fn capture_loop(
         }
     };
 
-    if capture_and_emit(
+    if observe_and_maybe_capture(
         &app,
         &state,
         &session_id,
@@ -12872,10 +13685,10 @@ fn capture_loop(
         false,
         &mut previous_image_hash,
         &mut previous_content_hash,
-        &mut previous_semantic_fingerprint,
         &stop_signal,
         None,
         None,
+        Vec::new(),
     )
     .is_ok()
     {
@@ -12925,7 +13738,8 @@ fn capture_loop(
             .is_some_and(|trigger| Instant::now() >= trigger.ready_at);
         if pending_ready && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL {
             if let Some(trigger) = pending_trigger.take() {
-                match capture_and_emit(
+                let source_event_ids = trigger.caused_by_event_ids.clone();
+                match observe_and_maybe_capture(
                     &app,
                     &state,
                     &session_id,
@@ -12933,10 +13747,10 @@ fn capture_loop(
                     true,
                     &mut previous_image_hash,
                     &mut previous_content_hash,
-                    &mut previous_semantic_fingerprint,
                     &stop_signal,
                     Some(trigger.id.clone()),
                     trigger.pre_frame_id.clone(),
+                    source_event_ids,
                 ) {
                     Ok(stored) => {
                         if stored {
@@ -12955,7 +13769,7 @@ fn capture_loop(
         if last_idle_capture.elapsed() >= IDLE_CAPTURE_INTERVAL
             && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL
         {
-            match capture_and_emit(
+            match observe_and_maybe_capture(
                 &app,
                 &state,
                 &session_id,
@@ -12963,12 +13777,12 @@ fn capture_loop(
                 true,
                 &mut previous_image_hash,
                 &mut previous_content_hash,
-                &mut previous_semantic_fingerprint,
                 &stop_signal,
                 None,
                 latest_frame_id_for_session(&app, &session_id)
                     .ok()
                     .flatten(),
+                Vec::new(),
             ) {
                 Ok(stored) => {
                     last_idle_capture = Instant::now();
@@ -12997,6 +13811,7 @@ fn capture_loop(
     );
 }
 
+#[allow(dead_code)]
 fn capture_and_emit(
     app: &AppHandle,
     state: &Arc<Mutex<CaptureRuntime>>,
@@ -13086,6 +13901,21 @@ fn queue_event_trigger(
         event.id = next_id("evt");
     }
     insert_ui_event(&conn, session_id, &event)?;
+    let _ = insert_memory_log(
+        &conn,
+        Some(session_id),
+        "debug",
+        "event_received",
+        event.app_name.as_deref(),
+        None,
+        "Event received",
+        serde_json::json!({
+            "event_id": event.id,
+            "event_type": event.event_type,
+            "window_title": event.window_title,
+            "key_category": event.key_category,
+        }),
+    );
     record_event_side_effects(&conn, session_id, &event, typing_burst)?;
 
     let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
@@ -13690,6 +14520,880 @@ impl CaptureEventSource {
             let _ = reader.join();
         }
     }
+}
+
+fn observe_and_maybe_capture(
+    app: &AppHandle,
+    state: &Arc<Mutex<CaptureRuntime>>,
+    session_id: &str,
+    trigger: &str,
+    dedupe: bool,
+    previous_image_hash: &mut Option<String>,
+    previous_content_hash: &mut Option<String>,
+    stop_signal: &AtomicBool,
+    trigger_id: Option<String>,
+    pre_frame_id: Option<String>,
+    source_event_ids: Vec<String>,
+) -> Result<bool, String> {
+    let paths = capture_paths(app)?;
+    let context = collect_accessibility_context(&paths);
+    let privacy = privacy_decision(app, &context)?;
+    let conn = open_db(app)?;
+    let draft = build_work_state_draft(
+        Some(session_id.to_string()),
+        trigger,
+        source_event_ids,
+        &context,
+        &privacy,
+    );
+    let previous = latest_work_state(&conn, Some(session_id))?;
+    let delta = compute_work_state_delta(previous.as_ref(), &draft);
+    let (mut decision, outcome) = arbitrate_capture(&conn, trigger, &draft, &delta, &privacy)?;
+    let mut decision_label = outcome.decision.as_label().to_string();
+
+    // A visual proof must carry a precise, allowed reason. If somehow it does not,
+    // refuse to save the screenshot instead of storing evidence with no reason.
+    if decision.save_screenshot
+        && !evidence_arbiter::is_valid_visual_proof_reason(&decision.reason)
+    {
+        insert_memory_log(
+            &conn,
+            Some(session_id),
+            "error",
+            "invalid_visual_proof_reason",
+            draft.app_name.as_deref(),
+            Some(&draft.work_key),
+            &format!("Rejected visual proof with reason '{}'", decision.reason),
+            serde_json::json!({ "trigger": trigger, "reason": decision.reason }),
+        )?;
+        decision.save_screenshot = false;
+        decision.decision = "skipped screenshot".to_string();
+        decision.scope = "metadata_only".to_string();
+        decision_label = CaptureDecision::MetadataOnly.as_label().to_string();
+    }
+
+    // Tiny visual probe: for active-window proofs on a text-friendly surface,
+    // take a discarded low-res sample. If the screen did not materially change and
+    // accessibility text is already strong, skip the screenshot entirely.
+    if decision.save_screenshot
+        && decision.scope == "active_window"
+        && !matches!(trigger, "manual" | "session_start")
+    {
+        if let Ok((delta_score, changed_tiles)) = run_visual_probe(app, &draft.work_key) {
+            let low_change = delta_score < 0.08;
+            let strong_ax = outcome.sufficiency.content_score >= 0.6;
+            let probe_decision = if low_change && strong_ax {
+                decision.save_screenshot = false;
+                decision.decision = "skipped screenshot".to_string();
+                decision.reason = "tiny visual probe: no material change".to_string();
+                decision.scope = "metadata_only".to_string();
+                decision_label = CaptureDecision::TinyVisualProbeDiscarded.as_label().to_string();
+                "discarded_no_change"
+            } else {
+                "proceed_visual_proof"
+            };
+            let probe_work_item = work_item_id_for_key(&conn, &draft.work_key)?;
+            insert_visual_probe(
+                &conn,
+                Some(session_id),
+                probe_work_item,
+                None,
+                &draft.work_key,
+                delta_score,
+                changed_tiles,
+                probe_decision,
+            )?;
+        }
+    }
+
+    let work_state_id = insert_work_state(&conn, &draft, &decision)?;
+    update_work_item(&conn, work_state_id, &draft, &decision)?;
+    let work_item_id = work_item_id_for_key(&conn, &draft.work_key)?;
+    insert_evidence_sufficiency(
+        &conn,
+        Some(session_id),
+        work_item_id,
+        work_state_id,
+        &outcome.sufficiency,
+        &decision_label,
+        &decision.reason,
+    )?;
+    insert_memory_log(
+        &conn,
+        Some(session_id),
+        "info",
+        "state_saved",
+        draft.app_name.as_deref(),
+        Some(&draft.work_key),
+        "Saved state",
+        serde_json::json!({
+            "trigger": trigger,
+            "activity": draft.activity,
+            "work_type": draft.work_type,
+            "decision": decision.decision,
+            "capture_decision": decision_label,
+            "reason": decision.reason,
+            "meaningful": delta.meaningful,
+            "score": delta.score,
+            "overall_score": outcome.sufficiency.overall_score,
+            "missing_signals": outcome.sufficiency.missing_signals,
+            "app_changed": delta.app_changed,
+            "window_changed": delta.window_changed,
+            "location_changed": delta.location_changed,
+            "visible_text_changed": delta.visible_text_changed,
+        }),
+    )?;
+
+    if privacy.skip_capture || !decision.save_screenshot {
+        update_skip(state);
+        insert_memory_log(
+            &conn,
+            Some(session_id),
+            "debug",
+            "screenshot_skipped",
+            draft.app_name.as_deref(),
+            Some(&draft.work_key),
+            &decision.reason,
+            serde_json::json!({
+                "trigger": trigger,
+                "privacy": draft.privacy,
+                "decision": decision.decision,
+                "text_chars": draft.text_chars,
+            }),
+        )?;
+        if let Ok(status) = capture_status_snapshot_inner(app, state) {
+            let _ = app.emit("capture-status", status);
+        }
+        return Ok(false);
+    }
+
+    let trigger_id = match trigger_id {
+        Some(id) => Some(id),
+        None => Some(insert_system_capture_trigger(
+            app,
+            session_id,
+            trigger,
+            pre_frame_id.clone(),
+            dedupe,
+        )?),
+    };
+    let outcome = capture_frame(
+        app,
+        session_id,
+        trigger,
+        dedupe,
+        previous_image_hash.as_deref(),
+        previous_content_hash.as_deref(),
+        Some(context),
+        Some(stop_signal),
+        trigger_id.as_deref(),
+        pre_frame_id.as_deref(),
+    )?;
+
+    *previous_image_hash = Some(outcome.image_hash.clone());
+    *previous_content_hash = outcome
+        .content_hash
+        .clone()
+        .or_else(|| previous_content_hash.clone());
+
+    let stored = outcome.frame.is_some();
+    if let Some(id) = trigger_id.as_deref() {
+        let _ = finalize_capture_trigger_by_id(app, id, stored);
+    }
+
+    if let Some(frame) = outcome.frame {
+        insert_visual_proof(
+            &conn,
+            Some(work_state_id),
+            &frame,
+            &decision.reason,
+            &decision.scope,
+        )?;
+        update_work_state_visual_proof(
+            &conn,
+            work_state_id,
+            frame.id,
+            "saved screenshot",
+            &decision.reason,
+        )?;
+        update_work_item_after_visual_proof(&conn, &draft.work_key, frame.id)?;
+        insert_memory_log(
+            &conn,
+            Some(session_id),
+            "info",
+            "visual_proof_saved",
+            draft.app_name.as_deref(),
+            Some(&draft.work_key),
+            "Visual proof saved",
+            serde_json::json!({
+                "frame_id": frame.id,
+                "trigger": trigger,
+                "reason": decision.reason,
+                "scope": decision.scope,
+            }),
+        )?;
+        update_success(state, frame.clone());
+        let _ = app.emit("capture-frame", frame);
+        if let Ok(status) = capture_status_snapshot_inner(app, state) {
+            let _ = app.emit("capture-status", status.clone());
+            crate::session_island::update_session_island_from_status(
+                &status,
+                crate::session_island::SessionIslandState::RecordingCompact,
+            );
+        }
+        Ok(true)
+    } else {
+        update_work_state_visual_proof(
+            &conn,
+            work_state_id,
+            0,
+            "skipped screenshot",
+            "screenshot path deduped or privacy skipped after decision",
+        )?;
+        update_skip(state);
+        insert_memory_log(
+            &conn,
+            Some(session_id),
+            "debug",
+            "screenshot_skipped",
+            draft.app_name.as_deref(),
+            Some(&draft.work_key),
+            "Screenshot was skipped after frame dedupe/privacy checks",
+            serde_json::json!({ "trigger": trigger }),
+        )?;
+        Ok(false)
+    }
+}
+
+fn build_work_state_draft(
+    session_id: Option<String>,
+    trigger: &str,
+    source_event_ids: Vec<String>,
+    context: &AccessibilityContext,
+    privacy: &PrivacyDecision,
+) -> WorkStateDraft {
+    let app_name = context.app_name.clone();
+    let app = app_name.as_deref().unwrap_or("Unknown app");
+    let (_adapter, work_type, base_confidence) =
+        classify_app_context(app, context.browser_url.as_deref());
+    let work_key = work_key_for_context(context, work_type);
+    let focused = context
+        .nodes
+        .iter()
+        .find(|node| node.focused.unwrap_or(false));
+    let selected_text = focused
+        .and_then(|node| node.selected_text.clone())
+        .or_else(|| {
+            context
+                .nodes
+                .iter()
+                .find_map(|node| non_empty(node.selected_text.clone()?))
+        });
+    let visible_text_hash =
+        non_empty(context.text.clone()).map(|text| stable_hash_bytes(text.as_bytes()));
+    let text_chars = context.text.chars().count();
+    let text_is_thin = accessibility_is_thin(context);
+    WorkStateDraft {
+        session_id,
+        ts_ms: now_millis(),
+        source_event_ids,
+        app_name,
+        bundle_id: context.app_bundle_id.clone(),
+        window_name: context.window_name.clone(),
+        browser_url: context.browser_url.clone(),
+        document_path: context.document_path.clone(),
+        work_key,
+        work_type: work_type.to_string(),
+        activity: infer_activity(trigger, work_type, context),
+        privacy: privacy.status.clone(),
+        confidence: if privacy.skip_capture {
+            0.25
+        } else {
+            base_confidence
+        },
+        focused_role: focused
+            .map(|node| node.role.clone())
+            .filter(|role| !role.is_empty()),
+        focused_label_hash: focused
+            .and_then(|node| node.title.as_ref().or(node.description.as_ref()))
+            .map(|value| stable_hash_bytes(value.as_bytes())),
+        focused_value_hash: focused
+            .and_then(|node| node.value.as_ref())
+            .map(|value| stable_hash_bytes(value.as_bytes())),
+        selected_text_hash: selected_text.map(|text| stable_hash_bytes(text.as_bytes())),
+        visible_text_hash,
+        text_chars,
+        text_is_thin,
+        raw_text_preview: if privacy.status == "normal" && trigger != "typing_pause" {
+            non_empty(truncate_chars(&context.text, 220))
+        } else {
+            None
+        },
+    }
+}
+
+fn work_key_for_context(context: &AccessibilityContext, work_type: &str) -> String {
+    let app = clean_label(context.app_name.as_deref().unwrap_or("unknown")).to_lowercase();
+    let location = context
+        .browser_url
+        .as_deref()
+        .or(context.document_path.as_deref())
+        .or(context.window_name.as_deref())
+        .unwrap_or("unknown")
+        .trim()
+        .to_lowercase();
+    format!("{}::{}::{}", app, work_type, location)
+}
+
+fn infer_activity(trigger: &str, work_type: &str, context: &AccessibilityContext) -> String {
+    match trigger {
+        "typing_pause" => {
+            if work_type == "chat_conversation" {
+                "composing".to_string()
+            } else {
+                "editing".to_string()
+            }
+        }
+        "scroll_stop" => "reading".to_string(),
+        "click" | "window_focus" | "app_switch" | "event_burst" => "navigating".to_string(),
+        "idle" => "idle".to_string(),
+        "session_start" => "starting".to_string(),
+        _ if context.text.to_lowercase().contains("error") => "debugging".to_string(),
+        _ => "working".to_string(),
+    }
+}
+
+fn compute_work_state_delta(
+    previous: Option<&WorkStateSummary>,
+    current: &WorkStateDraft,
+) -> WorkStateDelta {
+    let Some(previous) = previous else {
+        return WorkStateDelta {
+            same_work: false,
+            app_changed: true,
+            window_changed: true,
+            location_changed: true,
+            visible_text_changed: current.visible_text_hash.is_some(),
+            meaningful: true,
+            score: 1.0,
+        };
+    };
+    let same_work = previous.work_key == current.work_key;
+    let app_changed = previous.app_name != current.app_name;
+    let window_changed = previous.window_name != current.window_name;
+    let location_changed = previous.browser_url != current.browser_url
+        || previous.document_path != current.document_path;
+    let visible_text_changed = current
+        .visible_text_hash
+        .as_deref()
+        .zip(previous.visible_text_hash.as_deref())
+        .is_some_and(|(left, right)| left != right);
+    let score = [
+        (app_changed, 0.45),
+        (window_changed, 0.25),
+        (location_changed, 0.45),
+        (!same_work, 0.45),
+        (visible_text_changed, 0.2),
+    ]
+    .into_iter()
+    .filter_map(|(changed, score)| changed.then_some(score))
+    .sum::<f64>()
+    .min(1.0);
+    WorkStateDelta {
+        same_work,
+        app_changed,
+        window_changed,
+        location_changed,
+        visible_text_changed,
+        meaningful: score >= 0.25,
+        score,
+    }
+}
+
+/// Classify how unfinished the current work looks, for `unresolved_score`.
+fn unresolved_level(trigger: &str, draft: &WorkStateDraft, delta: &WorkStateDelta) -> UnresolvedLevel {
+    let active_edit = matches!(draft.activity.as_str(), "composing" | "editing" | "debugging");
+    if trigger == "idle" {
+        return if active_edit && draft.text_chars > 0 {
+            UnresolvedLevel::Strong
+        } else {
+            UnresolvedLevel::Suspended
+        };
+    }
+    if active_edit && draft.text_chars > 0 {
+        return UnresolvedLevel::Strong;
+    }
+    if trigger == "app_switch" && delta.app_changed {
+        return UnresolvedLevel::Suspended;
+    }
+    if delta.meaningful {
+        return UnresolvedLevel::Likely;
+    }
+    UnresolvedLevel::None
+}
+
+/// Gather every signal the arbiter needs from the work-state draft, the delta,
+/// the privacy decision, and DB recency for this work_key.
+fn build_evidence_inputs(
+    conn: &Connection,
+    trigger: &str,
+    draft: &WorkStateDraft,
+    delta: &WorkStateDelta,
+    privacy: &PrivacyDecision,
+) -> Result<EvidenceInputs, String> {
+    let app_known = draft
+        .app_name
+        .as_deref()
+        .is_some_and(|name| !name.is_empty() && name != "Unknown app");
+    let window_known = draft.window_name.as_deref().is_some_and(|w| !w.is_empty());
+    let location_ref_known = draft.browser_url.is_some() || draft.document_path.is_some();
+    let state_fingerprint_changed =
+        delta.location_changed || delta.app_changed || !delta.same_work;
+    let ax_available = draft.focused_role.is_some() || draft.text_chars > 0;
+    let surface_is_visual_or_thin_ax =
+        evidence_arbiter::is_visual_work_type(&draft.work_type) || draft.text_is_thin;
+    let visual_proof = visual_proof_level_for(conn, &draft.work_key, state_fingerprint_changed)?;
+    Ok(EvidenceInputs {
+        trigger: trigger.to_string(),
+        work_type: draft.work_type.clone(),
+        activity: draft.activity.clone(),
+        app_known,
+        window_known,
+        location_ref_known,
+        text_is_thin: draft.text_is_thin,
+        text_chars: draft.text_chars,
+        has_focused_value: draft.focused_value_hash.is_some(),
+        has_selection: draft.selected_text_hash.is_some(),
+        has_title: window_known || draft.browser_url.is_some(),
+        meaningfully_changed: delta.meaningful,
+        state_fingerprint_changed,
+        visible_text_changed: delta.visible_text_changed,
+        delta_score: delta.score,
+        unresolved: unresolved_level(trigger, draft, delta),
+        reopen_path_known: location_ref_known,
+        visual_proof,
+        privacy_status: privacy.status.clone(),
+        privacy_skip: privacy.skip_capture,
+        sensitive_surface: is_messaging_work_type(&draft.work_type),
+        ax_available,
+        surface_is_visual_or_thin_ax,
+    })
+}
+
+/// Map an arbiter [`CaptureDecision`] back onto the legacy [`ScreenshotDecision`]
+/// so the downstream `capture_frame` / `visual_proofs` flow is unchanged.
+fn screenshot_decision_from(outcome: &ArbiterOutcome) -> ScreenshotDecision {
+    let saves = outcome.decision.saves_visual_proof();
+    let scope = match outcome.decision {
+        CaptureDecision::FullScreenVisualProof => "full_screen",
+        CaptureDecision::ActiveWindowVisualProof => "active_window",
+        _ => "metadata_only",
+    };
+    ScreenshotDecision {
+        save_screenshot: saves,
+        decision: if saves {
+            "saved screenshot"
+        } else {
+            "skipped screenshot"
+        }
+        .to_string(),
+        reason: outcome.reason.clone(),
+        scope: scope.to_string(),
+    }
+}
+
+/// Run the evidence-sufficiency arbiter and return both the legacy screenshot
+/// decision and the full arbiter outcome (scores + decision + reason).
+fn arbitrate_capture(
+    conn: &Connection,
+    trigger: &str,
+    draft: &WorkStateDraft,
+    delta: &WorkStateDelta,
+    privacy: &PrivacyDecision,
+) -> Result<(ScreenshotDecision, ArbiterOutcome), String> {
+    let inputs = build_evidence_inputs(conn, trigger, draft, delta, privacy)?;
+    let budget =
+        CaptureBudget::for_work_type(evidence_arbiter::is_visual_work_type(&draft.work_type));
+    let budget_state = build_budget_state(conn)?;
+    let outcome = evidence_arbiter::arbitrate(&inputs, &budget, &budget_state);
+    let decision = screenshot_decision_from(&outcome);
+    Ok((decision, outcome))
+}
+
+fn decide_screenshot(
+    conn: &Connection,
+    trigger: &str,
+    draft: &WorkStateDraft,
+    delta: &WorkStateDelta,
+    privacy: &PrivacyDecision,
+) -> Result<ScreenshotDecision, String> {
+    Ok(arbitrate_capture(conn, trigger, draft, delta, privacy)?.0)
+}
+
+fn is_visual_work_type(work_type: &str) -> bool {
+    matches!(work_type, "canvas" | "pdf" | "media") || work_type.contains("design")
+}
+
+fn is_messaging_work_type(work_type: &str) -> bool {
+    work_type == "messaging" || work_type == "media"
+}
+
+fn recent_visual_proof_count(
+    conn: &Connection,
+    work_key: &str,
+    lookback_ms: i64,
+) -> Result<i64, String> {
+    let since = now_millis() - lookback_ms;
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM visual_proofs vp
+         JOIN work_states ws ON ws.id = vp.work_state_id
+         WHERE ws.work_key = ?1
+           AND vp.created_at_ms >= ?2",
+        params![work_key, since],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+/// Current spend against the capture budget over the trailing hour (global, not
+/// per work_key — the budget is a hard cap on total capture volume).
+fn build_budget_state(conn: &Connection) -> Result<BudgetState, String> {
+    let now = now_millis();
+    let since = now - 60 * 60 * 1000;
+    let visual: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM visual_proofs WHERE created_at_ms >= ?1",
+            params![since],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    let fullscreen: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM visual_proofs
+             WHERE created_at_ms >= ?1 AND capture_scope = 'full_screen'",
+            params![since],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    let last_ts: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(created_at_ms) FROM visual_proofs",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    let seconds_since_last_visual_proof =
+        last_ts.map(|ts| ((now - ts).max(0) / 1000).min(u32::MAX as i64) as u32);
+    Ok(BudgetState {
+        visual_proofs_last_hour: visual.max(0) as u32,
+        fullscreen_proofs_last_hour: fullscreen.max(0) as u32,
+        ocr_runs_last_hour: 0,
+        seconds_since_last_visual_proof,
+    })
+}
+
+/// How good a visual anchor we already have for this work_key/surface.
+fn visual_proof_level_for(
+    conn: &Connection,
+    work_key: &str,
+    state_changed: bool,
+) -> Result<VisualProofLevel, String> {
+    let last_ts: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(vp.created_at_ms)
+             FROM visual_proofs vp
+             JOIN work_states ws ON ws.id = vp.work_state_id
+             WHERE ws.work_key = ?1",
+            params![work_key],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    Ok(match last_ts {
+        Some(ts) => {
+            let age = now_millis() - ts;
+            if !state_changed && age <= 5 * 60 * 1000 {
+                VisualProofLevel::RecentSameSurface
+            } else {
+                VisualProofLevel::OlderStateChanged
+            }
+        }
+        None => VisualProofLevel::None,
+    })
+}
+
+/// Look up the `work_items.id` for a work_key (populated by `update_work_item`).
+fn work_item_id_for_key(conn: &Connection, work_key: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT id FROM work_items WHERE work_key = ?1",
+        params![work_key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn insert_evidence_sufficiency(
+    conn: &Connection,
+    session_id: Option<&str>,
+    work_item_id: Option<i64>,
+    work_state_id: i64,
+    sufficiency: &EvidenceSufficiency,
+    decision: &str,
+    decision_reason: &str,
+) -> Result<(), String> {
+    let missing_json = serde_json::to_string(&sufficiency.missing_signals).map_err(to_string)?;
+    conn.execute(
+        "INSERT INTO evidence_sufficiency (
+            created_at, session_id, work_item_id, work_state_id,
+            location_score, content_score, action_score, progress_score,
+            unresolved_score, reopenability_score, visual_proof_score,
+            privacy_risk_score, overall_score, missing_signals_json,
+            decision, decision_reason
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            now_millis(),
+            session_id,
+            work_item_id,
+            work_state_id,
+            sufficiency.location_score,
+            sufficiency.content_score,
+            sufficiency.action_score,
+            sufficiency.progress_score,
+            sufficiency.unresolved_score,
+            sufficiency.reopenability_score,
+            sufficiency.visual_proof_score,
+            sufficiency.privacy_risk_score,
+            sufficiency.overall_score,
+            missing_json,
+            decision,
+            decision_reason,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_visual_probe(
+    conn: &Connection,
+    session_id: Option<&str>,
+    work_item_id: Option<i64>,
+    work_state_id: Option<i64>,
+    surface_key: &str,
+    visual_delta_score: f64,
+    changed_tile_count: i64,
+    decision: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO visual_probes (
+            created_at, session_id, work_item_id, work_state_id, surface_key,
+            visual_delta_score, changed_tile_count, decision, discarded
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+        params![
+            now_millis(),
+            session_id,
+            work_item_id,
+            work_state_id,
+            surface_key,
+            visual_delta_score,
+            changed_tile_count,
+            decision,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_work_state(
+    conn: &Connection,
+    draft: &WorkStateDraft,
+    decision: &ScreenshotDecision,
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO work_states (
+            session_id, ts_ms, source_event_ids, app_name, bundle_id, window_name,
+            browser_url, document_path, work_key, work_type, activity, privacy,
+            confidence, focused_role, focused_label_hash, focused_value_hash,
+            selected_text_hash, visible_text_hash, text_chars, text_is_thin,
+            screenshot_decision, screenshot_reason, raw_text_preview, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        params![
+            draft.session_id.as_deref(),
+            draft.ts_ms,
+            serde_json::to_string(&draft.source_event_ids).map_err(to_string)?,
+            draft.app_name.as_deref(),
+            draft.bundle_id.as_deref(),
+            draft.window_name.as_deref(),
+            draft.browser_url.as_deref(),
+            draft.document_path.as_deref(),
+            draft.work_key.as_str(),
+            draft.work_type.as_str(),
+            draft.activity.as_str(),
+            draft.privacy.as_str(),
+            draft.confidence,
+            draft.focused_role.as_deref(),
+            draft.focused_label_hash.as_deref(),
+            draft.focused_value_hash.as_deref(),
+            draft.selected_text_hash.as_deref(),
+            draft.visible_text_hash.as_deref(),
+            draft.text_chars as i64,
+            if draft.text_is_thin { 1 } else { 0 },
+            decision.decision.as_str(),
+            decision.reason.as_str(),
+            draft.raw_text_preview.as_deref(),
+            draft.ts_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn update_work_state_visual_proof(
+    conn: &Connection,
+    work_state_id: i64,
+    frame_id: i64,
+    decision: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let frame_id = if frame_id > 0 { Some(frame_id) } else { None };
+    conn.execute(
+        "UPDATE work_states
+         SET visual_proof_frame_id = ?2,
+             screenshot_decision = ?3,
+             screenshot_reason = ?4
+         WHERE id = ?1",
+        params![work_state_id, frame_id, decision, reason],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn update_work_item(
+    conn: &Connection,
+    work_state_id: i64,
+    draft: &WorkStateDraft,
+    _decision: &ScreenshotDecision,
+) -> Result<(), String> {
+    let title = draft
+        .document_path
+        .clone()
+        .or_else(|| draft.browser_url.clone())
+        .or_else(|| draft.window_name.clone())
+        .or_else(|| draft.app_name.clone());
+    conn.execute(
+        "INSERT INTO work_items (
+            work_key, title, app_name, window_name, browser_url, document_path,
+            work_type, first_state_id, latest_state_id, resume_state_id,
+            state_count, visual_proof_count, status, confidence, first_seen_ms, last_seen_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 1, 0, 'active', ?9, ?10, ?10)
+         ON CONFLICT(work_key) DO UPDATE SET
+            title = excluded.title,
+            app_name = excluded.app_name,
+            window_name = excluded.window_name,
+            browser_url = excluded.browser_url,
+            document_path = excluded.document_path,
+            work_type = excluded.work_type,
+            latest_state_id = excluded.latest_state_id,
+            resume_state_id = CASE
+              WHEN excluded.work_type IN ('messaging', 'media') AND work_items.state_count < 4
+                THEN work_items.resume_state_id
+              ELSE excluded.resume_state_id
+            END,
+            state_count = work_items.state_count + 1,
+            status = 'active',
+            confidence = MAX(work_items.confidence, excluded.confidence),
+            last_seen_ms = excluded.last_seen_ms",
+        params![
+            draft.work_key.as_str(),
+            title.as_deref(),
+            draft.app_name.as_deref(),
+            draft.window_name.as_deref(),
+            draft.browser_url.as_deref(),
+            draft.document_path.as_deref(),
+            draft.work_type.as_str(),
+            work_state_id,
+            draft.confidence,
+            draft.ts_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn update_work_item_after_visual_proof(
+    conn: &Connection,
+    work_key: &str,
+    frame_id: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE work_items
+         SET resume_frame_id = ?2,
+             visual_proof_count = visual_proof_count + 1
+         WHERE work_key = ?1",
+        params![work_key, frame_id],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_visual_proof(
+    conn: &Connection,
+    work_state_id: Option<i64>,
+    frame: &CaptureFrame,
+    reason: &str,
+    scope: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO visual_proofs (
+            frame_id, work_state_id, session_id, reason, capture_scope, image_hash,
+            app_name, window_name, browser_url, document_path, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            frame.id,
+            work_state_id,
+            frame.session_id.as_deref(),
+            reason,
+            scope,
+            frame.image_hash.as_ref().or(frame.phash.as_ref()),
+            frame.app_name.as_deref(),
+            frame.window_name.as_deref(),
+            frame.browser_url.as_deref(),
+            frame.document_path.as_deref(),
+            now_millis(),
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_memory_log(
+    conn: &Connection,
+    session_id: Option<&str>,
+    level: &str,
+    event: &str,
+    app_name: Option<&str>,
+    work_key: Option<&str>,
+    message: &str,
+    detail: Value,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO memory_logs (
+            ts_ms, session_id, level, event, app_name, work_key, message, detail_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            now_millis(),
+            session_id,
+            level,
+            event,
+            app_name,
+            work_key,
+            message,
+            detail.to_string(),
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
 }
 
 fn capture_frame(
@@ -14532,6 +16236,14 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
     if url.contains("linear.app") {
         return ("linear_browser_adapter", "notes_doc", 0.82);
     }
+    if url.contains("figma.com")
+        || url.contains("miro.com")
+        || url.contains("canva.com")
+        || url.contains("excalidraw.com")
+        || url.contains("tldraw.com")
+    {
+        return ("canvas_browser_adapter", "canvas", 0.82);
+    }
     if is_media_url(&url) {
         return ("media_browser_adapter", "media", 0.86);
     }
@@ -14557,6 +16269,14 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
     }
     if app.contains("terminal") || app.contains("iterm") || app.contains("warp") {
         return ("terminal_adapter", "terminal", 0.66);
+    }
+    if app.contains("figma")
+        || app.contains("miro")
+        || app.contains("canva")
+        || app.contains("excalidraw")
+        || app.contains("tldraw")
+    {
+        return ("canvas_app_adapter", "canvas", 0.72);
     }
     if app.contains("preview") || app.contains("pdf") {
         return ("pdf_adapter", "pdf", 0.64);
@@ -14886,6 +16606,283 @@ fn capture_status_snapshot_inner(
         ocr_tool: Path::new("/usr/bin/swiftc").exists()
             || Path::new("/usr/bin/swift").exists()
             || command_in_path("tesseract"),
+    })
+}
+
+fn memory_status_snapshot(
+    app: &AppHandle,
+    state: &State<CaptureState>,
+) -> Result<MemoryStatus, String> {
+    let paths = capture_paths(app)?;
+    ensure_db(app)?;
+    let conn = open_db(app)?;
+    let runtime = lock_runtime(state.inner())?;
+    let running = runtime.running;
+    let active_session_id = runtime.active_session_id.clone();
+    let last_error = runtime.last_error.clone();
+    drop(runtime);
+
+    let active_session = active_session_id
+        .as_deref()
+        .and_then(|id| load_capture_session(&conn, id).ok());
+    let latest_work = latest_work_state(&conn, active_session_id.as_deref())?;
+    Ok(MemoryStatus {
+        running,
+        mode: if running {
+            "Memory On".to_string()
+        } else {
+            "Paused".to_string()
+        },
+        active_session,
+        latest_work,
+        resume_card: build_memory_resume_card(&conn)?,
+        counts: memory_counts(&conn)?,
+        recent_work: query_work_states(&conn, 12)?,
+        last_error,
+        data_dir: paths.root_dir.to_string_lossy().to_string(),
+        database_path: paths.db_path.to_string_lossy().to_string(),
+    })
+}
+
+fn memory_counts(conn: &Connection) -> Result<MemoryCounts, String> {
+    Ok(MemoryCounts {
+        saved_states: row_count(conn, "work_states")?,
+        visual_proofs: row_count(conn, "visual_proofs")?,
+        skipped_screenshots: conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_states WHERE screenshot_decision = 'skipped screenshot'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(to_string)?,
+        work_items: row_count(conn, "work_items")?,
+        log_entries: row_count(conn, "memory_logs")?,
+    })
+}
+
+fn query_work_states(conn: &Connection, limit: u32) -> Result<Vec<WorkStateSummary>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, ts_ms, app_name, window_name, browser_url,
+                    document_path, work_key, work_type, activity, privacy,
+                    confidence, screenshot_decision, screenshot_reason, visual_proof_frame_id,
+                    visible_text_hash
+             FROM work_states
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit], work_state_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn latest_work_state(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<WorkStateSummary>, String> {
+    conn.query_row(
+        "SELECT id, session_id, ts_ms, app_name, window_name, browser_url,
+                document_path, work_key, work_type, activity, privacy,
+                confidence, screenshot_decision, screenshot_reason, visual_proof_frame_id,
+                visible_text_hash
+         FROM work_states
+         WHERE (?1 IS NULL OR session_id = ?1)
+         ORDER BY ts_ms DESC, id DESC
+         LIMIT 1",
+        params![session_id],
+        work_state_from_row,
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn work_state_from_row(row: &Row<'_>) -> rusqlite::Result<WorkStateSummary> {
+    Ok(WorkStateSummary {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        ts_ms: row.get(2)?,
+        app_name: row.get(3)?,
+        window_name: row.get(4)?,
+        browser_url: row.get(5)?,
+        document_path: row.get(6)?,
+        work_key: row.get(7)?,
+        work_type: row.get(8)?,
+        activity: row.get(9)?,
+        privacy: row.get(10)?,
+        confidence: row.get(11)?,
+        screenshot_decision: row.get(12)?,
+        screenshot_reason: row.get(13)?,
+        visual_proof_frame_id: row.get(14)?,
+        visible_text_hash: row.get(15)?,
+    })
+}
+
+fn query_memory_logs(conn: &Connection, limit: u32) -> Result<Vec<TestLogEntry>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ts_ms, session_id, level, event, app_name, work_key, message, detail_json
+             FROM memory_logs
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(TestLogEntry {
+                id: row.get(0)?,
+                ts_ms: row.get(1)?,
+                session_id: row.get(2)?,
+                level: row.get(3)?,
+                event: row.get(4)?,
+                app_name: row.get(5)?,
+                work_key: row.get(6)?,
+                message: row.get(7)?,
+                detail_json: row.get(8)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn build_memory_resume_card(conn: &Connection) -> Result<MemoryResumeCard, String> {
+    let Some(item) = conn
+        .query_row(
+            "SELECT wi.resume_state_id, wi.latest_state_id, wi.resume_frame_id,
+                    wi.title, wi.app_name, wi.window_name, wi.browser_url, wi.document_path,
+                    wi.work_type, wi.confidence, wi.state_count, wi.visual_proof_count, wi.id
+             FROM work_items wi
+             WHERE wi.status = 'active'
+             ORDER BY
+               CASE WHEN wi.work_type = 'messaging' THEN 1 ELSE 0 END ASC,
+               wi.last_seen_ms DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, f64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?
+    else {
+        return Ok(MemoryResumeCard::default());
+    };
+
+    let (
+        resume_state_id,
+        latest_state_id,
+        resume_frame_id,
+        title,
+        app_name,
+        window_name,
+        browser_url,
+        document_path,
+        work_type,
+        confidence,
+        state_count,
+        visual_count,
+        work_item_id,
+    ) = item;
+    let state_id = resume_state_id.or(latest_state_id);
+    let evidence_row = latest_evidence_for_work_item(conn, work_item_id)?;
+    let label = title
+        .or_else(|| document_path.clone())
+        .or_else(|| browser_url.clone())
+        .or_else(|| window_name.clone())
+        .or_else(|| app_name.clone())
+        .unwrap_or_else(|| "recent work".to_string());
+    let app_label = app_name.unwrap_or_else(|| "Unknown app".to_string());
+    let work_type = work_type.unwrap_or_else(|| "unknown".to_string());
+    let mut missing = Vec::new();
+    if visual_count == 0 {
+        missing.push("No visual proof saved yet".to_string());
+    }
+    if confidence < 0.55 {
+        missing.push("I know the app/page, but exact content is unclear".to_string());
+    }
+    if work_type == "browser_tab" && browser_url.is_none() {
+        missing.push("Browser URL was not available".to_string());
+    }
+    let (evidence_scores, missing_signals) = match evidence_row {
+        Some((scores, signals)) => {
+            if scores.visual_proof < 0.5 {
+                missing.push("Visual proof is weak; resuming from state evidence".to_string());
+            }
+            (Some(scores), signals)
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(MemoryResumeCard {
+        headline: format!("You were working in {}", app_label),
+        detail: format!(
+            "Latest work item: {}. Activity looks like {}.",
+            label, work_type
+        ),
+        continue_label: label,
+        confidence,
+        evidence: vec![
+            format!("{} saved states", state_count),
+            format!("{} visual proofs", visual_count),
+        ],
+        missing,
+        work_state_id: state_id,
+        frame_id: resume_frame_id,
+        evidence_scores,
+        missing_signals,
+    })
+}
+
+/// Load the most recent evidence-sufficiency scores + missing signals for a work
+/// item, so the resume card is built from structured confidence, not just images.
+fn latest_evidence_for_work_item(
+    conn: &Connection,
+    work_item_id: i64,
+) -> Result<Option<(ResumeEvidenceScores, Vec<String>)>, String> {
+    conn.query_row(
+        "SELECT location_score, content_score, action_score, progress_score,
+                unresolved_score, reopenability_score, visual_proof_score,
+                missing_signals_json
+         FROM evidence_sufficiency
+         WHERE work_item_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        params![work_item_id],
+        |row| {
+            let scores = ResumeEvidenceScores {
+                location: row.get::<_, f64>(0)? as f32,
+                content: row.get::<_, f64>(1)? as f32,
+                action: row.get::<_, f64>(2)? as f32,
+                progress: row.get::<_, f64>(3)? as f32,
+                unresolved: row.get::<_, f64>(4)? as f32,
+                reopenability: row.get::<_, f64>(5)? as f32,
+                visual_proof: row.get::<_, f64>(6)? as f32,
+            };
+            let missing_json: String = row.get(7)?;
+            Ok((scores, missing_json))
+        },
+    )
+    .optional()
+    .map_err(to_string)
+    .map(|opt| {
+        opt.map(|(scores, missing_json)| {
+            let signals: Vec<String> = serde_json::from_str(&missing_json).unwrap_or_default();
+            (scores, signals)
+        })
     })
 }
 
@@ -16843,12 +18840,20 @@ fn project_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not resolve project root from CARGO_MANIFEST_DIR".to_string())
 }
 
+fn project_captured_root() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("captured"))
+}
+
 fn project_output_root() -> Result<PathBuf, String> {
-    Ok(project_root()?.join("output"))
+    Ok(project_captured_root()?.join("output"))
 }
 
 fn project_resume_query_root() -> Result<PathBuf, String> {
-    Ok(project_root()?.join("resume_query_exports"))
+    Ok(project_captured_root()?.join("resume_query_exports"))
+}
+
+fn project_memory_test_root() -> Result<PathBuf, String> {
+    Ok(project_captured_root()?.join("memory_test_exports"))
 }
 
 fn session_folder_name(sequence: i64) -> String {
@@ -16964,6 +18969,10 @@ fn clear_capture_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         BEGIN IMMEDIATE;
+        DELETE FROM memory_logs;
+        DELETE FROM work_items;
+        DELETE FROM visual_proofs;
+        DELETE FROM work_states;
         DELETE FROM episode_evidence;
         DELETE FROM episode_edges;
         DELETE FROM episode_nodes;
@@ -17189,6 +19198,138 @@ fn init_db(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_capture_triggers_session_ts
           ON capture_triggers(session_id, ts_ms);
+
+        CREATE TABLE IF NOT EXISTS work_states (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT,
+          ts_ms INTEGER NOT NULL,
+          source_event_ids TEXT NOT NULL,
+          app_name TEXT,
+          bundle_id TEXT,
+          window_name TEXT,
+          browser_url TEXT,
+          document_path TEXT,
+          work_key TEXT NOT NULL,
+          work_type TEXT NOT NULL,
+          activity TEXT NOT NULL,
+          privacy TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0,
+          focused_role TEXT,
+          focused_label_hash TEXT,
+          focused_value_hash TEXT,
+          selected_text_hash TEXT,
+          visible_text_hash TEXT,
+          text_chars INTEGER NOT NULL DEFAULT 0,
+          text_is_thin INTEGER NOT NULL DEFAULT 0,
+          screenshot_decision TEXT NOT NULL,
+          screenshot_reason TEXT NOT NULL,
+          visual_proof_frame_id INTEGER,
+          raw_text_preview TEXT,
+          created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_states_session_ts
+          ON work_states(session_id, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_work_states_work_key
+          ON work_states(work_key, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS visual_proofs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          frame_id INTEGER NOT NULL,
+          work_state_id INTEGER,
+          session_id TEXT,
+          reason TEXT NOT NULL,
+          capture_scope TEXT NOT NULL,
+          image_hash TEXT,
+          app_name TEXT,
+          window_name TEXT,
+          browser_url TEXT,
+          document_path TEXT,
+          created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_proofs_session
+          ON visual_proofs(session_id, created_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_visual_proofs_work_state
+          ON visual_proofs(work_state_id);
+
+        CREATE TABLE IF NOT EXISTS work_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          work_key TEXT NOT NULL UNIQUE,
+          title TEXT,
+          app_name TEXT,
+          window_name TEXT,
+          browser_url TEXT,
+          document_path TEXT,
+          work_type TEXT,
+          first_state_id INTEGER,
+          latest_state_id INTEGER,
+          resume_state_id INTEGER,
+          resume_frame_id INTEGER,
+          state_count INTEGER NOT NULL DEFAULT 0,
+          visual_proof_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'active',
+          confidence REAL NOT NULL DEFAULT 0,
+          first_seen_ms INTEGER NOT NULL,
+          last_seen_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_items_last_seen
+          ON work_items(last_seen_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS memory_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          session_id TEXT,
+          level TEXT NOT NULL,
+          event TEXT NOT NULL,
+          app_name TEXT,
+          work_key TEXT,
+          message TEXT NOT NULL,
+          detail_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_logs_ts
+          ON memory_logs(ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_logs_session
+          ON memory_logs(session_id, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS evidence_sufficiency (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at INTEGER NOT NULL,
+          session_id TEXT,
+          work_item_id INTEGER,
+          work_state_id INTEGER,
+          location_score REAL NOT NULL,
+          content_score REAL NOT NULL,
+          action_score REAL NOT NULL,
+          progress_score REAL NOT NULL,
+          unresolved_score REAL NOT NULL,
+          reopenability_score REAL NOT NULL,
+          visual_proof_score REAL NOT NULL,
+          privacy_risk_score REAL NOT NULL,
+          overall_score REAL NOT NULL,
+          missing_signals_json TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          decision_reason TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_sufficiency_work_state
+          ON evidence_sufficiency(work_state_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_sufficiency_work_item
+          ON evidence_sufficiency(work_item_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_evidence_sufficiency_created
+          ON evidence_sufficiency(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS visual_probes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at INTEGER NOT NULL,
+          session_id TEXT,
+          work_item_id INTEGER,
+          work_state_id INTEGER,
+          surface_key TEXT,
+          visual_delta_score REAL NOT NULL,
+          changed_tile_count INTEGER NOT NULL,
+          decision TEXT NOT NULL,
+          discarded INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_probes_surface
+          ON visual_probes(surface_key, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS event_transitions (
           id TEXT PRIMARY KEY,
@@ -17805,17 +19946,72 @@ fn ensure_default_exclusion_rules(conn: &Connection) -> Result<(), String> {
 }
 
 fn capture_paths(app: &AppHandle) -> Result<CapturePaths, String> {
-    let root_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(to_string)?
-        .join("capture");
+    let root_dir = project_captured_root()?;
+    migrate_legacy_capture_root(app, &root_dir)?;
     Ok(CapturePaths {
         snapshot_dir: root_dir.join("snapshots"),
         helper_dir: root_dir.join("helpers"),
         db_path: root_dir.join("smalltalk-capture.sqlite"),
         root_dir,
     })
+}
+
+fn migrate_legacy_capture_root(app: &AppHandle, new_root: &Path) -> Result<(), String> {
+    if new_root.exists() && directory_has_entries(new_root)? {
+        return Ok(());
+    }
+
+    let legacy_root = app
+        .path()
+        .app_data_dir()
+        .map_err(to_string)?
+        .join("capture");
+    if legacy_root == new_root || !legacy_root.exists() {
+        fs::create_dir_all(new_root).map_err(to_string)?;
+        return Ok(());
+    }
+
+    if let Some(parent) = new_root.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+
+    if !new_root.exists() {
+        match fs::rename(&legacy_root, new_root) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                copy_directory_contents(&legacy_root, new_root)?;
+                fs::remove_dir_all(&legacy_root).map_err(to_string)?;
+                return Ok(());
+            }
+        }
+    }
+
+    copy_directory_contents(&legacy_root, new_root)?;
+    fs::remove_dir_all(&legacy_root).map_err(to_string)?;
+    Ok(())
+}
+
+fn directory_has_entries(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(fs::read_dir(path).map_err(to_string)?.next().is_some())
+}
+
+fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(to_string)?;
+    for entry in fs::read_dir(from).map_err(to_string)? {
+        let entry = entry.map_err(to_string)?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source).map_err(to_string)?;
+        if metadata.is_dir() {
+            copy_directory_contents(&source, &target)?;
+        } else if metadata.is_file() {
+            fs::copy(&source, &target).map_err(to_string)?;
+        }
+    }
+    Ok(())
 }
 
 fn capture_screenshot(path: &Path) -> Result<(), String> {
@@ -17860,6 +20056,55 @@ fn capture_window_screenshot(window_id: i64, path: &Path) -> Result<(), String> 
             stderr
         })
     }
+}
+
+/// Process-lifetime cache of the last tiny probe thumbnail per work_key, so the
+/// probe can compute a change score without persisting any image.
+static LAST_PROBE_BYTES: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+
+/// Take a tiny low-resolution sample of the screen, compare it to the previous
+/// sample for this surface, and return `(visual_delta_score, changed_byte_count)`.
+/// The image is downscaled with the built-in macOS `sips` tool and deleted
+/// immediately — only the change score is kept.
+fn run_visual_probe(app: &AppHandle, work_key: &str) -> Result<(f64, i64), String> {
+    let paths = capture_paths(app)?;
+    fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
+    let probe_path = paths.root_dir.join(format!("probe-{}.jpg", now_millis()));
+    capture_screenshot(&probe_path)?;
+    // Downscale in place to a 32px thumbnail (no new crates; discarded after read).
+    let _ = Command::new("/usr/bin/sips")
+        .arg("-Z")
+        .arg("32")
+        .arg("-s")
+        .arg("format")
+        .arg("jpeg")
+        .arg(&probe_path)
+        .output();
+    let bytes = fs::read(&probe_path).map_err(to_string)?;
+    let _ = fs::remove_file(&probe_path);
+
+    let cache = LAST_PROBE_BYTES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| "probe cache poisoned".to_string())?;
+    let (delta, changed) = match guard.get(work_key) {
+        Some(previous) => {
+            let len = previous.len().max(bytes.len()).max(1);
+            let mut changed = 0i64;
+            for index in 0..len {
+                let a = previous.get(index).copied().unwrap_or(0);
+                let b = bytes.get(index).copied().unwrap_or(0);
+                if a != b {
+                    changed += 1;
+                }
+            }
+            (changed as f64 / len as f64, changed)
+        }
+        // First probe for this surface counts as a full change.
+        None => (1.0, bytes.len() as i64),
+    };
+    guard.insert(work_key.to_string(), bytes);
+    Ok((delta, changed))
 }
 
 fn jpeg_dimensions(bytes: &[u8]) -> Option<(i64, i64)> {
@@ -18736,6 +20981,193 @@ mod tests {
             Some("txt-a"),
             Some("txt-a")
         ));
+    }
+
+    fn test_work_draft(work_key: &str, work_type: &str) -> WorkStateDraft {
+        WorkStateDraft {
+            session_id: Some("session-test".to_string()),
+            ts_ms: 1_000,
+            source_event_ids: Vec::new(),
+            app_name: Some(
+                if work_type == "messaging" {
+                    "Slack"
+                } else {
+                    "Cursor"
+                }
+                .to_string(),
+            ),
+            bundle_id: None,
+            window_name: Some(work_key.to_string()),
+            browser_url: None,
+            document_path: Some(work_key.to_string()),
+            work_key: work_key.to_string(),
+            work_type: work_type.to_string(),
+            activity: "editing".to_string(),
+            privacy: "normal".to_string(),
+            confidence: 0.7,
+            focused_role: Some("AXTextArea".to_string()),
+            focused_label_hash: Some("label".to_string()),
+            focused_value_hash: Some("value".to_string()),
+            selected_text_hash: None,
+            visible_text_hash: Some("same-text".to_string()),
+            text_chars: 400,
+            text_is_thin: false,
+            raw_text_preview: None,
+        }
+    }
+
+    fn previous_state_for(draft: &WorkStateDraft) -> WorkStateSummary {
+        WorkStateSummary {
+            id: 1,
+            session_id: draft.session_id.clone(),
+            ts_ms: draft.ts_ms - 10,
+            app_name: draft.app_name.clone(),
+            window_name: draft.window_name.clone(),
+            browser_url: draft.browser_url.clone(),
+            document_path: draft.document_path.clone(),
+            work_key: draft.work_key.clone(),
+            work_type: draft.work_type.clone(),
+            activity: draft.activity.clone(),
+            privacy: draft.privacy.clone(),
+            confidence: draft.confidence,
+            screenshot_decision: "skipped screenshot".to_string(),
+            screenshot_reason: "saved state is enough".to_string(),
+            visual_proof_frame_id: None,
+            visible_text_hash: draft.visible_text_hash.clone(),
+        }
+    }
+
+    #[test]
+    fn typing_pause_same_work_skips_screenshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let draft = test_work_draft("cursor::product.md", "code_editor");
+        let previous = previous_state_for(&draft);
+        let delta = compute_work_state_delta(Some(&previous), &draft);
+        let privacy = PrivacyDecision {
+            skip_capture: false,
+            status: "normal".to_string(),
+            regions: Vec::new(),
+        };
+
+        let decision = decide_screenshot(&conn, "typing_pause", &draft, &delta, &privacy).unwrap();
+
+        assert!(!decision.save_screenshot);
+        assert_eq!(decision.decision, "skipped screenshot");
+    }
+
+    #[test]
+    fn manual_screenshot_always_saves_visual_proof() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let draft = test_work_draft("cursor::product.md", "code_editor");
+        let delta = WorkStateDelta::default();
+        let privacy = PrivacyDecision {
+            skip_capture: false,
+            status: "normal".to_string(),
+            regions: Vec::new(),
+        };
+
+        let decision = decide_screenshot(&conn, "manual", &draft, &delta, &privacy).unwrap();
+
+        assert!(decision.save_screenshot);
+        assert_eq!(decision.reason, "manual");
+    }
+
+    #[test]
+    fn private_surface_skips_screenshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let draft = test_work_draft("password-manager", "unknown");
+        let delta = WorkStateDelta {
+            meaningful: true,
+            score: 1.0,
+            ..WorkStateDelta::default()
+        };
+        let privacy = PrivacyDecision {
+            skip_capture: true,
+            status: "skipped_sensitive".to_string(),
+            regions: Vec::new(),
+        };
+
+        let decision = decide_screenshot(&conn, "app_switch", &draft, &delta, &privacy).unwrap();
+
+        assert!(!decision.save_screenshot);
+        assert_eq!(decision.reason, "private_surface_skipped");
+    }
+
+    #[test]
+    fn resume_card_works_without_screenshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let draft = test_work_draft("cursor::capture.rs", "code_editor");
+        let decision = ScreenshotDecision {
+            save_screenshot: false,
+            decision: "skipped screenshot".to_string(),
+            reason: "saved_state_is_enough".to_string(),
+            scope: "metadata_only".to_string(),
+        };
+        let ws_id = insert_work_state(&conn, &draft, &decision).unwrap();
+        update_work_item(&conn, ws_id, &draft, &decision).unwrap();
+        let work_item_id = work_item_id_for_key(&conn, &draft.work_key).unwrap();
+        let sufficiency = EvidenceSufficiency {
+            location_score: 1.0,
+            content_score: 0.8,
+            action_score: 0.9,
+            progress_score: 0.8,
+            unresolved_score: 0.7,
+            reopenability_score: 1.0,
+            visual_proof_score: 0.2,
+            privacy_risk_score: 0.0,
+            overall_score: 0.8,
+            missing_signals: vec!["no_visual_anchor".to_string()],
+        };
+        insert_evidence_sufficiency(
+            &conn,
+            draft.session_id.as_deref(),
+            work_item_id,
+            ws_id,
+            &sufficiency,
+            "metadata_only",
+            "saved_state_is_enough",
+        )
+        .unwrap();
+
+        let card = build_memory_resume_card(&conn).unwrap();
+
+        assert!(card.work_state_id.is_some());
+        assert_ne!(card.continue_label, "No return target yet");
+        let scores = card.evidence_scores.expect("evidence scores present");
+        assert!(scores.location >= 0.9);
+        assert!(scores.visual_proof < 0.5);
+        assert!(card
+            .missing
+            .iter()
+            .any(|entry| entry.contains("Visual proof is weak")));
+        assert!(card
+            .missing_signals
+            .contains(&"no_visual_anchor".to_string()));
+    }
+
+    #[test]
+    fn messaging_detour_does_not_replace_main_resume_item() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let cursor = test_work_draft("cursor::product.md", "code_editor");
+        let slack = test_work_draft("slack::launch-chat", "messaging");
+        let decision = ScreenshotDecision {
+            save_screenshot: false,
+            decision: "skipped screenshot".to_string(),
+            reason: "saved state is enough".to_string(),
+            scope: "metadata_only".to_string(),
+        };
+
+        update_work_item(&conn, 1, &cursor, &decision).unwrap();
+        update_work_item(&conn, 2, &slack, &decision).unwrap();
+
+        let card = build_memory_resume_card(&conn).unwrap();
+        assert!(card.headline.contains("Cursor"));
+        assert!(card.continue_label.contains("product.md"));
     }
 
     #[test]
@@ -21183,6 +23615,118 @@ mod tests {
 
         assert_eq!(compact.len(), 1);
         assert!(compact[0].text.contains("Build this next"));
+    }
+
+    #[test]
+    fn weak_ocr_text_is_not_promoted_to_resume_anchor() {
+        let gibberish = "Crece oanea exo ane reoulle ue doo croune unis tule";
+        let real_work_text =
+            "the reality is there is no source of truth, just evolving context of user work";
+        let unit = CompactContentUnit {
+            id: "ocr-weak".to_string(),
+            source: "ocr".to_string(),
+            unit_type: "text".to_string(),
+            semantic_role: Some("main_content".to_string()),
+            text: gibberish.to_string(),
+            bounds_x: Some(700.0),
+            bounds_y: Some(220.0),
+            bounds_w: Some(360.0),
+            bounds_h: Some(18.0),
+            confidence: Some(0.92),
+        };
+
+        assert!(looks_like_ocr_gibberish(gibberish));
+        assert!(!looks_like_ocr_gibberish(real_work_text));
+        assert!(low_information_anchor_text("Web Links [REDACTED_NUMBER]"));
+        assert!(line_anchor_confidence(&unit, 4) <= 0.46);
+    }
+
+    #[test]
+    fn resume_query_bundle_exports_work_timeline_as_primary_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-work-timeline-bundle-{}", now_millis()));
+        fs::create_dir_all(&output_root).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let image_path = output_root.join("frame.jpg");
+        fs::write(&image_path, b"test image placeholder").unwrap();
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            session.started_at,
+            "Codex",
+            "com.openai.codex",
+            "Codex",
+            "",
+            "ai_coding_workspace",
+            "The actual work is refactoring capture state so text and native signals lead.",
+            "phash-work-state",
+            None,
+        );
+        conn.execute(
+            "INSERT INTO work_states (
+                session_id, ts_ms, source_event_ids, app_name, bundle_id, window_name,
+                browser_url, document_path, work_key, work_type, activity, privacy,
+                confidence, focused_role, focused_label_hash, focused_value_hash,
+                selected_text_hash, visible_text_hash, text_chars, text_is_thin,
+                screenshot_decision, screenshot_reason, visual_proof_frame_id,
+                raw_text_preview, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'Codex', 'com.openai.codex', 'Codex',
+                       NULL, NULL, 'codex::ai_coding_workspace::capture',
+                       'ai_coding_workspace', 'editing', 'normal', 0.91,
+                       'AXTextArea', NULL, NULL, NULL, 'text-hash', 420, 0,
+                       'skipped screenshot', 'saved state is enough', ?4, ?5, ?2)",
+            params![
+                session.id,
+                session.started_at,
+                serde_json::json!(["evt-test"]).to_string(),
+                frame_id,
+                "The actual work is refactoring capture state so text and native signals lead."
+            ],
+        )
+        .unwrap();
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(frame_id),
+                lookback_minutes: None,
+                max_episode_cards: Some(4),
+                max_images: Some(4),
+                max_json_chars: Some(25_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert!(result
+            .payload
+            .evidence_policy
+            .visual_evidence_role
+            .contains("gap-fill"));
+        assert_eq!(result.payload.work_timeline.len(), 1);
+        assert_eq!(
+            result.payload.work_timeline[0].screenshot_decision,
+            "skipped screenshot"
+        );
+        assert!(result.payload.work_timeline[0]
+            .text_preview
+            .as_deref()
+            .unwrap_or("")
+            .contains("refactoring capture state"));
+        assert!(result
+            .payload
+            .visual_timeline
+            .iter()
+            .all(|anchor| anchor.evidence_role.contains("timeline")
+                || anchor.evidence_role.contains("gap")));
+
+        fs::remove_dir_all(output_root).unwrap();
     }
 
     #[test]
@@ -24195,6 +26739,7 @@ mod tests {
                 max_text_snippets_per_episode: 4,
                 max_output_tokens: 1200,
             },
+            evidence_policy: default_resume_query_evidence_policy(),
             session: ResumeQuerySession {
                 id: "session-test".to_string(),
                 started_at: 100,
@@ -24202,6 +26747,8 @@ mod tests {
                 duration_s: 12.0,
             },
             session_index,
+            work_timeline: Vec::new(),
+            visual_timeline: Vec::new(),
             candidate_episodes: Vec::new(),
             resume_candidate: ResumeQueryCandidate {
                 frame_id: "42".to_string(),

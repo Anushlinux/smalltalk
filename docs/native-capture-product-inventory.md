@@ -17,19 +17,19 @@ The product is not trying to record meetings, audio, microphone input, speaker i
 
 ## Local Storage Location
 
-The native app stores capture data under the Tauri app data directory:
+The native app stores capture data under the repo-local `captured/` directory:
 
 ```text
-<app_data_dir>/capture/
+captured/
   smalltalk-capture.sqlite
   snapshots/
   helpers/
 ```
 
-On macOS this is typically under:
+On this checkout that resolves to:
 
 ```text
-~/Library/Application Support/com.smalltalk.app/capture/
+/Users/bhaskarpandit/Documents/smalltalk/captured/
 ```
 
 The UI reads `data_dir` and `database_path` from `capture_status`, so the live app can show the exact runtime paths.

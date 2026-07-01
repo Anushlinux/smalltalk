@@ -28,14 +28,14 @@ Smalltalk does not capture audio, microphone input, meetings, speaker identity, 
 4. Each trigger waits a short settle delay before capture so the UI can finish changing.
 5. The user can force an immediate `manual` capture with `capture_once`.
 6. The capture worker uses `idle` capture as a fallback every 10 seconds when no useful event capture has happened recently.
-7. On stop, `stop_capture` stops the worker, marks the session stopped, and builds a compact resume-query bundle under `resume_query_exports/`.
+7. On stop, `stop_capture` stops the worker, marks the session stopped, and builds a compact resume-query bundle under `captured/resume_query_exports/`.
 
 ## Runtime Storage
 
-Live native capture data is stored in the Tauri app-data directory:
+Live native capture data is stored under the repo-local `captured/` directory:
 
 ```text
-~/Library/Application Support/com.smalltalk.app/capture/
+/Users/bhaskarpandit/Documents/smalltalk/captured/
   smalltalk-capture.sqlite
   snapshots/
   helpers/
@@ -47,7 +47,7 @@ The UI should trust `capture_status.data_dir` and `capture_status.database_path`
 Stop-time resume-query bundles are written separately under the repo:
 
 ```text
-/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/
+/Users/bhaskarpandit/Documents/smalltalk/captured/resume_query_exports/
   session-XXX-resume-query-<id>/
     resume-query-bundle.json
     images/
@@ -133,7 +133,7 @@ The screenshot provider is the macOS command-line tool:
 The full screenshot is saved under:
 
 ```text
-<app_data_dir>/capture/snapshots/day-<bucket>/<timestamp>_full.jpg
+captured/snapshots/day-<bucket>/<timestamp>_full.jpg
 ```
 
 When a window id is known, Smalltalk also attempts:
@@ -654,7 +654,7 @@ Frame detail includes verification signals such as screenshot presence, AX prese
 `build_safe_ai_export` creates a bounded, privacy-filtered local bundle under:
 
 ```text
-<app_data_dir>/capture/safe-ai-exports/<ai-export-id>/
+captured/safe-ai-exports/<ai-export-id>/
   safe-ai-export.json
   images/
 ```
@@ -684,7 +684,7 @@ Safe frames include:
 
 ## Resume-Query Bundle
 
-On stop, Smalltalk builds a `smalltalk.resume_query.v1` bundle under `resume_query_exports/`.
+On stop, Smalltalk builds a `smalltalk.resume_query.v1` bundle under `captured/resume_query_exports/`.
 
 The resume-query bundle is designed for a cloud model or local inspection. It is compact and bounded, not a full raw database dump.
 
@@ -715,7 +715,7 @@ The privacy contract explicitly says:
 - `raw_clipboard_sent: false`
 - `raw_keystrokes_sent: false`
 
-The bundle may include selected safe keyframe images in an `images/` folder, copied from the active-window crop when available or full screenshot otherwise. Model-facing images are capped at 12 selected keyframes; raw local screenshots and native capture volume stay in the app-data store.
+The bundle may include selected safe keyframe images in an `images/` folder, copied from the active-window crop when available or full screenshot otherwise. Model-facing images are capped at 12 selected keyframes; raw local screenshots and native capture volume stay in `captured/`.
 
 ## Resume Target Selection
 
@@ -772,7 +772,7 @@ If a permission is missing, the frame may still store partial evidence or diagno
 ## Current Implementation Boundaries
 
 - The active capture system is local-first and SQLite-backed.
-- Most raw capture stays in the app-data capture directory.
+- Most raw capture stays in `captured/`.
 - Model-facing paths go through safe export or resume-query bundle construction.
-- The current stop path builds `resume_query_exports/.../resume-query-bundle.json`; it does not currently produce the older exhaustive repo-root `output/session-XXX` artifact.
+- The current stop path builds `captured/resume_query_exports/.../resume-query-bundle.json`; it does not currently produce the older exhaustive `captured/output/session-XXX` artifact.
 - The native path is cross-app, but browser semantics are weaker than a browser extension because it relies on Accessibility, OCR, and browser URL metadata instead of DOM instrumentation.

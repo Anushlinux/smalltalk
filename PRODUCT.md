@@ -35,7 +35,7 @@ The native lane should be treated as the main product unless we explicitly reope
 - Native Rust capture backend in `src-tauri/src/capture.rs`.
 - Swift helpers for macOS Accessibility, OCR, window graph capture, and native event capture.
 - Local SQLite store with FTS search, sessions, frames, OCR, Accessibility nodes, UI events, transitions, content units, privacy metadata, and export audit data.
-- Stop-time cloud-ready resume query bundles under repo-root `resume_query_exports/`.
+- Stop-time cloud-ready resume query bundles under repo-root `captured/resume_query_exports/`.
 - Compact cloud bundles with selected safe keyframe images, episode cards, resume candidate metadata, quality flags, redactions, and missing-evidence notes.
 - Clean-slate delete path that stops capture, clears frames/sessions/events/search rows, removes snapshots, and resets the runtime UI state.
 - Safe AI export path for native evidence that redacts text/URLs/paths, masks sensitive images where possible, excludes `never_send_to_ai` frames, and writes an audit row.
@@ -50,15 +50,15 @@ The native lane should be treated as the main product unless we explicitly reope
 5. The user can click `Capture now` for an explicit manual frame.
 6. The UI continuously refreshes status, search results, recent timeline, frame details, and screenshot previews.
 7. The user clicks `Stop session`.
-8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `resume_query_exports/`, and returns the bundle summary.
+8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `captured/resume_query_exports/`, and returns the bundle summary.
 9. The user can inspect the compact bundle, ask OpenAI from the app, or use the native `Resume me` cue inside the app.
 
 ## Runtime Storage
 
-Native capture data is stored in the Tauri app data directory:
+Native capture data is stored under the repo-local `captured/` directory:
 
 ```text
-~/Library/Application Support/com.smalltalk.app/capture/
+/Users/bhaskarpandit/Documents/smalltalk/captured/
   smalltalk-capture.sqlite
   snapshots/
   helpers/
@@ -70,10 +70,10 @@ The UI gets the exact live paths from `capture_status`:
 - `data_dir`
 - `database_path`
 
-The stop-time cloud bundles are different from the live app-data store. They are written to the project resume-query root:
+The stop-time cloud bundles are written under the same captured root:
 
 ```text
-/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-041-resume-query-.../
+/Users/bhaskarpandit/Documents/smalltalk/captured/resume_query_exports/session-041-resume-query-.../
   resume-query-bundle.json
   images/
 ```
@@ -414,7 +414,7 @@ Results include:
 `Stop session` writes only the compact model-facing bundle:
 
 ```text
-resume_query_exports/session-041-resume-query-.../
+captured/resume_query_exports/session-041-resume-query-.../
   resume-query-bundle.json
   images/
     frame-000269-resume-candidate.jpg
@@ -426,9 +426,9 @@ Bundle details:
 - `resume-query-bundle.json` is the payload intended for cloud resume inference.
 - It includes session timing, a compact session index, candidate episodes, the chosen resume candidate, selected keyframes, transition labels, privacy metadata, quality flags, and missing-evidence notes.
 - Images are capped at 12 selected cloud-safe keyframes and copied only for those frames.
-- Raw table dumps, SQLite snapshots, full per-frame folders, PNG duplicates, and repo-root `output/session-*` folders are no longer produced by the Stop path.
+- Raw table dumps, SQLite snapshots, full per-frame folders, PNG duplicates, and `captured/output/session-*` folders are no longer produced by the Stop path.
 
-The old exhaustive `output/` folder is a legacy/debug artifact. Runtime Stop behavior should now preserve only the compact data that is ready for cloud use.
+The old exhaustive `captured/output/` folder is a legacy/debug artifact. Runtime Stop behavior should now preserve only the compact data that is ready for cloud use.
 
 ## Native Resume Card
 

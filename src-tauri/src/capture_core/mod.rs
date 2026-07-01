@@ -9,6 +9,7 @@
 pub mod browser_adapter;
 pub mod episode;
 pub mod event_governor;
+pub mod evidence_arbiter;
 pub mod extractors;
 pub mod privacy;
 pub mod quality;

@@ -120,7 +120,7 @@ A deduped capture deletes the just-created screenshot file and does not insert a
 
 ### Storage And Search
 
-Native capture data is stored under the app local data directory in a `capture` folder. The important paths are:
+Native capture data is stored under the repo-local `captured/` folder. The important paths are:
 
 - `snapshots/`: day-bucketed screenshot JPG files.
 - `smalltalk-capture.sqlite`: SQLite database.
