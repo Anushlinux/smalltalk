@@ -1,0 +1,224 @@
+{
+  "answer": {
+    "focus_now": "The current screen is Codex on the completed goal view, while the actionable work target is the Helium chat thread for the Smalltalk image-selection issue.",
+    "next_action": "Continue from: I verified the current tree against the requested plan and reran the gates:",
+    "what_was_i_doing": "You were reviewing a finished Codex result that says the current tree was verified against the requested plan and the gates were rerun.",
+    "why_this_focus": "The current focus is the factual screen you are on now, but it is a completed/summary surface. The resumeable workstream is the Helium chat thread candidate anchor from frame 1262, which is the valid actionable target supported by the evidence."
+  },
+  "cached": false,
+  "confidence": 0.65,
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1264-unit-1264-ocr-50",
+    "app": "Codex",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1264",
+    "line_anchor": {
+      "bounds": {
+        "h": 33.488372802734446,
+        "w": 950.2325439453124,
+        "x": 556.7442026459485,
+        "y": 372.5581390125863
+      },
+      "confidence": 0.72,
+      "frame_id": "1264",
+      "line_index": 17,
+      "next_line": "BeforeDevCommand (npm",
+      "previous_line": "O Automations",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "Current selected frame when the resume query was generated.",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1264-ocr-50"
+    },
+    "reason": "Factual current user activity from the selected current frame; active draft/goal summary on Codex is what is visible now.",
+    "title": "Codex"
+  },
+  "current_focus": {
+    "anchor_id": "1264-unit-1264-ocr-50",
+    "app": "Codex",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "exact_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1264",
+    "line_anchor": {
+      "bounds": {
+        "h": 33.488372802734446,
+        "w": 950.2325439453124,
+        "x": 556.7442026459485,
+        "y": 372.5581390125863
+      },
+      "confidence": 0.72,
+      "frame_id": "1264",
+      "line_index": 17,
+      "next_line": "BeforeDevCommand (npm",
+      "previous_line": "O Automations",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "Current selected frame when the resume query was generated.",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1264-ocr-50"
+    },
+    "reason": "This is the factual screen visible now; it is the Codex completion/result surface.",
+    "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+    "surface_state": "actionable_task_surface",
+    "title": "Codex"
+  },
+  "decision": "current_work_surface",
+  "evidence_handles": [
+    "ep-1262-1262",
+    "ep-1263-1264",
+    "frame-1262",
+    "frame-1264"
+  ],
+  "evidence_limits": [
+    "exact_words/exact_visible_words copied only from candidate_anchors[].text_exact",
+    "no raw URL/path/title used as exact words",
+    "current focus and resume target are separate by policy",
+    "Current screen is factual, but the work resume target is a separate locally selected actionable frame."
+  ],
+  "evidence_request": null,
+  "generated_at_ms": 1782477596013,
+  "model": "gpt-5.4-mini",
+  "query_bundle_path": "/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-069-resume-query-1782477549359-3100/resume-query-bundle.json",
+  "query_output_dir": "/Users/bhaskarpandit/Documents/smalltalk/resume_query_exports/session-069-resume-query-1782477549359-3100",
+  "rejected_input_target": null,
+  "request": {
+    "current_frame_id": 1264,
+    "session_id": "session-1782477359663-1"
+  },
+  "response_id": "resp_02183cf6f4a4353a016a3e730d8b9881a094fb0bfc36a67a7a",
+  "resume_target": {
+    "anchor_id": "1262-unit-1262-ocr-51",
+    "app": "Helium",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "exact_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1262",
+    "line_anchor": {
+      "bounds": {
+        "h": 29.395348548889277,
+        "w": 954.4185791015625,
+        "x": 820.4651449608461,
+        "y": 418.604651596664
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1262",
+      "line_index": 16,
+      "next_line": "Projects",
+      "previous_line": "Running",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "ordered main_content line 17 from ocr content units",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1262-ocr-51"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+    "surface_state": "actionable_task_surface",
+    "title": "smalltalk - Smalltalk Image Selection Issue - Helium"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1262-unit-1262-ocr-51",
+    "app": "Helium",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "exact_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1262",
+    "line_anchor": {
+      "bounds": {
+        "h": 29.395348548889277,
+        "w": 954.4185791015624,
+        "x": 820.4651449608461,
+        "y": 418.604651596664
+      },
+      "confidence": 0.72,
+      "frame_id": "1262",
+      "line_index": 16,
+      "next_line": "Projects",
+      "previous_line": "Running",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "ordered main_content line 17 from ocr content units",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1262-ocr-51"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+    "surface_state": "actionable_task_surface",
+    "title": "smalltalk - Smalltalk Image Selection Issue - Helium"
+  },
+  "resume_work_target": {
+    "anchor_id": "1262-unit-1262-ocr-51",
+    "app": "Helium",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "exact_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1262",
+    "line_anchor": {
+      "bounds": {
+        "h": 29.395348548889277,
+        "w": 954.4185791015625,
+        "x": 820.4651449608461,
+        "y": 418.604651596664
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1262",
+      "line_index": 16,
+      "next_line": "Projects",
+      "previous_line": "Running",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "ordered main_content line 17 from ocr content units",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1262-ocr-51"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+    "surface_state": "actionable_task_surface",
+    "title": "smalltalk - Smalltalk Image Selection Issue - Helium"
+  },
+  "return_target": {
+    "anchor_id": "1262-unit-1262-ocr-51",
+    "app": "Helium",
+    "exact_visible_words": "I verified the current tree against the requested plan and reran the gates:",
+    "exact_words": "I verified the current tree against the requested plan and reran the gates:",
+    "frame_id": "1262",
+    "line_anchor": {
+      "bounds": {
+        "h": 29.395348548889277,
+        "w": 954.4185791015624,
+        "x": 820.4651449608461,
+        "y": 418.604651596664
+      },
+      "confidence": 0.72,
+      "frame_id": "1262",
+      "line_index": 16,
+      "next_line": "Projects",
+      "previous_line": "Running",
+      "quote": "I verified the current tree against the requested plan and reran the gates:",
+      "reason": "ordered main_content line 17 from ocr content units",
+      "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1262-ocr-51"
+    },
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "section_anchor": "I verified the current tree against the requested plan and reran the gates:",
+    "surface_state": "actionable_task_surface",
+    "title": "smalltalk - Smalltalk Image Selection Issue - Helium"
+  },
+  "schema": "smalltalk.cloud_resume_result_file.v1",
+  "session_theme": {
+    "confidence": 0.55,
+    "evidence_frames": [
+      "1264",
+      "1262",
+      "1263"
+    ],
+    "summary": "I verified the current tree against the requested plan and reran the gates:"
+  },
+  "source": "cloud",
+  "warnings": []
+}

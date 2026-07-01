@@ -124,10 +124,10 @@ Manual and session-start captures bypass dedupe. Event and idle captures use ded
 
 ## Screenshot Capture
 
-The screenshot provider is the macOS command-line tool:
+The preferred screenshot provider is ScreenCaptureKit one-shot capture:
 
 ```text
-/usr/sbin/screencapture -x -t jpg <snapshot_path>
+ScreenCaptureKit SCScreenshotManager display capture
 ```
 
 The full screenshot is saved under:
@@ -139,7 +139,7 @@ The full screenshot is saved under:
 When a window id is known, Smalltalk also attempts:
 
 ```text
-/usr/sbin/screencapture -x -t jpg -l <window_id> <crop_path>
+ScreenCaptureKit SCScreenshotManager active-window capture
 ```
 
 That active-window crop is saved as:
@@ -150,7 +150,7 @@ That active-window crop is saved as:
 
 The frame records screenshot paths, image hash, perceptual-hash placeholder value, dimensions, scope, provider, display id, window id, app pid, and bundle id.
 
-Current `capture_provider` is `screencapture_cli`.
+Current `capture_provider` is `screen_capture_kit` when the one-shot SCK helper succeeds. The legacy `/usr/sbin/screencapture` path remains a fallback and records `screencapture_cli`.
 
 Current `scope` is:
 
@@ -337,6 +337,14 @@ Stores the core frame:
 - `pixel_width`
 - `pixel_height`
 - `privacy_status`
+- `sck_display_id`
+- `sck_window_id`
+- `sck_owning_bundle_id`
+- `sck_filter_summary_json`
+- `sck_configuration_summary_json`
+- `sck_frame_metadata_json`
+- `sck_capture_mode`
+- `sck_audio_policy`
 
 ### `frames_fts`
 

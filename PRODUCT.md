@@ -1,10 +1,10 @@
 # Smalltalk Product And Technical Snapshot
 
-Last updated: 2026-06-25
+Last updated: 2026-07-02
 
 Smalltalk is currently a desktop-first, local screen-memory app built with Tauri, Rust, React, and SQLite. The older Chrome extension still exists in `browser-extension/`, but the active product direction is the native app in the repo root.
 
-The product goal is simple: when a user stops working, detours, or comes back later, Smalltalk should have enough local evidence to explain what they were doing, what changed, what text or UI mattered, and where they should resume. It should be inspectable before it is intelligent. Every resume cue should point back to frames, events, text sources, app/window context, and exportable evidence.
+The product goal is simple: when a user stops working, detours, or comes back later, Smalltalk should have enough local evidence to explain what they were doing, what changed, what text or UI mattered, and where they should resume. It should be inspectable before it is intelligent. Every resume cue should point back to frames, events, text sources, app/window context, and exportable evidence. The current product distinction is important: `current_focus` is the factual current screen, `current_activity` is what the user appears to be doing now, and `resume_work_target` or `return_target` is where the actionable workstream should resume.
 
 ## Current Product Shape
 
@@ -32,6 +32,8 @@ The native lane should be treated as the main product unless we explicitly reope
   - frame verification panel
   - native `Resume me` card
   - cloud-ready stop bundle summary and `Open bundle JSON`
+  - `Ask OpenAI` cloud resume call with provenance tracking
+  - `Open return target` flow for resolved resume points
 - Native Rust capture backend in `src-tauri/src/capture.rs`.
 - Swift helpers for macOS Accessibility, OCR, window graph capture, and native event capture.
 - Local SQLite store with FTS search, sessions, frames, OCR, Accessibility nodes, UI events, transitions, content units, privacy metadata, and export audit data.
@@ -39,7 +41,8 @@ The native lane should be treated as the main product unless we explicitly reope
 - Compact cloud bundles with selected safe keyframe images, episode cards, resume candidate metadata, quality flags, redactions, and missing-evidence notes.
 - Clean-slate delete path that stops capture, clears frames/sessions/events/search rows, removes snapshots, and resets the runtime UI state.
 - Safe AI export path for native evidence that redacts text/URLs/paths, masks sensitive images where possible, excludes `never_send_to_ai` frames, and writes an audit row.
-- Native storyboard/resume-card builder based on local evidence, not a remote model call in the native path.
+- Native storyboard/resume-card builder based on local evidence.
+- Optional cloud resume reasoner that reads a bounded resume-query bundle, preserves `response_id` when a real cloud call succeeds, and records whether the result came from `cloud` or `local_fallback`.
 
 ## Main User Flow
 
@@ -51,7 +54,7 @@ The native lane should be treated as the main product unless we explicitly reope
 6. The UI continuously refreshes status, search results, recent timeline, frame details, and screenshot previews.
 7. The user clicks `Stop session`.
 8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `resume_query_exports/`, and returns the bundle summary.
-9. The user can inspect the compact bundle, ask OpenAI from the app, or use the native `Resume me` cue inside the app.
+9. The user can inspect the compact bundle, ask OpenAI from the app, open the resolved return target, or use the native `Resume me` cue inside the app.
 
 ## Runtime Storage
 
@@ -409,7 +412,7 @@ Results include:
 - snippet from SQLite FTS
 - BM25 rank
 
-## Cloud-Ready Stop Bundle
+## Resume-Query Bundle
 
 `Stop session` writes only the compact model-facing bundle:
 
@@ -423,12 +426,46 @@ resume_query_exports/session-041-resume-query-.../
 
 Bundle details:
 
-- `resume-query-bundle.json` is the payload intended for cloud resume inference.
-- It includes session timing, a compact session index, candidate episodes, the chosen resume candidate, selected keyframes, transition labels, privacy metadata, quality flags, and missing-evidence notes.
+- `resume-query-bundle.json` is the payload intended for cloud resume inference or local inspection.
+- The current schema is `smalltalk.resume_query.v2`.
+- It includes session timing, a compact session index, current activity, current focus, resume work target, return target, candidate anchors, candidate episodes, the chosen resume candidate, selected keyframes, transition labels, privacy metadata, quality flags, and missing-evidence notes.
 - Images are capped at 12 selected cloud-safe keyframes and copied only for those frames.
 - Raw table dumps, SQLite snapshots, full per-frame folders, PNG duplicates, and repo-root `output/session-*` folders are no longer produced by the Stop path.
 
 The old exhaustive `output/` folder is a legacy/debug artifact. Runtime Stop behavior should now preserve only the compact data that is ready for cloud use.
+
+## Ask OpenAI And Open Return Target
+
+The native UI can ask OpenAI after a resume-query bundle exists. The Tauri command is:
+
+```text
+run_cloud_resume
+```
+
+This command builds or reuses a bounded resume-query bundle, sends the compact evidence to the OpenAI Responses API when credentials are available, parses strict JSON, enforces local anchor contracts, persists a result file, and returns a `smalltalk.cloud_resume_result.v1` object to the UI.
+
+Cloud resume results explicitly track provenance:
+
+- `source: "cloud"` means a real model response was parsed and persisted.
+- `source: "local_fallback"` means the app produced a conservative local fallback instead of a real cloud result.
+- Cached cloud results are only reused when they match the current request and include cloud provenance rather than an older fallback.
+- Real cloud responses preserve request metadata such as `response_id` when available.
+
+The cloud reasoner must keep these concepts separate:
+
+- `current_focus`: the factual current screen.
+- `current_activity`: what the user appears to be doing now.
+- `resume_work_target`: the actionable workstream target.
+- `return_target`: the target to open when returning to previous work.
+- `resume_target`: compatibility alias for `resume_work_target`.
+
+Opening a resume point is handled by:
+
+```text
+open_resume_point
+```
+
+It resolves the best target from the cloud result, local native card, explicit frame id, or local resume-query candidate, then opens the underlying URL, document path, or local frame evidence when possible. It also carries warnings when it has to fall back from a cloud target to local evidence.
 
 ## Native Resume Card
 
@@ -442,7 +479,7 @@ get_native_resume_card({
 })
 ```
 
-The native path does not call OpenAI right now. It builds a safe local export, selects keyframes, classifies transitions, and returns a conservative `NativeResumeCard`.
+The native resume card path does not require OpenAI. It builds a safe local export, selects keyframes, classifies transitions, and returns a conservative `NativeResumeCard`.
 
 The card includes:
 
@@ -573,7 +610,7 @@ The native app does not currently capture:
 - full clipboard text as a clipboard event
 - browser DOM from the native path
 - cloud embeddings
-- remote AI summaries in the native capture path
+- unbounded remote AI summaries over the raw native capture store
 
 ## Runtime Commands
 
@@ -588,6 +625,10 @@ The Tauri command surface exposed in `src-tauri/src/lib.rs` currently includes:
 - `get_frame`
 - `get_frame_image`
 - `get_frame_image_variant`
+- `build_resume_query_bundle`
+- `run_cloud_resume`
+- `get_cloud_resume_status`
+- `open_resume_point`
 - `start_native_capture`
 - `stop_native_capture`
 - `capture_once_v2`

@@ -1,0 +1,1073 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "5-unit-5-ocr-98",
+      "bbox": {
+        "h": 19.09302234649664,
+        "w": 193.48837280273443,
+        "x": 755.3488336296407,
+        "y": 107.90697726290959
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 4 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• focused window changed",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "5-unit-5-ocr-99",
+      "bbox": {
+        "h": 18.604650497436452,
+        "w": 215.8139495849609,
+        "x": 755.348842757907,
+        "y": 137.67441875128173
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 10 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• focused Ul element changed",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "5-unit-5-ocr-100",
+      "bbox": {
+        "h": 19.046511650085414,
+        "w": 122.79069519042977,
+        "x": 755.3488364047853,
+        "y": 166.9999998311909
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 16 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• value changed",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "5-unit-5-ocr-144",
+      "bbox": {
+        "h": 18.604650497436452,
+        "w": 81.86046600341797,
+        "x": 1629.7674427812367,
+        "y": 189.76744200709567
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• Local v",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "5-unit-5-ocr-101",
+      "bbox": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "•selected text changed",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Codex",
+      "confidence": 0.92,
+      "duration_s": 11.7,
+      "episode_id": "ep-5-5",
+      "events": {
+        "app_switches": 1,
+        "clicks": 9,
+        "scrolls": 333,
+        "selections": 0,
+        "typing_bursts": 1
+      },
+      "frame_range": [
+        "5",
+        "5"
+      ],
+      "important_text": [
+        "•selected text changed",
+        "Following work",
+        "1s never used",
+        "O New chat",
+        "• focused window changed",
+        "src/capture.rs:15039:4",
+        "10 11",
+        "6 7"
+      ],
+      "keyframes": [
+        "5"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.12,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.92,
+    "final_score": 0.4833641043239533,
+    "frame_id": "5",
+    "line_anchor_quality": 0.11600000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.0013641043239533289,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.0,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.0
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "5-unit-5-ocr-101",
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_visible_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "current_focus": {
+    "anchor_id": "5-unit-5-ocr-101",
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_visible_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "diagnostic_rejected_anchors": [
+    {
+      "bbox": {
+        "h": 14.883720397949194,
+        "w": 48.3720932006836,
+        "x": 52.0930239733016,
+        "y": 7.441860607226989
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Codex"
+    },
+    {
+      "bbox": {
+        "h": 14.883720397949194,
+        "w": 37.20930099487305,
+        "x": 197.2093036110906,
+        "y": 7.441860607226989
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "View"
+    },
+    {
+      "bbox": {
+        "h": 7.441859722137387,
+        "w": 29.767438888549798,
+        "x": 107.90697971851564,
+        "y": 11.162791069163838
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Hile"
+    },
+    {
+      "bbox": {
+        "h": 7.441859722137387,
+        "w": 55.813949584960945,
+        "x": 245.5814000912402,
+        "y": 11.162791069163838
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Window"
+    },
+    {
+      "bbox": {
+        "h": 11.162789344787676,
+        "w": 37.20929718017576,
+        "x": 312.55814396805147,
+        "y": 11.162791188071282
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Help"
+    },
+    {
+      "bbox": {
+        "h": 7.441860198974677,
+        "w": 22.325580596923835,
+        "x": 200.93023277130553,
+        "y": 66.97674425710179
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "JULY"
+    },
+    {
+      "bbox": {
+        "h": 7.441860198974677,
+        "w": 55.81395339965822,
+        "x": 33.48837231013766,
+        "y": 66.97674434569541
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "THURSDAY"
+    },
+    {
+      "bbox": {
+        "h": 11.30232477188125,
+        "w": 93.02324676513678,
+        "x": 1789.7674417337112,
+        "y": 70.69767528109449
+      },
+      "frame_id": "5",
+      "reject_reason": "low_semantic_signal",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "* Open in v"
+    },
+    {
+      "bbox": {
+        "h": 7.999999999999972,
+        "w": 111.62790679931646,
+        "x": 1968.3720929259234,
+        "y": 73.99999992106144
+      },
+      "frame_id": "5",
+      "reject_reason": "surface_zone_environment_panel",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "nom run taun dev"
+    },
+    {
+      "bbox": {
+        "h": 29.767440795898388,
+        "w": 26.04651069641114,
+        "x": 29.76744214016653,
+        "y": 81.86046543593787
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "2"
+    },
+    {
+      "bbox": {
+        "h": 7.999999999999972,
+        "w": 89.3023223876952,
+        "x": 1205.5813967596407,
+        "y": 104.00000002885304
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "Following work"
+    },
+    {
+      "bbox": {
+        "h": 7.999999999999972,
+        "w": 96.74417877197243,
+        "x": 1953.488370893084,
+        "y": 104.00000004435695
+      },
+      "frame_id": "5",
+      "reject_reason": "surface_zone_environment_panel",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "1s never used"
+    },
+    {
+      "bbox": {
+        "h": 11.162790298461935,
+        "w": 85.58139038085933,
+        "x": 413.02326043747723,
+        "y": 107.90697685076904
+      },
+      "frame_id": "5",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "O New chat"
+    },
+    {
+      "bbox": {
+        "h": 14.883721351623613,
+        "w": 167.44186401367188,
+        "x": 2009.3023236252993,
+        "y": 115.34883698169351
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "src/capture.rs:15039:4"
+    },
+    {
+      "bbox": {
+        "h": 7.441859722137387,
+        "w": 37.20929718017576,
+        "x": 305.1162835029351,
+        "y": 122.79069804590806
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "10 11"
+    },
+    {
+      "bbox": {
+        "h": 11.209301948547417,
+        "w": 37.209297180175795,
+        "x": 215.81395792153984,
+        "y": 122.79069816481551
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "6 7"
+    },
+    {
+      "bbox": {
+        "h": 18.60465049743661,
+        "w": 89.3023223876952,
+        "x": 1629.7674449456872,
+        "y": 130.23255828616539
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "Environment"
+    },
+    {
+      "bbox": {
+        "h": 19.046511650085414,
+        "w": 70.69766998291016,
+        "x": 413.02325891552164,
+        "y": 133.95348856523526
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "search_result",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "Q Search"
+    },
+    {
+      "bbox": {
+        "h": 12.000000000000117,
+        "w": 122.79068756103513,
+        "x": 197.20931352180742,
+        "y": 140.99999982504266
+      },
+      "frame_id": "5",
+      "reject_reason": "low_semantic_signal",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "12 13 14 15 16 17"
+    },
+    {
+      "bbox": {
+        "h": 19.000000000000092,
+        "w": 93.02325439453125,
+        "x": 29.767441019788684,
+        "y": 144.99999998644026
+      },
+      "frame_id": "5",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "No Events Today"
+    },
+    {
+      "bbox": {
+        "h": 11.162789821624646,
+        "w": 145.11627197265625,
+        "x": 197.2093131299502,
+        "y": 160.0000000135598
+      },
+      "frame_id": "5",
+      "reject_reason": "low_semantic_signal",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "19 20 21 22 23 24 25"
+    },
+    {
+      "bbox": {
+        "h": 19.000000000000092,
+        "w": 85.58139038085926,
+        "x": 1633.4883756467798,
+        "y": 160.0000001931422
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "E Changes"
+    },
+    {
+      "bbox": {
+        "h": 19.046511650085414,
+        "w": 96.74418640136722,
+        "x": 413.02325442722343,
+        "y": 166.99999978467932
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "• Scheduled"
+    },
+    {
+      "bbox": {
+        "h": 7.441859722137547,
+        "w": 93.02324676513678,
+        "x": 1804.6511626639438,
+        "y": 167.44186083660566
+      },
+      "frame_id": "5",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "14.240-0.04/"
+    }
+  ],
+  "evidence_policy": {
+    "model_contract": [
+      "Do not treat screenshots as the source of truth when text/native state is available",
+      "Use visual evidence to resolve missing text, identity conflicts, and timeline order",
+      "Treat OCR-only anchors as lower confidence unless they have strong lexical signal",
+      "Keep current_focus, current_activity, and resume_work_target separate"
+    ],
+    "primary_sources": [
+      "work_timeline from accessibility/native app state",
+      "candidate_anchors from selected_text/accessibility text before OCR",
+      "ui_events, typing bursts, clipboard, and transition metadata"
+    ],
+    "schema": "smalltalk.resume_query.evidence_policy.v1",
+    "source_of_truth": "none; infer from evolving work state and timestamped evidence",
+    "visual_evidence_role": "screenshots/keyframes are visual timeline and gap-fill evidence only"
+  },
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "5",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-000005-resume-candidate.jpg",
+      "line_anchor": {
+        "bounds": {
+          "h": 18.999999999999932,
+          "w": 174.88371276855474,
+          "x": 755.3488442048699,
+          "y": 196.9999995699903
+        },
+        "confidence": 0.66,
+        "frame_id": "5",
+        "line_index": 20,
+        "next_line": "@Plugins",
+        "previous_line": "smalltalk (lib) generated 3 warnin",
+        "quote": "•selected text changed",
+        "reason": "ordered main_content line 21 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-5-ocr-101"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 0.2,
+      "title": "Codex",
+      "visible_text": "Following work 1s never used O New chat • focused window changed src/capture.rs:15039:4 10 11 6 7 Environment Q Search • focused Ul element changed 12 13 14 15 16 17 No Events Today 19 20 21 22 23 24 25 E Changes • Scheduled • value changed 14.240-0.04/ 26 27 28 29 30 31 • Local v smalltalk (lib) generated 3 warnin •selected text changed @Plugins warnLng. smalitalk",
+      "visual_text_snippets": [
+        "Following work",
+        "1s never used",
+        "O New chat",
+        "• focused window changed",
+        "src/capture.rs:15039:4",
+        "10 11",
+        "6 7",
+        "Environment"
+      ]
+    }
+  ],
+  "missing_evidence": [],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle"
+    ]
+  },
+  "quality_flags": [
+    "surface_state_current_work_surface"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": "smalltalk (lib) generated 3 warnin",
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "Following work 1s never used O New chat • focused window changed src/capture.rs:15039:4 10 11 6 7 Environment Q Search • focused Ul element changed 12 13 14 15 16 17 No Events Today 19 20 21 22 23 24 25 E Changes • Scheduled • value change...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "5-unit-5-ocr-101",
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_visible_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "5-unit-5-ocr-101",
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_visible_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "5-unit-5-ocr-101",
+    "app": "Codex",
+    "confidence": 0.92,
+    "exact_visible_words": "•selected text changed",
+    "frame_id": "5",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 18.999999999999932,
+        "w": 174.88371276855474,
+        "x": 755.3488442048699,
+        "y": 196.9999995699903
+      },
+      "confidence": 0.66,
+      "frame_id": "5",
+      "line_index": 20,
+      "next_line": "@Plugins",
+      "previous_line": "smalltalk (lib) generated 3 warnin",
+      "quote": "•selected text changed",
+      "reason": "ordered main_content line 21 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-5-ocr-101"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 11.7,
+    "id": "session-1782938655533-1",
+    "started_at": 1782938655533,
+    "stopped_at": 1782938667189
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [],
+    "candidate_resume_frames": [
+      "5"
+    ],
+    "current_frame_id": "5",
+    "duration_s": 11.7,
+    "episode_count": 1,
+    "episodes": [
+      {
+        "app": "Codex",
+        "confidence": 0.92,
+        "duration_s": 11.7,
+        "episode_id": "ep-5-5",
+        "events": {
+          "app_switches": 1,
+          "clicks": 9,
+          "scrolls": 333,
+          "selections": 0,
+          "typing_bursts": 1
+        },
+        "frame_range": [
+          "5",
+          "5"
+        ],
+        "important_text": [
+          "•selected text changed",
+          "Following work"
+        ],
+        "keyframes": [
+          "5"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1782938655533-1",
+    "surface_sequence": [
+      "Codex/Codex"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.92,
+    "evidence_frames": [
+      "5"
+    ],
+    "summary": "•selected text changed"
+  },
+  "timeline": [
+    {
+      "app": "Codex",
+      "frame_id": "5",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "line_anchor": {
+        "bounds": {
+          "h": 18.999999999999932,
+          "w": 174.88371276855474,
+          "x": 755.3488442048699,
+          "y": 196.9999995699903
+        },
+        "confidence": 0.66,
+        "frame_id": "5",
+        "line_index": 20,
+        "next_line": "@Plugins",
+        "previous_line": "smalltalk (lib) generated 3 warnin",
+        "quote": "•selected text changed",
+        "reason": "ordered main_content line 21 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-5-ocr-101"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "reason": "Omitted from keyframe images but summarized as compact trace evidence",
+      "role": "timeline",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex",
+      "visible_anchor": "Following work 1s never used O New chat • focused window changed src/capture.rs:15039:4 10 11 6 7 Environment Q Search • focused Ul element changed 12 13 14 15 16 17 No Events Tod..."
+    }
+  ],
+  "transitions": [],
+  "visual_timeline": [
+    {
+      "evidence_role": "gap_fill_visual_context",
+      "frame_id": "5",
+      "image_ref": "images/frame-000005-resume-candidate.jpg",
+      "linked_work_state_id": "88",
+      "reason": "resume_candidate keyframe; use only to fill text/state gaps or confirm timeline ordering",
+      "role": "resume_candidate",
+      "source": "exported_screenshot",
+      "t_rel_s": 0.2
+    }
+  ],
+  "work_timeline": [
+    {
+      "activity": "starting",
+      "app": "Codex",
+      "confidence": 0.82,
+      "privacy": "normal",
+      "screenshot_decision": "saved screenshot",
+      "screenshot_reason": "thread_start",
+      "source_event_count": 0,
+      "state_id": "88",
+      "surface_type": "ai_coding_workspace",
+      "t_rel_s": 0.1,
+      "text_chars": 5,
+      "text_is_thin": true,
+      "text_preview": "Codex",
+      "title": "Codex",
+      "visual_frame_id": "5",
+      "work_ref": "work-ref-f5a44951b0c3753a"
+    },
+    {
+      "activity": "navigating",
+      "app": "Helium",
+      "confidence": 0.88,
+      "privacy": "normal",
+      "screenshot_decision": "skipped screenshot",
+      "screenshot_reason": "visual_budget_exhausted",
+      "source_event_count": 31,
+      "state_id": "89",
+      "surface_type": "chat_conversation",
+      "t_rel_s": 5.5,
+      "text_chars": 951,
+      "text_is_thin": true,
+      "text_preview": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER] Back Forward Reload Open tab in split view View site information https://ch...",
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "work_ref": "work-ref-4279431b113eacda"
+    },
+    {
+      "activity": "navigating",
+      "app": "Helium",
+      "confidence": 0.88,
+      "privacy": "normal",
+      "screenshot_decision": "skipped screenshot",
+      "screenshot_reason": "progress_unclear",
+      "source_event_count": 181,
+      "state_id": "90",
+      "surface_type": "chat_conversation",
+      "t_rel_s": 8.3,
+      "text_chars": 951,
+      "text_is_thin": true,
+      "text_preview": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER] Back Forward Reload Open tab in split view View site information https://ch...",
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "work_ref": "work-ref-4279431b113eacda"
+    },
+    {
+      "activity": "idle",
+      "app": "Helium",
+      "confidence": 0.88,
+      "privacy": "normal",
+      "screenshot_decision": "skipped screenshot",
+      "screenshot_reason": "progress_unclear",
+      "source_event_count": 0,
+      "state_id": "91",
+      "surface_type": "chat_conversation",
+      "t_rel_s": 10.1,
+      "text_chars": 951,
+      "text_is_thin": true,
+      "text_preview": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER] Back Forward Reload Open tab in split view View site information https://ch...",
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "work_ref": "work-ref-4279431b113eacda"
+    },
+    {
+      "activity": "navigating",
+      "app": "Helium",
+      "confidence": 0.88,
+      "privacy": "normal",
+      "screenshot_decision": "skipped screenshot",
+      "screenshot_reason": "progress_unclear",
+      "source_event_count": 161,
+      "state_id": "92",
+      "surface_type": "chat_conversation",
+      "t_rel_s": 10.9,
+      "text_chars": 951,
+      "text_is_thin": true,
+      "text_preview": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER] Back Forward Reload Open tab in split view View site information https://ch...",
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "work_ref": "work-ref-4279431b113eacda"
+    }
+  ]
+}

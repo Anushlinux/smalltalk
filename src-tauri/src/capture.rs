@@ -170,6 +170,7 @@ const VISION_OCR_SWIFT: &str = include_str!("../scripts/vision_ocr.swift");
 const ACCESSIBILITY_SNAPSHOT_SWIFT: &str = include_str!("../scripts/accessibility_snapshot.swift");
 const CAPTURE_EVENTS_SWIFT: &str = include_str!("../scripts/capture_events.swift");
 const WINDOW_SNAPSHOT_SWIFT: &str = include_str!("../scripts/window_snapshot.swift");
+const SCK_SCREENSHOT_SWIFT: &str = include_str!("../scripts/sck_screenshot.swift");
 const IMAGE_MASK_SWIFT: &str = r#"
 import AppKit
 import Foundation
@@ -403,6 +404,14 @@ pub struct CaptureFrame {
     pub capture_trigger_id: Option<String>,
     pub previous_frame_id: Option<String>,
     pub session_id: Option<String>,
+    pub sck_display_id: Option<String>,
+    pub sck_window_id: Option<i64>,
+    pub sck_owning_bundle_id: Option<String>,
+    pub sck_filter_summary_json: Option<String>,
+    pub sck_configuration_summary_json: Option<String>,
+    pub sck_frame_metadata_json: Option<String>,
+    pub sck_capture_mode: Option<String>,
+    pub sck_audio_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -418,7 +427,10 @@ const FRAME_COLUMNS: &str = "id, captured_at, snapshot_path, app_name, window_na
     capture_provider, scope, display_id, window_id, app_pid, app_bundle_id,
     screen_scale, pixel_width, pixel_height, full_screenshot_path,
     active_window_crop_path, active_element_crop_path, phash, privacy_status,
-    capture_trigger_id, previous_frame_id, session_id";
+    capture_trigger_id, previous_frame_id, session_id, sck_display_id,
+    sck_window_id, sck_owning_bundle_id, sck_filter_summary_json,
+    sck_configuration_summary_json, sck_frame_metadata_json, sck_capture_mode,
+    sck_audio_policy";
 
 const FRAME_COLUMNS_F: &str = "f.id, f.captured_at, f.snapshot_path, f.app_name, f.window_name,
     f.browser_url, f.document_path, f.focused, f.capture_trigger, f.text_source,
@@ -426,7 +438,10 @@ const FRAME_COLUMNS_F: &str = "f.id, f.captured_at, f.snapshot_path, f.app_name,
     f.capture_provider, f.scope, f.display_id, f.window_id, f.app_pid, f.app_bundle_id,
     f.screen_scale, f.pixel_width, f.pixel_height, f.full_screenshot_path,
     f.active_window_crop_path, f.active_element_crop_path, f.phash, f.privacy_status,
-    f.capture_trigger_id, f.previous_frame_id, f.session_id";
+    f.capture_trigger_id, f.previous_frame_id, f.session_id, f.sck_display_id,
+    f.sck_window_id, f.sck_owning_bundle_id, f.sck_filter_summary_json,
+    f.sck_configuration_summary_json, f.sck_frame_metadata_json, f.sck_capture_mode,
+    f.sck_audio_policy";
 
 const INSERT_FRAME_SQL: &str = "INSERT INTO frames (
     captured_at, snapshot_path, app_name, window_name, browser_url,
@@ -436,10 +451,12 @@ const INSERT_FRAME_SQL: &str = "INSERT INTO frames (
     display_id, window_id, app_pid, app_bundle_id, screen_scale,
     pixel_width, pixel_height, full_screenshot_path, active_window_crop_path,
     active_element_crop_path, phash, privacy_status, capture_trigger_id,
-    previous_frame_id, session_id
+    previous_frame_id, session_id, sck_display_id, sck_window_id,
+    sck_owning_bundle_id, sck_filter_summary_json, sck_configuration_summary_json,
+    sck_frame_metadata_json, sck_capture_mode, sck_audio_policy
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
           ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-          ?29, ?30, ?31, ?32)";
+          ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Rect {
@@ -552,6 +569,46 @@ struct FrameMetadata {
     active_element_crop_path: Option<String>,
     phash: Option<String>,
     privacy_status: String,
+    sck_display_id: Option<String>,
+    sck_window_id: Option<i64>,
+    sck_owning_bundle_id: Option<String>,
+    sck_filter_summary_json: Option<String>,
+    sck_configuration_summary_json: Option<String>,
+    sck_frame_metadata_json: Option<String>,
+    sck_capture_mode: Option<String>,
+    sck_audio_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScreenshotCapture {
+    provider: String,
+    display_id: Option<String>,
+    window_id: Option<i64>,
+    bundle_id: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    filter_summary_json: Option<String>,
+    configuration_summary_json: Option<String>,
+    frame_metadata_json: Option<String>,
+    capture_mode: Option<String>,
+    audio_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SckScreenshotResponse {
+    ok: bool,
+    provider: String,
+    captured_display_id: Option<String>,
+    captured_window_id: Option<i64>,
+    captured_bundle_id: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    filter_summary_json: Option<String>,
+    configuration_summary_json: Option<String>,
+    frame_metadata_json: Option<String>,
+    capture_mode: Option<String>,
+    audio_policy: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2768,13 +2825,13 @@ fn build_resume_query_bundle_from_conn(
         })
         .or_else(|| candidates.last());
     let fallback_resume_candidate =
-        if surface_state_can_be_work_target(&base_resume_candidate.candidate.surface_state) {
+        if candidate_can_be_resume_work_target(&base_resume_candidate.candidate) {
             base_resume_candidate.clone()
         } else {
             candidates
                 .iter()
                 .rev()
-                .find(|candidate| surface_state_can_be_work_target(&candidate.surface_state))
+                .find(|candidate| candidate_can_be_resume_work_target(candidate))
                 .map(|candidate| SelectedResumeQueryFrame {
                     role: "resume_candidate".to_string(),
                     candidate: candidate.clone(),
@@ -2783,7 +2840,7 @@ fn build_resume_query_bundle_from_conn(
         };
     let resume_candidate = current_focus_candidate
         .filter(|current| {
-            surface_state_can_be_work_target(&current.surface_state)
+            candidate_can_be_resume_work_target(current)
                 && resume_candidates_share_stable_surface(
                     current,
                     &fallback_resume_candidate.candidate,
@@ -2804,11 +2861,13 @@ fn build_resume_query_bundle_from_conn(
     let current_activity = current_focus_candidate
         .map(|candidate| current_activity_for_cloud(candidate, &candidate_anchors));
     apply_activity_to_current_focus(&mut current_focus, &current_activity);
-    let resume_work_target = Some(focus_target_for_cloud(
-        &resume_candidate.candidate,
-        &candidate_anchors,
-        "Policy-selected work target for resuming the task, separate from the factual current screen.",
-    ));
+    let resume_work_target = candidate_can_be_resume_work_target(&resume_candidate.candidate).then(|| {
+        focus_target_for_cloud(
+            &resume_candidate.candidate,
+            &candidate_anchors,
+            "Policy-selected work target for resuming the task, separate from the factual current screen.",
+        )
+    });
     let resume_target_if_returning = resume_work_target.clone();
     let return_target = resume_target_if_returning.clone();
     ensure_required_resume_query_keyframes(
@@ -8483,7 +8542,7 @@ fn best_resume_query_candidate_index(
     let best_work = scored.iter().filter(|score| {
         candidates
             .get(score.index)
-            .is_some_and(|candidate| surface_state_can_be_work_target(&candidate.surface_state))
+            .is_some_and(candidate_can_be_resume_work_target)
     });
     let best_non_passive = scored.iter().filter(|score| {
         candidates.get(score.index).is_some_and(|candidate| {
@@ -9162,6 +9221,11 @@ fn classify_resume_surface_state(
 
 fn surface_state_can_be_work_target(surface_state: &str) -> bool {
     core_surface_state_can_be_resume_target(surface_state)
+}
+
+fn candidate_can_be_resume_work_target(candidate: &ResumeQueryCandidateFrame) -> bool {
+    surface_state_can_be_work_target(&candidate.surface_state)
+        && best_line_anchor_for_cloud(candidate).is_some()
 }
 
 fn surface_state_is_non_work_current(surface_state: &str) -> bool {
@@ -13735,19 +13799,27 @@ fn capture_frame(
     });
 
     let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
-    capture_screenshot(&snapshot_path)?;
+    let full_capture = capture_screenshot(&paths, &snapshot_path)?;
     let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
     let image_hash = stable_hash_bytes(&image_bytes);
     let image_dimensions = jpeg_dimensions(&image_bytes);
-    let active_window_crop_path = if let Some(window_id) = active_window_id {
+    let active_window_capture = if let Some(window_id) = active_window_id {
         let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
-        match capture_window_screenshot(window_id, &crop_path) {
-            Ok(()) => Some(crop_path),
+        match capture_window_screenshot(
+            &paths,
+            window_id,
+            &crop_path,
+            context.app_bundle_id.as_deref(),
+        ) {
+            Ok(capture) => Some((crop_path, capture)),
             Err(_) => None,
         }
     } else {
         None
     };
+    let active_window_crop_path = active_window_capture
+        .as_ref()
+        .map(|(path, _)| path.to_path_buf());
 
     if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
         let _ = fs::remove_file(&snapshot_path);
@@ -13838,16 +13910,35 @@ fn capture_frame(
     }
 
     let conn = open_db(app)?;
+    let active_sck_capture = active_window_capture
+        .as_ref()
+        .and_then(|(_, capture)| (capture.provider == "screen_capture_kit").then_some(capture));
+    let full_sck_capture = (full_capture.provider == "screen_capture_kit").then_some(&full_capture);
+    let sck_capture = active_sck_capture.or(full_sck_capture);
+    let sck_filter_summary_json =
+        sck_capture.and_then(|capture| capture.filter_summary_json.clone());
+    let sck_configuration_summary_json =
+        sck_capture.and_then(|capture| capture.configuration_summary_json.clone());
+    let sck_frame_metadata_json =
+        sck_capture.and_then(|capture| capture.frame_metadata_json.clone());
+    let sck_capture_mode = sck_capture
+        .and_then(|capture| capture.capture_mode.clone())
+        .or_else(|| full_sck_capture.map(|_| "screenshot".to_string()));
+    let sck_audio_policy = sck_capture
+        .and_then(|capture| capture.audio_policy.clone())
+        .or_else(|| full_sck_capture.map(|_| "disabled".to_string()));
     let metadata = FrameMetadata {
-        capture_provider: "screencapture_cli".to_string(),
-        scope: if active_window_id.is_some() {
+        capture_provider: full_capture.provider.clone(),
+        scope: if active_window_capture.is_some() {
             "active_window".to_string()
         } else {
             "active_display".to_string()
         },
-        display_id: window_snapshot
-            .as_ref()
-            .and_then(|_| Some("main".to_string())),
+        display_id: full_capture.display_id.clone().or_else(|| {
+            window_snapshot
+                .as_ref()
+                .and_then(|_| Some("main".to_string()))
+        }),
         window_id: active_window_id,
         app_pid: context.app_pid.or_else(|| {
             window_snapshot
@@ -13860,8 +13951,12 @@ fn capture_frame(
                 .and_then(|snapshot| snapshot.active_app_bundle_id.clone())
         }),
         screen_scale: 1.0,
-        pixel_width: image_dimensions.map(|(width, _)| width),
-        pixel_height: image_dimensions.map(|(_, height)| height),
+        pixel_width: full_capture
+            .width
+            .or_else(|| image_dimensions.map(|(width, _)| width)),
+        pixel_height: full_capture
+            .height
+            .or_else(|| image_dimensions.map(|(_, height)| height)),
         full_screenshot_path: snapshot_path.to_string_lossy().to_string(),
         active_window_crop_path: active_window_crop_path
             .as_ref()
@@ -13869,6 +13964,16 @@ fn capture_frame(
         active_element_crop_path: None,
         phash: Some(image_hash.clone()),
         privacy_status: privacy.status.clone(),
+        sck_display_id: full_sck_capture.and_then(|capture| capture.display_id.clone()),
+        sck_window_id: active_sck_capture.and_then(|capture| capture.window_id),
+        sck_owning_bundle_id: active_sck_capture
+            .and_then(|capture| capture.bundle_id.clone())
+            .or_else(|| full_sck_capture.and_then(|capture| capture.bundle_id.clone())),
+        sck_filter_summary_json,
+        sck_configuration_summary_json,
+        sck_frame_metadata_json,
+        sck_capture_mode,
+        sck_audio_policy,
     };
 
     conn.execute(
@@ -13906,6 +14011,14 @@ fn capture_frame(
             capture_trigger_id,
             previous_frame_id,
             session_id,
+            metadata.sck_display_id,
+            metadata.sck_window_id,
+            metadata.sck_owning_bundle_id,
+            metadata.sck_filter_summary_json,
+            metadata.sck_configuration_summary_json,
+            metadata.sck_frame_metadata_json,
+            metadata.sck_capture_mode,
+            metadata.sck_audio_policy,
         ],
     )
     .map_err(to_string)?;
@@ -13979,6 +14092,14 @@ fn capture_frame(
             capture_trigger_id: capture_trigger_id.map(str::to_string),
             previous_frame_id: previous_frame_id.map(str::to_string),
             session_id: Some(session_id.to_string()),
+            sck_display_id: metadata.sck_display_id.clone(),
+            sck_window_id: metadata.sck_window_id,
+            sck_owning_bundle_id: metadata.sck_owning_bundle_id.clone(),
+            sck_filter_summary_json: metadata.sck_filter_summary_json.clone(),
+            sck_configuration_summary_json: metadata.sck_configuration_summary_json.clone(),
+            sck_frame_metadata_json: metadata.sck_frame_metadata_json.clone(),
+            sck_capture_mode: metadata.sck_capture_mode.clone(),
+            sck_audio_policy: metadata.sck_audio_policy.clone(),
         },
     );
     if let Some(previous) = previous_frame_id {
@@ -15733,6 +15854,14 @@ fn frame_from_row(row: &Row<'_>) -> rusqlite::Result<CaptureFrame> {
         capture_trigger_id: row.get(29)?,
         previous_frame_id: row.get(30)?,
         session_id: row.get(31)?,
+        sck_display_id: row.get(32)?,
+        sck_window_id: row.get(33)?,
+        sck_owning_bundle_id: row.get(34)?,
+        sck_filter_summary_json: row.get(35)?,
+        sck_configuration_summary_json: row.get(36)?,
+        sck_frame_metadata_json: row.get(37)?,
+        sck_capture_mode: row.get(38)?,
+        sck_audio_policy: row.get(39)?,
     })
 }
 
@@ -17528,6 +17657,14 @@ fn ensure_frame_columns(conn: &Connection) -> Result<(), String> {
         ("privacy_status", "TEXT DEFAULT 'normal'"),
         ("capture_trigger_id", "TEXT"),
         ("previous_frame_id", "TEXT"),
+        ("sck_display_id", "TEXT"),
+        ("sck_window_id", "INTEGER"),
+        ("sck_owning_bundle_id", "TEXT"),
+        ("sck_filter_summary_json", "TEXT"),
+        ("sck_configuration_summary_json", "TEXT"),
+        ("sck_frame_metadata_json", "TEXT"),
+        ("sck_capture_mode", "TEXT"),
+        ("sck_audio_policy", "TEXT"),
     ];
 
     for (name, definition) in additions {
@@ -17818,7 +17955,112 @@ fn capture_paths(app: &AppHandle) -> Result<CapturePaths, String> {
     })
 }
 
-fn capture_screenshot(path: &Path) -> Result<(), String> {
+fn capture_screenshot(paths: &CapturePaths, path: &Path) -> Result<ScreenshotCapture, String> {
+    if cfg!(target_os = "macos") {
+        match capture_sck_screenshot(paths, "display", path, None, None, false) {
+            Ok(capture) => return Ok(capture),
+            Err(sck_error) => {
+                return capture_screenshot_cli(path).map_err(|cli_error| {
+                    format!(
+                        "ScreenCaptureKit failed: {}; screencapture fallback failed: {}",
+                        sck_error, cli_error
+                    )
+                });
+            }
+        }
+    }
+
+    capture_screenshot_cli(path)
+}
+
+fn capture_window_screenshot(
+    paths: &CapturePaths,
+    window_id: i64,
+    path: &Path,
+    target_bundle_id: Option<&str>,
+) -> Result<ScreenshotCapture, String> {
+    if cfg!(target_os = "macos") {
+        match capture_sck_screenshot(
+            paths,
+            "active_window",
+            path,
+            Some(window_id),
+            target_bundle_id,
+            false,
+        ) {
+            Ok(capture) => return Ok(capture),
+            Err(sck_error) => {
+                return capture_window_screenshot_cli(window_id, path).map_err(|cli_error| {
+                    format!(
+                        "ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
+                        sck_error, cli_error
+                    )
+                });
+            }
+        }
+    }
+
+    capture_window_screenshot_cli(window_id, path)
+}
+
+fn capture_sck_screenshot(
+    paths: &CapturePaths,
+    mode: &str,
+    path: &Path,
+    target_window_id: Option<i64>,
+    target_bundle_id: Option<&str>,
+    include_cursor: bool,
+) -> Result<ScreenshotCapture, String> {
+    let helper_path = ensure_swift_helper(
+        paths,
+        "sck_screenshot",
+        SCK_SCREENSHOT_SWIFT,
+        &["AppKit", "CoreGraphics", "ScreenCaptureKit"],
+    )?;
+    let request = serde_json::json!({
+        "mode": mode,
+        "target_window_id": target_window_id,
+        "target_bundle_id": target_bundle_id,
+        "exclude_bundle_ids": ["com.smalltalk.app"],
+        "output_path": path.to_string_lossy(),
+        "quality": 0.82,
+        "include_cursor": include_cursor
+    });
+    let output = Command::new(helper_path)
+        .arg(request.to_string())
+        .output()
+        .map_err(|error| format!("ScreenCaptureKit helper failed to start: {}", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = serde_json::from_str::<SckScreenshotResponse>(stdout.trim())
+        .map_err(|error| format!("ScreenCaptureKit helper returned invalid JSON: {}", error))?;
+
+    if output.status.success() && response.ok && path.exists() {
+        return Ok(ScreenshotCapture {
+            provider: response.provider,
+            display_id: response.captured_display_id,
+            window_id: response.captured_window_id,
+            bundle_id: response.captured_bundle_id,
+            width: response.width,
+            height: response.height,
+            filter_summary_json: response.filter_summary_json,
+            configuration_summary_json: response.configuration_summary_json,
+            frame_metadata_json: response.frame_metadata_json,
+            capture_mode: response.capture_mode,
+            audio_policy: response.audio_policy,
+        });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(response.error.unwrap_or_else(|| {
+        if stderr.is_empty() {
+            "ScreenCaptureKit helper failed".to_string()
+        } else {
+            stderr
+        }
+    }))
+}
+
+fn capture_screenshot_cli(path: &Path) -> Result<ScreenshotCapture, String> {
     let output = Command::new("/usr/sbin/screencapture")
         .arg("-x")
         .arg("-t")
@@ -17828,7 +18070,7 @@ fn capture_screenshot(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("screencapture failed to start: {}", error))?;
 
     if output.status.success() && path.exists() {
-        Ok(())
+        Ok(screenshot_capture_from_file("screencapture_cli", path))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(if stderr.is_empty() {
@@ -17839,7 +18081,7 @@ fn capture_screenshot(path: &Path) -> Result<(), String> {
     }
 }
 
-fn capture_window_screenshot(window_id: i64, path: &Path) -> Result<(), String> {
+fn capture_window_screenshot_cli(window_id: i64, path: &Path) -> Result<ScreenshotCapture, String> {
     let output = Command::new("/usr/sbin/screencapture")
         .arg("-x")
         .arg("-t")
@@ -17851,7 +18093,9 @@ fn capture_window_screenshot(window_id: i64, path: &Path) -> Result<(), String> 
         .map_err(|error| format!("window screencapture failed to start: {}", error))?;
 
     if output.status.success() && path.exists() {
-        Ok(())
+        let mut capture = screenshot_capture_from_file("screencapture_cli", path);
+        capture.window_id = Some(window_id);
+        Ok(capture)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(if stderr.is_empty() {
@@ -17859,6 +18103,20 @@ fn capture_window_screenshot(window_id: i64, path: &Path) -> Result<(), String> 
         } else {
             stderr
         })
+    }
+}
+
+fn screenshot_capture_from_file(provider: &str, path: &Path) -> ScreenshotCapture {
+    let dimensions = fs::read(path)
+        .ok()
+        .and_then(|bytes| jpeg_dimensions(&bytes));
+    ScreenshotCapture {
+        provider: provider.to_string(),
+        width: dimensions.map(|(width, _)| width),
+        height: dimensions.map(|(_, height)| height),
+        capture_mode: Some("screenshot".to_string()),
+        audio_policy: Some("disabled".to_string()),
+        ..ScreenshotCapture::default()
     }
 }
 
@@ -18900,6 +19158,14 @@ mod tests {
                 Some(trigger_id.clone()),
                 Option::<String>::None,
                 Some(session_id),
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
         )
         .unwrap();
@@ -19027,6 +19293,14 @@ mod tests {
                 Some(trigger_id.clone()),
                 previous_frame_id.map(|id| id.to_string()),
                 Some(session_id),
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
         )
         .unwrap();
@@ -19314,6 +19588,14 @@ mod tests {
                 Some("trigger-1"),
                 Option::<String>::None,
                 Some("session-1"),
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
         )
         .unwrap();
@@ -20988,6 +21270,132 @@ mod tests {
             result.payload.resume_candidate.frame_id,
             monitor.to_string()
         );
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn resume_query_does_not_emit_anchorless_work_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-anchorless-work-target-regression-{}",
+            now_millis()
+        ));
+        let source_root = output_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        let codex = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            1_000,
+            "Codex",
+            "com.openai.codex",
+            "Codex",
+            "",
+            "ai_coding_workspace",
+            "run ta",
+            "codex-anchorless",
+            None,
+        );
+        replace_resume_test_content_units_with_bounds(
+            &conn,
+            codex,
+            &[
+                (
+                    "app_sidebar",
+                    "text",
+                    "~/Documents/smalltalk (main*)",
+                    80.0,
+                    90.0,
+                    360.0,
+                    24.0,
+                    "ax",
+                ),
+                (
+                    "app_sidebar",
+                    "text",
+                    "run ta",
+                    90.0,
+                    126.0,
+                    140.0,
+                    22.0,
+                    "ax",
+                ),
+            ],
+        );
+        let helium = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            2_000,
+            "Helium",
+            "com.imput.helium",
+            "ChatGPT - smalltalk - Helium",
+            "https://chatgpt.com/c/smalltalk",
+            "chat_conversation",
+            "The key allocation in the file is: resume target selection must use protected anchors.",
+            "helium-anchored",
+            Some(codex),
+        );
+        let monitor = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            &image_path.to_string_lossy(),
+            3_000,
+            "Activity Monitor",
+            "com.apple.ActivityMonitor",
+            "Activity Monitor - All Processes",
+            "",
+            "unknown",
+            "Activity Monitor All Processes WindowServer Helium Helper Renderer",
+            "activity-monitor",
+            Some(helium),
+        );
+
+        let result = build_resume_query_bundle_from_conn(
+            &conn,
+            &output_root,
+            Some(ResumeQueryBundleInput {
+                session_id: Some(session.id.clone()),
+                current_frame_id: Some(monitor),
+                lookback_minutes: None,
+                max_episode_cards: Some(8),
+                max_images: Some(12),
+                max_json_chars: Some(40_000),
+                max_keyframes: None,
+                include_images: Some(false),
+            }),
+        )
+        .unwrap();
+
+        assert!(!result
+            .payload
+            .candidate_anchors
+            .iter()
+            .any(|anchor| anchor.frame_id == codex.to_string()));
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .map(|target| target.frame_id.as_str()),
+            Some(helium.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .payload
+                .resume_work_target
+                .as_ref()
+                .and_then(|target| target.anchor_id.as_deref())
+                .is_some(),
+            true
+        );
+        assert!(resume_query_critical_lint_errors(&result.payload).is_empty());
 
         fs::remove_dir_all(output_root).unwrap();
     }
@@ -24422,6 +24830,14 @@ mod tests {
                 Some("trigger-1"),
                 Option::<String>::None,
                 Some("session-1"),
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
         )
         .unwrap();

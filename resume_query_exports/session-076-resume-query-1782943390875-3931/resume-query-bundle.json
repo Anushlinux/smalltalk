@@ -1,0 +1,865 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1412-unit-1412-ax-28",
+      "confidence": 0.8200000000000001,
+      "frame_id": "1412",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 6 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "text_exact": "Helium Helper (Renderer)",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1412-unit-1412-ax-88",
+      "confidence": 0.8200000000000001,
+      "frame_id": "1412",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 18 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "text_exact": "Spotify Helper (Renderer)",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 53.1,
+      "episode_id": "ep-1399-1408",
+      "events": {
+        "app_switches": 3,
+        "clicks": 9,
+        "scrolls": 575,
+        "selections": 0,
+        "typing_bursts": 1
+      },
+      "frame_range": [
+        "1399",
+        "1408"
+      ],
+      "important_text": [
+        "run ta"
+      ],
+      "keyframes": [
+        "1399",
+        "1400"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface",
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 7.1,
+      "episode_id": "ep-1409-1409",
+      "events": {
+        "app_switches": 0,
+        "clicks": 1,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1409",
+        "1409"
+      ],
+      "important_text": [
+        "The key allocation in the file is:"
+      ],
+      "keyframes": [
+        "1409"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "chat_conversation",
+      "title": "ChatGPT - smalltalk - Helium"
+    },
+    {
+      "app": "Activity Monitor",
+      "confidence": 0.62,
+      "duration_s": 16.6,
+      "episode_id": "ep-1410-1412",
+      "events": {
+        "app_switches": 1,
+        "clicks": 6,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1410",
+        "1412"
+      ],
+      "important_text": [
+        "Helium Helper (Renderer)"
+      ],
+      "keyframes": [
+        "1410",
+        "1411"
+      ],
+      "quality_flags": [
+        "surface_state_system_monitor_surface",
+        "surface_type_unknown"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "unknown",
+      "title": "Activity Monitor – All Processes"
+    },
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 0.0,
+      "episode_id": "ep-1388-1388",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1388",
+        "1388"
+      ],
+      "important_text": [
+        "reference/screenpipe , and untracked"
+      ],
+      "keyframes": [
+        "1388"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role_guess": "origin",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.12,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.9,
+    "final_score": 0.9802194591421889,
+    "frame_id": "1408",
+    "line_anchor_quality": 0.0,
+    "metadata_penalty": 0.0,
+    "recency": 0.0752194591421888,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.25,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1412-unit-1412-ax-88",
+    "app": "Activity Monitor",
+    "confidence": 0.62,
+    "exact_visible_words": "Spotify Helper (Renderer)",
+    "frame_id": "1412",
+    "identity_verdict": {
+      "canonical_app": "Activity Monitor",
+      "canonical_surface_type": "unknown",
+      "canonical_title": "Activity Monitor – All Processes",
+      "captured_app": "Activity Monitor",
+      "captured_title": "Activity Monitor – All Processes",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.0,
+        "w": 500.0,
+        "x": 345.0,
+        "y": 356.0
+      },
+      "confidence": 0.8200000000000001,
+      "frame_id": "1412",
+      "line_index": 17,
+      "next_line": "533.5 MB",
+      "previous_line": "18104",
+      "quote": "Spotify Helper (Renderer)",
+      "reason": "ordered main_content line 18 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "source_unit_id": "unit-1412-ax-88"
+    },
+    "quality_flags": [
+      "surface_state_system_monitor_surface",
+      "surface_type_unknown"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_type": "unknown",
+    "title": "Activity Monitor – All Processes"
+  },
+  "current_focus": {
+    "anchor_id": "1412-unit-1412-ax-88",
+    "app": "Activity Monitor",
+    "confidence": 0.62,
+    "exact_visible_words": "Spotify Helper (Renderer)",
+    "frame_id": "1412",
+    "identity_verdict": {
+      "canonical_app": "Activity Monitor",
+      "canonical_surface_type": "unknown",
+      "canonical_title": "Activity Monitor – All Processes",
+      "captured_app": "Activity Monitor",
+      "captured_title": "Activity Monitor – All Processes",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.0,
+        "w": 500.0,
+        "x": 345.0,
+        "y": 356.0
+      },
+      "confidence": 0.8200000000000001,
+      "frame_id": "1412",
+      "line_index": 17,
+      "next_line": "533.5 MB",
+      "previous_line": "18104",
+      "quote": "Spotify Helper (Renderer)",
+      "reason": "ordered main_content line 18 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "source_unit_id": "unit-1412-ax-88"
+    },
+    "quality_flags": [
+      "surface_state_system_monitor_surface",
+      "surface_type_unknown"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "system_monitor_surface",
+    "surface_type": "unknown",
+    "title": "Activity Monitor – All Processes"
+  },
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "1388",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001388-origin.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1388",
+        "line_index": 18,
+        "quote": "reference/screenpipe , and untracked",
+        "reason": "ordered main_content line 19 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1388-ocr-51"
+      },
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role": "origin",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 0.0,
+      "title": "Codex",
+      "visible_text": "~/Documents/smalltalk (main*) run ta » прm uri dev Search • cargo check [REDACT..."
+    },
+    {
+      "app": "Finder",
+      "frame_id": "1392",
+      "identity_verdict": {
+        "canonical_app": "Finder",
+        "canonical_surface_type": "unknown",
+        "canonical_title": "resume_query_exports",
+        "captured_app": "Finder",
+        "captured_title": "resume_query_exports",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Finder",
+        "visible_title": "resume_query_exports"
+      },
+      "image_ref": "images/frame-001392-diagnostic-artifact.jpg",
+      "quality_flags": [
+        "debug_artifact_frame",
+        "surface_state_debug_export_surface"
+      ],
+      "role": "diagnostic_artifact",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 14.5,
+      "title": "resume_query_exports",
+      "visible_text": "resume_query_exports Anushlinux [REDACTED_NUMBER] Anushlinux [REDACTED_NUMBER] ..."
+    },
+    {
+      "app": "Finder",
+      "frame_id": "1393",
+      "identity_verdict": {
+        "canonical_app": "Finder",
+        "canonical_surface_type": "unknown",
+        "canonical_title": "captured",
+        "captured_app": "Finder",
+        "captured_title": "captured",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Finder",
+        "visible_title": "docs"
+      },
+      "image_ref": "images/frame-001393-side-branch.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1393",
+        "line_index": 3,
+        "quote": "<AXUIElement 0xc02c1c570> {pid=622}",
+        "reason": "ordered main_content line 4 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1393-ax-384"
+      },
+      "quality_flags": [
+        "surface_state_finder_overview_surface",
+        "surface_type_unknown"
+      ],
+      "role": "side_branch",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 18.2,
+      "title": "captured",
+      "visible_text": "captured docs Back/Forward <AXUIElement 0xc02c1c570> {pid=622} Anushlinux [REDA..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1398",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "ChatGPT - smalltalk - Helium",
+        "captured_app": "Helium",
+        "captured_title": "ChatGPT - smalltalk - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001398-context-surface.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1398",
+        "line_index": 12,
+        "quote": "eforeDevCommand ( npm run de",
+        "reason": "ordered main_content line 13 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1398-ocr-100"
+      },
+      "quality_flags": [
+        "surface_state_debug_export_surface",
+        "exact_words_chrome_heavy"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 35.2,
+      "title": "ChatGPT - smalltalk - Helium",
+      "visible_text": "run ta ~/Documents/smalltalk (main*) » прm uri dev Search • smalltalk-screencap..."
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1399",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001399-timeline-context.jpg",
+      "quality_flags": [
+        "surface_state_actionable_task_surface",
+        "no_valid_candidate_anchor"
+      ],
+      "role": "timeline_context",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 42.1,
+      "title": "Codex",
+      "visible_text": "run ta ~/Documents/smalltalk (main*) » прm uri dev Search I left the pre-existi..."
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1408",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001408-resume-candidate.jpg",
+      "quality_flags": [
+        "surface_state_actionable_task_surface",
+        "no_valid_candidate_anchor"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 87.1,
+      "title": "Codex",
+      "visible_text": "~/Documents/smalltalk (main*) run ta +645 -25 » прm uri dev Search +2-2 docs/na..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1409",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "ChatGPT - smalltalk - Helium",
+        "captured_app": "Helium",
+        "captured_title": "ChatGPT - smalltalk - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001409-timeline-context.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1409",
+        "line_index": 11,
+        "quote": "The key allocation in the file is:",
+        "reason": "ordered main_content line 12 from ocr content units",
+        "section_anchor": "The key allocation in the file is:",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1409-ocr-58"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "timeline_context",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 94.1,
+      "title": "ChatGPT - smalltalk - Helium",
+      "visible_text": "ChatGPT L Share • smalltalk resume reasoning, with frames/events/text/app-windo..."
+    },
+    {
+      "app": "Activity Monitor",
+      "frame_id": "1412",
+      "identity_verdict": {
+        "canonical_app": "Activity Monitor",
+        "canonical_surface_type": "unknown",
+        "canonical_title": "Activity Monitor – All Processes",
+        "captured_app": "Activity Monitor",
+        "captured_title": "Activity Monitor – All Processes",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001412-current-focus.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1412",
+        "line_index": 17,
+        "quote": "Spotify Helper (Renderer)",
+        "reason": "ordered main_content line 18 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1412-ax-88"
+      },
+      "quality_flags": [
+        "surface_state_system_monitor_surface",
+        "surface_type_unknown"
+      ],
+      "role": "current_focus",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 108.5,
+      "title": "Activity Monitor – All Processes",
+      "visible_text": "Activity Monitor – All Processes WindowServer 992.7 MB 8,203 404 Helium Helper ..."
+    }
+  ],
+  "missing_evidence": [
+    "5 internal Smalltalk frames omitted from model evidence",
+    "frame 1389 is an export/debug artifact; keep as diagnostic evidence, not resume target",
+    "frame 1390 is an export/debug artifact; keep as diagnostic evidence, not resume target",
+    "frame 1391 is an export/debug artifact; keep as diagnostic evidence, not resume target",
+    "protected frame 1408 has no valid resume anchor after lint repair"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "debug_artifact_frame",
+    "surface_state_actionable_task_surface",
+    "surface_state_current_work_surface",
+    "surface_state_debug_export_surface"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_words": "",
+    "frame_id": "1408",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "confidence": 0.0,
+      "frame_id": "1408",
+      "reason": "no valid local candidate anchor survived spatial and chrome validation"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "no_valid_candidate_anchor"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "~/Documents/smalltalk (main*) run ta +645 -25 » прm uri dev Search +2-2 docs/native-capture-product-inventory.md [REDAC...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "app": "Codex",
+    "confidence": 0.55,
+    "frame_id": "1408",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "no_valid_candidate_anchor"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "app": "Codex",
+    "confidence": 0.55,
+    "frame_id": "1408",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "no_valid_candidate_anchor"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "app": "Codex",
+    "confidence": 0.55,
+    "frame_id": "1408",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "no_valid_candidate_anchor"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 115.9,
+    "id": "session-1782943273644-2105",
+    "started_at": 1782943273644,
+    "stopped_at": 1782943389497
+  },
+  "session_index": {
+    "artifact_frames": [
+      "1389",
+      "1390",
+      "1391",
+      "1392"
+    ],
+    "branch_frames": [
+      "1393"
+    ],
+    "candidate_resume_frames": [
+      "1408"
+    ],
+    "current_frame_id": "1412",
+    "duration_s": 115.9,
+    "episode_count": 4,
+    "episodes": [
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 53.1,
+        "episode_id": "ep-1399-1408",
+        "events": {
+          "app_switches": 3,
+          "clicks": 9,
+          "scrolls": 575,
+          "selections": 0,
+          "typing_bursts": 1
+        },
+        "frame_range": [
+          "1399",
+          "1408"
+        ],
+        "important_text": [
+          "run ta"
+        ],
+        "keyframes": [
+          "1399",
+          "1400"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface",
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 7.1,
+        "episode_id": "ep-1409-1409",
+        "events": {
+          "app_switches": 0,
+          "clicks": 1,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1409",
+          "1409"
+        ],
+        "important_text": [
+          "The key allocation in the file is:"
+        ],
+        "keyframes": [
+          "1409"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "chat_conversation",
+        "title": "ChatGPT - smalltalk - Helium"
+      },
+      {
+        "app": "Activity Monitor",
+        "confidence": 0.62,
+        "duration_s": 16.6,
+        "episode_id": "ep-1410-1412",
+        "events": {
+          "app_switches": 1,
+          "clicks": 6,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1410",
+          "1412"
+        ],
+        "important_text": [
+          "Helium Helper (Renderer)"
+        ],
+        "keyframes": [
+          "1410",
+          "1411"
+        ],
+        "quality_flags": [
+          "surface_state_system_monitor_surface",
+          "surface_type_unknown"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "unknown",
+        "title": "Activity Monitor – All Processes"
+      },
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 0.0,
+        "episode_id": "ep-1388-1388",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1388",
+          "1388"
+        ],
+        "important_text": [
+          "reference/screenpipe , and untracked"
+        ],
+        "keyframes": [
+          "1388"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface"
+        ],
+        "role_guess": "origin",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "surface_state_debug_export_surface",
+      "debug_artifact_frame",
+      "surface_type_unknown"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1782943273644-2105",
+    "surface_sequence": [
+      "Codex/Codex",
+      "Finder/resume_query_exports",
+      "Finder/captured",
+      "Finder/reference",
+      "Finder/session-075-resume-query-1782943248843-2104",
+      "Finder/images",
+      "Helium/ChatGPT - smalltalk - Helium",
+      "Codex/Codex"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.62,
+    "evidence_frames": [
+      "1412",
+      "1408",
+      "1410"
+    ],
+    "summary": "Smalltalk resume workflow implementation and validation work."
+  },
+  "transitions": [
+    {
+      "confidence": 0.68,
+      "from_frame": "1392",
+      "label": "new_task",
+      "to_frame": "1393"
+    },
+    {
+      "confidence": 0.68,
+      "from_frame": "1398",
+      "label": "new_task",
+      "to_frame": "1399"
+    }
+  ]
+}

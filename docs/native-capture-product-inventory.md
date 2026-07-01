@@ -100,10 +100,10 @@ Stored in `frames`.
 | Trigger lineage | `capture_trigger`, `capture_trigger_id`, `previous_frame_id` |
 | Text | `text_source`, `accessibility_text`, `accessibility_tree_json`, `full_text` |
 | Hashes | `content_hash`, `image_hash`, `phash` |
-| Capture metadata | `capture_provider`, `scope`, `display_id`, `window_id`, `app_pid`, `app_bundle_id`, `screen_scale`, `pixel_width`, `pixel_height` |
+| Capture metadata | `capture_provider`, `scope`, `display_id`, `window_id`, `app_pid`, `app_bundle_id`, `screen_scale`, `pixel_width`, `pixel_height`, `sck_display_id`, `sck_window_id`, `sck_owning_bundle_id`, `sck_filter_summary_json`, `sck_configuration_summary_json`, `sck_frame_metadata_json`, `sck_capture_mode`, `sck_audio_policy` |
 | Privacy | `privacy_status` |
 
-Current `capture_provider` is `screencapture_cli`. Current `scope` is `active_window` when an active window id is known, otherwise `active_display`.
+Current `capture_provider` is `screen_capture_kit` when the one-shot SCK helper succeeds. The legacy `/usr/sbin/screencapture` path remains a fallback and records `screencapture_cli`. Current `scope` is `active_window` when an active window id is known, otherwise `active_display`.
 
 ### Native UI Events
 

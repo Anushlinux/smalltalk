@@ -1,0 +1,980 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1363-unit-1363-ax-47",
+      "confidence": 0.78,
+      "frame_id": "1363",
+      "is_browser_chrome": false,
+      "reason": "resume_query_lint protected anchor: ordered chat_message line 21 from ax conten...",
+      "semantic_role": "chat_message",
+      "source": "ax",
+      "text_exact": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1361-unit-1361-ocr-69",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1361",
+      "is_browser_chrome": false,
+      "reason": "resume_query_lint protected anchor: ordered main_content line 19 from ocr conte...",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "Crece oanea exo ane reoulle ue doo croune unis tule",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Finder",
+      "confidence": 0.72,
+      "duration_s": 4.7,
+      "episode_id": "ep-1357-1357",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1357",
+        "1357"
+      ],
+      "important_text": [
+        "Web Links [REDACTED_NUMBER]"
+      ],
+      "keyframes": [
+        "1357"
+      ],
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "metadata_suspect"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "chat_conversation",
+      "title": "Finder"
+    },
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 39.0,
+      "episode_id": "ep-1361-1361",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1361",
+        "1361"
+      ],
+      "important_text": [
+        "Crece oanea exo ane reoulle ue doo croune unis tule"
+      ],
+      "keyframes": [
+        "1361"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 5.4,
+      "episode_id": "ep-1363-1363",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1363",
+        "1363"
+      ],
+      "important_text": [
+        "smalltalk - Proactive Product Design [REDACTED_NUMBER]"
+      ],
+      "keyframes": [
+        "1363"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Proactive Product Design - Helium"
+    },
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 0.0,
+      "episode_id": "ep-1343-1343",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1343",
+        "1343"
+      ],
+      "important_text": [
+        "The final product should feel like:"
+      ],
+      "keyframes": [
+        "1343"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "origin",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 0.0,
+      "episode_id": "ep-1346-1346",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1346",
+        "1346"
+      ],
+      "important_text": [
+        "• Web search |"
+      ],
+      "keyframes": [
+        "1346"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "timeline_context",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Proactive Product Design - Helium"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.12,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.9,
+    "final_score": 1.0202094729983293,
+    "frame_id": "1361",
+    "line_anchor_quality": 0.17600000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.0792094729983294,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.25,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1363-unit-1363-ax-47",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+    "frame_id": "1363",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Proactive Product Design - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Proactive Product Design - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "confidence": 0.78,
+      "frame_id": "1363",
+      "line_index": 20,
+      "previous_line": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER]",
+      "quote": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+      "reason": "ordered chat_message line 21 from ax content units",
+      "semantic_role": "chat_message",
+      "source": "ax",
+      "source_unit_id": "unit-1363-ax-47"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Proactive Product Design - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1363-unit-1363-ax-47",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+    "frame_id": "1363",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Proactive Product Design - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Proactive Product Design - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "confidence": 0.78,
+      "frame_id": "1363",
+      "line_index": 20,
+      "previous_line": "smalltalk - Proactive Product Design - Helium [REDACTED_NUMBER]",
+      "quote": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+      "reason": "ordered chat_message line 21 from ax content units",
+      "semantic_role": "chat_message",
+      "source": "ax",
+      "source_unit_id": "unit-1363-ax-47"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Proactive Product Design - Helium"
+  },
+  "evidence_conflicts": [
+    "frame 1357 metadata/title disagrees with screenshot-visible content and is not trusted as a resume target"
+  ],
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "1343",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001343-origin.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1343",
+        "line_index": 23,
+        "quote": "The final product should feel like:",
+        "reason": "ordered main_content line 24 from ocr content units",
+        "section_anchor": "The final product should feel like:",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1343-ocr-40"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "origin",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 8.5,
+      "title": "Codex",
+      "visible_text": "esmalltalk I Share Interactiontice EvidenceSufficiency readlaver - WorkThread -..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1344",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Proactive Product Design - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Proactive Product Design - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001344-side-branch.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1344",
+        "line_index": 15,
+        "quote": "- optional ScreenCapturekit / screencapture anchors",
+        "reason": "ordered main_content line 16 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1344-ocr-29"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "side_branch",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 17.4,
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "visible_text": "Ssmalltalk I Share kesume: browser pade, bur exact content unknowr Need screens..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1346",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Proactive Product Design - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Proactive Product Design - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001346-timeline-context.jpg",
+      "line_anchor": {
+        "confidence": 0.9,
+        "frame_id": "1346",
+        "line_index": 23,
+        "quote": "• Web search |",
+        "reason": "ordered search_result line 24 from ocr content units",
+        "semantic_role": "composer",
+        "source": "ocr",
+        "source_unit_id": "unit-1346-ocr-60"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "timeline_context",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 23.0,
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "visible_text": "Ssmalltalk I Share kesume: browser pade, bur exact content unknowr Need screens..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1350",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Proactive Product Design - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Proactive Product Design - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001350-context-surface.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1350",
+        "line_index": 14,
+        "quote": "The user needs guidance on what to do next after their implementation.",
+        "reason": "ordered main_content line 15 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1350-ocr-27"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 64.5,
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "visible_text": "lementation threshold. The next work is proving whether the memory-first loop p..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1353",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "browser_tab",
+        "canonical_title": "Google Gemini - Helium",
+        "captured_app": "Helium",
+        "captured_title": "Google Gemini - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001353-context-surface.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1353",
+        "line_index": 4,
+        "quote": "Google Gemini https://gemini.google.com/app",
+        "reason": "ordered main_content line 5 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1353-ax-47"
+      },
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 75.5,
+      "title": "Google Gemini - Helium",
+      "visible_text": "Where should we start? * + Say i have ataur Google Gemini - Helium https://gemi..."
+    },
+    {
+      "app": "Finder",
+      "frame_id": "1357",
+      "identity_verdict": {
+        "canonical_app": "Finder",
+        "canonical_surface_type": "unknown",
+        "canonical_title": "Finder",
+        "captured_app": "Finder",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001357-debug-mismatch.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1357",
+        "line_index": 20,
+        "quote": "Web Links [REDACTED_NUMBER]",
+        "reason": "ordered main_content line 21 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1357-ax-31"
+      },
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "metadata_suspect"
+      ],
+      "role": "debug_mismatch",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 137.2,
+      "title": "Finder",
+      "visible_text": "Web Links [REDACTED_NUMBER] Web Links [REDACTED_NUMBER] LinearMouse file:///.fi..."
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1361",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001361-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1361",
+        "line_index": 18,
+        "quote": "Crece oanea exo ane reoulle ue doo croune unis tule",
+        "reason": "ordered main_content line 19 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1361-ocr-69"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 161.7,
+      "title": "Codex",
+      "visible_text": "o-pan C New chat uri dev sample Palmlerrro Claude Code v2.1.185 Environment Q S..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1363",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Proactive Product Design - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Proactive Product Design - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001363-current-focus.jpg",
+      "line_anchor": {
+        "confidence": 0.78,
+        "frame_id": "1363",
+        "line_index": 20,
+        "quote": "smalltalk - Proactive Product Design [REDACTED_NUMBER]",
+        "reason": "ordered chat_message line 21 from ax content units",
+        "semantic_role": "chat_message",
+        "source": "ax",
+        "source_unit_id": "unit-1363-ax-47"
+      },
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role": "current_focus",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 199.7,
+      "title": "smalltalk - Proactive Product Design - Helium",
+      "visible_text": "Osmalltalk I Share What changed: - Added memory-first backend APl and storage i..."
+    }
+  ],
+  "missing_evidence": [
+    "3 internal Smalltalk frames omitted from model evidence",
+    "frame 1357 metadata/title disagrees with visible task content",
+    "2 privacy-excluded frames omitted from model evidence (1355-1356)",
+    "frame 1357 failed resume_query_lint metadata/image consistency"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "metadata_image_mismatch",
+    "metadata_suspect",
+    "surface_state_actionable_task_surface",
+    "surface_state_current_work_surface"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_words": "Crece oanea exo ane reoulle ue doo croune unis tule",
+    "frame_id": "1361",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 7.441860675811807,
+        "w": 372.0930175781251,
+        "x": 785.1162817225654,
+        "y": 226.97674407697778
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1361",
+      "line_index": 18,
+      "next_line": "we• Lnks",
+      "previous_line": "@Plugins",
+      "quote": "Crece oanea exo ane reoulle ue doo croune unis tule",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1361-ocr-69"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": "@Plugins",
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "o-pan C New chat uri dev sample Palmlerrro Claude Code v2.1.185 Environment Q Search Plan: Rebuild Smalltalk As Always-...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1361-unit-1361-ocr-69",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "Crece oanea exo ane reoulle ue doo croune unis tule",
+    "frame_id": "1361",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 7.441860675811807,
+        "w": 372.0930175781251,
+        "x": 785.1162817225654,
+        "y": 226.97674407697778
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1361",
+      "line_index": 18,
+      "next_line": "we• Lnks",
+      "previous_line": "@Plugins",
+      "quote": "Crece oanea exo ane reoulle ue doo croune unis tule",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1361-ocr-69"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "1361-unit-1361-ocr-69",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "Crece oanea exo ane reoulle ue doo croune unis tule",
+    "frame_id": "1361",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 7.441860675811807,
+        "w": 372.0930175781251,
+        "x": 785.1162817225654,
+        "y": 226.97674407697778
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1361",
+      "line_index": 18,
+      "next_line": "we• Lnks",
+      "previous_line": "@Plugins",
+      "quote": "Crece oanea exo ane reoulle ue doo croune unis tule",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1361-ocr-69"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "1361-unit-1361-ocr-69",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "Crece oanea exo ane reoulle ue doo croune unis tule",
+    "frame_id": "1361",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 7.441860675811807,
+        "w": 372.0930175781251,
+        "x": 785.1162817225654,
+        "y": 226.97674407697778
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1361",
+      "line_index": 18,
+      "next_line": "we• Lnks",
+      "previous_line": "@Plugins",
+      "quote": "Crece oanea exo ane reoulle ue doo croune unis tule",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1361-ocr-69"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 204.1,
+    "id": "session-1782926131944-1",
+    "started_at": 1782926131944,
+    "stopped_at": 1782926336061
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [
+      "1344"
+    ],
+    "candidate_resume_frames": [
+      "1361"
+    ],
+    "current_frame_id": "1363",
+    "duration_s": 204.1,
+    "episode_count": 5,
+    "episodes": [
+      {
+        "app": "Finder",
+        "confidence": 0.72,
+        "duration_s": 4.7,
+        "episode_id": "ep-1357-1357",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1357",
+          "1357"
+        ],
+        "important_text": [
+          "Web Links [REDACTED_NUMBER]"
+        ],
+        "keyframes": [
+          "1357"
+        ],
+        "quality_flags": [
+          "metadata_image_mismatch",
+          "metadata_suspect"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "chat_conversation",
+        "title": "Finder"
+      },
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 39.0,
+        "episode_id": "ep-1361-1361",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1361",
+          "1361"
+        ],
+        "important_text": [
+          "Crece oanea exo ane reoulle ue doo croune unis tule"
+        ],
+        "keyframes": [
+          "1361"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 5.4,
+        "episode_id": "ep-1363-1363",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1363",
+          "1363"
+        ],
+        "important_text": [
+          "smalltalk - Proactive Product Design [REDACTED_NUMBER]"
+        ],
+        "keyframes": [
+          "1363"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Proactive Product Design - Helium"
+      },
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 0.0,
+        "episode_id": "ep-1343-1343",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1343",
+          "1343"
+        ],
+        "important_text": [
+          "The final product should feel like:"
+        ],
+        "keyframes": [
+          "1343"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "origin",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 0.0,
+        "episode_id": "ep-1346-1346",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1346",
+          "1346"
+        ],
+        "important_text": [
+          "• Web search |"
+        ],
+        "keyframes": [
+          "1346"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "timeline_context",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Proactive Product Design - Helium"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_current_work_surface",
+      "surface_state_source_or_discovery_surface",
+      "surface_state_need_more_evidence",
+      "metadata_suspect"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1782926131944-1",
+    "surface_sequence": [
+      "Codex/Codex",
+      "Helium/smalltalk - Proactive Product Design - Helium",
+      "Codex/Codex",
+      "Helium/smalltalk - Proactive Product Design - Helium",
+      "Codex/Codex",
+      "Helium/smalltalk - Proactive Product Design - Helium",
+      "Codex/Codex",
+      "Helium/smalltalk - Proactive Product Design - Helium"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.55,
+    "evidence_frames": [
+      "1363",
+      "1361",
+      "1357"
+    ],
+    "summary": "smalltalk - Proactive Product Design [REDACTED_NUMBER]"
+  },
+  "transitions": [
+    {
+      "confidence": 0.68,
+      "from_frame": "1343",
+      "label": "new_task",
+      "to_frame": "1344"
+    }
+  ]
+}

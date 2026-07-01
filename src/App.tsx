@@ -44,6 +44,14 @@ type CaptureFrame = {
   privacy_status?: string | null;
   capture_trigger_id?: string | null;
   previous_frame_id?: string | null;
+  sck_display_id?: string | null;
+  sck_window_id?: number | null;
+  sck_owning_bundle_id?: string | null;
+  sck_filter_summary_json?: string | null;
+  sck_configuration_summary_json?: string | null;
+  sck_frame_metadata_json?: string | null;
+  sck_capture_mode?: string | null;
+  sck_audio_policy?: string | null;
 };
 
 type SessionCounts = {
@@ -1497,6 +1505,7 @@ function FrameRow({
         <small>{cleanSnippet(snippet || frame.full_text)}</small>
         <span className="badge-row">
           <EvidenceBadge label="screen" ok={Boolean(frame.snapshot_path)} />
+          <EvidenceBadge label={frame.capture_provider || "capture"} ok={frame.capture_provider === "screen_capture_kit"} />
           <EvidenceBadge label={frame.text_source || "visual"} ok={Boolean(frame.text_source)} />
           <EvidenceBadge label={frame.privacy_status || "normal"} ok={frame.privacy_status !== "skipped_sensitive"} />
           <EvidenceBadge label="transition" ok={Boolean(frame.capture_trigger_id || frame.previous_frame_id)} />
@@ -1675,6 +1684,19 @@ function EvidencePanel({
         <div>
           <dt>App bundle</dt>
           <dd>{frame.app_bundle_id || "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>Capture provider</dt>
+          <dd>{frame.capture_provider || "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>SCK scope</dt>
+          <dd>{[
+            frame.sck_capture_mode,
+            frame.sck_display_id ? `display ${frame.sck_display_id}` : null,
+            frame.sck_window_id ? `window ${frame.sck_window_id}` : null,
+            frame.sck_audio_policy ? `audio ${frame.sck_audio_policy}` : null,
+          ].filter(Boolean).join(" / ") || "None"}</dd>
         </div>
         <div>
           <dt>URL / document</dt>
