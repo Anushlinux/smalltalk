@@ -1,6 +1,6 @@
 # Smalltalk Product And Technical Snapshot
 
-Last updated: 2026-07-02
+Last updated: 2026-07-03
 
 Smalltalk is currently a desktop-first, local screen-memory app built with Tauri, Rust, React, and SQLite. The older Chrome extension still exists in `browser-extension/`, but the active product direction is the native app in the repo root.
 
@@ -16,6 +16,8 @@ Smalltalk has two product lanes in this repo.
 | Browser extension resume flow | Older but still present | Capture explicit browser research sessions and ask a local OpenAI proxy for a return-to-origin resume card. | `browser-extension/` |
 
 The native lane should be treated as the main product unless we explicitly reopen the browser-extension lane.
+
+The current native product primitive is `Continue`, not "session recording." Sessions, screenshots, timelines, native resume cards, and stop-time bundles are evidence and debug infrastructure. Continue is the layer that turns local evidence into a workstream, a factual current focus, an actionable return target, and an inspectable next step.
 
 ## What We Have Built So Far
 
@@ -43,6 +45,10 @@ The native lane should be treated as the main product unless we explicitly reope
 - Safe AI export path for native evidence that redacts text/URLs/paths, masks sensitive images where possible, excludes `never_send_to_ai` frames, and writes an audit row.
 - Native storyboard/resume-card builder based on local evidence.
 - Optional cloud resume reasoner that reads a bounded resume-query bundle, preserves `response_id` when a real cloud call succeeds, and records whether the result came from `cloud` or `local_fallback`.
+- Native Continue semantic memory in `src-tauri/src/continuation.rs` with artifacts, observations, task actions, episodes, workstreams, continuation candidates, decisions, feedback events, and breadcrumbs.
+- Local Continue command that can run without Stop Session, rebuild derived layers, score local candidates, persist a decision, and return current focus separately from return/resume targets.
+- Optional bounded OpenAI micro-inference for Continue that can only select among locally generated candidate ids and is locally validated before use.
+- Continue feedback and eval support for measuring continuation decisions rather than prettier session summaries.
 
 ## Main User Flow
 
@@ -52,9 +58,9 @@ The native lane should be treated as the main product unless we explicitly reope
 4. While the session is running, native UI events schedule captures after short settle delays.
 5. The user can click `Capture now` for an explicit manual frame.
 6. The UI continuously refreshes status, search results, recent timeline, frame details, and screenshot previews.
-7. The user clicks `Stop session`.
-8. `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `resume_query_exports/`, and returns the bundle summary.
-9. The user can inspect the compact bundle, ask OpenAI from the app, open the resolved return target, or use the native `Resume me` cue inside the app.
+7. The user can invoke `Continue` without stopping the session. The backend rebuilds local derived state, scores continuation candidates, and returns an actionable target with evidence anchors.
+8. If the user clicks `Stop session`, `stop_capture` stops the worker, marks the session stopped, refreshes counts, builds a cloud-ready resume query bundle under `resume_query_exports/`, and returns the bundle summary.
+9. The user can inspect the compact bundle, ask OpenAI from the Stop bundle path, open the resolved return target, or use local Continue/native resume cues inside the app.
 
 ## Runtime Storage
 
@@ -412,6 +418,264 @@ Results include:
 - snippet from SQLite FTS
 - BM25 rank
 
+## Native Continue Architecture
+
+Native Continue is implemented in `src-tauri/src/continuation.rs` and exposed through Tauri commands in `src-tauri/src/capture.rs`. It is additive on top of the local capture store. It does not require Stop Session, does not read the browser extension store, and does not ask a model to summarize raw history.
+
+The Continue pipeline has five layers:
+
+1. **Evidence substrate**: native capture persists frames, app contexts, content units, UI events, triggers, transitions, frame diffs, typing burst metadata, clipboard metadata, privacy markers, and search indexes.
+2. **Semantic memory layer**: `rebuild_continue_second_layer` resolves stable artifacts and observations, then extracts task actions from local evidence.
+3. **Workstream layer**: `rebuild_continue_third_layer` groups actions into episodes, assigns artifact roles, clusters episodes into workstreams, records unresolved state, and marks active/suspended/background work.
+4. **Local decision layer**: `get_continue_decision` generates continuation candidates, scores them, persists `continue_candidates`, and writes a `continue_decisions` row.
+5. **Optional final layer**: bounded OpenAI micro-inference may choose among supplied candidate ids and phrase a cautious next action. The local validator remains the authority.
+
+The schema is local SQLite. `ensure_continue_schema` creates or upgrades these tables:
+
+- `continue_artifacts`
+- `continue_artifact_observations`
+- `continue_task_actions`
+- `continue_task_action_events`
+- `continue_episodes`
+- `continue_episode_actions`
+- `continue_episode_artifacts`
+- `continue_workstreams`
+- `continue_workstream_episodes`
+- `continue_workstream_artifacts`
+- `continue_candidates`
+- `continue_decisions`
+- `continue_feedback_events`
+- `continue_breadcrumbs`
+
+### Continue Artifacts
+
+Artifacts are stable local work objects. They can represent browser tabs, chat conversations, code editors, terminal surfaces, PDFs, Finder views, messaging threads, notes/documents, or unknown surfaces.
+
+The resolver prefers durable identity:
+
+- canonical URL when safe and meaningful
+- document path when available
+- app/window identity when no stronger object exists
+- stable hash-derived ids for deterministic local joins
+
+Artifacts keep identity confidence, evidence quality, privacy status, openability, first/last seen frame ids, and timestamps. This lets Continue talk about a target artifact without collapsing it into a screenshot.
+
+### Task Actions
+
+Task actions are derived from local event and frame evidence. Current action kinds include:
+
+- reading
+- editing
+- composing
+- searching
+- copying evidence
+- reviewing output
+- running command
+- observing command output
+- encountering error
+- navigating
+- switching context
+- branching away
+- returning to origin
+- idle after progress
+- messaging interrupt
+- verification branch
+- possible distraction
+- unknown
+
+Actions keep the evidence frame id, previous frame id, artifact ids, secondary artifact ids, event ids, confidence, and a local reason. Keyboard evidence is categorical and aggregate only; raw typed characters are not stored.
+
+### Episodes And Workstreams
+
+Episodes group adjacent task actions with boundary reasons such as idle after progress, interruption, branch, or return. Episode artifact roles include primary target, source evidence, branch support, output verification, blocker, interruption, current-focus-only, and unknown.
+
+Workstreams cluster related episodes and durable artifacts. A workstream has:
+
+- state: active, suspended, resumed, background, stale, or abandoned
+- title candidate
+- primary artifact id
+- created and last-active timestamps
+- confidence
+- unresolved signal
+- source
+
+Unresolved signals are local JSON notes, not model inventions. Examples include an error needing resolution, copied evidence not yet applied, an unfinished search branch, or idle after progress.
+
+### Local Continue Decision
+
+The main command is:
+
+```text
+get_continue_decision
+```
+
+Default behavior is local only:
+
+```ts
+await invoke("get_continue_decision", {
+  input: {
+    lookback_ms: 2700000,
+    rebuild_layers: true
+  }
+});
+```
+
+The request defaults to a 45 minute lookback, rebuilds the semantic/workstream layers, loads current focus, generates candidates, scores candidates, persists them, and returns a `ContinueDecisionResult`.
+
+The result separates:
+
+- `current_focus`: factual latest screen/artifact/frame
+- `current_activity`: local read of what appears to be happening now
+- `selected_workstream`: the workstream being continued
+- `return_target`: target artifact to return to
+- `resume_work_target`: actionable work target, kept separate from support/branch surfaces
+- `candidate_kind`: why this candidate exists
+- `last_meaningful_action`
+- `unresolved_state`
+- `next_action`
+- `confidence` and `confidence_label`
+- `evidence_anchors`: frame ids, action ids, episode ids, artifact ids
+- `missing_evidence`
+- `warnings`
+- `validation_status`
+
+Candidate scoring combines actionability, primary-target strength, unresolved state, branch/origin behavior, evidence quality, recency, openability, and privacy safety. Branch and support surfaces can be evidence without becoming the default return target.
+
+### Bounded OpenAI Micro-Inference
+
+OpenAI is optional for Continue. It is enabled only when the caller explicitly asks for it:
+
+```ts
+await invoke("get_continue_decision", {
+  input: {
+    lookback_ms: 2700000,
+    rebuild_layers: true,
+    micro_inference_enabled: true,
+    max_candidates_for_model: 5
+  }
+});
+```
+
+The backend reads `OPENAI_API_KEY` from process environment or project `.env`. Model selection defaults to `gpt-4.1-mini` and can be overridden by request `model`, `SMALLTALK_CONTINUE_OPENAI_MODEL`, `SMALLTALK_OPENAI_MODEL`, or `OPENAI_MODEL`.
+
+The request uses the OpenAI Responses API with Structured Outputs through a strict JSON schema. The model-facing pack is compact and candidate-bounded. It contains only:
+
+- current focus facts
+- top candidate workstreams
+- top continuation candidates
+- local candidate ids
+- target artifact ids/kinds/titles
+- URL/path availability booleans, not raw paths or raw URLs
+- local score components
+- last meaningful action summaries
+- unresolved-state reasons
+- evidence frame/action/episode ids
+- missing evidence notes
+- artifact role map
+- short manual breadcrumbs
+
+It does not include raw screenshots by default, raw timelines, raw database dumps, raw typed characters, full clipboard text, unredacted URLs, unredacted file paths, or frames excluded by privacy policy.
+
+The Structured Output fields are:
+
+- `selected_candidate_id`
+- `selected_workstream_id`
+- `intent_label`
+- `next_action`
+- `reason`
+- `confidence`: `low`, `medium`, or `high`
+- `uncertainty_notes`
+
+### Continue Model Validation
+
+The model result is never trusted directly. `validate_micro_inference_output` checks:
+
+- selected candidate id exists in the supplied local pack
+- selected workstream id matches the selected candidate
+- selected candidate was actually sent to the model
+- output does not contain unsupported URLs or paths
+- `next_action` is present only when compatible with the candidate
+- high confidence is rejected when local evidence is thin or missing
+- branch/support targets cannot override the primary target without a strong local candidate
+
+If the API call fails or validation fails, the decision is persisted with `source: "local_fallback"` and the local scorer result is returned. If validation succeeds, the decision source is `cloud_micro_inference`. Model name, `response_id`, validation notes, warnings, and validation status are stored on the decision row.
+
+### Continue Feedback
+
+Continue feedback is inferred locally after a decision. No UI prompt or nag is required.
+
+The command is:
+
+```text
+infer_continue_feedback
+```
+
+Feedback event kinds:
+
+- `accepted`: the user returned to the suggested target and stayed or acted there
+- `rejected`: the user opened the target but quickly left with no meaningful action
+- `ignored`: no target activity appeared inside the observation window
+- `corrected`: the user chose another artifact shortly after Continue
+- `auto_resumed`: the user naturally returned to the workstream without using the suggestion
+
+`get_continue_decision` also opportunistically infers feedback for pending prior decisions before creating a new decision. Feedback rows reference decision ids, observed frame ids, target artifact ids, chosen artifact ids, timestamps, confidence, and local reasons.
+
+### Breadcrumbs
+
+Breadcrumbs are local-only prospective notes attached to a workstream:
+
+```text
+add_continue_breadcrumb
+```
+
+They are backend storage only for now, not a product UI. A breadcrumb is capped, local, and later included as short evidence in bounded candidate packs. It should be used for concise context, not raw secrets or large pasted text.
+
+### Continue Eval Harness
+
+The command is:
+
+```text
+run_continue_eval
+```
+
+It can run the built-in fixture set or a JSON fixture file. The default harness covers:
+
+1. edit -> docs/search branch -> idle
+2. work target -> Slack/messaging interruption -> idle
+3. error -> search/docs -> no return
+4. source copied -> target edited
+5. source copied -> no target edit
+6. AI chat as support
+7. AI chat as primary
+8. terminal verification after edit
+9. terminal error as blocker
+10. thin OCR-only evidence
+11. nested dependent task
+
+The report includes:
+
+- target artifact correctness
+- Recall@k
+- MRR
+- current-focus false-positive rate
+- hallucinated artifact count
+- model validation fallback rate
+- per-case selected candidate, selected target, rank, validation status, and validation failures
+
+The current default fixture metrics are:
+
+- cases: 11
+- target artifact correctness: 11/11
+- Recall@k: 1.0
+- MRR: 1.0
+- current-focus false-positive rate: 0.0
+- hallucinated artifact count: 0
+- model validation fallback rate: 0.0
+
+### Continue Opening
+
+`open_resume_point` now accepts `continue_decision_id`. When present, it resolves the stored Continue decision target through `continue_decisions`, `continue_candidates`, and `continue_artifacts`, then uses the existing frame privacy and openability checks before opening anything. If the target is unsafe, missing, or not openable, the command falls back to local Smalltalk evidence instead of inventing a route.
+
 ## Resume-Query Bundle
 
 `Stop session` writes only the compact model-facing bundle:
@@ -611,6 +875,7 @@ The native app does not currently capture:
 - browser DOM from the native path
 - cloud embeddings
 - unbounded remote AI summaries over the raw native capture store
+- raw Continue candidate packs with unredacted paths or URLs
 
 ## Runtime Commands
 
@@ -628,6 +893,17 @@ The Tauri command surface exposed in `src-tauri/src/lib.rs` currently includes:
 - `build_resume_query_bundle`
 - `run_cloud_resume`
 - `get_cloud_resume_status`
+- `get_continue_memory_status`
+- `rebuild_continue_second_layer`
+- `rebuild_continue_third_layer`
+- `get_recent_continue_artifacts`
+- `get_recent_continue_task_actions`
+- `get_recent_continue_episodes`
+- `get_recent_continue_workstreams`
+- `get_continue_decision`
+- `add_continue_breadcrumb`
+- `infer_continue_feedback`
+- `run_continue_eval`
 - `open_resume_point`
 - `start_native_capture`
 - `stop_native_capture`

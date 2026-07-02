@@ -4,6 +4,16 @@
 
 This repository is centered on a Tauri desktop app. `src/` contains the React/Vite UI. `src-tauri/` contains the Rust backend, Tauri commands, SQLite capture logic, macOS native island code, and helper scripts under `src-tauri/scripts/`. Product notes live in `docs/` and `product.md`. The older WXT browser-extension prototype is preserved in `browser-extension/`, with shared logic in `browser-extension/src/shared/` and tests in `browser-extension/tests/`. Treat `resume_query_exports/`, `cloud_resume_exports/`, `output/`, `target/`, and local snapshot folders as generated artifacts unless a task explicitly asks for fixtures.
 
+## Continue Product Doctrine
+
+Smalltalk is continuation-first, not session-recorder-first. `Continue` is the primary product primitive; sessions, timelines, screenshots, and resume bundles are evidence, debugging, and export infrastructure rather than the core product model. The native desktop app is the MVP lane, so do not build or revive the browser extension for this MVP unless a task explicitly reopens that older prototype.
+
+Do not make `Stop Session` a prerequisite for `Continue`. Continue should observe local evidence, resolve stable artifacts, extract task actions, segment episodes, cluster workstreams, score continuation candidates, and return the user to the next actionable point with inspectable evidence.
+
+Do not send broad raw history to a model and ask it to invent intent. Any model call added later must be candidate-bounded, evidence-backed, and locally validated. Every continuation answer must separate factual current focus from actionable return target. Branch and support surfaces are evidence, not default return targets.
+
+Do not store raw typed characters or full clipboard text; preserve the existing privacy boundaries. Do not invent artifacts, URLs, file paths, user intent, or next actions. If evidence is thin, say it is thin. The backend must be able to explain every `Continue` result through frame ids, event ids, artifact ids, action ids, and evidence-quality notes.
+
 ## Build, Test, and Development Commands
 
 - `npm install`: install root React/Tauri dependencies.

@@ -1,5 +1,6 @@
 mod capture;
 mod capture_core;
+mod continuation;
 mod session_island;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -35,6 +36,17 @@ pub fn run() {
             capture::build_resume_query_bundle,
             capture::run_cloud_resume,
             capture::get_cloud_resume_status,
+            capture::get_continue_memory_status,
+            capture::rebuild_continue_second_layer,
+            capture::rebuild_continue_third_layer,
+            capture::get_recent_continue_artifacts,
+            capture::get_recent_continue_task_actions,
+            capture::get_recent_continue_episodes,
+            capture::get_recent_continue_workstreams,
+            capture::get_continue_decision,
+            capture::add_continue_breadcrumb,
+            capture::infer_continue_feedback,
+            capture::run_continue_eval,
             capture::open_resume_point,
             capture::get_native_storyboard_dossier,
             capture::classify_episode_transitions,

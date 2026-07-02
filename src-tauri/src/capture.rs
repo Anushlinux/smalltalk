@@ -1401,6 +1401,7 @@ pub struct CloudResumeStatus {
 pub struct OpenResumePointInput {
     pub output_path: Option<String>,
     pub session_id: Option<String>,
+    pub continue_decision_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub current_frame_id: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
@@ -2586,6 +2587,109 @@ pub fn get_cloud_resume_status() -> Result<CloudResumeStatus, String> {
         key_source: config.key_source,
         model: config.model,
     })
+}
+
+#[tauri::command]
+pub fn get_continue_memory_status(
+    app: AppHandle,
+) -> Result<crate::continuation::ContinueMemoryStatus, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::continue_memory_status(&conn)
+}
+
+#[tauri::command]
+pub fn rebuild_continue_second_layer(
+    app: AppHandle,
+    input: Option<crate::continuation::ContinueSecondLayerRebuildRequest>,
+) -> Result<crate::continuation::ContinueSecondLayerRebuildResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::rebuild_continue_second_layer(&conn, input.unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn rebuild_continue_third_layer(
+    app: AppHandle,
+    input: Option<crate::continuation::ContinueThirdLayerRebuildRequest>,
+) -> Result<crate::continuation::ContinueThirdLayerRebuildResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::rebuild_continue_third_layer(&conn, input.unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn get_recent_continue_artifacts(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<crate::continuation::RecentContinueArtifact>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::recent_continue_artifacts(&conn, limit)
+}
+
+#[tauri::command]
+pub fn get_recent_continue_task_actions(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<crate::continuation::RecentContinueTaskAction>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::recent_continue_task_actions(&conn, limit)
+}
+
+#[tauri::command]
+pub fn get_recent_continue_episodes(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<crate::continuation::RecentContinueEpisode>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::recent_continue_episodes(&conn, limit)
+}
+
+#[tauri::command]
+pub fn get_recent_continue_workstreams(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<crate::continuation::RecentContinueWorkstream>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::recent_continue_workstreams(&conn, limit)
+}
+
+#[tauri::command]
+pub fn get_continue_decision(
+    app: AppHandle,
+    input: Option<crate::continuation::ContinueDecisionRequest>,
+) -> Result<crate::continuation::ContinueDecisionResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::get_continue_decision(&conn, input.unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn add_continue_breadcrumb(
+    app: AppHandle,
+    input: crate::continuation::ContinueBreadcrumbRequest,
+) -> Result<crate::continuation::ContinueBreadcrumbResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::add_continue_breadcrumb(&conn, input)
+}
+
+#[tauri::command]
+pub fn infer_continue_feedback(
+    app: AppHandle,
+    input: Option<crate::continuation::ContinueFeedbackRequest>,
+) -> Result<Vec<crate::continuation::ContinueFeedbackEventResult>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::infer_continue_feedback(
+        &conn,
+        input.unwrap_or(crate::continuation::ContinueFeedbackRequest {
+            decision_id: None,
+            observation_window_ms: None,
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn run_continue_eval(
+    _app: AppHandle,
+    eval_file_path: Option<String>,
+) -> Result<crate::continuation::ContinueEvalReport, String> {
+    crate::continuation::run_continue_eval(eval_file_path)
 }
 
 #[tauri::command]
@@ -5380,6 +5484,12 @@ fn resolve_open_resume_point(
         ));
     }
 
+    if let Some(decision_id) = input.continue_decision_id.as_deref() {
+        if let Some(point) = resolve_continue_decision_for_open(conn, decision_id, warnings)? {
+            return Ok(Some(point));
+        }
+    }
+
     if let Some(file) = cloud_file {
         if let Some(point) = resolve_cloud_resume_target_for_open(conn, file, warnings)? {
             return Ok(Some(point));
@@ -5399,6 +5509,62 @@ fn resolve_open_resume_point(
     }
 
     Ok(None)
+}
+
+fn resolve_continue_decision_for_open(
+    conn: &Connection,
+    decision_id: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    let row = conn
+        .query_row(
+            "SELECT d.return_target_artifact_id, d.confidence, c.evidence_frame_id,
+                    a.last_seen_frame_id, a.browser_url
+             FROM continue_decisions d
+             LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
+             LEFT JOIN continue_artifacts a ON a.id = d.return_target_artifact_id
+             WHERE d.id = ?1",
+            params![decision_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((target_artifact_id, confidence, evidence_frame_id, last_seen_frame_id, _url)) = row
+    else {
+        warnings.push(format!("Continue decision {} was not found.", decision_id));
+        return Ok(None);
+    };
+    let frame_id = evidence_frame_id.or(last_seen_frame_id);
+    let Some(frame_id) = frame_id.and_then(|value| value.parse::<i64>().ok()) else {
+        warnings.push(format!(
+            "Continue decision {} has no openable target frame.",
+            decision_id
+        ));
+        return Ok(None);
+    };
+    let Some(frame) = frame_by_id(conn, frame_id)? else {
+        warnings.push(format!(
+            "Continue decision {} target frame {} is missing locally.",
+            decision_id, frame_id
+        ));
+        return Ok(None);
+    };
+    warnings.push(format!(
+        "Opening native Continue decision target{}.",
+        target_artifact_id
+            .as_deref()
+            .map(|id| format!(" {}", id))
+            .unwrap_or_default()
+    ));
+    resolved_open_resume_point_from_frame(conn, frame, None, confidence).map(Some)
 }
 
 fn resolve_cloud_resume_target_for_open(
@@ -17090,6 +17256,7 @@ fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 fn clear_capture_db(conn: &Connection) -> Result<(), String> {
+    crate::continuation::clear_continue_semantic_rows(conn)?;
     conn.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -17633,6 +17800,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     ensure_frame_columns(conn)?;
     ensure_session_columns(conn)?;
     ensure_episode_columns(conn)?;
+    crate::continuation::ensure_continue_schema(conn)?;
     ensure_default_exclusion_rules(conn)?;
     Ok(())
 }
@@ -24869,6 +25037,34 @@ mod tests {
             params![frame_id],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO continue_artifacts (
+                id, artifact_kind, stable_key, app_name, bundle_id, window_title,
+                browser_url, document_path, display_title, first_seen_frame_id,
+                last_seen_frame_id, first_seen_timestamp, last_seen_timestamp,
+                identity_confidence, evidence_quality, privacy_status, openability,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                'artifact-1', 'browser_tab', 'browser:https://example.com',
+                'Safari', 'com.apple.Safari', 'Example', 'https://example.com',
+                NULL, 'Example', ?1, ?1, 1000, 1000, 0.9, 'strong',
+                'normal', 'openable', 1000, 1000
+             )",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_artifact_observations (
+                id, artifact_id, frame_id, text_source, focused_node_evidence,
+                selected_text_present, visible_text_length, observation_confidence,
+                reason, timestamp_ms
+             ) VALUES (
+                'observation-1', 'artifact-1', ?1, 'accessibility', 1, 0,
+                42, 0.9, 'test observation', 1000
+             )",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
 
         clear_capture_db(&conn).unwrap();
 
@@ -24881,10 +25077,24 @@ mod tests {
         let fts: i64 = conn
             .query_row("SELECT COUNT(*) FROM frames_fts", [], |row| row.get(0))
             .unwrap();
+        let continue_artifacts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let continue_observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_artifact_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(frames, 0);
         assert_eq!(ocr, 0);
         assert_eq!(fts, 0);
+        assert_eq!(continue_artifacts, 0);
+        assert_eq!(continue_observations, 0);
 
         let next_frame_id = insert_test_frame(&conn, "/tmp/b.jpg");
         conn.execute(

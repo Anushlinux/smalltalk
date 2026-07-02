@@ -549,6 +549,7 @@ fn open_resume_point_from_island() {
             Some(OpenResumePointInput {
                 output_path,
                 session_id: None,
+                continue_decision_id: None,
                 current_frame_id: None,
                 target_frame_id: None,
             }),

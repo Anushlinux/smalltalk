@@ -1,0 +1,411 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 12,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1420-unit-1420-ocr-25",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "hai ki tu bass aise hi hot cute",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1420-unit-1420-ocr-26",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 4 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "beautiful bol deta",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1420-unit-1420-ocr-43",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• Copy page",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1420-unit-1420-ocr-27",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 7 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "i tought u wanted kids",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1420-unit-1420-ocr-44",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 8 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "our first Hyperframes video in under two",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Helium",
+      "confidence": 0.9200000000000002,
+      "duration_s": 90.0,
+      "episode_id": "ep-1415-1420",
+      "events": {
+        "app_switches": 7,
+        "clicks": 18,
+        "scrolls": 666,
+        "selections": 5,
+        "typing_bursts": 83
+      },
+      "frame_range": [
+        "1415",
+        "1420"
+      ],
+      "important_text": [
+        "State Session active"
+      ],
+      "keyframes": [
+        "1415",
+        "1417"
+      ],
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "browser_tab",
+      "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.0,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 1.0,
+    "final_score": 0.36960485423757045,
+    "frame_id": "1420",
+    "line_anchor_quality": 0.164,
+    "metadata_penalty": 0.0,
+    "recency": 0.08560485423757039,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.0,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1420-unit-1420-ocr-44",
+    "app": "Helium",
+    "confidence": 0.92,
+    "exact_visible_words": "our first Hyperframes video in under two",
+    "frame_id": "1420",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "browser_tab",
+      "canonical_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "captured_app": "Helium",
+      "captured_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 19.023255348205602,
+        "w": 322.32556152343744,
+        "x": 1107.2093079359556,
+        "y": 336.9767446261611
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "line_index": 7,
+      "next_line": "like obv not at 25",
+      "previous_line": "i tought u wanted kids",
+      "quote": "our first Hyperframes video in under two",
+      "reason": "ordered main_content line 8 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1420-ocr-44"
+    },
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_type": "browser_tab",
+    "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1420-unit-1420-ocr-44",
+    "app": "Helium",
+    "confidence": 0.92,
+    "exact_visible_words": "our first Hyperframes video in under two",
+    "frame_id": "1420",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "browser_tab",
+      "canonical_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "captured_app": "Helium",
+      "captured_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 19.023255348205602,
+        "w": 322.32556152343744,
+        "x": 1107.2093079359556,
+        "y": 336.9767446261611
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "line_index": 7,
+      "next_line": "like obv not at 25",
+      "previous_line": "i tought u wanted kids",
+      "quote": "our first Hyperframes video in under two",
+      "reason": "ordered main_content line 8 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1420-ocr-44"
+    },
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "source_or_discovery_surface",
+    "surface_type": "browser_tab",
+    "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+  },
+  "keyframes": [
+    {
+      "app": "Helium",
+      "frame_id": "1415",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "browser_tab",
+        "canonical_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+        "captured_app": "Helium",
+        "captured_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001415-origin.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1415",
+        "line_index": 21,
+        "quote": "State Session active",
+        "reason": "ordered main_content line 22 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1415-ocr-46"
+      },
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role": "origin",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 17.4,
+      "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "visible_text": "https://meet.google.com/dbh-ahkh-vmb"
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1420",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "browser_tab",
+        "canonical_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+        "captured_app": "Helium",
+        "captured_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001420-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1420",
+        "line_index": 23,
+        "quote": "CLI load them too):",
+        "reason": "ordered main_content line 24 from ocr content units",
+        "section_anchor": "CLI load them too):",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1420-ocr-51"
+      },
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 82.3,
+      "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "visible_text": "https://meet.google.com/dbh-ahkh-vmb"
+    }
+  ],
+  "missing_evidence": [
+    "2 internal Smalltalk frames omitted from model evidence"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "surface_state_source_or_discovery_surface"
+  ],
+  "resume_candidate": {
+    "app": "Helium",
+    "confidence": 0.92,
+    "exact_words": "our first Hyperframes video in under two",
+    "frame_id": "1420",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "browser_tab",
+      "canonical_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "captured_app": "Helium",
+      "captured_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 19.023255348205602,
+        "w": 322.32556152343744,
+        "x": 1107.2093079359556,
+        "y": 336.9767446261611
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1420",
+      "line_index": 7,
+      "next_line": "like obv not at 25",
+      "previous_line": "i tought u wanted kids",
+      "quote": "our first Hyperframes video in under two",
+      "reason": "ordered main_content line 8 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1420-ocr-44"
+    },
+    "local_url_ref": "url-hash-bcaecb0c7b17815d",
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "section_anchor": "CLI load them too):",
+    "surface_type": "browser_tab",
+    "visible_anchor": "https://meet.google.com/dbh-ahkh-vmb",
+    "window_title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 96.1,
+    "id": "session-1783029808502-1",
+    "started_at": 1783029808501,
+    "stopped_at": 1783029904582
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [],
+    "candidate_resume_frames": [
+      "1420"
+    ],
+    "current_frame_id": "1420",
+    "duration_s": 96.1,
+    "episode_count": 1,
+    "episodes": [
+      {
+        "app": "Helium",
+        "confidence": 0.9200000000000002,
+        "duration_s": 90.0,
+        "episode_id": "ep-1415-1420",
+        "events": {
+          "app_switches": 7,
+          "clicks": 18,
+          "scrolls": 666,
+          "selections": 5,
+          "typing_bursts": 83
+        },
+        "frame_range": [
+          "1415",
+          "1420"
+        ],
+        "important_text": [
+          "State Session active"
+        ],
+        "keyframes": [
+          "1415",
+          "1417"
+        ],
+        "quality_flags": [
+          "surface_state_source_or_discovery_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "browser_tab",
+        "title": "Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1783029808502-1",
+    "surface_sequence": [
+      "Helium/Meet - dbh-ahkh-vmb – Camera and microphone recording - High memory usage - 890 MB - Helium"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.92,
+    "evidence_frames": [
+      "1420",
+      "1415",
+      "1417"
+    ],
+    "summary": "our first Hyperframes video in under two"
+  },
+  "transitions": []
+}
