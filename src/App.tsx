@@ -8,7 +8,6 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type CaptureFrame = {
@@ -96,54 +95,10 @@ type SessionExportSummary = {
   counts: SessionCounts;
 };
 
-type ResumeLineAnchor = {
-  frame_id?: string | null;
-  quote?: string | null;
-  previous_line?: string | null;
-  next_line?: string | null;
-  line_index?: number | null;
-  source_unit_id?: string | null;
-  bounds?: {
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-  } | null;
-  source?: string | null;
-  semantic_role?: string | null;
-  section_anchor?: string | null;
-  confidence?: number | null;
-  reason?: string | null;
-};
-
-type ResumeQueryBundleResult = {
-  output_dir: string;
-  bundle_path: string;
-  byte_size: number;
-  image_count: number;
-  json_char_count: number;
-  bundle: {
-    schema: string;
-    candidate_episodes: unknown[];
-    resume_candidate?: {
-      frame_id: string;
-      app: string;
-      window_title: string;
-      confidence: number;
-      exact_words?: string;
-      line_anchor?: ResumeLineAnchor | null;
-      quality_flags?: string[];
-    };
-    missing_evidence?: string[];
-  };
-};
-
 type StopCaptureOutput = {
   status: CaptureStatus;
   session?: CaptureSession | null;
   export?: SessionExportSummary | null;
-  resume_query?: ResumeQueryBundleResult | null;
-  preview?: unknown;
 };
 
 type CaptureStatus = {
@@ -285,100 +240,6 @@ type FrameDetail = {
   transitions: TransitionSummary[];
 };
 
-type NativeResumeCard = {
-  generated_at_ms: number;
-  lookback_minutes: number;
-  what_was_i_doing: string;
-  what_was_i_reading?: string | null;
-  focus_now: string;
-  why_this_focus: string;
-  continue_from: {
-    frame_id?: string | null;
-    app_name?: string | null;
-    window_name?: string | null;
-    title?: string | null;
-    url?: string | null;
-    document_path?: string | null;
-    quote?: string | null;
-    line_anchor?: ResumeLineAnchor | null;
-    reason: string;
-  };
-  what_changed: string[];
-  useful_evidence: string[];
-  likely_distractions: string[];
-  behavior_read: {
-    mode: string;
-    confidence: number;
-    notes: string[];
-  };
-  next_action: string;
-  confidence: number;
-  evidence_frame_ids: string[];
-  evidence_transition_ids: string[];
-  warnings: string[];
-};
-
-type CloudResumeTarget = {
-  frame_id?: string | null;
-  app?: string | null;
-  title?: string | null;
-  reason?: string;
-  exact_words?: string | null;
-  exact_visible_words?: string | null;
-  anchor_id?: string | null;
-  section_anchor?: string | null;
-  line_anchor?: ResumeLineAnchor | null;
-};
-
-type CloudResumeResult = {
-  schema: string;
-  request?: {
-    session_id: string;
-    current_frame_id?: number | null;
-  };
-  cached?: boolean;
-  source: "cloud" | string;
-  decision: "current_focus" | "resume_target_found" | "ambiguous_current_focus_vs_prior_task" | "need_more_evidence" | "insufficient_evidence" | string;
-  resume_target?: CloudResumeTarget;
-  current_activity?: {
-    frame_id?: string | null;
-    app?: string | null;
-    title?: string | null;
-    activity_type?: string | null;
-    reason?: string;
-    exact_visible_words?: string | null;
-    anchor_id?: string | null;
-    line_anchor?: ResumeLineAnchor | null;
-  };
-  current_focus?: CloudResumeTarget;
-  resume_work_target?: CloudResumeTarget;
-  resume_target_if_returning?: CloudResumeTarget;
-  return_target?: CloudResumeTarget;
-  session_theme?: {
-    summary?: string;
-    evidence_frames?: string[];
-    confidence?: number;
-  };
-  rejected_input_target?: {
-    frame_id?: string | null;
-    reason?: string;
-  } | null;
-  answer?: {
-    focus_now?: string;
-    what_was_i_doing?: string;
-    why_this_focus?: string;
-    next_action?: string;
-  };
-  confidence: number;
-  warnings: string[];
-  evidence_limits?: string[];
-  evidence_handles: string[];
-  local_card: NativeResumeCard;
-  model?: string | null;
-  response_id?: string | null;
-  output_path?: string | null;
-};
-
 type OpenResumePointResult = {
   strategy: string;
   frame_id?: string | null;
@@ -386,12 +247,6 @@ type OpenResumePointResult = {
   anchor_text?: string | null;
   confidence: number;
   warnings: string[];
-};
-
-type CloudResumeStatus = {
-  has_key: boolean;
-  key_source: "process_env" | "project_env" | "missing" | string;
-  model: string;
 };
 
 type ContinueMemoryStatus = {
@@ -583,11 +438,6 @@ function App() {
   const [highlightedBoxId, setHighlightedBoxId] = useState<string | null>(null);
   const [imageData, setImageData] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [lastStopOutput, setLastStopOutput] = useState<StopCaptureOutput | null>(null);
-  const [resumeCard, setResumeCard] = useState<NativeResumeCard | null>(null);
-  const [cloudResume, setCloudResume] = useState<CloudResumeResult | null>(null);
-  const [cloudStatus, setCloudStatus] = useState<CloudResumeStatus | null>(null);
-  const [cloudError, setCloudError] = useState<string | null>(null);
   const [continueMemory, setContinueMemory] = useState<ContinueMemoryStatus | null>(null);
   const [continueDecision, setContinueDecision] = useState<ContinueDecisionResult | null>(null);
   const [continueError, setContinueError] = useState<string | null>(null);
@@ -617,20 +467,6 @@ function App() {
       setError(String(err));
     }
   }, [selectedFrame]);
-
-  const refreshCloudStatus = useCallback(async () => {
-    try {
-      const nextStatus = await invoke<CloudResumeStatus>("get_cloud_resume_status");
-      setCloudStatus(nextStatus);
-    } catch (err) {
-      setCloudStatus({
-        has_key: false,
-        key_source: "missing",
-        model: "gpt-4.1-mini",
-      });
-      setError(String(err));
-    }
-  }, []);
 
   const refreshContinueMemory = useCallback(async () => {
     try {
@@ -823,7 +659,6 @@ function App() {
             response.session?.id ||
             response.status.latest_session?.id ||
             currentSessionId;
-          setLastStopOutput(response);
           setStatus(response.status);
           await refreshStatus();
           await runSearch(query, stoppedSessionId);
@@ -836,13 +671,9 @@ function App() {
           await selectFrame(response as CaptureFrame);
         } else {
           const nextStatus = response as CaptureStatus;
-          setLastStopOutput(null);
           setSelectedFrame(null);
           setFrameDetail(null);
           setImageData(null);
-          setResumeCard(null);
-          setCloudResume(null);
-          setCloudError(null);
           setTimeline(emptyTimeline);
           setStatus(nextStatus);
           const nextSessionId =
@@ -884,10 +715,6 @@ function App() {
       setFrameDetail(null);
       setTimeline(emptyTimeline);
       setQuery("");
-      setLastStopOutput(null);
-      setResumeCard(null);
-      setCloudResume(null);
-      setCloudError(null);
       setStatus({
         ...nextStatus,
         running: false,
@@ -913,7 +740,6 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
-    void refreshCloudStatus();
     void refreshContinueMemory();
     void refreshWorkstreams();
     void runSearch("");
@@ -1056,178 +882,12 @@ function App() {
   const sessionLabel = currentSession
     ? `${currentSession.status} capture-${String(currentSession.sequence).padStart(3, "0")}`
     : "No capture";
-  const stopBundle = lastStopOutput?.resume_query || null;
-  const cloudBundleLabel = stopBundle ? pathBasename(stopBundle.output_dir) : "None";
   const activeContext = frameDetail?.app_contexts[0];
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No frame selected";
-  const cloudStatusTitle = cloudResume?.source === "cloud"
-    ? "OpenAI answered"
-    : cloudError
-      ? "OpenAI request failed"
-      : cloudStatus?.has_key
-    ? "OpenAI key connected"
-    : "OpenAI key missing";
-  const cloudStatusDetail = cloudError
-    ? cloudError
-    : cloudStatus?.has_key
-    ? `Using ${cloudStatus.model} from ${cloudStatus.key_source === "process_env" ? "process env" : "project .env"}`
-    : "Ask OpenAI will fail clearly until OPENAI_API_KEY is available.";
-  const cloudResultSummary = cloudResume
-    ? cloudResume.source === "cloud"
-      ? cloudResume.cached
-        ? "Cached cloud answer"
-        : cloudResume.answer?.focus_now || "Cloud answer saved"
-      : "Rejected non-cloud result"
-    : cloudError
-      ? "No OpenAI answer generated"
-      : "No OpenAI answer yet";
-  const cloudCurrentFocus = cloudResume?.current_focus || null;
-  const cloudReturnTarget = cloudResume?.resume_target_if_returning || null;
-  const cloudTarget = cloudReturnTarget || cloudResume?.resume_target || null;
-  const cloudLineAnchor = cloudTarget?.line_anchor || null;
-  const cloudExactLine =
-    presentLine(cloudLineAnchor?.quote) ||
-    presentLine(cloudTarget?.exact_visible_words) ||
-    presentLine(cloudTarget?.exact_words);
-  const cloudCurrentLine =
-    presentLine(cloudCurrentFocus?.line_anchor?.quote) ||
-    presentLine(cloudCurrentFocus?.exact_visible_words) ||
-    presentLine(cloudCurrentFocus?.exact_words);
-  const cloudReturnLine =
-    presentLine(cloudReturnTarget?.line_anchor?.quote) ||
-    presentLine(cloudReturnTarget?.exact_visible_words) ||
-    presentLine(cloudReturnTarget?.exact_words);
-  const cloudEvidenceLine = lineAnchorEvidenceLabel(
-    cloudLineAnchor,
-    cloudTarget?.frame_id,
-  );
-  const cloudHasSplitTargets =
-    Boolean(cloudCurrentFocus?.frame_id && cloudReturnTarget?.frame_id) &&
-    cloudCurrentFocus?.frame_id !== cloudReturnTarget?.frame_id;
-  const resumeLineAnchor = resumeCard?.continue_from.line_anchor || null;
-  const resumeExactLine =
-    presentLine(resumeLineAnchor?.quote) ||
-    presentLine(resumeCard?.continue_from.quote);
-  const resumeEvidenceLine = lineAnchorEvidenceLabel(
-    resumeLineAnchor,
-    resumeCard?.continue_from.frame_id,
-  );
-  const openStopBundle = useCallback(async () => {
-    const path = lastStopOutput?.resume_query?.bundle_path;
-    if (!path) return;
-    try {
-      await openPath(path);
-    } catch (err) {
-      setError(String(err));
-    }
-  }, [lastStopOutput?.resume_query?.bundle_path]);
-
-  const acceptCloudResumeResult = useCallback((result: CloudResumeResult) => {
-    if (result.source !== "cloud" || !result.response_id) {
-      setCloudResume(null);
-      setCloudError("OpenAI did not return a cloud response id; no OpenAI answer was shown.");
-      return;
-    }
-    setCloudResume(result);
-    setCloudError(null);
-    setError(null);
-  }, []);
-
-  const generateCloudResume = useCallback(async () => {
-    setBusyAction("run_cloud_resume");
-    setCloudResume(null);
-    setCloudError(null);
-    setError(null);
-    try {
-      const result = await invoke<CloudResumeResult>("run_cloud_resume", {
-        input: {
-          current_frame_id: selectedFrame?.id ?? null,
-          allow_followup: true,
-        },
-      });
-      acceptCloudResumeResult(result);
-    } catch (err) {
-      setCloudError(readableOpenAIError(String(err)));
-    } finally {
-      setBusyAction(null);
-    }
-  }, [acceptCloudResumeResult, selectedFrame?.id]);
-
-  const generateNativeResumeCard = useCallback(async () => {
-    setBusyAction("get_native_resume_card");
-    setError(null);
-    try {
-      const card = await invoke<NativeResumeCard>("get_native_resume_card", {
-        input: {
-          lookback_minutes: 20,
-          current_frame_id: selectedFrame?.id ?? null,
-          max_keyframes: 10,
-        },
-      });
-      setResumeCard(card);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  }, [selectedFrame?.id]);
-
-  const openCloudResumePoint = useCallback(async (targetFrameId?: string | null) => {
-    if (!cloudResume) return;
-    setBusyAction("open_resume_point");
-    setError(null);
-    const parsedTargetFrameId = targetFrameId ? Number(targetFrameId) : null;
-    const safeTargetFrameId =
-      parsedTargetFrameId !== null && Number.isFinite(parsedTargetFrameId)
-        ? parsedTargetFrameId
-        : null;
-    try {
-      const result = await invoke<OpenResumePointResult>("open_resume_point", {
-        input: {
-          output_path: cloudResume.output_path ?? null,
-          session_id: cloudResume.request?.session_id ?? null,
-          current_frame_id: selectedFrame?.id ?? cloudResume.request?.current_frame_id ?? null,
-          target_frame_id: safeTargetFrameId,
-        },
-      });
-      if (result.warnings.length > 0) {
-        setError(result.warnings.join(" "));
-      }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  }, [cloudResume, selectedFrame?.id]);
-
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
-
-    listen("session-island-resume-requested", () => {
-      void generateCloudResume();
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-        } else {
-          unlisteners.push(nextUnlisten);
-        }
-      })
-      .catch((err) => setError(String(err)));
-
-    listen<CloudResumeResult>("session-island-cloud-resume-ready", (event) => {
-      acceptCloudResumeResult(event.payload);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-        } else {
-          unlisteners.push(nextUnlisten);
-        }
-      })
-      .catch((err) => setError(String(err)));
 
     listen<CaptureFrame>("capture-frame", (event) => {
       void refreshStatus();
@@ -1250,8 +910,6 @@ function App() {
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [
-    acceptCloudResumeResult,
-    generateCloudResume,
     refreshContinueMemory,
     refreshStatus,
     selectedFrame,
@@ -1392,14 +1050,19 @@ function App() {
         <div className="error-box" role="alert">{error || status.last_error}</div>
       ) : null}
 
-      <details
-        className="developer-panel"
-        open={evidenceOpen}
-        onToggle={(event) => setEvidenceOpen(event.currentTarget.open)}
-      >
+      {evidenceOpen ? (
+        <ContinueEvidencePanel
+          decision={continueDecision}
+          selectedFrame={selectedFrame}
+          imageData={imageData}
+          onClose={() => setEvidenceOpen(false)}
+        />
+      ) : null}
+
+      <details className="developer-panel diagnostics-panel">
         <summary>
-          <span>Evidence / Developer</span>
-          <strong>Timeline, search, frame inspector, stop bundles, and legacy resume tools</strong>
+          <span>Developer diagnostics</span>
+          <strong>Frame inspector, search, raw events, and local evidence substrate</strong>
         </summary>
 
         <form
@@ -1418,184 +1081,9 @@ function App() {
           <button type="submit" disabled={busyAction !== null}>Search evidence</button>
         </form>
 
-        <section
-        className={`cloud-resume-bar ${cloudResume?.source === "cloud" ? "ready" : cloudError || !cloudStatus?.has_key ? "missing" : "ready"}`}
-        aria-label="OpenAI resume output"
-      >
-        <div className="cloud-resume-status">
-          <p className="product-kicker">OpenAI resume</p>
-          <h2>{cloudStatusTitle}</h2>
-          <span>{cloudStatusDetail}</span>
-        </div>
-        <div className="cloud-resume-result">
-          <span>{cloudResultSummary}</span>
-          {cloudResume ? (
-            <strong>{cloudResumeProvenanceLabel(cloudResume)}</strong>
-          ) : (
-            <strong>Waiting for a resume request</strong>
-          )}
-        </div>
-        <div className="cloud-resume-actions">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busyAction !== null || !hasFrames}
-            aria-busy={busyAction === "run_cloud_resume"}
-            onClick={() => void generateCloudResume()}
-          >
-            {busyAction === "run_cloud_resume" ? "Asking OpenAI" : "Ask OpenAI"}
-          </button>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={busyAction !== null || !cloudResume}
-            aria-busy={busyAction === "open_resume_point"}
-            onClick={() => void openCloudResumePoint(cloudTarget?.frame_id ?? null)}
-          >
-            {busyAction === "open_resume_point" ? "Opening" : "Open return target"}
-          </button>
-          {cloudHasSplitTargets ? (
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null || !cloudResume}
-              aria-busy={busyAction === "open_resume_point"}
-              onClick={() => void openCloudResumePoint(cloudCurrentFocus?.frame_id ?? null)}
-            >
-              Open current focus
-            </button>
-          ) : null}
-        </div>
-        {cloudResume ? (
-          <div className="cloud-resume-details">
-            <dl className="resume-facts">
-              {cloudCurrentFocus ? (
-                <div>
-                  <dt>Current focus</dt>
-                  <dd>
-                    {[
-                      cloudCurrentFocus.frame_id ? `Frame ${cloudCurrentFocus.frame_id}` : null,
-                      cloudCurrentFocus.title || cloudCurrentFocus.app || null,
-                      cloudCurrentLine,
-                    ]
-                      .filter(Boolean)
-                      .join(" / ") || "No current focus returned"}
-                  </dd>
-                </div>
-              ) : null}
-              {cloudReturnTarget ? (
-                <div>
-                  <dt>Return target</dt>
-                  <dd>
-                    {[
-                      cloudReturnTarget.frame_id ? `Frame ${cloudReturnTarget.frame_id}` : null,
-                      cloudReturnTarget.title || cloudReturnTarget.app || null,
-                      cloudReturnLine,
-                    ]
-                      .filter(Boolean)
-                      .join(" / ") || "No return target returned"}
-                  </dd>
-                </div>
-              ) : null}
-              <div>
-                <dt>Exact line</dt>
-                <dd>{cloudExactLine || "No exact line returned"}</dd>
-              </div>
-              {presentLine(cloudLineAnchor?.previous_line) ? (
-                <div>
-                  <dt>Before</dt>
-                  <dd>{presentLine(cloudLineAnchor?.previous_line)}</dd>
-                </div>
-              ) : null}
-              {presentLine(cloudLineAnchor?.next_line) ? (
-                <div>
-                  <dt>After</dt>
-                  <dd>{presentLine(cloudLineAnchor?.next_line)}</dd>
-                </div>
-              ) : null}
-              <div>
-                <dt>Why</dt>
-                <dd>
-                  {[
-                    cloudResume.decision === "ambiguous_current_focus_vs_prior_task"
-                      ? "Current focus and return target are different."
-                      : null,
-                    cloudTarget?.reason || cloudResume.answer?.why_this_focus || null,
-                  ]
-                    .filter(Boolean)
-                    .join(" ") || "No reason returned"}
-                </dd>
-              </div>
-              {cloudResume.evidence_limits?.length ? (
-                <div>
-                  <dt>Limits</dt>
-                  <dd>{cloudResume.evidence_limits.slice(0, 3).join(" / ")}</dd>
-                </div>
-              ) : null}
-              <div>
-                <dt>Evidence</dt>
-                <dd>
-                  {[
-                    cloudEvidenceLine,
-                    cloudResume.evidence_handles.slice(0, 4).join(" / "),
-                  ]
-                    .filter(Boolean)
-                    .join(" / ") || "No evidence handles"}
-                </dd>
-              </div>
-            </dl>
-          </div>
-        ) : null}
-      </section>
-
-      {lastStopOutput?.resume_query ? (
-        <section className="session-output" aria-label="Stopped session output">
-          <div className="session-output-main">
-            <div>
-              <p className="product-kicker">Stop output</p>
-              <h2>Cloud-ready bundle ready</h2>
-            </div>
-            <dl>
-              <div>
-                <dt>Session</dt>
-                <dd>
-                  {lastStopOutput.session
-                    ? `session-${String(lastStopOutput.session.sequence).padStart(3, "0")}`
-                    : pathBasename(lastStopOutput.resume_query.output_dir)}
-                </dd>
-              </div>
-              <div>
-                <dt>Frames</dt>
-                <dd>{lastStopOutput.session?.counts.frames ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Images</dt>
-                <dd>{lastStopOutput.resume_query.image_count}</dd>
-              </div>
-              <div>
-                <dt>Episodes</dt>
-                <dd>{lastStopOutput.resume_query.bundle.candidate_episodes.length}</dd>
-              </div>
-            </dl>
-          </div>
-          <div className="artifact-path">
-            <span>{lastStopOutput.resume_query.bundle_path}</span>
-          </div>
-          <button
-            className="secondary-button open-artifact-button"
-            type="button"
-            onClick={() => void openStopBundle()}
-          >
-            Open bundle JSON
-          </button>
-          <pre>{formatStopPreview(lastStopOutput)}</pre>
-        </section>
-      ) : null}
-
       <section className="health-strip" aria-label="Capture health">
         <StatusPill label="State" value={captureStateLabel} tone={status.running ? "good" : "quiet"} />
         <StatusPill label="Session" value={sessionLabel} tone={status.running ? "good" : "quiet"} />
-        <StatusPill label="Cloud bundle" value={cloudBundleLabel} />
         <StatusPill label="Frames" value={status.frame_count} />
         <StatusPill label="Events" value={status.event_count} />
         <StatusPill label="Transitions" value={status.transition_count} />
@@ -1758,115 +1246,28 @@ function App() {
           <section className="resume-card">
             <div className="pane-heading compact">
               <div>
-                <h2>Resume cue</h2>
-                <p>
-                  {resumeCard
-                    ? `Local / last ${resumeCard.lookback_minutes} minutes`
-                    : "Safe native resume card"}
-                </p>
+                <h2>Selected evidence signal</h2>
+                <p>Diagnostic context only; Continue decides from workstreams.</p>
               </div>
-              <button
-                className="secondary-button"
-                type="button"
-                disabled={busyAction !== null || !hasFrames}
-                aria-busy={busyAction === "get_native_resume_card"}
-                onClick={() => void generateNativeResumeCard()}
-              >
-                {busyAction === "get_native_resume_card" ? "Reading" : "Resume me"}
-              </button>
             </div>
-            {resumeCard ? (
-              <div className="native-resume-card">
-                <strong>{resumeCard.focus_now}</strong>
-                <p>{resumeCard.what_was_i_doing}</p>
-                {resumeCard.what_was_i_reading ? (
-                  <p>{resumeCard.what_was_i_reading}</p>
-                ) : null}
-                <dl className="resume-facts">
-                  <div>
-                    <dt>Continue from</dt>
-                    <dd>
-                      {resumeCard.continue_from.title ||
-                        resumeCard.continue_from.window_name ||
-                        resumeCard.continue_from.app_name ||
-                        "No safe frame"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Exact line</dt>
-                    <dd>{resumeExactLine || "No exact line available"}</dd>
-                  </div>
-                  {presentLine(resumeLineAnchor?.previous_line) ? (
-                    <div>
-                      <dt>Before</dt>
-                      <dd>{presentLine(resumeLineAnchor?.previous_line)}</dd>
-                    </div>
-                  ) : null}
-                  {presentLine(resumeLineAnchor?.next_line) ? (
-                    <div>
-                      <dt>After</dt>
-                      <dd>{presentLine(resumeLineAnchor?.next_line)}</dd>
-                    </div>
-                  ) : null}
-                  <div>
-                    <dt>Why</dt>
-                    <dd>{resumeCard.why_this_focus}</dd>
-                  </div>
-                  <div>
-                    <dt>Target reason</dt>
-                    <dd>{resumeLineAnchor?.reason || resumeCard.continue_from.reason}</dd>
-                  </div>
-                  <div>
-                    <dt>Next action</dt>
-                    <dd>{resumeCard.next_action}</dd>
-                  </div>
-                  <div>
-                    <dt>Evidence</dt>
-                    <dd>
-                      {[
-                        resumeEvidenceLine,
-                        resumeCard.evidence_frame_ids.slice(0, 4).map((id) => `frame ${id}`).join(" / "),
-                      ]
-                        .filter(Boolean)
-                        .join(" / ") || "No evidence handles"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Confidence</dt>
-                    <dd>{confidenceLabel(resumeCard.confidence)}</dd>
-                  </div>
-                </dl>
-                {resumeExactLine ? (
-                  <blockquote>{resumeExactLine}</blockquote>
-                ) : null}
-                {resumeCard.warnings.length ? (
-                  <div className="resume-warning">
-                    {resumeCard.warnings.slice(0, 2).map((warning) => (
-                      <span key={warning}>{warning}</span>
-                    ))}
-                  </div>
-                ) : null}
+            <dl className="resume-facts">
+              <div>
+                <dt>Current surface</dt>
+                <dd>{activeContext?.title || selectedTitle}</dd>
               </div>
-            ) : (
-              <dl className="resume-facts">
-                <div>
-                  <dt>Current surface</dt>
-                  <dd>{activeContext?.title || selectedTitle}</dd>
-                </div>
-                <div>
-                  <dt>Likely object</dt>
-                  <dd>{activeContext?.object_type || "unknown"}</dd>
-                </div>
-                <div>
-                  <dt>Transition</dt>
-                  <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
-                </div>
-                <div>
-                  <dt>Focus now</dt>
-                  <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to infer focus."}</dd>
-                </div>
-              </dl>
-            )}
+              <div>
+                <dt>Likely object</dt>
+                <dd>{activeContext?.object_type || "unknown"}</dd>
+              </div>
+              <div>
+                <dt>Transition</dt>
+                <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
+              </div>
+              <div>
+                <dt>Strongest text</dt>
+                <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to inspect text."}</dd>
+              </div>
+            </dl>
           </section>
 
           <section className="detail-drawer">
@@ -1962,7 +1363,7 @@ function ContinueDecisionCard({
             {busyAction === "start_capture" ? "Starting" : "Start local memory"}
           </button>
           <button className="secondary-button" type="button" onClick={onShowEvidence}>
-            Open developer capture controls
+            Show evidence
           </button>
         </div>
       </section>
@@ -2129,6 +1530,145 @@ function ContinueDecisionCard({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function ContinueEvidencePanel({
+  decision,
+  selectedFrame,
+  imageData,
+  onClose,
+}: {
+  decision: ContinueDecisionResult | null;
+  selectedFrame: CaptureFrame | null;
+  imageData: string | null;
+  onClose: () => void;
+}) {
+  const target = decision?.resume_work_target || decision?.return_target || null;
+  const warnings = [
+    ...(decision?.missing_evidence || []),
+    ...(decision?.warnings || []),
+    ...(decision?.validation_failures || []),
+  ];
+
+  if (!decision) {
+    return (
+      <section className="continue-evidence-panel empty" aria-label="Continue evidence">
+        <div className="continue-evidence-head">
+          <div>
+            <p className="product-kicker">Continue evidence</p>
+            <h2>Run Continue after local memory has evidence.</h2>
+          </div>
+          <button className="secondary-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="continue-evidence-panel" aria-label="Continue evidence">
+      <div className="continue-evidence-head">
+        <div>
+          <p className="product-kicker">Continue evidence</p>
+          <h2>{decision.selected_workstream?.title_candidate || continueTargetLabel(target) || "Selected workstream"}</h2>
+        </div>
+        <button className="secondary-button" type="button" onClick={onClose}>
+          Close
+        </button>
+      </div>
+
+      <div className="continue-evidence-grid">
+        <dl className="continue-evidence-facts">
+          <div>
+            <dt>Why this workstream</dt>
+            <dd>
+              {[
+                decision.candidate_kind ? sentenceCase(decision.candidate_kind) : null,
+                decision.selected_workstream?.state,
+                decision.selected_workstream?.unresolved_signal,
+              ].filter(Boolean).join(" / ") || "Selected by local continuation scoring."}
+            </dd>
+          </div>
+          <div>
+            <dt>Return target</dt>
+            <dd>{continueTargetLabel(target) || "No return target returned."}</dd>
+          </div>
+          <div>
+            <dt>Current screen</dt>
+            <dd>{continueFocusLabel(decision.current_focus)}</dd>
+          </div>
+          <div>
+            <dt>Last meaningful action</dt>
+            <dd>{continueActionLabel(decision.last_meaningful_action)}</dd>
+          </div>
+          <div>
+            <dt>Unresolved state</dt>
+            <dd>{decision.unresolved_state || "No unresolved state returned."}</dd>
+          </div>
+          <div>
+            <dt>Validation</dt>
+            <dd>{[decision.validation_status, decision.source, decision.response_id].filter(Boolean).join(" / ")}</dd>
+          </div>
+        </dl>
+
+        <div className="anchor-preview">
+          <div className="anchor-preview-head">
+            <strong>Evidence anchor</strong>
+            <span>{selectedFrame ? `frame ${selectedFrame.id}` : "No frame selected"}</span>
+          </div>
+          {selectedFrame && imageData ? (
+            <div className="anchor-image" style={stageStyle(selectedFrame)}>
+              <img src={imageData} alt={`Evidence anchor frame ${selectedFrame.id}`} />
+            </div>
+          ) : (
+            <div className="anchor-empty">
+              <strong>No preview loaded</strong>
+              <span>{selectedFrame ? frameTitle(selectedFrame) : "Continue returned anchor ids only."}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="anchor-id-grid">
+        <AnchorIdGroup title="Frames" ids={decision.evidence_anchors.frame_ids} />
+        <AnchorIdGroup title="Actions" ids={decision.evidence_anchors.action_ids} />
+        <AnchorIdGroup title="Episodes" ids={decision.evidence_anchors.episode_ids} />
+        <AnchorIdGroup title="Artifacts" ids={decision.evidence_anchors.artifact_ids} />
+      </div>
+
+      {warnings.length ? (
+        <div className="continue-warning-grid evidence-warnings">
+          <WarningGroup title="Evidence notes" items={warnings} />
+        </div>
+      ) : null}
+
+      {decision.alternatives.length ? (
+        <div className="alternative-list" aria-label="Other possible continuations">
+          <div className="alternative-heading">
+            <strong>Other possible continuations</strong>
+            <span>{decision.alternatives.length}</span>
+          </div>
+          {decision.alternatives.slice(0, 3).map((candidate) => (
+            <div className="alternative-row" key={candidate.candidate_id}>
+              <strong>{sentenceCase(candidate.candidate_kind)}</strong>
+              <span>{candidate.reason || candidate.target_artifact_id || "No reason returned"}</span>
+              <small>{candidate.confidence_label || confidenceLabel(candidate.score)}</small>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function AnchorIdGroup({ title, ids }: { title: string; ids: string[] }) {
+  return (
+    <div className="anchor-id-group">
+      <strong>{title}</strong>
+      <span>{ids.length ? ids.slice(0, 8).join(" / ") : "None"}</span>
+    </div>
   );
 }
 
@@ -2557,17 +2097,6 @@ function formatTime(value?: number | null) {
   }).format(new Date(value));
 }
 
-function formatStopPreview(output: StopCaptureOutput) {
-  return JSON.stringify(
-    output.preview || {
-      session: output.session,
-      resumeQuery: output.resume_query,
-    },
-    null,
-    2,
-  );
-}
-
 function pathBasename(path?: string | null) {
   if (!path) return "";
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
@@ -2576,23 +2105,6 @@ function pathBasename(path?: string | null) {
 function cleanSnippet(value?: string | null) {
   if (!value) return "No text";
   return value.replace(/\[/g, "").replace(/\]/g, "").replace(/\s+/g, " ").trim();
-}
-
-function presentLine(value?: string | null) {
-  if (!value) return null;
-  const text = value.replace(/\[/g, "").replace(/\]/g, "").replace(/\s+/g, " ").trim();
-  return text || null;
-}
-
-function lineAnchorEvidenceLabel(anchor?: ResumeLineAnchor | null, frameId?: string | null) {
-  const resolvedFrameId = frameId || anchor?.frame_id || null;
-  const parts = [
-    resolvedFrameId ? `frame ${resolvedFrameId}` : null,
-    anchor?.source || null,
-    anchor?.semantic_role || null,
-    typeof anchor?.confidence === "number" ? confidenceLabel(anchor.confidence) : null,
-  ].filter(Boolean);
-  return parts.join(" / ");
 }
 
 function hasBounds(item: BoxLike) {
@@ -2655,34 +2167,6 @@ function overlayCount(detail: FrameDetail | null, mode: OverlayMode) {
 function confidenceLabel(value?: number | null) {
   if (typeof value !== "number") return "unscored";
   return `${Math.round(value * 100)}%`;
-}
-
-function cloudResumeProvenanceLabel(result: CloudResumeResult) {
-  if (result.source === "cloud") {
-    return ["Cloud", result.model, result.response_id].filter(Boolean).join(" / ");
-  }
-  return "Rejected non-cloud result";
-}
-
-function readableOpenAIError(error: string) {
-  const lower = error.toLowerCase();
-  if (lower.includes("openai_api_key")) {
-    return "OPENAI_API_KEY is not set; Ask OpenAI did not call OpenAI.";
-  }
-  if (
-    lower.includes("could not resolve host") ||
-    lower.includes("couldn't resolve host") ||
-    lower.includes("exit status: 6")
-  ) {
-    return "OpenAI network unavailable: DNS could not resolve api.openai.com; no OpenAI answer was generated.";
-  }
-  if (lower.includes("authentication")) {
-    return "OpenAI authentication failed: check OPENAI_API_KEY; no OpenAI answer was generated.";
-  }
-  if (lower.includes("rate limit")) {
-    return "OpenAI rate limit reached; no OpenAI answer was generated.";
-  }
-  return error.replace(/^Error:\s*/, "");
 }
 
 function topContentUnit(detail: FrameDetail | null) {

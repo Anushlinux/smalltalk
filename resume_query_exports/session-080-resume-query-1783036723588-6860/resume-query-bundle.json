@@ -1,0 +1,696 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 12,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1470-unit-1470-ocr-39",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "is_browser_chrome": false,
+      "reason": "resume_query_lint protected anchor: ordered main_content line 16 from ocr conte...",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "That means the product should no longer answer:",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 0.0,
+      "episode_id": "ep-1444-1444",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1444",
+        "1444"
+      ],
+      "important_text": [
+        "ok forget about ui and its still shit but after all the changes what should i expect now? What should i do to see the changes now?"
+      ],
+      "keyframes": [
+        "1444"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "timeline_context",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Context Restoration Insights – left view - Helium"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 0.0,
+      "episode_id": "ep-1447-1447",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1447",
+        "1447"
+      ],
+      "important_text": [
+        "• Web search ok so forgetting about the ui given the changes what"
+      ],
+      "keyframes": [
+        "1447"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role_guess": "timeline_context",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Context Restoration Insights – left view - Helium"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.9200000000000002,
+      "duration_s": 46.6,
+      "episode_id": "ep-1463-1470",
+      "events": {
+        "app_switches": 2,
+        "clicks": 4,
+        "scrolls": 281,
+        "selections": 2,
+        "typing_bursts": 1
+      },
+      "frame_range": [
+        "1463",
+        "1470"
+      ],
+      "important_text": [
+        "(like Recall@k and MRR) to properly test the ranking quality of your local candidate scorer."
+      ],
+      "keyframes": [
+        "1463",
+        "1467"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Context Restoration Insights – left view - Helium"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.92,
+      "duration_s": 0.0,
+      "episode_id": "ep-1468-1468",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1468",
+        "1468"
+      ],
+      "important_text": [
+        "You should not expect \"a better session summary\" now. You should expect a Continue decision."
+      ],
+      "keyframes": [
+        "1468"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "chat_conversation",
+      "title": "smalltalk - Context Restoration Insights – left view - Helium"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.0,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 1.0,
+    "final_score": 0.9301882462533911,
+    "frame_id": "1470",
+    "line_anchor_quality": 0.18400000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.096188246253391,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.25,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1470-unit-1470-ocr-39",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1470-unit-1470-ocr-39",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "keyframes": [
+    {
+      "app": "Helium",
+      "frame_id": "1468",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001468-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1468",
+        "line_index": 23,
+        "quote": "You should not expect \"a better session summary\" now. You should expect a Continue decision.",
+        "reason": "ordered main_content line 24 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1468-ocr-41"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 143.8,
+      "title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "visible_text": "G smalltalk I Share project instructions help keep Codex aligned before work st..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1470",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001470-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1470",
+        "line_index": 15,
+        "quote": "That means the product should no longer answer:",
+        "reason": "ordered main_content line 16 from ocr content units",
+        "section_anchor": "That means the product should no longer answer:",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1470-ocr-39"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 152.8,
+      "title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "visible_text": "should"
+    }
+  ],
+  "missing_evidence": [
+    "11 internal Smalltalk frames omitted from model evidence"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "surface_state_actionable_task_surface",
+    "surface_state_current_work_surface",
+    "surface_state_source_or_discovery_surface",
+    "current_frame_missing_page_body_anchor"
+  ],
+  "resume_candidate": {
+    "app": "Helium",
+    "confidence": 0.92,
+    "exact_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "local_url_ref": "url-hash-9485387bbfc56f6d",
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "section_anchor": "That means the product should no longer answer:",
+    "surface_type": "chat_conversation",
+    "visible_anchor": "should",
+    "window_title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1470-unit-1470-ocr-39",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "resume_work_target": {
+    "anchor_id": "1470-unit-1470-ocr-39",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "return_target": {
+    "anchor_id": "1470-unit-1470-ocr-39",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "That means the product should no longer answer:",
+    "frame_id": "1470",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "chat_conversation",
+      "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "captured_app": "Helium",
+      "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 22.32558059692387,
+        "w": 364.6511535644532,
+        "x": 334.8837194658356,
+        "y": 483.72093075580165
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1470",
+      "line_index": 15,
+      "next_line": "to explicitly instruct the agent to utilize your OpenAl API integration.",
+      "previous_line": "Here is the improved and hardened markdown file. I have updated the micro-inference sections",
+      "quote": "That means the product should no longer answer:",
+      "reason": "ordered main_content line 16 from ocr content units",
+      "section_anchor": "That means the product should no longer answer:",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1470-ocr-39"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "chat_conversation",
+    "title": "smalltalk - Context Restoration Insights – left view - Helium"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 158.9,
+    "id": "session-1783036556740-1",
+    "started_at": 1783036556740,
+    "stopped_at": 1783036715617
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [
+      "1450"
+    ],
+    "candidate_resume_frames": [
+      "1468",
+      "1470"
+    ],
+    "current_frame_id": "1470",
+    "duration_s": 158.9,
+    "episode_count": 4,
+    "episodes": [
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 0.0,
+        "episode_id": "ep-1444-1444",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1444",
+          "1444"
+        ],
+        "important_text": [
+          "ok forget about ui and its still shit but after all the changes what should i expect now? What should i do to see the changes now?"
+        ],
+        "keyframes": [
+          "1444"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "timeline_context",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Context Restoration Insights – left view - Helium"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 0.0,
+        "episode_id": "ep-1447-1447",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1447",
+          "1447"
+        ],
+        "important_text": [
+          "• Web search ok so forgetting about the ui given the changes what"
+        ],
+        "keyframes": [
+          "1447"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface"
+        ],
+        "role_guess": "timeline_context",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Context Restoration Insights – left view - Helium"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.9200000000000002,
+        "duration_s": 46.6,
+        "episode_id": "ep-1463-1470",
+        "events": {
+          "app_switches": 2,
+          "clicks": 4,
+          "scrolls": 281,
+          "selections": 2,
+          "typing_bursts": 1
+        },
+        "frame_range": [
+          "1463",
+          "1470"
+        ],
+        "important_text": [
+          "(like Recall@k and MRR) to properly test the ranking quality of your local candidate scorer."
+        ],
+        "keyframes": [
+          "1463",
+          "1467"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Context Restoration Insights – left view - Helium"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.92,
+        "duration_s": 0.0,
+        "episode_id": "ep-1468-1468",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1468",
+          "1468"
+        ],
+        "important_text": [
+          "You should not expect \"a better session summary\" now. You should expect a Continue decision."
+        ],
+        "keyframes": [
+          "1468"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "chat_conversation",
+        "title": "smalltalk - Context Restoration Insights – left view - Helium"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_actionable_task_surface",
+      "surface_state_current_work_surface",
+      "surface_state_source_or_discovery_surface",
+      "current_frame_missing_page_body_anchor"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1783036556740-1",
+    "surface_sequence": [
+      "Helium/smalltalk - Context Restoration Insights – left view - Helium",
+      "Helium/Enhancing Markdown with OpenAI Integration - Google Gemini – right view - Helium",
+      "Helium/smalltalk - Context Restoration Insights – left view - Helium",
+      "Codex/Codex",
+      "Helium/smalltalk - Context Restoration Insights – left view - Helium"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.55,
+    "evidence_frames": [
+      "1470",
+      "1463",
+      "1467"
+    ],
+    "summary": "(like Recall@k and MRR) to properly test the ranking quality of your local candidate scorer."
+  },
+  "transitions": []
+}
