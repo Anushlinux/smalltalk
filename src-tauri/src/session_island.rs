@@ -401,7 +401,8 @@ fn continue_from_island() {
             Some(crate::continuation::ContinueDecisionRequest {
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
-                micro_inference_enabled: Some(false),
+                micro_inference_enabled: Some(true),
+                max_candidates_for_model: Some(5),
                 ..Default::default()
             }),
         ) {
@@ -614,7 +615,8 @@ fn open_resume_point_from_island() {
                 Some(crate::continuation::ContinueDecisionRequest {
                     mode: Some("normal".to_string()),
                     rebuild_layers: Some(false),
-                    micro_inference_enabled: Some(false),
+                    micro_inference_enabled: Some(true),
+                    max_candidates_for_model: Some(5),
                     ..Default::default()
                 }),
             ) {

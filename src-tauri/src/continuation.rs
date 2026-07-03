@@ -450,9 +450,23 @@ pub struct ContinueDecisionResult {
     pub missing_evidence: Vec<String>,
     pub warnings: Vec<String>,
     pub validation_failures: Vec<String>,
+    pub handoff: ContinueHandoff,
     pub alternatives: Vec<ContinueCandidateSummary>,
     pub generated_candidates: i64,
     pub validation_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueHandoff {
+    pub headline: String,
+    pub return_line: String,
+    pub current_focus_line: String,
+    pub last_state_line: String,
+    pub next_action: String,
+    pub why_this: Vec<String>,
+    pub missing_evidence_line: Option<String>,
+    pub confidence_label: String,
+    pub user_visible_uncertainty: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1240,9 +1254,16 @@ struct ContinueMicroInferenceOutput {
     selected_candidate_id: String,
     selected_workstream_id: String,
     intent_label: String,
+    headline: String,
+    return_line: String,
+    current_focus_line: String,
+    last_state_line: String,
     next_action: Option<String>,
+    why_this: Vec<String>,
+    missing_evidence_line: Option<String>,
     reason: String,
     confidence: String,
+    user_visible_uncertainty: Option<String>,
     uncertainty_notes: Option<String>,
 }
 
@@ -1259,6 +1280,7 @@ struct CachedContinueDecisionMeta {
     model: Option<String>,
     response_id: Option<String>,
     next_action: Option<String>,
+    handoff: Option<ContinueHandoff>,
     confidence: f64,
     warnings: Vec<String>,
     validation_status: String,
@@ -1556,6 +1578,7 @@ pub fn get_continue_decision(
     let mut decision_reason = selected
         .as_ref()
         .and_then(|candidate| candidate.reason.clone());
+    let mut model_handoff_output: Option<ContinueMicroInferenceOutput> = None;
 
     if micro_inference_enabled && !candidates.is_empty() {
         match continue_openai_config(request.model.clone()) {
@@ -1608,6 +1631,7 @@ pub fn get_continue_decision(
                                         warnings.push(format!("model_uncertainty:{}", note));
                                     }
                                     response_id = model_result.response_id;
+                                    model_handoff_output = Some(model_result.output.clone());
                                     source = "cloud_micro_inference".to_string();
                                     validation_status = "valid".to_string();
                                 }
@@ -1651,6 +1675,9 @@ pub fn get_continue_decision(
         response_id = cached.response_id.clone();
         if cached.next_action.is_some() {
             next_action = cached.next_action.clone();
+        }
+        if cached.handoff.is_some() {
+            model_handoff_output = None;
         }
         confidence = cached.confidence;
         if !cached.warnings.is_empty() {
@@ -1700,6 +1727,26 @@ pub fn get_continue_decision(
     } else {
         Some(validation_failures.join(";"))
     };
+    let missing_evidence = selected
+        .as_ref()
+        .map(|candidate| candidate.missing_evidence.clone())
+        .unwrap_or_else(|| vec!["no_candidate_generated".to_string()]);
+    let handoff = cached_meta
+        .as_ref()
+        .and_then(|cached| cached.handoff.clone())
+        .unwrap_or_else(|| {
+            compose_continue_handoff(
+                current_focus.as_ref(),
+                selected_workstream.as_ref(),
+                selected.as_ref(),
+                next_action.as_deref(),
+                round_score(confidence),
+                &missing_evidence,
+                &warnings,
+                &validation_failures,
+                model_handoff_output.as_ref(),
+            )
+        });
 
     if cached_meta.is_none() {
         insert_continue_decision(
@@ -1718,6 +1765,7 @@ pub fn get_continue_decision(
             response_id.as_deref(),
             model.as_deref(),
             validation_notes.as_deref(),
+            &handoff,
         )?;
     }
 
@@ -1726,10 +1774,6 @@ pub fn get_continue_decision(
         selected.as_ref(),
         selected_workstream.as_ref(),
     );
-    let missing_evidence = selected
-        .as_ref()
-        .map(|candidate| candidate.missing_evidence.clone())
-        .unwrap_or_else(|| vec!["no_candidate_generated".to_string()]);
     let alternatives = candidates
         .iter()
         .take(3)
@@ -1783,6 +1827,7 @@ pub fn get_continue_decision(
         missing_evidence,
         warnings,
         validation_failures,
+        handoff,
         alternatives,
         generated_candidates: candidates.len() as i64,
         validation_status,
@@ -1932,7 +1977,11 @@ fn fresh_cached_continue_decision(
         .prepare(
             "SELECT d.id, d.source, d.model, d.response_id, d.next_action,
                     d.confidence, d.warnings, d.validation_status,
-                    d.validation_notes, d.decision_reason
+                    d.validation_notes, d.decision_reason, d.handoff_headline,
+                    d.handoff_return_line, d.handoff_current_focus_line,
+                    d.handoff_last_state_line, d.handoff_next_action,
+                    d.handoff_why_this, d.handoff_missing_evidence_line,
+                    d.handoff_confidence_label, d.handoff_user_visible_uncertainty
              FROM continue_decisions d
              LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
              WHERE d.requested_at_ms >= ?1
@@ -1950,6 +1999,7 @@ fn fresh_cached_continue_decision(
             model: row.get(2)?,
             response_id: row.get(3)?,
             next_action: row.get(4)?,
+            handoff: cached_handoff_from_row(row)?,
             confidence: row.get(5)?,
             warnings: split_semicolon_list(warnings.as_deref()),
             validation_status: row.get(7)?,
@@ -2063,6 +2113,46 @@ fn split_semicolon_list(value: Option<&str>) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_handoff_why_this(value: Option<&str>) -> Vec<String> {
+    let Some(raw) = value else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_else(|_| split_semicolon_list(Some(raw)))
+        .into_iter()
+        .filter_map(|item| clean_handoff_line(item, 140))
+        .take(3)
+        .collect()
+}
+
+fn cached_handoff_from_row(row: &Row<'_>) -> rusqlite::Result<Option<ContinueHandoff>> {
+    let headline: Option<String> = row.get(10)?;
+    let Some(headline) = headline else {
+        return Ok(None);
+    };
+    Ok(Some(ContinueHandoff {
+        headline,
+        return_line: row
+            .get::<_, Option<String>>(11)?
+            .unwrap_or_else(|| "No stable return target yet.".to_string()),
+        current_focus_line: row
+            .get::<_, Option<String>>(12)?
+            .unwrap_or_else(|| "Current focus is unclear.".to_string()),
+        last_state_line: row
+            .get::<_, Option<String>>(13)?
+            .unwrap_or_else(|| "No meaningful prior state is clear yet.".to_string()),
+        next_action: row.get::<_, Option<String>>(14)?.unwrap_or_else(|| {
+            "Open the target and continue from the last meaningful state.".to_string()
+        }),
+        why_this: parse_handoff_why_this(row.get::<_, Option<String>>(15)?.as_deref()),
+        missing_evidence_line: row.get(16)?,
+        confidence_label: row
+            .get::<_, Option<String>>(17)?
+            .unwrap_or_else(|| "thin".to_string()),
+        user_visible_uncertainty: row.get(18)?,
+    }))
 }
 
 fn load_scorer_workstreams(conn: &Connection, limit: i64) -> Result<Vec<ScorerWorkstream>, String> {
@@ -4015,7 +4105,7 @@ fn build_continue_openai_request(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "You are Smalltalk's bounded Continue adjudicator. Use only supplied candidate ids and evidence facts. You may rank and phrase, but you must not invent artifacts, paths, URLs, evidence, or intent. Select low confidence when evidence is thin."
+                        "text": "You are Smalltalk's bounded Continue handoff composer. Use only supplied candidate ids and evidence facts. You may select a candidate and phrase one concise user-facing handoff, but you must not invent artifacts, paths, URLs, evidence, or intent. Do not include raw ids. Select low confidence when evidence is thin."
                     }
                 ]
             },
@@ -4040,18 +4130,37 @@ fn continue_micro_inference_schema() -> Value {
             "selected_candidate_id",
             "selected_workstream_id",
             "intent_label",
+            "headline",
+            "return_line",
+            "current_focus_line",
+            "last_state_line",
             "next_action",
+            "why_this",
+            "missing_evidence_line",
             "reason",
             "confidence",
+            "user_visible_uncertainty",
             "uncertainty_notes"
         ],
         "properties": {
             "selected_candidate_id": {"type": "string"},
             "selected_workstream_id": {"type": "string"},
             "intent_label": {"type": "string"},
+            "headline": {"type": "string"},
+            "return_line": {"type": "string"},
+            "current_focus_line": {"type": "string"},
+            "last_state_line": {"type": "string"},
             "next_action": {"type": ["string", "null"]},
+            "why_this": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 3
+            },
+            "missing_evidence_line": {"type": ["string", "null"]},
             "reason": {"type": "string"},
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+            "user_visible_uncertainty": {"type": ["string", "null"]},
             "uncertainty_notes": {"type": ["string", "null"]}
         }
     })
@@ -4126,6 +4235,19 @@ fn validate_micro_inference_output(
     if unsupported_locator_in_model_output(output) {
         failures.push("model_output_contains_unsupported_url_or_path".to_string());
     }
+    if clean_handoff_line(output.headline.clone(), 90).is_none()
+        || clean_handoff_line(output.return_line.clone(), 180).is_none()
+        || clean_handoff_line(output.current_focus_line.clone(), 180).is_none()
+        || clean_handoff_line(output.last_state_line.clone(), 180).is_none()
+    {
+        failures.push("handoff_required_line_missing".to_string());
+    }
+    if output.why_this.is_empty() || output.why_this.len() > 3 {
+        failures.push("handoff_why_this_count_invalid".to_string());
+    }
+    if clean_handoff_reasons(&output.why_this).is_none() {
+        failures.push("handoff_why_this_empty".to_string());
+    }
     if output.next_action.as_ref().is_some_and(|action| {
         action.trim().is_empty()
             || action.len() > 220
@@ -4154,10 +4276,18 @@ fn validate_micro_inference_output(
 }
 
 fn unsupported_locator_in_model_output(output: &ContinueMicroInferenceOutput) -> bool {
+    let why_this = output.why_this.join(" ");
     let joined = [
         output.intent_label.as_str(),
+        output.headline.as_str(),
+        output.return_line.as_str(),
+        output.current_focus_line.as_str(),
+        output.last_state_line.as_str(),
         output.next_action.as_deref().unwrap_or(""),
+        why_this.as_str(),
+        output.missing_evidence_line.as_deref().unwrap_or(""),
         output.reason.as_str(),
+        output.user_visible_uncertainty.as_deref().unwrap_or(""),
         output.uncertainty_notes.as_deref().unwrap_or(""),
     ]
     .join(" ")
@@ -5198,6 +5328,229 @@ fn current_activity_summary(
         _ => "viewing",
     };
     Some(format!("{} {}", activity, surface))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_continue_handoff(
+    current_focus: Option<&ContinueFocusSummary>,
+    selected_workstream: Option<&ScorerWorkstream>,
+    selected: Option<&ScoredContinueCandidate>,
+    next_action: Option<&str>,
+    confidence: f64,
+    missing_evidence: &[String],
+    warnings: &[String],
+    validation_failures: &[String],
+    model_output: Option<&ContinueMicroInferenceOutput>,
+) -> ContinueHandoff {
+    let confidence_label_value = confidence_label(confidence).to_string();
+    if let Some(output) = model_output {
+        let local_fallback = compose_local_continue_handoff(
+            current_focus,
+            selected_workstream,
+            selected,
+            next_action,
+            confidence,
+            missing_evidence,
+            warnings,
+            validation_failures,
+        );
+        return ContinueHandoff {
+            headline: clean_handoff_line(output.headline.clone(), 90)
+                .unwrap_or(local_fallback.headline),
+            return_line: clean_handoff_line(output.return_line.clone(), 180)
+                .unwrap_or(local_fallback.return_line),
+            current_focus_line: clean_handoff_line(output.current_focus_line.clone(), 180)
+                .unwrap_or(local_fallback.current_focus_line),
+            last_state_line: clean_handoff_line(output.last_state_line.clone(), 180)
+                .unwrap_or(local_fallback.last_state_line),
+            next_action: output
+                .next_action
+                .as_ref()
+                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .unwrap_or(local_fallback.next_action),
+            why_this: clean_handoff_reasons(&output.why_this).unwrap_or(local_fallback.why_this),
+            missing_evidence_line: output
+                .missing_evidence_line
+                .as_ref()
+                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .or(local_fallback.missing_evidence_line),
+            confidence_label: confidence_label_value,
+            user_visible_uncertainty: output
+                .user_visible_uncertainty
+                .as_ref()
+                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .or(local_fallback.user_visible_uncertainty),
+        };
+    }
+
+    compose_local_continue_handoff(
+        current_focus,
+        selected_workstream,
+        selected,
+        next_action,
+        confidence,
+        missing_evidence,
+        warnings,
+        validation_failures,
+    )
+}
+
+fn compose_local_continue_handoff(
+    current_focus: Option<&ContinueFocusSummary>,
+    selected_workstream: Option<&ScorerWorkstream>,
+    selected: Option<&ScoredContinueCandidate>,
+    next_action: Option<&str>,
+    confidence: f64,
+    missing_evidence: &[String],
+    warnings: &[String],
+    validation_failures: &[String],
+) -> ContinueHandoff {
+    let target_label = selected
+        .and_then(|candidate| {
+            candidate
+                .resume_work_target
+                .as_ref()
+                .or(candidate.target_artifact.as_ref())
+        })
+        .and_then(artifact_title_for_scorer)
+        .unwrap_or_else(|| "the best available return point".to_string());
+    let workstream_label = selected_workstream
+        .and_then(|workstream| workstream.title_candidate.clone())
+        .or_else(|| Some(target_label.clone()))
+        .unwrap_or_else(|| "recent work".to_string());
+    let focus_label = current_focus
+        .and_then(|focus| {
+            first_non_empty([
+                focus.title.as_deref(),
+                focus.window_title.as_deref(),
+                focus.app_name.as_deref(),
+            ])
+            .map(str::to_string)
+        })
+        .unwrap_or_else(|| "the current screen".to_string());
+    let action_label = selected
+        .and_then(|candidate| candidate.last_meaningful_action.as_ref())
+        .map(|action| human_action_kind(&action.action_kind))
+        .unwrap_or("working");
+    let local_next_action = next_action
+        .and_then(|value| clean_handoff_line(value.to_string(), 180))
+        .unwrap_or_else(|| {
+            "Open the target and continue from the last meaningful state.".to_string()
+        });
+    let confidence_text = confidence_label(confidence).to_string();
+    let thin = confidence < 0.5 || selected.is_none();
+    let missing_line =
+        visible_missing_evidence_line(missing_evidence, warnings, validation_failures);
+    let uncertainty = if thin {
+        Some(missing_line.clone().unwrap_or_else(|| {
+            "Evidence is thin, so this is the best available handoff.".to_string()
+        }))
+    } else {
+        missing_line.clone()
+    };
+    let headline = if thin {
+        "Best available continuation".to_string()
+    } else {
+        format!("Continue {}", readable_fragment(&workstream_label, 68))
+    };
+    let mut why_this = Vec::new();
+    if let Some(candidate) = selected {
+        if candidate.resume_work_target.is_some() || candidate.target_artifact.is_some() {
+            why_this.push("Selected from local workstream and target evidence.".to_string());
+        }
+        if candidate.last_meaningful_action.is_some() {
+            why_this.push("Anchored to the last meaningful action.".to_string());
+        }
+        if candidate.evidence_quality_score >= 0.58 {
+            why_this.push("Evidence quality is strong enough for a recommendation.".to_string());
+        }
+    }
+    if why_this.is_empty() {
+        why_this.push(
+            "Local evidence is thin, but this is the strongest available signal.".to_string(),
+        );
+    }
+
+    ContinueHandoff {
+        headline: clean_handoff_line(headline, 90)
+            .unwrap_or_else(|| "Continue from recent work".to_string()),
+        return_line: clean_handoff_line(format!("Continue from {}", target_label), 180)
+            .unwrap_or_else(|| "No stable return target yet.".to_string()),
+        current_focus_line: clean_handoff_line(format!("Current focus: {}", focus_label), 180)
+            .unwrap_or_else(|| "Current focus is unclear.".to_string()),
+        last_state_line: clean_handoff_line(
+            format!(
+                "Last meaningful state: {} in {}",
+                action_label, workstream_label
+            ),
+            180,
+        )
+        .unwrap_or_else(|| "No meaningful prior state is clear yet.".to_string()),
+        next_action: local_next_action,
+        why_this,
+        missing_evidence_line: missing_line,
+        confidence_label: confidence_text,
+        user_visible_uncertainty: uncertainty,
+    }
+}
+
+fn clean_handoff_reasons(values: &[String]) -> Option<Vec<String>> {
+    let reasons = values
+        .iter()
+        .filter_map(|value| clean_handoff_line(value.clone(), 140))
+        .take(3)
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons)
+    }
+}
+
+fn clean_handoff_line(value: String, max_chars: usize) -> Option<String> {
+    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = one_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut output = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        output = output.trim_end_matches([' ', '.', ',']).to_string();
+        output.push_str("...");
+    }
+    Some(output)
+}
+
+fn readable_fragment(value: &str, max_chars: usize) -> String {
+    clean_handoff_line(value.to_string(), max_chars).unwrap_or_else(|| "recent work".to_string())
+}
+
+fn human_action_kind(kind: &str) -> &'static str {
+    match kind {
+        "editing" => "editing",
+        "composing" => "composing",
+        "encountering_error" => "an error was visible",
+        "running_command" => "a command was running",
+        "observing_command_output" | "reviewing_output" => "reviewing output",
+        "searching" => "searching for support",
+        "branching_away" => "using a support surface",
+        "idle_after_progress" => "paused after progress",
+        "reading" => "reading",
+        _ => "working",
+    }
+}
+
+fn visible_missing_evidence_line(
+    missing_evidence: &[String],
+    warnings: &[String],
+    validation_failures: &[String],
+) -> Option<String> {
+    let first = missing_evidence
+        .iter()
+        .chain(warnings.iter())
+        .chain(validation_failures.iter())
+        .find_map(|value| productize_continue_label(value))?;
+    clean_handoff_line(format!("Missing or weak evidence: {}", first), 180)
 }
 
 fn workstream_summary(workstream: &ScorerWorkstream) -> ContinueSelectedWorkstream {
@@ -8010,14 +8363,22 @@ fn insert_continue_decision(
     response_id: Option<&str>,
     model: Option<&str>,
     validation_notes: Option<&str>,
+    handoff: &ContinueHandoff,
 ) -> Result<(), String> {
     conn.execute(
         "INSERT OR REPLACE INTO continue_decisions (
             id, requested_at_ms, source, current_focus_frame_id,
             current_focus_artifact_id, selected_workstream_id, selected_candidate_id,
             return_target_artifact_id, confidence, decision_reason, next_action,
-            warnings, validation_status, response_id, model, validation_notes
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            warnings, validation_status, response_id, model, validation_notes,
+            handoff_headline, handoff_return_line, handoff_current_focus_line,
+            handoff_last_state_line, handoff_next_action, handoff_why_this,
+            handoff_missing_evidence_line, handoff_confidence_label,
+            handoff_user_visible_uncertainty
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+         )",
         params![
             decision_id,
             requested_at_ms,
@@ -8044,6 +8405,15 @@ fn insert_continue_decision(
             response_id,
             model,
             validation_notes,
+            handoff.headline.as_str(),
+            handoff.return_line.as_str(),
+            handoff.current_focus_line.as_str(),
+            handoff.last_state_line.as_str(),
+            handoff.next_action.as_str(),
+            serde_json::to_string(&handoff.why_this).map_err(to_string)?,
+            handoff.missing_evidence_line.as_deref(),
+            handoff.confidence_label.as_str(),
+            handoff.user_visible_uncertainty.as_deref(),
         ],
     )
     .map_err(to_string)?;
@@ -9046,6 +9416,40 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     ensure_column_exists(conn, "continue_decisions", "response_id", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "model", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "validation_notes", "TEXT")?;
+    ensure_column_exists(conn, "continue_decisions", "handoff_headline", "TEXT")?;
+    ensure_column_exists(conn, "continue_decisions", "handoff_return_line", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "handoff_current_focus_line",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "handoff_last_state_line",
+        "TEXT",
+    )?;
+    ensure_column_exists(conn, "continue_decisions", "handoff_next_action", "TEXT")?;
+    ensure_column_exists(conn, "continue_decisions", "handoff_why_this", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "handoff_missing_evidence_line",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "handoff_confidence_label",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "handoff_user_visible_uncertainty",
+        "TEXT",
+    )?;
     ensure_column_exists(
         conn,
         "continue_feedback_events",
@@ -10599,6 +11003,65 @@ mod tests {
     }
 
     #[test]
+    fn continue_decision_returns_local_handoff_without_openai() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "PRODUCT.md - smalltalk",
+            None,
+            Some("/Users/me/project/PRODUCT.md"),
+            "typing_pause",
+            "Continue architecture handoff composer",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "PRODUCT.md",
+            None,
+            Some("/Users/me/project/PRODUCT.md"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+
+        let decision = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!decision.handoff.headline.is_empty());
+        assert!(decision.handoff.return_line.contains("Continue from"));
+        assert!(!decision.handoff.current_focus_line.is_empty());
+        assert!(!decision.handoff.last_state_line.is_empty());
+        assert!(!decision.handoff.next_action.is_empty());
+        assert!(!decision.handoff.why_this.is_empty());
+
+        let persisted_headline: Option<String> = conn
+            .query_row(
+                "SELECT handoff_headline FROM continue_decisions WHERE id = ?1",
+                params![decision.decision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_headline.as_deref(),
+            Some(decision.handoff.headline.as_str())
+        );
+    }
+
+    #[test]
     fn continue_feedback_dedupes_repeated_explicit_feedback() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
@@ -10831,9 +11294,16 @@ mod tests {
                     selected_candidate_id: "invented-candidate".to_string(),
                     selected_workstream_id: "w".to_string(),
                     intent_label: "Invented".to_string(),
+                    headline: "Continue an invented target".to_string(),
+                    return_line: "Continue from https://invented.example/path".to_string(),
+                    current_focus_line: "Current focus is unknown".to_string(),
+                    last_state_line: "Last meaningful state is unsupported".to_string(),
                     next_action: Some("Open https://invented.example/path".to_string()),
+                    why_this: vec!["Unsupported invented target".to_string()],
+                    missing_evidence_line: None,
                     reason: "Unsupported invented target".to_string(),
                     confidence: "high".to_string(),
+                    user_visible_uncertainty: None,
                     uncertainty_notes: None,
                 }),
             }],
@@ -10846,5 +11316,48 @@ mod tests {
         assert!(report.cases[0]
             .validation_failures
             .contains(&"selected_candidate_id_not_in_fixture".to_string()));
+    }
+
+    #[test]
+    fn continue_eval_rejects_model_handoff_with_unsupported_locator() {
+        let fixture = ContinueEvalFixture {
+            k: Some(1),
+            cases: vec![ContinueEvalCaseFixture {
+                name: "bad_handoff_locator".to_string(),
+                scenario: "Unsupported handoff URL".to_string(),
+                expected_target_artifact_id: "known".to_string(),
+                current_focus_artifact_id: Some("known".to_string()),
+                candidates: vec![eval_candidate(
+                    "known-candidate",
+                    "w",
+                    Some("known"),
+                    0.82,
+                    "strong",
+                )],
+                model_output: Some(ContinueMicroInferenceOutput {
+                    selected_candidate_id: "known-candidate".to_string(),
+                    selected_workstream_id: "w".to_string(),
+                    intent_label: "Known work".to_string(),
+                    headline: "Continue known work".to_string(),
+                    return_line: "Continue from https://invented.example/path".to_string(),
+                    current_focus_line: "Current focus is known work".to_string(),
+                    last_state_line: "Last meaningful state was editing".to_string(),
+                    next_action: Some("Open the known target and continue.".to_string()),
+                    why_this: vec!["Local candidate evidence supports this target.".to_string()],
+                    missing_evidence_line: None,
+                    reason: "Valid candidate but invented locator in handoff".to_string(),
+                    confidence: "medium".to_string(),
+                    user_visible_uncertainty: None,
+                    uncertainty_notes: None,
+                }),
+            }],
+        };
+
+        let report = summarize_continue_eval_fixture(fixture).unwrap();
+
+        assert_eq!(report.model_validation_fallback_rate, 1.0);
+        assert!(report.cases[0]
+            .validation_failures
+            .contains(&"unsupported_locator_in_model_output".to_string()));
     }
 }

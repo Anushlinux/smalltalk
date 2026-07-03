@@ -450,9 +450,22 @@ type ContinueDecisionResult = {
   missing_evidence: string[];
   warnings: string[];
   validation_failures: string[];
+  handoff: ContinueHandoff;
   alternatives: ContinueCandidateSummary[];
   generated_candidates: number;
   validation_status: string;
+};
+
+type ContinueHandoff = {
+  headline: string;
+  return_line: string;
+  current_focus_line: string;
+  last_state_line: string;
+  next_action: string;
+  why_this: string[];
+  missing_evidence_line?: string | null;
+  confidence_label: string;
+  user_visible_uncertainty?: string | null;
 };
 
 type RecentContinueWorkstream = {
@@ -886,7 +899,8 @@ function App() {
         input: {
           mode: options.forceRebuild === true ? "rebuild" : "normal",
           rebuild_layers: options.forceRebuild === true,
-          micro_inference_enabled: false,
+          micro_inference_enabled: true,
+          max_candidates_for_model: 5,
         },
       });
       setContinueDecision(decision);
@@ -2120,7 +2134,8 @@ function ContinueDecisionCard({
   const resumeTarget = decision?.resume_work_target || decision?.return_target || null;
   const target = resumeTarget;
   const lowConfidence = decision ? decision.confidence < 0.55 : false;
-  const presentation = decision ? presentContinueDecision(decision) : null;
+  const handoff = decision?.handoff || null;
+  const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
   const refreshLabel = busyAction === "get_continue_decision"
@@ -2219,12 +2234,12 @@ function ContinueDecisionCard({
       <div className="continue-card-head">
         <div>
           <p className="product-kicker">{sourceLabel}</p>
-          <h2>{presentation?.workstreamTitle || "Recent workstream"}</h2>
+          <h2>{handoff?.headline || presentation?.workstreamTitle || "Recent workstream"}</h2>
         </div>
         <div className="continue-card-badges">
           <span className={`trust-badge ${stale ? "partial" : "complete"}`}>{refreshLabel}</span>
           <span className={`trust-badge ${lowConfidence ? "thin" : "complete"}`}>
-            {presentation?.confidenceLabel || confidenceLabel(decision.confidence)}
+            {handoff ? sentenceCase(handoff.confidence_label) : presentation?.confidenceLabel || confidenceLabel(decision.confidence)}
           </span>
         </div>
       </div>
@@ -2242,12 +2257,12 @@ function ContinueDecisionCard({
       <div className="continue-state-grid">
         <div className="target-block current-focus-target">
           <span>Current focus</span>
-          <strong>{presentation?.currentFocus || "No current screen returned."}</strong>
+          <strong>{handoff?.current_focus_line || presentation?.currentFocus || "No current screen returned."}</strong>
           <small>{presentation?.currentActivity || "Current activity is still thin."}</small>
         </div>
         <div className="target-block primary-target">
           <span>{lowConfidence ? "Best available return point" : "Return target"}</span>
-          <strong>{presentation?.returnTarget || "No target returned"}</strong>
+          <strong>{handoff?.return_line || presentation?.returnTarget || "No target returned"}</strong>
           <small>{presentation?.targetMeta || "Target metadata unavailable."}</small>
         </div>
       </div>
@@ -2255,12 +2270,12 @@ function ContinueDecisionCard({
       <div className="continue-state-grid product-state-grid">
         <div className="next-action-block">
           <span>Last meaningful state</span>
-          <strong>{presentation?.lastState || "No last state returned."}</strong>
+          <strong>{handoff?.last_state_line || presentation?.lastState || "No last state returned."}</strong>
         </div>
         <div className="next-action-block">
           <span>Next action</span>
           <strong>
-            {presentation?.nextAction || "Open the target and continue from the last meaningful state."}
+            {handoff?.next_action || presentation?.nextAction || "Open the target and continue from the last meaningful state."}
           </strong>
         </div>
       </div>
@@ -2268,10 +2283,28 @@ function ContinueDecisionCard({
       <div className="continue-evidence-summary">
         <div>
           <span>Confidence</span>
-          <strong>{presentation?.confidenceSummary || "Evidence quality unavailable."}</strong>
+          <strong>
+            {handoff
+              ? `${sentenceCase(handoff.confidence_label)} confidence`
+              : presentation?.confidenceSummary || "Evidence quality unavailable."}
+          </strong>
         </div>
-        <p>{presentation?.missingEvidenceSummary || "No missing evidence called out."}</p>
+        <p>
+          {handoff?.missing_evidence_line ||
+            handoff?.user_visible_uncertainty ||
+            handoff?.why_this.join(" ") ||
+            presentation?.missingEvidenceSummary ||
+            "No missing evidence called out."}
+        </p>
       </div>
+
+      {handoff?.why_this.length ? (
+        <div className="continue-why-list" aria-label="Why this continuation">
+          {handoff.why_this.map((reason) => (
+            <span key={reason}>{reason}</span>
+          ))}
+        </div>
+      ) : null}
 
       <div className="continue-primary-action">
         <button
