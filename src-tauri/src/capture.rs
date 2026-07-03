@@ -269,11 +269,29 @@ struct CaptureRuntime {
     last_skipped_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeDiagnostics {
+    pub heavy_captures_stored: i64,
+    pub heavy_captures_skipped: i64,
+    pub heavy_captures_skipped_budget: i64,
+    pub heavy_captures_skipped_dedupe: i64,
+    pub heavy_captures_skipped_privacy: i64,
+    pub heavy_captures_skipped_cancellation: i64,
+    pub heavy_captures_skipped_smalltalk_self: i64,
+    pub events_aggregated: i64,
+    pub ocr_runs: i64,
+    pub ax_snapshots: i64,
+    pub continue_normal_calls: i64,
+    pub continue_rebuild_calls: i64,
+    pub decision_cache_hits: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CaptureStatus {
     pub running: bool,
     pub frame_count: i64,
     pub recent_app_labels: Vec<String>,
+    pub signal_count: i64,
     pub event_count: i64,
     pub transition_count: i64,
     pub content_unit_count: i64,
@@ -291,6 +309,91 @@ pub struct CaptureStatus {
     pub screenshot_tool: bool,
     pub accessibility_tool: bool,
     pub ocr_tool: bool,
+    pub runtime_diagnostics: RuntimeDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureBudgetDiagnostics {
+    pub min_important_capture_interval_ms: i64,
+    pub min_low_value_capture_interval_ms: i64,
+    pub idle_capture_interval_ms: i64,
+    pub rolling_window_ms: i64,
+    pub max_screenshots_per_10_minutes: i64,
+    pub max_screenshots_per_surface_without_change: i64,
+    pub max_snapshot_dir_bytes: u64,
+    pub max_retained_low_value_duplicate_frames: i64,
+    pub max_diagnostic_rows_per_cleanup: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalMemoryDiagnostics {
+    pub database_path: String,
+    pub captured_root: String,
+    pub database_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub safe_export_bytes: u64,
+    pub frame_count: i64,
+    pub event_count: i64,
+    pub heavy_evidence_rows: LocalMemoryHeavyEvidenceRows,
+    pub continue_object_counts: LocalMemoryContinueObjectCounts,
+    pub low_value_duplicate_frames: i64,
+    pub self_capture_frames: i64,
+    pub decision_linked_frames: i64,
+    pub estimated_cleanup_potential_bytes: u64,
+    pub oldest_retained_frame_ms: Option<i64>,
+    pub latest_frame_ms: Option<i64>,
+    pub cleanup_last_run_ms: Option<i64>,
+    pub cleanup_last_result: Option<String>,
+    pub budgets: CaptureBudgetDiagnostics,
+    pub runtime_diagnostics: RuntimeDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LocalMemoryHeavyEvidenceRows {
+    pub content_units: i64,
+    pub ax_nodes: i64,
+    pub ocr_text_rows: i64,
+    pub ocr_spans: i64,
+    pub app_contexts: i64,
+    pub window_snapshots: i64,
+    pub windows: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LocalMemoryContinueObjectCounts {
+    pub artifacts: i64,
+    pub artifact_observations: i64,
+    pub task_actions: i64,
+    pub episodes: i64,
+    pub workstreams: i64,
+    pub candidates: i64,
+    pub decisions: i64,
+    pub feedback_events: i64,
+    pub breadcrumbs: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CleanupLocalMemoryInput {
+    pub include_debug_exports: Option<bool>,
+    pub vacuum: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DevResetLocalMemoryInput {
+    pub include_debug_exports: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupLocalMemoryResult {
+    pub diagnostics: LocalMemoryDiagnostics,
+    pub dry_run: bool,
+    pub candidate_frames: i64,
+    pub protected_frames: i64,
+    pub deleted_frames: i64,
+    pub deleted_snapshot_files: i64,
+    pub reclaimed_bytes: u64,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -519,8 +622,20 @@ struct AccessibilityNode {
 }
 
 const EVENT_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(100);
-const MIN_CAPTURE_INTERVAL: Duration = Duration::from_millis(600);
-const IDLE_CAPTURE_INTERVAL: Duration = Duration::from_secs(10);
+const MIN_IMPORTANT_CAPTURE_INTERVAL: Duration = Duration::from_secs(4);
+const MIN_LOW_VALUE_CAPTURE_INTERVAL: Duration = Duration::from_secs(45);
+const IDLE_CAPTURE_INTERVAL: Duration = Duration::from_secs(120);
+const CAPTURE_BUDGET_ROLLING_WINDOW_MS: i64 = 10 * 60 * 1000;
+const MAX_SCREENSHOT_FRAMES_PER_10_MINUTES: i64 = 24;
+const MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE: i64 = 3;
+const MAX_LOCAL_SNAPSHOT_DIR_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES: i64 = 400;
+const MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP: i64 = 5_000;
+const MAX_RETAINED_FRAME_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const MAX_RETAINED_CONTINUE_DECISION_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+const SMALLTALK_BUNDLE_ID: &str = "com.smalltalk.app";
+const LOCAL_SIGNAL_BUCKET_WINDOW_MS: i64 = 30_000;
+const MAX_LOCAL_SIGNAL_EVENTS: i64 = 5_000;
 
 #[derive(Debug, Clone, Default)]
 struct AccessibilityContext {
@@ -678,6 +793,7 @@ struct CaptureOutcome {
     image_hash: String,
     content_hash: Option<String>,
     semantic_fingerprint: SemanticFingerprint,
+    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1773,15 +1889,19 @@ pub fn stop_capture(
             ) {
                 Ok(query) => Some(query),
                 Err(error) => {
-                    let message = format!(
-                        "Stopped capture, but failed to save resume trail: {}",
-                        error
-                    );
-                    update_error(&state.inner().inner, message.clone());
-                    crate::session_island::update_session_island(
-                        crate::session_island::SessionIslandSnapshot::error(message.clone()),
-                    );
-                    return Err(message);
+                    if is_thin_resume_trail_error(&error) {
+                        None
+                    } else {
+                        let message = format!(
+                            "Stopped capture, but failed to save resume trail: {}",
+                            error
+                        );
+                        update_error(&state.inner().inner, message.clone());
+                        crate::session_island::update_session_island(
+                            crate::session_island::SessionIslandSnapshot::error(message.clone()),
+                        );
+                        return Err(message);
+                    }
                 }
             }
         };
@@ -1820,6 +1940,11 @@ pub fn stop_capture(
     })
 }
 
+fn is_thin_resume_trail_error(error: &str) -> bool {
+    error.contains("has no non-internal frames to summarize")
+        || error.contains("has no model-safe frames after privacy filtering")
+}
+
 #[tauri::command]
 pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<CaptureFrame, String> {
     let session_id = {
@@ -1839,6 +1964,7 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
         &session_id,
         "manual",
         false,
+        None,
         None,
         None,
         None,
@@ -1878,6 +2004,65 @@ pub fn delete_all_frames(
 ) -> Result<CaptureStatus, String> {
     stop_runtime(state.inner())?;
     clear_capture_store(&app)?;
+
+    {
+        let mut runtime = lock_runtime(state.inner())?;
+        runtime.running = false;
+        runtime.started_at = None;
+        runtime.last_error = None;
+        runtime.last_frame = None;
+        runtime.active_session_id = None;
+        runtime.last_session = None;
+        runtime.last_export = None;
+        runtime.skipped_samples = 0;
+        runtime.last_skipped_at = None;
+    }
+
+    let status = capture_status_snapshot(&app, &state)?;
+    let _ = app.emit("capture-status", status.clone());
+    crate::session_island::update_session_island_from_status(
+        &status,
+        crate::session_island::SessionIslandState::Ready,
+    );
+    crate::session_island::show_session_island();
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn get_local_memory_diagnostics(app: AppHandle) -> Result<LocalMemoryDiagnostics, String> {
+    local_memory_diagnostics(&app)
+}
+
+#[tauri::command]
+pub fn cleanup_local_memory(
+    app: AppHandle,
+    input: Option<CleanupLocalMemoryInput>,
+) -> Result<CleanupLocalMemoryResult, String> {
+    cleanup_local_memory_impl(
+        &app,
+        input.unwrap_or(CleanupLocalMemoryInput {
+            include_debug_exports: Some(false),
+            vacuum: Some(false),
+            dry_run: Some(true),
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn dev_reset_local_memory(
+    app: AppHandle,
+    state: State<CaptureState>,
+    input: Option<DevResetLocalMemoryInput>,
+) -> Result<CaptureStatus, String> {
+    stop_runtime(state.inner())?;
+    clear_capture_store(&app)?;
+    if input
+        .and_then(|input| input.include_debug_exports)
+        .unwrap_or(true)
+    {
+        clear_project_output_dir()?;
+        clear_project_resume_query_dir()?;
+    }
 
     {
         let mut runtime = lock_runtime(state.inner())?;
@@ -2652,12 +2837,38 @@ pub fn get_recent_continue_workstreams(
 }
 
 #[tauri::command]
+pub fn get_continue_workstream_detail(
+    app: AppHandle,
+    input: crate::continuation::ContinueWorkstreamDetailRequest,
+) -> Result<crate::continuation::ContinueWorkstreamDetailResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::get_continue_workstream_detail(&conn, input)
+}
+
+#[tauri::command]
 pub fn get_continue_decision(
     app: AppHandle,
     input: Option<crate::continuation::ContinueDecisionRequest>,
 ) -> Result<crate::continuation::ContinueDecisionResult, String> {
     let conn = open_db(&app)?;
-    crate::continuation::get_continue_decision(&conn, input.unwrap_or_default())
+    let request = input.unwrap_or_default();
+    let effective_mode = crate::continuation::effective_continue_decision_mode(
+        request.mode.as_deref(),
+        request.rebuild_layers.unwrap_or(false),
+    );
+    match effective_mode {
+        "rebuild" => {
+            increment_maintenance_counter(&conn, "continue_rebuild_calls", 1)?;
+        }
+        _ => {
+            increment_maintenance_counter(&conn, "continue_normal_calls", 1)?;
+        }
+    }
+    let result = crate::continuation::get_continue_decision(&conn, request)?;
+    if result.cache_hit {
+        increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2682,6 +2893,15 @@ pub fn infer_continue_feedback(
             observation_window_ms: None,
         }),
     )
+}
+
+#[tauri::command]
+pub fn record_continue_feedback(
+    app: AppHandle,
+    input: crate::continuation::ContinueExplicitFeedbackRequest,
+) -> Result<crate::continuation::ContinueFeedbackEventResult, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::record_continue_feedback(&conn, input)
 }
 
 #[tauri::command]
@@ -5212,7 +5432,10 @@ fn open_resume_point_impl(
     let cloud_file = load_cloud_resume_file_for_open(&conn, &input)?;
     let mut warnings = Vec::new();
 
-    if cloud_file.is_none() {
+    if cloud_file.is_none()
+        && input.continue_decision_id.is_none()
+        && input.target_frame_id.is_none()
+    {
         warnings.push(
             "No completed cloud resume result was found for this session; showing Smalltalk instead."
                 .to_string(),
@@ -5760,10 +5983,12 @@ fn resolved_open_resume_point_from_frame(
     let url = if route_eligibility.url_allowed {
         frame.browser_url.clone().or(app_context_url)
     } else {
-        if frame.browser_url.is_some() || app_context_url.is_some() {
+        if (frame.browser_url.is_some() || app_context_url.is_some())
+            && route_eligibility.reason != "captured URL blocked because visible app identity repaired to a non-browser surface"
+        {
             warnings.push(format!(
-                "target_url_blocked_by_identity_mismatch: frame {} {}",
-                frame_id, route_eligibility.reason
+                "Frame {} has a captured URL, but Smalltalk kept this as local evidence because the visible app identity did not match a trusted browser surface.",
+                frame_id
             ));
         }
         None
@@ -13077,7 +13302,7 @@ fn capture_loop(
 ) {
     let mut last_idle_capture = Instant::now();
     let mut last_capture_at = Instant::now()
-        .checked_sub(MIN_CAPTURE_INTERVAL)
+        .checked_sub(MIN_IMPORTANT_CAPTURE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut previous_image_hash: Option<String> = None;
     let mut previous_content_hash: Option<String> = None;
@@ -13153,7 +13378,13 @@ fn capture_loop(
         let pending_ready = pending_trigger
             .as_ref()
             .is_some_and(|trigger| Instant::now() >= trigger.ready_at);
-        if pending_ready && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL {
+        let pending_interval_met = pending_trigger
+            .as_ref()
+            .map(|trigger| {
+                last_capture_at.elapsed() >= capture_interval_for_trigger(&trigger.capture_trigger)
+            })
+            .unwrap_or(false);
+        if pending_ready && pending_interval_met {
             if let Some(trigger) = pending_trigger.take() {
                 match capture_and_emit(
                     &app,
@@ -13183,7 +13414,7 @@ fn capture_loop(
         }
 
         if last_idle_capture.elapsed() >= IDLE_CAPTURE_INTERVAL
-            && last_capture_at.elapsed() >= MIN_CAPTURE_INTERVAL
+            && last_capture_at.elapsed() >= capture_interval_for_trigger("idle")
         {
             match capture_and_emit(
                 &app,
@@ -13258,6 +13489,7 @@ fn capture_and_emit(
         previous_image_hash.as_deref(),
         previous_content_hash.as_deref(),
         None,
+        previous_semantic_fingerprint.as_ref(),
         Some(stop_signal),
         trigger_id.as_deref(),
         pre_frame_id.as_deref(),
@@ -13269,6 +13501,7 @@ fn capture_and_emit(
         .clone()
         .or_else(|| previous_content_hash.clone());
     *previous_semantic_fingerprint = Some(outcome.semantic_fingerprint.clone());
+    let _ = record_capture_outcome_counters(app, &outcome);
 
     let stored = outcome.frame.is_some();
     if let Some(id) = trigger_id.as_deref() {
@@ -13316,6 +13549,7 @@ fn queue_event_trigger(
         event.id = next_id("evt");
     }
     insert_ui_event(&conn, session_id, &event)?;
+    increment_maintenance_counter(&conn, "events_aggregated", 1)?;
     record_event_side_effects(&conn, session_id, &event, typing_burst)?;
 
     let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
@@ -13379,6 +13613,19 @@ fn normalize_event_trigger(event_type: &str) -> Option<(String, Duration)> {
         "scroll" => Some(("scroll_stop".to_string(), Duration::from_millis(500))),
         "clipboard" => Some(("clipboard".to_string(), Duration::from_millis(220))),
         _ => None,
+    }
+}
+
+fn capture_interval_for_trigger(trigger: &str) -> Duration {
+    match trigger {
+        "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard" => {
+            MIN_IMPORTANT_CAPTURE_INTERVAL
+        }
+        "idle" => IDLE_CAPTURE_INTERVAL,
+        "typing_pause" | "scroll_stop" | "click" | "accessibility_change" | "event_burst" => {
+            MIN_LOW_VALUE_CAPTURE_INTERVAL
+        }
+        _ => MIN_LOW_VALUE_CAPTURE_INTERVAL,
     }
 }
 
@@ -13930,6 +14177,7 @@ fn capture_frame(
     previous_image_hash: Option<&str>,
     previous_content_hash: Option<&str>,
     precollected_context: Option<AccessibilityContext>,
+    previous_semantic_fingerprint: Option<&SemanticFingerprint>,
     cancellation: Option<&AtomicBool>,
     capture_trigger_id: Option<&str>,
     previous_frame_id: Option<&str>,
@@ -13954,6 +14202,34 @@ fn capture_frame(
             ),
             content_hash: None,
             semantic_fingerprint,
+            skip_reason: Some("privacy".to_string()),
+        });
+    }
+
+    let conn = open_db(app)?;
+    increment_maintenance_counter(&conn, "ax_snapshots", 1)?;
+    if let Some(skip_reason) = should_skip_heavy_capture_for_budget(
+        &conn,
+        &paths,
+        session_id,
+        capture_trigger,
+        captured_at,
+        &context,
+        &semantic_fingerprint,
+        previous_semantic_fingerprint,
+    )? {
+        return Ok(CaptureOutcome {
+            frame: None,
+            image_hash: stable_hash_bytes(
+                format!(
+                    "budget-skip:{}:{}:{}",
+                    capture_trigger, skip_reason, captured_at
+                )
+                .as_bytes(),
+            ),
+            content_hash: semantic_fingerprint.text_hash.clone(),
+            semantic_fingerprint,
+            skip_reason: Some(skip_reason),
         });
     }
 
@@ -13997,6 +14273,7 @@ fn capture_frame(
             image_hash,
             content_hash: None,
             semantic_fingerprint: SemanticFingerprint::default(),
+            skip_reason: Some("cancellation".to_string()),
         });
     }
 
@@ -14012,6 +14289,7 @@ fn capture_frame(
         .unwrap_or(true);
 
     let ocr = if accessibility_text.is_none() || a11y_is_thin {
+        increment_maintenance_counter(&conn, "ocr_runs", 1)?;
         run_ocr(&paths, &snapshot_path).unwrap_or_else(|error| OcrOutput {
             error: Some(error),
             ..OcrOutput::default()
@@ -14040,6 +14318,7 @@ fn capture_frame(
             image_hash,
             content_hash,
             semantic_fingerprint,
+            skip_reason: Some("cancellation".to_string()),
         });
     }
 
@@ -14059,6 +14338,7 @@ fn capture_frame(
             image_hash,
             content_hash,
             semantic_fingerprint,
+            skip_reason: Some("dedupe".to_string()),
         });
     }
 
@@ -14072,10 +14352,10 @@ fn capture_frame(
             image_hash,
             content_hash,
             semantic_fingerprint,
+            skip_reason: Some("cancellation".to_string()),
         });
     }
 
-    let conn = open_db(app)?;
     let active_sck_capture = active_window_capture
         .as_ref()
         .and_then(|(_, capture)| (capture.provider == "screen_capture_kit").then_some(capture));
@@ -14300,6 +14580,7 @@ fn capture_frame(
         image_hash,
         content_hash,
         semantic_fingerprint,
+        skip_reason: None,
     })
 }
 
@@ -15075,6 +15356,136 @@ fn should_skip_dedup(
     same_image && same_content
 }
 
+#[allow(clippy::too_many_arguments)]
+fn should_skip_heavy_capture_for_budget(
+    conn: &Connection,
+    paths: &CapturePaths,
+    session_id: &str,
+    capture_trigger: &str,
+    captured_at: i64,
+    context: &AccessibilityContext,
+    semantic_fingerprint: &SemanticFingerprint,
+    previous_semantic_fingerprint: Option<&SemanticFingerprint>,
+) -> Result<Option<String>, String> {
+    if is_manual_or_start_capture(capture_trigger) {
+        return Ok(None);
+    }
+    if is_internal_smalltalk_context(context) {
+        return Ok(Some("smalltalk_self_observation".to_string()));
+    }
+    if context_has_error_signal(context) {
+        return Ok(None);
+    }
+
+    let important = is_important_capture_trigger(capture_trigger);
+    let cutoff = captured_at.saturating_sub(CAPTURE_BUDGET_ROLLING_WINDOW_MS);
+    let rolling_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM frames WHERE captured_at >= ?1",
+            params![cutoff],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    if !important && rolling_count >= MAX_SCREENSHOT_FRAMES_PER_10_MINUTES {
+        return Ok(Some("rolling_screenshot_budget_exhausted".to_string()));
+    }
+
+    if !important {
+        if let Ok(stats) = directory_stats(&paths.snapshot_dir) {
+            if (stats.byte_size.max(0) as u64) > MAX_LOCAL_SNAPSHOT_DIR_BYTES {
+                return Ok(Some("snapshot_directory_budget_exhausted".to_string()));
+            }
+        }
+    }
+
+    let same_semantic_surface = previous_semantic_fingerprint
+        .map(|previous| previous == semantic_fingerprint)
+        .unwrap_or(false);
+    if !important && same_semantic_surface {
+        let same_surface_count =
+            recent_same_surface_count(conn, session_id, context, semantic_fingerprint, cutoff)?;
+        if same_surface_count >= MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE {
+            return Ok(Some("same_surface_without_meaningful_change".to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn is_manual_or_start_capture(capture_trigger: &str) -> bool {
+    matches!(capture_trigger, "manual" | "session_start")
+}
+
+fn is_important_capture_trigger(capture_trigger: &str) -> bool {
+    matches!(
+        capture_trigger,
+        "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard"
+    )
+}
+
+fn is_internal_smalltalk_context(context: &AccessibilityContext) -> bool {
+    context
+        .app_bundle_id
+        .as_deref()
+        .is_some_and(|bundle_id| bundle_id == SMALLTALK_BUNDLE_ID)
+        || context
+            .app_name
+            .as_deref()
+            .is_some_and(|app_name| app_name.to_lowercase().contains("smalltalk"))
+}
+
+fn context_has_error_signal(context: &AccessibilityContext) -> bool {
+    let haystack = format!(
+        "{} {}",
+        context.window_name.as_deref().unwrap_or_default(),
+        context.text
+    )
+    .to_lowercase();
+    [
+        "error:",
+        "failed",
+        "failure",
+        "exception",
+        "traceback",
+        "panic",
+        "unresolved",
+        "denied",
+    ]
+    .iter()
+    .any(|needle| haystack.contains(needle))
+}
+
+fn recent_same_surface_count(
+    conn: &Connection,
+    session_id: &str,
+    context: &AccessibilityContext,
+    semantic_fingerprint: &SemanticFingerprint,
+    cutoff: i64,
+) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM frames
+         WHERE session_id = ?1
+           AND captured_at >= ?2
+           AND COALESCE(app_name, '') = COALESCE(?3, '')
+           AND COALESCE(window_name, '') = COALESCE(?4, '')
+           AND COALESCE(browser_url, '') = COALESCE(?5, '')
+           AND COALESCE(document_path, '') = COALESCE(?6, '')
+           AND (?7 IS NULL OR content_hash = ?7)",
+        params![
+            session_id,
+            cutoff,
+            context.app_name.as_deref(),
+            context.window_name.as_deref(),
+            context.browser_url.as_deref(),
+            context.document_path.as_deref(),
+            semantic_fingerprint.text_hash.as_deref(),
+        ],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
 fn capture_status_snapshot(
     app: &AppHandle,
     state: &State<CaptureState>,
@@ -15149,11 +15560,16 @@ fn capture_status_snapshot_inner(
         .as_ref()
         .and_then(|conn| recent_app_labels(conn, scoped_session_id).ok())
         .unwrap_or_default();
+    let signal_count = conn
+        .as_ref()
+        .and_then(|conn| local_signal_count(conn, scoped_session_id).ok())
+        .unwrap_or(counts.frames);
 
     Ok(CaptureStatus {
         running,
         frame_count: counts.frames,
         recent_app_labels,
+        signal_count,
         event_count: counts.events,
         transition_count: counts.transitions,
         content_unit_count: counts.content_units,
@@ -15173,10 +15589,53 @@ fn capture_status_snapshot_inner(
         ocr_tool: Path::new("/usr/bin/swiftc").exists()
             || Path::new("/usr/bin/swift").exists()
             || command_in_path("tesseract"),
+        runtime_diagnostics: runtime_diagnostics_from_conn(conn.as_ref()),
     })
 }
 
 fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<String>, String> {
+    let event_labels = recent_event_app_labels(conn, session_id)?;
+    if !event_labels.is_empty() {
+        return Ok(event_labels);
+    }
+    recent_frame_app_labels(conn, session_id)
+}
+
+fn recent_event_app_labels(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if !table_exists_in_capture(conn, "ui_events")?
+        || !table_has_column(conn, "ui_events", "app_name")?
+    {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT app_name
+             FROM (
+               SELECT app_name, MAX(ts_ms) AS latest_ts
+               FROM ui_events
+               WHERE (?1 IS NULL OR session_id = ?1)
+                 AND app_name IS NOT NULL
+                 AND TRIM(app_name) != ''
+               GROUP BY LOWER(TRIM(app_name))
+               ORDER BY latest_ts DESC
+               LIMIT 5
+             )
+             ORDER BY latest_ts ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .map_err(to_string)?;
+    clean_distinct_labels(rows)
+}
+
+fn recent_frame_app_labels(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT app_name
@@ -15191,7 +15650,14 @@ fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<
     let rows = stmt
         .query_map(params![session_id], |row| row.get::<_, String>(0))
         .map_err(to_string)?;
-    let mut newest_first = Vec::new();
+    clean_distinct_labels(rows)
+}
+
+fn clean_distinct_labels<I>(rows: I) -> Result<Vec<String>, String>
+where
+    I: IntoIterator<Item = rusqlite::Result<String>>,
+{
+    let mut labels = Vec::new();
     let mut seen = HashSet::new();
     for row in rows {
         let label = clean_label(&row.map_err(to_string)?);
@@ -15200,14 +15666,135 @@ fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<
         }
         let key = label.to_lowercase();
         if seen.insert(key) {
-            newest_first.push(label);
+            labels.push(label);
         }
-        if newest_first.len() >= 5 {
+        if labels.len() >= 5 {
             break;
         }
     }
-    newest_first.reverse();
-    Ok(newest_first)
+    Ok(labels)
+}
+
+#[derive(Debug)]
+struct SignalEventRow {
+    ts_ms: i64,
+    signal_kind: String,
+    app_label: String,
+    window_label: String,
+}
+
+fn local_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64, String> {
+    let event_count = event_signal_count(conn, session_id)?;
+    if event_count > 0 {
+        return Ok(event_count);
+    }
+    conn.query_row(
+        "SELECT COUNT(*) FROM frames WHERE (?1 IS NULL OR session_id = ?1)",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64, String> {
+    if !table_exists_in_capture(conn, "ui_events")? {
+        return Ok(0);
+    }
+    let has_app_name = table_has_column(conn, "ui_events", "app_name")?;
+    let has_window_title = table_has_column(conn, "ui_events", "window_title")?;
+    let app_expr = if has_app_name { "app_name" } else { "NULL" };
+    let window_expr = if has_window_title {
+        "window_title"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT ts_ms, event_type, key_category, {}, {}
+         FROM (
+           SELECT ts_ms, event_type, key_category, {}, {}
+           FROM ui_events
+           WHERE (?1 IS NULL OR session_id = ?1)
+           ORDER BY ts_ms DESC
+           LIMIT {}
+         )
+         ORDER BY ts_ms ASC",
+        app_expr, window_expr, app_expr, window_expr, MAX_LOCAL_SIGNAL_EVENTS
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            let event_type: String = row.get(1)?;
+            let key_category: Option<String> = row.get(2)?;
+            let app_name: Option<String> = row.get(3)?;
+            let window_title: Option<String> = row.get(4)?;
+            Ok(SignalEventRow {
+                ts_ms: row.get(0)?,
+                signal_kind: signal_kind(&event_type, key_category.as_deref()),
+                app_label: clean_label(app_name.as_deref().unwrap_or("")),
+                window_label: clean_label(window_title.as_deref().unwrap_or("")),
+            })
+        })
+        .map_err(to_string)?;
+    let rows = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
+    Ok(bucket_signal_events(&rows))
+}
+
+fn bucket_signal_events(rows: &[SignalEventRow]) -> i64 {
+    let mut bucket_count = 0_i64;
+    let mut previous: Option<&SignalEventRow> = None;
+    for row in rows {
+        if row.signal_kind == "noise" {
+            continue;
+        }
+        let same_bucket = previous
+            .map(|prev| {
+                prev.signal_kind == row.signal_kind
+                    && prev.app_label.eq_ignore_ascii_case(&row.app_label)
+                    && prev.window_label.eq_ignore_ascii_case(&row.window_label)
+                    && row.ts_ms.saturating_sub(prev.ts_ms) <= LOCAL_SIGNAL_BUCKET_WINDOW_MS
+            })
+            .unwrap_or(false);
+        if !same_bucket {
+            bucket_count += 1;
+        }
+        previous = Some(row);
+    }
+    bucket_count
+}
+
+fn signal_kind(event_type: &str, key_category: Option<&str>) -> String {
+    match event_type {
+        "key_down" => match key_category.unwrap_or("") {
+            "character" => "typing".to_string(),
+            "enter" | "return" => "commit_key".to_string(),
+            "shortcut" => "shortcut".to_string(),
+            other if !other.trim().is_empty() => format!("key_{}", normalize_signal_piece(other)),
+            _ => "key_down".to_string(),
+        },
+        "scroll" => "scroll".to_string(),
+        "click" => "click".to_string(),
+        "app_switch" => "app_switch".to_string(),
+        "ax_notification" => "accessibility".to_string(),
+        other if other.trim().is_empty() => "noise".to_string(),
+        other => normalize_signal_piece(other),
+    }
+}
+
+fn normalize_signal_piece(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 fn clean_label(value: &str) -> String {
@@ -17254,6 +17841,622 @@ fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_local_memory_impl(
+    app: &AppHandle,
+    input: CleanupLocalMemoryInput,
+) -> Result<CleanupLocalMemoryResult, String> {
+    ensure_db(app)?;
+    let before = local_memory_diagnostics(app)?;
+    let paths = capture_paths(app)?;
+    let conn = open_db(app)?;
+    crate::continuation::ensure_continue_schema(&conn)?;
+    let dry_run = input.dry_run.unwrap_or(true);
+    let protected_frame_ids = protected_cleanup_frame_ids(&conn)?;
+    let mut frame_ids = cleanup_candidate_frame_ids(&conn)?;
+    let candidate_frames = frame_ids.len() as i64;
+    frame_ids.retain(|frame_id| !protected_frame_ids.contains(frame_id));
+    frame_ids.sort_unstable();
+    frame_ids.dedup();
+
+    let mut reclaimed_bytes = 0_u64;
+    let mut deleted_snapshot_files = 0_i64;
+    for frame_id in &frame_ids {
+        for path in frame_asset_paths(&conn, *frame_id)? {
+            if let Ok(metadata) = fs::metadata(&path) {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+
+    let (orphan_paths, orphan_bytes) = orphaned_snapshot_paths(&conn, &paths.snapshot_dir)?;
+    reclaimed_bytes = reclaimed_bytes.saturating_add(orphan_bytes);
+    if input.include_debug_exports.unwrap_or(false) {
+        reclaimed_bytes = reclaimed_bytes.saturating_add(
+            directory_stats(&paths.root_dir.join("safe-ai-exports"))
+                .map(|stats| stats.byte_size.max(0) as u64)
+                .unwrap_or(0),
+        );
+    }
+
+    if dry_run {
+        let summary = format!(
+            "preview: {} eligible frame rows, {} protected frame rows, {} orphan snapshot files, about {} bytes reclaimable",
+            frame_ids.len(),
+            protected_frame_ids.len(),
+            orphan_paths.len(),
+            reclaimed_bytes
+        );
+        let after = local_memory_diagnostics(app)?;
+        return Ok(CleanupLocalMemoryResult {
+            diagnostics: after,
+            dry_run,
+            candidate_frames,
+            protected_frames: protected_frame_ids.len() as i64,
+            deleted_frames: 0,
+            deleted_snapshot_files: 0,
+            reclaimed_bytes,
+            summary,
+        });
+    }
+
+    let mut deleted_frame_count = 0_i64;
+    for frame_id in &frame_ids {
+        for path in frame_asset_paths(&conn, *frame_id)? {
+            if fs::remove_file(&path).is_ok() {
+                deleted_snapshot_files += 1;
+            }
+        }
+        delete_frame_dependents(&conn, *frame_id)?;
+        conn.execute("DELETE FROM frames WHERE id = ?1", params![frame_id])
+            .map_err(to_string)?;
+        deleted_frame_count += 1;
+    }
+
+    let orphan_files = delete_orphaned_snapshots(&conn, &paths.snapshot_dir)?;
+    deleted_snapshot_files += orphan_files;
+    prune_continue_refresh_rows(&conn)?;
+    if input.include_debug_exports.unwrap_or(false) {
+        clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
+        clear_project_output_dir()?;
+        clear_project_resume_query_dir()?;
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(to_string)?;
+    if input.vacuum.unwrap_or(false) {
+        conn.execute_batch("VACUUM;").map_err(to_string)?;
+    }
+
+    let summary = format!(
+        "deleted {} frame rows, {} snapshot files, reclaimed about {} bytes",
+        deleted_frame_count, deleted_snapshot_files, reclaimed_bytes
+    );
+    record_maintenance_value(&conn, "cleanup_last_run_ms", &now_millis().to_string())?;
+    record_maintenance_value(&conn, "cleanup_last_result", &summary)?;
+    let after = local_memory_diagnostics(app)?;
+    let measured_reclaimed = before
+        .database_bytes
+        .saturating_add(before.snapshot_bytes)
+        .saturating_sub(after.database_bytes.saturating_add(after.snapshot_bytes));
+    Ok(CleanupLocalMemoryResult {
+        diagnostics: after,
+        dry_run,
+        candidate_frames,
+        protected_frames: protected_frame_ids.len() as i64,
+        deleted_frames: deleted_frame_count,
+        deleted_snapshot_files,
+        reclaimed_bytes: measured_reclaimed.max(reclaimed_bytes),
+        summary,
+    })
+}
+
+fn local_memory_diagnostics(app: &AppHandle) -> Result<LocalMemoryDiagnostics, String> {
+    let paths = capture_paths(app)?;
+    ensure_db(app)?;
+    let conn = open_db(app)?;
+    crate::continuation::ensure_continue_schema(&conn)?;
+    let database_bytes = capture_db_files(&paths.db_path)
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    let snapshot_bytes = directory_stats(&paths.snapshot_dir)
+        .map(|stats| stats.byte_size.max(0) as u64)
+        .unwrap_or(0);
+    let safe_export_bytes = directory_stats(&paths.root_dir.join("safe-ai-exports"))
+        .map(|stats| stats.byte_size.max(0) as u64)
+        .unwrap_or(0);
+    let protected_frame_ids = protected_cleanup_frame_ids(&conn)?;
+    let cleanup_frame_ids = cleanup_candidate_frame_ids(&conn)?
+        .into_iter()
+        .filter(|frame_id| !protected_frame_ids.contains(frame_id))
+        .collect::<Vec<_>>();
+    let estimated_cleanup_potential_bytes = estimate_frame_asset_bytes(&conn, &cleanup_frame_ids)?
+        .saturating_add(
+            orphaned_snapshot_paths(&conn, &paths.snapshot_dir)
+                .map(|(_, bytes)| bytes)
+                .unwrap_or(0),
+        );
+    Ok(LocalMemoryDiagnostics {
+        database_path: paths.db_path.to_string_lossy().to_string(),
+        captured_root: paths.root_dir.to_string_lossy().to_string(),
+        database_bytes,
+        snapshot_bytes,
+        safe_export_bytes,
+        frame_count: row_count(&conn, "frames").unwrap_or(0),
+        event_count: row_count(&conn, "ui_events").unwrap_or(0),
+        heavy_evidence_rows: heavy_evidence_rows(&conn),
+        continue_object_counts: continue_object_counts(&conn),
+        low_value_duplicate_frames: low_value_duplicate_frame_count(&conn)?,
+        self_capture_frames: self_capture_frame_count(&conn)?,
+        decision_linked_frames: protected_frame_ids.len() as i64,
+        estimated_cleanup_potential_bytes,
+        oldest_retained_frame_ms: min_i64(&conn, "frames", "captured_at").ok().flatten(),
+        latest_frame_ms: max_i64(&conn, "frames", "captured_at").ok().flatten(),
+        cleanup_last_run_ms: maintenance_value(&conn, "cleanup_last_run_ms")?
+            .and_then(|value| value.parse::<i64>().ok()),
+        cleanup_last_result: maintenance_value(&conn, "cleanup_last_result")?,
+        budgets: CaptureBudgetDiagnostics {
+            min_important_capture_interval_ms: MIN_IMPORTANT_CAPTURE_INTERVAL.as_millis() as i64,
+            min_low_value_capture_interval_ms: MIN_LOW_VALUE_CAPTURE_INTERVAL.as_millis() as i64,
+            idle_capture_interval_ms: IDLE_CAPTURE_INTERVAL.as_millis() as i64,
+            rolling_window_ms: CAPTURE_BUDGET_ROLLING_WINDOW_MS,
+            max_screenshots_per_10_minutes: MAX_SCREENSHOT_FRAMES_PER_10_MINUTES,
+            max_screenshots_per_surface_without_change:
+                MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE,
+            max_snapshot_dir_bytes: MAX_LOCAL_SNAPSHOT_DIR_BYTES,
+            max_retained_low_value_duplicate_frames: MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES,
+            max_diagnostic_rows_per_cleanup: MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP,
+        },
+        runtime_diagnostics: runtime_diagnostics_from_conn(Some(&conn)),
+    })
+}
+
+fn cleanup_candidate_frame_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let cutoff = now_millis().saturating_sub(MAX_RETAINED_FRAME_AGE_MS);
+    let mut ids = query_i64_rows(
+        conn,
+        "SELECT id FROM frames WHERE captured_at < ?1 LIMIT 2000",
+        &[&cutoff as &dyn ToSql],
+    )?;
+    let mut self_capture_ids = query_i64_rows(
+        conn,
+        "SELECT id FROM frames
+         WHERE captured_at < ?1
+           AND (
+             lower(COALESCE(app_name, '')) = 'smalltalk'
+             OR lower(COALESCE(app_bundle_id, '')) LIKE '%com.smalltalk%'
+             OR lower(COALESCE(window_name, '')) = 'smalltalk'
+           )
+         ORDER BY captured_at ASC, id ASC
+         LIMIT 1000",
+        &[&cutoff as &dyn ToSql],
+    )?;
+    let low_value_offset = MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES.max(0);
+    let mut duplicate_ids = query_i64_rows(
+        conn,
+        "SELECT id FROM frames
+         WHERE capture_trigger IN ('typing_pause', 'scroll_stop', 'click', 'accessibility_change', 'event_burst', 'idle')
+         ORDER BY captured_at DESC, id DESC
+         LIMIT -1 OFFSET ?1",
+        &[&low_value_offset as &dyn ToSql],
+    )?;
+    ids.append(&mut self_capture_ids);
+    ids.append(&mut duplicate_ids);
+    Ok(ids)
+}
+
+fn protected_cleanup_frame_ids(conn: &Connection) -> Result<HashSet<i64>, String> {
+    let mut protected = HashSet::new();
+    for query in [
+        "SELECT CAST(evidence_frame_id AS INTEGER) FROM continue_candidates WHERE evidence_frame_id IS NOT NULL",
+        "SELECT CAST(frame_id AS INTEGER) FROM continue_task_actions",
+        "SELECT CAST(first_frame_id AS INTEGER) FROM continue_task_actions WHERE first_frame_id IS NOT NULL",
+        "SELECT CAST(last_frame_id AS INTEGER) FROM continue_task_actions WHERE last_frame_id IS NOT NULL",
+        "SELECT CAST(strongest_frame_id AS INTEGER) FROM continue_task_actions WHERE strongest_frame_id IS NOT NULL",
+        "SELECT CAST(start_frame_id AS INTEGER) FROM continue_episodes WHERE start_frame_id IS NOT NULL",
+        "SELECT CAST(end_frame_id AS INTEGER) FROM continue_episodes WHERE end_frame_id IS NOT NULL",
+        "SELECT CAST(frame_id AS INTEGER) FROM continue_artifact_observations WHERE frame_id IS NOT NULL",
+    ] {
+        let table_name = query
+            .split(" FROM ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .unwrap_or_default();
+        if table_name.is_empty() || !table_exists_in_capture(conn, table_name)? {
+            continue;
+        }
+        for id in query_i64_rows(conn, query, &[])? {
+            if id > 0 {
+                protected.insert(id);
+            }
+        }
+    }
+    for id in query_i64_rows(
+        conn,
+        "SELECT id FROM frames
+         WHERE capture_trigger IN ('manual', 'capture_once', 'explicit', 'hotkey')
+            OR privacy_status IN ('manual_evidence', 'high_value', 'decision_anchor')",
+        &[],
+    )
+    .unwrap_or_default()
+    {
+        protected.insert(id);
+    }
+    Ok(protected)
+}
+
+fn estimate_frame_asset_bytes(conn: &Connection, frame_ids: &[i64]) -> Result<u64, String> {
+    let mut bytes = 0_u64;
+    for frame_id in frame_ids {
+        for path in frame_asset_paths(conn, *frame_id)? {
+            if let Ok(metadata) = fs::metadata(path) {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn heavy_evidence_rows(conn: &Connection) -> LocalMemoryHeavyEvidenceRows {
+    LocalMemoryHeavyEvidenceRows {
+        content_units: count_if_present_capture(conn, "content_units"),
+        ax_nodes: count_if_present_capture(conn, "ax_nodes"),
+        ocr_text_rows: count_if_present_capture(conn, "ocr_text"),
+        ocr_spans: count_if_present_capture(conn, "ocr_spans"),
+        app_contexts: count_if_present_capture(conn, "app_contexts"),
+        window_snapshots: count_if_present_capture(conn, "window_snapshots"),
+        windows: count_if_present_capture(conn, "windows"),
+    }
+}
+
+fn continue_object_counts(conn: &Connection) -> LocalMemoryContinueObjectCounts {
+    LocalMemoryContinueObjectCounts {
+        artifacts: count_if_present_capture(conn, "continue_artifacts"),
+        artifact_observations: count_if_present_capture(conn, "continue_artifact_observations"),
+        task_actions: count_if_present_capture(conn, "continue_task_actions"),
+        episodes: count_if_present_capture(conn, "continue_episodes"),
+        workstreams: count_if_present_capture(conn, "continue_workstreams"),
+        candidates: count_if_present_capture(conn, "continue_candidates"),
+        decisions: count_if_present_capture(conn, "continue_decisions"),
+        feedback_events: count_if_present_capture(conn, "continue_feedback_events"),
+        breadcrumbs: count_if_present_capture(conn, "continue_breadcrumbs"),
+    }
+}
+
+fn count_if_present_capture(conn: &Connection, table: &str) -> i64 {
+    table_exists_in_capture(conn, table)
+        .ok()
+        .filter(|exists| *exists)
+        .and_then(|_| row_count(conn, table).ok())
+        .unwrap_or(0)
+}
+
+fn low_value_duplicate_frame_count(conn: &Connection) -> Result<i64, String> {
+    let offset = MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES.max(0);
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT id FROM frames
+            WHERE capture_trigger IN ('typing_pause', 'scroll_stop', 'click', 'accessibility_change', 'event_burst', 'idle')
+            ORDER BY captured_at DESC, id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        params![offset],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn self_capture_frame_count(conn: &Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM frames
+         WHERE lower(COALESCE(app_name, '')) = 'smalltalk'
+            OR lower(COALESCE(app_bundle_id, '')) LIKE '%com.smalltalk%'
+            OR lower(COALESCE(window_name, '')) = 'smalltalk'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn query_i64_rows(conn: &Connection, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<i64>, String> {
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let rows = stmt
+        .query_map(params, |row| row.get::<_, i64>(0))
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn frame_asset_paths(conn: &Connection, frame_id: i64) -> Result<Vec<PathBuf>, String> {
+    conn.query_row(
+        "SELECT snapshot_path, full_screenshot_path, active_window_crop_path, active_element_crop_path
+         FROM frames WHERE id = ?1",
+        params![frame_id],
+        |row| {
+            let mut paths = Vec::new();
+            for index in 0..4 {
+                let value: Option<String> = row.get(index)?;
+                if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                    paths.push(PathBuf::from(value));
+                }
+            }
+            Ok(paths)
+        },
+    )
+    .optional()
+    .map(|paths| paths.unwrap_or_default())
+    .map_err(to_string)
+}
+
+fn delete_frame_dependents(conn: &Connection, frame_id: i64) -> Result<(), String> {
+    let frame_key = frame_id.to_string();
+    for (table, column) in [
+        ("frame_quality_warnings", "frame_id"),
+        ("sensitive_regions", "frame_id"),
+        ("presence_samples", "frame_id"),
+        ("app_contexts", "frame_id"),
+        ("content_units", "frame_id"),
+        ("ocr_spans", "frame_id"),
+        ("ax_nodes", "frame_id"),
+        ("windows", "frame_id"),
+        ("ocr_text", "frame_id"),
+    ] {
+        if table_exists_in_capture(conn, table)? {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE {} = ?1", table, column),
+                params![frame_id],
+            )
+            .map_err(to_string)?;
+        }
+    }
+    for (table, column) in [
+        ("typing_bursts", "pre_frame_id"),
+        ("typing_bursts", "post_frame_id"),
+        ("clipboard_events", "source_frame_id"),
+        ("clipboard_events", "target_frame_id"),
+        ("frame_diffs", "from_frame_id"),
+        ("frame_diffs", "to_frame_id"),
+        ("event_transitions", "pre_frame_id"),
+        ("event_transitions", "post_frame_id"),
+        ("capture_triggers", "pre_frame_id"),
+        ("capture_triggers", "post_frame_id"),
+    ] {
+        if table_exists_in_capture(conn, table)? {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE {} = ?1", table, column),
+                params![frame_key.as_str()],
+            )
+            .map_err(to_string)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_orphaned_snapshots(conn: &Connection, snapshot_dir: &Path) -> Result<i64, String> {
+    let (paths, _) = orphaned_snapshot_paths(conn, snapshot_dir)?;
+    let mut deleted_files = 0_i64;
+    for path in paths {
+        if fs::remove_file(path).is_ok() {
+            deleted_files += 1;
+        }
+    }
+    Ok(deleted_files)
+}
+
+fn orphaned_snapshot_paths(
+    conn: &Connection,
+    snapshot_dir: &Path,
+) -> Result<(Vec<PathBuf>, u64), String> {
+    let referenced = referenced_snapshot_paths(conn)?;
+    let mut paths = Vec::new();
+    let mut reclaimed_bytes = 0_u64;
+    for path in collect_files(snapshot_dir)? {
+        let key = path.to_string_lossy().to_string();
+        if referenced.contains(&key) {
+            continue;
+        }
+        if let Ok(metadata) = fs::metadata(&path) {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(metadata.len());
+        }
+        paths.push(path);
+    }
+    Ok((paths, reclaimed_bytes))
+}
+
+fn referenced_snapshot_paths(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut referenced = HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT snapshot_path, full_screenshot_path, active_window_crop_path, active_element_crop_path
+             FROM frames",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let mut paths = Vec::new();
+            for index in 0..4 {
+                let value: Option<String> = row.get(index)?;
+                if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                    paths.push(value);
+                }
+            }
+            Ok(paths)
+        })
+        .map_err(to_string)?;
+    for row in rows {
+        for path in row.map_err(to_string)? {
+            referenced.insert(path);
+        }
+    }
+    Ok(referenced)
+}
+
+fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(root).map_err(to_string)? {
+        let entry = entry.map_err(to_string)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(to_string)?;
+        if metadata.is_dir() {
+            files.extend(collect_files(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn prune_continue_refresh_rows(conn: &Connection) -> Result<(), String> {
+    let cutoff = now_millis().saturating_sub(MAX_RETAINED_CONTINUE_DECISION_AGE_MS);
+    if table_exists_in_capture(conn, "continue_decisions")? {
+        conn.execute(
+            "DELETE FROM continue_decisions
+             WHERE requested_at_ms < ?1
+               AND id NOT IN (
+                 SELECT id FROM continue_decisions ORDER BY requested_at_ms DESC LIMIT 100
+               )",
+            params![cutoff],
+        )
+        .map_err(to_string)?;
+    }
+    if table_exists_in_capture(conn, "continue_candidates")? {
+        conn.execute(
+            "DELETE FROM continue_candidates
+             WHERE created_at_ms < ?1
+               AND id NOT IN (
+                 SELECT selected_candidate_id FROM continue_decisions
+                 WHERE selected_candidate_id IS NOT NULL
+               )",
+            params![cutoff],
+        )
+        .map_err(to_string)?;
+    }
+    if table_exists_in_capture(conn, "continue_feedback_events")? {
+        conn.execute(
+            "DELETE FROM continue_feedback_events
+             WHERE decision_id IS NOT NULL
+               AND decision_id NOT IN (SELECT id FROM continue_decisions)",
+            [],
+        )
+        .map_err(to_string)?;
+    }
+    Ok(())
+}
+
+fn min_i64(conn: &Connection, table: &str, column: &str) -> Result<Option<i64>, String> {
+    if !table_exists_in_capture(conn, table)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        &format!("SELECT MIN({}) FROM {}", column, table),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn max_i64(conn: &Connection, table: &str, column: &str) -> Result<Option<i64>, String> {
+    if !table_exists_in_capture(conn, table)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        &format!("SELECT MAX({}) FROM {}", column, table),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn maintenance_value(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    if !table_exists_in_capture(conn, "local_memory_maintenance")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT value FROM local_memory_maintenance WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn maintenance_i64(conn: &Connection, key: &str) -> Result<i64, String> {
+    Ok(maintenance_value(conn, key)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0))
+}
+
+fn record_maintenance_value(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO local_memory_maintenance (key, value, updated_at_ms)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at_ms = excluded.updated_at_ms",
+        params![key, value, now_millis()],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn increment_maintenance_counter(conn: &Connection, key: &str, delta: i64) -> Result<i64, String> {
+    let next = maintenance_i64(conn, key)?.saturating_add(delta);
+    record_maintenance_value(conn, key, &next.to_string())?;
+    Ok(next)
+}
+
+fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostics {
+    let Some(conn) = conn else {
+        return RuntimeDiagnostics::default();
+    };
+    RuntimeDiagnostics {
+        heavy_captures_stored: maintenance_i64(conn, "heavy_captures_stored").unwrap_or(0),
+        heavy_captures_skipped: maintenance_i64(conn, "heavy_captures_skipped").unwrap_or(0),
+        heavy_captures_skipped_budget: maintenance_i64(conn, "heavy_captures_skipped_budget")
+            .unwrap_or(0),
+        heavy_captures_skipped_dedupe: maintenance_i64(conn, "heavy_captures_skipped_dedupe")
+            .unwrap_or(0),
+        heavy_captures_skipped_privacy: maintenance_i64(conn, "heavy_captures_skipped_privacy")
+            .unwrap_or(0),
+        heavy_captures_skipped_cancellation: maintenance_i64(
+            conn,
+            "heavy_captures_skipped_cancellation",
+        )
+        .unwrap_or(0),
+        heavy_captures_skipped_smalltalk_self: maintenance_i64(
+            conn,
+            "heavy_captures_skipped_smalltalk_self",
+        )
+        .unwrap_or(0),
+        events_aggregated: maintenance_i64(conn, "events_aggregated").unwrap_or(0),
+        ocr_runs: maintenance_i64(conn, "ocr_runs").unwrap_or(0),
+        ax_snapshots: maintenance_i64(conn, "ax_snapshots").unwrap_or(0),
+        continue_normal_calls: maintenance_i64(conn, "continue_normal_calls").unwrap_or(0),
+        continue_rebuild_calls: maintenance_i64(conn, "continue_rebuild_calls").unwrap_or(0),
+        decision_cache_hits: maintenance_i64(conn, "decision_cache_hits").unwrap_or(0),
+    }
+}
+
+fn table_exists_in_capture(conn: &Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1
+         )",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(to_string)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    Ok(table_columns(conn, table)?
+        .iter()
+        .any(|existing| existing == column))
+}
+
 #[cfg(test)]
 fn clear_capture_db(conn: &Connection) -> Result<(), String> {
     crate::continuation::clear_continue_semantic_rows(conn)?;
@@ -17282,6 +18485,7 @@ fn clear_capture_db(conn: &Connection) -> Result<(), String> {
         DELETE FROM event_transitions;
         DELETE FROM capture_triggers;
         DELETE FROM ui_events;
+        DELETE FROM local_memory_maintenance;
         DELETE FROM ocr_text;
         DELETE FROM frames;
         DELETE FROM frames_fts;
@@ -17426,6 +18630,12 @@ fn init_db(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_frames_captured_at ON frames(captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_frames_session ON frames(session_id, captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ocr_text_frame_id ON ocr_text(frame_id);
+
+        CREATE TABLE IF NOT EXISTS local_memory_maintenance (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS capture_sessions (
           id TEXT PRIMARY KEY,
@@ -19029,6 +20239,39 @@ fn update_skip(state: &Arc<Mutex<CaptureRuntime>>) {
     }
 }
 
+fn record_capture_outcome_counters(
+    app: &AppHandle,
+    outcome: &CaptureOutcome,
+) -> Result<(), String> {
+    let conn = open_db(app)?;
+    if outcome.frame.is_some() {
+        increment_maintenance_counter(&conn, "heavy_captures_stored", 1)?;
+        return Ok(());
+    }
+
+    increment_maintenance_counter(&conn, "heavy_captures_skipped", 1)?;
+    match outcome.skip_reason.as_deref().unwrap_or("unknown") {
+        "dedupe" => {
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_dedupe", 1)?;
+        }
+        "privacy" => {
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_privacy", 1)?;
+        }
+        "cancellation" => {
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_cancellation", 1)?;
+        }
+        "smalltalk_self_observation" => {
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_smalltalk_self", 1)?;
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_budget", 1)?;
+        }
+        reason if reason.contains("budget") || reason.contains("same_surface") => {
+            increment_maintenance_counter(&conn, "heavy_captures_skipped_budget", 1)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -19116,6 +20359,7 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
 
     fn fingerprint(
         app: &str,
@@ -19162,6 +20406,74 @@ mod tests {
             Some("txt-a"),
             Some("txt-a")
         ));
+    }
+
+    #[test]
+    fn cleanup_candidates_exclude_continue_and_manual_evidence_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE frames (
+              id INTEGER PRIMARY KEY,
+              captured_at INTEGER NOT NULL,
+              capture_trigger TEXT,
+              privacy_status TEXT,
+              app_name TEXT,
+              app_bundle_id TEXT,
+              window_name TEXT
+            );
+            ",
+        )
+        .unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let old = now_millis().saturating_sub(MAX_RETAINED_FRAME_AGE_MS + 60_000);
+        conn.execute(
+            "INSERT INTO frames (id, captured_at, capture_trigger, privacy_status, app_name, app_bundle_id, window_name)
+             VALUES (1, ?1, 'typing_pause', NULL, 'Code', 'com.editor', 'main'),
+                    (2, ?1, 'typing_pause', NULL, 'Code', 'com.editor', 'main'),
+                    (3, ?1, 'manual', NULL, 'Code', 'com.editor', 'main')",
+            params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_workstreams (
+                id, state, title_candidate, inferred_intent, primary_artifact_id,
+                created_at_ms, last_active_timestamp_ms, suspended_timestamp_ms,
+                confidence, unresolved_signal, source
+             ) VALUES (
+                'workstream-1', 'active', 'Test workstream', NULL, NULL,
+                ?1, ?1, NULL, 0.5, NULL, 'test'
+             )",
+            params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_candidates (
+                id, workstream_id, target_artifact_id, candidate_kind,
+                evidence_frame_id, supporting_episode_id, last_meaningful_action_id,
+                score, actionability_score, primary_target_score, unresolved_score,
+                branch_origin_score, evidence_quality_score, recency_score,
+                openability_score, privacy_safety_score, reason, missing_evidence,
+                created_at_ms
+             ) VALUES (
+                'candidate-1', 'workstream-1', NULL, 'evidence_only',
+                '2', NULL, NULL,
+                0.2, 0.2, 0.1, 0.1,
+                0.1, 0.1, 0.1,
+                0.1, 0.8, NULL, NULL,
+                ?1
+             )",
+            params![old],
+        )
+        .unwrap();
+
+        let protected = protected_cleanup_frame_ids(&conn).unwrap();
+        let mut candidates = cleanup_candidate_frame_ids(&conn).unwrap();
+        candidates.retain(|frame_id| !protected.contains(frame_id));
+
+        assert!(candidates.contains(&1));
+        assert!(!candidates.contains(&2));
+        assert!(!candidates.contains(&3));
     }
 
     #[test]
@@ -19217,6 +20529,142 @@ mod tests {
             Some("accessibility_change")
         );
         assert_eq!(semantic_trigger(Some(&base), &base), None);
+    }
+
+    #[test]
+    fn smalltalk_self_surface_skips_heavy_capture_by_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = std::env::temp_dir().join(format!("smalltalk-budget-test-{}", now_millis()));
+        let paths = CapturePaths {
+            root_dir: root.clone(),
+            snapshot_dir: root.join("snapshots"),
+            helper_dir: root.join("helpers"),
+            db_path: root.join("smalltalk-capture.sqlite"),
+        };
+        fs::create_dir_all(&paths.snapshot_dir).unwrap();
+        let context = AccessibilityContext {
+            app_bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+            app_name: Some("Smalltalk".to_string()),
+            window_name: Some("Smalltalk".to_string()),
+            text: "Continue diagnostics".to_string(),
+            ..Default::default()
+        };
+        let fingerprint = SemanticFingerprint::from_context(&context);
+
+        let decision = should_skip_heavy_capture_for_budget(
+            &conn,
+            &paths,
+            "session-a",
+            "click",
+            now_millis(),
+            &context,
+            &fingerprint,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(decision.as_deref(), Some("smalltalk_self_observation"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn low_value_event_bursts_use_long_heavy_capture_interval() {
+        let (_, scroll_settle) = normalize_event_trigger("scroll").unwrap();
+        let (_, key_settle) = normalize_event_trigger("key_down").unwrap();
+        let (_, ax_settle) = normalize_event_trigger("ax_notification").unwrap();
+
+        assert!(scroll_settle < MIN_LOW_VALUE_CAPTURE_INTERVAL);
+        assert!(key_settle < MIN_LOW_VALUE_CAPTURE_INTERVAL);
+        assert!(ax_settle < MIN_LOW_VALUE_CAPTURE_INTERVAL);
+        assert_eq!(
+            capture_interval_for_trigger("scroll_stop"),
+            MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+        assert_eq!(
+            capture_interval_for_trigger("typing_pause"),
+            MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+        assert_eq!(
+            capture_interval_for_trigger("accessibility_change"),
+            MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn recent_app_labels_and_signal_count_come_from_ui_events_without_new_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-events";
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, created_at_ms
+             ) VALUES (?1, 1, 1000, 'running', 1000)",
+            params![session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+                captured_at, snapshot_path, app_name, window_name, focused,
+                capture_trigger, created_at, session_id
+             ) VALUES (1000, '/tmp/one.jpg', 'smalltalk', 'smalltalk', 1, 'manual', 1000, ?1)",
+            params![session_id],
+        )
+        .unwrap();
+        for (index, (ts, event_type, app, key_category)) in [
+            (1010, "app_switch", "Helium", None),
+            (1020, "scroll", "Helium", None),
+            (1030, "scroll", "Helium", None),
+            (40_000, "key_down", "Codex", Some("character")),
+            (40_100, "key_down", "Codex", Some("character")),
+            (80_000, "click", "smalltalk", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO ui_events (
+                    id, session_id, ts_ms, event_type, app_name, window_title,
+                    key_category, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?3)",
+                params![
+                    format!("evt-{}", index),
+                    session_id,
+                    ts,
+                    event_type,
+                    app,
+                    key_category,
+                ],
+            )
+            .unwrap();
+        }
+
+        let labels = recent_app_labels(&conn, Some(session_id)).unwrap();
+        assert_eq!(labels, vec!["Helium", "Codex", "smalltalk"]);
+        let signal_count = local_signal_count(&conn, Some(session_id)).unwrap();
+        assert!(signal_count > 1, "signal_count={}", signal_count);
+        assert!(signal_count < 6, "signal_count={}", signal_count);
+    }
+
+    #[test]
+    fn recent_app_labels_and_signal_count_fall_back_to_frames_without_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-frames";
+        conn.execute(
+            "INSERT INTO frames (
+                captured_at, snapshot_path, app_name, window_name, focused,
+                capture_trigger, created_at, session_id
+             ) VALUES
+               (1000, '/tmp/one.jpg', 'Helium', 'A', 1, 'manual', 1000, ?1),
+               (2000, '/tmp/two.jpg', 'Codex', 'B', 1, 'manual', 2000, ?1)",
+            params![session_id],
+        )
+        .unwrap();
+
+        let labels = recent_app_labels(&conn, Some(session_id)).unwrap();
+        assert_eq!(labels, vec!["Codex", "Helium"]);
+        assert_eq!(local_signal_count(&conn, Some(session_id)).unwrap(), 2);
     }
 
     #[test]
@@ -20058,6 +21506,19 @@ mod tests {
         assert_eq!(bundle.frames[0].frame_id, new_frame.to_string());
         assert_ne!(bundle.frames[0].frame_id, old_frame.to_string());
         fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn thin_resume_trail_errors_are_non_fatal_on_stop() {
+        assert!(is_thin_resume_trail_error(
+            "session session-1 has no non-internal frames to summarize"
+        ));
+        assert!(is_thin_resume_trail_error(
+            "session session-1 has no model-safe frames after privacy filtering"
+        ));
+        assert!(!is_thin_resume_trail_error(
+            "resume query bundle failed coherence lint"
+        ));
     }
 
     #[test]
@@ -23083,7 +24544,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.url, None);
         assert_eq!(resolved.app_name.as_deref(), Some("Codex"));
-        assert!(resolved
+        assert!(!resolved
             .warnings
             .iter()
             .any(|warning| warning.contains("target_url_blocked_by_identity_mismatch")));

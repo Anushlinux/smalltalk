@@ -1,0 +1,695 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1647-unit-1647-ocr-50",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1647",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "env: node: No",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1649-unit-1649-ocr-28",
+      "confidence": 0.68,
+      "frame_id": "1649",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 1 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "What's next, Anushrut?",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1649-unit-1649-ax-47",
+      "confidence": 0.8200000000000001,
+      "frame_id": "1649",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 5 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "text_exact": "Google Gemini https://gemini.google.com/app",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 53.0,
+      "episode_id": "ep-1647-1647",
+      "events": {
+        "app_switches": 5,
+        "clicks": 14,
+        "scrolls": 155,
+        "selections": 0,
+        "typing_bursts": 2
+      },
+      "frame_range": [
+        "1647",
+        "1647"
+      ],
+      "important_text": [
+        "env: node: No"
+      ],
+      "keyframes": [
+        "1647"
+      ],
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    },
+    {
+      "app": "Stremio",
+      "confidence": 0.62,
+      "duration_s": 16.6,
+      "episode_id": "ep-1648-1648",
+      "events": {
+        "app_switches": 2,
+        "clicks": 3,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 7
+      },
+      "frame_range": [
+        "1648",
+        "1648"
+      ],
+      "important_text": [
+        "Stremio - Freedom to Stream [REDACTED_NUMBER]"
+      ],
+      "keyframes": [
+        "1648"
+      ],
+      "quality_flags": [
+        "surface_state_need_more_evidence",
+        "surface_type_unknown"
+      ],
+      "role_guess": "side_branch",
+      "surface_type": "unknown",
+      "title": "Stremio"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.9,
+      "duration_s": 48.2,
+      "episode_id": "ep-1649-1649",
+      "events": {
+        "app_switches": 7,
+        "clicks": 10,
+        "scrolls": 414,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1649",
+        "1649"
+      ],
+      "important_text": [
+        "Google Gemini https://gemini.google.com/app"
+      ],
+      "keyframes": [
+        "1649"
+      ],
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "browser_tab",
+      "title": "Google Gemini - Helium"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.12,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.9,
+    "final_score": 0.5414412971199102,
+    "frame_id": "1647",
+    "line_anchor_quality": 0.17600000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.0004412971199101861,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.0,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.0
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1649-unit-1649-ax-47",
+    "app": "Helium",
+    "confidence": 0.9,
+    "exact_visible_words": "Google Gemini https://gemini.google.com/app",
+    "frame_id": "1649",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "browser_tab",
+      "canonical_title": "Google Gemini - Helium",
+      "captured_app": "Helium",
+      "captured_title": "Google Gemini - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "confidence": 0.8200000000000001,
+      "frame_id": "1649",
+      "line_index": 4,
+      "previous_line": "Google Gemini - Helium https://gemini.google.com/app",
+      "quote": "Google Gemini https://gemini.google.com/app",
+      "reason": "ordered main_content line 5 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "source_unit_id": "unit-1649-ax-47"
+    },
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_type": "browser_tab",
+    "title": "Google Gemini - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1649-unit-1649-ax-47",
+    "app": "Helium",
+    "confidence": 0.9,
+    "exact_visible_words": "Google Gemini https://gemini.google.com/app",
+    "frame_id": "1649",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "browser_tab",
+      "canonical_title": "Google Gemini - Helium",
+      "captured_app": "Helium",
+      "captured_title": "Google Gemini - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "confidence": 0.8200000000000001,
+      "frame_id": "1649",
+      "line_index": 4,
+      "previous_line": "Google Gemini - Helium https://gemini.google.com/app",
+      "quote": "Google Gemini https://gemini.google.com/app",
+      "reason": "ordered main_content line 5 from ax content units",
+      "semantic_role": "main_content",
+      "source": "ax",
+      "source_unit_id": "unit-1649-ax-47"
+    },
+    "quality_flags": [
+      "surface_state_source_or_discovery_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "captured URL matches a trusted browser/chat surface",
+      "url_allowed": true
+    },
+    "surface_state": "source_or_discovery_surface",
+    "surface_type": "browser_tab",
+    "title": "Google Gemini - Helium"
+  },
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "1647",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001647-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1647",
+        "line_index": 18,
+        "quote": "env: node: No",
+        "reason": "ordered main_content line 19 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1647-ocr-50"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 0.5,
+      "title": "Codex",
+      "visible_text": "npm run tauri dev Search •cargo test continue_rebuild_uses_event_only > [REDACT..."
+    },
+    {
+      "app": "Stremio",
+      "frame_id": "1648",
+      "identity_verdict": {
+        "canonical_app": "Stremio",
+        "canonical_surface_type": "unknown",
+        "canonical_title": "Stremio",
+        "captured_app": "Stremio",
+        "captured_title": "Stremio",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Stremio",
+        "visible_title": "Stremio"
+      },
+      "image_ref": "images/frame-001648-side-branch.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1648",
+        "line_index": 2,
+        "quote": "Stremio - Freedom to Stream [REDACTED_NUMBER]",
+        "reason": "ordered main_content line 3 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1648-ax-6"
+      },
+      "quality_flags": [
+        "surface_state_need_more_evidence",
+        "surface_type_unknown"
+      ],
+      "role": "side_branch",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 53.0,
+      "title": "Stremio",
+      "visible_text": "00:10:43 Stremio Stremio - Freedom to Stream [REDACTED_NUMBER] Obsession"
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1649",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "browser_tab",
+        "canonical_title": "Google Gemini - Helium",
+        "captured_app": "Helium",
+        "captured_title": "Google Gemini - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001649-current-focus.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1649",
+        "line_index": 4,
+        "quote": "Google Gemini https://gemini.google.com/app",
+        "reason": "ordered main_content line 5 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1649-ax-47"
+      },
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface"
+      ],
+      "role": "current_focus",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 68.6,
+      "title": "Google Gemini - Helium",
+      "visible_text": "What's next, Anushrut? + AskGemini Pro V Google Gemini - Helium https://gemini...."
+    }
+  ],
+  "missing_evidence": [
+    "1 internal Smalltalk frames omitted from model evidence"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "surface_state_current_work_surface",
+    "surface_state_need_more_evidence",
+    "surface_type_unknown",
+    "surface_state_source_or_discovery_surface"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_words": "env: node: No",
+    "frame_id": "1647",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521868,
+        "w": 108.83720397949216,
+        "x": 659.3023264288585,
+        "y": 242.79069810065772
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1647",
+      "line_index": 18,
+      "next_line": "vite",
+      "previous_line": "Note: plain npm run build still fails on this machine with",
+      "quote": "env: node: No",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1647-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": "vite",
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "npm run tauri dev Search •cargo test continue_rebuild_uses_event_only > [REDACTED_EMAIL] tauri • Scheduled • cargo chec...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1647-unit-1647-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "env: node: No",
+    "frame_id": "1647",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521868,
+        "w": 108.83720397949216,
+        "x": 659.3023264288585,
+        "y": 242.79069810065772
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1647",
+      "line_index": 18,
+      "next_line": "vite",
+      "previous_line": "Note: plain npm run build still fails on this machine with",
+      "quote": "env: node: No",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1647-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "1647-unit-1647-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "env: node: No",
+    "frame_id": "1647",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521868,
+        "w": 108.83720397949216,
+        "x": 659.3023264288585,
+        "y": 242.79069810065772
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1647",
+      "line_index": 18,
+      "next_line": "vite",
+      "previous_line": "Note: plain npm run build still fails on this machine with",
+      "quote": "env: node: No",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1647-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "1647-unit-1647-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "env: node: No",
+    "frame_id": "1647",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521868,
+        "w": 108.83720397949216,
+        "x": 659.3023264288585,
+        "y": 242.79069810065772
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1647",
+      "line_index": 18,
+      "next_line": "vite",
+      "previous_line": "Note: plain npm run build still fails on this machine with",
+      "quote": "env: node: No",
+      "reason": "ordered main_content line 19 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1647-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_current_work_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "current_work_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 115.8,
+    "id": "session-1783111337617-441",
+    "started_at": 1783111337617,
+    "stopped_at": 1783111453412
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [
+      "1648"
+    ],
+    "candidate_resume_frames": [
+      "1647"
+    ],
+    "current_frame_id": "1650",
+    "duration_s": 115.8,
+    "episode_count": 3,
+    "episodes": [
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 53.0,
+        "episode_id": "ep-1647-1647",
+        "events": {
+          "app_switches": 5,
+          "clicks": 14,
+          "scrolls": 155,
+          "selections": 0,
+          "typing_bursts": 2
+        },
+        "frame_range": [
+          "1647",
+          "1647"
+        ],
+        "important_text": [
+          "env: node: No"
+        ],
+        "keyframes": [
+          "1647"
+        ],
+        "quality_flags": [
+          "surface_state_current_work_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      },
+      {
+        "app": "Stremio",
+        "confidence": 0.62,
+        "duration_s": 16.6,
+        "episode_id": "ep-1648-1648",
+        "events": {
+          "app_switches": 2,
+          "clicks": 3,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 7
+        },
+        "frame_range": [
+          "1648",
+          "1648"
+        ],
+        "important_text": [
+          "Stremio - Freedom to Stream [REDACTED_NUMBER]"
+        ],
+        "keyframes": [
+          "1648"
+        ],
+        "quality_flags": [
+          "surface_state_need_more_evidence",
+          "surface_type_unknown"
+        ],
+        "role_guess": "side_branch",
+        "surface_type": "unknown",
+        "title": "Stremio"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.9,
+        "duration_s": 48.2,
+        "episode_id": "ep-1649-1649",
+        "events": {
+          "app_switches": 7,
+          "clicks": 10,
+          "scrolls": 414,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1649",
+          "1649"
+        ],
+        "important_text": [
+          "Google Gemini https://gemini.google.com/app"
+        ],
+        "keyframes": [
+          "1649"
+        ],
+        "quality_flags": [
+          "surface_state_source_or_discovery_surface"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "browser_tab",
+        "title": "Google Gemini - Helium"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_current_work_surface",
+      "surface_state_need_more_evidence",
+      "surface_type_unknown",
+      "surface_state_source_or_discovery_surface"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1783111337617-441",
+    "surface_sequence": [
+      "Codex/Codex",
+      "Stremio/Stremio",
+      "Helium/Google Gemini - Helium"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.9,
+    "evidence_frames": [
+      "1649",
+      "1647",
+      "1648"
+    ],
+    "summary": "Code implementation verification and build/test review."
+  },
+  "transitions": [
+    {
+      "confidence": 0.68,
+      "from_frame": "1647",
+      "label": "new_task",
+      "to_frame": "1648"
+    },
+    {
+      "confidence": 0.68,
+      "from_frame": "1648",
+      "label": "new_task",
+      "to_frame": "1649"
+    }
+  ]
+}

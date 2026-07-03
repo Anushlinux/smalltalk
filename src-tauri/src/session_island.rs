@@ -7,11 +7,13 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::capture::{CaptureStatus, CloudResumeInput, CloudResumeResult, OpenResumePointInput};
+use crate::capture::{CaptureStatus, CloudResumeResult, OpenResumePointInput};
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static EXPANDED: AtomicBool = AtomicBool::new(false);
+#[allow(dead_code)]
 static LAST_CLOUD_RESUME_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
+static LAST_CONTINUE_DECISION_ID: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionIslandSnapshot {
@@ -36,6 +38,7 @@ pub struct SessionIslandSnapshot {
     pub resume_source: Option<String>,
     pub resume_model: Option<String>,
     pub resume_response_id: Option<String>,
+    pub continue_decision_id: Option<String>,
     pub resume_warning: Option<String>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
@@ -65,6 +68,7 @@ struct SessionIslandAction {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SessionIslandActionKind {
+    Continue,
     StartCapture,
     StopCapture,
     CaptureOnce,
@@ -101,6 +105,7 @@ impl SessionIslandSnapshot {
             resume_source: None,
             resume_model: None,
             resume_response_id: None,
+            continue_decision_id: None,
             resume_warning: None,
             privacy_label: None,
             is_sensitive: false,
@@ -288,7 +293,7 @@ fn snapshot_from_status(
         elapsed_ms,
         frame_count: status.frame_count.max(0) as u64,
         trail_app_count: status.recent_app_labels.len() as u64,
-        trail_moment_count: status.frame_count.max(0) as u64,
+        trail_moment_count: status.signal_count.max(0) as u64,
         trail_labels: status.recent_app_labels.clone(),
         last_frame_id: frame.map(|frame| frame.id),
         current_app: if is_sensitive {
@@ -320,6 +325,7 @@ fn snapshot_from_status(
         resume_source: None,
         resume_model: None,
         resume_response_id: None,
+        continue_decision_id: None,
         resume_warning: None,
         privacy_label,
         is_sensitive,
@@ -363,7 +369,8 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
         SessionIslandActionKind::StartCapture => start_capture_from_island(),
         SessionIslandActionKind::StopCapture => stop_capture_from_island(),
         SessionIslandActionKind::CaptureOnce => capture_once_from_island(),
-        SessionIslandActionKind::ReconstructTrail => reconstruct_trail_from_island(),
+        SessionIslandActionKind::Continue => continue_from_island(),
+        SessionIslandActionKind::ReconstructTrail => continue_from_island(),
         SessionIslandActionKind::ShowTrail => open_main_window(),
         SessionIslandActionKind::OpenResumePoint => open_resume_point_from_island(),
         SessionIslandActionKind::OpenMainWindow => open_main_window(),
@@ -373,9 +380,9 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
     }
 }
 
-fn reconstruct_trail_from_island() {
+fn continue_from_island() {
     let Some(app) = APP_HANDLE.get().cloned() else {
-        eprintln!("[session_island] reconstruct requested before AppHandle was ready");
+        eprintln!("[session_island] continue requested before AppHandle was ready");
         return;
     };
 
@@ -389,47 +396,100 @@ fn reconstruct_trail_from_island() {
     }
 
     thread::spawn(move || {
-        let state = app.state::<crate::capture::CaptureState>();
-        let status = match crate::capture::capture_status(app.clone(), state) {
-            Ok(status) => status,
-            Err(error) => {
-                update_session_island(SessionIslandSnapshot::error(error));
-                return;
-            }
-        };
-        let current_frame_id = status.latest_frame.as_ref().map(|frame| frame.id);
-        match crate::capture::run_cloud_resume(
+        match crate::capture::get_continue_decision(
             app.clone(),
-            Some(CloudResumeInput {
-                session_id: status
-                    .active_session
-                    .as_ref()
-                    .or(status.latest_session.as_ref())
-                    .map(|session| session.id.clone()),
-                current_frame_id,
-                allow_followup: Some(true),
+            Some(crate::continuation::ContinueDecisionRequest {
+                mode: Some("normal".to_string()),
+                rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
             }),
         ) {
-            Ok(result) => {
-                remember_cloud_resume_output_path(&result);
+            Ok(decision) => {
+                remember_continue_decision_id(&decision.decision_id);
                 let state = app.state::<crate::capture::CaptureState>();
-                let next_status =
-                    crate::capture::capture_status(app.clone(), state).unwrap_or(status);
+                let next_status = crate::capture::capture_status(app.clone(), state)
+                    .unwrap_or_else(|_| crate::capture::CaptureStatus {
+                        running: false,
+                        frame_count: 0,
+                        recent_app_labels: Vec::new(),
+                        signal_count: 0,
+                        event_count: 0,
+                        transition_count: 0,
+                        content_unit_count: 0,
+                        session_count: 0,
+                        active_session: None,
+                        latest_session: None,
+                        last_export: None,
+                        started_at: None,
+                        last_error: None,
+                        latest_frame: None,
+                        skipped_samples: 0,
+                        last_skipped_at: None,
+                        data_dir: String::new(),
+                        database_path: String::new(),
+                        screenshot_tool: false,
+                        accessibility_tool: false,
+                        ocr_tool: false,
+                        runtime_diagnostics: crate::capture::RuntimeDiagnostics::default(),
+                    });
                 let mut snapshot =
                     snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
-                apply_cloud_resume_to_snapshot(&mut snapshot, &result);
-                let _ = app.emit("session-island-cloud-resume-ready", result.clone());
+                apply_continue_decision_to_snapshot(&mut snapshot, &decision);
+                let _ = app.emit("session-island-continue-ready", decision.clone());
                 update_session_island(snapshot);
                 show_session_island();
             }
             Err(error) => {
-                eprintln!("[session_island] reconstruct_trail failed: {}", error);
+                eprintln!("[session_island] continue failed: {}", error);
                 update_session_island(SessionIslandSnapshot::error(error));
             }
         }
     });
 }
 
+fn apply_continue_decision_to_snapshot(
+    snapshot: &mut SessionIslandSnapshot,
+    decision: &crate::continuation::ContinueDecisionResult,
+) {
+    snapshot.continue_decision_id = Some(decision.decision_id.clone());
+    snapshot.resume_source = Some("continue".to_string());
+    snapshot.resume_model = decision.model.clone();
+    snapshot.resume_response_id = decision.response_id.clone();
+    snapshot.resume_headline = Some(match decision.confidence_label.as_str() {
+        "high" => "Ready to continue".to_string(),
+        "medium" => "Likely continuation found".to_string(),
+        _ => "Evidence is thin".to_string(),
+    });
+    snapshot.resume_detail = clean_one_line(
+        decision
+            .selected_workstream
+            .as_ref()
+            .and_then(|workstream| workstream.title_candidate.as_deref())
+            .or(decision.next_action.as_deref()),
+    );
+    snapshot.resume_point = clean_one_line(
+        decision
+            .resume_work_target
+            .as_ref()
+            .or(decision.return_target.as_ref())
+            .and_then(|target| {
+                target
+                    .title
+                    .as_deref()
+                    .or(target.browser_url.as_deref())
+                    .or(target.document_path.as_deref())
+                    .or(target.artifact_kind.as_deref())
+            }),
+    );
+    snapshot.resume_warning = decision
+        .missing_evidence
+        .first()
+        .or_else(|| decision.warnings.first())
+        .and_then(|warning| clean_one_line(Some(warning)));
+}
+
+#[allow(dead_code)]
 fn apply_cloud_resume_to_snapshot(
     snapshot: &mut SessionIslandSnapshot,
     result: &CloudResumeResult,
@@ -493,6 +553,7 @@ fn apply_cloud_resume_to_snapshot(
     }
 }
 
+#[allow(dead_code)]
 fn cloud_answer_text(result: &CloudResumeResult, key: &str) -> Option<String> {
     result
         .answer
@@ -501,11 +562,13 @@ fn cloud_answer_text(result: &CloudResumeResult, key: &str) -> Option<String> {
         .and_then(|value| clean_one_line(Some(value)))
 }
 
+#[allow(dead_code)]
 fn cloud_resume_point_label(result: &CloudResumeResult) -> Option<String> {
     cloud_target_label(&result.resume_target_if_returning)
         .or_else(|| cloud_target_label(&result.resume_target))
 }
 
+#[allow(dead_code)]
 fn cloud_target_label(target: &serde_json::Value) -> Option<String> {
     target
         .get("line_anchor")
@@ -522,6 +585,7 @@ fn cloud_target_label(target: &serde_json::Value) -> Option<String> {
         .and_then(|value| clean_one_line(Some(value)))
 }
 
+#[allow(dead_code)]
 fn resume_point_label(card: &crate::capture::NativeResumeCard) -> Option<String> {
     clean_one_line(
         card.continue_from
@@ -542,14 +606,34 @@ fn open_resume_point_from_island() {
         eprintln!("[session_island] open resume point requested before AppHandle was ready");
         return;
     };
-    let output_path = remembered_cloud_resume_output_path();
     thread::spawn(move || {
+        let continue_decision_id = match remembered_continue_decision_id() {
+            Some(id) => Some(id),
+            None => match crate::capture::get_continue_decision(
+                app.clone(),
+                Some(crate::continuation::ContinueDecisionRequest {
+                    mode: Some("normal".to_string()),
+                    rebuild_layers: Some(false),
+                    micro_inference_enabled: Some(false),
+                    ..Default::default()
+                }),
+            ) {
+                Ok(decision) => {
+                    remember_continue_decision_id(&decision.decision_id);
+                    Some(decision.decision_id)
+                }
+                Err(error) => {
+                    eprintln!("[session_island] get_continue_decision failed: {}", error);
+                    None
+                }
+            },
+        };
         match crate::capture::open_resume_point(
             app.clone(),
             Some(OpenResumePointInput {
-                output_path,
+                output_path: None,
                 session_id: None,
-                continue_decision_id: None,
+                continue_decision_id,
                 current_frame_id: None,
                 target_frame_id: None,
             }),
@@ -573,6 +657,20 @@ fn open_resume_point_from_island() {
     });
 }
 
+fn remember_continue_decision_id(decision_id: &str) {
+    if let Ok(mut slot) = LAST_CONTINUE_DECISION_ID.lock() {
+        *slot = Some(decision_id.to_string());
+    }
+}
+
+fn remembered_continue_decision_id() -> Option<String> {
+    LAST_CONTINUE_DECISION_ID
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+#[allow(dead_code)]
 fn remember_cloud_resume_output_path(result: &CloudResumeResult) {
     if let Some(path) = result
         .output_path
@@ -585,6 +683,7 @@ fn remember_cloud_resume_output_path(result: &CloudResumeResult) {
     }
 }
 
+#[allow(dead_code)]
 fn remembered_cloud_resume_output_path() -> Option<String> {
     LAST_CLOUD_RESUME_OUTPUT_PATH
         .lock()
@@ -688,6 +787,49 @@ fn open_main_window() {
 fn toggle_expanded_from_native() {
     let expanded = !EXPANDED.load(Ordering::Relaxed);
     set_session_island_expanded(expanded);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_from_status_uses_event_backed_signal_count_for_trail_moments() {
+        let status = CaptureStatus {
+            running: true,
+            frame_count: 1,
+            recent_app_labels: vec![
+                "Helium".to_string(),
+                "Codex".to_string(),
+                "smalltalk".to_string(),
+            ],
+            signal_count: 7,
+            event_count: 1370,
+            transition_count: 0,
+            content_unit_count: 0,
+            session_count: 1,
+            active_session: None,
+            latest_session: None,
+            last_export: None,
+            started_at: Some(now_millis()),
+            last_error: None,
+            latest_frame: None,
+            skipped_samples: 0,
+            last_skipped_at: None,
+            data_dir: String::new(),
+            database_path: String::new(),
+            screenshot_tool: true,
+            accessibility_tool: true,
+            ocr_tool: true,
+            runtime_diagnostics: crate::capture::RuntimeDiagnostics::default(),
+        };
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
+
+        assert_eq!(snapshot.frame_count, 1);
+        assert_eq!(snapshot.trail_app_count, 3);
+        assert_eq!(snapshot.trail_moment_count, 7);
+    }
 }
 
 #[cfg(target_os = "macos")]

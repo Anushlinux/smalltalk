@@ -8,6 +8,8 @@ This repository is centered on a Tauri desktop app. `src/` contains the React/Vi
 
 Smalltalk is continuation-first, not session-recorder-first. `Continue` is the primary product primitive; sessions, timelines, screenshots, and resume bundles are evidence, debugging, and export infrastructure rather than the core product model. The native desktop app is the MVP lane, so do not build or revive the browser extension for this MVP unless a task explicitly reopens that older prototype.
 
+Smalltalk is now Continue-first at the product-surface level. The primary app screen must be a single continuation answer. Sessions, frames, screenshots, search, timelines, raw events, bundles, native resume cards, cloud resume paths, candidate scoring internals, artifact-role tables, episode/action lists, and evals are diagnostics or evidence inspection only, and must not appear on the first screen by default.
+
 Do not make `Stop Session` a prerequisite for `Continue`. Continue should observe local evidence, resolve stable artifacts, extract task actions, segment episodes, cluster workstreams, score continuation candidates, and return the user to the next actionable point with inspectable evidence.
 
 Do not send broad raw history to a model and ask it to invent intent. Any model call added later must be candidate-bounded, evidence-backed, and locally validated. Every continuation answer must separate factual current focus from actionable return target. Branch and support surfaces are evidence, not default return targets.

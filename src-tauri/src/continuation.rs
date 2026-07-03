@@ -405,6 +405,7 @@ pub struct ContinueDecisionRequest {
     pub session_id: Option<String>,
     pub lookback_ms: Option<i64>,
     pub limit: Option<i64>,
+    pub mode: Option<String>,
     pub rebuild_layers: Option<bool>,
     pub micro_inference_enabled: Option<bool>,
     pub model: Option<String>,
@@ -417,7 +418,8 @@ impl Default for ContinueDecisionRequest {
             session_id: None,
             lookback_ms: Some(45 * 60 * 1000),
             limit: Some(700),
-            rebuild_layers: Some(true),
+            mode: Some("normal".to_string()),
+            rebuild_layers: Some(false),
             micro_inference_enabled: Some(false),
             model: None,
             max_candidates_for_model: Some(5),
@@ -428,6 +430,8 @@ impl Default for ContinueDecisionRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContinueDecisionResult {
     pub decision_id: String,
+    pub mode: String,
+    pub cache_hit: bool,
     pub source: String,
     pub model: Option<String>,
     pub response_id: Option<String>,
@@ -461,6 +465,8 @@ pub struct ContinueFeedbackRequest {
 pub struct ContinueFeedbackEventResult {
     pub id: String,
     pub decision_id: Option<String>,
+    pub selected_candidate_id: Option<String>,
+    pub workstream_id: Option<String>,
     pub event_kind: String,
     pub observed_frame_id: Option<String>,
     pub target_artifact_id: Option<String>,
@@ -468,6 +474,20 @@ pub struct ContinueFeedbackEventResult {
     pub timestamp_ms: i64,
     pub confidence: f64,
     pub reason: Option<String>,
+    pub note: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContinueExplicitFeedbackRequest {
+    pub decision_id: Option<String>,
+    pub selected_candidate_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub target_artifact_id: Option<String>,
+    pub corrected_artifact_id: Option<String>,
+    pub feedback_kind: String,
+    pub note: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -518,6 +538,130 @@ pub struct ContinueEvalCaseReport {
     pub validation_failures: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContinueWorkstreamDetailRequest {
+    pub workstream_id: String,
+    pub decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueWorkstreamArtifactDetail {
+    pub artifact_id: String,
+    pub durable_role: String,
+    pub artifact_kind: String,
+    pub display_title: Option<String>,
+    pub stable_key: Option<String>,
+    pub app_name: Option<String>,
+    pub window_title: Option<String>,
+    pub browser_url: Option<String>,
+    pub document_path: Option<String>,
+    pub openability: String,
+    pub evidence_quality: String,
+    pub privacy_status: Option<String>,
+    pub importance_score: f64,
+    pub first_seen_frame_id: Option<String>,
+    pub last_seen_frame_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueWorkstreamActionDetail {
+    pub action_id: String,
+    pub frame_id: String,
+    pub previous_frame_id: Option<String>,
+    pub artifact_id: Option<String>,
+    pub artifact_title: Option<String>,
+    pub secondary_artifact_id: Option<String>,
+    pub secondary_artifact_title: Option<String>,
+    pub action_kind: String,
+    pub action_role: String,
+    pub role_in_episode: String,
+    pub order_index: i64,
+    pub trigger_type: Option<String>,
+    pub transition_label: Option<String>,
+    pub evidence_event_ids: Vec<String>,
+    pub confidence: f64,
+    pub reason: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueWorkstreamEpisodeDetail {
+    pub id: String,
+    pub state: String,
+    pub start_frame_id: Option<String>,
+    pub end_frame_id: Option<String>,
+    pub start_timestamp_ms: i64,
+    pub end_timestamp_ms: Option<i64>,
+    pub primary_artifact_id: Option<String>,
+    pub primary_artifact_title: Option<String>,
+    pub dominant_action_kind: Option<String>,
+    pub boundary_start_reason: Option<String>,
+    pub boundary_end_reason: Option<String>,
+    pub evidence_quality: String,
+    pub confidence: f64,
+    pub summary_label: Option<String>,
+    pub membership_score: f64,
+    pub membership_reason: Option<String>,
+    pub actions: Vec<ContinueWorkstreamActionDetail>,
+    pub artifacts: Vec<RecentContinueEpisodeArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueWorkstreamCandidateDetail {
+    pub candidate_id: String,
+    pub workstream_id: String,
+    pub target_artifact_id: Option<String>,
+    pub target_title: Option<String>,
+    pub target_kind: Option<String>,
+    pub target_openability: Option<String>,
+    pub candidate_kind: String,
+    pub last_meaningful_action_id: Option<String>,
+    pub evidence_frame_id: Option<String>,
+    pub supporting_episode_id: Option<String>,
+    pub score: f64,
+    pub confidence_label: String,
+    pub reason: Option<String>,
+    pub missing_evidence: Vec<String>,
+    pub components: ContinueScoreComponents,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueDecisionSummary {
+    pub decision_id: String,
+    pub requested_at_ms: i64,
+    pub source: String,
+    pub selected_candidate_id: Option<String>,
+    pub return_target_artifact_id: Option<String>,
+    pub confidence: f64,
+    pub decision_reason: Option<String>,
+    pub next_action: Option<String>,
+    pub warnings: Vec<String>,
+    pub validation_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueBreadcrumbSummary {
+    pub id: String,
+    pub workstream_id: String,
+    pub text: String,
+    pub source: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueWorkstreamDetailResult {
+    pub workstream: RecentContinueWorkstream,
+    pub artifacts: Vec<ContinueWorkstreamArtifactDetail>,
+    pub episodes: Vec<ContinueWorkstreamEpisodeDetail>,
+    pub candidates: Vec<ContinueWorkstreamCandidateDetail>,
+    pub latest_decision: Option<ContinueDecisionSummary>,
+    pub feedback_events: Vec<ContinueFeedbackEventResult>,
+    pub breadcrumbs: Vec<ContinueBreadcrumbSummary>,
+    pub evidence_anchors: ContinueEvidenceAnchors,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContinueFocusSummary {
     pub frame_id: String,
@@ -560,6 +704,10 @@ pub struct ContinueActionSummary {
     pub timestamp_ms: i64,
     pub evidence_frame_id: String,
     pub artifact_id: Option<String>,
+    pub collapse_count: i64,
+    pub first_frame_id: Option<String>,
+    pub last_frame_id: Option<String>,
+    pub strongest_frame_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -632,6 +780,10 @@ pub struct RecentContinueTaskAction {
     pub confidence: f64,
     pub reason: Option<String>,
     pub created_at_ms: i64,
+    pub collapse_count: i64,
+    pub first_frame_id: Option<String>,
+    pub last_frame_id: Option<String>,
+    pub strongest_frame_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -844,6 +996,10 @@ struct ExtractedTaskAction {
     confidence: f64,
     reason: String,
     created_at_ms: i64,
+    collapse_count: i64,
+    first_frame_id: Option<String>,
+    last_frame_id: Option<String>,
+    strongest_frame_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -858,6 +1014,10 @@ struct ContinueActionRecord {
     confidence: f64,
     reason: Option<String>,
     created_at_ms: i64,
+    collapse_count: i64,
+    first_frame_id: Option<String>,
+    last_frame_id: Option<String>,
+    strongest_frame_id: Option<String>,
     artifact: Option<ContinueArtifactRecord>,
     secondary_artifact: Option<ContinueArtifactRecord>,
 }
@@ -970,7 +1130,12 @@ struct ScorerAction {
     action_kind: String,
     action_role: String,
     confidence: f64,
+    reason: Option<String>,
     created_at_ms: i64,
+    collapse_count: i64,
+    first_frame_id: Option<String>,
+    last_frame_id: Option<String>,
+    strongest_frame_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1087,6 +1252,20 @@ struct ValidatedMicroInference {
     response_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedContinueDecisionMeta {
+    decision_id: String,
+    source: String,
+    model: Option<String>,
+    response_id: Option<String>,
+    next_action: Option<String>,
+    confidence: f64,
+    warnings: Vec<String>,
+    validation_status: String,
+    validation_failures: Vec<String>,
+    decision_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ContinueEvalFixture {
     cases: Vec<ContinueEvalCaseFixture>,
@@ -1133,7 +1312,7 @@ pub fn rebuild_continue_second_layer(
         frame_artifacts.insert(frame.id.clone(), artifact);
     }
 
-    let actions = extract_task_actions(&frames, &frame_artifacts);
+    let actions = collapse_repeated_task_actions(extract_task_actions(&frames, &frame_artifacts));
     for action in &actions {
         insert_continue_task_action(conn, action)?;
     }
@@ -1202,7 +1381,8 @@ pub fn recent_continue_task_actions(
         .prepare(
             "SELECT id, frame_id, previous_frame_id, artifact_id, secondary_artifact_id,
                     action_kind, action_role, trigger_type, transition_label,
-                    evidence_event_ids_json, confidence, reason, created_at_ms
+                    evidence_event_ids_json, confidence, reason, created_at_ms,
+                    collapse_count, first_frame_id, last_frame_id, strongest_frame_id
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -1225,6 +1405,10 @@ pub fn recent_continue_task_actions(
                 confidence: row.get(10)?,
                 reason: row.get(11)?,
                 created_at_ms: row.get(12)?,
+                collapse_count: row.get::<_, i64>(13)?.max(1),
+                first_frame_id: row.get(14)?,
+                last_frame_id: row.get(15)?,
+                strongest_frame_id: row.get(16)?,
             })
         })
         .map_err(to_string)?;
@@ -1265,20 +1449,43 @@ pub fn get_continue_decision(
     request: ContinueDecisionRequest,
 ) -> Result<ContinueDecisionResult, String> {
     ensure_continue_schema(conn)?;
-    infer_pending_continue_feedback(conn, 15 * 60 * 1000)?;
     let request = ContinueDecisionRequest {
         session_id: request.session_id,
         lookback_ms: request.lookback_ms.or(Some(45 * 60 * 1000)),
         limit: request.limit.or(Some(700)),
-        rebuild_layers: request.rebuild_layers.or(Some(true)),
+        mode: request.mode.or(Some("normal".to_string())),
+        rebuild_layers: request.rebuild_layers.or(Some(false)),
         micro_inference_enabled: request.micro_inference_enabled.or(Some(false)),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
     };
-    if request.rebuild_layers.unwrap_or(true) {
+    let effective_mode = effective_continue_decision_mode(
+        request.mode.as_deref(),
+        request.rebuild_layers.unwrap_or(false),
+    );
+    let force_rebuild = effective_mode == "rebuild";
+    let micro_inference_enabled = request.micro_inference_enabled.unwrap_or(false);
+    let cached_meta = if !force_rebuild && !micro_inference_enabled {
+        fresh_cached_continue_decision(conn, request.session_id.as_deref())?
+    } else {
+        None
+    };
+    if cached_meta.is_none() {
+        infer_pending_continue_feedback(conn, 15 * 60 * 1000)?;
+    }
+
+    let semantic_rebuild_needed = cached_meta.is_none()
+        && (force_rebuild || continue_layers_need_rebuild(conn, request.session_id.as_deref())?);
+    if semantic_rebuild_needed {
+        let start_frame_id = if force_rebuild {
+            None
+        } else {
+            latest_continue_processed_frame_id(conn)?.map(|id| id + 1)
+        };
         let second_request = ContinueSecondLayerRebuildRequest {
             session_id: request.session_id.clone(),
             lookback_ms: request.lookback_ms,
+            start_frame_id,
             limit: request.limit,
             ..Default::default()
         };
@@ -1307,8 +1514,10 @@ pub fn get_continue_decision(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    for candidate in &candidates {
-        insert_continue_candidate(conn, candidate, requested_at_ms)?;
+    if cached_meta.is_none() {
+        for candidate in &candidates {
+            insert_continue_candidate(conn, candidate, requested_at_ms)?;
+        }
     }
 
     let local_selected = candidates.first().cloned();
@@ -1348,7 +1557,7 @@ pub fn get_continue_decision(
         .as_ref()
         .and_then(|candidate| candidate.reason.clone());
 
-    if request.micro_inference_enabled.unwrap_or(false) && !candidates.is_empty() {
+    if micro_inference_enabled && !candidates.is_empty() {
         match continue_openai_config(request.model.clone()) {
             Ok(config) => {
                 model = Some(config.model.clone());
@@ -1436,24 +1645,55 @@ pub fn get_continue_decision(
         }
     }
 
-    let decision_id = format!(
-        "continue-decision-{}",
-        stable_hash(
+    if let Some(cached) = &cached_meta {
+        source = cached.source.clone();
+        model = cached.model.clone();
+        response_id = cached.response_id.clone();
+        if cached.next_action.is_some() {
+            next_action = cached.next_action.clone();
+        }
+        confidence = cached.confidence;
+        if !cached.warnings.is_empty() {
+            warnings = cached.warnings.clone();
+        }
+        validation_status = cached.validation_status.clone();
+        validation_failures = cached.validation_failures.clone();
+        if cached.decision_reason.is_some() {
+            decision_reason = cached.decision_reason.clone();
+        }
+    }
+
+    if let Some(candidate) = selected.as_ref() {
+        confidence = round_score(f64::min(confidence, candidate.score));
+    }
+
+    let decision_watermark =
+        latest_continue_evidence_timestamp(conn, request.session_id.as_deref())?
+            .unwrap_or(requested_at_ms);
+    let decision_id = cached_meta
+        .as_ref()
+        .map(|cached| cached.decision_id.clone())
+        .unwrap_or_else(|| {
             format!(
-                "{}:{}:{}",
-                requested_at_ms,
-                selected
-                    .as_ref()
-                    .map(|candidate| candidate.id.as_str())
-                    .unwrap_or("none"),
-                current_focus
-                    .as_ref()
-                    .map(|focus| focus.frame_id.as_str())
-                    .unwrap_or("none")
+                "continue-decision-{}",
+                stable_hash(
+                    format!(
+                        "{}:{}:{}:{}",
+                        decision_watermark,
+                        selected
+                            .as_ref()
+                            .map(|candidate| candidate.id.as_str())
+                            .unwrap_or("none"),
+                        current_focus
+                            .as_ref()
+                            .map(|focus| focus.frame_id.as_str())
+                            .unwrap_or("none"),
+                        validation_status
+                    )
+                    .as_bytes()
+                )
             )
-            .as_bytes()
-        )
-    );
+        });
 
     let validation_notes = if validation_failures.is_empty() {
         None
@@ -1461,23 +1701,25 @@ pub fn get_continue_decision(
         Some(validation_failures.join(";"))
     };
 
-    insert_continue_decision(
-        conn,
-        &decision_id,
-        requested_at_ms,
-        current_focus.as_ref(),
-        selected_workstream.as_ref(),
-        selected.as_ref(),
-        next_action.as_deref(),
-        &warnings,
-        &validation_status,
-        &source,
-        decision_reason.as_deref(),
-        confidence,
-        response_id.as_deref(),
-        model.as_deref(),
-        validation_notes.as_deref(),
-    )?;
+    if cached_meta.is_none() {
+        insert_continue_decision(
+            conn,
+            &decision_id,
+            requested_at_ms,
+            current_focus.as_ref(),
+            selected_workstream.as_ref(),
+            selected.as_ref(),
+            next_action.as_deref(),
+            &warnings,
+            &validation_status,
+            &source,
+            decision_reason.as_deref(),
+            confidence,
+            response_id.as_deref(),
+            model.as_deref(),
+            validation_notes.as_deref(),
+        )?;
+    }
 
     let evidence_anchors = evidence_anchors_for_decision(
         current_focus.as_ref(),
@@ -1496,6 +1738,8 @@ pub fn get_continue_decision(
 
     Ok(ContinueDecisionResult {
         decision_id,
+        mode: effective_mode.to_string(),
+        cache_hit: cached_meta.is_some(),
         source,
         model,
         response_id,
@@ -1674,6 +1918,153 @@ fn load_continue_current_focus(
     .map_err(to_string)
 }
 
+fn fresh_cached_continue_decision(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<CachedContinueDecisionMeta>, String> {
+    if !table_exists(conn, "continue_decisions")? {
+        return Ok(None);
+    }
+    let Some(evidence_ts) = latest_continue_evidence_timestamp(conn, session_id)? else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.id, d.source, d.model, d.response_id, d.next_action,
+                    d.confidence, d.warnings, d.validation_status,
+                    d.validation_notes, d.decision_reason
+             FROM continue_decisions d
+             LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
+             WHERE d.requested_at_ms >= ?1
+               AND (?2 IS NULL OR f.session_id = ?2)
+             ORDER BY d.requested_at_ms DESC
+             LIMIT 1",
+        )
+        .map_err(to_string)?;
+    stmt.query_row(params![evidence_ts, session_id], |row| {
+        let warnings: Option<String> = row.get(6)?;
+        let validation_notes: Option<String> = row.get(8)?;
+        Ok(CachedContinueDecisionMeta {
+            decision_id: row.get(0)?,
+            source: row.get(1)?,
+            model: row.get(2)?,
+            response_id: row.get(3)?,
+            next_action: row.get(4)?,
+            confidence: row.get(5)?,
+            warnings: split_semicolon_list(warnings.as_deref()),
+            validation_status: row.get(7)?,
+            validation_failures: split_semicolon_list(validation_notes.as_deref()),
+            decision_reason: row.get(9)?,
+        })
+    })
+    .optional()
+    .map_err(to_string)
+}
+
+pub fn effective_continue_decision_mode(mode: Option<&str>, rebuild_layers: bool) -> &'static str {
+    if rebuild_layers {
+        return "rebuild";
+    }
+    match mode
+        .unwrap_or("normal")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rebuild" | "force_rebuild" | "diagnostic_rebuild" => "rebuild",
+        _ => "normal",
+    }
+}
+
+fn continue_layers_need_rebuild(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<bool, String> {
+    if !table_exists(conn, "frames")? {
+        return Ok(false);
+    }
+    let latest_frame_ts = latest_frame_timestamp(conn, session_id)?;
+    let Some(latest_frame_ts) = latest_frame_ts else {
+        return Ok(false);
+    };
+    if !table_exists(conn, "continue_workstreams")?
+        || count_if_present(conn, "continue_workstreams")? == 0
+    {
+        return Ok(true);
+    }
+    let latest_artifact_ts =
+        max_i64_if_present(conn, "continue_artifact_observations", "timestamp_ms")?.unwrap_or(0);
+    Ok(latest_frame_ts > latest_artifact_ts)
+}
+
+fn latest_continue_processed_frame_id(conn: &Connection) -> Result<Option<i64>, String> {
+    if !table_exists(conn, "continue_artifact_observations")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT MAX(CAST(frame_id AS INTEGER))
+         FROM continue_artifact_observations
+         WHERE frame_id NOT LIKE 'event-%'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn latest_continue_evidence_timestamp(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<i64>, String> {
+    let latest_frame = latest_frame_timestamp(conn, session_id)?;
+    let latest_event = latest_event_timestamp(conn, session_id)?;
+    Ok(match (latest_frame, latest_event) {
+        (Some(frame_ts), Some(event_ts)) => Some(frame_ts.max(event_ts)),
+        (Some(frame_ts), None) => Some(frame_ts),
+        (None, Some(event_ts)) => Some(event_ts),
+        (None, None) => None,
+    })
+}
+
+fn latest_frame_timestamp(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<i64>, String> {
+    if !table_exists(conn, "frames")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT MAX(captured_at) FROM frames WHERE (?1 IS NULL OR session_id = ?1)",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn latest_event_timestamp(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<i64>, String> {
+    if !table_exists(conn, "ui_events")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT MAX(ts_ms) FROM ui_events WHERE (?1 IS NULL OR session_id = ?1)",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
+fn split_semicolon_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn load_scorer_workstreams(conn: &Connection, limit: i64) -> Result<Vec<ScorerWorkstream>, String> {
     load_scorer_workstreams_with_filter(
         conn,
@@ -1835,6 +2226,138 @@ pub fn infer_continue_feedback(
     }
 }
 
+pub fn get_continue_workstream_detail(
+    conn: &Connection,
+    request: ContinueWorkstreamDetailRequest,
+) -> Result<ContinueWorkstreamDetailResult, String> {
+    ensure_continue_schema(conn)?;
+    let workstream_id = request.workstream_id.trim();
+    if workstream_id.is_empty() {
+        return Err("workstream_id cannot be empty".to_string());
+    }
+    let workstream = load_recent_continue_workstream(conn, workstream_id)?
+        .ok_or_else(|| format!("unknown workstream_id: {}", workstream_id))?;
+    let artifacts = load_continue_workstream_artifact_details(conn, workstream_id)?;
+    let episodes = load_continue_workstream_episode_details(conn, workstream_id)?;
+    let candidates = load_continue_workstream_candidate_details(conn, workstream_id)?;
+    let latest_decision =
+        load_continue_decision_summary(conn, workstream_id, request.decision_id.as_deref())?;
+    let feedback_events = load_continue_feedback_events(
+        conn,
+        latest_decision
+            .as_ref()
+            .map(|decision| decision.decision_id.as_str()),
+        Some(workstream_id),
+    )?;
+    let breadcrumbs = load_continue_breadcrumbs(conn, workstream_id)?;
+    let evidence_anchors = workstream_detail_anchors(&artifacts, &episodes, &candidates);
+
+    Ok(ContinueWorkstreamDetailResult {
+        workstream,
+        artifacts,
+        episodes,
+        candidates,
+        latest_decision,
+        feedback_events,
+        breadcrumbs,
+        evidence_anchors,
+    })
+}
+
+pub fn record_continue_feedback(
+    conn: &Connection,
+    request: ContinueExplicitFeedbackRequest,
+) -> Result<ContinueFeedbackEventResult, String> {
+    ensure_continue_schema(conn)?;
+    let feedback_kind = request.feedback_kind.trim();
+    let allowed = [
+        "accepted",
+        "rejected",
+        "ignored",
+        "corrected",
+        "artifact_only_evidence",
+        "ignored_workstream",
+        "user_next_step_note",
+    ];
+    if !allowed.contains(&feedback_kind) {
+        return Err(format!("unsupported feedback_kind: {}", feedback_kind));
+    }
+    let note = request.note.and_then(non_empty).map(|value| {
+        if value.len() > 500 {
+            value.chars().take(500).collect::<String>()
+        } else {
+            value
+        }
+    });
+    let source = request
+        .source
+        .and_then(non_empty)
+        .unwrap_or_else(|| "desktop_ui".to_string());
+    let timestamp_ms = current_time_millis();
+    let reason = match feedback_kind {
+        "accepted" => "user marked the Continue target useful",
+        "rejected" => "user marked the Continue target wrong",
+        "corrected" => "user selected a different continuation target",
+        "artifact_only_evidence" => "user marked the artifact as supporting evidence only",
+        "ignored_workstream" => "user ignored this workstream",
+        "user_next_step_note" => "user added a next-step note",
+        _ => "user supplied explicit Continue feedback",
+    };
+    let id = format!(
+        "continue-feedback-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                request.decision_id.as_deref().unwrap_or("none"),
+                request.workstream_id.as_deref().unwrap_or("none"),
+                feedback_kind,
+                request.target_artifact_id.as_deref().unwrap_or("none"),
+                request.corrected_artifact_id.as_deref().unwrap_or("none"),
+                note.as_deref().unwrap_or("none"),
+                source
+            )
+            .as_bytes(),
+        )
+    );
+    conn.execute(
+        "INSERT OR IGNORE INTO continue_feedback_events (
+            id, decision_id, event_kind, observed_frame_id, target_artifact_id,
+            chosen_artifact_id, timestamp_ms, confidence, reason,
+            selected_candidate_id, workstream_id, note, source
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            request.decision_id,
+            feedback_kind,
+            request.target_artifact_id,
+            request.corrected_artifact_id,
+            timestamp_ms,
+            1.0_f64,
+            reason,
+            request.selected_candidate_id,
+            request.workstream_id,
+            note,
+            source,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(ContinueFeedbackEventResult {
+        id,
+        decision_id: request.decision_id,
+        selected_candidate_id: request.selected_candidate_id,
+        workstream_id: request.workstream_id,
+        event_kind: feedback_kind.to_string(),
+        observed_frame_id: None,
+        target_artifact_id: request.target_artifact_id,
+        chosen_artifact_id: request.corrected_artifact_id,
+        timestamp_ms,
+        confidence: 1.0,
+        reason: Some(reason.to_string()),
+        note,
+        source: Some(source),
+    })
+}
+
 pub fn run_continue_eval(eval_file_path: Option<String>) -> Result<ContinueEvalReport, String> {
     let fixture = if let Some(path) = eval_file_path.and_then(non_empty) {
         let raw = fs::read_to_string(path).map_err(to_string)?;
@@ -1843,6 +2366,459 @@ pub fn run_continue_eval(eval_file_path: Option<String>) -> Result<ContinueEvalR
         default_continue_eval_fixture()
     };
     summarize_continue_eval_fixture(fixture)
+}
+
+fn load_recent_continue_workstream(
+    conn: &Connection,
+    workstream_id: &str,
+) -> Result<Option<RecentContinueWorkstream>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT w.id, w.state, w.title_candidate, w.primary_artifact_id,
+                    a.display_title, w.created_at_ms, w.last_active_timestamp_ms,
+                    w.suspended_timestamp_ms, w.confidence, w.unresolved_signal, w.source
+             FROM continue_workstreams w
+             LEFT JOIN continue_artifacts a ON a.id = w.primary_artifact_id
+             WHERE w.id = ?1
+             LIMIT 1",
+        )
+        .map_err(to_string)?;
+    let mut workstream = stmt
+        .query_row(params![workstream_id], |row| {
+            Ok(RecentContinueWorkstream {
+                id: row.get(0)?,
+                state: row.get(1)?,
+                title_candidate: row.get(2)?,
+                primary_artifact_id: row.get(3)?,
+                primary_artifact_title: row.get(4)?,
+                created_at_ms: row.get(5)?,
+                last_active_timestamp_ms: row.get(6)?,
+                suspended_timestamp_ms: row.get(7)?,
+                confidence: row.get(8)?,
+                unresolved_signal: row.get(9)?,
+                source: row.get(10)?,
+                episodes: Vec::new(),
+                artifacts: Vec::new(),
+            })
+        })
+        .optional()
+        .map_err(to_string)?;
+    if let Some(workstream) = workstream.as_mut() {
+        workstream.episodes = recent_workstream_episodes(conn, &workstream.id)?;
+        workstream.artifacts = recent_workstream_artifacts(conn, &workstream.id)?;
+    }
+    Ok(workstream)
+}
+
+fn load_continue_workstream_artifact_details(
+    conn: &Connection,
+    workstream_id: &str,
+) -> Result<Vec<ContinueWorkstreamArtifactDetail>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT wa.artifact_id, wa.durable_role, a.artifact_kind, a.display_title,
+                    a.stable_key, a.app_name, a.window_title, a.browser_url,
+                    a.document_path, a.openability, a.evidence_quality, a.privacy_status,
+                    wa.importance_score, wa.first_seen_frame_id, wa.last_seen_frame_id, wa.reason
+             FROM continue_workstream_artifacts wa
+             JOIN continue_artifacts a ON a.id = wa.artifact_id
+             WHERE wa.workstream_id = ?1
+             ORDER BY wa.importance_score DESC, wa.durable_role ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![workstream_id], |row| {
+            Ok(ContinueWorkstreamArtifactDetail {
+                artifact_id: row.get(0)?,
+                durable_role: row.get(1)?,
+                artifact_kind: row.get(2)?,
+                display_title: row.get(3)?,
+                stable_key: row.get(4)?,
+                app_name: row.get(5)?,
+                window_title: row.get(6)?,
+                browser_url: row.get(7)?,
+                document_path: row.get(8)?,
+                openability: row.get(9)?,
+                evidence_quality: row.get(10)?,
+                privacy_status: row.get(11)?,
+                importance_score: row.get(12)?,
+                first_seen_frame_id: row.get(13)?,
+                last_seen_frame_id: row.get(14)?,
+                reason: row.get(15)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_continue_workstream_episode_details(
+    conn: &Connection,
+    workstream_id: &str,
+) -> Result<Vec<ContinueWorkstreamEpisodeDetail>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.state, e.start_frame_id, e.end_frame_id,
+                    e.start_timestamp_ms, e.end_timestamp_ms, e.primary_artifact_id,
+                    a.display_title, e.dominant_action_kind, e.boundary_start_reason,
+                    e.boundary_end_reason, e.evidence_quality, e.confidence, e.summary_label,
+                    we.membership_score, we.membership_reason
+             FROM continue_workstream_episodes we
+             JOIN continue_episodes e ON e.id = we.episode_id
+             LEFT JOIN continue_artifacts a ON a.id = e.primary_artifact_id
+             WHERE we.workstream_id = ?1
+             ORDER BY we.order_index ASC, e.start_timestamp_ms DESC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![workstream_id], |row| {
+            Ok(ContinueWorkstreamEpisodeDetail {
+                id: row.get(0)?,
+                state: row.get(1)?,
+                start_frame_id: row.get(2)?,
+                end_frame_id: row.get(3)?,
+                start_timestamp_ms: row.get(4)?,
+                end_timestamp_ms: row.get(5)?,
+                primary_artifact_id: row.get(6)?,
+                primary_artifact_title: row.get(7)?,
+                dominant_action_kind: row.get(8)?,
+                boundary_start_reason: row.get(9)?,
+                boundary_end_reason: row.get(10)?,
+                evidence_quality: row.get(11)?,
+                confidence: row.get(12)?,
+                summary_label: row.get(13)?,
+                membership_score: row.get(14)?,
+                membership_reason: row.get(15)?,
+                actions: Vec::new(),
+                artifacts: Vec::new(),
+            })
+        })
+        .map_err(to_string)?;
+    let mut episodes = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
+    for episode in &mut episodes {
+        episode.actions = load_continue_episode_action_details(conn, &episode.id)?;
+        episode.artifacts = recent_episode_artifacts(conn, &episode.id)?;
+    }
+    Ok(episodes)
+}
+
+fn load_continue_episode_action_details(
+    conn: &Connection,
+    episode_id: &str,
+) -> Result<Vec<ContinueWorkstreamActionDetail>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ea.action_id, ta.frame_id, ta.previous_frame_id, ta.artifact_id,
+                    artifact.display_title, ta.secondary_artifact_id, secondary.display_title,
+                    ta.action_kind, ta.action_role, ea.role_in_episode, ea.order_index,
+                    ta.trigger_type, ta.transition_label, ta.evidence_event_ids_json,
+                    ta.confidence, ta.reason, ta.created_at_ms
+             FROM continue_episode_actions ea
+             JOIN continue_task_actions ta ON ta.id = ea.action_id
+             LEFT JOIN continue_artifacts artifact ON artifact.id = ta.artifact_id
+             LEFT JOIN continue_artifacts secondary ON secondary.id = ta.secondary_artifact_id
+             WHERE ea.episode_id = ?1
+             ORDER BY ea.order_index ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![episode_id], |row| {
+            let events_json: String = row.get(13)?;
+            Ok(ContinueWorkstreamActionDetail {
+                action_id: row.get(0)?,
+                frame_id: row.get(1)?,
+                previous_frame_id: row.get(2)?,
+                artifact_id: row.get(3)?,
+                artifact_title: row.get(4)?,
+                secondary_artifact_id: row.get(5)?,
+                secondary_artifact_title: row.get(6)?,
+                action_kind: row.get(7)?,
+                action_role: row.get(8)?,
+                role_in_episode: row.get(9)?,
+                order_index: row.get(10)?,
+                trigger_type: row.get(11)?,
+                transition_label: row.get(12)?,
+                evidence_event_ids: parse_string_array(&events_json),
+                confidence: row.get(14)?,
+                reason: row.get(15)?,
+                created_at_ms: row.get(16)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_continue_workstream_candidate_details(
+    conn: &Connection,
+    workstream_id: &str,
+) -> Result<Vec<ContinueWorkstreamCandidateDetail>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id, c.workstream_id, c.target_artifact_id, a.display_title,
+                    a.artifact_kind, a.openability, c.candidate_kind,
+                    c.last_meaningful_action_id, c.evidence_frame_id, c.supporting_episode_id,
+                    c.score, c.actionability_score, c.primary_target_score,
+                    c.unresolved_score, c.branch_origin_score, c.evidence_quality_score,
+                    c.recency_score, c.openability_score, c.privacy_safety_score,
+                    c.reason, c.missing_evidence, c.created_at_ms
+             FROM continue_candidates c
+             LEFT JOIN continue_artifacts a ON a.id = c.target_artifact_id
+             WHERE c.workstream_id = ?1
+             ORDER BY c.created_at_ms DESC, c.score DESC
+             LIMIT 12",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![workstream_id], |row| {
+            let score: f64 = row.get(10)?;
+            let missing_evidence = row
+                .get::<_, Option<String>>(20)?
+                .map(|value| {
+                    value
+                        .split(';')
+                        .filter_map(|part| non_empty(part.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(ContinueWorkstreamCandidateDetail {
+                candidate_id: row.get(0)?,
+                workstream_id: row.get(1)?,
+                target_artifact_id: row.get(2)?,
+                target_title: row.get(3)?,
+                target_kind: row.get(4)?,
+                target_openability: row.get(5)?,
+                candidate_kind: row.get(6)?,
+                last_meaningful_action_id: row.get(7)?,
+                evidence_frame_id: row.get(8)?,
+                supporting_episode_id: row.get(9)?,
+                score: round_score(score),
+                confidence_label: confidence_label(score).to_string(),
+                reason: row.get(19)?,
+                missing_evidence,
+                components: ContinueScoreComponents {
+                    actionability: round_score(row.get(11)?),
+                    primary_target: round_score(row.get(12)?),
+                    unresolved_state: round_score(row.get(13)?),
+                    branch_origin: round_score(row.get(14)?),
+                    evidence_quality: round_score(row.get(15)?),
+                    recency: round_score(row.get(16)?),
+                    openability: round_score(row.get(17)?),
+                    privacy_safety: round_score(row.get(18)?),
+                },
+                created_at_ms: row.get(21)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_continue_decision_summary(
+    conn: &Connection,
+    workstream_id: &str,
+    decision_id: Option<&str>,
+) -> Result<Option<ContinueDecisionSummary>, String> {
+    let (sql, bind_value) = if let Some(decision_id) = decision_id {
+        (
+            "SELECT id, requested_at_ms, source, selected_candidate_id,
+                    return_target_artifact_id, confidence, decision_reason,
+                    next_action, warnings, validation_status
+             FROM continue_decisions
+             WHERE id = ?1
+             LIMIT 1",
+            decision_id,
+        )
+    } else {
+        (
+            "SELECT id, requested_at_ms, source, selected_candidate_id,
+                    return_target_artifact_id, confidence, decision_reason,
+                    next_action, warnings, validation_status
+             FROM continue_decisions
+             WHERE selected_workstream_id = ?1
+             ORDER BY requested_at_ms DESC
+             LIMIT 1",
+            workstream_id,
+        )
+    };
+    conn.query_row(sql, params![bind_value], |row| {
+        let warnings = row
+            .get::<_, Option<String>>(8)?
+            .map(|value| {
+                value
+                    .split(';')
+                    .filter_map(|part| non_empty(part.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(ContinueDecisionSummary {
+            decision_id: row.get(0)?,
+            requested_at_ms: row.get(1)?,
+            source: row.get(2)?,
+            selected_candidate_id: row.get(3)?,
+            return_target_artifact_id: row.get(4)?,
+            confidence: round_score(row.get(5)?),
+            decision_reason: row.get(6)?,
+            next_action: row.get(7)?,
+            warnings,
+            validation_status: row.get(9)?,
+        })
+    })
+    .optional()
+    .map_err(to_string)
+}
+
+fn load_continue_feedback_events(
+    conn: &Connection,
+    decision_id: Option<&str>,
+    workstream_id: Option<&str>,
+) -> Result<Vec<ContinueFeedbackEventResult>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
+                    observed_frame_id, target_artifact_id, chosen_artifact_id,
+                    timestamp_ms, confidence, reason, note, source
+             FROM continue_feedback_events
+             WHERE (?1 IS NOT NULL AND decision_id = ?1)
+                OR (?2 IS NOT NULL AND workstream_id = ?2)
+             ORDER BY timestamp_ms DESC
+             LIMIT 20",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![decision_id, workstream_id], |row| {
+            Ok(ContinueFeedbackEventResult {
+                id: row.get(0)?,
+                decision_id: row.get(1)?,
+                selected_candidate_id: row.get(2)?,
+                workstream_id: row.get(3)?,
+                event_kind: row.get(4)?,
+                observed_frame_id: row.get(5)?,
+                target_artifact_id: row.get(6)?,
+                chosen_artifact_id: row.get(7)?,
+                timestamp_ms: row.get(8)?,
+                confidence: round_score(row.get(9)?),
+                reason: row.get(10)?,
+                note: row.get(11)?,
+                source: row.get(12)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_continue_breadcrumbs(
+    conn: &Connection,
+    workstream_id: &str,
+) -> Result<Vec<ContinueBreadcrumbSummary>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workstream_id, text, source, created_at_ms
+             FROM continue_breadcrumbs
+             WHERE workstream_id = ?1
+             ORDER BY created_at_ms DESC
+             LIMIT 12",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![workstream_id], |row| {
+            Ok(ContinueBreadcrumbSummary {
+                id: row.get(0)?,
+                workstream_id: row.get(1)?,
+                text: row.get(2)?,
+                source: row.get(3)?,
+                created_at_ms: row.get(4)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn workstream_detail_anchors(
+    artifacts: &[ContinueWorkstreamArtifactDetail],
+    episodes: &[ContinueWorkstreamEpisodeDetail],
+    candidates: &[ContinueWorkstreamCandidateDetail],
+) -> ContinueEvidenceAnchors {
+    let mut frame_ids = Vec::new();
+    let mut action_ids = Vec::new();
+    let mut episode_ids = Vec::new();
+    let mut artifact_ids = Vec::new();
+    let mut seen_frames = HashSet::new();
+    let mut seen_actions = HashSet::new();
+    let mut seen_episodes = HashSet::new();
+    let mut seen_artifacts = HashSet::new();
+
+    for artifact in artifacts {
+        if seen_artifacts.insert(artifact.artifact_id.clone()) {
+            artifact_ids.push(artifact.artifact_id.clone());
+        }
+        for frame_id in [
+            artifact.first_seen_frame_id.as_ref(),
+            artifact.last_seen_frame_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen_frames.insert(frame_id.clone()) {
+                frame_ids.push(frame_id.clone());
+            }
+        }
+    }
+    for episode in episodes {
+        if seen_episodes.insert(episode.id.clone()) {
+            episode_ids.push(episode.id.clone());
+        }
+        for frame_id in [
+            episode.start_frame_id.as_ref(),
+            episode.end_frame_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen_frames.insert(frame_id.clone()) {
+                frame_ids.push(frame_id.clone());
+            }
+        }
+        for action in &episode.actions {
+            if seen_actions.insert(action.action_id.clone()) {
+                action_ids.push(action.action_id.clone());
+            }
+            if seen_frames.insert(action.frame_id.clone()) {
+                frame_ids.push(action.frame_id.clone());
+            }
+            if let Some(artifact_id) = &action.artifact_id {
+                if seen_artifacts.insert(artifact_id.clone()) {
+                    artifact_ids.push(artifact_id.clone());
+                }
+            }
+        }
+    }
+    for candidate in candidates {
+        if let Some(frame_id) = &candidate.evidence_frame_id {
+            if seen_frames.insert(frame_id.clone()) {
+                frame_ids.push(frame_id.clone());
+            }
+        }
+        if let Some(action_id) = &candidate.last_meaningful_action_id {
+            if seen_actions.insert(action_id.clone()) {
+                action_ids.push(action_id.clone());
+            }
+        }
+        if let Some(episode_id) = &candidate.supporting_episode_id {
+            if seen_episodes.insert(episode_id.clone()) {
+                episode_ids.push(episode_id.clone());
+            }
+        }
+        if let Some(artifact_id) = &candidate.target_artifact_id {
+            if seen_artifacts.insert(artifact_id.clone()) {
+                artifact_ids.push(artifact_id.clone());
+            }
+        }
+    }
+
+    ContinueEvidenceAnchors {
+        frame_ids: frame_ids.into_iter().take(24).collect(),
+        action_ids: action_ids.into_iter().take(24).collect(),
+        episode_ids: episode_ids.into_iter().take(24).collect(),
+        artifact_ids: artifact_ids.into_iter().take(24).collect(),
+    }
 }
 
 fn load_scorer_workstream_episodes(
@@ -1879,7 +2855,8 @@ fn load_last_meaningful_action(
 ) -> Result<Option<ScorerAction>, String> {
     conn.query_row(
         "SELECT ta.id, ta.frame_id, ta.artifact_id, ta.secondary_artifact_id,
-                ta.action_kind, ta.action_role, ta.confidence, ta.created_at_ms
+                ta.action_kind, ta.action_role, ta.confidence, ta.reason, ta.created_at_ms,
+                ta.collapse_count, ta.first_frame_id, ta.last_frame_id, ta.strongest_frame_id
          FROM continue_workstream_episodes we
          JOIN continue_episode_actions ea ON ea.episode_id = we.episode_id
          JOIN continue_task_actions ta ON ta.id = ea.action_id
@@ -1901,7 +2878,12 @@ fn load_last_meaningful_action(
                 action_kind: row.get(4)?,
                 action_role: row.get(5)?,
                 confidence: row.get(6)?,
-                created_at_ms: row.get(7)?,
+                reason: row.get(7)?,
+                created_at_ms: row.get(8)?,
+                collapse_count: row.get::<_, i64>(9)?.max(1),
+                first_frame_id: row.get(10)?,
+                last_frame_id: row.get(11)?,
+                strongest_frame_id: row.get(12)?,
             })
         },
     )
@@ -2194,6 +3176,77 @@ fn score_continue_candidates(
                 + candidate.privacy_safety_score * 0.04
                 + candidate.recency_score * 0.03,
         );
+        candidate.score = round_score(confidence_cap_for_candidate(candidate, workstream));
+    }
+}
+
+fn confidence_cap_for_candidate(
+    candidate: &ScoredContinueCandidate,
+    workstream: &ScorerWorkstream,
+) -> f64 {
+    let mut cap = 1.0;
+    let mut capped = false;
+    if candidate.candidate_kind == "evidence_only" {
+        cap = f64::min(cap, 0.42);
+        capped = true;
+    }
+    if candidate.target_artifact.is_none() {
+        cap = f64::min(cap, 0.44);
+        capped = true;
+    }
+    if let Some(target) = candidate.target_artifact.as_ref() {
+        if target.artifact_kind == "unknown" || target.evidence_quality == "thin" {
+            cap = f64::min(cap, 0.55);
+            capped = true;
+        }
+        if target.openability == "frame_fallback" {
+            cap = f64::min(cap, 0.58);
+            capped = true;
+        } else if target.browser_url.is_none() && target.document_path.is_none() {
+            cap = f64::min(cap, 0.64);
+            capped = true;
+        }
+        if is_smalltalk_artifact(target) {
+            cap = f64::min(cap, 0.42);
+            capped = true;
+        }
+    }
+    if candidate.evidence_quality_score < 0.45 {
+        cap = f64::min(cap, 0.52);
+        capped = true;
+    }
+    if candidate
+        .last_meaningful_action
+        .as_ref()
+        .is_some_and(|action| action.collapse_count > 1)
+    {
+        cap = f64::min(cap, 0.64);
+        capped = true;
+    }
+    if candidate.last_meaningful_action.is_none() && workstream.unresolved_signal.is_none() {
+        cap = f64::min(cap, 0.48);
+        capped = true;
+    }
+    if candidate.warnings.iter().any(|warning| {
+        matches!(
+            warning.as_str(),
+            "current_focus_mismatch" | "current_focus_differs_from_return_target"
+        )
+    }) {
+        cap = f64::min(cap, 0.68);
+        capped = true;
+    }
+    if candidate.recency_score >= 0.95
+        && candidate.unresolved_score <= 0.42
+        && candidate.primary_target_score <= 0.2
+    {
+        cap = f64::min(cap, 0.46);
+        capped = true;
+    }
+    if capped {
+        f64::min(candidate.score, cap)
+    } else {
+        candidate.score
     }
 }
 
@@ -2345,10 +3398,15 @@ fn openability_score(target: Option<&ScorerArtifact>) -> f64 {
 }
 
 fn privacy_safety_score(candidate: &ScoredContinueCandidate) -> f64 {
-    candidate
-        .target_artifact
-        .as_ref()
-        .and_then(|artifact| artifact.privacy_status.as_deref())
+    let Some(artifact) = candidate.target_artifact.as_ref() else {
+        return 0.85;
+    };
+    if is_smalltalk_artifact(artifact) {
+        return 0.12;
+    }
+    artifact
+        .privacy_status
+        .as_deref()
         .map(|status| {
             let lower = status.to_lowercase();
             if contains_any(
@@ -2367,6 +3425,22 @@ fn privacy_safety_score(candidate: &ScoredContinueCandidate) -> f64 {
             }
         })
         .unwrap_or(0.85)
+}
+
+fn is_smalltalk_artifact(artifact: &ScorerArtifact) -> bool {
+    let haystack = [
+        artifact.display_title.as_deref(),
+        artifact.browser_url.as_deref(),
+        artifact.document_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_lowercase();
+    haystack.contains("smalltalk continue")
+        || haystack.contains("com.smalltalk.app")
+        || haystack.contains("smalltalk.app")
 }
 
 fn primary_artifact_for_workstream(workstream: &ScorerWorkstream) -> Option<ScorerArtifact> {
@@ -2545,15 +3619,88 @@ fn unresolved_kind(raw: Option<&str>) -> Option<String> {
 
 fn unresolved_state_description(raw: Option<&str>) -> Option<String> {
     match unresolved_kind(raw)?.as_str() {
-        "visible_error_or_failure" => Some("Visible error or failure evidence is unresolved.".to_string()),
-        "draft_or_composer_active" => Some("Draft or composer activity appears unfinished.".to_string()),
+        "error_signal" => Some("An error or failure was visible.".to_string()),
+        "unresolved_error_signal" | "visible_error_or_failure" => {
+            Some("There appears to be an unresolved error.".to_string())
+        }
+        "draft_or_composer_active" => Some("A draft or composer appears unfinished.".to_string()),
         "verification_without_return" => {
             Some("Verification/output surface was observed without a return to the primary target.".to_string())
         }
         "branch_without_return" => Some("Support/search branch was recent and there is no observed return to the primary target.".to_string()),
         "idle_after_progress" => Some("User went idle after meaningful progress on the workstream.".to_string()),
-        other => Some(format!("Unresolved signal: {}", other)),
+        other => productize_continue_label(other).or_else(|| Some("Unresolved state still present.".to_string())),
     }
+}
+
+fn productize_continue_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let key = unresolved_kind(Some(trimmed))
+        .unwrap_or_else(|| trimmed.to_string())
+        .to_lowercase()
+        .replace('-', "_");
+    let label = match key.as_str() {
+        "error_signal" => "An error or failure was visible.",
+        "unresolved_error_signal" => "There appears to be an unresolved error.",
+        "primary_artifact_fallback" => "This looks like the main place to continue.",
+        "last_meaningful_error" => "The last meaningful state was an error/blocker.",
+        "frame_fallback" => "This target is based on visible screen evidence.",
+        "last_meaningful_edit" => "Editing was the last meaningful activity.",
+        "last_meaningful_composer" => "A draft or composer was active.",
+        "last_meaningful_command" => "A command had just been run.",
+        "last_meaningful_output_review" => "Output was being reviewed.",
+        "last_meaningful_search" => "Search was the last meaningful branch.",
+        "last_meaningful_reading" => "Reading was the last meaningful activity.",
+        "last_meaningful_action_fallback" => "This is based on the last visible meaningful action.",
+        "idle_after_meaningful_progress" => "Work paused after meaningful progress.",
+        "draft_or_composer_signal" => "A draft or composer appears unfinished.",
+        "verification_without_return" => "Verification has not been applied back to the target.",
+        "branch_without_return" => "Search branch has not been applied back to the target.",
+        "branch_page_is_evidence_return_to_origin" => {
+            "The branch looks like evidence; return to the primary target."
+        }
+        "search_has_no_primary_target" => "The visible search branch is the best available target.",
+        "thin_semantic_workstream_fallback" => {
+            "Evidence is thin; this is the best available continuation."
+        }
+        "current_focus_connected_to_workstream" => "Current focus is connected to the workstream.",
+        "smalltalk_self_observation_downranked" => {
+            "Smalltalk's own UI was treated as low-value evidence."
+        }
+        "current_focus_mismatch" | "current_focus_differs_from_return_target" => {
+            "Current screen is not the return target."
+        }
+        "no_last_meaningful_action" => "No clear last action was captured.",
+        "no_direct_url_or_document_path" | "no_openable_target" => {
+            "No directly openable target was found."
+        }
+        "thin_evidence" | "thin_evidence_quality" => "Evidence is thin.",
+        "no_candidate_generated" => "No continuation candidate could be generated yet.",
+        _ if trimmed.starts_with('{') => {
+            return Some("Unresolved state still present.".to_string())
+        }
+        _ if key.contains("_id") || key.contains("json") => return None,
+        _ => return Some(sentence_from_internal_label(trimmed)),
+    };
+    Some(label.to_string())
+}
+
+fn sentence_from_internal_label(raw: &str) -> String {
+    let mut sentence = raw.replace('_', " ").replace('-', " ");
+    sentence = sentence.split_whitespace().collect::<Vec<_>>().join(" ");
+    if sentence.is_empty() {
+        return "Local evidence is thin.".to_string();
+    }
+    let mut chars = sentence.chars();
+    let first = chars
+        .next()
+        .map(|ch| ch.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    let rest = chars.collect::<String>();
+    format!("{}{}.", first, rest.trim_end_matches('.'))
 }
 
 fn missing_evidence_for_candidate(
@@ -2603,7 +3750,15 @@ fn warnings_for_candidate(
         }
     }
     if candidate.privacy_safety_score < 0.7 {
-        warnings.push("privacy_sensitive_or_redacted_target_local_only".to_string());
+        if candidate
+            .target_artifact
+            .as_ref()
+            .is_some_and(is_smalltalk_artifact)
+        {
+            warnings.push("smalltalk_self_observation_downranked".to_string());
+        } else {
+            warnings.push("privacy_sensitive_or_redacted_target_local_only".to_string());
+        }
     }
     if let (Some(focus), Some(target)) = (current_focus, candidate.target_artifact.as_ref()) {
         if focus.artifact_id.as_deref() != Some(target.id.as_str()) {
@@ -3419,8 +4574,9 @@ fn insert_feedback_event(
     conn.execute(
         "INSERT OR IGNORE INTO continue_feedback_events (
             id, decision_id, event_kind, observed_frame_id, target_artifact_id,
-            chosen_artifact_id, timestamp_ms, confidence, reason
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            chosen_artifact_id, timestamp_ms, confidence, reason,
+            selected_candidate_id, workstream_id, note, source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             decision_id,
@@ -3431,12 +4587,18 @@ fn insert_feedback_event(
             timestamp_ms,
             confidence,
             reason,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "inferred",
         ],
     )
     .map_err(to_string)?;
     Ok(ContinueFeedbackEventResult {
         id,
         decision_id: Some(decision_id.to_string()),
+        selected_candidate_id: None,
+        workstream_id: None,
         event_kind: event_kind.to_string(),
         observed_frame_id: observed_frame_id.map(|value| value.to_string()),
         target_artifact_id: target_artifact_id.map(|value| value.to_string()),
@@ -3444,6 +4606,8 @@ fn insert_feedback_event(
         timestamp_ms,
         confidence: round_score(confidence),
         reason: Some(reason.to_string()),
+        note: None,
+        source: Some("inferred".to_string()),
     })
 }
 
@@ -3571,6 +4735,187 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             vec![
                 eval_candidate("c-subtask", "w-parent", Some("subtask"), 0.82, "strong"),
                 eval_candidate("c-parent", "w-parent", Some("parent"), 0.61, "medium"),
+            ],
+        ),
+        eval_case(
+            "hardqa_repeated_error_collapses_to_blocker",
+            "Repeated adjacent error frames should still rank one blocker target",
+            "origin-error",
+            Some("origin-error"),
+            vec![
+                eval_candidate(
+                    "c-error-blocker",
+                    "w-error-repeat",
+                    Some("origin-error"),
+                    0.82,
+                    "strong",
+                ),
+                eval_candidate(
+                    "c-error-duplicate",
+                    "w-error-repeat",
+                    Some("duplicate-error-row"),
+                    0.44,
+                    "thin",
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_smalltalk_self_not_primary",
+            "Smalltalk UI self-capture should not become the primary workstream",
+            "code",
+            Some("smalltalk"),
+            vec![
+                eval_candidate("c-code-target", "w-code", Some("code"), 0.74, "medium"),
+                eval_candidate(
+                    "c-smalltalk-self",
+                    "w-smalltalk",
+                    Some("smalltalk"),
+                    0.32,
+                    "thin",
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_latest_screen_not_enough",
+            "Candidate target should not win purely because it is the latest screen",
+            "doc",
+            Some("latest-feed"),
+            vec![
+                eval_candidate("c-doc-work", "w-doc", Some("doc"), 0.76, "medium"),
+                eval_candidate("c-latest-feed", "w-feed", Some("latest-feed"), 0.39, "thin"),
+            ],
+        ),
+        eval_case(
+            "hardqa_raw_unresolved_json_hidden",
+            "Raw unresolved JSON should not affect target ranking",
+            "terminal",
+            Some("terminal"),
+            vec![
+                eval_candidate(
+                    "c-terminal-blocker",
+                    "w-terminal-json",
+                    Some("terminal"),
+                    0.79,
+                    "strong",
+                ),
+                eval_candidate_with_missing(
+                    "c-json-raw",
+                    "w-terminal-json",
+                    Some("raw-json"),
+                    0.31,
+                    "thin",
+                    vec!["raw_unresolved_json"],
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_island_continue_decision_id",
+            "Floating island Continue path should stay tied to a Continue decision target",
+            "continue-target",
+            Some("smalltalk"),
+            vec![
+                eval_candidate(
+                    "c-continue-target",
+                    "w-island",
+                    Some("continue-target"),
+                    0.73,
+                    "medium",
+                ),
+                eval_candidate(
+                    "c-session-trail",
+                    "w-island",
+                    Some("legacy-session-trail"),
+                    0.28,
+                    "thin",
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_typing_throttle_keeps_target",
+            "Heavy typing capture should not turn duplicate typing evidence into the target",
+            "draft",
+            Some("draft"),
+            vec![
+                eval_candidate("c-draft", "w-typing", Some("draft"), 0.7, "medium"),
+                eval_candidate_with_missing(
+                    "c-typing-dup",
+                    "w-typing",
+                    Some("typing-duplicate"),
+                    0.34,
+                    "thin",
+                    vec!["repeated_identical_actions"],
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_passive_refresh_no_duplicate_decision",
+            "Passive refresh should keep the same target instead of duplicating decisions",
+            "code",
+            Some("code"),
+            vec![
+                eval_candidate("c-code-cache", "w-cache", Some("code"), 0.72, "medium"),
+                eval_candidate_with_missing(
+                    "c-duplicate-decision",
+                    "w-cache",
+                    Some("duplicate-decision"),
+                    0.3,
+                    "thin",
+                    vec!["duplicate_passive_refresh"],
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_thin_fallback_confidence_capped",
+            "Thin fallback evidence should remain low-confidence evidence",
+            "unknown",
+            Some("unknown"),
+            vec![eval_candidate_with_missing(
+                "c-frame-fallback",
+                "w-fallback",
+                Some("unknown"),
+                0.34,
+                "thin",
+                vec!["frame_fallback"],
+            )],
+        ),
+        eval_case(
+            "hardqa_default_ui_no_raw_ids",
+            "Raw ids are diagnostics-only and should not define the target",
+            "document",
+            Some("artifact-raw-id"),
+            vec![
+                eval_candidate("c-document", "w-ui", Some("document"), 0.69, "medium"),
+                eval_candidate_with_missing(
+                    "c-raw-id",
+                    "w-ui",
+                    Some("artifact-raw-id"),
+                    0.33,
+                    "thin",
+                    vec!["raw_id_diagnostic_only"],
+                ),
+            ],
+        ),
+        eval_case(
+            "hardqa_legacy_stop_cloud_error_demoted",
+            "Stop-time legacy bundle/cloud errors should not surface as primary Continue failures",
+            "code",
+            Some("cloud-error"),
+            vec![
+                eval_candidate(
+                    "c-code-after-cloud-error",
+                    "w-legacy",
+                    Some("code"),
+                    0.71,
+                    "medium",
+                ),
+                eval_candidate_with_missing(
+                    "c-cloud-error",
+                    "w-legacy",
+                    Some("cloud-error"),
+                    0.29,
+                    "thin",
+                    vec!["legacy_stop_cloud_error"],
+                ),
             ],
         ),
     ];
@@ -3862,7 +5207,7 @@ fn workstream_summary(workstream: &ScorerWorkstream) -> ContinueSelectedWorkstre
         title_candidate: workstream.title_candidate.clone(),
         primary_artifact_id: workstream.primary_artifact_id.clone(),
         last_active_timestamp_ms: workstream.last_active_timestamp_ms,
-        unresolved_signal: workstream.unresolved_signal.clone(),
+        unresolved_signal: unresolved_state_description(workstream.unresolved_signal.as_deref()),
     }
 }
 
@@ -3889,8 +5234,15 @@ fn action_summary(action: &ScorerAction) -> ContinueActionSummary {
         action_kind: action.action_kind.clone(),
         action_role: action.action_role.clone(),
         timestamp_ms: action.created_at_ms,
-        evidence_frame_id: action.frame_id.clone(),
+        evidence_frame_id: action
+            .strongest_frame_id
+            .clone()
+            .unwrap_or_else(|| action.frame_id.clone()),
         artifact_id: action.artifact_id.clone(),
+        collapse_count: action.collapse_count.max(1),
+        first_frame_id: action.first_frame_id.clone(),
+        last_frame_id: action.last_frame_id.clone(),
+        strongest_frame_id: action.strongest_frame_id.clone(),
     }
 }
 
@@ -3905,7 +5257,10 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
         candidate_kind: candidate.candidate_kind.clone(),
         score: round_score(candidate.score),
         confidence_label: confidence_label(candidate.score).to_string(),
-        reason: candidate.reason.clone(),
+        reason: candidate
+            .reason
+            .as_deref()
+            .and_then(productize_continue_label),
         missing_evidence: candidate.missing_evidence.clone(),
         evidence_frame_id: candidate.evidence_frame_id.clone(),
         supporting_episode_id: candidate.supporting_episode_id.clone(),
@@ -4020,8 +5375,230 @@ fn load_evidence_frames(
             });
         frames.push(frame);
     }
-    frames.sort_by_key(|frame| (frame.captured_at, frame.id.parse::<i64>().unwrap_or(0)));
+    if frames.len() <= 1 {
+        frames.extend(load_event_evidence_frames(conn, request, frames.last())?);
+    }
+    frames.sort_by_key(|frame| {
+        (
+            frame.captured_at,
+            frame.id.parse::<i64>().unwrap_or(i64::MAX),
+        )
+    });
     Ok(frames)
+}
+
+#[derive(Debug)]
+struct EventEvidenceRow {
+    id: String,
+    ts_ms: i64,
+    event_type: String,
+    key_category: Option<String>,
+    app_name: Option<String>,
+    app_bundle_id: Option<String>,
+    window_title: Option<String>,
+}
+
+fn load_event_evidence_frames(
+    conn: &Connection,
+    request: &ContinueSecondLayerRebuildRequest,
+    latest_frame: Option<&EvidenceFrame>,
+) -> Result<Vec<EvidenceFrame>, String> {
+    if !table_exists(conn, "ui_events")? {
+        return Ok(Vec::new());
+    }
+    let has_app_name = column_exists(conn, "ui_events", "app_name")?;
+    let has_app_bundle_id = column_exists(conn, "ui_events", "app_bundle_id")?;
+    let has_window_title = column_exists(conn, "ui_events", "window_title")?;
+    let app_expr = if has_app_name { "app_name" } else { "NULL" };
+    let bundle_expr = if has_app_bundle_id {
+        "app_bundle_id"
+    } else {
+        "NULL"
+    };
+    let window_expr = if has_window_title {
+        "window_title"
+    } else {
+        "NULL"
+    };
+    let limit = request.limit.unwrap_or(300).clamp(1, 2_000);
+    let max_ts_cutoff = request.lookback_ms.and_then(|lookback| {
+        if lookback > 0 {
+            conn.query_row("SELECT MAX(ts_ms) FROM ui_events", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+            .map(|max_ts| max_ts - lookback)
+        } else {
+            None
+        }
+    });
+    let sql = format!(
+        "SELECT id, ts_ms, event_type, key_category, {}, {}, {}
+         FROM (
+           SELECT id, ts_ms, event_type, key_category, {}, {}, {}
+           FROM ui_events
+           WHERE (?1 IS NULL OR session_id = ?1)
+             AND (?2 IS NULL OR ts_ms >= ?2)
+           ORDER BY ts_ms DESC
+           LIMIT ?3
+         )
+         ORDER BY ts_ms ASC",
+        app_expr, bundle_expr, window_expr, app_expr, bundle_expr, window_expr
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
+    let rows = stmt
+        .query_map(
+            params![request.session_id.as_deref(), max_ts_cutoff, limit],
+            |row| {
+                Ok(EventEvidenceRow {
+                    id: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    event_type: row.get(2)?,
+                    key_category: row.get(3)?,
+                    app_name: row.get(4)?,
+                    app_bundle_id: row.get(5)?,
+                    window_title: row.get(6)?,
+                })
+            },
+        )
+        .map_err(to_string)?;
+    let rows = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
+    Ok(event_rows_to_evidence_frames(
+        &rows,
+        request.session_id.clone(),
+        latest_frame,
+    ))
+}
+
+fn event_rows_to_evidence_frames(
+    rows: &[EventEvidenceRow],
+    session_id: Option<String>,
+    latest_frame: Option<&EvidenceFrame>,
+) -> Vec<EvidenceFrame> {
+    let mut frames = Vec::new();
+    let mut previous_bucket: Option<(String, String, String, i64)> = None;
+    let mut previous_frame_id = latest_frame.map(|frame| frame.id.clone());
+    for row in rows {
+        let signal = event_signal_kind(&row.event_type, row.key_category.as_deref());
+        if signal == "noise" {
+            continue;
+        }
+        let app = clean_event_label(row.app_name.as_deref());
+        let window = clean_event_label(row.window_title.as_deref());
+        let same_bucket = previous_bucket
+            .as_ref()
+            .map(|(prev_signal, prev_app, prev_window, prev_ts)| {
+                prev_signal == &signal
+                    && prev_app.eq_ignore_ascii_case(&app)
+                    && prev_window.eq_ignore_ascii_case(&window)
+                    && row.ts_ms.saturating_sub(*prev_ts) <= 30_000
+            })
+            .unwrap_or(false);
+        if same_bucket {
+            previous_bucket = Some((signal, app, window, row.ts_ms));
+            continue;
+        }
+        let id_seed = format!(
+            "{}:{}:{}:{}:{}",
+            session_id.as_deref().unwrap_or(""),
+            row.ts_ms,
+            row.id,
+            signal,
+            app
+        );
+        let id = format!("event-{}", stable_hash(id_seed.as_bytes()));
+        let summary = event_evidence_summary(&signal, &app, &window);
+        let content_hash = stable_hash(summary.as_bytes());
+        frames.push(EvidenceFrame {
+            id: id.clone(),
+            captured_at: row.ts_ms,
+            app_name: if app.is_empty() {
+                None
+            } else {
+                Some(app.clone())
+            },
+            window_name: if window.is_empty() {
+                None
+            } else {
+                Some(window.clone())
+            },
+            browser_url: None,
+            document_path: None,
+            capture_trigger: format!("event_signal_{}", signal),
+            text_source: Some("event".to_string()),
+            full_text: Some(summary),
+            content_hash: Some(content_hash),
+            image_hash: None,
+            privacy_status: None,
+            app_bundle_id: row.app_bundle_id.clone(),
+            previous_frame_id,
+            session_id: session_id.clone(),
+            app_contexts: Vec::new(),
+            content_units: Vec::new(),
+            ui_events: vec![EvidenceUiEvent {
+                id: row.id.clone(),
+                event_type: row.event_type.clone(),
+                key_category: row.key_category.clone(),
+            }],
+            trigger: Some(EvidenceTrigger {
+                id: format!("event-trigger-{}", stable_hash(row.id.as_bytes())),
+                trigger_type: format!("event_signal_{}", signal),
+                caused_by_event_ids: vec![row.id.clone()],
+            }),
+            transition: None,
+            frame_diff: None,
+            typing_bursts: Vec::new(),
+            clipboard_events: Vec::new(),
+            focused_node_evidence: false,
+            selected_text_present: false,
+        });
+        previous_frame_id = Some(id);
+        previous_bucket = Some((signal, app, window, row.ts_ms));
+        if frames.len() >= 64 {
+            break;
+        }
+    }
+    frames
+}
+
+fn event_signal_kind(event_type: &str, key_category: Option<&str>) -> String {
+    match event_type {
+        "key_down" => match key_category.unwrap_or("") {
+            "character" => "typing".to_string(),
+            "enter" | "return" => "commit_key".to_string(),
+            "shortcut" => "shortcut".to_string(),
+            other if !other.trim().is_empty() => format!("key_{}", normalize_token(other)),
+            _ => "key_down".to_string(),
+        },
+        "scroll" => "scroll".to_string(),
+        "click" => "click".to_string(),
+        "app_switch" => "app_switch".to_string(),
+        "ax_notification" => "accessibility".to_string(),
+        other if other.trim().is_empty() => "noise".to_string(),
+        other => normalize_token(other),
+    }
+}
+
+fn clean_event_label(value: Option<&str>) -> String {
+    value
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn event_evidence_summary(signal: &str, app: &str, window: &str) -> String {
+    let surface = [app, window]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if surface.is_empty() {
+        format!("Local event signal: {}", signal)
+    } else {
+        format!("Local event signal: {} in {}", signal, surface)
+    }
 }
 
 fn query_evidence_frame_rows(
@@ -4478,6 +6055,7 @@ fn load_continue_action_records(
             SELECT ta.id, ta.frame_id, ta.previous_frame_id, ta.artifact_id,
                    ta.secondary_artifact_id, ta.action_kind, ta.action_role,
                    ta.confidence, ta.reason, ta.created_at_ms,
+                   ta.collapse_count, ta.first_frame_id, ta.last_frame_id, ta.strongest_frame_id,
                    a.id, a.artifact_kind, a.stable_key, a.app_name, a.display_title,
                    a.browser_url, a.document_path, a.evidence_quality,
                    sa.id, sa.artifact_kind, sa.stable_key, sa.app_name, sa.display_title,
@@ -4506,8 +6084,8 @@ fn load_continue_action_records(
                 limit,
             ],
             |row| {
-                let artifact = artifact_record_from_row(row, 10)?;
-                let secondary_artifact = artifact_record_from_row(row, 18)?;
+                let artifact = artifact_record_from_row(row, 14)?;
+                let secondary_artifact = artifact_record_from_row(row, 22)?;
                 Ok(ContinueActionRecord {
                     id: row.get(0)?,
                     frame_id: row.get(1)?,
@@ -4519,6 +6097,10 @@ fn load_continue_action_records(
                     confidence: row.get(7)?,
                     reason: row.get(8)?,
                     created_at_ms: row.get(9)?,
+                    collapse_count: row.get::<_, i64>(10)?.max(1),
+                    first_frame_id: row.get(11)?,
+                    last_frame_id: row.get(12)?,
+                    strongest_frame_id: row.get(13)?,
                     artifact,
                     secondary_artifact,
                 })
@@ -4938,6 +6520,109 @@ fn extract_task_actions(
     actions
 }
 
+fn collapse_repeated_task_actions(actions: Vec<ExtractedTaskAction>) -> Vec<ExtractedTaskAction> {
+    let mut collapsed: Vec<ExtractedTaskAction> = Vec::new();
+    for action in actions {
+        if let Some(previous) = collapsed.last_mut() {
+            if repeated_task_action(previous, &action) {
+                let previous_confidence = previous.confidence;
+                previous.collapse_count = previous.collapse_count.saturating_add(1).max(2);
+                previous.last_frame_id = Some(action.frame_id.clone());
+                previous.frame_id = if action.confidence >= previous_confidence {
+                    action.frame_id.clone()
+                } else {
+                    previous
+                        .strongest_frame_id
+                        .clone()
+                        .unwrap_or_else(|| previous.frame_id.clone())
+                };
+                previous.created_at_ms = action.created_at_ms;
+                previous.confidence = previous.confidence.max(action.confidence);
+                if action.confidence >= previous_confidence {
+                    previous.strongest_frame_id = Some(action.frame_id.clone());
+                }
+                for event_id in action.evidence_event_ids {
+                    if !previous.evidence_event_ids.contains(&event_id) {
+                        previous.evidence_event_ids.push(event_id);
+                    }
+                }
+                previous.id = semantic_action_id(previous);
+                continue;
+            }
+        }
+        collapsed.push(action);
+    }
+    collapsed
+}
+
+fn repeated_task_action(previous: &ExtractedTaskAction, next: &ExtractedTaskAction) -> bool {
+    if !matches!(
+        next.action_kind.as_str(),
+        "encountering_error"
+            | "composing"
+            | "editing"
+            | "reading"
+            | "observing_command_output"
+            | "reviewing_output"
+            | "idle_after_progress"
+    ) {
+        return false;
+    }
+    if previous.action_kind != next.action_kind
+        || previous.artifact_id != next.artifact_id
+        || previous.secondary_artifact_id != next.secondary_artifact_id
+    {
+        return false;
+    }
+    if semantic_base_reason(&previous.reason) != semantic_base_reason(&next.reason) {
+        return false;
+    }
+    if previous.trigger_type != next.trigger_type
+        || previous.transition_label != next.transition_label
+    {
+        return false;
+    }
+    let adjacent_frame = previous
+        .last_frame_id
+        .as_deref()
+        .unwrap_or(previous.frame_id.as_str())
+        .parse::<i64>()
+        .ok()
+        .zip(next.frame_id.parse::<i64>().ok())
+        .map(|(left, right)| right.saturating_sub(left).abs() <= 3)
+        .unwrap_or(false);
+    let close_in_time = next.created_at_ms.saturating_sub(previous.created_at_ms) <= 2 * 60 * 1000;
+    adjacent_frame || close_in_time
+}
+
+fn semantic_base_reason(reason: &str) -> String {
+    let mut parts = reason.splitn(4, ':').collect::<Vec<_>>();
+    if parts.len() == 4 && parts[0] == "semantic_collapse" {
+        parts.pop().unwrap_or("").to_string()
+    } else {
+        reason.to_string()
+    }
+}
+
+fn semantic_action_id(action: &ExtractedTaskAction) -> String {
+    let id_seed = format!(
+        "{}:{}:{}:{}:{}:{}",
+        action.previous_frame_id.as_deref().unwrap_or(""),
+        action
+            .first_frame_id
+            .as_deref()
+            .unwrap_or(action.frame_id.as_str()),
+        action
+            .last_frame_id
+            .as_deref()
+            .unwrap_or(action.frame_id.as_str()),
+        action.artifact_id.as_deref().unwrap_or(""),
+        action.action_kind,
+        semantic_base_reason(&action.reason)
+    );
+    format!("task-action-{}", stable_hash(id_seed.as_bytes()))
+}
+
 fn classify_task_action(
     frame: &EvidenceFrame,
     previous_frame: Option<&EvidenceFrame>,
@@ -5079,6 +6764,10 @@ fn classify_task_action(
         confidence,
         reason: reason.to_string(),
         created_at_ms: frame.captured_at,
+        collapse_count: 1,
+        first_frame_id: Some(frame.id.clone()),
+        last_frame_id: Some(frame.id.clone()),
+        strongest_frame_id: Some(frame.id.clone()),
     }
 }
 
@@ -5091,8 +6780,9 @@ fn insert_continue_task_action(
         "INSERT INTO continue_task_actions (
             id, frame_id, previous_frame_id, artifact_id, secondary_artifact_id,
             action_kind, action_role, trigger_type, transition_label,
-            evidence_event_ids_json, confidence, reason, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            evidence_event_ids_json, confidence, reason, created_at_ms,
+            collapse_count, first_frame_id, last_frame_id, strongest_frame_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             action.id,
             action.frame_id,
@@ -5107,6 +6797,10 @@ fn insert_continue_task_action(
             action.confidence,
             action.reason,
             action.created_at_ms,
+            action.collapse_count.max(1),
+            action.first_frame_id,
+            action.last_frame_id,
+            action.strongest_frame_id,
         ],
     )
     .map_err(to_string)?;
@@ -5532,6 +7226,27 @@ fn episode_summary_label(
     primary_artifact_id: Option<&str>,
 ) -> String {
     let kind = dominant_action_kind(actions).unwrap_or_else(|| "unknown".to_string());
+    if let Some(action) = actions.first() {
+        let count = action.collapse_count.max(1);
+        if count > 1 {
+            let label = match kind.as_str() {
+                "encountering_error" => format!("Error remained visible across {} frames", count),
+                "composing" => format!(
+                    "User continued typing in the same composer across {} frames",
+                    count
+                ),
+                "observing_command_output" | "reviewing_output" => {
+                    format!("Same output observed repeatedly across {} frames", count)
+                }
+                _ => format!(
+                    "Same {} state repeated across {} frames",
+                    kind.replace('_', " "),
+                    count
+                ),
+            };
+            return label;
+        }
+    }
     let title = primary_artifact_id.and_then(|artifact_id| {
         actions
             .iter()
@@ -6297,7 +8012,7 @@ fn insert_continue_decision(
     validation_notes: Option<&str>,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO continue_decisions (
+        "INSERT OR REPLACE INTO continue_decisions (
             id, requested_at_ms, source, current_focus_frame_id,
             current_focus_artifact_id, selected_workstream_id, selected_candidate_id,
             return_target_artifact_id, confidence, decision_reason, next_action,
@@ -7098,6 +8813,10 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           confidence REAL NOT NULL DEFAULT 0.0,
           reason TEXT,
           created_at_ms INTEGER NOT NULL,
+          collapse_count INTEGER NOT NULL DEFAULT 1,
+          first_frame_id TEXT,
+          last_frame_id TEXT,
+          strongest_frame_id TEXT,
           FOREIGN KEY(artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
           FOREIGN KEY(secondary_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL
         );
@@ -7305,6 +9024,15 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     ensure_column_exists(conn, "continue_candidates", "supporting_episode_id", "TEXT")?;
     ensure_column_exists(
         conn,
+        "continue_task_actions",
+        "collapse_count",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column_exists(conn, "continue_task_actions", "first_frame_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_task_actions", "last_frame_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_task_actions", "strongest_frame_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
         "continue_candidates",
         "branch_origin_score",
         "REAL NOT NULL DEFAULT 0.0",
@@ -7318,6 +9046,20 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     ensure_column_exists(conn, "continue_decisions", "response_id", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "model", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "validation_notes", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "selected_candidate_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(conn, "continue_feedback_events", "workstream_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_feedback_events", "note", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "source",
+        "TEXT NOT NULL DEFAULT 'inferred'",
+    )?;
     Ok(())
 }
 
@@ -7496,6 +9238,137 @@ mod tests {
         assert_eq!(status.latest_workstream_timestamp, None);
     }
 
+    fn test_extracted_action(frame_id: &str, confidence: f64) -> ExtractedTaskAction {
+        ExtractedTaskAction {
+            id: format!("action-{}", frame_id),
+            frame_id: frame_id.to_string(),
+            previous_frame_id: None,
+            artifact_id: Some("artifact-code".to_string()),
+            secondary_artifact_id: None,
+            action_kind: "encountering_error".to_string(),
+            action_role: "blocker".to_string(),
+            trigger_type: Some("typing_pause".to_string()),
+            transition_label: Some("same_surface".to_string()),
+            evidence_event_ids: vec![format!("event-{}", frame_id)],
+            confidence,
+            reason: "error_signal".to_string(),
+            created_at_ms: 1_000 + frame_id.parse::<i64>().unwrap_or(0) * 1_000,
+            collapse_count: 1,
+            first_frame_id: Some(frame_id.to_string()),
+            last_frame_id: Some(frame_id.to_string()),
+            strongest_frame_id: Some(frame_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn repeated_error_actions_collapse_with_typed_frame_metadata() {
+        let collapsed = collapse_repeated_task_actions(vec![
+            test_extracted_action("10", 0.64),
+            test_extracted_action("11", 0.9),
+            test_extracted_action("12", 0.72),
+        ]);
+
+        assert_eq!(collapsed.len(), 1);
+        let action = &collapsed[0];
+        assert_eq!(action.collapse_count, 3);
+        assert_eq!(action.first_frame_id.as_deref(), Some("10"));
+        assert_eq!(action.last_frame_id.as_deref(), Some("12"));
+        assert_eq!(action.strongest_frame_id.as_deref(), Some("11"));
+        assert_eq!(action.frame_id, "11");
+        assert_eq!(action.reason, "error_signal");
+        assert_eq!(action.evidence_event_ids.len(), 3);
+    }
+
+    #[test]
+    fn confidence_caps_unknown_fallback_and_smalltalk_self_targets() {
+        let unknown = ScorerArtifact {
+            id: "artifact-unknown".to_string(),
+            artifact_kind: "unknown".to_string(),
+            display_title: Some("Unknown".to_string()),
+            browser_url: None,
+            document_path: None,
+            evidence_quality: "thin".to_string(),
+            privacy_status: None,
+            openability: "frame_fallback".to_string(),
+            last_seen_frame_id: Some("1".to_string()),
+            last_seen_timestamp: 1_000,
+        };
+        let mut unknown_candidate = ScoredContinueCandidate {
+            id: "candidate-unknown".to_string(),
+            workstream_id: "workstream-1".to_string(),
+            target_artifact: Some(unknown.clone()),
+            candidate_kind: "continue_edit".to_string(),
+            last_meaningful_action: None,
+            evidence_frame_id: Some("1".to_string()),
+            supporting_episode_id: None,
+            score: 0.95,
+            actionability_score: 0.92,
+            primary_target_score: 1.0,
+            unresolved_score: 0.8,
+            branch_origin_score: 0.8,
+            evidence_quality_score: 0.38,
+            recency_score: 1.0,
+            openability_score: 0.58,
+            privacy_safety_score: 0.85,
+            reason: Some("primary_artifact_fallback".to_string()),
+            missing_evidence: Vec::new(),
+            warnings: Vec::new(),
+            resume_work_target: Some(unknown),
+        };
+        let workstream = ScorerWorkstream {
+            id: "workstream-1".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("Smalltalk Continue".to_string()),
+            primary_artifact_id: Some("artifact-unknown".to_string()),
+            last_active_timestamp_ms: 1_000,
+            confidence: 0.9,
+            unresolved_signal: None,
+            episodes: Vec::new(),
+            artifacts: Vec::new(),
+            last_meaningful_action: None,
+        };
+
+        unknown_candidate.score = confidence_cap_for_candidate(&unknown_candidate, &workstream);
+        assert!(unknown_candidate.score <= 0.52);
+
+        let smalltalk = ScorerArtifact {
+            id: "artifact-smalltalk".to_string(),
+            artifact_kind: "browser_tab".to_string(),
+            display_title: Some("Smalltalk Continue".to_string()),
+            browser_url: None,
+            document_path: None,
+            evidence_quality: "medium".to_string(),
+            privacy_status: None,
+            openability: "openable".to_string(),
+            last_seen_frame_id: Some("2".to_string()),
+            last_seen_timestamp: 2_000,
+        };
+        let mut smalltalk_candidate = unknown_candidate.clone();
+        smalltalk_candidate.target_artifact = Some(smalltalk);
+        smalltalk_candidate.score = 0.95;
+        smalltalk_candidate.evidence_quality_score = 0.72;
+        assert!(confidence_cap_for_candidate(&smalltalk_candidate, &workstream) <= 0.42);
+    }
+
+    #[test]
+    fn user_facing_labels_do_not_return_raw_json_or_scorer_strings() {
+        assert_eq!(
+            unresolved_state_description(Some(
+                r#"{"kind":"visible_error_or_failure","confidence":0.91}"#
+            ))
+            .as_deref(),
+            Some("There appears to be an unresolved error.")
+        );
+        assert_eq!(
+            productize_continue_label("primary_artifact_fallback").as_deref(),
+            Some("This looks like the main place to continue.")
+        );
+        assert_eq!(
+            productize_continue_label(r#"{"kind":"branch_without_return"}"#).as_deref(),
+            Some("Search branch has not been applied back to the target.")
+        );
+    }
+
     fn init_evidence_schema(conn: &Connection) {
         conn.execute_batch(
             "
@@ -7551,6 +9424,9 @@ mod tests {
               session_id TEXT,
               ts_ms INTEGER NOT NULL,
               event_type TEXT NOT NULL,
+              app_bundle_id TEXT,
+              app_name TEXT,
+              window_title TEXT,
               key_category TEXT,
               created_at_ms INTEGER NOT NULL
             );
@@ -7825,6 +9701,103 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn continue_rebuild_uses_event_only_moments_without_new_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        for (index, (ts, event_type, app, bundle, window, key_category)) in [
+            (
+                1_000,
+                "app_switch",
+                "Helium",
+                "app.helium",
+                "Smalltalk direction",
+                None,
+            ),
+            (
+                1_500,
+                "scroll",
+                "Helium",
+                "app.helium",
+                "Smalltalk direction",
+                None,
+            ),
+            (
+                40_000,
+                "key_down",
+                "Codex",
+                "com.openai.codex",
+                "smalltalk",
+                Some("character"),
+            ),
+            (
+                80_000,
+                "click",
+                "smalltalk",
+                "com.smalltalk.app",
+                "smalltalk",
+                None,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO ui_events (
+                    id, session_id, ts_ms, event_type, app_bundle_id, app_name,
+                    window_title, key_category, created_at_ms
+                 ) VALUES (?1, 'session-events', ?2, ?3, ?4, ?5, ?6, ?7, ?2)",
+                params![
+                    format!("evt-event-only-{}", index),
+                    ts,
+                    event_type,
+                    bundle,
+                    app,
+                    window,
+                    key_category,
+                ],
+            )
+            .unwrap();
+        }
+
+        let result = rebuild_continue_second_layer(
+            &conn,
+            ContinueSecondLayerRebuildRequest {
+                session_id: Some("session-events".to_string()),
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let frame_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
+            .unwrap();
+        let event_observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_artifact_observations
+                 WHERE frame_id LIKE 'event-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event_actions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_task_actions
+                 WHERE frame_id LIKE 'event-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(frame_rows, 0);
+        assert!(result.processed_frames > 1, "{:?}", result);
+        assert_eq!(event_observations, result.observation_count);
+        assert!(event_actions > 0);
     }
 
     #[test]
@@ -8563,6 +10536,134 @@ mod tests {
     }
 
     #[test]
+    fn normal_continue_mode_reuses_cached_decision_without_growth() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+
+        let rebuild = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("rebuild".to_string()),
+                rebuild_layers: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rebuild.mode, "rebuild");
+        assert!(!rebuild.cache_hit);
+
+        let normal = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("normal".to_string()),
+                rebuild_layers: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(normal.mode, "normal");
+        assert!(normal.cache_hit);
+        assert_eq!(normal.decision_id, rebuild.decision_id);
+
+        let persisted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn continue_feedback_dedupes_repeated_explicit_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "manual",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        let decision = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                rebuild_layers: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let request = ContinueExplicitFeedbackRequest {
+            decision_id: Some(decision.decision_id.clone()),
+            selected_candidate_id: None,
+            workstream_id: decision
+                .selected_workstream
+                .as_ref()
+                .map(|workstream| workstream.workstream_id.clone()),
+            target_artifact_id: decision
+                .return_target
+                .as_ref()
+                .and_then(|target| target.artifact_id.clone()),
+            corrected_artifact_id: None,
+            feedback_kind: "accepted".to_string(),
+            note: Some("works".to_string()),
+            source: Some("test".to_string()),
+        };
+        let first = record_continue_feedback(&conn, request.clone()).unwrap();
+        let second = record_continue_feedback(&conn, request).unwrap();
+        assert_eq!(first.id, second.id);
+
+        let persisted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_feedback_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[test]
     fn continue_decision_selects_error_resolution_from_unresolved_workstream() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
@@ -8694,8 +10795,8 @@ mod tests {
         let report = run_continue_eval(None).unwrap();
 
         assert_eq!(report.schema, "smalltalk.continue_eval.v1");
-        assert_eq!(report.case_count, 11);
-        assert_eq!(report.target_artifact_correct, 11);
+        assert_eq!(report.case_count, 21);
+        assert_eq!(report.target_artifact_correct, 21);
         assert_eq!(report.recall_at_k, 1.0);
         assert_eq!(report.mrr, 1.0);
         assert_eq!(report.hallucinated_artifact_count, 0);

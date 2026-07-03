@@ -1,0 +1,915 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1646-unit-1646-ocr-48",
+      "bbox": {
+        "h": 16.99999999999996,
+        "w": 234.41859436035148,
+        "x": 558.8372150756381,
+        "y": 114.99999996489348
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 4 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "separately from raw frames/events.",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1646-unit-1646-ocr-50",
+      "bbox": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "is_browser_chrome": false,
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "event-* evidence from ui_events when frames are sparse,",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 47.2,
+      "episode_id": "ep-1646-1646",
+      "events": {
+        "app_switches": 3,
+        "clicks": 14,
+        "scrolls": 316,
+        "selections": 0,
+        "typing_bursts": 21
+      },
+      "frame_range": [
+        "1646",
+        "1646"
+      ],
+      "important_text": [
+        "event-* evidence from ui_events when frames are sparse,",
+        "npm run tauri dev",
+        "Search",
+        "• React status/types now show Signals",
+        "separately from raw frames/events.",
+        "> [REDACTED_EMAIL] tauri",
+        "• Continue rebuild now synthesizes bounded",
+        "Scheduled"
+      ],
+      "keyframes": [
+        "1646"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.12,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.9,
+    "final_score": 0.9199995760915644,
+    "frame_id": "1646",
+    "line_anchor_quality": 0.17600000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.08899957609156423,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.0,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1646-unit-1646-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "current_focus": {
+    "anchor_id": "1646-unit-1646-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "diagnostic_rejected_anchors": [
+    {
+      "bbox": {
+        "h": 12.999999999999936,
+        "w": 110.93022918701172,
+        "x": 1312.3255829762616,
+        "y": 8.000000154491271
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_os_menu_bar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Sat 4 Jul 2:05AM"
+    },
+    {
+      "bbox": {
+        "h": 16.744186401367124,
+        "w": 29.302324295043896,
+        "x": 1268.3720939594548,
+        "y": 8.372092720246672
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "8•"
+    },
+    {
+      "bbox": {
+        "h": 14.651162147521967,
+        "w": 31.395347595214847,
+        "x": 318.13953516460185,
+        "y": 8.372093161704141
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Help"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351154,
+        "w": 23.02325630187987,
+        "x": 115.11627905603682,
+        "y": 8.372093283301174
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "File"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351154,
+        "w": 25.116277694702166,
+        "x": 156.97674512474194,
+        "y": 8.372093283301174
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Edit"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351154,
+        "w": 31.395347595214815,
+        "x": 200.9302334930903,
+        "y": 8.372093283301174
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "View"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351154,
+        "w": 50.23255538940433,
+        "x": 251.16279257506528,
+        "y": 8.372093283301174
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Window"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351053,
+        "w": 43.953487396240234,
+        "x": 54.4186058716473,
+        "y": 8.372093297254713
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "Codex"
+    },
+    {
+      "bbox": {
+        "h": 10.465115547180137,
+        "w": 27.2093009948731,
+        "x": 1159.5348840461681,
+        "y": 10.465116723502979
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "os_menu_bar",
+      "text_exact": "48%"
+    },
+    {
+      "bbox": {
+        "h": 16.99999999999996,
+        "w": 207.20930480957034,
+        "x": 255.34883393707537,
+        "y": 45.999999632951905
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "• Fix stalled memory capture"
+    },
+    {
+      "bbox": {
+        "h": 15.000000000000046,
+        "w": 92.093017578125,
+        "x": 650.9302369318677,
+        "y": 46.00000019475821
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "chat_thread",
+      "text_exact": "Following work"
+    },
+    {
+      "bbox": {
+        "h": 17.00000000000006,
+        "w": 52.325580596923764,
+        "x": 927.2093035968869,
+        "y": 47.999999616501874
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "Open in"
+    },
+    {
+      "bbox": {
+        "h": 13.000000000000034,
+        "w": 113.02325439453135,
+        "x": 1163.72093282599,
+        "y": 48.000000207463465
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_environment_panel",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "npm run tauri dev"
+    },
+    {
+      "bbox": {
+        "h": 16.744186401367223,
+        "w": 16.744186401367163,
+        "x": 1297.6744185528048,
+        "y": 48.13953487373503
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "+"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351053,
+        "w": 31.395347595214847,
+        "x": 1082.0930233535555,
+        "y": 48.139535297254746
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "Plan"
+    },
+    {
+      "bbox": {
+        "h": 19.333787918090827,
+        "w": 71.29261779785166,
+        "x": 1056.9118313070246,
+        "y": 77.19357134092319
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "^ІА^ІАЗ"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351154,
+        "w": 64.88372039794923,
+        "x": 41.86046619346723,
+        "y": 85.81395372748723
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "New chat"
+    },
+    {
+      "bbox": {
+        "h": 14.651162147521967,
+        "w": 336.97674560546875,
+        "x": 278.3720881013355,
+        "y": 85.81395388844837
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "• Native island now renders trail_moment_count"
+    },
+    {
+      "bbox": {
+        "h": 13.144037246704098,
+        "w": 50.37581634521485,
+        "x": 39.69581212853862,
+        "y": 114.82333031116684
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "search_result",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "Search"
+    },
+    {
+      "bbox": {
+        "h": 16.99999999999996,
+        "w": 276.27905273437506,
+        "x": 278.3721042607193,
+        "y": 114.99999996489348
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "• React status/types now show Signals"
+    },
+    {
+      "bbox": {
+        "h": 16.744186401367124,
+        "w": 16.744186401367188,
+        "x": 16.74418565978153,
+        "y": 115.11627899699086
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "Q"
+    },
+    {
+      "bbox": {
+        "h": 15.069767475128248,
+        "w": 169.53488159179688,
+        "x": 1059.069769029683,
+        "y": 143.99999988933047
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_environment_panel",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "environment_panel",
+      "text_exact": "> smalltalk@0.1.0 tauri"
+    },
+    {
+      "bbox": {
+        "h": 14.651162147521967,
+        "w": 301.3953552246094,
+        "x": 278.3720935969975,
+        "y": 146.5116280977507
+      },
+      "frame_id": "1646",
+      "reject_reason": "surface_zone_app_sidebar",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "• Continue rebuild now synthesizes bounded"
+    },
+    {
+      "bbox": {
+        "h": 12.558138847351053,
+        "w": 73.25581359863281,
+        "x": 39.767440816962704,
+        "y": 146.511628390278
+      },
+      "frame_id": "1646",
+      "reject_reason": "low_word_count",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "surface_zone": "app_sidebar",
+      "text_exact": "Scheduled"
+    }
+  ],
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "1646",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001646-resume-candidate.jpg",
+      "line_anchor": {
+        "bounds": {
+          "h": 16.744186401367223,
+          "w": 414.41857910156256,
+          "x": 581.8604709841026,
+          "y": 146.51162779931641
+        },
+        "confidence": 0.7200000000000001,
+        "frame_id": "1646",
+        "line_index": 5,
+        "next_line": "• Continue rebuild now synthesizes bounded",
+        "previous_line": "> [REDACTED_EMAIL] tauri",
+        "quote": "event-* evidence from ui_events when frames are sparse,",
+        "reason": "ordered main_content line 6 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1646-ocr-50"
+      },
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 42.0,
+      "title": "Codex",
+      "visible_text": "npm run tauri dev Search • React status/types now show Signals separately from raw frames/events. > [REDACTED_EMAIL] tauri event-* evidence from ui_events when frames are sparse, • Continue rebuild now synthesizes bounded Scheduled > tauri dev without inserting fake frames rows. @ Plugins Running BeforeDevCommand (\"npm run dev\") Verification passed: Projects [REDACTED_EMAIL] • cargo test recent_app_labels vite • sma...",
+      "visual_text_snippets": [
+        "npm run tauri dev",
+        "Search",
+        "• React status/types now show Signals",
+        "separately from raw frames/events.",
+        "> [REDACTED_EMAIL] tauri",
+        "event-* evidence from ui_events when frames are sparse,",
+        "• Continue rebuild now synthesizes bounded",
+        "Scheduled"
+      ]
+    }
+  ],
+  "missing_evidence": [
+    "1 internal Smalltalk frames omitted from model evidence"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle"
+    ]
+  },
+  "quality_flags": [
+    "surface_state_actionable_task_surface"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": "> [REDACTED_EMAIL] tauri",
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "npm run tauri dev Search • React status/types now show Signals separately from raw frames/events. > [REDACTED_EMAIL] tauri event-* evidence from ui_events when frames are sparse, • Continue rebuild now synthesizes bounded Scheduled > tauri...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1646-unit-1646-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "1646-unit-1646-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "1646-unit-1646-ocr-50",
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_visible_words": "event-* evidence from ui_events when frames are sparse,",
+    "frame_id": "1646",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 16.744186401367223,
+        "w": 414.41857910156256,
+        "x": 581.8604709841026,
+        "y": 146.51162779931641
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1646",
+      "line_index": 5,
+      "next_line": "• Continue rebuild now synthesizes bounded",
+      "previous_line": "> [REDACTED_EMAIL] tauri",
+      "quote": "event-* evidence from ui_events when frames are sparse,",
+      "reason": "ordered main_content line 6 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1646-ocr-50"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 47.2,
+    "id": "session-1783110890287-1",
+    "started_at": 1783110890287,
+    "stopped_at": 1783110937467
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [],
+    "candidate_resume_frames": [
+      "1646"
+    ],
+    "current_frame_id": "1646",
+    "duration_s": 47.2,
+    "episode_count": 1,
+    "episodes": [
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 47.2,
+        "episode_id": "ep-1646-1646",
+        "events": {
+          "app_switches": 3,
+          "clicks": 14,
+          "scrolls": 316,
+          "selections": 0,
+          "typing_bursts": 21
+        },
+        "frame_range": [
+          "1646",
+          "1646"
+        ],
+        "important_text": [
+          "event-* evidence from ui_events when frames are sparse,",
+          "npm run tauri dev"
+        ],
+        "keyframes": [
+          "1646"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1783110890287-1",
+    "surface_sequence": [
+      "Codex/Codex"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.9,
+    "evidence_frames": [
+      "1646"
+    ],
+    "summary": "event-* evidence from ui_events when frames are sparse,"
+  },
+  "timeline": [
+    {
+      "app": "Codex",
+      "frame_id": "1646",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "line_anchor": {
+        "bounds": {
+          "h": 16.744186401367223,
+          "w": 414.41857910156256,
+          "x": 581.8604709841026,
+          "y": 146.51162779931641
+        },
+        "confidence": 0.7200000000000001,
+        "frame_id": "1646",
+        "line_index": 5,
+        "next_line": "• Continue rebuild now synthesizes bounded",
+        "previous_line": "> [REDACTED_EMAIL] tauri",
+        "quote": "event-* evidence from ui_events when frames are sparse,",
+        "reason": "ordered main_content line 6 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1646-ocr-50"
+      },
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "reason": "Omitted from keyframe images but summarized as compact trace evidence",
+      "role": "timeline",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex",
+      "visible_anchor": "npm run tauri dev Search • React status/types now show Signals separately from raw frames/events. > [REDACTED_EMAIL] tauri event-* evidence from ui_events when frames are sparse, ..."
+    }
+  ],
+  "transitions": [
+    {
+      "confidence": 0.68,
+      "from_frame": "1645",
+      "label": "new_task",
+      "to_frame": "1646"
+    }
+  ]
+}

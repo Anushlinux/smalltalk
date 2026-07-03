@@ -474,19 +474,19 @@ private struct SessionIslandView: View {
         }
         switch snapshot.state {
         case "starting":
-            return "Starting trail"
+            return "Starting memory"
         case "recording_compact", "recording_expanded":
             return "Following work"
         case "processing":
-            return "Saving trail"
+            return "Saving memory"
         case "stopped_toast":
-            return "Where was I?"
+            return "Continue"
         case "trail_reconstructing":
-            return "Asking OpenAI"
+            return "Finding continuation"
         case "resume_ready":
             return resumeReadyTitle
         default:
-            return hasMoments ? "Where was I?" : "Ready to follow"
+            return hasMoments ? "Continue" : "Ready to follow"
         }
     }
 
@@ -498,15 +498,15 @@ private struct SessionIslandView: View {
         case "recording_compact", "recording_expanded":
             return trailSummary
         case "starting":
-            return "Start a work trail"
+            return "Start local memory"
         case "processing":
             return trailSummary
         case "trail_reconstructing":
-            return "Sending safe resume bundle"
+            return "Checking local evidence"
         case "resume_ready":
             return resumePointLine
         default:
-            return hasMoments ? "Ready to resume" : "Start a work trail"
+            return hasMoments ? "Ready to continue" : "Start local memory"
         }
     }
 
@@ -515,28 +515,28 @@ private struct SessionIslandView: View {
             return "Starting"
         }
         if snapshot.state == "processing" || snapshot.state == "trail_reconstructing" {
-            return snapshot.state == "trail_reconstructing" ? "Asking" : "Saving"
+            return snapshot.state == "trail_reconstructing" ? "Finding" : "Saving"
         }
         if snapshot.state == "resume_ready" {
-            return "Open resume point"
+            return "Continue here"
         }
         if isRecording {
-            return "Save moment"
+            return "Mark memory"
         }
         if hasMoments {
-            return "Ask OpenAI"
+            return "Continue"
         }
-        return "Start trail"
+        return "Start memory"
     }
 
     private var secondaryActionLabel: String {
         if snapshot.state == "resume_ready" {
-            return "Show trail"
+            return "Open app"
         }
         if isRecording {
             return "Pause"
         }
-        return "View trail"
+        return "Open app"
     }
 
     private var primaryActionDisabled: Bool {
@@ -555,7 +555,7 @@ private struct SessionIslandView: View {
             return "capture_once"
         }
         if hasMoments {
-            return "reconstruct_trail"
+            return "continue"
         }
         return "toggle_meeting"
     }
@@ -589,20 +589,28 @@ private struct SessionIslandView: View {
         if trailMomentCount > 0 {
             return momentLabel
         }
-        return "Building trail"
+        return "Building local memory"
     }
 
     private var momentLabel: String {
-        "\(trailMomentCount) \(trailMomentCount == 1 ? "moment" : "moments")"
+        "\(trailMomentCount) \(trailMomentCount == 1 ? "signal" : "signals")"
     }
 
     private var resumePointLine: String {
         let point = trimmed(snapshot.resumePoint)
-        guard !point.isEmpty else { return "Resume point found" }
+        guard !point.isEmpty else { return "Continue target ready" }
         return "Continue at \(point)"
     }
 
     private var resumeReadyTitle: String {
+        if trimmed(snapshot.resumeSource) == "continue" {
+            let warning = trimmed(snapshot.resumeWarning).lowercased()
+            if warning.contains("thin") || warning.contains("missing") || warning.contains("no_") {
+                return "Evidence is thin"
+            }
+            let headline = trimmed(snapshot.resumeHeadline)
+            return headline.isEmpty ? "Ready to continue" : headline
+        }
         if trimmed(snapshot.resumeSource) == "cloud" {
             return "OpenAI answered"
         }
@@ -619,10 +627,14 @@ private struct SessionIslandView: View {
             return detail
         }
         let headline = trimmed(snapshot.resumeHeadline)
-        return headline.isEmpty ? "Smalltalk rebuilt your recent work trail." : headline
+        return headline.isEmpty ? "Smalltalk found a local continuation." : headline
     }
 
     private var resumeProvenanceLine: String {
+        if trimmed(snapshot.resumeSource) == "continue" {
+            let warning = trimmed(snapshot.resumeWarning)
+            return warning.isEmpty ? "Local Continue" : warning
+        }
         if trimmed(snapshot.resumeSource) == "cloud" {
             let model = trimmed(snapshot.resumeModel)
             let response = trimmed(snapshot.resumeResponseId)
@@ -632,7 +644,7 @@ private struct SessionIslandView: View {
             return model.isEmpty ? "Cloud resume" : model
         }
         let warning = trimmed(snapshot.resumeWarning)
-        return warning.isEmpty ? "No OpenAI answer generated" : warning
+        return warning.isEmpty ? "Local evidence" : warning
     }
 
     private func trimmed(_ value: String?) -> String {
@@ -1614,9 +1626,12 @@ private final class SessionIslandController: NSObject {
             sendAction("resume_me")
         case "open_search":
             sendAction("open_main_window")
+        case "continue":
+            setPresentation(.expanded, resetIdleTimer: false)
+            sendAction("continue")
         case "reconstruct_trail":
             setPresentation(.expanded, resetIdleTimer: false)
-            sendAction("reconstruct_trail")
+            sendAction("continue")
         case "show_trail":
             sendAction("show_trail")
         case "open_resume_point":

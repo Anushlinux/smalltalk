@@ -1,0 +1,885 @@
+{
+  "ask": {
+    "allow_need_more_evidence": true,
+    "task": "infer_resume_target"
+  },
+  "budget": {
+    "max_episode_cards": 8,
+    "max_images": 8,
+    "max_json_chars": 25000,
+    "max_output_tokens": 2400,
+    "max_text_snippets_per_episode": 5
+  },
+  "candidate_anchors": [
+    {
+      "anchor_id": "1532-unit-1532-ocr-49",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1532",
+      "is_browser_chrome": false,
+      "reason": "resume_query_lint protected anchor: ordered main_content line 3 from ocr conten...",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "y....-wul.uwidyers, loads current focus,",
+      "visible_ratio": 1.0
+    },
+    {
+      "anchor_id": "1541-unit-1541-ocr-57",
+      "confidence": 0.7200000000000001,
+      "frame_id": "1541",
+      "is_browser_chrome": false,
+      "reason": "resume_query_lint protected anchor: ordered main_content line 24 from ocr conte...",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "text_exact": "• seatiratige.1.e tars",
+      "visible_ratio": 1.0
+    }
+  ],
+  "candidate_episodes": [
+    {
+      "app": "Codex",
+      "confidence": 0.72,
+      "duration_s": 0.0,
+      "episode_id": "ep-1485-1485",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1485",
+        "1485"
+      ],
+      "important_text": [
+        "Specifically, I integrated instructions to use OpenAl's Structured Outputs"
+      ],
+      "keyframes": [
+        "1485"
+      ],
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "metadata_suspect"
+      ],
+      "role_guess": "origin",
+      "surface_type": "chat_conversation",
+      "title": "Codex"
+    },
+    {
+      "app": "Codex",
+      "confidence": 0.9,
+      "duration_s": 0.0,
+      "episode_id": "ep-1532-1532",
+      "events": {
+        "app_switches": 0,
+        "clicks": 0,
+        "scrolls": 0,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1532",
+        "1532"
+      ],
+      "important_text": [
+        "y....-wul.uwidyers, loads current focus,"
+      ],
+      "keyframes": [
+        "1532"
+      ],
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role_guess": "resume_candidate",
+      "surface_type": "ai_coding_workspace",
+      "title": "Codex"
+    },
+    {
+      "app": "Helium",
+      "confidence": 0.8533333333333334,
+      "duration_s": 14.2,
+      "episode_id": "ep-1539-1541",
+      "events": {
+        "app_switches": 2,
+        "clicks": 1,
+        "scrolls": 278,
+        "selections": 0,
+        "typing_bursts": 0
+      },
+      "frame_range": [
+        "1539",
+        "1541"
+      ],
+      "important_text": [
+        "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube [REDACTED_SECRET]"
+      ],
+      "keyframes": [
+        "1539",
+        "1540"
+      ],
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "target_url_blocked_by_identity_mismatch"
+      ],
+      "role_guess": "candidate",
+      "surface_type": "media",
+      "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium"
+    }
+  ],
+  "confidence_breakdown": {
+    "actionable_text": 0.35,
+    "artifact_penalty": 0.0,
+    "branch_penalty": 0.0,
+    "chrome_penalty": 0.0,
+    "evidence_strength": 0.9,
+    "final_score": 1.390843529028422,
+    "frame_id": "1532",
+    "line_anchor_quality": 0.17600000000000002,
+    "metadata_penalty": 0.0,
+    "recency": 0.0798435290284221,
+    "recognized_surface": 0.1,
+    "return_to_origin": 0.25,
+    "unknown_surface_penalty": 0.0,
+    "user_interaction": 0.15
+  },
+  "current_activity": {
+    "activity_type": "current_surface",
+    "anchor_id": "1541-unit-1541-ocr-57",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "• seatiratige.1.e tars",
+    "frame_id": "1541",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "media",
+      "canonical_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "captured_app": "Helium",
+      "captured_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 10.465115547180137,
+        "w": 69.06976318359372,
+        "x": 826.7441893268078,
+        "y": 491.8604653775727
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1541",
+      "line_index": 23,
+      "previous_line": "The model-ranking part is not active in the Ul because iNicre,inference_enabted is hardcodedts (fatee",
+      "quote": "• seatiratige.1.e tars",
+      "reason": "ordered main_content line 24 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1541-ocr-57"
+    },
+    "quality_flags": [
+      "metadata_image_mismatch",
+      "target_url_blocked_by_identity_mismatch"
+    ],
+    "reason": "Factual current user activity from the selected current frame; active drafts beat older page-body text.",
+    "route_eligibility": {
+      "blocked_url_ref": "url-hash-8473afb87e3d4011",
+      "reason": "captured URL blocked because canonical target is not a browser/chat surface",
+      "url_allowed": false
+    },
+    "surface_type": "chat_conversation",
+    "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium"
+  },
+  "current_focus": {
+    "anchor_id": "1541-unit-1541-ocr-57",
+    "app": "Helium",
+    "confidence": 0.55,
+    "exact_visible_words": "• seatiratige.1.e tars",
+    "frame_id": "1541",
+    "identity_verdict": {
+      "canonical_app": "Helium",
+      "canonical_surface_type": "media",
+      "canonical_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "captured_app": "Helium",
+      "captured_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 10.465115547180137,
+        "w": 69.06976318359372,
+        "x": 826.7441893268078,
+        "y": 491.8604653775727
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1541",
+      "line_index": 23,
+      "previous_line": "The model-ranking part is not active in the Ul because iNicre,inference_enabted is hardcodedts (fatee",
+      "quote": "• seatiratige.1.e tars",
+      "reason": "ordered main_content line 24 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1541-ocr-57"
+    },
+    "quality_flags": [
+      "metadata_image_mismatch",
+      "target_url_blocked_by_identity_mismatch"
+    ],
+    "reason": "Current selected frame when the resume query was generated.",
+    "route_eligibility": {
+      "blocked_url_ref": "url-hash-8473afb87e3d4011",
+      "reason": "captured URL blocked because canonical target is not a browser/chat surface",
+      "url_allowed": false
+    },
+    "surface_state": "need_more_evidence",
+    "surface_type": "chat_conversation",
+    "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium"
+  },
+  "evidence_conflicts": [
+    "frame 1485 metadata/title disagrees with screenshot-visible content and is not trusted as a resume target",
+    "frame 1493 metadata/title disagrees with screenshot-visible content and is not trusted as a resume target",
+    "frame 1541 metadata/title disagrees with screenshot-visible content and is not trusted as a resume target",
+    "frame 1499 metadata/title was repaired to screenshot-visible Codex identity before target selection and routing"
+  ],
+  "keyframes": [
+    {
+      "app": "Codex",
+      "frame_id": "1485",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001485-origin.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1485",
+        "line_index": 23,
+        "quote": "Specifically, I integrated instructions to use OpenAl's Structured Outputs",
+        "reason": "ordered main_content line 24 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1485-ocr-66"
+      },
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "metadata_suspect"
+      ],
+      "role": "origin",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 0.2,
+      "title": "Codex",
+      "visible_text": "L Share smalltalk Pro Extended v Next action: return to the prior workstream. 0..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1486",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "media",
+        "canonical_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+        "captured_app": "Helium",
+        "captured_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001486-side-branch.jpg",
+      "line_anchor": {
+        "confidence": 0.8200000000000001,
+        "frame_id": "1486",
+        "line_index": 18,
+        "quote": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube [REDACTED_SECRET]",
+        "reason": "ordered main_content line 19 from ax content units",
+        "semantic_role": "main_content",
+        "source": "ax",
+        "source_unit_id": "unit-1486-ax-47"
+      },
+      "quality_flags": [
+        "surface_state_source_or_discovery_surface",
+        "target_url_blocked_by_identity_mismatch"
+      ],
+      "role": "side_branch",
+      "route_eligibility": {
+        "blocked_url_ref": "url-hash-8473afb87e3d4011",
+        "reason": "captured URL blocked because canonical target is not a browser/chat surface",
+        "url_allowed": false
+      },
+      "t_rel_s": 11.7,
+      "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "visible_text": "+ Create YouTube Search DRIVETRIBE Richard Hammond VS James May - Plane vs Car ..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1493",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "browser_tab",
+        "canonical_title": "Enhancing Markdown with OpenAI Integration - Google Gemini – right view - Helium",
+        "captured_app": "Helium",
+        "captured_title": "Enhancing Markdown with OpenAI Integration - Google Gemini – right view - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001493-context-surface.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1493",
+        "line_index": 21,
+        "quote": "Next action: apply or verify the fix.",
+        "reason": "ordered main_content line 22 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1493-ocr-38"
+      },
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "metadata_suspect"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 34.0,
+      "title": "Enhancing Markdown with OpenAI Integration - Google Gemini – right view - Helium",
+      "visible_text": "smalltalk - Context Restoration Insights [REDACTED_NUMBER] smalltalk - Context ..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1495",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "chat_conversation",
+        "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001495-context-surface.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1495",
+        "line_index": 21,
+        "quote": "Next action: apply or verify the fix.",
+        "reason": "ordered main_content line 22 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1495-ocr-40"
+      },
+      "quality_flags": [
+        "surface_state_current_work_surface"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "reason": "captured URL matches a trusted browser/chat surface",
+        "url_allowed": true
+      },
+      "t_rel_s": 40.8,
+      "title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "visible_text": "ging/fixing the issue. Return target: usual"
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1499",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "captured_app": "Helium",
+        "captured_title": "smalltalk - Context Restoration Insights – left view - Helium",
+        "reason": "visible Codex window/menu evidence overrides stale captured app/title/url metadata",
+        "status": "metadata_image_mismatch_repaired",
+        "visible_app": "Codex",
+        "visible_title": "smalltalk - Context Restoration Insights – left view - Helium"
+      },
+      "image_ref": "images/frame-001499-context-surface.jpg",
+      "quality_flags": [
+        "metadata_image_mismatch_repaired",
+        "target_url_blocked_by_identity_mismatch"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "blocked_url_ref": "url-hash-9485387bbfc56f6d",
+        "reason": "captured URL blocked because visible app identity repaired to a non-browser surface",
+        "url_allowed": false
+      },
+      "t_rel_s": 50.4,
+      "title": "smalltalk - Context Restoration Insights – left view - Helium",
+      "visible_text": "npm run tauri dev smalltalk - Context Restoration Insights [REDACTED_NUMBER] sm..."
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1526",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Helium",
+        "captured_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+        "reason": "visible Codex window/menu evidence overrides stale captured app/title/url metadata",
+        "status": "metadata_image_mismatch_repaired",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001526-context-surface.jpg",
+      "quality_flags": [
+        "metadata_image_mismatch_repaired",
+        "target_url_blocked_by_identity_mismatch"
+      ],
+      "role": "context_surface",
+      "route_eligibility": {
+        "blocked_url_ref": "url-hash-8473afb87e3d4011",
+        "reason": "captured URL blocked because visible app identity repaired to a non-browser surface",
+        "url_allowed": false
+      },
+      "t_rel_s": 208.0,
+      "title": "Codex",
+      "visible_text": "npm run tauri dev reeecermaeee e bee cenfs e re as Contine waunenu articuture, ..."
+    },
+    {
+      "app": "Codex",
+      "frame_id": "1532",
+      "identity_verdict": {
+        "canonical_app": "Codex",
+        "canonical_surface_type": "ai_coding_workspace",
+        "canonical_title": "Codex",
+        "captured_app": "Codex",
+        "captured_title": "Codex",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent",
+        "visible_app": "Codex",
+        "visible_title": "Codex"
+      },
+      "image_ref": "images/frame-001532-resume-candidate.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1532",
+        "line_index": 2,
+        "quote": "y....-wul.uwidyers, loads current focus,",
+        "reason": "ordered main_content line 3 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1532-ocr-49"
+      },
+      "quality_flags": [
+        "surface_state_actionable_task_surface"
+      ],
+      "role": "resume_candidate",
+      "route_eligibility": {
+        "reason": "frame has no captured URL",
+        "url_allowed": false
+      },
+      "t_rel_s": 237.7,
+      "title": "Codex",
+      "visible_text": "npm run tauri dev • Added get_continue_decision in ® continuatiu....- y....-wul..."
+    },
+    {
+      "app": "Helium",
+      "frame_id": "1541",
+      "identity_verdict": {
+        "canonical_app": "Helium",
+        "canonical_surface_type": "media",
+        "canonical_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+        "captured_app": "Helium",
+        "captured_title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+        "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+        "status": "metadata_consistent"
+      },
+      "image_ref": "images/frame-001541-current-focus.jpg",
+      "line_anchor": {
+        "confidence": 0.7200000000000001,
+        "frame_id": "1541",
+        "line_index": 23,
+        "quote": "• seatiratige.1.e tars",
+        "reason": "ordered main_content line 24 from ocr content units",
+        "semantic_role": "main_content",
+        "source": "ocr",
+        "source_unit_id": "unit-1541-ocr-57"
+      },
+      "quality_flags": [
+        "metadata_image_mismatch",
+        "target_url_blocked_by_identity_mismatch"
+      ],
+      "role": "current_focus",
+      "route_eligibility": {
+        "blocked_url_ref": "url-hash-8473afb87e3d4011",
+        "reason": "captured URL blocked because canonical target is not a browser/chat surface",
+        "url_allowed": false
+      },
+      "t_rel_s": 293.1,
+      "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "visible_text": "ocokieousmon tee mXРADR DOCORER O tceo Tast,seen,fraie lee bet •P.COUCTAe the l..."
+    }
+  ],
+  "missing_evidence": [
+    "4 internal Smalltalk frames omitted from model evidence",
+    "frame 1485 metadata/title disagrees with visible task content",
+    "frame 1486 captured URL is not route-eligible: captured URL blocked because canonical target is not a browser/chat surface",
+    "frame 1487 captured URL is not route-eligible: captured URL blocked because canonical target is not a browser/chat surface",
+    "frame 1485 failed resume_query_lint metadata/image consistency",
+    "frame 1493 failed resume_query_lint metadata/image consistency",
+    "frame 1541 failed resume_query_lint metadata/image consistency",
+    "frame 1499 captured URL metadata was not trusted after identity repair",
+    "frame 1526 captured URL metadata was not trusted after identity repair"
+  ],
+  "privacy": {
+    "raw_clipboard_sent": false,
+    "raw_keystrokes_sent": false,
+    "raw_paths_sent": false,
+    "raw_urls_sent": false,
+    "redactions_applied": [
+      "text redacted before resume query bundle",
+      "raw browser URL replaced with local hash reference"
+    ]
+  },
+  "quality_flags": [
+    "metadata_image_mismatch",
+    "metadata_image_mismatch_repaired",
+    "target_url_blocked_by_identity_mismatch",
+    "metadata_suspect"
+  ],
+  "resume_candidate": {
+    "app": "Codex",
+    "confidence": 0.9,
+    "exact_words": "y....-wul.uwidyers, loads current focus,",
+    "frame_id": "1532",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521967,
+        "w": 288.8371887207031,
+        "x": 699.0697729187184,
+        "y": 102.55814003089019
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1532",
+      "line_index": 2,
+      "next_line": "Search",
+      "previous_line": "• Added get_continue_decision in ® continuatiu....-",
+      "quote": "y....-wul.uwidyers, loads current focus,",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1532-ocr-49"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "section_anchor": "• Added get_continue_decision in ® continuatiu....-",
+    "surface_type": "ai_coding_workspace",
+    "visible_anchor": "npm run tauri dev • Added get_continue_decision in ® continuatiu....- y....-wul.uwidyers, loads current focus, Search g...",
+    "window_title": "Codex"
+  },
+  "resume_target_if_returning": {
+    "anchor_id": "1532-unit-1532-ocr-49",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "y....-wul.uwidyers, loads current focus,",
+    "frame_id": "1532",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521967,
+        "w": 288.8371887207031,
+        "x": 699.0697729187184,
+        "y": 102.55814003089019
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1532",
+      "line_index": 2,
+      "next_line": "Search",
+      "previous_line": "• Added get_continue_decision in ® continuatiu....-",
+      "quote": "y....-wul.uwidyers, loads current focus,",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1532-ocr-49"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "resume_work_target": {
+    "anchor_id": "1532-unit-1532-ocr-49",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "y....-wul.uwidyers, loads current focus,",
+    "frame_id": "1532",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521967,
+        "w": 288.8371887207031,
+        "x": 699.0697729187184,
+        "y": 102.55814003089019
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1532",
+      "line_index": 2,
+      "next_line": "Search",
+      "previous_line": "• Added get_continue_decision in ® continuatiu....-",
+      "quote": "y....-wul.uwidyers, loads current focus,",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1532-ocr-49"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "return_target": {
+    "anchor_id": "1532-unit-1532-ocr-49",
+    "app": "Codex",
+    "confidence": 0.55,
+    "exact_visible_words": "y....-wul.uwidyers, loads current focus,",
+    "frame_id": "1532",
+    "identity_verdict": {
+      "canonical_app": "Codex",
+      "canonical_surface_type": "ai_coding_workspace",
+      "canonical_title": "Codex",
+      "captured_app": "Codex",
+      "captured_title": "Codex",
+      "reason": "captured metadata and visible app evidence are consistent or no stronger visible app evidence was available",
+      "status": "metadata_consistent",
+      "visible_app": "Codex",
+      "visible_title": "Codex"
+    },
+    "line_anchor": {
+      "bounds": {
+        "h": 14.651162147521967,
+        "w": 288.8371887207031,
+        "x": 699.0697729187184,
+        "y": 102.55814003089019
+      },
+      "confidence": 0.7200000000000001,
+      "frame_id": "1532",
+      "line_index": 2,
+      "next_line": "Search",
+      "previous_line": "• Added get_continue_decision in ® continuatiu....-",
+      "quote": "y....-wul.uwidyers, loads current focus,",
+      "reason": "ordered main_content line 3 from ocr content units",
+      "semantic_role": "main_content",
+      "source": "ocr",
+      "source_unit_id": "unit-1532-ocr-49"
+    },
+    "quality_flags": [
+      "surface_state_actionable_task_surface"
+    ],
+    "reason": "Policy-selected work target for resuming the task, separate from the factual current screen.",
+    "route_eligibility": {
+      "reason": "frame has no captured URL",
+      "url_allowed": false
+    },
+    "surface_state": "actionable_task_surface",
+    "surface_type": "ai_coding_workspace",
+    "title": "Codex"
+  },
+  "schema": "smalltalk.resume_query.v2",
+  "session": {
+    "duration_s": 297.7,
+    "id": "session-1783085694441-1",
+    "started_at": 1783085694441,
+    "stopped_at": 1783085992132
+  },
+  "session_index": {
+    "artifact_frames": [],
+    "branch_frames": [
+      "1486"
+    ],
+    "candidate_resume_frames": [
+      "1532"
+    ],
+    "current_frame_id": "1541",
+    "duration_s": 297.7,
+    "episode_count": 3,
+    "episodes": [
+      {
+        "app": "Codex",
+        "confidence": 0.72,
+        "duration_s": 0.0,
+        "episode_id": "ep-1485-1485",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1485",
+          "1485"
+        ],
+        "important_text": [
+          "Specifically, I integrated instructions to use OpenAl's Structured Outputs"
+        ],
+        "keyframes": [
+          "1485"
+        ],
+        "quality_flags": [
+          "metadata_image_mismatch",
+          "metadata_suspect"
+        ],
+        "role_guess": "origin",
+        "surface_type": "chat_conversation",
+        "title": "Codex"
+      },
+      {
+        "app": "Codex",
+        "confidence": 0.9,
+        "duration_s": 0.0,
+        "episode_id": "ep-1532-1532",
+        "events": {
+          "app_switches": 0,
+          "clicks": 0,
+          "scrolls": 0,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1532",
+          "1532"
+        ],
+        "important_text": [
+          "y....-wul.uwidyers, loads current focus,"
+        ],
+        "keyframes": [
+          "1532"
+        ],
+        "quality_flags": [
+          "surface_state_actionable_task_surface"
+        ],
+        "role_guess": "resume_candidate",
+        "surface_type": "ai_coding_workspace",
+        "title": "Codex"
+      },
+      {
+        "app": "Helium",
+        "confidence": 0.8533333333333334,
+        "duration_s": 14.2,
+        "episode_id": "ep-1539-1541",
+        "events": {
+          "app_switches": 2,
+          "clicks": 1,
+          "scrolls": 278,
+          "selections": 0,
+          "typing_bursts": 0
+        },
+        "frame_range": [
+          "1539",
+          "1541"
+        ],
+        "important_text": [
+          "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube [REDACTED_SECRET]"
+        ],
+        "keyframes": [
+          "1539",
+          "1540"
+        ],
+        "quality_flags": [
+          "metadata_image_mismatch",
+          "target_url_blocked_by_identity_mismatch"
+        ],
+        "role_guess": "candidate",
+        "surface_type": "media",
+        "title": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium"
+      }
+    ],
+    "evidence_conflicts": [],
+    "quality_flags": [
+      "surface_state_need_more_evidence",
+      "metadata_suspect",
+      "metadata_image_mismatch",
+      "surface_state_source_or_discovery_surface"
+    ],
+    "return_to_origin_frames": [],
+    "schema": "smalltalk.session_index.v1",
+    "session_id": "session-1783085694441-1",
+    "surface_sequence": [
+      "Codex/Codex",
+      "Helium/(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium",
+      "Helium/Enhancing Markdown with OpenAI Integration - Google Gemini – right view - Helium",
+      "Helium/smalltalk - Context Restoration Insights – left view - Helium",
+      "Codex/Codex",
+      "Helium/smalltalk - Context Restoration Insights – left view - Helium",
+      "Helium/(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube - Helium",
+      "Helium/(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube – Audio playing - Helium"
+    ]
+  },
+  "session_theme": {
+    "confidence": 0.55,
+    "evidence_frames": [
+      "1541",
+      "1532",
+      "1539"
+    ],
+    "summary": "(26) Richard Hammond VS James May – Plane vs Car RACE! - YouTube [REDACTED_SECRET]"
+  },
+  "transitions": [
+    {
+      "confidence": 0.68,
+      "from_frame": "1485",
+      "label": "new_task",
+      "to_frame": "1486"
+    }
+  ]
+}
