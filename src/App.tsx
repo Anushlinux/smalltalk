@@ -654,6 +654,7 @@ type ContinueWorkstreamDetailResult = {
   evidence_anchors: ContinueEvidenceAnchors;
 };
 
+type ViewMode = "continue" | "developer";
 type OverlayMode = "units" | "ocr" | "ax" | "privacy";
 type EvidenceTab = "text" | "events" | "context" | "paths";
 
@@ -716,7 +717,6 @@ function App() {
   const [continueMemory, setContinueMemory] = useState<ContinueMemoryStatus | null>(null);
   const [continueDecision, setContinueDecision] = useState<ContinueDecisionResult | null>(null);
   const [continueDecisionFrameCount, setContinueDecisionFrameCount] = useState<number | null>(null);
-  const [continueDecisionUpdatedAt, setContinueDecisionUpdatedAt] = useState<number | null>(null);
   const [continueError, setContinueError] = useState<string | null>(null);
   const [continueOpenResult, setContinueOpenResult] = useState<OpenResumePointResult | null>(null);
   const [workstreams, setWorkstreams] = useState<RecentContinueWorkstream[]>([]);
@@ -731,13 +731,14 @@ function App() {
   const [memoryDiagnostics, setMemoryDiagnostics] = useState<LocalMemoryDiagnostics | null>(null);
   const [cleanupResult, setCleanupResult] = useState<CleanupLocalMemoryResult | null>(null);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
-  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("continue");
   const [memoryMenuOpen, setMemoryMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const storeGenerationRef = useRef(0);
   const autoContinueRef = useRef(false);
   const captureMenuRef = useRef<HTMLDetailsElement | null>(null);
   const isDeleting = busyAction === "delete_all_frames";
+  const diagnosticsOpen = viewMode === "developer";
   const currentSession = status.active_session || status.latest_session || null;
   const currentSessionId = currentSession?.id || null;
 
@@ -911,13 +912,12 @@ function App() {
       setContinueDecision(decision);
       setSelectedWorkstreamId(decision.selected_workstream?.workstream_id || null);
       setContinueDecisionFrameCount(status.frame_count);
-      setContinueDecisionUpdatedAt(Date.now());
       await refreshContinueMemory();
       if (diagnosticsOpen) {
         await refreshWorkstreams();
       }
       const firstEvidenceFrame = decision.evidence_anchors.frame_ids[0];
-      if (firstEvidenceFrame && !selectedFrame) {
+      if (diagnosticsOpen && firstEvidenceFrame && !selectedFrame) {
         await revealContinueFrame(firstEvidenceFrame);
         setEvidenceOpen(false);
       }
@@ -1140,7 +1140,6 @@ function App() {
       setTimeline(emptyTimeline);
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
-      setContinueDecisionUpdatedAt(null);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1171,8 +1170,10 @@ function App() {
             currentSessionId;
           setStatus(response.status);
           await refreshStatus();
-          await runSearch(query, stoppedSessionId);
-          await refreshTimeline(stoppedSessionId);
+          if (diagnosticsOpen) {
+            await runSearch(query, stoppedSessionId);
+            await refreshTimeline(stoppedSessionId);
+          }
           return;
         }
 
@@ -1191,20 +1192,24 @@ function App() {
             nextStatus.latest_session?.id ||
             currentSessionId;
           await refreshStatus();
-          await runSearch(query, nextSessionId);
-          await refreshTimeline(nextSessionId);
+          if (diagnosticsOpen) {
+            await runSearch(query, nextSessionId);
+            await refreshTimeline(nextSessionId);
+          }
           return;
         }
         await refreshStatus();
-        await runSearch(query, currentSessionId);
-        await refreshTimeline(currentSessionId);
+        if (diagnosticsOpen) {
+          await runSearch(query, currentSessionId);
+          await refreshTimeline(currentSessionId);
+        }
       } catch (err) {
         setError(String(err));
       } finally {
         setBusyAction(null);
       }
     },
-    [currentSessionId, query, refreshStatus, refreshTimeline, runSearch, selectFrame],
+    [currentSessionId, diagnosticsOpen, query, refreshStatus, refreshTimeline, runSearch, selectFrame],
   );
 
   const deleteAllFrames = useCallback(async () => {
@@ -1226,7 +1231,6 @@ function App() {
       setTimeline(emptyTimeline);
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
-      setContinueDecisionUpdatedAt(null);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1330,7 +1334,7 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     async function loadImage() {
-      if (!selectedFrame) {
+      if (!selectedFrame || (!diagnosticsOpen && !evidenceOpen)) {
         setImageData(null);
         return;
       }
@@ -1351,12 +1355,12 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedFrame?.id]);
+  }, [diagnosticsOpen, evidenceOpen, selectedFrame?.id]);
 
   useEffect(() => {
     let cancelled = false;
     async function loadDetail() {
-      if (!selectedFrame) {
+      if (!selectedFrame || !diagnosticsOpen) {
         setFrameDetail(null);
         return;
       }
@@ -1374,7 +1378,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedFrame?.id]);
+  }, [diagnosticsOpen, selectedFrame?.id]);
 
   const selectedText = useMemo(() => {
     return (
@@ -1398,13 +1402,6 @@ function App() {
     continueDecision?.selected_workstream?.title_candidate ||
     continueTargetLabel(continueResumeTarget) ||
     "Possible continuation";
-  const continueSourceLabel = continueDecision
-    ? continueDecision.source === "cloud_micro_inference"
-      ? "Model-ranked, locally validated"
-      : continueDecision.source === "local_fallback"
-        ? "Local fallback"
-        : "Local decision"
-    : "No decision yet";
   const continueHasEvidence =
     status.frame_count > 0 ||
     Boolean(continueMemory && continueMemory.counts.artifacts > 0);
@@ -1490,89 +1487,55 @@ function App() {
   ]);
 
   return (
-    <main className="capture-shell">
+    <main className={`capture-shell ${viewMode === "developer" ? "developer-mode" : "continue-mode"}`}>
       <header className="capture-topbar">
         <div className="identity-block">
           <div className="brand-mark" aria-hidden="true">S</div>
           <div>
             <p className="product-kicker">Smalltalk</p>
-            <h1>Smalltalk Continue</h1>
+            <h1>{viewMode === "developer" ? "Developer mode" : "Continue"}</h1>
           </div>
         </div>
 
-        <div className="continue-status-strip" aria-label="Local memory status">
-          <StatusPill label="Local memory" value={continueStatusLabel} tone={status.running ? "good" : status.last_error ? "bad" : "quiet"} />
-          <StatusPill label="Evidence age" value={latestEvidenceAgeLabel} />
-          <StatusPill label="Continue" value={continueFreshnessLabel} tone={continueIsStale ? "good" : "quiet"} />
+        <div className="view-switch" aria-label="App view">
+          <button
+            className={viewMode === "continue" ? "active" : ""}
+            type="button"
+            onClick={() => {
+              setViewMode("continue");
+              setEvidenceOpen(false);
+            }}
+          >
+            Continue
+          </button>
+          <button
+            className={viewMode === "developer" ? "active" : ""}
+            type="button"
+            onClick={() => {
+              setViewMode("developer");
+              void refreshWorkstreams();
+              void runSearch("");
+              void refreshTimeline();
+              void refreshMemoryDiagnostics();
+              void loadWorkstreamDetail(selectedWorkstreamId);
+            }}
+          >
+            Developer
+          </button>
         </div>
 
-        <div className="control-strip" aria-label="Capture controls">
-          <button
-            className="primary-button"
-            disabled={busyAction !== null}
-            aria-busy={busyAction === "get_continue_decision"}
-            onClick={() => void runContinueDecision()}
-          >
-            {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
-          </button>
-          <details
-            className="capture-menu"
-            open={memoryMenuOpen}
-            ref={captureMenuRef}
-            onToggle={(event) => setMemoryMenuOpen(event.currentTarget.open)}
-          >
-            <summary>Memory</summary>
-            <div>
-              <button
-                className="secondary-button"
-                disabled={status.running || busyAction !== null}
-                aria-busy={busyAction === "start_capture"}
-                onClick={() => {
-                  setMemoryMenuOpen(false);
-                  void runAction("start_capture");
-                }}
-                type="button"
-              >
-                {busyAction === "start_capture" ? "Starting" : "Start local memory"}
-              </button>
-              <button
-                className="secondary-button"
-                disabled={!status.running || busyAction !== null}
-                aria-busy={busyAction === "stop_capture"}
-                onClick={() => {
-                  setMemoryMenuOpen(false);
-                  void runAction("stop_capture");
-                }}
-                type="button"
-              >
-                {busyAction === "stop_capture" ? "Pausing" : "Pause local memory"}
-              </button>
-              <button
-                className="secondary-button"
-                disabled={!status.running || busyAction !== null}
-                aria-busy={busyAction === "capture_once"}
-                onClick={() => {
-                  setMemoryMenuOpen(false);
-                  void runAction("capture_once");
-                }}
-                type="button"
-              >
-                {busyAction === "capture_once" ? "Capturing" : "Capture evidence now"}
-              </button>
-              <button
-                className="danger-button"
-                disabled={busyAction !== null}
-                aria-busy={isDeleting}
-                onClick={() => {
-                  setMemoryMenuOpen(false);
-                  void deleteAllFrames();
-                }}
-                type="button"
-              >
-                {isDeleting ? "Deleting" : "Delete local memory"}
-              </button>
-            </div>
-          </details>
+        <div className="topbar-meta" aria-label="Local memory status">
+          {viewMode === "developer" ? (
+            <>
+              <StatusPill label="Local memory" value={continueStatusLabel} tone={status.running ? "good" : status.last_error ? "bad" : "quiet"} />
+              <StatusPill label="Evidence age" value={latestEvidenceAgeLabel} />
+              <StatusPill label="Continue" value={continueFreshnessLabel} tone={continueIsStale ? "good" : "quiet"} />
+            </>
+          ) : (
+            <span className={`memory-dot ${status.running ? "active" : ""}`}>
+              {status.running ? "Local memory active" : continueHasEvidence ? "Local memory paused" : "No local memory yet"}
+            </span>
+          )}
         </div>
       </header>
 
@@ -1583,23 +1546,17 @@ function App() {
         }}
       >
       <section className="continue-home" aria-label="Continue">
-        <ContinueDecisionCard
+        <ContinuationAnswer
           decision={continueDecision}
           primaryMessage={continuePrimaryMessage}
           hasEvidence={continueHasEvidence}
           running={status.running}
           busyAction={busyAction}
-          sourceLabel={continueSourceLabel}
           openResult={continueOpenResult}
-          liveFrameCount={status.frame_count}
-          liveSignalCount={status.signal_count}
-          decisionFrameCount={continueDecisionFrameCount}
-          decisionUpdatedAt={continueDecisionUpdatedAt}
           stale={continueIsStale}
           onStartMemory={() => void runAction("start_capture")}
           onContinue={() => void runContinueDecision()}
           onOpenTarget={() => void openContinueTarget()}
-          onShowEvidence={() => void revealContinueFrame(continueDecision?.evidence_anchors.frame_ids[0])}
           onRecordFeedback={(kind) => void recordContinueFeedback(kind)}
           onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
         />
@@ -1613,7 +1570,7 @@ function App() {
         <div className="error-box" role="alert">{error || status.last_error}</div>
       ) : null}
 
-      {evidenceOpen ? (
+      {viewMode === "developer" && evidenceOpen ? (
         <ContinueEvidencePanel
           decision={continueDecision}
           selectedFrame={selectedFrame}
@@ -1622,24 +1579,82 @@ function App() {
         />
       ) : null}
 
-      <details
-        className="developer-panel diagnostics-panel"
-        onToggle={(event) => {
-          const open = event.currentTarget.open;
-          setDiagnosticsOpen(open);
-          if (open) {
-            void refreshWorkstreams();
-            void runSearch("");
-            void refreshTimeline();
-            void refreshMemoryDiagnostics();
-            void loadWorkstreamDetail(selectedWorkstreamId);
-          }
-        }}
-      >
-        <summary>
-          <span>Developer diagnostics</span>
-          <strong>Frame inspector, search, raw events, and local evidence substrate</strong>
-        </summary>
+      {viewMode === "developer" ? (
+      <section className="developer-panel diagnostics-panel" aria-label="Developer diagnostics">
+        <div className="developer-panel-head">
+          <div>
+            <span>Developer diagnostics</span>
+            <strong>Frame inspector, search, raw events, and local evidence substrate</strong>
+          </div>
+          <div className="control-strip" aria-label="Capture controls">
+            <button
+              className="primary-button"
+              disabled={busyAction !== null}
+              aria-busy={busyAction === "get_continue_decision"}
+              onClick={() => void runContinueDecision()}
+            >
+              {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
+            </button>
+            <details
+              className="capture-menu"
+              open={memoryMenuOpen}
+              ref={captureMenuRef}
+              onToggle={(event) => setMemoryMenuOpen(event.currentTarget.open)}
+            >
+              <summary>Memory</summary>
+              <div>
+                <button
+                  className="secondary-button"
+                  disabled={status.running || busyAction !== null}
+                  aria-busy={busyAction === "start_capture"}
+                  onClick={() => {
+                    setMemoryMenuOpen(false);
+                    void runAction("start_capture");
+                  }}
+                  type="button"
+                >
+                  {busyAction === "start_capture" ? "Starting" : "Start local memory"}
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={!status.running || busyAction !== null}
+                  aria-busy={busyAction === "stop_capture"}
+                  onClick={() => {
+                    setMemoryMenuOpen(false);
+                    void runAction("stop_capture");
+                  }}
+                  type="button"
+                >
+                  {busyAction === "stop_capture" ? "Pausing" : "Pause local memory"}
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={!status.running || busyAction !== null}
+                  aria-busy={busyAction === "capture_once"}
+                  onClick={() => {
+                    setMemoryMenuOpen(false);
+                    void runAction("capture_once");
+                  }}
+                  type="button"
+                >
+                  {busyAction === "capture_once" ? "Capturing" : "Capture evidence now"}
+                </button>
+                <button
+                  className="danger-button"
+                  disabled={busyAction !== null}
+                  aria-busy={isDeleting}
+                  onClick={() => {
+                    setMemoryMenuOpen(false);
+                    void deleteAllFrames();
+                  }}
+                  type="button"
+                >
+                  {isDeleting ? "Deleting" : "Delete local memory"}
+                </button>
+              </div>
+            </details>
+          </div>
+        </div>
 
         <section className="diagnostics-workspace" aria-label="Continue diagnostics">
           <WorkstreamList
@@ -2091,29 +2106,24 @@ function App() {
           </section>
         </aside>
       </section>
-      </details>
+      </section>
+      ) : null}
       </div>
     </main>
   );
 }
 
-function ContinueDecisionCard({
+function ContinuationAnswer({
   decision,
   primaryMessage,
   hasEvidence,
   running,
   busyAction,
-  sourceLabel,
   openResult,
-  liveFrameCount,
-  liveSignalCount,
-  decisionFrameCount,
-  decisionUpdatedAt,
   stale,
   onStartMemory,
   onContinue,
   onOpenTarget,
-  onShowEvidence,
   onRecordFeedback,
   onUseAlternative,
 }: {
@@ -2122,36 +2132,45 @@ function ContinueDecisionCard({
   hasEvidence: boolean;
   running: boolean;
   busyAction: string | null;
-  sourceLabel: string;
   openResult: OpenResumePointResult | null;
-  liveFrameCount: number;
-  liveSignalCount: number;
-  decisionFrameCount: number | null;
-  decisionUpdatedAt: number | null;
   stale: boolean;
   onStartMemory: () => void;
   onContinue: () => void;
   onOpenTarget: () => void;
-  onShowEvidence: () => void;
   onRecordFeedback: (feedbackKind: string) => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
   const resumeTarget = decision?.resume_work_target || decision?.return_target || null;
-  const target = resumeTarget;
   const lowConfidence = decision ? decision.confidence < 0.55 : false;
   const handoff = decision?.handoff || null;
   const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
-  const refreshLabel = busyAction === "get_continue_decision"
-    ? "Refreshing"
-    : stale
-      ? "Catching up"
-      : decision
-        ? "Live"
-        : "Idle";
   const alternatives = decision?.alternatives || [];
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
+  const workstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
+  const targetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
+  const targetMeta = presentation?.targetMeta || humanTargetMeta(resumeTarget);
+  const lastStateLine = handoff?.last_state_line || presentation?.lastState || "No last meaningful state is clear yet.";
+  const nextActionLine =
+    handoff?.next_action ||
+    presentation?.nextAction ||
+    "Open the target and continue from the last meaningful state.";
+  const currentFocusLine = handoff?.current_focus_line || presentation?.currentFocus || "";
+  const uncertaintyLine =
+    handoff?.user_visible_uncertainty ||
+    handoff?.missing_evidence_line ||
+    presentation?.missingEvidenceSummary ||
+    "";
+  const showCurrentFocus =
+    Boolean(currentFocusLine) &&
+    currentFocusLine !== "No current screen returned." &&
+    currentFocusLine !== targetLine &&
+    (
+      decision?.warnings.includes("current_focus_differs_from_return_target") ||
+      decision?.warnings.includes("current_focus_mismatch") ||
+      decision?.current_focus?.artifact_id !== resumeTarget?.artifact_id
+    );
 
   useEffect(() => {
     setCorrectionOpen(false);
@@ -2163,60 +2182,22 @@ function ContinueDecisionCard({
     setCorrectionOpen(false);
   };
 
-  if (!hasEvidence && !decision) {
-    return (
-      <section className="continue-card empty" aria-label="Continue decision">
-        <div className="continue-card-head">
-          <div>
-            <p className="product-kicker">Continue</p>
-            <h2>{primaryMessage}</h2>
-          </div>
-          <span className="trust-badge partial">No evidence</span>
-        </div>
-        <p className="continue-lede">
-          Smalltalk needs local evidence before it can identify a workstream and return target.
-        </p>
-        <div className="continue-actions">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busyAction !== null}
-            aria-busy={busyAction === "get_continue_decision"}
-            onClick={onContinue}
-          >
-            {busyAction === "get_continue_decision" ? "Checking local memory" : "Continue"}
-          </button>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={running || busyAction !== null}
-            aria-busy={busyAction === "start_capture"}
-            onClick={onStartMemory}
-          >
-            {busyAction === "start_capture" ? "Starting" : "Start local memory"}
-          </button>
-          <button className="secondary-button" type="button" onClick={onShowEvidence}>
-            Inspect evidence
-          </button>
-        </div>
-      </section>
-    );
-  }
-
   if (!decision) {
     return (
-      <section className="continue-card empty" aria-label="Continue decision">
-        <div className="continue-card-head">
-          <div>
-            <p className="product-kicker">Continue</p>
-            <h2>{primaryMessage}</h2>
-          </div>
-          <span className="trust-badge partial">{running ? "Local memory active" : "Ready"}</span>
+      <section className="continue-card continuation-answer empty" aria-label="Continue decision">
+        <div className="answer-eyebrow">
+          <span>{running ? "Local memory active" : hasEvidence ? "Local memory ready" : "No local memory yet"}</span>
         </div>
-        <p className="continue-lede">
-          Continue runs against the local memory layer. Stopping capture is not required.
-        </p>
-        <div className="continue-actions">
+        <div className="answer-hero">
+          <p>{hasEvidence ? "Ready to answer" : "Start local memory"}</p>
+          <h2>{primaryMessage}</h2>
+          <span>
+            {hasEvidence
+              ? "Continue uses local evidence. You do not need to stop anything first."
+              : "Smalltalk needs local evidence before it can say what you were doing and where to continue."}
+          </span>
+        </div>
+        <div className="answer-actions">
           <button
             className="primary-button"
             type="button"
@@ -2224,98 +2205,71 @@ function ContinueDecisionCard({
             aria-busy={busyAction === "get_continue_decision"}
             onClick={onContinue}
           >
-            {busyAction === "get_continue_decision" ? "Finding where to continue" : "Continue"}
+            {busyAction === "get_continue_decision" ? "Finding where to continue" : "Find where to continue"}
           </button>
-          <button className="secondary-button" type="button" onClick={onShowEvidence}>
-            Inspect evidence
-          </button>
+          {!hasEvidence ? (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={running || busyAction !== null}
+              aria-busy={busyAction === "start_capture"}
+              onClick={onStartMemory}
+            >
+              {busyAction === "start_capture" ? "Starting" : "Start local memory"}
+            </button>
+          ) : null}
         </div>
       </section>
     );
   }
 
   return (
-    <section className={`continue-card ${lowConfidence ? "low-confidence" : ""}`} aria-label="Continue decision">
-      <div className="continue-card-head">
+    <section className={`continue-card continuation-answer ${lowConfidence ? "low-confidence" : ""}`} aria-label="Continue decision">
+      <div className="answer-eyebrow">
+        <span>{stale ? "New local evidence since this answer" : lowConfidence ? "Best available answer" : "Continue answer"}</span>
+      </div>
+
+      <div className="answer-hero">
+        <p>You were working on</p>
+        <h2>{workstreamLine}</h2>
+      </div>
+
+      <div className="answer-target">
         <div>
-          <p className="product-kicker">{sourceLabel}</p>
-          <h2>{handoff?.headline || presentation?.workstreamTitle || "Recent workstream"}</h2>
-        </div>
-        <div className="continue-card-badges">
-          <span className={`trust-badge ${stale ? "partial" : "complete"}`}>{refreshLabel}</span>
-          <span className={`trust-badge ${lowConfidence ? "thin" : "complete"}`}>
-            {handoff ? sentenceCase(handoff.confidence_label) : presentation?.confidenceLabel || confidenceLabel(decision.confidence)}
-          </span>
+          <span>{lowConfidence ? "Best available place to continue" : "Continue at"}</span>
+          <strong>{targetLine}</strong>
+          <small>{targetMeta}</small>
         </div>
       </div>
 
-      <div className="continue-live-row" aria-label="Continue freshness">
-        <span>{decisionUpdatedAt ? `Updated ${formatTime(decisionUpdatedAt)}` : "Not refreshed yet"}</span>
-        <span>{`${liveSignalCount} ${liveSignalCount === 1 ? "signal" : "signals"}`}</span>
-        <span>
-          {decisionFrameCount === null
-            ? `${liveFrameCount} evidence frames`
-            : `${decisionFrameCount}/${liveFrameCount} evidence frames`}
-        </span>
-      </div>
-
-      <div className="continue-state-grid">
-        <div className="target-block current-focus-target">
-          <span>Current focus</span>
-          <strong>{handoff?.current_focus_line || presentation?.currentFocus || "No current screen returned."}</strong>
-          <small>{presentation?.currentActivity || "Current activity is still thin."}</small>
-        </div>
-        <div className="target-block primary-target">
-          <span>{lowConfidence ? "Best available return point" : "Return target"}</span>
-          <strong>{handoff?.return_line || presentation?.returnTarget || "No target returned"}</strong>
-          <small>{presentation?.targetMeta || "Target metadata unavailable."}</small>
-        </div>
-      </div>
-
-      <div className="continue-state-grid product-state-grid">
-        <div className="next-action-block">
+      <div className="answer-state">
+        <div>
           <span>Last meaningful state</span>
-          <strong>{handoff?.last_state_line || presentation?.lastState || "No last state returned."}</strong>
+          <strong>{lastStateLine}</strong>
         </div>
-        <div className="next-action-block">
-          <span>Next action</span>
-          <strong>
-            {handoff?.next_action || presentation?.nextAction || "Open the target and continue from the last meaningful state."}
-          </strong>
-        </div>
-      </div>
-
-      <div className="continue-evidence-summary">
         <div>
-          <span>Confidence</span>
-          <strong>
-            {handoff
-              ? `${sentenceCase(handoff.confidence_label)} confidence`
-              : presentation?.confidenceSummary || "Evidence quality unavailable."}
-          </strong>
+          <span>Next action</span>
+          <strong>{nextActionLine}</strong>
         </div>
-        <p>
-          {handoff?.missing_evidence_line ||
-            handoff?.user_visible_uncertainty ||
-            handoff?.why_this.join(" ") ||
-            presentation?.missingEvidenceSummary ||
-            "No missing evidence called out."}
-        </p>
       </div>
 
-      {handoff?.why_this.length ? (
-        <div className="continue-why-list" aria-label="Why this continuation">
-          {handoff.why_this.map((reason) => (
-            <span key={reason}>{reason}</span>
-          ))}
-        </div>
+      {showCurrentFocus ? (
+        <p className="answer-context">
+          Current focus: <strong>{currentFocusLine}</strong>
+        </p>
       ) : null}
 
-      <div className="continue-primary-action">
+      {lowConfidence || uncertaintyLine ? (
+        <p className="answer-uncertainty">
+          {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
+        </p>
+      ) : null}
+
+      <div className="answer-actions">
         <button
           className="primary-button"
           type="button"
-          disabled={busyAction !== null || !target}
+          disabled={busyAction !== null || !resumeTarget}
           aria-busy={busyAction === "open_continue_target"}
           onClick={onOpenTarget}
         >
@@ -2325,24 +2279,61 @@ function ContinueDecisionCard({
           className="secondary-button"
           type="button"
           disabled={busyAction !== null}
-          onClick={onShowEvidence}
+          aria-busy={busyAction === "get_continue_decision"}
+          onClick={onContinue}
         >
-          Inspect evidence
+          {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh Continue"}
         </button>
       </div>
 
-      {alternatives.length > 0 ? (
-        <div className="continue-alternative-summary">
-          <span>Other possible continuations available.</span>
-          <button
-            className="text-button"
-            type="button"
-            onClick={() => setAlternativesOpen((open) => !open)}
-          >
-            {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
-          </button>
-        </div>
-      ) : null}
+      <div className="continue-correction">
+        <button
+          className="text-button"
+          type="button"
+          disabled={busyAction !== null}
+          onClick={() => setCorrectionOpen((open) => !open)}
+        >
+          Not right
+        </button>
+        {correctionOpen ? (
+          <div className="continue-correction-panel" aria-label="Correction controls">
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => recordAndClose("rejected")}
+            >
+              Mark wrong target
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null || alternatives.length === 0}
+              onClick={() => {
+                setAlternativesOpen((open) => !open);
+              }}
+            >
+              {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => recordAndClose("artifact_only_evidence")}
+            >
+              This was only evidence
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => recordAndClose("ignored_workstream")}
+            >
+              Ignore this workstream
+            </button>
+          </div>
+        ) : null}
+      </div>
 
       {visibleAlternatives.length > 0 ? (
         <div className="alternative-list" aria-label="Alternative continuations">
@@ -2364,56 +2355,6 @@ function ContinueDecisionCard({
           ))}
         </div>
       ) : null}
-
-      <div className="continue-correction">
-        <button
-          className="text-button"
-          type="button"
-          disabled={busyAction !== null}
-          onClick={() => setCorrectionOpen((open) => !open)}
-        >
-          Wrong target?
-        </button>
-        {correctionOpen ? (
-          <div className="continue-correction-panel" aria-label="Correction controls">
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("rejected")}
-            >
-              Mark wrong target
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null || alternatives.length === 0}
-              onClick={() => {
-                setAlternativesOpen(true);
-                setCorrectionOpen(false);
-              }}
-            >
-              Use another target
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("artifact_only_evidence")}
-            >
-              This was only evidence
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("ignored_workstream")}
-            >
-              Ignore this workstream
-            </button>
-          </div>
-        ) : null}
-      </div>
 
       {openResult ? (
         <div className="continue-open-result">
