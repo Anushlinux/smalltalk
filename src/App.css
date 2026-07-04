@@ -457,6 +457,8 @@ h3 {
 
 .answer-eyebrow {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-start;
 }
 
@@ -471,6 +473,24 @@ h3 {
   background: rgba(223, 241, 236, 0.72);
   font-size: 12px;
   font-weight: 760;
+}
+
+.answer-eyebrow .provenance-pill.ai {
+  border-color: rgba(51, 94, 160, 0.18);
+  color: #274e87;
+  background: rgba(225, 235, 250, 0.86);
+}
+
+.answer-eyebrow .provenance-pill.fallback {
+  border-color: rgba(151, 94, 28, 0.2);
+  color: #805016;
+  background: rgba(248, 236, 216, 0.9);
+}
+
+.answer-eyebrow .provenance-pill.local {
+  border-color: rgba(93, 102, 108, 0.16);
+  color: #556066;
+  background: rgba(235, 239, 240, 0.86);
 }
 
 .answer-hero {

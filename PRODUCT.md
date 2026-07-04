@@ -50,7 +50,7 @@ Smalltalk must not store raw typed characters or full clipboard text. Keyboard a
 | `src/App.css` | Desktop shell, fixed top bar, scroll containment, Continue card, diagnostics, workstream and inspector styling. |
 | `src-tauri/` | Rust/Tauri backend, command registration, capture runtime, SQLite store, Continue engine, macOS island integration. |
 | `src-tauri/src/capture.rs` | Active runtime facade for capture, storage, search, safe exports, cloud resume, local memory diagnostics, cleanup, and Tauri command wrappers. |
-| `src-tauri/src/continuation.rs` | Native Continue semantic memory, rebuild layers, scoring, decisions, feedback, breadcrumbs, eval, and optional bounded micro-inference. |
+| `src-tauri/src/continuation.rs` | Native Continue semantic memory, rebuild layers, scoring, decisions, feedback, breadcrumbs, eval, and default bounded micro-inference. |
 | `src-tauri/src/lib.rs` | Tauri builder and command registration. |
 | `src-tauri/src/session_island.rs` | macOS floating island bridge. Still speaks older session/resume language in several paths. |
 | `src-tauri/macos/SessionIslandPanel.swift` | Native macOS panel UI. |
@@ -59,6 +59,7 @@ Smalltalk must not store raw typed characters or full clipboard text. Keyboard a
 | `docs/` | Technical docs, audits, architecture notes, QA notes, and product rebuild notes. |
 | `browser-extension/` | Older browser-extension prototype. Not the active MVP lane. |
 | `resume_query_exports/` | Generated stop-time resume-query bundles. Treat as generated unless explicitly asked to inspect. |
+| `continue_outputs/` | Generated full Continue audit folders. Folder names start with the capture session, for example `session-001-session-id__continue-<timestamp>__normal__<decision>`. Private/debug only; do not commit. |
 | `cloud_resume_exports/`, `output/`, `target/`, local snapshot folders | Generated artifacts. Do not commit. |
 
 ## Build And Verification Commands
@@ -123,6 +124,7 @@ The main first screen is the `ContinueDecisionCard`. Depending on evidence state
 - No-evidence state.
 - Local-memory-active state.
 - Continue decision state.
+- Inference provenance: `AI-assisted`, `Local fallback`, or `Local only`.
 - Current focus.
 - Return target or best available return point.
 - Last meaningful state.
@@ -133,17 +135,22 @@ The main first screen is the `ContinueDecisionCard`. Depending on evidence state
 - Alternative continuation targets when present.
 - Collapsed correction controls behind `Wrong target?`.
 
-The product card invokes local Continue by default:
+The product card invokes bounded AI Continue by default:
 
 ```ts
 await invoke("get_continue_decision", {
   input: {
     mode: "normal",
     rebuild_layers: false,
-    micro_inference_enabled: false
+    micro_inference_enabled: true,
+    max_candidates_for_model: 5
   }
 });
 ```
+
+The UI treats provenance as product-visible state. A cloud micro-inference result with a real `response_id` is shown as `AI-assisted`; a failed or unavailable model path is shown as `Local fallback`; local scorer-only output is shown as `Local only`.
+
+The UI also filters user-facing handoff copy. If a backend or model handoff leaks internal ids or implementation labels such as candidate ids, workstream ids, artifact ids, frame fallback text, or target-metadata placeholders, the card falls back to honest thin-evidence copy instead of displaying those internals as product language.
 
 The UI opens the selected target through:
 
@@ -228,8 +235,9 @@ Developer reset can also clear generated repo debug output:
 
 - `output/`
 - `resume_query_exports/`
+- `continue_outputs/`
 
-Generated capture data, SQLite files, screenshots, safe exports, and resume-query bundles must not be committed.
+Generated capture data, SQLite files, screenshots, safe exports, resume-query bundles, and Continue output audits must not be committed.
 
 ## Data Model Overview
 
@@ -448,7 +456,10 @@ Current budget constants in `capture.rs`:
 | `MAX_RETAINED_FRAME_AGE_MS` | 7 days | Retention age for frame cleanup candidates. |
 | `MAX_RETAINED_CONTINUE_DECISION_AGE_MS` | 24 hours | Retention age used to protect recent Continue decisions. |
 | `LOCAL_SIGNAL_BUCKET_WINDOW_MS` | 30 seconds | Window for aggregating recent local signals. |
-| `MAX_LOCAL_SIGNAL_EVENTS` | 5,000 | Maximum local signal events considered. |
+| `LOCAL_SIGNAL_RECENT_WINDOW_MS` | 20 minutes | Recent event window used for visible local signal counts. |
+| `MAX_LOCAL_SIGNAL_EVENTS` | 600 | Maximum raw local signal events considered. |
+| `MAX_VISIBLE_SIGNAL_MOMENTS` | 48 | Product-facing cap for bucketed signal moments. |
+| `ISLAND_EVENT_STATUS_INTERVAL` | 900 ms | Minimum interval for refreshing island/status after native events. |
 
 ## Capture Trigger Model
 
@@ -473,6 +484,10 @@ Trigger types include:
 | `event_burst` | Runtime coalescing | Multiple event kinds merged before capture fired. |
 
 The runtime stores event rows even when a heavy screenshot is skipped. Continue can use event-backed evidence and synthetic ids such as `event-<hash>` to avoid collapsing local memory to only screenshot frames.
+
+Visible local signal counts are intentionally bounded. The status path looks at recent event rows, buckets them into signal moments, and caps the product-facing count so a long event stream does not make the app look heavier or more precise than it is.
+
+Native event ingestion can refresh `capture-status` and the floating island even when no heavy frame is stored. This keeps local-memory state alive during event-only periods without requiring continuous screenshots.
 
 ## Native Capture Pipeline
 
@@ -853,7 +868,7 @@ The pipeline has five layers:
 2. Semantic memory layer.
 3. Workstream layer.
 4. Local decision layer.
-5. Optional bounded micro-inference layer.
+5. Default bounded micro-inference layer with local validation and fallback.
 
 ### Layer 1: Evidence Substrate
 
@@ -1141,7 +1156,7 @@ Default backend request values:
 - `limit`: 700
 - `mode`: `normal`
 - `rebuild_layers`: false
-- `micro_inference_enabled`: false
+- `micro_inference_enabled`: true
 - `max_candidates_for_model`: 5
 
 The frontend normal path sends:
@@ -1151,7 +1166,8 @@ await invoke("get_continue_decision", {
   input: {
     mode: "normal",
     rebuild_layers: false,
-    micro_inference_enabled: false
+    micro_inference_enabled: true,
+    max_candidates_for_model: 5
   }
 });
 ```
@@ -1163,7 +1179,8 @@ await invoke("get_continue_decision", {
   input: {
     mode: "rebuild",
     rebuild_layers: true,
-    micro_inference_enabled: false
+    micro_inference_enabled: true,
+    max_candidates_for_model: 5
   }
 });
 ```
@@ -1177,7 +1194,7 @@ Normal mode can reuse a cached decision when no newer local evidence exists. Cac
 1. Ensure Continue schema.
 2. Normalize request defaults.
 3. Determine normal versus rebuild mode.
-4. Try to load a fresh cached decision when not rebuilding and micro-inference is disabled.
+4. Try to load a fresh cached decision when not rebuilding and the cached decision matches the requested inference policy.
 5. Infer pending feedback for previous decisions when no cache is used.
 6. Check whether semantic layers need rebuild.
 7. Rebuild second layer incrementally when needed.
@@ -1190,11 +1207,12 @@ Normal mode can reuse a cached decision when no newer local evidence exists. Cac
 14. Persist candidates when not using cached decision metadata.
 15. Select the highest local candidate.
 16. Add warnings such as current focus differing from return target.
-17. Optionally run bounded micro-inference.
+17. Run bounded micro-inference by default when candidates exist and `micro_inference_enabled` is not explicitly false.
 18. Validate any model result.
 19. Build a stable decision id.
 20. Persist a `continue_decisions` row when no cached decision was used.
-21. Return the decision, anchors, missing evidence, warnings, alternatives, and provenance.
+21. Best-effort write a full generated audit folder under `continue_outputs/`, named with the resolved capture session label first.
+22. Return the decision, anchors, missing evidence, warnings, alternatives, provenance, and optional audit path.
 
 Candidate kinds:
 
@@ -1293,11 +1311,11 @@ A Continue answer must be explainable through anchors:
 
 The UI should productize these into evidence previews and concise explanations. Raw ids belong in diagnostics.
 
-## Optional Bounded Micro-Inference
+## Default Bounded Micro-Inference
 
-OpenAI micro-inference is optional and disabled by the current frontend primary path.
+OpenAI micro-inference is the default Continue path. It is still bounded to local candidate ids, locally validated, and cache-aware. It does not receive broad raw history.
 
-It can be requested with:
+The normal request is:
 
 ```ts
 await invoke("get_continue_decision", {
@@ -1367,11 +1385,16 @@ The model output is validated locally. The validator rejects output when:
 - selected workstream id does not match the selected candidate
 - selected candidate was not sent to the model
 - output mentions unsupported URLs or paths
+- output leaks internal candidate, workstream, artifact, frame, or fallback identifiers into handoff copy
 - `next_action` is empty, too long, or incompatible with candidate semantics
 - high confidence is returned for thin evidence
 - a branch/support target is promoted without a strong local candidate
 
 If the API fails, the key is missing, parsing fails, or validation fails, the decision source becomes `local_fallback` and the local scorer result is returned.
+
+Fallback decisions are still cached when their evidence watermark and inference policy match the next normal request. This matters because default micro-inference should not repeatedly attempt network/model work when the same local evidence already produced a validated local fallback.
+
+The decision layer also refuses to present a selected candidate as a clear continuation when there is no human-readable return target. In that case it adds `thin_evidence:no_human_return_target`, lowers confidence, suppresses model handoff output, and returns no-clear-continuation copy rather than exposing internal target metadata.
 
 ## Feedback And Breadcrumbs
 
@@ -1519,6 +1542,8 @@ Default resume-query policy:
 
 Requested JSON and image limits are capped at those defaults.
 
+Resume-query bundles can include `recent_surface_context`. This is context-only evidence extracted from rejected browser-chrome anchors, especially tab-strip titles. These labels can explain that another browser tab was briefly visible, but they are explicitly not resume anchors and should not become the return target.
+
 The stop-time path is useful for bounded cloud reasoning, but it is not the core Continue engine.
 
 ## Cloud Resume Path
@@ -1587,6 +1612,8 @@ Privacy boundaries:
 - Do not commit `.env`, API keys, SQLite DBs, screenshots, capture exports, or resume-query exports.
 
 Safe AI export means derived/redacted evidence plus audit rows, not raw screenshot dumps.
+
+`continue_outputs/` is different. It is an explicit full developer audit requested for understanding how raw local evidence becomes a Continue decision. It can include raw SQLite snapshots, screenshots, OCR text, Accessibility text/tree data, content units, URLs, file paths, events, semantic layers, candidate scoring, model request JSON, raw model response JSON, validation results, final handoff copy, and an `explain.md` walkthrough. It is private generated output and must not be committed.
 
 ## Cleanup And Retention
 
@@ -1714,12 +1741,18 @@ What is real now:
 - Artifacts/actions/episodes/workstreams/candidates/decisions are persisted.
 - Continue can run without stopping local memory.
 - Normal Continue mode can reuse cached decisions.
+- Default micro-inference can fall back locally and reuse that cached fallback when evidence has not changed.
+- Continue handoff copy is persisted and filtered so internal candidate/workstream/artifact/frame ids do not become user-facing product text.
+- Every `get_continue_decision` call best-effort writes a full audit folder under `continue_outputs/`, including cache hits and island-triggered Continue calls. Folder names begin with the resolved capture session label so audits can be matched back to a session without opening the manifest.
+- Continue micro-inference audit events record the candidate pack, OpenAI request body without secrets, raw response, parsed output, validation result, failures, and fallback reason.
 - Diagnostic rebuild can force semantic layer rebuild.
 - The UI opens Continue targets by `continue_decision_id`.
 - Correction feedback and next-step breadcrumbs are persisted.
 - Local memory diagnostics expose storage size, row counts, budgets, skip counters, and cache counters.
 - Heavy capture budgets and duplicate/self-capture skipping exist.
 - Event-only evidence is part of the Continue recovery direction.
+- Visible local signal counts are recent-windowed and capped.
+- Stop-time resume-query preserves rejected browser tab-strip titles as context-only evidence.
 - Stop-time resume-query bundles still exist and are generated artifacts.
 - Cloud resume is distinct from Continue.
 - The floating island is not fully migrated to Continue.

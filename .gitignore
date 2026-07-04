@@ -23,6 +23,9 @@ reference/
 
 
 cloud_resume_exports/
+continue_outputs/
+resume_query_exports/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

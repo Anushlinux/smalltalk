@@ -24,7 +24,9 @@ await invoke("get_continue_decision", {
 });
 ```
 
-## Invoke Bounded OpenAI Micro-Inference
+## Default Bounded OpenAI Micro-Inference
+
+Normal Continue requests use bounded OpenAI micro-inference by default. Callers can still pass `micro_inference_enabled: false` for local-only diagnostics.
 
 ```ts
 await invoke("get_continue_decision", {

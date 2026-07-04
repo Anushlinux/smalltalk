@@ -2148,20 +2148,48 @@ function ContinuationAnswer({
   const [alternativesOpen, setAlternativesOpen] = useState(false);
   const alternatives = decision?.alternatives || [];
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
-  const workstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
-  const targetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
-  const targetMeta = presentation?.targetMeta || humanTargetMeta(resumeTarget);
-  const lastStateLine = handoff?.last_state_line || presentation?.lastState || "No last meaningful state is clear yet.";
+  const rawWorkstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
+  const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
+  const targetLooksInternal = isInternalFacingText(rawTargetLine);
+  const workstreamLine = targetLooksInternal
+    ? "No reliable continuation target yet"
+    : safeProductLine(rawWorkstreamLine, "Recent work");
+  const targetLine = targetLooksInternal
+    ? "No reliable return target is grounded yet."
+    : safeProductLine(rawTargetLine, "No stable place to continue yet.");
+  const targetMeta = targetLooksInternal
+    ? "I don't have a reliable app or page target for this yet."
+    : presentation?.targetMeta || humanTargetMeta(resumeTarget);
+  const lastStateLine = targetLooksInternal
+    ? "I do not have enough local evidence to identify a reliable unfinished task."
+    : safeProductLine(
+        handoff?.last_state_line || presentation?.lastState || "No last meaningful state is clear yet.",
+        "No last meaningful state is clear yet.",
+      );
   const nextActionLine =
-    handoff?.next_action ||
-    presentation?.nextAction ||
-    "Open the target and continue from the last meaningful state.";
-  const currentFocusLine = handoff?.current_focus_line || presentation?.currentFocus || "";
+    targetLooksInternal
+      ? "Use more local evidence before selecting a continuation target."
+      : safeProductLine(
+          handoff?.next_action ||
+            presentation?.nextAction ||
+            "Open the target and continue from the last meaningful state.",
+          "Open the target and continue from the last meaningful state.",
+        );
+  const currentFocusLine = stripCurrentFocusPrefix(
+    safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
+  );
+  const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
+  const provenanceTone = decision ? continueProvenanceTone(decision) : "local";
   const uncertaintyLine =
-    handoff?.user_visible_uncertainty ||
-    handoff?.missing_evidence_line ||
-    presentation?.missingEvidenceSummary ||
-    "";
+    targetLooksInternal
+      ? "I saw the current screen, but I don't have a reliable return target yet."
+      : safeProductLine(
+          handoff?.user_visible_uncertainty ||
+            handoff?.missing_evidence_line ||
+            presentation?.missingEvidenceSummary ||
+            "",
+          "",
+        );
   const showCurrentFocus =
     Boolean(currentFocusLine) &&
     currentFocusLine !== "No current screen returned." &&
@@ -2193,7 +2221,7 @@ function ContinuationAnswer({
           <h2>{primaryMessage}</h2>
           <span>
             {hasEvidence
-              ? "Continue uses local evidence. You do not need to stop anything first."
+              ? "Continue uses bounded AI over local candidates when available, with local validation and fallback. You do not need to stop anything first."
               : "Smalltalk needs local evidence before it can say what you were doing and where to continue."}
           </span>
         </div>
@@ -2224,9 +2252,10 @@ function ContinuationAnswer({
   }
 
   return (
-    <section className={`continue-card continuation-answer ${lowConfidence ? "low-confidence" : ""}`} aria-label="Continue decision">
-      <div className="answer-eyebrow">
-        <span>{stale ? "New local evidence since this answer" : lowConfidence ? "Best available answer" : "Continue answer"}</span>
+    <section className={`continue-card continuation-answer ${lowConfidence || targetLooksInternal ? "low-confidence" : ""}`} aria-label="Continue decision">
+      <div className="answer-eyebrow answer-provenance">
+        <span>{stale ? "New local evidence since this answer" : lowConfidence || targetLooksInternal ? "Best available answer" : "Continue answer"}</span>
+        <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
       </div>
 
       <div className="answer-hero">
@@ -2384,6 +2413,7 @@ function ContinueEvidencePanel({
     ...(decision?.validation_failures || []),
   ].map(productizeInternalLabel);
   const presentation = decision ? presentContinueDecision(decision) : null;
+  const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
 
   if (!decision) {
     return (
@@ -2438,6 +2468,10 @@ function ContinueEvidencePanel({
           <div>
             <dt>Evidence</dt>
             <dd>{presentation?.missingEvidenceSummary || "No missing evidence called out."}</dd>
+          </div>
+          <div>
+            <dt>Inference</dt>
+            <dd>{provenanceLabel}</dd>
           </div>
         </dl>
 
@@ -3213,6 +3247,26 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
   };
 }
 
+function continueProvenanceLabel(decision: ContinueDecisionResult) {
+  if (decision.source === "cloud_micro_inference" && decision.response_id) {
+    return "AI-assisted";
+  }
+  if (decision.source === "local_fallback") {
+    return "Local fallback";
+  }
+  return "Local only";
+}
+
+function continueProvenanceTone(decision: ContinueDecisionResult) {
+  if (decision.source === "cloud_micro_inference" && decision.response_id) {
+    return "ai";
+  }
+  if (decision.source === "local_fallback") {
+    return "fallback";
+  }
+  return "local";
+}
+
 function humanTargetLabel(target?: ContinueReturnTarget | null) {
   if (!target) return "";
   return cleanHumanText(target.title)
@@ -3222,12 +3276,12 @@ function humanTargetLabel(target?: ContinueReturnTarget | null) {
 }
 
 function humanTargetMeta(target?: ContinueReturnTarget | null) {
-  if (!target) return "No stable target metadata yet.";
+  if (!target) return "I don't have a reliable app or page target for this yet.";
   const parts = [
     productizeArtifactKind(target.artifact_kind),
     productizeOpenability(target.openability),
   ].filter(Boolean);
-  return parts.join(" / ") || "Target metadata is thin.";
+  return parts.join(" / ") || "I don't have a reliable app or page target for this yet.";
 }
 
 function humanFocusLabel(focus?: ContinueFocusSummary | null) {
@@ -3380,6 +3434,38 @@ function productizeOpenability(value?: string | null) {
   return labels[key] || "";
 }
 
+function safeProductLine(value: string, fallback: string) {
+  const cleaned = cleanHumanText(value);
+  if (!cleaned || isInternalFacingText(cleaned)) return fallback;
+  return cleaned;
+}
+
+function stripCurrentFocusPrefix(value: string) {
+  return value.replace(/^current focus:\s*/i, "").trim();
+}
+
+function isInternalFacingText(value?: string | null) {
+  const lower = (value || "").toLowerCase();
+  if (!lower) return false;
+  if (
+    lower.includes("continue-candidate-") ||
+    lower.includes("workstream-") ||
+    lower.includes("artifact-") ||
+    lower.includes("frame-fallback") ||
+    lower.includes("frame_fallback") ||
+    lower.includes("target metadata") ||
+    lower.includes("selected candidate") ||
+    lower.includes("candidate id") ||
+    lower.includes("workstream id") ||
+    lower.includes("artifact id") ||
+    lower.includes("frame_id") ||
+    lower.includes("frame id")
+  ) {
+    return true;
+  }
+  return /\bframe-\d+\b/.test(lower) || /\bframe\s+\d+\b/.test(lower);
+}
+
 function presentOpenResult(result: OpenResumePointResult) {
   if (result.warnings.length > 0) {
     return productizeInternalLabel(result.warnings[0]);
@@ -3409,7 +3495,7 @@ function cleanHumanText(value?: string | null) {
 
 function looksLikeInternalId(value: string) {
   const trimmed = value.trim();
-  return /^(frame|action|artifact|episode|workstream|continue-decision|task-action)-?[a-z0-9_-]+$/i.test(trimmed)
+  return /^(frame|action|artifact|episode|workstream|continue-candidate|continue-decision|task-action)-?[a-z0-9_-]+$/i.test(trimmed)
     || /^-?\d+$/.test(trimmed);
 }
 

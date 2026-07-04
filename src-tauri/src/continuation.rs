@@ -278,6 +278,12 @@ pub struct ContinueTaskAction {
     pub semantic_evidence_quote: Option<String>,
     pub semantic_delta_confidence: Option<f64>,
     pub semantic_moment_id: Option<String>,
+    pub evidence_source_kind: Option<String>,
+    pub evidence_span_ids: Vec<String>,
+    pub evidence_attribution: Option<Value>,
+    pub attribution_confidence: Option<f64>,
+    pub classifier_context: Option<Value>,
+    pub quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,7 +538,7 @@ pub struct ContinueThirdLayerRebuildResult {
     pub end_frame_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueDecisionRequest {
     pub session_id: Option<String>,
     pub lookback_ms: Option<i64>,
@@ -552,7 +558,7 @@ impl Default for ContinueDecisionRequest {
             limit: Some(700),
             mode: Some("normal".to_string()),
             rebuild_layers: Some(false),
-            micro_inference_enabled: Some(false),
+            micro_inference_enabled: Some(true),
             model: None,
             max_candidates_for_model: Some(5),
         }
@@ -594,6 +600,9 @@ pub struct ContinueDecisionResult {
     pub micro_inference_requested: bool,
     pub micro_inference_attempted: bool,
     pub micro_inference_result_kind: Option<String>,
+    pub continue_output_path: Option<String>,
+    #[serde(skip_serializing)]
+    pub audit_inference_events: Vec<ContinueAuditInferenceEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -607,6 +616,25 @@ pub struct ContinueHandoff {
     pub missing_evidence_line: Option<String>,
     pub confidence_label: String,
     pub user_visible_uncertainty: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueAuditInferenceEvent {
+    pub inference_id: String,
+    pub inference_kind: String,
+    pub requested_at_ms: i64,
+    pub model: Option<String>,
+    pub candidate_limit: Option<i64>,
+    pub pack: Option<Value>,
+    pub request: Option<Value>,
+    pub raw_response: Option<Value>,
+    pub parsed_output: Option<Value>,
+    pub validation_result: Option<String>,
+    pub validation_failures: Vec<String>,
+    pub validation_classification: Option<Value>,
+    pub error: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -792,6 +820,12 @@ pub struct TraceTaskActionSummary {
     pub confidence: f64,
     pub created_at_ms: i64,
     pub reason: Option<String>,
+    pub evidence_source_kind: Option<String>,
+    pub evidence_span_ids: Vec<String>,
+    pub evidence_attribution: Option<Value>,
+    pub attribution_confidence: Option<f64>,
+    pub classifier_context: Option<Value>,
+    pub quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1052,10 +1086,15 @@ pub struct ContinueCandidateSummary {
     pub workstream_id: String,
     pub target_artifact_id: Option<String>,
     pub candidate_kind: String,
+    pub pre_cap_score: f64,
     pub score: f64,
     pub confidence_label: String,
     pub reason: Option<String>,
     pub missing_evidence: Vec<String>,
+    pub risk_flags: Vec<String>,
+    pub score_caps_applied: Vec<String>,
+    pub eligible_for_primary_selection: bool,
+    pub selection_demotion_reason: Option<String>,
     pub evidence_frame_id: Option<String>,
     pub supporting_episode_id: Option<String>,
     pub last_meaningful_action_id: Option<String>,
@@ -1107,6 +1146,12 @@ pub struct RecentContinueTaskAction {
     pub semantic_evidence_quote: Option<String>,
     pub semantic_delta_confidence: Option<f64>,
     pub semantic_moment_id: Option<String>,
+    pub evidence_source_kind: Option<String>,
+    pub evidence_span_ids: Vec<String>,
+    pub evidence_attribution: Option<Value>,
+    pub attribution_confidence: Option<f64>,
+    pub classifier_context: Option<Value>,
+    pub quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1222,6 +1267,9 @@ struct EvidenceFrame {
     document_path: Option<String>,
     capture_trigger: String,
     text_source: Option<String>,
+    scope: Option<String>,
+    window_id: Option<i64>,
+    active_window_crop_path: Option<String>,
     full_text: Option<String>,
     content_hash: Option<String>,
     image_hash: Option<String>,
@@ -1231,6 +1279,8 @@ struct EvidenceFrame {
     session_id: Option<String>,
     app_contexts: Vec<EvidenceAppContext>,
     content_units: Vec<EvidenceContentUnit>,
+    ocr_spans: Vec<EvidenceOcrSpan>,
+    visible_windows: Vec<EvidenceWindow>,
     ui_events: Vec<EvidenceUiEvent>,
     trigger: Option<EvidenceTrigger>,
     transition: Option<EvidenceTransition>,
@@ -1265,6 +1315,38 @@ struct EvidenceContentUnit {
     text: Option<String>,
     text_hash: Option<String>,
     confidence: Option<f64>,
+    ocr_span_ids: Vec<String>,
+    bounds: Option<Rect>,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceOcrSpan {
+    id: String,
+    text: String,
+    confidence: Option<f64>,
+    bounds: Rect,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceWindow {
+    id: String,
+    cg_window_id: Option<i64>,
+    owner_name: Option<String>,
+    bundle_id: Option<String>,
+    window_title: Option<String>,
+    layer: Option<i64>,
+    alpha: Option<f64>,
+    is_onscreen: bool,
+    is_active: bool,
+    bounds: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1355,6 +1437,12 @@ struct ExtractedTaskAction {
     semantic_evidence_quote: Option<String>,
     semantic_delta_confidence: Option<f64>,
     semantic_moment_id: Option<String>,
+    evidence_source_kind: Option<String>,
+    evidence_span_ids: Vec<String>,
+    evidence_attribution_json: Option<String>,
+    attribution_confidence: Option<f64>,
+    classifier_context_json: Option<String>,
+    quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1567,6 +1655,7 @@ struct ScoredContinueCandidate {
     last_meaningful_action: Option<ScorerAction>,
     evidence_frame_id: Option<String>,
     supporting_episode_id: Option<String>,
+    pre_cap_score: f64,
     score: f64,
     actionability_score: f64,
     primary_target_score: f64,
@@ -1579,6 +1668,10 @@ struct ScoredContinueCandidate {
     reason: Option<String>,
     missing_evidence: Vec<String>,
     warnings: Vec<String>,
+    risk_flags: Vec<String>,
+    score_caps_applied: Vec<String>,
+    eligible_for_primary_selection: bool,
+    selection_demotion_reason: Option<String>,
     resume_work_target: Option<ScorerArtifact>,
     open_loop: Option<ScorerOpenLoop>,
 }
@@ -1723,7 +1816,7 @@ struct ContinuePackBreadcrumb {
     created_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ContinueMicroInferenceOutput {
     result: String,
     selected_candidate_id: Option<String>,
@@ -1911,7 +2004,9 @@ pub fn recent_continue_task_actions(
                     collapse_count, first_frame_id, last_frame_id, strongest_frame_id,
                     semantic_delta_kind, semantic_subject, semantic_before_hint,
                     semantic_after_hint, semantic_evidence_quote, semantic_delta_confidence,
-                    semantic_moment_id
+                    semantic_moment_id, evidence_source_kind, evidence_span_ids_json,
+                    evidence_attribution_json, attribution_confidence, classifier_context_json,
+                    quality_flags_json
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -1920,6 +2015,8 @@ pub fn recent_continue_task_actions(
     let rows = stmt
         .query_map(params![limit], |row| {
             let events_json: String = row.get(9)?;
+            let span_ids_json: String = row.get(25)?;
+            let quality_flags_json: String = row.get(29)?;
             Ok(RecentContinueTaskAction {
                 id: row.get(0)?,
                 frame_id: row.get(1)?,
@@ -1945,6 +2042,12 @@ pub fn recent_continue_task_actions(
                 semantic_evidence_quote: row.get(21)?,
                 semantic_delta_confidence: row.get(22)?,
                 semantic_moment_id: row.get(23)?,
+                evidence_source_kind: row.get(24)?,
+                evidence_span_ids: parse_string_array(&span_ids_json),
+                evidence_attribution: parse_optional_json_value(row.get(26)?),
+                attribution_confidence: row.get(27)?,
+                classifier_context: parse_optional_json_value(row.get(28)?),
+                quality_flags: parse_string_array(&quality_flags_json),
             })
         })
         .map_err(to_string)?;
@@ -2044,7 +2147,7 @@ pub fn get_continue_decision(
         limit: request.limit.or(Some(700)),
         mode: request.mode.or(Some("normal".to_string())),
         rebuild_layers: request.rebuild_layers.or(Some(false)),
-        micro_inference_enabled: request.micro_inference_enabled.or(Some(false)),
+        micro_inference_enabled: request.micro_inference_enabled.or(Some(true)),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
     };
@@ -2056,8 +2159,13 @@ pub fn get_continue_decision(
     let micro_inference_enabled = request.micro_inference_enabled.unwrap_or(false);
     let mut current_watermark =
         build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
-    let cached_meta = if !force_rebuild && !micro_inference_enabled {
-        fresh_cached_continue_decision(conn, request.session_id.as_deref(), &current_watermark)?
+    let cached_meta = if !force_rebuild {
+        fresh_cached_continue_decision(
+            conn,
+            request.session_id.as_deref(),
+            &current_watermark,
+            micro_inference_enabled,
+        )?
     } else {
         None
     };
@@ -2112,7 +2220,11 @@ pub fn get_continue_decision(
         }
     }
 
-    let local_selected = candidates.first().cloned();
+    let local_selected = candidates
+        .iter()
+        .find(|candidate| candidate.eligible_for_primary_selection)
+        .cloned()
+        .or_else(|| candidates.first().cloned());
     let mut selected = local_selected.clone();
     let mut selected_workstream = selected.as_ref().and_then(|candidate| {
         workstreams
@@ -2131,7 +2243,16 @@ pub fn get_continue_decision(
         if focus.artifact_id.as_deref() != candidate.target_artifact.as_ref().map(|a| a.id.as_str())
             && candidate.candidate_kind != "evidence_only"
         {
-            warnings.push("current_focus_differs_from_return_target".to_string());
+            let explicit_return = selected_workstream.as_ref().is_some_and(|workstream| {
+                has_explicit_current_focus_return_evidence(candidate, workstream)
+            });
+            if explicit_return {
+                warnings.push(
+                    "current_focus_differs_from_return_target:explicit_return_origin".to_string(),
+                );
+            } else {
+                warnings.push("current_focus_differs_from_return_target".to_string());
+            }
         }
     }
 
@@ -2172,6 +2293,7 @@ pub fn get_continue_decision(
     let micro_inference_requested = micro_inference_enabled;
     let mut micro_inference_attempted = false;
     let mut micro_inference_result_kind: Option<String> = None;
+    let mut audit_inference_events = Vec::new();
     if let Some(gate) = quality_gate.as_ref() {
         warnings.extend(gate.warnings.clone());
         for missing in &gate.fatal_missing {
@@ -2204,160 +2326,452 @@ pub fn get_continue_decision(
                         &candidates,
                         candidate_limit as usize,
                     )?;
+                    let mut audit_event = ContinueAuditInferenceEvent {
+                        inference_id: format!("continue-micro-{}", current_time_millis()),
+                        inference_kind: "continue_micro_inference".to_string(),
+                        requested_at_ms: current_time_millis(),
+                        model: Some(config.model.clone()),
+                        candidate_limit: Some(candidate_limit),
+                        pack: serde_json::to_value(&pack).ok(),
+                        request: None,
+                        raw_response: None,
+                        parsed_output: None,
+                        validation_result: None,
+                        validation_failures: Vec::new(),
+                        validation_classification: None,
+                        error: None,
+                        fallback_reason: None,
+                        response_id: None,
+                    };
                     micro_inference_attempted = true;
-                    match run_continue_micro_inference(&api_key, &config.model, &pack) {
-                        Ok(model_result) => {
-                            match validate_micro_inference_output(
-                                &model_result.output,
-                                &candidates,
-                                &pack,
-                            ) {
-                                Ok(validated_candidate) => {
-                                    micro_inference_result_kind =
-                                        Some(model_result.output.result.clone());
-                                    if let Some(validated_candidate) = validated_candidate {
-                                        selected = Some(validated_candidate.clone());
-                                        selected_workstream = workstreams
-                                            .iter()
-                                            .find(|workstream| {
-                                                workstream.id == validated_candidate.workstream_id
-                                            })
-                                            .cloned();
-                                        let evidence_pack = build_candidate_evidence_pack_v2(
-                                            &validated_candidate,
-                                            selected_workstream.as_ref(),
-                                            current_focus.as_ref(),
-                                        );
-                                        let artifact_audit =
-                                            artifact_audit_from_pack(&evidence_pack);
-                                        quality_gate = Some(evaluate_continue_decision_quality(
-                                            &validated_candidate,
-                                            validated_candidate.open_loop.as_ref(),
-                                            current_focus.as_ref(),
-                                            artifact_audit.as_ref(),
-                                            &evidence_pack,
-                                        ));
-                                        if let Some(gate) = quality_gate.as_ref() {
-                                            continue_output_mode = gate.output_mode.clone();
-                                            confidence = round_score(f64::min(
-                                                confidence_from_micro_output(
-                                                    &model_result.output.confidence,
-                                                    validated_candidate.score,
-                                                ),
-                                                gate_confidence_cap(gate),
-                                            ));
-                                            validation_status = local_gate_validation_status(gate);
-                                            if matches!(
-                                                gate.output_mode,
-                                                ContinueOutputMode::StrongContinue
+
+                    match build_continue_openai_request(&config.model, &pack) {
+                        Ok(request_json) => {
+                            audit_event.request = Some(request_json.clone());
+                            match call_openai_responses(&api_key, &request_json) {
+                                Ok(raw_response) => {
+                                    let response_id_from_response = raw_response
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .map(|value| value.to_string());
+                                    audit_event.raw_response = Some(raw_response.clone());
+                                    match parse_continue_micro_inference_response(&raw_response) {
+                                        Ok(model_output) => {
+                                            audit_event.parsed_output =
+                                                serde_json::to_value(&model_output).ok();
+                                            match validate_micro_inference_output(
+                                                &model_output,
+                                                &candidates,
+                                                &pack,
                                             ) {
-                                                next_action = model_result
-                                                    .output
-                                                    .next_action
-                                                    .clone()
-                                                    .or_else(|| {
-                                                        Some(next_action_for_candidate(
-                                                            &validated_candidate,
-                                                        ))
-                                                    });
-                                            } else {
-                                                next_action = Some(
-                                                    fallback_next_action_for_output_mode(
-                                                        &gate.output_mode,
-                                                    )
-                                                    .to_string(),
-                                                );
+                                                Ok(validated_candidate) => {
+                                                    micro_inference_result_kind =
+                                                        Some(model_output.result.clone());
+                                                    audit_event.validation_result = Some(
+                                                        validated_candidate
+                                                            .as_ref()
+                                                            .map(|_| {
+                                                                "selected_candidate".to_string()
+                                                            })
+                                                            .unwrap_or_else(|| {
+                                                                model_output.result.clone()
+                                                            }),
+                                                    );
+                                                    if let Some(validated_candidate) =
+                                                        validated_candidate
+                                                    {
+                                                        selected =
+                                                            Some(validated_candidate.clone());
+                                                        selected_workstream = workstreams
+                                                            .iter()
+                                                            .find(|workstream| {
+                                                                workstream.id
+                                                                    == validated_candidate
+                                                                        .workstream_id
+                                                            })
+                                                            .cloned();
+                                                        let evidence_pack =
+                                                            build_candidate_evidence_pack_v2(
+                                                                &validated_candidate,
+                                                                selected_workstream.as_ref(),
+                                                                current_focus.as_ref(),
+                                                            );
+                                                        let artifact_audit =
+                                                            artifact_audit_from_pack(
+                                                                &evidence_pack,
+                                                            );
+                                                        quality_gate = Some(
+                                                            evaluate_continue_decision_quality(
+                                                                &validated_candidate,
+                                                                validated_candidate
+                                                                    .open_loop
+                                                                    .as_ref(),
+                                                                current_focus.as_ref(),
+                                                                artifact_audit.as_ref(),
+                                                                &evidence_pack,
+                                                            ),
+                                                        );
+                                                        if let Some(gate) = quality_gate.as_ref() {
+                                                            continue_output_mode =
+                                                                gate.output_mode.clone();
+                                                            confidence = round_score(f64::min(
+                                                                confidence_from_micro_output(
+                                                                    &model_output.confidence,
+                                                                    validated_candidate.score,
+                                                                ),
+                                                                gate_confidence_cap(gate),
+                                                            ));
+                                                            validation_status =
+                                                                local_gate_validation_status(gate);
+                                                            if matches!(
+                                                                gate.output_mode,
+                                                                ContinueOutputMode::StrongContinue
+                                                            ) {
+                                                                next_action = model_output
+                                                                    .next_action
+                                                                    .clone()
+                                                                    .or_else(|| {
+                                                                        Some(
+                                                                            next_action_for_candidate(
+                                                                                &validated_candidate,
+                                                                            ),
+                                                                        )
+                                                                    });
+                                                            } else {
+                                                                next_action = Some(
+                                                                    fallback_next_action_for_output_mode(
+                                                                        &gate.output_mode,
+                                                                    )
+                                                                    .to_string(),
+                                                                );
+                                                            }
+                                                            warnings.extend(gate.warnings.clone());
+                                                            for missing in &gate.fatal_missing {
+                                                                warnings.push(format!(
+                                                                    "quality_gate:{}",
+                                                                    missing
+                                                                ));
+                                                            }
+                                                        }
+                                                    } else {
+                                                        if model_output.result
+                                                            == "no_clear_continuation"
+                                                        {
+                                                            continue_output_mode =
+                                                                ContinueOutputMode::NoClearContinuation;
+                                                            confidence = round_score(f64::min(
+                                                                confidence, 0.28,
+                                                            ));
+                                                        } else {
+                                                            continue_output_mode =
+                                                                ContinueOutputMode::ThinContinue;
+                                                            confidence = round_score(f64::min(
+                                                                confidence, 0.48,
+                                                            ));
+                                                        }
+                                                        validation_status =
+                                                            local_gate_validation_status(
+                                                                &ContinueDecisionQualityGate {
+                                                                    target_grounded: false,
+                                                                    target_openable_or_inspectable:
+                                                                        selected.is_some(),
+                                                                    last_state_specific: false,
+                                                                    next_action_specific: false,
+                                                                    current_vs_return_relation_clear:
+                                                                        false,
+                                                                    evidence_has_boundary: false,
+                                                                    evidence_has_content_delta:
+                                                                        false,
+                                                                    source_provenance_clear: true,
+                                                                    fatal_missing: vec![
+                                                                        model_output
+                                                                            .result
+                                                                            .clone(),
+                                                                    ],
+                                                                    warnings: model_output
+                                                                        .missing_evidence
+                                                                        .clone(),
+                                                                    output_mode:
+                                                                        continue_output_mode
+                                                                            .clone(),
+                                                                },
+                                                            );
+                                                        next_action = Some(
+                                                            fallback_next_action_for_output_mode(
+                                                                &continue_output_mode,
+                                                            )
+                                                            .to_string(),
+                                                        );
+                                                    }
+                                                    decision_reason =
+                                                        Some(model_output.reason.clone());
+                                                    if let Some(intent) =
+                                                        non_empty(model_output.intent_label.clone())
+                                                    {
+                                                        if let Some(workstream) =
+                                                            selected_workstream.as_mut()
+                                                        {
+                                                            workstream.title_candidate =
+                                                                Some(intent);
+                                                        }
+                                                    }
+                                                    if let Some(note) =
+                                                        model_output.uncertainty_notes.clone()
+                                                    {
+                                                        warnings.push(format!(
+                                                            "model_uncertainty:{}",
+                                                            note
+                                                        ));
+                                                    }
+                                                    warnings.extend(
+                                                        model_output.missing_evidence.iter().map(
+                                                            |item| {
+                                                                format!(
+                                                                    "model_missing_evidence:{}",
+                                                                    item
+                                                                )
+                                                            },
+                                                        ),
+                                                    );
+                                                    response_id = response_id_from_response.clone();
+                                                    audit_event.response_id = response_id.clone();
+                                                    model_handoff_output =
+                                                        Some(model_output.clone());
+                                                    source = "cloud_micro_inference".to_string();
+                                                    evidence_pack_v2_used = true;
+                                                }
+                                                Err(failures) => {
+                                                    audit_event.response_id =
+                                                        response_id_from_response.clone();
+                                                    response_id = response_id_from_response.clone();
+                                                    validation_failures = failures;
+                                                    let mut classification =
+                                                        classify_micro_inference_validation_failures(
+                                                            &model_output,
+                                                            &candidates,
+                                                            &pack,
+                                                            &validation_failures,
+                                                        );
+                                                    audit_event.validation_failures =
+                                                        validation_failures.clone();
+                                                    audit_event.validation_classification =
+                                                        Some(classification.as_audit_value());
+                                                    if classification.recoverable {
+                                                        let recovered_candidate = classification
+                                                            .selected_candidate
+                                                            .clone()
+                                                            .expect("recoverable classification has candidate");
+                                                        let recovered_workstream = workstreams
+                                                            .iter()
+                                                            .find(|workstream| {
+                                                                workstream.id
+                                                                    == recovered_candidate
+                                                                        .workstream_id
+                                                            })
+                                                            .cloned();
+                                                        let evidence_pack =
+                                                            build_candidate_evidence_pack_v2(
+                                                                &recovered_candidate,
+                                                                recovered_workstream.as_ref(),
+                                                                current_focus.as_ref(),
+                                                            );
+                                                        let artifact_audit =
+                                                            artifact_audit_from_pack(
+                                                                &evidence_pack,
+                                                            );
+                                                        let recovered_gate =
+                                                            evaluate_continue_decision_quality(
+                                                                &recovered_candidate,
+                                                                recovered_candidate
+                                                                    .open_loop
+                                                                    .as_ref(),
+                                                                current_focus.as_ref(),
+                                                                artifact_audit.as_ref(),
+                                                                &evidence_pack,
+                                                            );
+                                                        if matches!(
+                                                            recovered_gate.output_mode,
+                                                            ContinueOutputMode::NoClearContinuation
+                                                        ) {
+                                                            classification.recoverable = false;
+                                                            classification.hard_failures.push(
+                                                                "selected_candidate_blocked_by_quality_gate"
+                                                                    .to_string(),
+                                                            );
+                                                            classification.hard_failures.sort();
+                                                            classification.hard_failures.dedup();
+                                                            audit_event.validation_result =
+                                                                Some("rejected".to_string());
+                                                            audit_event.fallback_reason = Some(
+                                                                "validation_failed".to_string(),
+                                                            );
+                                                            audit_event.validation_classification =
+                                                                Some(
+                                                                    classification.as_audit_value(),
+                                                                );
+                                                            warnings.push(format!(
+                                                                "micro_inference_validation_failed:{}",
+                                                                validation_failures.join("|")
+                                                            ));
+                                                            source = "local_fallback".to_string();
+                                                            validation_status =
+                                                                "fallback".to_string();
+                                                        } else {
+                                                            selected =
+                                                                Some(recovered_candidate.clone());
+                                                            selected_workstream =
+                                                                recovered_workstream;
+                                                            quality_gate =
+                                                                Some(recovered_gate.clone());
+                                                            continue_output_mode =
+                                                                ContinueOutputMode::ThinContinue;
+                                                            confidence =
+                                                                confidence_for_soft_recovered_micro_inference(
+                                                                    &model_output.confidence,
+                                                                    &recovered_candidate,
+                                                                    &recovered_gate,
+                                                                    &classification.soft_failures,
+                                                                );
+                                                            next_action = Some(
+                                                                fallback_next_action_for_output_mode(
+                                                                    &continue_output_mode,
+                                                                )
+                                                                .to_string(),
+                                                            );
+                                                            decision_reason = recovered_candidate
+                                                                .reason
+                                                                .clone()
+                                                                .or_else(|| {
+                                                                    Some(
+                                                                        "model_selected_valid_candidate_soft_recovered"
+                                                                            .to_string(),
+                                                                    )
+                                                                });
+                                                            warnings.extend(
+                                                                recovered_gate.warnings.clone(),
+                                                            );
+                                                            for missing in
+                                                                &recovered_gate.fatal_missing
+                                                            {
+                                                                warnings.push(format!(
+                                                                    "quality_gate:{}",
+                                                                    missing
+                                                                ));
+                                                            }
+                                                            warnings.push(
+                                                                "micro_inference_soft_recovered"
+                                                                    .to_string(),
+                                                            );
+                                                            warnings.push(
+                                                                "model_copy_replaced_with_local_safe_copy"
+                                                                    .to_string(),
+                                                            );
+                                                            warnings.push(
+                                                                "model_confidence_downgraded"
+                                                                    .to_string(),
+                                                            );
+                                                            warnings.push(format!(
+                                                                "micro_inference_validation_soft:{}",
+                                                                classification
+                                                                    .soft_failures
+                                                                    .join("|")
+                                                            ));
+                                                            response_id =
+                                                                response_id_from_response.clone();
+                                                            audit_event.response_id =
+                                                                response_id.clone();
+                                                            audit_event.validation_result =
+                                                                Some("soft_recovered".to_string());
+                                                            audit_event.fallback_reason = Some(
+                                                                "soft_validation_recovered"
+                                                                    .to_string(),
+                                                            );
+                                                            audit_event.validation_classification =
+                                                                Some(
+                                                                    classification.as_audit_value(),
+                                                                );
+                                                            source =
+                                                                "cloud_micro_inference".to_string();
+                                                            validation_status =
+                                                                "soft_recovered".to_string();
+                                                            micro_inference_result_kind =
+                                                                Some(model_output.result.clone());
+                                                            model_handoff_output = None;
+                                                            evidence_pack_v2_used = true;
+                                                        }
+                                                    } else {
+                                                        audit_event.validation_result =
+                                                            Some("rejected".to_string());
+                                                        audit_event.fallback_reason =
+                                                            Some("validation_failed".to_string());
+                                                        warnings.push(format!(
+                                                            "micro_inference_validation_failed:{}",
+                                                            validation_failures.join("|")
+                                                        ));
+                                                        source = "local_fallback".to_string();
+                                                        validation_status = "fallback".to_string();
+                                                    }
+                                                }
                                             }
-                                            warnings.extend(gate.warnings.clone());
-                                            for missing in &gate.fatal_missing {
-                                                warnings.push(format!("quality_gate:{}", missing));
-                                            }
                                         }
-                                    } else {
-                                        if model_result.output.result == "no_clear_continuation" {
-                                            continue_output_mode =
-                                                ContinueOutputMode::NoClearContinuation;
-                                            confidence = round_score(f64::min(confidence, 0.28));
-                                        } else {
-                                            continue_output_mode = ContinueOutputMode::ThinContinue;
-                                            confidence = round_score(f64::min(confidence, 0.48));
-                                        }
-                                        validation_status = local_gate_validation_status(
-                                            &ContinueDecisionQualityGate {
-                                                target_grounded: false,
-                                                target_openable_or_inspectable: selected.is_some(),
-                                                last_state_specific: false,
-                                                next_action_specific: false,
-                                                current_vs_return_relation_clear: false,
-                                                evidence_has_boundary: false,
-                                                evidence_has_content_delta: false,
-                                                source_provenance_clear: true,
-                                                fatal_missing: vec![model_result
-                                                    .output
-                                                    .result
-                                                    .clone()],
-                                                warnings: model_result
-                                                    .output
-                                                    .missing_evidence
-                                                    .clone(),
-                                                output_mode: continue_output_mode.clone(),
-                                            },
-                                        );
-                                        next_action = Some(
-                                            fallback_next_action_for_output_mode(
-                                                &continue_output_mode,
-                                            )
-                                            .to_string(),
-                                        );
-                                    }
-                                    decision_reason = Some(model_result.output.reason.clone());
-                                    if let Some(intent) =
-                                        non_empty(model_result.output.intent_label.clone())
-                                    {
-                                        if let Some(workstream) = selected_workstream.as_mut() {
-                                            workstream.title_candidate = Some(intent);
+                                        Err(error) => {
+                                            audit_event.error = Some(error.clone());
+                                            audit_event.fallback_reason =
+                                                Some("parse_failed".to_string());
+                                            audit_event.response_id =
+                                                response_id_from_response.clone();
+                                            response_id = response_id_from_response.clone();
+                                            validation_failures.push(error.clone());
+                                            warnings
+                                                .push(format!("micro_inference_failed:{}", error));
+                                            source = "local_fallback".to_string();
+                                            validation_status = "fallback".to_string();
                                         }
                                     }
-                                    if let Some(note) =
-                                        model_result.output.uncertainty_notes.clone()
-                                    {
-                                        warnings.push(format!("model_uncertainty:{}", note));
-                                    }
-                                    warnings.extend(
-                                        model_result
-                                            .output
-                                            .missing_evidence
-                                            .iter()
-                                            .map(|item| format!("model_missing_evidence:{}", item)),
-                                    );
-                                    response_id = model_result.response_id;
-                                    model_handoff_output = Some(model_result.output.clone());
-                                    source = "cloud_micro_inference".to_string();
-                                    evidence_pack_v2_used = true;
                                 }
-                                Err(failures) => {
-                                    validation_failures = failures;
-                                    warnings.push(format!(
-                                        "micro_inference_validation_failed:{}",
-                                        validation_failures.join("|")
-                                    ));
+                                Err(error) => {
+                                    audit_event.error = Some(error.clone());
+                                    audit_event.fallback_reason =
+                                        Some("request_failed".to_string());
+                                    validation_failures.push(error.clone());
+                                    warnings.push(format!("micro_inference_failed:{}", error));
                                     source = "local_fallback".to_string();
                                     validation_status = "fallback".to_string();
                                 }
                             }
                         }
                         Err(error) => {
+                            audit_event.error = Some(error.clone());
+                            audit_event.fallback_reason = Some("request_build_failed".to_string());
                             validation_failures.push(error.clone());
                             warnings.push(format!("micro_inference_failed:{}", error));
                             source = "local_fallback".to_string();
                             validation_status = "fallback".to_string();
                         }
                     }
+                    audit_inference_events.push(audit_event);
                 } else {
                     validation_failures.push("OPENAI_API_KEY is not set".to_string());
                     warnings.push("micro_inference_missing_openai_api_key".to_string());
                     source = "local_fallback".to_string();
                     validation_status = "fallback".to_string();
+                    audit_inference_events.push(ContinueAuditInferenceEvent {
+                        inference_id: format!("continue-micro-{}", current_time_millis()),
+                        inference_kind: "continue_micro_inference".to_string(),
+                        requested_at_ms: current_time_millis(),
+                        model: Some(config.model.clone()),
+                        candidate_limit: request.max_candidates_for_model,
+                        pack: None,
+                        request: None,
+                        raw_response: None,
+                        parsed_output: None,
+                        validation_result: Some("not_attempted".to_string()),
+                        validation_failures: vec!["OPENAI_API_KEY is not set".to_string()],
+                        validation_classification: None,
+                        error: Some("OPENAI_API_KEY is not set".to_string()),
+                        fallback_reason: Some("missing_openai_api_key".to_string()),
+                        response_id: None,
+                    });
                 }
             }
             Err(error) => {
@@ -2365,8 +2779,96 @@ pub fn get_continue_decision(
                 warnings.push(format!("micro_inference_config_failed:{}", error));
                 source = "local_fallback".to_string();
                 validation_status = "fallback".to_string();
+                audit_inference_events.push(ContinueAuditInferenceEvent {
+                    inference_id: format!("continue-micro-{}", current_time_millis()),
+                    inference_kind: "continue_micro_inference".to_string(),
+                    requested_at_ms: current_time_millis(),
+                    model: request.model.clone(),
+                    candidate_limit: request.max_candidates_for_model,
+                    pack: None,
+                    request: None,
+                    raw_response: None,
+                    parsed_output: None,
+                    validation_result: Some("not_attempted".to_string()),
+                    validation_failures: vec![error.clone()],
+                    validation_classification: None,
+                    error: Some(error),
+                    fallback_reason: Some("config_failed".to_string()),
+                    response_id: None,
+                });
             }
         }
+    }
+
+    if cached_meta.is_none()
+        && source == "local_fallback"
+        && (validation_status == "fallback" || !validation_failures.is_empty())
+    {
+        let selected_is_risky = selected
+            .as_ref()
+            .is_some_and(candidate_has_high_risk_selection)
+            || warnings_have_local_fallback_risk(&warnings);
+        if selected_is_risky {
+            if let Some(safer_candidate) = select_safer_local_fallback_candidate(
+                &candidates,
+                selected.as_ref(),
+                current_focus.as_ref(),
+            ) {
+                let replaced_id = selected.as_ref().map(|candidate| candidate.id.clone());
+                selected = Some(safer_candidate.clone());
+                selected_workstream = workstreams
+                    .iter()
+                    .find(|workstream| workstream.id == safer_candidate.workstream_id)
+                    .cloned();
+                warnings.push("local_fallback_gate:used_safer_alternative".to_string());
+                if let Some(replaced_id) = replaced_id {
+                    warnings.push(format!(
+                        "local_fallback_gate:rejected_top_candidate:{}",
+                        replaced_id
+                    ));
+                }
+                let evidence_pack = build_candidate_evidence_pack_v2(
+                    &safer_candidate,
+                    selected_workstream.as_ref(),
+                    current_focus.as_ref(),
+                );
+                let artifact_audit = artifact_audit_from_pack(&evidence_pack);
+                quality_gate = Some(evaluate_continue_decision_quality(
+                    &safer_candidate,
+                    safer_candidate.open_loop.as_ref(),
+                    current_focus.as_ref(),
+                    artifact_audit.as_ref(),
+                    &evidence_pack,
+                ));
+                if let Some(gate) = quality_gate.as_ref() {
+                    warnings.extend(gate.warnings.clone());
+                    for missing in &gate.fatal_missing {
+                        warnings.push(format!("quality_gate:{}", missing));
+                    }
+                    continue_output_mode = gate.output_mode.clone();
+                    validation_status = local_gate_validation_status(gate);
+                    confidence =
+                        round_score(f64::min(safer_candidate.score, gate_confidence_cap(gate)));
+                }
+            } else {
+                warnings.push("local_fallback_gate:no_safe_primary_candidate".to_string());
+                continue_output_mode = ContinueOutputMode::NoClearContinuation;
+                validation_status = "fallback".to_string();
+                confidence = round_score(f64::min(confidence, 0.34));
+            }
+        }
+        if !matches!(
+            continue_output_mode,
+            ContinueOutputMode::NoClearContinuation
+        ) {
+            continue_output_mode = ContinueOutputMode::ThinContinue;
+        }
+        confidence = round_score(f64::min(confidence, 0.48));
+        next_action = Some(fallback_next_action_for_output_mode(&continue_output_mode).to_string());
+        model_handoff_output = None;
+        warnings.push("local_fallback_gate:strong_continue_blocked".to_string());
+        warnings.sort();
+        warnings.dedup();
     }
 
     if let Some(cached) = &cached_meta {
@@ -2397,6 +2899,20 @@ pub fn get_continue_decision(
         evidence_pack_v2_used = cached.evidence_pack_v2_used;
         micro_inference_attempted = cached.micro_inference_attempted;
         micro_inference_result_kind = cached.micro_inference_result_kind.clone();
+    }
+
+    if selected
+        .as_ref()
+        .is_some_and(|candidate| !candidate_has_human_return_target(candidate))
+    {
+        warnings.push("thin_evidence:no_human_return_target".to_string());
+        continue_output_mode = ContinueOutputMode::NoClearContinuation;
+        confidence = round_score(f64::min(confidence, 0.28));
+        next_action = Some(
+            fallback_next_action_for_output_mode(&ContinueOutputMode::NoClearContinuation)
+                .to_string(),
+        );
+        model_handoff_output = None;
     }
 
     if let Some(candidate) = selected.as_ref() {
@@ -2442,7 +2958,7 @@ pub fn get_continue_decision(
         .as_ref()
         .map(|candidate| candidate.missing_evidence.clone())
         .unwrap_or_else(|| vec!["no_candidate_generated".to_string()]);
-    let handoff = cached_meta
+    let mut handoff = cached_meta
         .as_ref()
         .and_then(|cached| cached.handoff.clone())
         .unwrap_or_else(|| {
@@ -2460,6 +2976,21 @@ pub fn get_continue_decision(
                 &continue_output_mode,
             )
         });
+    if handoff_contains_internal_reference(&handoff) {
+        warnings.push("handoff_suppressed_internal_reference".to_string());
+        handoff = compose_local_continue_handoff(
+            current_focus.as_ref(),
+            selected_workstream.as_ref(),
+            selected.as_ref(),
+            next_action.as_deref(),
+            round_score(f64::min(confidence, 0.28)),
+            &missing_evidence,
+            &warnings,
+            &validation_failures,
+            quality_gate.as_ref(),
+            &ContinueOutputMode::NoClearContinuation,
+        );
+    }
 
     if cached_meta.is_none() {
         insert_continue_decision(
@@ -2565,6 +3096,8 @@ pub fn get_continue_decision(
         micro_inference_requested,
         micro_inference_attempted,
         micro_inference_result_kind,
+        continue_output_path: None,
+        audit_inference_events,
     })
 }
 
@@ -2701,6 +3234,7 @@ fn fresh_cached_continue_decision(
     conn: &Connection,
     session_id: Option<&str>,
     current_watermark: &ContinueEvidenceWatermark,
+    micro_inference_requested: bool,
 ) -> Result<Option<CachedContinueDecisionMeta>, String> {
     if !table_exists(conn, "continue_decisions")? {
         return Ok(None);
@@ -2723,6 +3257,21 @@ fn fresh_cached_continue_decision(
              WHERE d.evidence_watermark_hash = ?1
                AND (?2 IS NULL OR f.session_id = ?2 OR d.current_focus_frame_id IS NULL)
                AND COALESCE(d.latest_boundary_revision, 0) = ?3
+               AND COALESCE(d.micro_inference_requested, 0) = ?4
+               AND NOT (
+                 d.source = 'local_fallback'
+                 AND d.validation_status = 'fallback'
+                 AND (
+                   COALESCE(d.continue_output_mode, '') <> 'strong_continue'
+                   OR COALESCE(d.warnings, '') LIKE '%thin_evidence%'
+                   OR COALESCE(d.warnings, '') LIKE '%current_focus_mismatch%'
+                   OR COALESCE(d.warnings, '') LIKE '%current_focus_differs_from_return_target%'
+                   OR COALESCE(d.warnings, '') LIKE '%score_capped:%'
+                   OR COALESCE(d.warnings, '') LIKE '%selection_demoted:%'
+                   OR COALESCE(d.warnings, '') LIKE '%local_fallback_gate:%'
+                   OR COALESCE(d.warnings, '') LIKE '%micro_inference_validation_failed:%'
+                 )
+               )
                AND NOT EXISTS (
                  SELECT 1
                  FROM continue_boundary_revisions br
@@ -2748,7 +3297,12 @@ fn fresh_cached_continue_decision(
         params![
             current_watermark.hash,
             session_id,
-            current_watermark.latest_boundary_revision.unwrap_or(0)
+            current_watermark.latest_boundary_revision.unwrap_or(0),
+            if micro_inference_requested {
+                1_i64
+            } else {
+                0_i64
+            }
         ],
         |row| {
             let warnings: Option<String> = row.get(6)?;
@@ -3766,7 +4320,9 @@ fn load_trace_task_actions(
             "SELECT id, frame_id, artifact_id, secondary_artifact_id,
                     action_kind, action_role, semantic_delta_kind,
                     semantic_subject, semantic_moment_id, confidence,
-                    created_at_ms, reason
+                    created_at_ms, reason, evidence_source_kind,
+                    evidence_span_ids_json, evidence_attribution_json,
+                    attribution_confidence, classifier_context_json, quality_flags_json
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -3774,6 +4330,8 @@ fn load_trace_task_actions(
         .map_err(to_string)?;
     let rows = stmt
         .query_map(params![limit as i64], |row| {
+            let span_ids_json: String = row.get(13)?;
+            let quality_flags_json: String = row.get(17)?;
             Ok(TraceTaskActionSummary {
                 action_id: row.get(0)?,
                 frame_id: row.get(1)?,
@@ -3791,6 +4349,12 @@ fn load_trace_task_actions(
                 reason: row
                     .get::<_, Option<String>>(11)?
                     .and_then(|value| clean_handoff_line(value, 140)),
+                evidence_source_kind: row.get(12)?,
+                evidence_span_ids: parse_string_array(&span_ids_json),
+                evidence_attribution: parse_optional_json_value(row.get(14)?),
+                attribution_confidence: row.get(15)?,
+                classifier_context: parse_optional_json_value(row.get(16)?),
+                quality_flags: parse_string_array(&quality_flags_json),
             })
         })
         .map_err(to_string)?;
@@ -4844,6 +5408,7 @@ fn push_candidate_with_open_loop(
         last_meaningful_action,
         evidence_frame_id,
         supporting_episode_id,
+        pre_cap_score: 0.0,
         score: 0.0,
         actionability_score: 0.0,
         primary_target_score: 0.0,
@@ -4856,6 +5421,10 @@ fn push_candidate_with_open_loop(
         reason: Some(reason.to_string()),
         missing_evidence: Vec::new(),
         warnings: Vec::new(),
+        risk_flags: Vec::new(),
+        score_caps_applied: Vec::new(),
+        eligible_for_primary_selection: true,
+        selection_demotion_reason: None,
         resume_work_target,
         open_loop,
     });
@@ -4964,7 +5533,7 @@ fn score_continue_candidates(
         .map(|workstream| workstream.last_active_timestamp_ms)
         .max()
         .unwrap_or_default();
-    for candidate in candidates {
+    for candidate in &mut *candidates {
         let workstream = match workstreams
             .iter()
             .find(|workstream| workstream.id == candidate.workstream_id)
@@ -4978,101 +5547,203 @@ fn score_continue_candidates(
         candidate.branch_origin_score = branch_origin_score(candidate, workstream);
         candidate.evidence_quality_score = evidence_quality_score(candidate, workstream);
         candidate.recency_score = recency_score(workstream, latest_ts);
-        candidate.openability_score = openability_score(candidate.target_artifact.as_ref());
+        candidate.openability_score = openability_score(candidate, current_focus);
         candidate.privacy_safety_score = privacy_safety_score(candidate);
+        candidate.pre_cap_score = round_score(
+            candidate.actionability_score * 0.22
+                + candidate.primary_target_score * 0.21
+                + candidate.unresolved_score * 0.18
+                + candidate.branch_origin_score * 0.14
+                + candidate.evidence_quality_score * 0.13
+                + candidate.recency_score * 0.07
+                + candidate.privacy_safety_score * 0.03
+                + candidate.openability_score * 0.02,
+        );
+        candidate.score = candidate.pre_cap_score;
         candidate.missing_evidence = missing_evidence_for_candidate(candidate, workstream);
         candidate.warnings = warnings_for_candidate(candidate, workstream, current_focus);
-        candidate.score = round_score(
-            candidate.actionability_score * 0.24
-                + candidate.primary_target_score * 0.20
-                + candidate.unresolved_score * 0.18
-                + candidate.branch_origin_score * 0.12
-                + candidate.evidence_quality_score * 0.12
-                + candidate.openability_score * 0.07
-                + candidate.privacy_safety_score * 0.04
-                + candidate.recency_score * 0.03,
-        );
+        apply_candidate_risk_caps(candidate, workstream, current_focus);
         candidate.score = round_score(confidence_cap_for_candidate(candidate, workstream));
     }
+    apply_candidate_dominance_rules(candidates, current_focus);
 }
 
-fn confidence_cap_for_candidate(
-    candidate: &ScoredContinueCandidate,
+fn apply_candidate_risk_caps(
+    candidate: &mut ScoredContinueCandidate,
     workstream: &ScorerWorkstream,
-) -> f64 {
-    let mut cap = 1.0;
-    let mut capped = false;
+    current_focus: Option<&ContinueFocusSummary>,
+) {
+    candidate.risk_flags.clear();
+    candidate.score_caps_applied.clear();
+    candidate.eligible_for_primary_selection = true;
+    candidate.selection_demotion_reason = None;
+
     if candidate.candidate_kind == "evidence_only" {
-        cap = f64::min(cap, 0.42);
-        capped = true;
+        cap_candidate_score(candidate, 0.42, "evidence_only_candidate");
     }
     if candidate.target_artifact.is_none() {
-        cap = f64::min(cap, 0.44);
-        capped = true;
+        cap_candidate_score(candidate, 0.44, "no_target_artifact");
     }
-    if let Some(target) = candidate.target_artifact.as_ref() {
+    if let Some(target) = candidate.target_artifact.clone() {
         if target.artifact_kind == "unknown" || target.evidence_quality == "thin" {
-            cap = f64::min(cap, 0.55);
-            capped = true;
+            cap_candidate_score(candidate, 0.55, "thin_or_unknown_target");
         }
         if target.openability == "frame_fallback" {
-            cap = f64::min(cap, 0.58);
-            capped = true;
+            let cap = if target_matches_current_focus(candidate, current_focus) {
+                0.72
+            } else {
+                0.58
+            };
+            cap_candidate_score(candidate, cap, "frame_fallback_inspectable");
         } else if target.browser_url.is_none() && target.document_path.is_none() {
-            cap = f64::min(cap, 0.64);
-            capped = true;
+            cap_candidate_score(candidate, 0.64, "no_direct_url_or_document_path");
         }
-        if is_smalltalk_artifact(target) {
-            cap = f64::min(cap, 0.42);
-            capped = true;
+        if is_smalltalk_artifact(&target) {
+            let cap = if target_matches_current_focus(candidate, current_focus) {
+                0.58
+            } else {
+                0.42
+            };
+            cap_candidate_score(candidate, cap, "smalltalk_self_observation");
+        }
+        if media_or_background_browser_target(&target)
+            && candidate.candidate_kind == "resolve_error"
+            && !candidate_has_target_owned_blocker(candidate)
+        {
+            cap_candidate_score(
+                candidate,
+                0.35,
+                "media_tab_resolve_error_without_owned_error",
+            );
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason =
+                Some("background media tab was only directly openable".to_string());
         }
     }
     if candidate.evidence_quality_score < 0.45 {
-        cap = f64::min(cap, 0.52);
-        capped = true;
+        cap_candidate_score(candidate, 0.52, "thin_or_unattributed_evidence");
     }
     if candidate
         .last_meaningful_action
         .as_ref()
         .is_some_and(|action| action.collapse_count > 1)
     {
-        cap = f64::min(cap, 0.64);
-        capped = true;
+        cap_candidate_score(candidate, 0.64, "collapsed_repeated_action");
     }
     if candidate.last_meaningful_action.is_none() && workstream.unresolved_signal.is_none() {
-        cap = f64::min(cap, 0.48);
-        capped = true;
+        cap_candidate_score(candidate, 0.48, "no_action_or_unresolved_state");
     }
     if let Some(open_loop) = &candidate.open_loop {
         match open_loop.quality.as_str() {
-            "thin" => {
-                cap = f64::min(cap, 0.62);
-                capped = true;
-            }
-            "unknown" => {
-                cap = f64::min(cap, 0.42);
-                capped = true;
-            }
+            "thin" => cap_candidate_score(candidate, 0.62, "thin_open_loop"),
+            "unknown" => cap_candidate_score(candidate, 0.42, "unknown_open_loop"),
             _ => {}
         }
     }
-    if candidate.warnings.iter().any(|warning| {
-        matches!(
-            warning.as_str(),
-            "current_focus_mismatch" | "current_focus_differs_from_return_target"
-        )
-    }) {
-        cap = f64::min(cap, 0.68);
-        capped = true;
+
+    let current_focus_mismatch = candidate_has_current_focus_mismatch(candidate, current_focus);
+    let explicit_return = has_explicit_current_focus_return_evidence(candidate, workstream);
+    if current_focus_mismatch && !explicit_return {
+        cap_candidate_score(candidate, 0.45, "current_focus_mismatch_no_return_origin");
+        candidate
+            .risk_flags
+            .push("current_focus_differs_from_return_target".to_string());
+    }
+    if current_focus_mismatch && candidate.recency_score < 0.40 && !explicit_return {
+        cap_candidate_score(candidate, 0.45, "stale_openable_target");
+    }
+    if let Some(target_id) = candidate
+        .target_artifact
+        .as_ref()
+        .map(|artifact| artifact.id.as_str())
+    {
+        if matches!(
+            durable_role_for_target(workstream, target_id),
+            Some("branch" | "support_source")
+        ) && !branch_became_primary(candidate, workstream)
+        {
+            cap_candidate_score(candidate, 0.42, "branch_support_not_default_return_target");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason =
+                Some("support branch lacked evidence that it was unfinished itself".to_string());
+        }
     }
     if candidate.recency_score >= 0.95
         && candidate.unresolved_score <= 0.42
         && candidate.primary_target_score <= 0.2
     {
-        cap = f64::min(cap, 0.46);
-        capped = true;
+        cap_candidate_score(candidate, 0.46, "recent_but_not_work_target");
     }
-    if capped {
+    if candidate.score < 0.45 || candidate.candidate_kind == "evidence_only" {
+        candidate.warnings.push("thin_evidence".to_string());
+    }
+
+    candidate.risk_flags.sort();
+    candidate.risk_flags.dedup();
+    candidate.score_caps_applied.sort();
+    candidate.score_caps_applied.dedup();
+    if !candidate.score_caps_applied.is_empty() {
+        candidate
+            .warnings
+            .extend(candidate.score_caps_applied.iter().cloned());
+    }
+    if !candidate.risk_flags.is_empty() {
+        candidate
+            .warnings
+            .extend(candidate.risk_flags.iter().cloned());
+    }
+    if let Some(reason) = candidate.selection_demotion_reason.as_ref() {
+        candidate
+            .warnings
+            .push(format!("selection_demoted:{}", reason.replace(' ', "_")));
+    }
+    candidate.warnings.sort();
+    candidate.warnings.dedup();
+}
+
+fn cap_candidate_score(candidate: &mut ScoredContinueCandidate, cap: f64, reason: &str) {
+    if candidate.score > cap {
+        candidate.score = cap;
+    }
+    candidate
+        .score_caps_applied
+        .push(format!("score_capped:{}", reason));
+    candidate.risk_flags.push(reason.to_string());
+    if cap <= 0.45 {
+        candidate.eligible_for_primary_selection = false;
+    }
+}
+
+fn confidence_cap_for_candidate(
+    candidate: &ScoredContinueCandidate,
+    _workstream: &ScorerWorkstream,
+) -> f64 {
+    let mut cap = 1.0;
+    for cap_reason in &candidate.score_caps_applied {
+        if let Some(reason) = cap_reason.strip_prefix("score_capped:") {
+            cap = f64::min(
+                cap,
+                match reason {
+                    "media_tab_resolve_error_without_owned_error" => 0.35,
+                    "evidence_only_candidate" | "unknown_open_loop" => 0.42,
+                    "no_target_artifact" => 0.44,
+                    "current_focus_mismatch_no_return_origin"
+                    | "stale_openable_target"
+                    | "branch_support_not_default_return_target" => 0.45,
+                    "recent_but_not_work_target" => 0.46,
+                    "no_action_or_unresolved_state" => 0.48,
+                    "thin_or_unattributed_evidence" => 0.52,
+                    "thin_or_unknown_target" => 0.55,
+                    "smalltalk_self_observation" => 0.58,
+                    "frame_fallback_inspectable" => 0.72,
+                    "thin_open_loop" | "no_direct_url_or_document_path" => 0.62,
+                    "collapsed_repeated_action" => 0.64,
+                    _ => 1.0,
+                },
+            );
+        }
+    }
+    if cap < 1.0 {
         f64::min(candidate.score, cap)
     } else {
         candidate.score
@@ -5245,11 +5916,21 @@ fn recency_score(workstream: &ScorerWorkstream, latest_ts: i64) -> f64 {
     }
 }
 
-fn openability_score(target: Option<&ScorerArtifact>) -> f64 {
-    match target {
+fn openability_score(
+    candidate: &ScoredContinueCandidate,
+    current_focus: Option<&ContinueFocusSummary>,
+) -> f64 {
+    match candidate.target_artifact.as_ref() {
         Some(artifact) if artifact.browser_url.is_some() || artifact.document_path.is_some() => 1.0,
         Some(artifact) if artifact.openability == "openable" => 0.9,
-        Some(artifact) if artifact.openability == "frame_fallback" => 0.58,
+        Some(artifact) if artifact.openability == "frame_fallback" => {
+            if target_matches_current_focus(candidate, current_focus) {
+                0.82
+            } else {
+                0.70
+            }
+        }
+        Some(artifact) if artifact.last_seen_frame_id.is_some() => 0.55,
         Some(_) => 0.28,
         None => 0.18,
     }
@@ -5283,6 +5964,220 @@ fn privacy_safety_score(candidate: &ScoredContinueCandidate) -> f64 {
             }
         })
         .unwrap_or(0.85)
+}
+
+fn target_matches_current_focus(
+    candidate: &ScoredContinueCandidate,
+    current_focus: Option<&ContinueFocusSummary>,
+) -> bool {
+    current_focus
+        .and_then(|focus| focus.artifact_id.as_deref())
+        .zip(
+            candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.as_str()),
+        )
+        .is_some_and(|(focus_id, target_id)| focus_id == target_id)
+}
+
+fn candidate_has_current_focus_mismatch(
+    candidate: &ScoredContinueCandidate,
+    current_focus: Option<&ContinueFocusSummary>,
+) -> bool {
+    current_focus
+        .and_then(|focus| focus.artifact_id.as_deref())
+        .zip(
+            candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.as_str()),
+        )
+        .is_some_and(|(focus_id, target_id)| focus_id != target_id)
+}
+
+fn has_explicit_current_focus_return_evidence(
+    candidate: &ScoredContinueCandidate,
+    workstream: &ScorerWorkstream,
+) -> bool {
+    candidate.open_loop.as_ref().is_some_and(|open_loop| {
+        open_loop
+            .current_focus_relation
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || open_loop.primary_return_artifact_id.is_some()
+            || open_loop.resume_work_artifact_id.is_some()
+    }) || candidate
+        .last_meaningful_action
+        .as_ref()
+        .is_some_and(|action| {
+            matches!(
+                action.action_kind.as_str(),
+                "returning_to_origin" | "branching_away" | "searching"
+            )
+        })
+        || (candidate.candidate_kind == "return_to_primary_artifact"
+            && candidate.branch_origin_score >= 0.9
+            && unresolved_kind(workstream.unresolved_signal.as_deref()).as_deref()
+                == Some("branch_without_return"))
+}
+
+fn media_or_background_browser_target(target: &ScorerArtifact) -> bool {
+    if target.artifact_kind != "browser_tab" {
+        return false;
+    }
+    let haystack = [
+        target.display_title.as_deref(),
+        target.browser_url.as_deref(),
+        target.document_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    contains_any(
+        &haystack,
+        &[
+            "youtube",
+            "youtu.be",
+            "/shorts/",
+            "audio playing",
+            "spotify",
+            "netflix",
+            "instagram",
+            "tiktok",
+            "reels",
+        ],
+    )
+}
+
+fn candidate_has_target_owned_blocker(candidate: &ScoredContinueCandidate) -> bool {
+    let Some(target_id) = candidate
+        .target_artifact
+        .as_ref()
+        .map(|artifact| artifact.id.as_str())
+    else {
+        return false;
+    };
+    candidate.open_loop.as_ref().is_some_and(|open_loop| {
+        open_loop.boundary_kind == "error_without_resolution"
+            && open_loop.blocker_artifact_id.as_deref() == Some(target_id)
+    }) || candidate
+        .last_meaningful_action
+        .as_ref()
+        .is_some_and(|action| {
+            action.action_kind == "encountering_error"
+                && action.artifact_id.as_deref() == Some(target_id)
+        })
+}
+
+fn candidate_has_high_risk_selection(candidate: &ScoredContinueCandidate) -> bool {
+    !candidate.eligible_for_primary_selection
+        || candidate.score_caps_applied.iter().any(|cap| {
+            matches!(
+                cap.as_str(),
+                "score_capped:current_focus_mismatch_no_return_origin"
+                    | "score_capped:stale_openable_target"
+                    | "score_capped:media_tab_resolve_error_without_owned_error"
+                    | "score_capped:branch_support_not_default_return_target"
+            )
+        })
+}
+
+fn apply_candidate_dominance_rules(
+    candidates: &mut [ScoredContinueCandidate],
+    current_focus: Option<&ContinueFocusSummary>,
+) {
+    let best_current_focus_candidate = candidates
+        .iter()
+        .filter(|candidate| {
+            target_matches_current_focus(candidate, current_focus)
+                && candidate.recency_score >= 0.75
+                && candidate.eligible_for_primary_selection
+        })
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|candidate| (candidate.id.clone(), candidate.score));
+
+    let Some((focus_candidate_id, focus_score)) = best_current_focus_candidate else {
+        return;
+    };
+    for candidate in candidates {
+        if candidate.id == focus_candidate_id {
+            continue;
+        }
+        let openability_advantage = candidate.openability_score >= 0.9;
+        if candidate_has_current_focus_mismatch(candidate, current_focus)
+            && candidate.recency_score <= 0.40
+            && openability_advantage
+            && candidate.score >= focus_score
+        {
+            candidate.score = round_score((focus_score - 0.01).max(0.0));
+            candidate
+                .risk_flags
+                .push("openability_only_advantage".to_string());
+            candidate
+                .score_caps_applied
+                .push("score_capped:openability_only_advantage".to_string());
+            candidate
+                .warnings
+                .push("selection_demoted:openability_only_advantage".to_string());
+            candidate.selection_demotion_reason =
+                Some("openability only advantage over current focus".to_string());
+            candidate.eligible_for_primary_selection = false;
+            candidate.risk_flags.sort();
+            candidate.risk_flags.dedup();
+            candidate.score_caps_applied.sort();
+            candidate.score_caps_applied.dedup();
+            candidate.warnings.sort();
+            candidate.warnings.dedup();
+        }
+    }
+}
+
+fn warnings_have_local_fallback_risk(warnings: &[String]) -> bool {
+    warnings.iter().any(|warning| {
+        warning == "thin_evidence"
+            || warning.starts_with("thin_evidence:")
+            || warning == "current_focus_mismatch"
+            || warning == "current_focus_differs_from_return_target"
+            || warning.starts_with("score_capped:")
+            || warning.starts_with("selection_demoted:")
+            || warning == "candidate_score_capped_or_demoted"
+            || warning.starts_with("micro_inference_validation_failed:")
+    })
+}
+
+fn select_safer_local_fallback_candidate(
+    candidates: &[ScoredContinueCandidate],
+    selected: Option<&ScoredContinueCandidate>,
+    current_focus: Option<&ContinueFocusSummary>,
+) -> Option<ScoredContinueCandidate> {
+    let selected_score = selected.map(|candidate| candidate.score).unwrap_or(0.0);
+    let selected_id = selected.map(|candidate| candidate.id.as_str());
+    candidates
+        .iter()
+        .filter(|candidate| Some(candidate.id.as_str()) != selected_id)
+        .filter(|candidate| candidate.eligible_for_primary_selection)
+        .filter(|candidate| !candidate_has_high_risk_selection(candidate))
+        .filter(|candidate| {
+            target_matches_current_focus(candidate, current_focus)
+                || candidate.score + 0.20 >= selected_score
+        })
+        .max_by(|left, right| {
+            let left_focus = target_matches_current_focus(left, current_focus);
+            let right_focus = target_matches_current_focus(right, current_focus);
+            left_focus.cmp(&right_focus).then_with(|| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .cloned()
 }
 
 fn is_smalltalk_artifact(artifact: &ScorerArtifact) -> bool {
@@ -5635,7 +6530,13 @@ fn warnings_for_candidate(
     }
     if let (Some(focus), Some(target)) = (current_focus, candidate.target_artifact.as_ref()) {
         if focus.artifact_id.as_deref() != Some(target.id.as_str()) {
-            warnings.push("current_focus_mismatch".to_string());
+            if has_explicit_current_focus_return_evidence(candidate, workstream) {
+                warnings.push(
+                    "current_focus_differs_from_return_target:explicit_return_origin".to_string(),
+                );
+            } else {
+                warnings.push("current_focus_mismatch".to_string());
+            }
         }
     }
     warnings
@@ -5764,7 +6665,7 @@ fn evaluate_continue_decision_quality(
             | "rerun_command"
             | "return_to_primary_artifact"
     );
-    let current_vs_return_relation_clear = open_loop
+    let mut current_vs_return_relation_clear = open_loop
         .and_then(|open_loop| open_loop.current_focus_relation.as_ref())
         .is_some_and(|value| !value.trim().is_empty())
         || current_focus
@@ -5805,6 +6706,17 @@ fn evaluate_continue_decision_quality(
     }
     if !source_provenance_clear {
         warnings.push("source_provenance_unclear".to_string());
+    }
+    if warnings.iter().any(|warning| {
+        matches!(
+            warning.as_str(),
+            "current_focus_mismatch" | "current_focus_differs_from_return_target"
+        )
+    }) {
+        current_vs_return_relation_clear = false;
+    }
+    if candidate_has_high_risk_selection(candidate) {
+        warnings.push("candidate_score_capped_or_demoted".to_string());
     }
 
     if !last_state_specific || !evidence_has_content_delta {
@@ -5880,7 +6792,7 @@ fn evaluate_continue_decision_quality(
         evidence.target.output_risk.as_str(),
         "current_focus_only" | "distractor"
     );
-    let output_mode = if target_grounded
+    let mut output_mode = if target_grounded
         && evidence_has_boundary
         && last_state_specific
         && next_action_specific
@@ -5901,6 +6813,19 @@ fn evaluate_continue_decision_quality(
     } else {
         ContinueOutputMode::NoClearContinuation
     };
+
+    let risky_for_strong_output = warnings.iter().any(|warning| {
+        warning == "thin_evidence"
+            || warning.starts_with("thin_evidence:")
+            || warning == "current_focus_mismatch"
+            || warning == "current_focus_differs_from_return_target"
+            || warning.starts_with("score_capped:")
+            || warning.starts_with("selection_demoted:")
+            || warning == "candidate_score_capped_or_demoted"
+    }) || !candidate.eligible_for_primary_selection;
+    if matches!(output_mode, ContinueOutputMode::StrongContinue) && risky_for_strong_output {
+        output_mode = ContinueOutputMode::ThinContinue;
+    }
 
     if matches!(output_mode, ContinueOutputMode::NoClearContinuation) {
         last_state_specific = false;
@@ -6577,6 +7502,231 @@ fn parse_continue_micro_inference_response(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MicroInferenceValidationSeverity {
+    Hard,
+    Soft,
+}
+
+#[derive(Debug, Clone)]
+struct MicroInferenceValidationClassification {
+    selected_candidate: Option<ScoredContinueCandidate>,
+    hard_failures: Vec<String>,
+    soft_failures: Vec<String>,
+    recoverable: bool,
+    recovery_reason: Option<String>,
+}
+
+impl MicroInferenceValidationClassification {
+    fn as_audit_value(&self) -> Value {
+        serde_json::json!({
+            "classification": if self.recoverable {
+                "soft_recovered"
+            } else {
+                "hard_rejected"
+            },
+            "selected_candidate_id": self.selected_candidate.as_ref().map(|candidate| candidate.id.clone()),
+            "selected_workstream_id": self.selected_candidate.as_ref().map(|candidate| candidate.workstream_id.clone()),
+            "candidate_contract_valid": self.hard_failures.is_empty() && self.selected_candidate.is_some(),
+            "hard_failures": self.hard_failures,
+            "soft_failures": self.soft_failures,
+            "candidate_preserved": self.recoverable,
+            "model_copy_used": false,
+            "local_safe_copy_used": self.recoverable,
+            "fallback_to_local_top_candidate": !self.recoverable,
+            "recovery_reason": self.recovery_reason,
+        })
+    }
+}
+
+fn classify_micro_inference_validation_failure(
+    code: &str,
+    output: &ContinueMicroInferenceOutput,
+    candidate: Option<&ScoredContinueCandidate>,
+) -> MicroInferenceValidationSeverity {
+    if code.starts_with("unknown_micro_inference_result:")
+        || code.starts_with("selected_candidate_id_not_in_pack:")
+    {
+        return MicroInferenceValidationSeverity::Hard;
+    }
+
+    match code {
+        "model_output_contains_internal_reference"
+        | "handoff_required_line_missing"
+        | "handoff_why_this_count_invalid"
+        | "handoff_why_this_empty"
+        | "high_confidence_with_thin_local_evidence"
+        | "high_confidence_with_quality_gate_risks" => MicroInferenceValidationSeverity::Soft,
+        "next_action_incompatible_with_candidate" => {
+            if model_next_action_can_be_locally_replaced(output, candidate) {
+                MicroInferenceValidationSeverity::Soft
+            } else {
+                MicroInferenceValidationSeverity::Hard
+            }
+        }
+        "selected_candidate_id_missing"
+        | "selected_workstream_id_missing"
+        | "selected_workstream_id_mismatch"
+        | "selected_candidate_not_sent_to_model"
+        | "model_output_contains_unsupported_url_or_path"
+        | "escape_hatch_cannot_claim_high_confidence"
+        | "need_more_evidence_requires_capture_recommendation"
+        | "escape_hatch_must_not_select_candidate"
+        | "branch_or_support_target_promoted_without_strong_local_score" => {
+            MicroInferenceValidationSeverity::Hard
+        }
+        _ => MicroInferenceValidationSeverity::Hard,
+    }
+}
+
+fn model_next_action_can_be_locally_replaced(
+    output: &ContinueMicroInferenceOutput,
+    candidate: Option<&ScoredContinueCandidate>,
+) -> bool {
+    let Some(action) = output.next_action.as_deref() else {
+        return true;
+    };
+    let copy_problem = action.trim().is_empty() || action.len() > 220;
+    let evidence_only_problem = candidate.is_some_and(|candidate| {
+        candidate.candidate_kind == "evidence_only"
+            && output.confidence != "low"
+            && !action.to_lowercase().contains("evidence")
+    });
+    copy_problem && !evidence_only_problem
+}
+
+fn classify_micro_inference_validation_failures(
+    output: &ContinueMicroInferenceOutput,
+    candidates: &[ScoredContinueCandidate],
+    pack: &ContinueMicroInferencePack,
+    failures: &[String],
+) -> MicroInferenceValidationClassification {
+    let selected_candidate =
+        output
+            .selected_candidate_id
+            .as_deref()
+            .and_then(|selected_candidate_id| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.id == selected_candidate_id)
+                    .cloned()
+            });
+    let mut hard_failures = Vec::new();
+    let mut soft_failures = Vec::new();
+
+    if output.result != "selected_candidate" {
+        hard_failures.push("result_does_not_select_candidate".to_string());
+    }
+
+    match output
+        .selected_candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(selected_candidate_id) => {
+            if selected_candidate.is_none() {
+                hard_failures.push(format!(
+                    "selected_candidate_id_not_in_pack:{}",
+                    selected_candidate_id
+                ));
+            }
+            if !pack
+                .candidates
+                .iter()
+                .any(|pack_candidate| pack_candidate.id == selected_candidate_id)
+            {
+                hard_failures.push("selected_candidate_not_sent_to_model".to_string());
+            }
+        }
+        None => hard_failures.push("selected_candidate_id_missing".to_string()),
+    }
+
+    if let Some(candidate) = selected_candidate.as_ref() {
+        match output
+            .selected_workstream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(selected_workstream_id) if selected_workstream_id == candidate.workstream_id => {}
+            Some(_) => hard_failures.push("selected_workstream_id_mismatch".to_string()),
+            None => hard_failures.push("selected_workstream_id_missing".to_string()),
+        }
+        if candidate.score < 0.35 {
+            hard_failures.push("selected_candidate_below_recovery_score_floor".to_string());
+        }
+        if !candidate.eligible_for_primary_selection {
+            hard_failures.push("selected_candidate_blocked_by_local_gates".to_string());
+        }
+        if !candidate_has_human_return_target(candidate) {
+            hard_failures.push("selected_candidate_without_human_return_target".to_string());
+        }
+    }
+
+    for failure in failures {
+        let severity = classify_micro_inference_validation_failure(
+            failure,
+            output,
+            selected_candidate.as_ref(),
+        );
+        match severity {
+            MicroInferenceValidationSeverity::Hard => hard_failures.push(failure.clone()),
+            MicroInferenceValidationSeverity::Soft => soft_failures.push(failure.clone()),
+        }
+    }
+
+    hard_failures.sort();
+    hard_failures.dedup();
+    soft_failures.sort();
+    soft_failures.dedup();
+
+    let recoverable =
+        selected_candidate.is_some() && hard_failures.is_empty() && !soft_failures.is_empty();
+    MicroInferenceValidationClassification {
+        selected_candidate,
+        hard_failures,
+        soft_failures,
+        recoverable,
+        recovery_reason: if recoverable {
+            Some("valid_candidate_with_soft_presentation_failures".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+fn confidence_for_soft_recovered_micro_inference(
+    model_confidence: &str,
+    candidate: &ScoredContinueCandidate,
+    gate: &ContinueDecisionQualityGate,
+    soft_failures: &[String],
+) -> f64 {
+    let mut cap = f64::min(gate_confidence_cap(gate), candidate.score);
+    if soft_failures
+        .iter()
+        .any(|failure| failure == "high_confidence_with_thin_local_evidence")
+    {
+        cap = f64::min(cap, 0.49);
+    }
+    if soft_failures
+        .iter()
+        .any(|failure| failure == "high_confidence_with_quality_gate_risks")
+    {
+        cap = f64::min(cap, 0.55);
+    }
+    if soft_failures
+        .iter()
+        .any(|failure| failure.contains("internal_reference"))
+    {
+        cap = f64::min(cap, 0.62);
+    }
+    round_score(f64::min(
+        confidence_from_micro_output(model_confidence, candidate.score),
+        cap,
+    ))
+}
+
 fn validate_micro_inference_output(
     output: &ContinueMicroInferenceOutput,
     candidates: &[ScoredContinueCandidate],
@@ -6594,6 +7744,9 @@ fn validate_micro_inference_output(
     }
     if unsupported_locator_in_model_output(output) {
         failures.push("model_output_contains_unsupported_url_or_path".to_string());
+    }
+    if model_output_contains_internal_reference(output) {
+        failures.push("model_output_contains_internal_reference".to_string());
     }
     if clean_handoff_line(output.headline.clone(), 90).is_none()
         || clean_handoff_line(output.return_line.clone(), 180).is_none()
@@ -6726,6 +7879,25 @@ fn unsupported_locator_in_model_output(output: &ContinueMicroInferenceOutput) ->
         || joined.contains("file://")
         || joined.contains(".com/")
         || joined.contains(".app/")
+}
+
+fn model_output_contains_internal_reference(output: &ContinueMicroInferenceOutput) -> bool {
+    let why_this = output.why_this.join(" ");
+    [
+        output.intent_label.as_str(),
+        output.headline.as_str(),
+        output.return_line.as_str(),
+        output.current_focus_line.as_str(),
+        output.last_state_line.as_str(),
+        output.next_action.as_deref().unwrap_or(""),
+        why_this.as_str(),
+        output.missing_evidence_line.as_deref().unwrap_or(""),
+        output.reason.as_str(),
+        output.user_visible_uncertainty.as_deref().unwrap_or(""),
+        output.uncertainty_notes.as_deref().unwrap_or(""),
+    ]
+    .iter()
+    .any(|value| contains_internal_continue_reference(value))
 }
 
 fn branch_support_target_requires_local_candidate_guard(
@@ -8017,30 +9189,30 @@ fn compose_continue_handoff(
             output_mode,
         );
         return ContinueHandoff {
-            headline: clean_handoff_line(output.headline.clone(), 90)
+            headline: clean_user_handoff_line(output.headline.clone(), 90)
                 .unwrap_or(local_fallback.headline),
-            return_line: clean_handoff_line(output.return_line.clone(), 180)
+            return_line: clean_user_handoff_line(output.return_line.clone(), 180)
                 .unwrap_or(local_fallback.return_line),
-            current_focus_line: clean_handoff_line(output.current_focus_line.clone(), 180)
+            current_focus_line: clean_user_handoff_line(output.current_focus_line.clone(), 180)
                 .unwrap_or(local_fallback.current_focus_line),
-            last_state_line: clean_handoff_line(output.last_state_line.clone(), 180)
+            last_state_line: clean_user_handoff_line(output.last_state_line.clone(), 180)
                 .unwrap_or(local_fallback.last_state_line),
             next_action: output
                 .next_action
                 .as_ref()
-                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .and_then(|value| clean_user_handoff_line(value.clone(), 180))
                 .unwrap_or(local_fallback.next_action),
             why_this: clean_handoff_reasons(&output.why_this).unwrap_or(local_fallback.why_this),
             missing_evidence_line: output
                 .missing_evidence_line
                 .as_ref()
-                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .and_then(|value| clean_user_handoff_line(value.clone(), 180))
                 .or(local_fallback.missing_evidence_line),
             confidence_label: confidence_label_value,
             user_visible_uncertainty: output
                 .user_visible_uncertainty
                 .as_ref()
-                .and_then(|value| clean_handoff_line(value.clone(), 180))
+                .and_then(|value| clean_user_handoff_line(value.clone(), 180))
                 .or(local_fallback.user_visible_uncertainty),
         };
     }
@@ -8071,7 +9243,12 @@ fn compose_local_continue_handoff(
     quality_gate: Option<&ContinueDecisionQualityGate>,
     output_mode: &ContinueOutputMode,
 ) -> ContinueHandoff {
-    if matches!(output_mode, ContinueOutputMode::NoClearContinuation) {
+    let target_label = selected.and_then(human_return_target_label);
+    if matches!(output_mode, ContinueOutputMode::NoClearContinuation)
+        || selected
+            .as_ref()
+            .is_some_and(|candidate| !candidate_has_human_return_target(candidate))
+    {
         let missing_line =
             visible_missing_evidence_line(missing_evidence, warnings, validation_failures).or_else(
                 || {
@@ -8082,20 +9259,38 @@ fn compose_local_continue_handoff(
                         })
                 },
             );
-        return ContinueHandoff {
-            headline: "No clear continuation yet".to_string(),
-            return_line: "No reliable return target is grounded yet.".to_string(),
-            current_focus_line: current_focus
-                .and_then(|focus| {
+        let focus_phrase = current_focus.and_then(friendly_focus_phrase);
+        let focus_line = focus_phrase
+            .as_ref()
+            .map(|value| format!("I saw you on {}.", value))
+            .or_else(|| {
+                current_focus.and_then(|focus| {
                     first_non_empty([
                         focus.title.as_deref(),
                         focus.window_title.as_deref(),
                         focus.app_name.as_deref(),
                     ])
-                    .map(|value| format!("Current focus: {}", value))
+                    .map(|value| format!("I saw {}", value))
                 })
-                .and_then(|line| clean_handoff_line(line, 180))
-                .unwrap_or_else(|| "Current focus is unclear.".to_string()),
+            })
+            .and_then(|line| clean_user_handoff_line(line, 180))
+            .unwrap_or_else(|| "Current focus is unclear.".to_string());
+        let uncertainty = focus_phrase
+            .as_ref()
+            .map(|value| {
+                format!(
+                    "I saw you on {}, but I don't have a reliable return target yet.",
+                    value
+                )
+            })
+            .and_then(|line| clean_user_handoff_line(line, 180))
+            .or_else(|| {
+                Some("I don't have a reliable app or page target for this yet.".to_string())
+            });
+        return ContinueHandoff {
+            headline: "No reliable continuation target yet".to_string(),
+            return_line: "No reliable return target is grounded yet.".to_string(),
+            current_focus_line: focus_line,
             last_state_line:
                 "I do not have enough local evidence to identify a reliable unfinished task."
                     .to_string(),
@@ -8105,20 +9300,11 @@ fn compose_local_continue_handoff(
             ],
             missing_evidence_line: missing_line.clone(),
             confidence_label: "Thin".to_string(),
-            user_visible_uncertainty: missing_line.or_else(|| {
-                Some("Evidence is thin, so Smalltalk is not selecting a specific task.".to_string())
-            }),
+            user_visible_uncertainty: uncertainty.or(missing_line),
         };
     }
-    let target_label = selected
-        .and_then(|candidate| {
-            candidate
-                .resume_work_target
-                .as_ref()
-                .or(candidate.target_artifact.as_ref())
-        })
-        .and_then(artifact_title_for_scorer)
-        .unwrap_or_else(|| "the best available return point".to_string());
+    let target_label =
+        target_label.unwrap_or_else(|| "the best available return point".to_string());
     let workstream_label = selected_workstream
         .and_then(|workstream| workstream.title_candidate.clone())
         .or_else(|| Some(target_label.clone()))
@@ -8149,7 +9335,7 @@ fn compose_local_continue_handoff(
         .unwrap_or_else(|| "working".to_string());
     let action_label = action_label.as_str();
     let local_next_action = next_action
-        .and_then(|value| clean_handoff_line(value.to_string(), 180))
+        .and_then(|value| clean_user_handoff_line(value.to_string(), 180))
         .unwrap_or_else(|| {
             "Open the target and continue from the last meaningful state.".to_string()
         });
@@ -8192,13 +9378,13 @@ fn compose_local_continue_handoff(
     }
 
     ContinueHandoff {
-        headline: clean_handoff_line(headline, 90)
+        headline: clean_user_handoff_line(headline, 90)
             .unwrap_or_else(|| "Continue from recent work".to_string()),
-        return_line: clean_handoff_line(format!("Continue from {}", target_label), 180)
+        return_line: clean_user_handoff_line(format!("Continue from {}", target_label), 180)
             .unwrap_or_else(|| "No stable return target yet.".to_string()),
-        current_focus_line: clean_handoff_line(format!("Current focus: {}", focus_label), 180)
+        current_focus_line: clean_user_handoff_line(focus_label, 180)
             .unwrap_or_else(|| "Current focus is unclear.".to_string()),
-        last_state_line: clean_handoff_line(
+        last_state_line: clean_user_handoff_line(
             if thin {
                 "I have thin evidence of recent progress, but the unfinished state is not specific enough.".to_string()
             } else {
@@ -8234,7 +9420,7 @@ fn handoff_confidence_label(confidence: f64, output_mode: &ContinueOutputMode) -
 fn clean_handoff_reasons(values: &[String]) -> Option<Vec<String>> {
     let reasons = values
         .iter()
-        .filter_map(|value| clean_handoff_line(value.clone(), 140))
+        .filter_map(|value| clean_user_handoff_line(value.clone(), 140))
         .take(3)
         .collect::<Vec<_>>();
     if reasons.is_empty() {
@@ -8258,8 +9444,70 @@ fn clean_handoff_line(value: String, max_chars: usize) -> Option<String> {
     Some(output)
 }
 
+fn clean_user_handoff_line(value: String, max_chars: usize) -> Option<String> {
+    let cleaned = clean_handoff_line(value, max_chars)?;
+    if contains_internal_continue_reference(&cleaned) {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn contains_internal_continue_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("continue-candidate-")
+        || lower.contains("workstream-")
+        || lower.contains("artifact-")
+        || lower.contains("frame-fallback")
+        || lower.contains("frame_fallback")
+        || lower.contains("target metadata")
+        || lower.contains("selected candidate")
+        || lower.contains("candidate id")
+        || lower.contains("workstream id")
+        || lower.contains("artifact id")
+        || lower.contains("frame_id")
+        || lower.contains("frame id")
+    {
+        return true;
+    }
+    lower.split_whitespace().any(|token| {
+        let token = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
+        token
+            .strip_prefix("frame-")
+            .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+    }) || contains_raw_frame_phrase(&lower)
+}
+
+fn contains_raw_frame_phrase(value: &str) -> bool {
+    value
+        .split("frame ")
+        .skip(1)
+        .any(|suffix| suffix.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+}
+
+fn handoff_contains_internal_reference(handoff: &ContinueHandoff) -> bool {
+    contains_internal_continue_reference(&handoff.headline)
+        || contains_internal_continue_reference(&handoff.return_line)
+        || contains_internal_continue_reference(&handoff.current_focus_line)
+        || contains_internal_continue_reference(&handoff.last_state_line)
+        || contains_internal_continue_reference(&handoff.next_action)
+        || handoff
+            .why_this
+            .iter()
+            .any(|line| contains_internal_continue_reference(line))
+        || handoff
+            .missing_evidence_line
+            .as_deref()
+            .is_some_and(contains_internal_continue_reference)
+        || handoff
+            .user_visible_uncertainty
+            .as_deref()
+            .is_some_and(contains_internal_continue_reference)
+}
+
 fn readable_fragment(value: &str, max_chars: usize) -> String {
-    clean_handoff_line(value.to_string(), max_chars).unwrap_or_else(|| "recent work".to_string())
+    clean_user_handoff_line(value.to_string(), max_chars)
+        .unwrap_or_else(|| "recent work".to_string())
 }
 
 fn human_action_kind(kind: &str) -> &'static str {
@@ -8345,6 +9593,7 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
             .as_ref()
             .map(|artifact| artifact.id.clone()),
         candidate_kind: candidate.candidate_kind.clone(),
+        pre_cap_score: round_score(candidate.pre_cap_score),
         score: round_score(candidate.score),
         confidence_label: confidence_label(candidate.score).to_string(),
         reason: candidate
@@ -8352,6 +9601,10 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
             .as_deref()
             .and_then(productize_continue_label),
         missing_evidence: candidate.missing_evidence.clone(),
+        risk_flags: candidate.risk_flags.clone(),
+        score_caps_applied: candidate.score_caps_applied.clone(),
+        eligible_for_primary_selection: candidate.eligible_for_primary_selection,
+        selection_demotion_reason: candidate.selection_demotion_reason.clone(),
         evidence_frame_id: candidate.evidence_frame_id.clone(),
         supporting_episode_id: candidate.supporting_episode_id.clone(),
         last_meaningful_action_id: candidate
@@ -8378,6 +9631,90 @@ fn artifact_title_for_scorer(artifact: &ScorerArtifact) -> Option<String> {
         artifact.browser_url.as_deref(),
     ])
     .map(str::to_string)
+}
+
+fn candidate_has_human_return_target(candidate: &ScoredContinueCandidate) -> bool {
+    human_return_target_label(candidate).is_some()
+}
+
+fn human_return_target_label(candidate: &ScoredContinueCandidate) -> Option<String> {
+    candidate
+        .resume_work_target
+        .as_ref()
+        .or(candidate.target_artifact.as_ref())
+        .and_then(human_artifact_label)
+}
+
+fn human_artifact_label(artifact: &ScorerArtifact) -> Option<String> {
+    if let Some(title) = artifact
+        .display_title
+        .as_deref()
+        .and_then(|value| human_label_text(value, 90))
+    {
+        return Some(title);
+    }
+    if let Some(path) = artifact.document_path.as_deref() {
+        if let Some(name) = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| human_label_text(value, 90))
+        {
+            return Some(name);
+        }
+    }
+    if let Some(host) = artifact
+        .browser_url
+        .as_deref()
+        .and_then(browser_url_host_label)
+        .and_then(|value| human_label_text(&value, 90))
+    {
+        return Some(host);
+    }
+    None
+}
+
+fn human_label_text(value: &str, max_chars: usize) -> Option<String> {
+    let cleaned = clean_user_handoff_line(value.to_string(), max_chars)?;
+    let lower = cleaned.to_ascii_lowercase();
+    if lower == "unknown"
+        || lower == "untitled"
+        || lower == "the best available return point"
+        || lower.contains("target metadata")
+    {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn browser_url_host_label(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    after_scheme
+        .split('/')
+        .next()
+        .and_then(|host| non_empty(host.trim().trim_start_matches("www.").to_string()))
+}
+
+fn friendly_focus_phrase(focus: &ContinueFocusSummary) -> Option<String> {
+    let label = first_non_empty([
+        focus.title.as_deref(),
+        focus.window_title.as_deref(),
+        focus.app_name.as_deref(),
+    ])?;
+    let lower = label.to_ascii_lowercase();
+    if lower.contains("gemini") {
+        return Some("the Gemini chat".to_string());
+    }
+    if lower.contains("chatgpt") || lower.contains("gpt") {
+        return Some("the ChatGPT chat".to_string());
+    }
+    if lower.contains("claude") {
+        return Some("the Claude chat".to_string());
+    }
+    if lower.contains("helium") || matches!(focus.artifact_kind.as_deref(), Some("browser_tab")) {
+        return clean_user_handoff_line(format!("the browser tab \"{}\"", label), 120);
+    }
+    clean_user_handoff_line(label.to_string(), 120)
 }
 
 fn confidence_label(score: f64) -> &'static str {
@@ -8446,8 +9783,11 @@ fn load_evidence_frames(
 
     let mut frames = Vec::with_capacity(rows.len());
     for mut frame in rows {
+        load_frame_capture_attribution(conn, &mut frame)?;
         frame.app_contexts = load_frame_app_contexts(conn, &frame.id)?;
         frame.content_units = load_frame_content_units(conn, &frame.id)?;
+        frame.ocr_spans = load_frame_ocr_spans(conn, &frame.id)?;
+        frame.visible_windows = load_frame_visible_windows(conn, &frame.id)?;
         frame.trigger = load_frame_trigger(conn, &frame.id)?;
         frame.ui_events = load_frame_ui_events(conn, &frame)?;
         frame.transition = load_frame_transition(conn, &frame.id)?;
@@ -8617,6 +9957,9 @@ fn event_rows_to_evidence_frames(
             document_path: None,
             capture_trigger: format!("event_signal_{}", signal),
             text_source: Some("event".to_string()),
+            scope: None,
+            window_id: None,
+            active_window_crop_path: None,
             full_text: Some(summary),
             content_hash: Some(content_hash),
             image_hash: None,
@@ -8626,6 +9969,8 @@ fn event_rows_to_evidence_frames(
             session_id: session_id.clone(),
             app_contexts: Vec::new(),
             content_units: Vec::new(),
+            ocr_spans: Vec::new(),
+            visible_windows: Vec::new(),
             ui_events: vec![EvidenceUiEvent {
                 id: row.id.clone(),
                 ts_ms: Some(row.ts_ms),
@@ -8731,6 +10076,9 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         document_path: row.get(5)?,
         capture_trigger: row.get(6)?,
         text_source: row.get(7)?,
+        scope: None,
+        window_id: None,
+        active_window_crop_path: None,
         full_text: row.get(8)?,
         content_hash: row.get(9)?,
         image_hash: row.get(10)?,
@@ -8740,6 +10088,8 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         session_id: row.get(14)?,
         app_contexts: Vec::new(),
         content_units: Vec::new(),
+        ocr_spans: Vec::new(),
+        visible_windows: Vec::new(),
         ui_events: Vec::new(),
         trigger: None,
         transition: None,
@@ -8749,6 +10099,46 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         focused_node_evidence: false,
         selected_text_present: false,
     })
+}
+
+fn load_frame_capture_attribution(
+    conn: &Connection,
+    frame: &mut EvidenceFrame,
+) -> Result<(), String> {
+    if column_exists(conn, "frames", "scope")? {
+        frame.scope = conn
+            .query_row(
+                "SELECT scope FROM frames WHERE CAST(id AS TEXT) = ?1",
+                params![frame.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .flatten();
+    }
+    if column_exists(conn, "frames", "window_id")? {
+        frame.window_id = conn
+            .query_row(
+                "SELECT window_id FROM frames WHERE CAST(id AS TEXT) = ?1",
+                params![frame.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .flatten();
+    }
+    if column_exists(conn, "frames", "active_window_crop_path")? {
+        frame.active_window_crop_path = conn
+            .query_row(
+                "SELECT active_window_crop_path FROM frames WHERE CAST(id AS TEXT) = ?1",
+                params![frame.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .flatten();
+    }
+    Ok(())
 }
 
 fn load_frame_app_contexts(
@@ -8794,17 +10184,50 @@ fn load_frame_content_units(
     if !table_exists(conn, "content_units")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, source, unit_type, semantic_role, text, text_hash, confidence
-             FROM content_units
-             WHERE frame_id = ?1
-             ORDER BY confidence DESC, created_at_ms DESC
-             LIMIT 240",
-        )
-        .map_err(to_string)?;
+    let ocr_span_ids_expr = if column_exists(conn, "content_units", "ocr_span_ids")? {
+        "ocr_span_ids"
+    } else {
+        "NULL"
+    };
+    let bounds_x_expr = if column_exists(conn, "content_units", "bounds_x")? {
+        "bounds_x"
+    } else {
+        "NULL"
+    };
+    let bounds_y_expr = if column_exists(conn, "content_units", "bounds_y")? {
+        "bounds_y"
+    } else {
+        "NULL"
+    };
+    let bounds_w_expr = if column_exists(conn, "content_units", "bounds_w")? {
+        "bounds_w"
+    } else {
+        "NULL"
+    };
+    let bounds_h_expr = if column_exists(conn, "content_units", "bounds_h")? {
+        "bounds_h"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, source, unit_type, semantic_role, text, text_hash, confidence,
+                {}, {}, {}, {}, {}
+         FROM content_units
+         WHERE frame_id = ?1
+         ORDER BY confidence DESC, created_at_ms DESC
+         LIMIT 240",
+        ocr_span_ids_expr, bounds_x_expr, bounds_y_expr, bounds_w_expr, bounds_h_expr
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(params![frame_id], |row| {
+            let bounds = rect_from_optional(
+                row.get::<_, Option<f64>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+            );
+            let ocr_span_ids_raw: Option<String> = row.get(7)?;
             Ok(EvidenceContentUnit {
                 id: row.get(0)?,
                 source: row.get(1)?,
@@ -8813,10 +10236,90 @@ fn load_frame_content_units(
                 text: row.get(4)?,
                 text_hash: row.get(5)?,
                 confidence: row.get(6)?,
+                ocr_span_ids: parse_evidence_id_array(ocr_span_ids_raw.as_deref()),
+                bounds,
             })
         })
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_frame_ocr_spans(conn: &Connection, frame_id: &str) -> Result<Vec<EvidenceOcrSpan>, String> {
+    if !table_exists(conn, "ocr_spans")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, text, confidence, bounds_x, bounds_y, bounds_w, bounds_h
+             FROM ocr_spans
+             WHERE frame_id = ?1
+             ORDER BY line_index ASC, word_index ASC, id ASC
+             LIMIT 600",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id], |row| {
+            Ok(EvidenceOcrSpan {
+                id: row.get(0)?,
+                text: row.get(1)?,
+                confidence: row.get(2)?,
+                bounds: Rect {
+                    x: row.get(3)?,
+                    y: row.get(4)?,
+                    w: row.get(5)?,
+                    h: row.get(6)?,
+                },
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_frame_visible_windows(
+    conn: &Connection,
+    frame_id: &str,
+) -> Result<Vec<EvidenceWindow>, String> {
+    if !table_exists(conn, "window_snapshots")? || !table_exists(conn, "windows")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT w.id, w.cg_window_id, w.owner_name, w.bundle_id, w.window_title,
+                    w.layer, w.alpha, w.is_onscreen, w.is_active,
+                    w.bounds_x, w.bounds_y, w.bounds_w, w.bounds_h
+             FROM windows w
+             JOIN window_snapshots s ON s.id = w.window_snapshot_id
+             WHERE CAST(s.frame_id AS TEXT) = ?1
+             ORDER BY COALESCE(w.is_active, 0) DESC, COALESCE(w.layer, 0) DESC, w.id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id], |row| {
+            Ok(EvidenceWindow {
+                id: row.get(0)?,
+                cg_window_id: row.get(1)?,
+                owner_name: row.get(2)?,
+                bundle_id: row.get(3)?,
+                window_title: row.get(4)?,
+                layer: row.get(5)?,
+                alpha: row.get(6)?,
+                is_onscreen: row.get::<_, Option<i64>>(7)?.unwrap_or(1) != 0,
+                is_active: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                bounds: Rect {
+                    x: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    y: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    w: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+                    h: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+                },
+            })
+        })
+        .map_err(to_string)?;
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?
+        .into_iter()
+        .filter(|window| usable_window_for_attribution(window))
+        .collect())
 }
 
 fn load_frame_ui_events(
@@ -9946,10 +11449,20 @@ fn collapse_repeated_task_actions(actions: Vec<ExtractedTaskAction>) -> Vec<Extr
                     previous.semantic_evidence_quote = action.semantic_evidence_quote.clone();
                     previous.semantic_delta_confidence = action.semantic_delta_confidence;
                     previous.semantic_moment_id = action.semantic_moment_id.clone();
+                    previous.evidence_source_kind = action.evidence_source_kind.clone();
+                    previous.evidence_attribution_json = action.evidence_attribution_json.clone();
+                    previous.attribution_confidence = action.attribution_confidence;
+                    previous.classifier_context_json = action.classifier_context_json.clone();
+                    previous.quality_flags = action.quality_flags.clone();
                 }
                 for event_id in action.evidence_event_ids {
                     if !previous.evidence_event_ids.contains(&event_id) {
                         previous.evidence_event_ids.push(event_id);
+                    }
+                }
+                for span_id in action.evidence_span_ids {
+                    if !previous.evidence_span_ids.contains(&span_id) {
+                        previous.evidence_span_ids.push(span_id);
                     }
                 }
                 previous.id = semantic_action_id(previous);
@@ -10029,6 +11542,480 @@ fn semantic_action_id(action: &ExtractedTaskAction) -> String {
     format!("task-action-{}", stable_hash(id_seed.as_bytes()))
 }
 
+#[derive(Debug, Clone)]
+struct ErrorClassification {
+    is_error: bool,
+    action_role: String,
+    confidence: f64,
+    reason: String,
+    evidence_source_kind: Option<String>,
+    supporting_span_ids: Vec<String>,
+    suppressing_span_ids: Vec<String>,
+    evidence_attribution_json: Option<String>,
+    attribution_confidence: Option<f64>,
+    classifier_context_json: Option<String>,
+    quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AttributedEvidenceSpan {
+    source: String,
+    source_id: String,
+    text: String,
+    confidence: f64,
+    semantic_role: Option<String>,
+    nearest_window_owner: Option<String>,
+    nearest_window_bundle_id: Option<String>,
+    nearest_window_title: Option<String>,
+    nearest_window_overlap_ratio: Option<f64>,
+    attribution: String,
+    artifact_match_score: f64,
+    flags: Vec<String>,
+}
+
+fn classify_error_context(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> ErrorClassification {
+    let mut spans = attributed_evidence_spans_for_frame(frame, artifact);
+    if spans.is_empty() {
+        spans.push(frame_full_text_fallback_span(frame, artifact));
+    }
+    let mut quality_flags = frame_quality_flags(frame, artifact);
+    let product_echo = is_smalltalk_product_ui_echo(frame);
+    if product_echo {
+        push_string_once(&mut quality_flags, "smalltalk_self_output");
+        push_string_once(&mut quality_flags, "product_ui_echo");
+    }
+
+    let mut supporting = Vec::new();
+    let mut suppressing = Vec::new();
+    for span in &spans {
+        if active_error_signal(&span.text) || span.semantic_role.as_deref() == Some("error") {
+            supporting.push(span.clone());
+        }
+        if error_suppression_signal(&span.text) {
+            suppressing.push(span.clone());
+        }
+    }
+
+    if product_echo {
+        return suppressed_error_classification(
+            "smalltalk_product_ui_echo",
+            supporting,
+            suppressing,
+            quality_flags,
+        );
+    }
+    if !suppressing.is_empty()
+        && (supporting.is_empty()
+            || !supporting
+                .iter()
+                .any(|span| strong_active_failure_text(&span.text) && span_is_artifact_owned(span)))
+    {
+        return suppressed_error_classification(
+            "resolved_or_verification_context",
+            supporting,
+            suppressing,
+            quality_flags,
+        );
+    }
+
+    let owned_support = supporting
+        .iter()
+        .filter(|span| span_is_artifact_owned(span))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unsafe_other_window = supporting
+        .iter()
+        .any(|span| span.source == "ocr_span" && span.attribution == "other_window_owned");
+    let display_only_support = supporting.iter().any(|span| {
+        span.source == "ocr_span"
+            && matches!(
+                span.attribution.as_str(),
+                "display_only_unattributed" | "ambiguous"
+            )
+    });
+    let media_target = is_media_or_background_artifact(artifact, frame);
+    let dev_context = owned_support
+        .iter()
+        .any(|span| span_has_dev_error_context(span, artifact))
+        || (matches!(artifact.kind.as_str(), "terminal" | "code_editor")
+            && supporting
+                .iter()
+                .any(|span| span_has_dev_error_context(span, artifact)));
+
+    if supporting.is_empty() {
+        return no_error_classification("no_active_error_signal", quality_flags);
+    }
+    if owned_support.is_empty() {
+        if unsafe_other_window {
+            push_string_once(&mut quality_flags, "ocr_inside_other_window");
+        }
+        if display_only_support {
+            push_string_once(&mut quality_flags, "display_only_unattributed");
+        }
+        if media_target {
+            push_string_once(&mut quality_flags, "media_or_background_target");
+        }
+        return blocked_error_classification(
+            "error_signal_not_owned_by_artifact",
+            supporting,
+            suppressing,
+            quality_flags,
+            frame,
+            artifact,
+        );
+    }
+    if !dev_context {
+        push_string_once(&mut quality_flags, "error_mention_only");
+        return blocked_error_classification(
+            "error_mention_without_dev_context",
+            supporting,
+            suppressing,
+            quality_flags,
+            frame,
+            artifact,
+        );
+    }
+
+    let source_kind = owned_support
+        .iter()
+        .map(|span| span.source.as_str())
+        .find(|source| *source != "frame_full_text_fallback")
+        .unwrap_or("frame_full_text_fallback")
+        .to_string();
+    let supporting_ids = owned_support
+        .iter()
+        .map(|span| span.source_id.clone())
+        .collect::<Vec<_>>();
+    let attribution_confidence = owned_support
+        .iter()
+        .map(|span| span.artifact_match_score)
+        .fold(0.0_f64, f64::max)
+        .max(if source_kind == "accessibility_node" {
+            0.82
+        } else {
+            0.0
+        });
+    let mut confidence: f64 = if source_kind == "ocr_span" {
+        0.78
+    } else {
+        0.86
+    };
+    if frame_is_unbounded_display_ocr(frame) && source_kind == "ocr_span" {
+        confidence = confidence.min(0.45);
+        push_string_once(&mut quality_flags, "unbounded_display_ocr_confidence_cap");
+    }
+    if media_target && source_kind == "ocr_span" {
+        confidence = confidence.min(0.30);
+        push_string_once(&mut quality_flags, "media_or_background_target");
+    }
+    let action_role = if confidence >= 0.75 {
+        "primary"
+    } else {
+        "support"
+    }
+    .to_string();
+    ErrorClassification {
+        is_error: confidence >= 0.50,
+        action_role,
+        confidence,
+        reason: "artifact_attributed_error_signal".to_string(),
+        evidence_source_kind: Some(source_kind),
+        supporting_span_ids: supporting_ids,
+        suppressing_span_ids: suppressing
+            .iter()
+            .map(|span| span.source_id.clone())
+            .collect(),
+        evidence_attribution_json: Some(attribution_json(&owned_support, frame, artifact)),
+        attribution_confidence: Some(attribution_confidence),
+        classifier_context_json: Some(classifier_context_json(
+            "active_failure",
+            &supporting,
+            &suppressing,
+            &quality_flags,
+        )),
+        quality_flags,
+    }
+}
+
+fn gate_task_action_attribution(
+    action: &mut ExtractedTaskAction,
+    classification: &ErrorClassification,
+) {
+    if action.action_kind != "encountering_error" {
+        return;
+    }
+    for flag in &classification.quality_flags {
+        if matches!(
+            flag.as_str(),
+            "ocr_inside_other_window"
+                | "display_only_unattributed"
+                | "missing_active_window_id"
+                | "missing_active_window_crop"
+                | "media_or_background_target"
+                | "smalltalk_self_output"
+                | "product_ui_echo"
+        ) {
+            if action.confidence > 0.45 {
+                action.confidence = action.confidence.min(0.45);
+                action.reason = format!("{}:confidence_capped_by_attribution", action.reason);
+            }
+            if action.action_role == "primary" {
+                action.action_role = "support".to_string();
+            }
+        }
+    }
+    if classification.reason == "error_signal_not_owned_by_artifact"
+        || classification.reason == "smalltalk_product_ui_echo"
+        || classification.reason == "resolved_or_verification_context"
+    {
+        action.action_kind = "reviewing_output".to_string();
+        action.action_role = "support".to_string();
+        action.confidence = action.confidence.min(0.42);
+        action.reason = classification.reason.clone();
+    }
+}
+
+fn attributed_evidence_spans_for_frame(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> Vec<AttributedEvidenceSpan> {
+    let mut spans = Vec::new();
+    for unit in &frame.content_units {
+        let Some(text) = unit
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let source = if unit.source.to_lowercase().contains("ocr") {
+            "ocr_span"
+        } else if unit.source.to_lowercase().contains("ax")
+            || unit.source.to_lowercase().contains("accessibility")
+        {
+            "accessibility_node"
+        } else {
+            "content_unit"
+        };
+        let span = attributed_span_from_text_and_rect(
+            frame,
+            artifact,
+            source,
+            &unit.id,
+            text,
+            unit.confidence.unwrap_or(0.72),
+            unit.semantic_role.clone(),
+            unit.bounds,
+        );
+        spans.push(span);
+    }
+    for span in &frame.ocr_spans {
+        spans.push(attributed_span_from_text_and_rect(
+            frame,
+            artifact,
+            "ocr_span",
+            &span.id,
+            &span.text,
+            span.confidence.unwrap_or(0.70),
+            None,
+            Some(span.bounds),
+        ));
+    }
+    spans
+}
+
+fn attributed_span_from_text_and_rect(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+    source: &str,
+    source_id: &str,
+    text: &str,
+    confidence: f64,
+    semantic_role: Option<String>,
+    bounds: Option<Rect>,
+) -> AttributedEvidenceSpan {
+    let mut flags = frame_quality_flags(frame, artifact);
+    let mut nearest_window_owner = None;
+    let mut nearest_window_bundle_id = None;
+    let mut nearest_window_title = None;
+    let mut nearest_window_overlap_ratio = None;
+    let mut artifact_match_score = if source != "ocr_span" { 0.82 } else { 0.0 };
+    let attribution = if source != "ocr_span" {
+        "artifact_owned".to_string()
+    } else if let Some(rect) = bounds {
+        if let Some(window_match) = best_window_for_rect(rect, &frame.visible_windows) {
+            nearest_window_owner = window_match.window.owner_name.clone();
+            nearest_window_bundle_id = window_match.window.bundle_id.clone();
+            nearest_window_title = window_match.window.window_title.clone();
+            nearest_window_overlap_ratio = Some(window_match.overlap_ratio);
+            artifact_match_score =
+                artifact_window_match_score(frame, artifact, window_match.window);
+            if artifact_match_score >= 0.62 {
+                "artifact_owned".to_string()
+            } else {
+                push_string_once(&mut flags, "ocr_inside_other_window");
+                "other_window_owned".to_string()
+            }
+        } else if frame.scope.as_deref() == Some("active_window") && frame.window_id.is_some() {
+            artifact_match_score = 0.58;
+            "active_window_owned".to_string()
+        } else {
+            push_string_once(&mut flags, "display_only_unattributed");
+            "display_only_unattributed".to_string()
+        }
+    } else if frame.scope.as_deref() == Some("active_window") && frame.window_id.is_some() {
+        artifact_match_score = 0.52;
+        "active_window_owned".to_string()
+    } else {
+        push_string_once(&mut flags, "display_only_unattributed");
+        "display_only_unattributed".to_string()
+    };
+    AttributedEvidenceSpan {
+        source: source.to_string(),
+        source_id: source_id.to_string(),
+        text: text.to_string(),
+        confidence,
+        semantic_role,
+        nearest_window_owner,
+        nearest_window_bundle_id,
+        nearest_window_title,
+        nearest_window_overlap_ratio,
+        attribution,
+        artifact_match_score,
+        flags,
+    }
+}
+
+fn frame_full_text_fallback_span(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> AttributedEvidenceSpan {
+    let text_source = continue_text_source(frame);
+    let attribution = if text_source == "accessibility" && !frame_is_unbounded_display_ocr(frame) {
+        "artifact_owned"
+    } else {
+        "display_only_unattributed"
+    };
+    let mut flags = frame_quality_flags(frame, artifact);
+    if attribution == "display_only_unattributed" {
+        push_string_once(&mut flags, "display_only_unattributed");
+    }
+    AttributedEvidenceSpan {
+        source: "frame_full_text_fallback".to_string(),
+        source_id: format!("frame-full-text-{}", frame.id),
+        text: frame.full_text.clone().unwrap_or_default(),
+        confidence: if attribution == "artifact_owned" {
+            0.58
+        } else {
+            0.25
+        },
+        semantic_role: None,
+        nearest_window_owner: None,
+        nearest_window_bundle_id: None,
+        nearest_window_title: None,
+        nearest_window_overlap_ratio: None,
+        attribution: attribution.to_string(),
+        artifact_match_score: if attribution == "artifact_owned" {
+            0.58
+        } else {
+            0.0
+        },
+        flags,
+    }
+}
+
+fn suppressed_error_classification(
+    reason: &str,
+    supporting: Vec<AttributedEvidenceSpan>,
+    suppressing: Vec<AttributedEvidenceSpan>,
+    quality_flags: Vec<String>,
+) -> ErrorClassification {
+    ErrorClassification {
+        is_error: false,
+        action_role: "support".to_string(),
+        confidence: 0.0,
+        reason: reason.to_string(),
+        evidence_source_kind: supporting.first().map(|span| span.source.clone()),
+        supporting_span_ids: supporting
+            .iter()
+            .map(|span| span.source_id.clone())
+            .collect(),
+        suppressing_span_ids: suppressing
+            .iter()
+            .map(|span| span.source_id.clone())
+            .collect(),
+        evidence_attribution_json: Some(attribution_json_without_frame(&supporting)),
+        attribution_confidence: supporting
+            .iter()
+            .map(|span| span.artifact_match_score)
+            .reduce(f64::max),
+        classifier_context_json: Some(classifier_context_json(
+            reason,
+            &supporting,
+            &suppressing,
+            &quality_flags,
+        )),
+        quality_flags,
+    }
+}
+
+fn blocked_error_classification(
+    reason: &str,
+    supporting: Vec<AttributedEvidenceSpan>,
+    suppressing: Vec<AttributedEvidenceSpan>,
+    quality_flags: Vec<String>,
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> ErrorClassification {
+    ErrorClassification {
+        is_error: false,
+        action_role: "support".to_string(),
+        confidence: 0.35,
+        reason: reason.to_string(),
+        evidence_source_kind: supporting.first().map(|span| span.source.clone()),
+        supporting_span_ids: supporting
+            .iter()
+            .map(|span| span.source_id.clone())
+            .collect(),
+        suppressing_span_ids: suppressing
+            .iter()
+            .map(|span| span.source_id.clone())
+            .collect(),
+        evidence_attribution_json: Some(attribution_json(&supporting, frame, artifact)),
+        attribution_confidence: supporting
+            .iter()
+            .map(|span| span.artifact_match_score)
+            .reduce(f64::max),
+        classifier_context_json: Some(classifier_context_json(
+            reason,
+            &supporting,
+            &suppressing,
+            &quality_flags,
+        )),
+        quality_flags,
+    }
+}
+
+fn no_error_classification(reason: &str, quality_flags: Vec<String>) -> ErrorClassification {
+    ErrorClassification {
+        is_error: false,
+        action_role: "unknown".to_string(),
+        confidence: 0.0,
+        reason: reason.to_string(),
+        evidence_source_kind: None,
+        supporting_span_ids: Vec::new(),
+        suppressing_span_ids: Vec::new(),
+        evidence_attribution_json: None,
+        attribution_confidence: None,
+        classifier_context_json: Some(classifier_context_json(reason, &[], &[], &quality_flags)),
+        quality_flags,
+    }
+}
+
 fn classify_task_action(
     frame: &EvidenceFrame,
     previous_frame: Option<&EvidenceFrame>,
@@ -10051,6 +12038,7 @@ fn classify_task_action(
         .transition
         .as_ref()
         .and_then(|transition| transition.transition_type.clone());
+    let error_classification = classify_error_context(frame, artifact);
 
     let (kind, role, confidence, reason) = if has_clipboard_transfer(frame) {
         ("copying_evidence", "support", 0.82, "clipboard_transfer")
@@ -10066,8 +12054,20 @@ fn classify_task_action(
             0.78,
             "returned_to_recent_primary_artifact",
         )
-    } else if has_error_signal(frame) {
-        ("encountering_error", "primary", 0.86, "error_signal")
+    } else if error_classification.is_error {
+        (
+            "encountering_error",
+            error_classification.action_role.as_str(),
+            error_classification.confidence,
+            error_classification.reason.as_str(),
+        )
+    } else if error_classification.reason == "smalltalk_product_ui_echo" {
+        (
+            "unknown",
+            "support",
+            0.20,
+            error_classification.reason.as_str(),
+        )
     } else if artifact.kind == "terminal" && terminal_has_enter_or_commit(frame) {
         (
             "running_command",
@@ -10081,6 +12081,18 @@ fn classify_task_action(
             "support",
             0.78,
             "terminal_output_changed",
+        )
+    } else if matches!(
+        error_classification.reason.as_str(),
+        "error_signal_not_owned_by_artifact"
+            | "error_mention_without_dev_context"
+            | "resolved_or_verification_context"
+    ) {
+        (
+            "reviewing_output",
+            "support",
+            error_classification.confidence.max(0.35).min(0.42),
+            error_classification.reason.as_str(),
         )
     } else if frame.capture_trigger.contains("idle")
         && last_meaningful.is_some()
@@ -10154,7 +12166,7 @@ fn classify_task_action(
         kind,
         previous_artifact_id.as_deref().unwrap_or("")
     );
-    ExtractedTaskAction {
+    let mut action = ExtractedTaskAction {
         id: format!("task-action-{}", stable_hash(id_seed.as_bytes())),
         frame_id: frame.id.clone(),
         previous_frame_id: previous_frame
@@ -10181,7 +12193,15 @@ fn classify_task_action(
         semantic_evidence_quote: None,
         semantic_delta_confidence: None,
         semantic_moment_id: None,
-    }
+        evidence_source_kind: error_classification.evidence_source_kind.clone(),
+        evidence_span_ids: error_classification.supporting_span_ids.clone(),
+        evidence_attribution_json: error_classification.evidence_attribution_json.clone(),
+        attribution_confidence: error_classification.attribution_confidence,
+        classifier_context_json: error_classification.classifier_context_json.clone(),
+        quality_flags: error_classification.quality_flags.clone(),
+    };
+    gate_task_action_attribution(&mut action, &error_classification);
+    action
 }
 
 fn insert_continue_task_action(
@@ -10189,6 +12209,9 @@ fn insert_continue_task_action(
     action: &ExtractedTaskAction,
 ) -> Result<(), String> {
     let event_ids_json = serde_json::to_string(&action.evidence_event_ids).map_err(to_string)?;
+    let evidence_span_ids_json =
+        serde_json::to_string(&action.evidence_span_ids).map_err(to_string)?;
+    let quality_flags_json = serde_json::to_string(&action.quality_flags).map_err(to_string)?;
     conn.execute(
         "INSERT INTO continue_task_actions (
             id, frame_id, previous_frame_id, artifact_id, secondary_artifact_id,
@@ -10197,9 +12220,12 @@ fn insert_continue_task_action(
             collapse_count, first_frame_id, last_frame_id, strongest_frame_id,
             semantic_delta_kind, semantic_subject, semantic_before_hint,
             semantic_after_hint, semantic_evidence_quote, semantic_delta_confidence,
-            semantic_moment_id
+            semantic_moment_id, evidence_source_kind, evidence_span_ids_json,
+            evidence_attribution_json, attribution_confidence, classifier_context_json,
+            quality_flags_json
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                   ?25, ?26, ?27, ?28, ?29, ?30)",
         params![
             action.id,
             action.frame_id,
@@ -10225,6 +12251,12 @@ fn insert_continue_task_action(
             action.semantic_evidence_quote,
             action.semantic_delta_confidence,
             action.semantic_moment_id,
+            action.evidence_source_kind,
+            evidence_span_ids_json,
+            action.evidence_attribution_json,
+            action.attribution_confidence,
+            action.classifier_context_json,
+            quality_flags_json,
         ],
     )
     .map_err(to_string)?;
@@ -10276,7 +12308,7 @@ fn should_promote_trigger_for_continue_boundary(
                 .to_string(),
         };
     }
-    if has_error_signal(post_frame) {
+    if classify_error_context(post_frame, artifact).is_error {
         return ContinueBoundaryPromotion {
             important_for_continue: true,
             boundary_kind: Some("error_without_resolution".to_string()),
@@ -10424,7 +12456,7 @@ fn derive_semantic_delta(
             before_hint: None,
             after_hint: None,
             evidence_quote: safe_evidence_quote(frame, &["error"]),
-            confidence: 0.86,
+            confidence: action.confidence.min(0.90),
         }),
         "searching" => Some(SemanticDelta {
             kind: "browser_search".to_string(),
@@ -10551,7 +12583,7 @@ fn causal_chain_for_frame(
     if has_clipboard_transfer(frame) {
         push_causal_step(&mut chain, "clipboard_transfer".to_string());
     }
-    if has_error_signal(frame) {
+    if classify_error_context(frame, artifact).is_error {
         push_causal_step(&mut chain, "error_seen".to_string());
     }
     if is_search_context(frame, artifact) {
@@ -13492,6 +15524,443 @@ fn is_code_like_path(path: &str) -> bool {
     .any(|suffix| lower.ends_with(suffix))
 }
 
+#[derive(Debug)]
+struct WindowMatch<'a> {
+    window: &'a EvidenceWindow,
+    overlap_ratio: f64,
+    center_inside: bool,
+}
+
+impl Rect {
+    fn area(self) -> f64 {
+        (self.w.max(0.0)) * (self.h.max(0.0))
+    }
+
+    fn center(self) -> (f64, f64) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+
+    fn contains_point(self, x: f64, y: f64) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    fn intersection_area(self, other: Rect) -> f64 {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.w).min(other.x + other.w);
+        let bottom = (self.y + self.h).min(other.y + other.h);
+        (right - left).max(0.0) * (bottom - top).max(0.0)
+    }
+}
+
+fn rect_from_optional(
+    x: Option<f64>,
+    y: Option<f64>,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> Option<Rect> {
+    Some(Rect {
+        x: x?,
+        y: y?,
+        w: w?,
+        h: h?,
+    })
+    .filter(|rect| rect.area() > 0.0)
+}
+
+fn best_window_for_rect<'a>(rect: Rect, windows: &'a [EvidenceWindow]) -> Option<WindowMatch<'a>> {
+    let (center_x, center_y) = rect.center();
+    windows
+        .iter()
+        .filter(|window| usable_window_for_attribution(window))
+        .filter_map(|window| {
+            let overlap_ratio = rect.intersection_area(window.bounds) / rect.area().max(1.0);
+            let center_inside = window.bounds.contains_point(center_x, center_y);
+            if overlap_ratio >= 0.50 || center_inside {
+                Some(WindowMatch {
+                    window,
+                    overlap_ratio,
+                    center_inside,
+                })
+            } else {
+                None
+            }
+        })
+        .max_by(|left, right| {
+            left.center_inside
+                .cmp(&right.center_inside)
+                .then_with(|| {
+                    left.overlap_ratio
+                        .partial_cmp(&right.overlap_ratio)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| right.window.layer.cmp(&left.window.layer))
+        })
+}
+
+fn usable_window_for_attribution(window: &EvidenceWindow) -> bool {
+    if !window.is_onscreen || window.bounds.area() <= 0.0 {
+        return false;
+    }
+    if window.alpha.unwrap_or(1.0) <= 0.01 {
+        return false;
+    }
+    let owner = window.owner_name.as_deref().unwrap_or("").to_lowercase();
+    let title = window.window_title.as_deref().unwrap_or("").to_lowercase();
+    if owner.contains("window server") || owner.contains("systemuiserver") {
+        return false;
+    }
+    if title.contains("status item") || title.contains("menu bar") {
+        return false;
+    }
+    true
+}
+
+fn artifact_window_match_score(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+    window: &EvidenceWindow,
+) -> f64 {
+    let mut score: f64 = 0.0;
+    let owner = window.owner_name.as_deref().unwrap_or("").to_lowercase();
+    let bundle = window.bundle_id.as_deref().unwrap_or("").to_lowercase();
+    let title = window.window_title.as_deref().unwrap_or("").to_lowercase();
+    let frame_app = frame.app_name.as_deref().unwrap_or("").to_lowercase();
+    let frame_bundle = frame.app_bundle_id.as_deref().unwrap_or("").to_lowercase();
+    let frame_title = frame.window_name.as_deref().unwrap_or("").to_lowercase();
+    let artifact_title = artifact
+        .display_title
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    if !frame_bundle.is_empty() && bundle == frame_bundle {
+        score = score.max(0.78);
+    }
+    if !frame_app.is_empty() && owner == frame_app {
+        score = score.max(0.72);
+    }
+    if !frame_title.is_empty() && normalized_contains(&title, &frame_title) {
+        score = score.max(0.70);
+    }
+    if !artifact_title.is_empty() && normalized_contains(&title, &artifact_title) {
+        score = score.max(0.68);
+    }
+    if window.is_active {
+        score = score.max(0.60);
+    }
+    score
+}
+
+fn normalized_contains(left: &str, right: &str) -> bool {
+    let left = left.split_whitespace().collect::<Vec<_>>().join(" ");
+    let right = right.split_whitespace().collect::<Vec<_>>().join(" ");
+    !left.is_empty() && !right.is_empty() && (left.contains(&right) || right.contains(&left))
+}
+
+fn frame_quality_flags(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> Vec<String> {
+    let mut flags = Vec::new();
+    if frame.scope.as_deref() == Some("active_display") {
+        flags.push("active_display_scope".to_string());
+    }
+    if frame.window_id.is_none() {
+        flags.push("missing_active_window_id".to_string());
+    }
+    if frame.active_window_crop_path.is_none() {
+        flags.push("missing_active_window_crop".to_string());
+    }
+    match continue_text_source(frame) {
+        "ocr" => flags.push("ocr_text_source".to_string()),
+        "hybrid" => flags.push("hybrid_text_source".to_string()),
+        _ => {}
+    }
+    if is_media_or_background_artifact(artifact, frame) {
+        flags.push("media_or_background_target".to_string());
+    }
+    flags
+}
+
+fn frame_is_unbounded_display_ocr(frame: &EvidenceFrame) -> bool {
+    matches!(continue_text_source(frame), "ocr" | "hybrid")
+        && frame.scope.as_deref() == Some("active_display")
+        && frame.window_id.is_none()
+        && frame.active_window_crop_path.is_none()
+}
+
+fn span_is_artifact_owned(span: &AttributedEvidenceSpan) -> bool {
+    matches!(
+        span.attribution.as_str(),
+        "artifact_owned" | "active_window_owned"
+    ) && span.artifact_match_score >= 0.50
+}
+
+fn span_has_dev_error_context(span: &AttributedEvidenceSpan, artifact: &ResolvedArtifact) -> bool {
+    if matches!(artifact.kind.as_str(), "terminal" | "code_editor") {
+        return true;
+    }
+    let owner = span
+        .nearest_window_owner
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    let title = span
+        .nearest_window_title
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    let role = span.semantic_role.as_deref().unwrap_or("").to_lowercase();
+    contains_any(
+        &owner,
+        &[
+            "terminal", "iterm", "warp", "code", "cursor", "xcode", "codex",
+        ],
+    ) || contains_any(
+        &title,
+        &["terminal", "cargo", "npm", "code", "smalltalk", "codex"],
+    ) || contains_any(&role, &["terminal", "code", "error"])
+        || contains_any(
+            &span.text,
+            &[
+                "cargo ",
+                "rustc",
+                "could not compile",
+                "npm err",
+                "tsc",
+                "traceback",
+                "stack trace",
+            ],
+        )
+}
+
+fn active_error_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "error:",
+            "error[",
+            "could not compile",
+            "failed to compile",
+            "compilation failed",
+            "build failed",
+            "test failed",
+            "tests failed",
+            "cargo test failed",
+            "cargo check failed",
+            "cargo check error",
+            "rustc --explain",
+            "information about this error",
+            "npm err",
+            "panic",
+            "stack trace",
+            "traceback",
+            "exception",
+            "unhandled rejection",
+            "exit code",
+            "command failed",
+            "no space left on device",
+        ],
+    )
+}
+
+fn strong_active_failure_text(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "error[",
+            "could not compile",
+            "failed to compile",
+            "compilation failed",
+            "build failed",
+            "test failed",
+            "tests failed",
+            "npm err",
+            "panic",
+            "traceback",
+            "command failed",
+        ],
+    )
+}
+
+fn error_suppression_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("unresolved") {
+        return false;
+    }
+    contains_any(
+        &lower,
+        &[
+            "verification passed",
+            "cargo check passed",
+            "cargo test passed",
+            "tests passed",
+            "passed",
+            "build succeeded",
+            "finished dev profile",
+            "implemented",
+            "fixed",
+            "resolved",
+            "warnings only",
+            "failure recorded in raw/export_errors.json",
+            "status/error artifacts",
+        ],
+    ) && !contains_any(
+        &lower,
+        &["could not compile", "error[", "build failed", "test failed"],
+    )
+}
+
+fn is_media_or_background_artifact(artifact: &ResolvedArtifact, frame: &EvidenceFrame) -> bool {
+    if artifact.kind != "browser_tab" {
+        return false;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        artifact.browser_url.as_deref().unwrap_or(""),
+        artifact.display_title.as_deref().unwrap_or(""),
+        frame.window_name.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    contains_any(
+        &haystack,
+        &[
+            "youtube.com",
+            "youtu.be",
+            "shorts",
+            "audio playing",
+            "spotify.com",
+            "netflix.com",
+            "x.com",
+            "twitter.com",
+            "instagram.com",
+            "facebook.com",
+            "reddit.com",
+        ],
+    )
+}
+
+fn is_smalltalk_product_ui_echo(frame: &EvidenceFrame) -> bool {
+    let surface = format!(
+        "{} {} {}",
+        frame.app_name.as_deref().unwrap_or(""),
+        frame.app_bundle_id.as_deref().unwrap_or(""),
+        frame.window_name.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    if !contains_any(&surface, &["smalltalk", "com.smalltalk.app"]) {
+        return false;
+    }
+    let lower = frame_text_lower(frame);
+    contains_any(
+        &lower,
+        &[
+            "continue answer",
+            "local fallback",
+            "ai-assisted",
+            "local only",
+            "continue from",
+            "continue here",
+            "last meaningful state",
+            "missing or weak evidence",
+            "current focus",
+            "return target",
+            "wrong target",
+            "inspect evidence",
+            "evidence is thin",
+            "selected from local workstream",
+        ],
+    )
+}
+
+fn parse_evidence_id_array(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn push_string_once(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+fn attribution_json(
+    spans: &[AttributedEvidenceSpan],
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "frame_scope": frame.scope,
+        "frame_window_id": frame.window_id,
+        "active_window_crop_present": frame.active_window_crop_path.is_some(),
+        "target_artifact_id": artifact.id,
+        "target_artifact_kind": artifact.kind,
+        "spans": span_attribution_values(spans),
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn attribution_json_without_frame(spans: &[AttributedEvidenceSpan]) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "spans": span_attribution_values(spans),
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn span_attribution_values(spans: &[AttributedEvidenceSpan]) -> Vec<Value> {
+    spans
+        .iter()
+        .map(|span| {
+            serde_json::json!({
+                "source": span.source,
+                "source_id": span.source_id,
+                "span_attribution": span.attribution,
+                "artifact_match_score": span.artifact_match_score,
+                "nearest_window_owner": span.nearest_window_owner,
+                "nearest_window_bundle_id": span.nearest_window_bundle_id,
+                "nearest_window_title": span.nearest_window_title,
+                "nearest_window_overlap_ratio": span.nearest_window_overlap_ratio,
+                "confidence": span.confidence,
+                "flags": span.flags,
+            })
+        })
+        .collect()
+}
+
+fn classifier_context_json(
+    polarity: &str,
+    supporting: &[AttributedEvidenceSpan],
+    suppressing: &[AttributedEvidenceSpan],
+    quality_flags: &[String],
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "polarity": polarity,
+        "decision": classifier_context_decision(polarity),
+        "supporting_span_ids": supporting.iter().map(|span| span.source_id.as_str()).collect::<Vec<_>>(),
+        "suppressing_span_ids": suppressing.iter().map(|span| span.source_id.as_str()).collect::<Vec<_>>(),
+        "quality_flags": quality_flags,
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn classifier_context_decision(polarity: &str) -> &'static str {
+    match polarity {
+        "error_signal_not_owned_by_artifact" | "error_mention_without_dev_context" => {
+            "blocked_primary_action_for_target_artifact"
+        }
+        "smalltalk_product_ui_echo" => "suppressed_smalltalk_self_output",
+        "resolved_or_verification_context" => "suppressed_resolved_or_verification_output",
+        "active_failure" => "allowed_artifact_attributed_error",
+        _ => "no_primary_error_action",
+    }
+}
+
 fn continue_text_source(frame: &EvidenceFrame) -> &'static str {
     match frame
         .text_source
@@ -13629,6 +16098,10 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 
 fn parse_string_array(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn parse_optional_json_value(raw: Option<String>) -> Option<Value> {
+    raw.and_then(|value| serde_json::from_str::<Value>(&value).ok())
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -14081,6 +16554,42 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     ensure_column_exists(conn, "continue_task_actions", "semantic_moment_id", "TEXT")?;
     ensure_column_exists(
         conn,
+        "continue_task_actions",
+        "evidence_source_kind",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "evidence_span_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "evidence_attribution_json",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "attribution_confidence",
+        "REAL",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "classifier_context_json",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "quality_flags_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
         "continue_candidates",
         "branch_origin_score",
         "REAL NOT NULL DEFAULT 0.0",
@@ -14409,6 +16918,12 @@ mod tests {
             semantic_evidence_quote: None,
             semantic_delta_confidence: None,
             semantic_moment_id: None,
+            evidence_source_kind: None,
+            evidence_span_ids: Vec::new(),
+            evidence_attribution_json: None,
+            attribution_confidence: None,
+            classifier_context_json: None,
+            quality_flags: Vec::new(),
         }
     }
 
@@ -14453,6 +16968,7 @@ mod tests {
             last_meaningful_action: None,
             evidence_frame_id: Some("1".to_string()),
             supporting_episode_id: None,
+            pre_cap_score: 0.95,
             score: 0.95,
             actionability_score: 0.92,
             primary_target_score: 1.0,
@@ -14465,6 +16981,10 @@ mod tests {
             reason: Some("primary_artifact_fallback".to_string()),
             missing_evidence: Vec::new(),
             warnings: Vec::new(),
+            risk_flags: Vec::new(),
+            score_caps_applied: Vec::new(),
+            eligible_for_primary_selection: true,
+            selection_demotion_reason: None,
             resume_work_target: Some(unknown),
             open_loop: None,
         };
@@ -14482,6 +17002,7 @@ mod tests {
             open_loops: Vec::new(),
         };
 
+        apply_candidate_risk_caps(&mut unknown_candidate, &workstream, None);
         unknown_candidate.score = confidence_cap_for_candidate(&unknown_candidate, &workstream);
         assert!(unknown_candidate.score <= 0.52);
 
@@ -14501,6 +17022,7 @@ mod tests {
         smalltalk_candidate.target_artifact = Some(smalltalk);
         smalltalk_candidate.score = 0.95;
         smalltalk_candidate.evidence_quality_score = 0.72;
+        apply_candidate_risk_caps(&mut smalltalk_candidate, &workstream, None);
         assert!(confidence_cap_for_candidate(&smalltalk_candidate, &workstream) <= 0.42);
     }
 
@@ -14637,6 +17159,7 @@ mod tests {
             last_meaningful_action: action,
             evidence_frame_id: Some("1".to_string()),
             supporting_episode_id: Some("episode-test".to_string()),
+            pre_cap_score: 0.82,
             score: 0.82,
             actionability_score: 0.9,
             primary_target_score: 1.0,
@@ -14649,6 +17172,10 @@ mod tests {
             reason: Some("test_candidate".to_string()),
             missing_evidence: Vec::new(),
             warnings: Vec::new(),
+            risk_flags: Vec::new(),
+            score_caps_applied: Vec::new(),
+            eligible_for_primary_selection: true,
+            selection_demotion_reason: None,
             resume_work_target: target,
             open_loop,
         }
@@ -14667,6 +17194,308 @@ mod tests {
             audit.as_ref(),
             &pack,
         )
+    }
+
+    fn pack_candidate_for_test(candidate: &ScoredContinueCandidate) -> ContinuePackCandidate {
+        ContinuePackCandidate {
+            id: candidate.id.clone(),
+            workstream_id: candidate.workstream_id.clone(),
+            candidate_kind: candidate.candidate_kind.clone(),
+            target_artifact_id: candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.clone()),
+            target_title: candidate
+                .target_artifact
+                .as_ref()
+                .and_then(artifact_title_for_scorer),
+            target_kind: candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_kind.clone()),
+            target_url_available: candidate
+                .target_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.browser_url.as_ref())
+                .is_some(),
+            target_path_available: candidate
+                .target_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.document_path.as_ref())
+                .is_some(),
+            local_score: candidate.score,
+            score_components: candidate_summary(candidate).components,
+            last_meaningful_action: candidate
+                .last_meaningful_action
+                .as_ref()
+                .map(action_summary),
+            unresolved_state_reason: candidate
+                .open_loop
+                .as_ref()
+                .and_then(|open_loop| open_loop.unfinished_state.clone()),
+            evidence_frame_id: candidate.evidence_frame_id.clone(),
+            evidence_action_id: candidate
+                .last_meaningful_action
+                .as_ref()
+                .map(|action| action.id.clone()),
+            evidence_episode_id: candidate.supporting_episode_id.clone(),
+            missing_evidence: candidate.missing_evidence.clone(),
+            local_reason: candidate.reason.clone(),
+        }
+    }
+
+    fn micro_pack_for_candidates(
+        candidates: &[ScoredContinueCandidate],
+    ) -> ContinueMicroInferencePack {
+        ContinueMicroInferencePack {
+            schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
+            instructions: "test".to_string(),
+            current_focus: None,
+            workstreams: Vec::new(),
+            candidates: candidates.iter().map(pack_candidate_for_test).collect(),
+            evidence_packs_v2: candidates
+                .iter()
+                .map(|candidate| build_candidate_evidence_pack_v2(candidate, None, None))
+                .collect(),
+            artifact_roles: Vec::new(),
+            breadcrumbs: Vec::new(),
+        }
+    }
+
+    fn micro_pack_for_candidate(candidate: &ScoredContinueCandidate) -> ContinueMicroInferencePack {
+        micro_pack_for_candidates(std::slice::from_ref(candidate))
+    }
+
+    fn selected_candidate_model_output(
+        candidate: &ScoredContinueCandidate,
+    ) -> ContinueMicroInferenceOutput {
+        ContinueMicroInferenceOutput {
+            result: "selected_candidate".to_string(),
+            selected_candidate_id: Some(candidate.id.clone()),
+            selected_workstream_id: Some(candidate.workstream_id.clone()),
+            intent_label: "Continue the current work".to_string(),
+            headline: "Continue current work".to_string(),
+            return_line: "Return to the local work surface.".to_string(),
+            current_focus_line: "Current focus is the local work surface.".to_string(),
+            last_state_line: "Last state was visible in local evidence.".to_string(),
+            next_action: Some("Inspect the local work surface.".to_string()),
+            why_this: vec!["The selected candidate is grounded in local evidence.".to_string()],
+            missing_evidence_line: None,
+            reason: "selected local candidate".to_string(),
+            confidence: "medium".to_string(),
+            user_visible_uncertainty: None,
+            uncertainty_notes: None,
+            missing_evidence: Vec::new(),
+            recommended_local_capture: None,
+        }
+    }
+
+    #[test]
+    fn stale_openable_media_target_cannot_beat_current_frame_fallback() {
+        let youtube = ScorerArtifact {
+            id: "artifact-youtube".to_string(),
+            artifact_kind: "browser_tab".to_string(),
+            display_title: Some(
+                "(26) Thomas Newman Any Other Name American Beauty #shorts - YouTube - Helium"
+                    .to_string(),
+            ),
+            browser_url: Some("https://www.youtube.com/shorts/0SMgxlv0Mfc".to_string()),
+            document_path: None,
+            evidence_quality: "strong".to_string(),
+            privacy_status: None,
+            openability: "openable".to_string(),
+            last_seen_frame_id: Some("1664".to_string()),
+            last_seen_timestamp: 1_000,
+        };
+        let smalltalk = ScorerArtifact {
+            id: "artifact-smalltalk-current".to_string(),
+            artifact_kind: "code_editor".to_string(),
+            display_title: Some("smalltalk".to_string()),
+            browser_url: None,
+            document_path: None,
+            evidence_quality: "medium".to_string(),
+            privacy_status: None,
+            openability: "frame_fallback".to_string(),
+            last_seen_frame_id: Some("1667".to_string()),
+            last_seen_timestamp: 2_000,
+        };
+        let youtube_action = ScorerAction {
+            id: "action-youtube".to_string(),
+            frame_id: "1664".to_string(),
+            artifact_id: Some(youtube.id.clone()),
+            secondary_artifact_id: None,
+            action_kind: "reviewing_output".to_string(),
+            action_role: "support".to_string(),
+            confidence: 0.42,
+            reason: Some("display_level_output".to_string()),
+            created_at_ms: 1_000,
+            collapse_count: 1,
+            first_frame_id: Some("1664".to_string()),
+            last_frame_id: Some("1664".to_string()),
+            strongest_frame_id: Some("1664".to_string()),
+            semantic_delta_kind: None,
+            semantic_subject: None,
+            semantic_after_hint: None,
+            semantic_evidence_quote: None,
+        };
+        let smalltalk_action = ScorerAction {
+            id: "action-smalltalk".to_string(),
+            frame_id: "1667".to_string(),
+            artifact_id: Some(smalltalk.id.clone()),
+            secondary_artifact_id: None,
+            action_kind: "encountering_error".to_string(),
+            action_role: "primary".to_string(),
+            confidence: 0.92,
+            reason: Some("visible_error_or_failure".to_string()),
+            created_at_ms: 2_000,
+            collapse_count: 1,
+            first_frame_id: Some("1667".to_string()),
+            last_frame_id: Some("1667".to_string()),
+            strongest_frame_id: Some("1667".to_string()),
+            semantic_delta_kind: Some("terminal_error".to_string()),
+            semantic_subject: Some("smalltalk".to_string()),
+            semantic_after_hint: Some("visible failure".to_string()),
+            semantic_evidence_quote: Some("error visible".to_string()),
+        };
+        let youtube_workstream = ScorerWorkstream {
+            id: "workstream-youtube".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("YouTube media".to_string()),
+            primary_artifact_id: Some(youtube.id.clone()),
+            last_active_timestamp_ms: 1_000,
+            confidence: 0.8,
+            unresolved_signal: Some("visible_error_or_failure".to_string()),
+            episodes: vec![ScorerEpisode {
+                id: "episode-youtube".to_string(),
+                end_frame_id: Some("1664".to_string()),
+                end_timestamp_ms: 1_000,
+                dominant_action_kind: Some("reviewing_output".to_string()),
+                evidence_quality: "thin".to_string(),
+            }],
+            artifacts: vec![ScorerWorkstreamArtifact {
+                artifact: youtube.clone(),
+                durable_role: "primary_target".to_string(),
+                importance_score: 1.0,
+                first_seen_frame_id: Some("1664".to_string()),
+                last_seen_frame_id: Some("1664".to_string()),
+            }],
+            last_meaningful_action: Some(youtube_action.clone()),
+            open_loops: Vec::new(),
+        };
+        let smalltalk_workstream = ScorerWorkstream {
+            id: "workstream-smalltalk".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("smalltalk".to_string()),
+            primary_artifact_id: Some(smalltalk.id.clone()),
+            last_active_timestamp_ms: 2_000,
+            confidence: 0.86,
+            unresolved_signal: Some("visible_error_or_failure".to_string()),
+            episodes: vec![ScorerEpisode {
+                id: "episode-smalltalk".to_string(),
+                end_frame_id: Some("1667".to_string()),
+                end_timestamp_ms: 2_000,
+                dominant_action_kind: Some("encountering_error".to_string()),
+                evidence_quality: "medium".to_string(),
+            }],
+            artifacts: vec![ScorerWorkstreamArtifact {
+                artifact: smalltalk.clone(),
+                durable_role: "primary_target".to_string(),
+                importance_score: 1.0,
+                first_seen_frame_id: Some("1667".to_string()),
+                last_seen_frame_id: Some("1667".to_string()),
+            }],
+            last_meaningful_action: Some(smalltalk_action.clone()),
+            open_loops: Vec::new(),
+        };
+        let focus = ContinueFocusSummary {
+            frame_id: "1667".to_string(),
+            artifact_id: Some(smalltalk.id.clone()),
+            artifact_kind: Some("code_editor".to_string()),
+            app_name: Some("smalltalk".to_string()),
+            window_title: Some("smalltalk".to_string()),
+            title: Some("smalltalk".to_string()),
+            browser_url: None,
+            document_path: None,
+            captured_at_ms: 2_000,
+        };
+        let mut candidates = vec![
+            ScoredContinueCandidate {
+                id: "candidate-youtube".to_string(),
+                workstream_id: youtube_workstream.id.clone(),
+                target_artifact: Some(youtube),
+                candidate_kind: "resolve_error".to_string(),
+                last_meaningful_action: Some(youtube_action),
+                evidence_frame_id: Some("1664".to_string()),
+                supporting_episode_id: Some("episode-youtube".to_string()),
+                pre_cap_score: 0.0,
+                score: 0.0,
+                actionability_score: 0.0,
+                primary_target_score: 0.0,
+                unresolved_score: 0.0,
+                branch_origin_score: 0.0,
+                evidence_quality_score: 0.0,
+                recency_score: 0.0,
+                openability_score: 0.0,
+                privacy_safety_score: 0.0,
+                reason: Some("recent_progress_still_open".to_string()),
+                missing_evidence: Vec::new(),
+                warnings: Vec::new(),
+                risk_flags: Vec::new(),
+                score_caps_applied: Vec::new(),
+                eligible_for_primary_selection: true,
+                selection_demotion_reason: None,
+                resume_work_target: None,
+                open_loop: None,
+            },
+            ScoredContinueCandidate {
+                id: "candidate-smalltalk".to_string(),
+                workstream_id: smalltalk_workstream.id.clone(),
+                target_artifact: Some(smalltalk),
+                candidate_kind: "resolve_error".to_string(),
+                last_meaningful_action: Some(smalltalk_action),
+                evidence_frame_id: Some("1667".to_string()),
+                supporting_episode_id: Some("episode-smalltalk".to_string()),
+                pre_cap_score: 0.0,
+                score: 0.0,
+                actionability_score: 0.0,
+                primary_target_score: 0.0,
+                unresolved_score: 0.0,
+                branch_origin_score: 0.0,
+                evidence_quality_score: 0.0,
+                recency_score: 0.0,
+                openability_score: 0.0,
+                privacy_safety_score: 0.0,
+                reason: Some("recent_progress_still_open".to_string()),
+                missing_evidence: Vec::new(),
+                warnings: Vec::new(),
+                risk_flags: Vec::new(),
+                score_caps_applied: Vec::new(),
+                eligible_for_primary_selection: true,
+                selection_demotion_reason: None,
+                resume_work_target: None,
+                open_loop: None,
+            },
+        ];
+        let workstreams = vec![youtube_workstream, smalltalk_workstream];
+
+        score_continue_candidates(&mut candidates, &workstreams, Some(&focus));
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(candidates[0].id, "candidate-smalltalk");
+        let youtube_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-youtube")
+            .unwrap();
+        assert!(!youtube_candidate.eligible_for_primary_selection);
+        assert!(youtube_candidate
+            .score_caps_applied
+            .contains(&"score_capped:media_tab_resolve_error_without_owned_error".to_string()));
+        assert!(youtube_candidate.score <= 0.35);
     }
 
     #[test]
@@ -14726,6 +17555,254 @@ mod tests {
         assert!(handoff
             .last_state_line
             .contains("not have enough local evidence"));
+    }
+
+    #[test]
+    fn thin_gemini_focus_handoff_does_not_expose_candidate_id() {
+        let mut candidate = test_candidate("resolve_error", None, None, None);
+        candidate.id = "continue-candidate-6afa36c62303d2af".to_string();
+        candidate.score = 0.39;
+        candidate.evidence_quality_score = 0.2;
+        candidate.missing_evidence = vec!["frame_fallback".to_string()];
+        let focus = ContinueFocusSummary {
+            frame_id: "1658".to_string(),
+            artifact_id: Some("artifact-focus".to_string()),
+            artifact_kind: Some("browser_tab".to_string()),
+            app_name: Some("Helium".to_string()),
+            window_title: Some(
+                "Napoleon's Fearful Presence on Battlefield - Google Gemini - Helium".to_string(),
+            ),
+            title: Some(
+                "Napoleon's Fearful Presence on Battlefield - Google Gemini - Helium".to_string(),
+            ),
+            browser_url: None,
+            document_path: None,
+            captured_at_ms: 1_658,
+        };
+
+        let handoff = compose_continue_handoff(
+            Some(&focus),
+            None,
+            Some(&candidate),
+            Some("Inspect the smalltalk target and address the visible failure."),
+            0.39,
+            &candidate.missing_evidence,
+            &candidate.warnings,
+            &[],
+            None,
+            None,
+            &ContinueOutputMode::ThinContinue,
+        );
+
+        let joined = format!(
+            "{} {} {} {} {}",
+            handoff.headline,
+            handoff.return_line,
+            handoff.current_focus_line,
+            handoff.last_state_line,
+            handoff.user_visible_uncertainty.clone().unwrap_or_default()
+        );
+        assert!(!joined.contains("continue-candidate-"));
+        assert!(!joined.to_lowercase().contains("target metadata"));
+        assert!(handoff.return_line.contains("No reliable return target"));
+        assert!(handoff
+            .user_visible_uncertainty
+            .as_deref()
+            .unwrap_or("")
+            .contains("Gemini chat"));
+    }
+
+    #[test]
+    fn model_handoff_with_internal_candidate_id_is_rejected() {
+        let output = ContinueMicroInferenceOutput {
+            result: "selected_candidate".to_string(),
+            selected_candidate_id: Some("continue-candidate-6afa36c62303d2af".to_string()),
+            selected_workstream_id: Some("workstream-test".to_string()),
+            intent_label: "Smalltalk error loop".to_string(),
+            headline: "Continue the open smalltalk error/failure loop".to_string(),
+            return_line: "Return to continue-candidate-6afa36c62303d2af.".to_string(),
+            current_focus_line: "Current focus is the Gemini page.".to_string(),
+            last_state_line: "The workstream is suspended.".to_string(),
+            next_action: Some("Inspect the smalltalk target.".to_string()),
+            why_this: vec!["The target is frame-fallback identified.".to_string()],
+            missing_evidence_line: Some("Target metadata is thin.".to_string()),
+            reason: "model leaked internal candidate id".to_string(),
+            confidence: "medium".to_string(),
+            user_visible_uncertainty: Some("Target metadata is thin.".to_string()),
+            uncertainty_notes: None,
+            missing_evidence: Vec::new(),
+            recommended_local_capture: None,
+        };
+
+        assert!(model_output_contains_internal_reference(&output));
+    }
+
+    #[test]
+    fn soft_micro_inference_validation_preserves_valid_candidate_choice() {
+        let target = test_artifact("artifact-smalltalk", "code_editor", "smalltalk");
+        let action = test_action(&target.id, "encountering_error");
+        let open_loop = test_open_loop(&target.id, "error_without_resolution");
+        let mut candidate =
+            test_candidate("resolve_error", Some(target), Some(action), Some(open_loop));
+        candidate.id = "continue-candidate-smalltalk".to_string();
+        candidate.workstream_id = "workstream-smalltalk".to_string();
+        candidate.score = 0.55;
+        candidate.evidence_quality_score = 0.44;
+        candidate.missing_evidence = vec!["no_direct_url_or_document_path".to_string()];
+        candidate.eligible_for_primary_selection = true;
+        let pack = micro_pack_for_candidate(&candidate);
+        let mut output = selected_candidate_model_output(&candidate);
+        output.confidence = "high".to_string();
+        output.return_line = "Return to continue-candidate-smalltalk.".to_string();
+
+        let failures = validate_micro_inference_output(&output, &[candidate.clone()], &pack)
+            .expect_err("unsafe copy and high confidence should fail validation");
+        let classification = classify_micro_inference_validation_failures(
+            &output,
+            &[candidate.clone()],
+            &pack,
+            &failures,
+        );
+
+        assert!(classification.recoverable);
+        assert_eq!(
+            classification
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.id.as_str()),
+            Some("continue-candidate-smalltalk")
+        );
+        assert!(classification.hard_failures.is_empty());
+        assert!(classification
+            .soft_failures
+            .contains(&"model_output_contains_internal_reference".to_string()));
+        assert!(classification
+            .soft_failures
+            .contains(&"high_confidence_with_thin_local_evidence".to_string()));
+        let gate = quality_gate_for_test(&candidate, None);
+        let recovered_confidence = confidence_for_soft_recovered_micro_inference(
+            &output.confidence,
+            &candidate,
+            &gate,
+            &classification.soft_failures,
+        );
+        assert!(recovered_confidence <= 0.49);
+    }
+
+    #[test]
+    fn soft_micro_inference_recovery_keeps_model_selected_smalltalk_over_local_top_media() {
+        let mut youtube_target = test_artifact(
+            "artifact-youtube",
+            "browser_tab",
+            "Thomas Newman Any Other Name - YouTube - Helium",
+        );
+        youtube_target.browser_url = Some("https://www.youtube.com/shorts/0SMgxlv0Mfc".to_string());
+        youtube_target.openability = "openable".to_string();
+        let mut youtube_candidate =
+            test_candidate("resolve_error", Some(youtube_target), None, None);
+        youtube_candidate.id = "continue-candidate-youtube".to_string();
+        youtube_candidate.workstream_id = "workstream-youtube".to_string();
+        youtube_candidate.score = 0.68;
+
+        let mut smalltalk_target = test_artifact("artifact-smalltalk", "code_editor", "smalltalk");
+        smalltalk_target.openability = "frame_fallback".to_string();
+        let smalltalk_action = test_action(&smalltalk_target.id, "encountering_error");
+        let smalltalk_open_loop = test_open_loop(&smalltalk_target.id, "error_without_resolution");
+        let mut smalltalk_candidate = test_candidate(
+            "resolve_error",
+            Some(smalltalk_target),
+            Some(smalltalk_action),
+            Some(smalltalk_open_loop),
+        );
+        smalltalk_candidate.id = "continue-candidate-smalltalk".to_string();
+        smalltalk_candidate.workstream_id = "workstream-smalltalk".to_string();
+        smalltalk_candidate.score = 0.55;
+        smalltalk_candidate.evidence_quality_score = 0.44;
+        smalltalk_candidate.missing_evidence = vec!["no_direct_url_or_document_path".to_string()];
+        smalltalk_candidate.eligible_for_primary_selection = true;
+
+        let candidates = vec![youtube_candidate, smalltalk_candidate.clone()];
+        let pack = micro_pack_for_candidates(&candidates);
+        let mut output = selected_candidate_model_output(&smalltalk_candidate);
+        output.confidence = "high".to_string();
+        output.reason =
+            "The workstream-b7dd58dd55cfcc46 points to the unresolved Smalltalk branch."
+                .to_string();
+
+        let failures = validate_micro_inference_output(&output, &candidates, &pack)
+            .expect_err("unsafe model copy should fail validation");
+        let classification =
+            classify_micro_inference_validation_failures(&output, &candidates, &pack, &failures);
+
+        assert!(classification.recoverable);
+        assert_eq!(
+            classification
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.id.as_str()),
+            Some("continue-candidate-smalltalk")
+        );
+        assert_ne!(
+            classification
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.id.as_str()),
+            Some("continue-candidate-youtube")
+        );
+        assert!(classification
+            .soft_failures
+            .contains(&"model_output_contains_internal_reference".to_string()));
+    }
+
+    #[test]
+    fn soft_micro_inference_recovery_requires_candidate_sent_to_model() {
+        let target = test_artifact("artifact-smalltalk", "code_editor", "smalltalk");
+        let mut candidate = test_candidate("continue_edit", Some(target), None, None);
+        candidate.id = "continue-candidate-known".to_string();
+        candidate.workstream_id = "workstream-known".to_string();
+        candidate.score = 0.65;
+        let pack = ContinueMicroInferencePack {
+            schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
+            instructions: "test".to_string(),
+            current_focus: None,
+            workstreams: Vec::new(),
+            candidates: Vec::new(),
+            evidence_packs_v2: Vec::new(),
+            artifact_roles: Vec::new(),
+            breadcrumbs: Vec::new(),
+        };
+        let mut output = selected_candidate_model_output(&candidate);
+        output.return_line = "Return to continue-candidate-known.".to_string();
+
+        let failures = validate_micro_inference_output(&output, &[candidate.clone()], &pack)
+            .expect_err("candidate outside the model pack should fail validation");
+        let classification =
+            classify_micro_inference_validation_failures(&output, &[candidate], &pack, &failures);
+
+        assert!(!classification.recoverable);
+        assert!(classification
+            .hard_failures
+            .contains(&"selected_candidate_not_sent_to_model".to_string()));
+    }
+
+    #[test]
+    fn soft_micro_inference_recovery_rejects_unknown_candidate_id() {
+        let target = test_artifact("artifact-known", "code_editor", "lib.rs");
+        let candidate = test_candidate("continue_edit", Some(target), None, None);
+        let pack = micro_pack_for_candidate(&candidate);
+        let mut output = selected_candidate_model_output(&candidate);
+        output.selected_candidate_id = Some("continue-candidate-invented".to_string());
+        output.return_line = "Return to continue-candidate-invented.".to_string();
+
+        let failures = validate_micro_inference_output(&output, &[candidate.clone()], &pack)
+            .expect_err("unknown selected candidate should fail validation");
+        let classification =
+            classify_micro_inference_validation_failures(&output, &[candidate], &pack, &failures);
+
+        assert!(!classification.recoverable);
+        assert!(classification.hard_failures.iter().any(|failure| {
+            failure.starts_with("selected_candidate_id_not_in_pack:continue-candidate-invented")
+        }));
     }
 
     #[test]
@@ -14949,6 +18026,8 @@ mod tests {
               focused INTEGER NOT NULL DEFAULT 1,
               capture_trigger TEXT NOT NULL,
               text_source TEXT,
+              scope TEXT,
+              window_id INTEGER,
               accessibility_text TEXT,
               accessibility_tree_json TEXT,
               full_text TEXT,
@@ -14957,7 +18036,8 @@ mod tests {
               created_at INTEGER NOT NULL,
               app_bundle_id TEXT,
               privacy_status TEXT,
-              previous_frame_id TEXT
+              previous_frame_id TEXT,
+              active_window_crop_path TEXT
             );
             CREATE TABLE app_contexts (
               id TEXT PRIMARY KEY,
@@ -14976,13 +18056,56 @@ mod tests {
             CREATE TABLE content_units (
               id TEXT PRIMARY KEY,
               frame_id TEXT NOT NULL,
+              window_id INTEGER,
               source TEXT NOT NULL,
               unit_type TEXT NOT NULL,
               semantic_role TEXT,
               text TEXT,
               text_hash TEXT,
+              ocr_span_ids TEXT,
+              bounds_x REAL,
+              bounds_y REAL,
+              bounds_w REAL,
+              bounds_h REAL,
               confidence REAL,
               created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE ocr_spans (
+              id TEXT PRIMARY KEY,
+              frame_id TEXT NOT NULL,
+              engine TEXT NOT NULL,
+              text TEXT NOT NULL,
+              confidence REAL,
+              line_index INTEGER,
+              word_index INTEGER,
+              bounds_x REAL NOT NULL,
+              bounds_y REAL NOT NULL,
+              bounds_w REAL NOT NULL,
+              bounds_h REAL NOT NULL
+            );
+            CREATE TABLE window_snapshots (
+              id TEXT PRIMARY KEY,
+              frame_id TEXT,
+              ts_ms INTEGER NOT NULL,
+              active_window_id INTEGER,
+              active_app_bundle_id TEXT,
+              screen_count INTEGER
+            );
+            CREATE TABLE windows (
+              id TEXT PRIMARY KEY,
+              window_snapshot_id TEXT NOT NULL,
+              cg_window_id INTEGER,
+              owner_name TEXT,
+              bundle_id TEXT,
+              window_title TEXT,
+              layer INTEGER,
+              alpha REAL,
+              is_onscreen INTEGER,
+              is_active INTEGER,
+              bounds_x REAL,
+              bounds_y REAL,
+              bounds_w REAL,
+              bounds_h REAL
             );
             CREATE TABLE ui_events (
               id TEXT PRIMARY KEY,
@@ -15082,9 +18205,10 @@ mod tests {
                 id, session_id, captured_at, snapshot_path, app_name, window_name,
                 browser_url, document_path, capture_trigger, text_source, full_text,
                 content_hash, image_hash, created_at, app_bundle_id, privacy_status,
-                previous_frame_id
+                previous_frame_id, scope, window_id, active_window_crop_path
              ) VALUES (?1, 'session-a', ?2, '/tmp/frame.jpg', ?3, ?4, ?5, ?6,
-                       ?7, 'accessibility', ?8, ?9, ?10, ?2, ?11, 'normal', ?12)",
+                       ?7, 'accessibility', ?8, ?9, ?10, ?2, ?11, 'normal', ?12,
+                       'active_window', ?13, '/tmp/active-window.jpg')",
             params![
                 id,
                 id * 1000,
@@ -15098,6 +18222,7 @@ mod tests {
                 format!("image-{}", id),
                 bundle_id,
                 previous_frame_id.map(|value| value.to_string()),
+                id,
             ],
         )
         .unwrap();
@@ -15150,6 +18275,105 @@ mod tests {
                 text,
                 stable_hash(text.as_bytes()),
                 frame_id * 1000,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_ocr_span(
+        conn: &Connection,
+        frame_id: i64,
+        index: i64,
+        text: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO ocr_spans (
+                id, frame_id, engine, text, confidence, line_index, word_index,
+                bounds_x, bounds_y, bounds_w, bounds_h
+             ) VALUES (?1, ?2, 'AppleVision', ?3, 1.0, ?4, 0, ?5, ?6, ?7, ?8)",
+            params![
+                format!("ocr-{}-{}", frame_id, index),
+                frame_id.to_string(),
+                text,
+                index,
+                x,
+                y,
+                w,
+                h,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_window(
+        conn: &Connection,
+        frame_id: i64,
+        owner_name: &str,
+        bundle_id: &str,
+        title: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        is_active: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO window_snapshots (
+                id, frame_id, ts_ms, active_window_id, active_app_bundle_id, screen_count
+             ) VALUES (?1, ?2, ?3, NULL, ?4, 2)",
+            params![
+                format!("window-snapshot-{}", frame_id),
+                frame_id.to_string(),
+                frame_id * 1000,
+                if is_active { Some(bundle_id) } else { None },
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO windows (
+                id, window_snapshot_id, cg_window_id, owner_name, bundle_id, window_title,
+                layer, alpha, is_onscreen, is_active, bounds_x, bounds_y, bounds_w, bounds_h
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1.0, 1, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                format!("window-{}-{}", frame_id, stable_hash(title.as_bytes())),
+                format!("window-snapshot-{}", frame_id),
+                frame_id * 100 + if is_active { 1 } else { 2 },
+                owner_name,
+                bundle_id,
+                title,
+                if is_active { 1 } else { 0 },
+                x,
+                y,
+                w,
+                h,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn set_frame_capture_scope(
+        conn: &Connection,
+        frame_id: i64,
+        text_source: &str,
+        scope: &str,
+        window_id: Option<i64>,
+        active_window_crop_path: Option<&str>,
+    ) {
+        conn.execute(
+            "UPDATE frames
+             SET text_source = ?2, scope = ?3, window_id = ?4, active_window_crop_path = ?5
+             WHERE id = ?1",
+            params![
+                frame_id,
+                text_source,
+                scope,
+                window_id,
+                active_window_crop_path,
             ],
         )
         .unwrap();
@@ -15301,10 +18525,528 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn active_display_ocr_from_code_window_does_not_make_youtube_primary_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        let youtube_title =
+            "(26) Thomas Newman Any Other Name American Beauty #shorts - YouTube - Helium";
+        insert_frame(
+            &conn,
+            1664,
+            "Helium",
+            youtube_title,
+            Some("https://www.youtube.com/shorts/0SMgxlv0Mfc"),
+            None,
+            "event_burst",
+            "information about this error, try\nrustc --explain E0425\ncould not compile smalltalk",
+            Some("net.imput.helium"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1664,
+            "browser_tab",
+            youtube_title,
+            Some("https://www.youtube.com/shorts/0SMgxlv0Mfc"),
+            None,
+            None,
+        );
+        set_frame_capture_scope(&conn, 1664, "hybrid", "active_display", None, None);
+        insert_test_window(
+            &conn,
+            1664,
+            "Helium",
+            "net.imput.helium",
+            youtube_title,
+            -2619.0,
+            31.0,
+            2560.0,
+            1409.0,
+            true,
+        );
+        insert_test_window(
+            &conn,
+            1664,
+            "Code",
+            "com.microsoft.VSCode",
+            "index.html - smalltalk",
+            786.0,
+            142.0,
+            1440.0,
+            869.0,
+            false,
+        );
+        insert_test_window(
+            &conn,
+            1664,
+            "Codex",
+            "com.openai.codex",
+            "Codex",
+            565.0,
+            301.0,
+            1440.0,
+            967.0,
+            false,
+        );
+        insert_ocr_span(
+            &conn,
+            1664,
+            121,
+            "information about this error, try",
+            1655.0,
+            443.0,
+            245.0,
+            18.0,
+        );
+        insert_ocr_span(
+            &conn,
+            1664,
+            122,
+            "rustc --explain E0425",
+            1655.0,
+            466.0,
+            245.0,
+            18.0,
+        );
+        insert_ocr_span(
+            &conn,
+            1664,
+            123,
+            "could not compile smalltalk",
+            1655.0,
+            489.0,
+            245.0,
+            18.0,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let youtube_errors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_task_actions ta
+                 JOIN continue_artifacts a ON a.id = ta.artifact_id
+                 WHERE ta.action_kind = 'encountering_error'
+                   AND ta.action_role = 'primary'
+                   AND a.browser_url LIKE '%youtube.com/shorts%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(youtube_errors, 0);
+        let youtube_terminal_deltas: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_task_actions ta
+                 JOIN continue_artifacts a ON a.id = ta.artifact_id
+                 WHERE ta.semantic_delta_kind = 'terminal_error'
+                   AND a.browser_url LIKE '%youtube.com/shorts%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(youtube_terminal_deltas, 0);
+        let resolve_youtube_candidates: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_candidates c
+                 JOIN continue_artifacts a ON a.id = c.target_artifact_id
+                 WHERE c.candidate_kind = 'resolve_error'
+                   AND a.browser_url LIKE '%youtube.com/shorts%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolve_youtube_candidates, 0);
+        let youtube_blocker_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE wa.durable_role = 'blocker_surface'
+                   AND a.browser_url LIKE '%youtube.com/shorts%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(youtube_blocker_roles, 0);
+        let (
+            action_kind,
+            action_role,
+            confidence,
+            span_ids,
+            attribution,
+            attr_conf,
+            context,
+            flags,
+        ): (String, String, f64, String, String, f64, String, String) = conn
+            .query_row(
+                "SELECT action_kind, action_role, confidence, evidence_span_ids_json,
+                        evidence_attribution_json, attribution_confidence,
+                        classifier_context_json, quality_flags_json
+                 FROM continue_task_actions
+                 WHERE frame_id = '1664'
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(action_kind, "reviewing_output");
+        assert_eq!(action_role, "support");
+        assert!(confidence <= 0.42);
+        assert!(span_ids.contains("ocr-1664-121"));
+        assert!(attr_conf <= 0.20);
+        assert!(attribution.contains("active_display"));
+        assert!(attribution.contains("other_window_owned"));
+        assert!(context.contains("blocked_primary_action_for_target_artifact"));
+        assert!(flags.contains("ocr_inside_other_window"));
+        assert!(flags.contains("media_or_background_target"));
+
+        let recent_actions = recent_continue_task_actions(&conn, Some(20)).unwrap();
+        let recent = recent_actions
+            .iter()
+            .find(|action| action.frame_id == "1664")
+            .expect("recent action for contaminated frame");
+        assert_eq!(recent.action_kind, "reviewing_output");
+        assert_eq!(recent.action_role, "support");
+        assert!(recent
+            .evidence_span_ids
+            .contains(&"ocr-1664-121".to_string()));
+        assert_eq!(recent.attribution_confidence, Some(0.0));
+        assert_eq!(
+            recent
+                .evidence_attribution
+                .as_ref()
+                .and_then(|value| value.get("frame_scope"))
+                .and_then(Value::as_str),
+            Some("active_display")
+        );
+        assert_eq!(
+            recent
+                .classifier_context
+                .as_ref()
+                .and_then(|value| value.get("decision"))
+                .and_then(Value::as_str),
+            Some("blocked_primary_action_for_target_artifact")
+        );
+        assert!(recent
+            .quality_flags
+            .contains(&"ocr_inside_other_window".to_string()));
+
+        let decision = generate_local_decision(&conn);
+        let trace = get_continue_decision_trace(
+            &conn,
+            ContinueDecisionTraceInput {
+                decision_id: decision.decision_id,
+                include_evidence_snippets: Some(false),
+                max_rows_per_section: Some(20),
+            },
+        )
+        .unwrap();
+        let trace_action = trace
+            .task_actions
+            .iter()
+            .find(|action| action.frame_id == "1664")
+            .expect("trace action for contaminated frame");
+        assert!(trace_action
+            .evidence_span_ids
+            .contains(&"ocr-1664-121".to_string()));
+        assert_eq!(
+            trace_action
+                .classifier_context
+                .as_ref()
+                .and_then(|value| value.get("decision"))
+                .and_then(Value::as_str),
+            Some("blocked_primary_action_for_target_artifact")
+        );
+    }
+
+    #[test]
+    fn active_display_unattributed_ocr_error_is_capped_and_non_primary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            10,
+            "Helium",
+            "Reference page - Helium",
+            Some("https://example.com/reference"),
+            None,
+            "event_burst",
+            "error: something failed",
+            Some("net.imput.helium"),
+            None,
+        );
+        insert_context(
+            &conn,
+            10,
+            "browser_tab",
+            "Reference page",
+            Some("https://example.com/reference"),
+            None,
+            None,
+        );
+        set_frame_capture_scope(&conn, 10, "ocr", "active_display", None, None);
+        insert_ocr_span(
+            &conn,
+            10,
+            1,
+            "error: something failed",
+            600.0,
+            300.0,
+            220.0,
+            20.0,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let (action_kind, action_role, confidence, span_ids, flags): (
+            String,
+            String,
+            f64,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT action_kind, action_role, confidence, evidence_span_ids_json,
+                        quality_flags_json
+                 FROM continue_task_actions
+                 WHERE frame_id = '10'
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(action_kind, "reviewing_output");
+        assert_ne!(action_role, "primary");
+        assert!(confidence <= 0.45);
+        assert!(span_ids.contains("ocr-10-1"));
+        assert!(flags.contains("missing_active_window_id"));
+        assert!(flags.contains("missing_active_window_crop"));
+        assert!(flags.contains("display_only_unattributed"));
+    }
+
+    #[test]
+    fn active_code_window_ocr_rust_error_still_creates_primary_terminal_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Code",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/src/lib.rs"),
+            "event_burst",
+            "error[E0425]\ncould not compile smalltalk\nRunning cargo check",
+            Some("com.microsoft.VSCode"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/src/lib.rs"),
+            None,
+        );
+        set_frame_capture_scope(
+            &conn,
+            1,
+            "ocr",
+            "active_display",
+            Some(44),
+            Some("/tmp/code-active.jpg"),
+        );
+        insert_test_window(
+            &conn,
+            1,
+            "Code",
+            "com.microsoft.VSCode",
+            "lib.rs - smalltalk",
+            100.0,
+            100.0,
+            1200.0,
+            900.0,
+            true,
+        );
+        insert_ocr_span(&conn, 1, 1, "error[E0425]", 200.0, 220.0, 300.0, 20.0);
+        insert_ocr_span(
+            &conn,
+            1,
+            2,
+            "could not compile smalltalk",
+            200.0,
+            245.0,
+            380.0,
+            20.0,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        assert_eq!(action_kind_for_frame(&conn, 1), "encountering_error");
+        assert_eq!(
+            action_semantic_delta(&conn, 1).0,
+            Some("terminal_error".to_string())
+        );
+        let (role, confidence, source_kind, attribution, flags): (
+            String,
+            f64,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT action_role, confidence, evidence_source_kind,
+                        evidence_attribution_json, quality_flags_json
+                 FROM continue_task_actions
+                 WHERE frame_id = '1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(role, "primary");
+        assert!(confidence >= 0.75);
+        assert_eq!(source_kind, "ocr_span");
+        assert!(attribution.contains("artifact_owned"));
+        assert!(!flags.contains("ocr_inside_other_window"));
+        assert!(!flags.contains("display_only_unattributed"));
+    }
+
+    #[test]
+    fn smalltalk_continue_card_echo_cannot_create_terminal_error_action() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "smalltalk",
+            "smalltalk",
+            None,
+            None,
+            "manual",
+            "Continue answer\nLocal fallback\nLast meaningful state: Terminal error on smalltalk\nMissing or weak evidence: Evidence is thin.",
+            Some("com.smalltalk.app"),
+            None,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let error_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_task_actions
+                 WHERE action_kind = 'encountering_error'
+                    OR semantic_delta_kind = 'terminal_error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error_count, 0);
+        let (action_kind, action_role, reason, flags): (String, String, String, String) = conn
+            .query_row(
+                "SELECT action_kind, action_role, reason, quality_flags_json
+                 FROM continue_task_actions
+                 WHERE frame_id = '1'
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(action_kind, "unknown");
+        assert_eq!(action_role, "support");
+        assert_eq!(reason, "smalltalk_product_ui_echo");
+        assert!(flags.contains("smalltalk_self_output"));
+        assert!(flags.contains("product_ui_echo"));
+    }
+
+    #[test]
+    fn verification_passed_text_suppresses_error_mentions() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Code",
+            "continue-output-audit - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/docs/audit.md"),
+            "manual",
+            "Implemented the audit reliability plan.\nVerification passed:\ncargo test continue_output_audit\ncargo check passed\ncargo test 140 passed\nfailures recorded in raw/export_errors.json\nstatus/error artifacts",
+            Some("com.microsoft.VSCode"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "continue-output-audit - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/docs/audit.md"),
+            None,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let error_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_task_actions
+                 WHERE action_kind = 'encountering_error'
+                    OR semantic_delta_kind = 'terminal_error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error_count, 0);
+        let (action_kind, action_role, reason, context): (String, String, String, String) = conn
+            .query_row(
+                "SELECT action_kind, action_role, reason, classifier_context_json
+                 FROM continue_task_actions
+                 WHERE frame_id = '1'
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(action_kind, "reviewing_output");
+        assert_eq!(action_role, "support");
+        assert_eq!(reason, "resolved_or_verification_context");
+        assert!(context.contains("suppressed_resolved_or_verification_output"));
     }
 
     #[test]
@@ -16661,6 +20403,7 @@ mod tests {
                 lookback_ms: None,
                 limit: Some(50),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16693,6 +20436,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn continue_decision_defaults_to_bounded_micro_inference() {
+        let request = ContinueDecisionRequest::default();
+        assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.max_candidates_for_model, Some(5));
     }
 
     #[test]
@@ -16729,6 +20479,7 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("rebuild".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16742,6 +20493,7 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16805,11 +20557,150 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
         .unwrap();
         assert!(!invalidated.cache_hit);
+    }
+
+    #[test]
+    fn default_micro_inference_missing_key_falls_back_and_caches() {
+        if continue_openai_config(None)
+            .unwrap()
+            .api_key
+            .as_deref()
+            .is_some()
+        {
+            return;
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+
+        let first = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("rebuild".to_string()),
+                rebuild_layers: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!first.cache_hit);
+        assert_eq!(first.source, "local_fallback");
+        assert!(first.response_id.is_none());
+        assert!(first
+            .validation_failures
+            .iter()
+            .any(|failure| failure == "OPENAI_API_KEY is not set"));
+
+        let cached = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("normal".to_string()),
+                rebuild_layers: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(cached.cache_hit);
+        assert_eq!(cached.decision_id, first.decision_id);
+        assert_eq!(cached.source, "local_fallback");
+        assert_eq!(cached.model, first.model);
+        assert_eq!(cached.response_id, first.response_id);
+        assert_eq!(cached.validation_status, first.validation_status);
+        assert_eq!(cached.handoff.headline, first.handoff.headline);
+
+        let persisted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn risky_validation_fallback_decision_is_not_reused_from_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        let decision = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("rebuild".to_string()),
+                rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let watermark = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+        conn.execute(
+            "UPDATE continue_decisions
+             SET source = 'local_fallback',
+                 validation_status = 'fallback',
+                 validation_notes = 'high_confidence_with_quality_gate_risks',
+                 warnings = 'micro_inference_validation_failed:high_confidence_with_quality_gate_risks',
+                 continue_output_mode = 'strong_continue',
+                 micro_inference_requested = 1,
+                 micro_inference_attempted = 1
+             WHERE id = ?1",
+            params![decision.decision_id],
+        )
+        .unwrap();
+
+        let cached =
+            fresh_cached_continue_decision(&conn, Some("session-a"), &watermark, true).unwrap();
+        assert!(cached.is_none());
     }
 
     #[test]
@@ -16843,6 +20734,7 @@ mod tests {
             ContinueDecisionRequest {
                 session_id: Some("session-a".to_string()),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16860,6 +20752,7 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16899,6 +20792,7 @@ mod tests {
             ContinueDecisionRequest {
                 session_id: Some("session-a".to_string()),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16934,6 +20828,7 @@ mod tests {
                 session_id: Some("session-a".to_string()),
                 mode: Some("normal".to_string()),
                 rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -16972,6 +20867,7 @@ mod tests {
             ContinueDecisionRequest {
                 session_id: Some("session-a".to_string()),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -17187,6 +21083,7 @@ mod tests {
                 lookback_ms: None,
                 limit: Some(50),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )
@@ -17233,6 +21130,7 @@ mod tests {
                 lookback_ms: None,
                 limit: Some(20),
                 rebuild_layers: Some(true),
+                micro_inference_enabled: Some(false),
                 ..Default::default()
             },
         )

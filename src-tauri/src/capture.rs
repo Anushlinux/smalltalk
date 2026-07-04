@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -284,6 +284,7 @@ pub struct RuntimeDiagnostics {
     pub continue_normal_calls: i64,
     pub continue_rebuild_calls: i64,
     pub decision_cache_hits: i64,
+    pub continue_output_audit_failures: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -624,6 +625,7 @@ struct AccessibilityNode {
 }
 
 const EVENT_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(100);
+const ISLAND_EVENT_STATUS_INTERVAL: Duration = Duration::from_millis(900);
 const MIN_IMPORTANT_CAPTURE_INTERVAL: Duration = Duration::from_secs(4);
 const MIN_LOW_VALUE_CAPTURE_INTERVAL: Duration = Duration::from_secs(45);
 const IDLE_CAPTURE_INTERVAL: Duration = Duration::from_secs(120);
@@ -637,7 +639,9 @@ const MAX_RETAINED_FRAME_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_RETAINED_CONTINUE_DECISION_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 const SMALLTALK_BUNDLE_ID: &str = "com.smalltalk.app";
 const LOCAL_SIGNAL_BUCKET_WINDOW_MS: i64 = 30_000;
-const MAX_LOCAL_SIGNAL_EVENTS: i64 = 5_000;
+const LOCAL_SIGNAL_RECENT_WINDOW_MS: i64 = 20 * 60 * 1000;
+const MAX_LOCAL_SIGNAL_EVENTS: i64 = 600;
+const MAX_VISIBLE_SIGNAL_MOMENTS: i64 = 48;
 
 #[derive(Debug, Clone, Default)]
 struct AccessibilityContext {
@@ -1123,6 +1127,8 @@ pub struct ResumeQueryBundle {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_rejected_anchors: Vec<ResumeQueryRejectedAnchor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_surface_context: Vec<ResumeQuerySurfaceContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_artifacts: Vec<ResumeQueryEvidenceFrame>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branch_evidence: Vec<ResumeQueryEvidenceFrame>,
@@ -1334,6 +1340,16 @@ pub struct ResumeQueryRejectedAnchor {
     pub semantic_role: String,
     pub surface_zone: String,
     pub reject_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeQuerySurfaceContext {
+    pub frame_id: String,
+    pub label: String,
+    pub context_kind: String,
+    pub source: String,
+    pub confidence: f64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2064,6 +2080,7 @@ pub fn dev_reset_local_memory(
     {
         clear_project_output_dir()?;
         clear_project_resume_query_dir()?;
+        clear_project_continue_outputs_dir()?;
     }
 
     {
@@ -2875,9 +2892,20 @@ pub fn get_continue_decision(
             increment_maintenance_counter(&conn, "continue_normal_calls", 1)?;
         }
     }
-    let result = crate::continuation::get_continue_decision(&conn, request)?;
+    let mut result = crate::continuation::get_continue_decision(&conn, request.clone())?;
     if result.cache_hit {
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
+    }
+    match schedule_continue_output_audit(&conn, &app, &request, effective_mode, &mut result) {
+        Ok(summary) => {
+            result.continue_output_path = Some(summary.path);
+        }
+        Err(error) => {
+            let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
+            result
+                .warnings
+                .push(format!("continue_output_audit_failed:{}", error));
+        }
     }
     Ok(result)
 }
@@ -2889,6 +2917,26 @@ pub fn get_continue_decision_trace(
 ) -> Result<crate::continuation::ContinueDecisionTrace, String> {
     let conn = open_db(&app)?;
     crate::continuation::get_continue_decision_trace(&conn, input)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContinueOutputExportSummary {
+    schema: String,
+    generated_at_ms: i64,
+    decision_id: String,
+    folder_name: String,
+    path: String,
+    file_count: i64,
+    byte_size: i64,
+    warning_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ContinueOutputAuditPlan {
+    generated_at_ms: i64,
+    session_label: String,
+    folder_name: String,
+    final_dir: PathBuf,
 }
 
 #[tauri::command]
@@ -3168,6 +3216,18 @@ fn build_resume_query_bundle_from_conn(
                 .find(|candidate| candidate.safe.frame_id == id)
         })
         .or_else(|| candidates.last());
+    let recent_surface_context = recent_surface_context_from_rejected_anchors(
+        &diagnostic_rejected_anchors,
+        current_focus_candidate
+            .map(resume_identity_title)
+            .as_deref(),
+    );
+    if !recent_surface_context.is_empty() {
+        push_unique(
+            &mut missing_evidence,
+            "other browser tabs were visible only as tab-strip context".to_string(),
+        );
+    }
     let fallback_resume_candidate =
         if candidate_can_be_resume_work_target(&base_resume_candidate.candidate) {
             base_resume_candidate.clone()
@@ -3440,6 +3500,7 @@ fn build_resume_query_bundle_from_conn(
         session_theme,
         candidate_anchors,
         diagnostic_rejected_anchors,
+        recent_surface_context,
         diagnostic_artifacts,
         branch_evidence,
         dropped_frame_summary,
@@ -9930,6 +9991,108 @@ fn candidate_anchors_for_cloud(
     (anchors, rejected)
 }
 
+fn recent_surface_context_from_rejected_anchors(
+    rejected: &[ResumeQueryRejectedAnchor],
+    current_title: Option<&str>,
+) -> Vec<ResumeQuerySurfaceContext> {
+    let current_key = current_title.map(normalized_line_key).unwrap_or_default();
+    let mut contexts = Vec::new();
+    let mut seen = HashSet::new();
+    for anchor in rejected {
+        if anchor.reject_reason != "surface_zone_browser_chrome"
+            || anchor.surface_zone != "browser_chrome"
+        {
+            continue;
+        }
+        if !anchor_looks_like_tab_strip(anchor) {
+            continue;
+        }
+        for label in tab_context_labels_from_text(&anchor.text_exact) {
+            let key = normalized_line_key(&label);
+            if key.is_empty()
+                || key == current_key
+                || (!current_key.is_empty() && current_key.contains(&key))
+                || !seen.insert(key)
+            {
+                continue;
+            }
+            contexts.push(ResumeQuerySurfaceContext {
+                frame_id: anchor.frame_id.clone(),
+                label,
+                context_kind: "briefly_visible_tab".to_string(),
+                source: anchor.source.clone(),
+                confidence: 0.42,
+                reason: "Seen only in browser tab-strip chrome; context, not a resume anchor."
+                    .to_string(),
+            });
+            if contexts.len() >= 6 {
+                return contexts;
+            }
+        }
+    }
+    contexts
+}
+
+fn anchor_looks_like_tab_strip(anchor: &ResumeQueryRejectedAnchor) -> bool {
+    let text = anchor.text_exact.to_lowercase();
+    if text.contains("memory usage") || text.contains(" - helium") {
+        return true;
+    }
+    anchor
+        .bbox
+        .as_ref()
+        .is_some_and(|bounds| bounds.y <= 96.0 && bounds.h <= 96.0)
+}
+
+fn tab_context_labels_from_text(text: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for chunk in text.split('|') {
+        let mut cleaned = chunk
+            .replace("•", " ")
+            .replace('\u{2026}', "...")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(index) = cleaned.to_lowercase().find(" - memory usage") {
+            cleaned.truncate(index);
+        }
+        cleaned = cleaned
+            .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch.is_whitespace())
+            .trim()
+            .to_string();
+        cleaned = collapse_repeated_tab_title(&cleaned);
+        let lower = cleaned.to_lowercase();
+        if cleaned.chars().count() < 4
+            || lower == "new tab"
+            || lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.contains("address and search")
+        {
+            continue;
+        }
+        let label = truncate_chars(&cleaned, 120);
+        if !label.is_empty() {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+fn collapse_repeated_tab_title(text: &str) -> String {
+    for marker in [
+        " 0 ", " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 ", " 9 ",
+    ] {
+        if let Some(index) = text.find(marker) {
+            let left = text[..index].trim();
+            let right = text[index + marker.len()..].trim();
+            if !left.is_empty() && normalized_line_key(left) == normalized_line_key(right) {
+                return left.to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
 fn push_rejected_resume_anchor(
     rejected: &mut Vec<ResumeQueryRejectedAnchor>,
     seen: &mut HashSet<String>,
@@ -13329,6 +13492,7 @@ fn capture_loop(
     let mut previous_semantic_fingerprint: Option<SemanticFingerprint> = None;
     let mut pending_trigger: Option<PendingTrigger> = None;
     let mut typing_burst = TypingBurstState::default();
+    let mut last_island_event_status_at: Option<Instant> = None;
     let mut event_source = match capture_paths(&app)
         .and_then(|paths| start_capture_event_source(&paths))
     {
@@ -13369,6 +13533,8 @@ fn capture_loop(
                         &raw_trigger,
                     ) {
                         update_error_and_island(&app, &state, error);
+                    } else {
+                        refresh_island_after_event(&app, &state, &mut last_island_event_status_at);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -13391,6 +13557,8 @@ fn capture_loop(
                     &raw_trigger,
                 ) {
                     update_error_and_island(&app, &state, error);
+                } else {
+                    refresh_island_after_event(&app, &state, &mut last_island_event_status_at);
                 }
             }
         }
@@ -13541,6 +13709,27 @@ fn capture_and_emit(
     } else {
         update_skip(state);
         Ok(false)
+    }
+}
+
+fn refresh_island_after_event(
+    app: &AppHandle,
+    state: &Arc<Mutex<CaptureRuntime>>,
+    last_refresh_at: &mut Option<Instant>,
+) {
+    if last_refresh_at
+        .as_ref()
+        .is_some_and(|last| last.elapsed() < ISLAND_EVENT_STATUS_INTERVAL)
+    {
+        return;
+    }
+    *last_refresh_at = Some(Instant::now());
+    if let Ok(status) = capture_status_snapshot_inner(app, state) {
+        let _ = app.emit("capture-status", status.clone());
+        crate::session_island::update_session_island_from_status(
+            &status,
+            crate::session_island::SessionIslandState::RecordingCompact,
+        );
     }
 }
 
@@ -15734,6 +15923,11 @@ fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
            SELECT ts_ms, event_type, key_category, {}, {}
            FROM ui_events
            WHERE (?1 IS NULL OR session_id = ?1)
+             AND ts_ms >= COALESCE((
+               SELECT MAX(ts_ms)
+               FROM ui_events
+               WHERE (?1 IS NULL OR session_id = ?1)
+             ), 0) - ?2
            ORDER BY ts_ms DESC
            LIMIT {}
          )
@@ -15742,7 +15936,7 @@ fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
     );
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
-        .query_map(params![session_id], |row| {
+        .query_map(params![session_id, LOCAL_SIGNAL_RECENT_WINDOW_MS], |row| {
             let event_type: String = row.get(1)?;
             let key_category: Option<String> = row.get(2)?;
             let app_name: Option<String> = row.get(3)?;
@@ -15756,7 +15950,7 @@ fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
         })
         .map_err(to_string)?;
     let rows = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
-    Ok(bucket_signal_events(&rows))
+    Ok(bucket_signal_events(&rows).min(MAX_VISIBLE_SIGNAL_MOMENTS))
 }
 
 fn bucket_signal_events(rows: &[SignalEventRow]) -> i64 {
@@ -16898,10 +17092,923 @@ struct ExportedImageArtifact {
     png_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct ExportStats {
     file_count: i64,
     byte_size: i64,
+}
+
+const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
+    "continue_schema_migrations",
+    "continue_artifacts",
+    "continue_artifact_observations",
+    "continue_semantic_moments",
+    "continue_task_actions",
+    "continue_task_action_events",
+    "continue_episodes",
+    "continue_episode_actions",
+    "continue_episode_artifacts",
+    "continue_workstreams",
+    "continue_workstream_episodes",
+    "continue_workstream_artifacts",
+    "continue_open_loops",
+    "continue_open_loop_artifacts",
+    "continue_open_loop_evidence",
+    "continue_boundary_revisions",
+    "continue_feedback_events",
+    "continue_breadcrumbs",
+];
+
+const CONTINUE_OUTPUT_CANDIDATE_TABLES: &[&str] = &["continue_candidates", "continue_decisions"];
+
+fn schedule_continue_output_audit(
+    conn: &Connection,
+    app: &AppHandle,
+    request: &crate::continuation::ContinueDecisionRequest,
+    effective_mode: &str,
+    result: &mut crate::continuation::ContinueDecisionResult,
+) -> Result<ContinueOutputExportSummary, String> {
+    let output_root = project_continue_outputs_root()?;
+    let plan = continue_output_audit_plan(conn, &output_root, request, effective_mode, result);
+    result.continue_output_path = Some(plan.final_dir.to_string_lossy().to_string());
+    let summary = ContinueOutputExportSummary {
+        schema: "smalltalk.continue_output.full_audit.v1".to_string(),
+        generated_at_ms: plan.generated_at_ms,
+        decision_id: result.decision_id.clone(),
+        folder_name: plan.folder_name.clone(),
+        path: plan.final_dir.to_string_lossy().to_string(),
+        file_count: 0,
+        byte_size: 0,
+        warning_count: 0,
+    };
+
+    let db_path = capture_paths(app)?.db_path;
+    let request = request.clone();
+    let effective_mode = effective_mode.to_string();
+    let mut audit_result = result.clone();
+    audit_result.continue_output_path = Some(summary.path.clone());
+    thread::spawn(move || {
+        let export_result = (|| -> Result<(), String> {
+            let conn = Connection::open(&db_path).map_err(to_string)?;
+            conn.busy_timeout(Duration::from_secs(5))
+                .map_err(to_string)?;
+            export_continue_output_audit_to_plan(
+                &conn,
+                &request,
+                &effective_mode,
+                &mut audit_result,
+                &plan,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = export_result {
+            eprintln!("[continue_output_audit] failed: {}", error);
+            if let Ok(conn) = Connection::open(&db_path) {
+                let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
+            }
+        }
+    });
+
+    Ok(summary)
+}
+
+fn continue_output_audit_plan(
+    conn: &Connection,
+    output_root: &Path,
+    request: &crate::continuation::ContinueDecisionRequest,
+    effective_mode: &str,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> ContinueOutputAuditPlan {
+    let generated_at_ms = now_millis();
+    let session_label = continue_output_session_label(conn, request, result)
+        .unwrap_or_else(|| "session-unknown".to_string());
+    let decision_label = short_sanitized_id(&result.decision_id, 18);
+    let mode_label = sanitize_id(effective_mode);
+    let folder_name = format!(
+        "{}__continue-{}__{}__{}",
+        session_label, generated_at_ms, mode_label, decision_label
+    );
+    ContinueOutputAuditPlan {
+        generated_at_ms,
+        session_label,
+        folder_name: folder_name.clone(),
+        final_dir: output_root.join(&folder_name),
+    }
+}
+
+fn continue_output_session_label(
+    conn: &Connection,
+    request: &crate::continuation::ContinueDecisionRequest,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Option<String> {
+    let session_id = request
+        .session_id
+        .clone()
+        .or_else(|| {
+            result
+                .current_focus
+                .as_ref()
+                .and_then(|focus| focus.frame_id.parse::<i64>().ok())
+                .and_then(|frame_id| frame_session_id(conn, frame_id).ok().flatten())
+        })
+        .or_else(|| {
+            result
+                .resume_work_target
+                .as_ref()
+                .or(result.return_target.as_ref())
+                .and_then(|target| target.fallback_frame_id.as_ref())
+                .and_then(|frame_id| frame_id.parse::<i64>().ok())
+                .and_then(|frame_id| frame_session_id(conn, frame_id).ok().flatten())
+        })
+        .or_else(|| latest_session_id(conn).ok().flatten())?;
+
+    let session_stem = load_capture_session(conn, &session_id)
+        .map(|session| session_folder_name(session.sequence))
+        .unwrap_or_else(|_| "session".to_string());
+    let session_id_stem = short_sanitized_id(&session_id, 16);
+    if session_id_stem.is_empty() {
+        Some(session_stem)
+    } else {
+        Some(format!("{}-{}", session_stem, session_id_stem))
+    }
+}
+
+fn short_sanitized_id(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_id(value);
+    if sanitized.chars().count() <= max_chars {
+        sanitized
+    } else {
+        sanitized.chars().take(max_chars).collect()
+    }
+}
+
+#[allow(dead_code)]
+fn export_continue_output_audit(
+    conn: &Connection,
+    request: &crate::continuation::ContinueDecisionRequest,
+    effective_mode: &str,
+    result: &mut crate::continuation::ContinueDecisionResult,
+) -> Result<ContinueOutputExportSummary, String> {
+    export_continue_output_audit_to_root(
+        conn,
+        request,
+        effective_mode,
+        result,
+        &project_continue_outputs_root()?,
+    )
+}
+
+#[allow(dead_code)]
+fn export_continue_output_audit_to_root(
+    conn: &Connection,
+    request: &crate::continuation::ContinueDecisionRequest,
+    effective_mode: &str,
+    result: &mut crate::continuation::ContinueDecisionResult,
+    output_root: &Path,
+) -> Result<ContinueOutputExportSummary, String> {
+    let plan = continue_output_audit_plan(conn, output_root, request, effective_mode, result);
+    export_continue_output_audit_to_plan(conn, request, effective_mode, result, &plan)
+}
+
+fn export_continue_output_audit_to_plan(
+    conn: &Connection,
+    request: &crate::continuation::ContinueDecisionRequest,
+    effective_mode: &str,
+    result: &mut crate::continuation::ContinueDecisionResult,
+    plan: &ContinueOutputAuditPlan,
+) -> Result<ContinueOutputExportSummary, String> {
+    crate::continuation::ensure_continue_schema(conn)?;
+    let generated_at = plan.generated_at_ms;
+    let folder_name = plan.folder_name.clone();
+    let final_dir = plan.final_dir.clone();
+    if let Some(output_root) = final_dir.parent() {
+        fs::create_dir_all(output_root).map_err(to_string)?;
+    }
+    if final_dir.exists() {
+        fs::remove_dir_all(&final_dir).map_err(to_string)?;
+    }
+    fs::create_dir_all(&final_dir).map_err(to_string)?;
+    result.continue_output_path = Some(final_dir.to_string_lossy().to_string());
+
+    let mut warnings = Vec::new();
+    let mut raw_errors = Vec::new();
+    let mut skipped_tables = Vec::new();
+    let mut raw_table_manifest = Vec::new();
+    let mut frame_manifests = Vec::new();
+    let mut layer_manifest = Vec::new();
+    let mut candidate_manifest = Vec::new();
+
+    let raw_dir = final_dir.join("raw");
+    let raw_tables_dir = raw_dir.join("tables");
+    let request_dir = final_dir.join("request");
+    let capture_frames_dir = final_dir.join("capture").join("frames");
+    let layers_dir = final_dir.join("continue").join("layers");
+    let candidates_dir = final_dir.join("continue").join("candidates");
+    let inference_dir = final_dir.join("inference");
+    let final_output_dir = final_dir.join("final");
+    for dir in [
+        &raw_tables_dir,
+        &request_dir,
+        &capture_frames_dir,
+        &layers_dir,
+        &candidates_dir,
+        &inference_dir,
+        &final_output_dir,
+    ] {
+        fs::create_dir_all(dir).map_err(to_string)?;
+    }
+
+    write_continue_export_status(
+        &final_dir,
+        "running",
+        "critical_started",
+        result,
+        &warnings,
+        &raw_errors,
+        &skipped_tables,
+    )?;
+    write_continue_disk_status(&final_dir.join("disk_status.json"), &final_dir)?;
+
+    write_json_pretty(
+        &request_dir.join("get_continue_decision_request.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_output.request.v1",
+            "effectiveMode": effective_mode,
+            "request": request,
+            "normalizedDefaults": {
+                "lookback_ms": request.lookback_ms.unwrap_or(45 * 60 * 1000),
+                "limit": request.limit.unwrap_or(700),
+                "mode": request.mode.as_deref().unwrap_or("normal"),
+                "rebuild_layers": request.rebuild_layers.unwrap_or(false),
+                "micro_inference_enabled": request.micro_inference_enabled.unwrap_or(true),
+                "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
+            }
+        }),
+    )?;
+
+    let inference_manifest =
+        export_continue_inference_events(&inference_dir, &result.audit_inference_events)?;
+    write_json_pretty(
+        &candidates_dir.join("selected_candidate.json"),
+        &selected_continue_candidate_json(conn, &result.decision_id)?,
+    )?;
+    write_json_pretty(
+        &candidates_dir.join("alternatives.json"),
+        &serde_json::to_value(&result.alternatives).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &candidates_dir.join("missing_evidence.json"),
+        &serde_json::to_value(&result.missing_evidence).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &candidates_dir.join("warnings.json"),
+        &serde_json::to_value(&result.warnings).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &final_output_dir.join("continue_decision_result.json"),
+        &serde_json::to_value(&result).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &final_output_dir.join("handoff.json"),
+        &serde_json::to_value(&result.handoff).map_err(to_string)?,
+    )?;
+    write_text_file(
+        &final_dir.join("explain.md"),
+        &continue_output_explain_markdown(result, 0, &inference_manifest),
+    )?;
+
+    write_continue_export_status(
+        &final_dir,
+        "running",
+        "critical_complete_raw_pending",
+        result,
+        &warnings,
+        &raw_errors,
+        &skipped_tables,
+    )?;
+    write_continue_output_manifest(
+        &final_dir,
+        generated_at,
+        &folder_name,
+        plan,
+        effective_mode,
+        result,
+        &raw_table_manifest,
+        &frame_manifests,
+        &layer_manifest,
+        &candidate_manifest,
+        &inference_manifest,
+        &warnings,
+        &raw_errors,
+        &skipped_tables,
+    )?;
+
+    match export_continue_table_group(conn, &layers_dir, CONTINUE_OUTPUT_LAYER_TABLES) {
+        Ok(manifest) => layer_manifest = manifest,
+        Err(error) => push_continue_raw_error(
+            &mut raw_errors,
+            &mut warnings,
+            "continue_layers",
+            "continue_layer_export_failed",
+            error,
+            None,
+        ),
+    }
+    match export_continue_table_group(conn, &candidates_dir, CONTINUE_OUTPUT_CANDIDATE_TABLES) {
+        Ok(manifest) => candidate_manifest = manifest,
+        Err(error) => push_continue_raw_error(
+            &mut raw_errors,
+            &mut warnings,
+            "continue_candidates",
+            "continue_candidate_export_failed",
+            error,
+            None,
+        ),
+    }
+
+    #[cfg(test)]
+    let force_raw_failure = effective_mode == "force_raw_failure_for_test";
+    #[cfg(not(test))]
+    let force_raw_failure = false;
+
+    if force_raw_failure {
+        push_continue_raw_error(
+            &mut raw_errors,
+            &mut warnings,
+            "raw_tables",
+            "forced_raw_table_failure",
+            "forced raw table failure for regression coverage".to_string(),
+            None,
+        );
+        skipped_tables.push(serde_json::json!({
+            "table": "*",
+            "reason": "forced_raw_table_failure"
+        }));
+    } else {
+        match copy_database_snapshot(conn, &raw_dir.join("smalltalk-capture.sqlite")) {
+            Ok(()) => {}
+            Err(error) => push_continue_raw_error(
+                &mut raw_errors,
+                &mut warnings,
+                "raw_database",
+                "database_snapshot_failed",
+                error,
+                Some("raw/smalltalk-capture.sqlite".to_string()),
+            ),
+        }
+        match write_schema_dump(conn, &raw_dir.join("schema.sql")) {
+            Ok(()) => {}
+            Err(error) => push_continue_raw_error(
+                &mut raw_errors,
+                &mut warnings,
+                "raw_schema",
+                "schema_dump_failed",
+                error,
+                Some("raw/schema.sql".to_string()),
+            ),
+        }
+        match export_all_tables_streaming_ndjson(conn, &raw_tables_dir, &mut warnings) {
+            Ok((manifest, skipped)) => {
+                raw_table_manifest = manifest;
+                skipped_tables.extend(skipped);
+            }
+            Err(error) => push_continue_raw_error(
+                &mut raw_errors,
+                &mut warnings,
+                "raw_tables",
+                "raw_table_manifest_failed",
+                error,
+                Some("raw/tables".to_string()),
+            ),
+        }
+        match all_frames_for_continue_output(conn) {
+            Ok(frames) => {
+                for (index, frame) in frames.iter().enumerate() {
+                    match export_frame_folder(
+                        conn,
+                        frame,
+                        index + 1,
+                        &capture_frames_dir,
+                        &mut warnings,
+                    ) {
+                        Ok(manifest) => frame_manifests.push(manifest),
+                        Err(error) => push_continue_raw_error(
+                            &mut raw_errors,
+                            &mut warnings,
+                            "capture_frames",
+                            "frame_export_failed",
+                            error,
+                            Some(format!("capture/frames/frame-{:06}", index + 1)),
+                        ),
+                    }
+                }
+                write_text_file(
+                    &final_dir.join("explain.md"),
+                    &continue_output_explain_markdown(
+                        result,
+                        frame_manifests.len(),
+                        &inference_manifest,
+                    ),
+                )?;
+            }
+            Err(error) => push_continue_raw_error(
+                &mut raw_errors,
+                &mut warnings,
+                "capture_frames",
+                "frame_manifest_query_failed",
+                error,
+                Some("capture/frames".to_string()),
+            ),
+        }
+    }
+
+    write_json_pretty(
+        &raw_dir.join("export_errors.json"),
+        &Value::Array(raw_errors.clone()),
+    )?;
+    write_json_pretty(
+        &raw_dir.join("skipped_tables.json"),
+        &Value::Array(skipped_tables.clone()),
+    )?;
+    write_json_pretty(
+        &final_dir.join("export_warnings.json"),
+        &Value::Array(
+            warnings
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(to_string)?,
+        ),
+    )?;
+    write_continue_export_status(
+        &final_dir,
+        if raw_errors.is_empty() {
+            "complete"
+        } else {
+            "complete_with_raw_errors"
+        },
+        "finished",
+        result,
+        &warnings,
+        &raw_errors,
+        &skipped_tables,
+    )?;
+    write_continue_output_manifest(
+        &final_dir,
+        generated_at,
+        &folder_name,
+        plan,
+        effective_mode,
+        result,
+        &raw_table_manifest,
+        &frame_manifests,
+        &layer_manifest,
+        &candidate_manifest,
+        &inference_manifest,
+        &warnings,
+        &raw_errors,
+        &skipped_tables,
+    )?;
+    write_continue_disk_status(&final_dir.join("disk_status.json"), &final_dir)?;
+    let stats = directory_stats(&final_dir).unwrap_or(ExportStats {
+        file_count: 0,
+        byte_size: 0,
+    });
+
+    Ok(ContinueOutputExportSummary {
+        schema: "smalltalk.continue_output.full_audit.v1".to_string(),
+        generated_at_ms: generated_at,
+        decision_id: result.decision_id.clone(),
+        folder_name,
+        path: final_dir.to_string_lossy().to_string(),
+        file_count: stats.file_count,
+        byte_size: stats.byte_size,
+        warning_count: warnings.len() as i64,
+    })
+}
+
+fn write_continue_export_status(
+    output_dir: &Path,
+    status: &str,
+    stage: &str,
+    result: &crate::continuation::ContinueDecisionResult,
+    warnings: &[ExportWarning],
+    raw_errors: &[Value],
+    skipped_tables: &[Value],
+) -> Result<(), String> {
+    let stats = directory_stats(output_dir).unwrap_or(ExportStats {
+        file_count: 0,
+        byte_size: 0,
+    });
+    write_json_pretty(
+        &output_dir.join("export_status.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_output.export_status.v1",
+            "updatedAtMs": now_millis(),
+            "status": status,
+            "stage": stage,
+            "decisionId": result.decision_id,
+            "source": result.source,
+            "model": result.model,
+            "responseId": result.response_id,
+            "criticalArtifacts": {
+                "request": "request/get_continue_decision_request.json",
+                "inferenceSummary": "inference/summary.json",
+                "selectedCandidate": "continue/candidates/selected_candidate.json",
+                "finalDecision": "final/continue_decision_result.json",
+                "handoff": "final/handoff.json"
+            },
+            "rawArtifacts": {
+                "database": "raw/smalltalk-capture.sqlite",
+                "schema": "raw/schema.sql",
+                "tables": "raw/tables/",
+                "captureFrames": "capture/frames/"
+            },
+            "counts": {
+                "warnings": warnings.len(),
+                "rawErrors": raw_errors.len(),
+                "skippedTables": skipped_tables.len(),
+                "files": stats.file_count,
+                "bytes": stats.byte_size
+            },
+            "rawExportStatus": if raw_errors.is_empty() { "ok_or_pending" } else { "errors_recorded" },
+        }),
+    )
+}
+
+fn write_continue_output_manifest(
+    output_dir: &Path,
+    generated_at: i64,
+    folder_name: &str,
+    plan: &ContinueOutputAuditPlan,
+    effective_mode: &str,
+    result: &crate::continuation::ContinueDecisionResult,
+    raw_table_manifest: &[Value],
+    frame_manifests: &[Value],
+    layer_manifest: &[Value],
+    candidate_manifest: &[Value],
+    inference_manifest: &[Value],
+    warnings: &[ExportWarning],
+    raw_errors: &[Value],
+    skipped_tables: &[Value],
+) -> Result<(), String> {
+    let file_index = collect_relative_file_index(output_dir).unwrap_or_default();
+    let stats = directory_stats(output_dir).unwrap_or(ExportStats {
+        file_count: 0,
+        byte_size: 0,
+    });
+    write_json_pretty(
+        &output_dir.join("manifest.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_output.full_audit.v1",
+            "generatedAtMs": generated_at,
+            "updatedAtMs": now_millis(),
+            "decisionId": result.decision_id,
+            "cacheHit": result.cache_hit,
+            "source": result.source,
+            "model": result.model,
+            "responseId": result.response_id,
+            "effectiveMode": effective_mode,
+            "sessionLabel": &plan.session_label,
+            "folderName": folder_name,
+            "path": output_dir.to_string_lossy(),
+            "latestFrame": result.current_focus,
+            "selectedWorkstream": result.selected_workstream,
+            "returnTarget": result.resume_work_target.as_ref().or(result.return_target.as_ref()),
+            "counts": {
+                "rawTables": raw_table_manifest.len(),
+                "frames": frame_manifests.len(),
+                "continueLayerTables": layer_manifest.len(),
+                "candidateTables": candidate_manifest.len(),
+                "inferenceEvents": inference_manifest.len(),
+                "warnings": warnings.len(),
+                "rawErrors": raw_errors.len(),
+                "skippedTables": skipped_tables.len(),
+                "filesBeforeManifest": file_index.len(),
+            },
+            "manifest": {
+                "status": "export_status.json",
+                "diskStatus": "disk_status.json",
+                "request": "request/get_continue_decision_request.json",
+                "rawDatabase": "raw/smalltalk-capture.sqlite",
+                "schema": "raw/schema.sql",
+                "rawTables": raw_table_manifest,
+                "rawErrors": "raw/export_errors.json",
+                "skippedTables": "raw/skipped_tables.json",
+                "captureFrames": frame_manifests,
+                "continueLayers": layer_manifest,
+                "continueCandidates": candidate_manifest,
+                "selectedCandidate": "continue/candidates/selected_candidate.json",
+                "inference": inference_manifest,
+                "finalDecision": "final/continue_decision_result.json",
+                "handoff": "final/handoff.json",
+                "explanation": "explain.md",
+                "warnings": "export_warnings.json",
+                "fileIndex": file_index,
+            },
+            "statsBeforeManifest": {
+                "fileCount": stats.file_count,
+                "byteSize": stats.byte_size,
+            },
+            "notes": [
+                "This is a full local developer audit and may contain screenshots, OCR text, Accessibility text, URLs, paths, and personal local data.",
+                "Critical request, inference, candidate, and final decision artifacts are written before best-effort raw dumps.",
+                "Inference request bodies do not include API keys or authorization headers.",
+                "The final Continue answer is in final/continue_decision_result.json and final/handoff.json."
+            ],
+        }),
+    )
+}
+
+fn write_continue_disk_status(path: &Path, output_dir: &Path) -> Result<(), String> {
+    write_json_pretty(
+        path,
+        &serde_json::json!({
+            "schema": "smalltalk.continue_output.disk_status.v1",
+            "generatedAtMs": now_millis(),
+            "outputPath": output_dir.to_string_lossy(),
+            "outputDirectoryStats": directory_stats(output_dir).ok(),
+            "filesystem": disk_status_for_path(output_dir),
+        }),
+    )
+}
+
+fn disk_status_for_path(path: &Path) -> Value {
+    let output = Command::new("df").arg("-k").arg(path).output();
+    let Ok(output) = output else {
+        return serde_json::json!({
+            "available": false,
+            "error": "df command failed to start"
+        });
+    };
+    if !output.status.success() {
+        return serde_json::json!({
+            "available": false,
+            "error": String::from_utf8_lossy(&output.stderr).trim()
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    let values = lines.next().unwrap_or_default();
+    let columns = header.split_whitespace().collect::<Vec<_>>();
+    let parts = values.split_whitespace().collect::<Vec<_>>();
+    let mut object = serde_json::Map::new();
+    for (index, column) in columns.iter().enumerate() {
+        if let Some(value) = parts.get(index) {
+            object.insert(column.to_string(), Value::String((*value).to_string()));
+        }
+    }
+    object.insert("available".to_string(), Value::Bool(true));
+    Value::Object(object)
+}
+
+fn push_continue_raw_error(
+    raw_errors: &mut Vec<Value>,
+    warnings: &mut Vec<ExportWarning>,
+    scope: &str,
+    code: &str,
+    message: String,
+    path: Option<String>,
+) {
+    push_export_warning(warnings, scope, code, message.clone(), path.clone(), None);
+    raw_errors.push(serde_json::json!({
+        "scope": scope,
+        "code": code,
+        "message": message,
+        "path": path,
+        "recordedAtMs": now_millis(),
+    }));
+}
+
+fn all_frames_for_continue_output(conn: &Connection) -> Result<Vec<CaptureFrame>, String> {
+    if !table_exists_in_capture(conn, "frames")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}
+             FROM frames
+             ORDER BY captured_at ASC, id ASC",
+            FRAME_COLUMNS
+        ))
+        .map_err(to_string)?;
+    let rows = stmt.query_map([], frame_from_row).map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn export_continue_table_group(
+    conn: &Connection,
+    output_dir: &Path,
+    tables: &[&str],
+) -> Result<Vec<Value>, String> {
+    fs::create_dir_all(output_dir).map_err(to_string)?;
+    let mut manifest = Vec::new();
+    for table in tables {
+        if !table_exists_in_capture(conn, table)? {
+            continue;
+        }
+        let stem = safe_file_stem(table);
+        let row_count = stream_query_to_ndjson(
+            conn,
+            &format!("SELECT * FROM {}", quote_identifier(table)),
+            &output_dir.join(format!("{}.ndjson", stem)),
+        )?;
+        manifest.push(serde_json::json!({
+            "table": table,
+            "rowCount": row_count,
+            "ndjson": format!("{}.ndjson", stem),
+        }));
+    }
+    Ok(manifest)
+}
+
+fn selected_continue_candidate_json(conn: &Connection, decision_id: &str) -> Result<Value, String> {
+    if !table_exists_in_capture(conn, "continue_decisions")?
+        || !table_exists_in_capture(conn, "continue_candidates")?
+    {
+        return Ok(Value::Null);
+    }
+    let candidate_id: Option<String> = conn
+        .query_row(
+            "SELECT selected_candidate_id FROM continue_decisions WHERE id = ?1",
+            params![decision_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .flatten();
+    let Some(candidate_id) = candidate_id else {
+        return Ok(Value::Null);
+    };
+    let rows = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM continue_candidates WHERE id = ?1",
+        &[&candidate_id],
+    )?;
+    Ok(rows.into_iter().next().unwrap_or(Value::Null))
+}
+
+fn export_continue_inference_events(
+    inference_dir: &Path,
+    events: &[crate::continuation::ContinueAuditInferenceEvent],
+) -> Result<Vec<Value>, String> {
+    fs::create_dir_all(inference_dir).map_err(to_string)?;
+    let mut manifest = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let folder = format!(
+            "inference-{:03}-{}",
+            index + 1,
+            safe_file_stem(&event.inference_id)
+        );
+        let event_dir = inference_dir.join(&folder);
+        fs::create_dir_all(&event_dir).map_err(to_string)?;
+        write_json_pretty(
+            &event_dir.join("event.json"),
+            &serde_json::to_value(event).map_err(to_string)?,
+        )?;
+        if let Some(pack) = &event.pack {
+            write_json_pretty(&event_dir.join("candidate_pack.json"), pack)?;
+        }
+        if let Some(request) = &event.request {
+            write_json_pretty(&event_dir.join("openai_request.json"), request)?;
+        }
+        if let Some(response) = &event.raw_response {
+            write_json_pretty(&event_dir.join("openai_raw_response.json"), response)?;
+        }
+        if let Some(output) = &event.parsed_output {
+            write_json_pretty(&event_dir.join("parsed_output.json"), output)?;
+        }
+        write_json_pretty(
+            &event_dir.join("validation.json"),
+            &serde_json::json!({
+                "validationResult": event.validation_result,
+                "validationFailures": event.validation_failures,
+                "fallbackReason": event.fallback_reason,
+                "error": event.error,
+                "responseId": event.response_id,
+            }),
+        )?;
+        manifest.push(serde_json::json!({
+            "inferenceId": event.inference_id,
+            "kind": event.inference_kind,
+            "model": event.model,
+            "responseId": event.response_id,
+            "validationResult": event.validation_result,
+            "fallbackReason": event.fallback_reason,
+            "folder": format!("inference/{}", folder),
+            "event": format!("inference/{}/event.json", folder),
+            "candidatePack": event.pack.as_ref().map(|_| format!("inference/{}/candidate_pack.json", folder)),
+            "request": event.request.as_ref().map(|_| format!("inference/{}/openai_request.json", folder)),
+            "rawResponse": event.raw_response.as_ref().map(|_| format!("inference/{}/openai_raw_response.json", folder)),
+            "parsedOutput": event.parsed_output.as_ref().map(|_| format!("inference/{}/parsed_output.json", folder)),
+            "validation": format!("inference/{}/validation.json", folder),
+        }));
+    }
+    write_json_pretty(
+        &inference_dir.join("summary.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_output.inference_summary.v1",
+            "eventCount": events.len(),
+            "events": manifest,
+        }),
+    )?;
+    Ok(manifest)
+}
+
+fn continue_output_explain_markdown(
+    result: &crate::continuation::ContinueDecisionResult,
+    frame_count: usize,
+    inference_manifest: &[Value],
+) -> String {
+    let handoff = &result.handoff;
+    format!(
+        "# Continue Output Audit\n\n\
+Generated for `{decision_id}`.\n\n\
+## What This Folder Explains\n\n\
+This audit follows the path from raw local capture evidence to the final intent-based Continue decision. \
+It includes the raw SQLite snapshot, raw tables, per-frame evidence, Continue semantic layers, candidate scoring, inference payloads, validation, and the final handoff.\n\n\
+## Raw Capture\n\n\
+- Exported frame folders: {frame_count}\n\
+- Raw database snapshot: `raw/smalltalk-capture.sqlite`\n\
+- Raw table dumps: `raw/tables/`\n\
+- Per-frame evidence: `capture/frames/`\n\n\
+## Continue Transformation\n\n\
+- Semantic layers: `continue/layers/`\n\
+- Candidate and scoring data: `continue/candidates/`\n\
+- Inference calls logged: {inference_count}\n\n\
+## Final Decision\n\n\
+- Source: `{source}`\n\
+- Cache hit: `{cache_hit}`\n\
+- Mode: `{mode}`\n\
+- Confidence: `{confidence_label}` ({confidence:.2})\n\
+- Output mode: `{output_mode}`\n\
+- Headline: {headline}\n\
+- Return line: {return_line}\n\
+- Current focus: {current_focus}\n\
+- Last state: {last_state}\n\
+- Next action: {next_action}\n\n\
+## Why This Was Selected\n\n\
+{why_this}\n\n\
+## Missing Evidence And Warnings\n\n\
+- Missing evidence: {missing_evidence}\n\
+- Warnings: {warnings}\n\
+- Validation failures: {validation_failures}\n\n",
+        decision_id = result.decision_id,
+        frame_count = frame_count,
+        inference_count = inference_manifest.len(),
+        source = result.source,
+        cache_hit = result.cache_hit,
+        mode = result.mode,
+        confidence_label = result.confidence_label,
+        confidence = result.confidence,
+        output_mode = result.continue_output_mode,
+        headline = handoff.headline,
+        return_line = handoff.return_line,
+        current_focus = handoff.current_focus_line,
+        last_state = handoff.last_state_line,
+        next_action = handoff.next_action,
+        why_this = if handoff.why_this.is_empty() {
+            "- No why-this lines returned.".to_string()
+        } else {
+            handoff
+                .why_this
+                .iter()
+                .map(|line| format!("- {}", line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        missing_evidence = result.missing_evidence.join("; "),
+        warnings = result.warnings.join("; "),
+        validation_failures = result.validation_failures.join("; "),
+    )
+}
+
+fn collect_relative_file_index(root: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    collect_relative_file_index_inner(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_relative_file_index_inner(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(current).map_err(to_string)? {
+        let entry = entry.map_err(to_string)?;
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(to_string)?;
+        if metadata.is_dir() {
+            collect_relative_file_index_inner(root, &path, files)?;
+        } else if metadata.is_file() {
+            if let Ok(relative) = path.strip_prefix(root) {
+                files.push(relative.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -17120,6 +18227,79 @@ fn export_all_tables(
         }));
     }
     Ok(manifest)
+}
+
+fn export_all_tables_streaming_ndjson(
+    conn: &Connection,
+    tables_dir: &Path,
+    warnings: &mut Vec<ExportWarning>,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    fs::create_dir_all(tables_dir).map_err(to_string)?;
+    let tables = table_names_for_export(conn)?;
+    let mut manifest = Vec::new();
+    let mut skipped = Vec::new();
+    for table in tables {
+        let stem = safe_file_stem(&table);
+        let path = tables_dir.join(format!("{}.ndjson", stem));
+        let sql = format!("SELECT * FROM {}", quote_identifier(&table));
+        match stream_query_to_ndjson(conn, &sql, &path) {
+            Ok(row_count) => {
+                manifest.push(serde_json::json!({
+                    "table": table,
+                    "rowCount": row_count,
+                    "ndjson": format!("raw/tables/{}.ndjson", stem),
+                    "format": "ndjson",
+                }));
+            }
+            Err(error) => {
+                push_export_warning(
+                    warnings,
+                    "raw_tables",
+                    "table_export_failed",
+                    format!("failed to export table {}: {}", table, error),
+                    Some(format!("raw/tables/{}.ndjson", stem)),
+                    None,
+                );
+                skipped.push(serde_json::json!({
+                    "table": table,
+                    "reason": "table_export_failed",
+                    "error": error,
+                    "path": format!("raw/tables/{}.ndjson", stem),
+                }));
+            }
+        }
+    }
+    Ok((manifest, skipped))
+}
+
+fn stream_query_to_ndjson(conn: &Connection, sql: &str, path: &Path) -> Result<usize, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let column_names = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut rows = stmt.query([]).map_err(to_string)?;
+    let file = fs::File::create(path).map_err(to_string)?;
+    let mut writer = BufWriter::new(file);
+    let mut row_count = 0usize;
+    while let Some(row) = rows.next().map_err(to_string)? {
+        let mut object = serde_json::Map::new();
+        for (index, column_name) in column_names.iter().enumerate() {
+            object.insert(
+                column_name.clone(),
+                sql_value_to_json(row.get_ref(index).map_err(to_string)?),
+            );
+        }
+        serde_json::to_writer(&mut writer, &Value::Object(object)).map_err(to_string)?;
+        writer.write_all(b"\n").map_err(to_string)?;
+        row_count += 1;
+    }
+    writer.flush().map_err(to_string)?;
+    Ok(row_count)
 }
 
 #[allow(dead_code)]
@@ -17753,6 +18933,10 @@ fn project_resume_query_root() -> Result<PathBuf, String> {
     Ok(project_root()?.join("resume_query_exports"))
 }
 
+fn project_continue_outputs_root() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("continue_outputs"))
+}
+
 fn session_folder_name(sequence: i64) -> String {
     format!("session-{:03}", sequence.max(1))
 }
@@ -17858,6 +19042,7 @@ fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
     clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
     clear_project_output_dir()?;
     clear_project_resume_query_dir()?;
+    clear_project_continue_outputs_dir()?;
     Ok(())
 }
 
@@ -17893,6 +19078,11 @@ fn cleanup_local_memory_impl(
     if input.include_debug_exports.unwrap_or(false) {
         reclaimed_bytes = reclaimed_bytes.saturating_add(
             directory_stats(&paths.root_dir.join("safe-ai-exports"))
+                .map(|stats| stats.byte_size.max(0) as u64)
+                .unwrap_or(0),
+        );
+        reclaimed_bytes = reclaimed_bytes.saturating_add(
+            directory_stats(&project_continue_outputs_root()?)
                 .map(|stats| stats.byte_size.max(0) as u64)
                 .unwrap_or(0),
         );
@@ -17939,6 +19129,7 @@ fn cleanup_local_memory_impl(
         clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
         clear_project_output_dir()?;
         clear_project_resume_query_dir()?;
+        clear_project_continue_outputs_dir()?;
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(to_string)?;
@@ -18460,6 +19651,8 @@ fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostic
         continue_normal_calls: maintenance_i64(conn, "continue_normal_calls").unwrap_or(0),
         continue_rebuild_calls: maintenance_i64(conn, "continue_rebuild_calls").unwrap_or(0),
         decision_cache_hits: maintenance_i64(conn, "decision_cache_hits").unwrap_or(0),
+        continue_output_audit_failures: maintenance_i64(conn, "continue_output_audit_failures")
+            .unwrap_or(0),
     }
 }
 
@@ -18579,6 +19772,10 @@ fn clear_project_output_dir() -> Result<(), String> {
 
 fn clear_project_resume_query_dir() -> Result<(), String> {
     clear_directory_contents(&project_resume_query_root()?)
+}
+
+fn clear_project_continue_outputs_dir() -> Result<(), String> {
+    clear_directory_contents(&project_continue_outputs_root()?)
 }
 
 fn clear_directory_contents(dir: &Path) -> Result<(), String> {
@@ -20668,6 +21865,42 @@ mod tests {
         let signal_count = local_signal_count(&conn, Some(session_id)).unwrap();
         assert!(signal_count > 1, "signal_count={}", signal_count);
         assert!(signal_count < 6, "signal_count={}", signal_count);
+    }
+
+    #[test]
+    fn visible_signal_count_is_capped_for_long_event_streams() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-many-events";
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, created_at_ms
+             ) VALUES (?1, 1, 1000, 'running', 1000)",
+            params![session_id],
+        )
+        .unwrap();
+        for index in 0..300 {
+            let event_type = if index % 2 == 0 { "click" } else { "scroll" };
+            let app = if index % 3 == 0 { "Helium" } else { "Codex" };
+            conn.execute(
+                "INSERT INTO ui_events (
+                    id, session_id, ts_ms, event_type, app_name, window_title,
+                    key_category, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, ?3)",
+                params![
+                    format!("evt-many-{}", index),
+                    session_id,
+                    10_000 + (index as i64 * 1_000),
+                    event_type,
+                    app,
+                ],
+            )
+            .unwrap();
+        }
+
+        let signal_count = local_signal_count(&conn, Some(session_id)).unwrap();
+
+        assert_eq!(signal_count, MAX_VISIBLE_SIGNAL_MOMENTS);
     }
 
     #[test]
@@ -23909,6 +25142,54 @@ mod tests {
     }
 
     #[test]
+    fn resume_query_preserves_tab_strip_titles_as_context_only() {
+        let rejected = vec![
+            ResumeQueryRejectedAnchor {
+                frame_id: "1658".to_string(),
+                text_exact:
+                    "0 Usage - OpenAI API - Memory usage - 240 MB 0 Usage - OpenAI API"
+                        .to_string(),
+                bbox: Some(ResumeLineBounds {
+                    x: 76.0,
+                    y: 31.0,
+                    w: 206.0,
+                    h: 34.0,
+                }),
+                source: "ax".to_string(),
+                semantic_role: "main_content".to_string(),
+                surface_zone: "browser_chrome".to_string(),
+                reject_reason: "surface_zone_browser_chrome".to_string(),
+            },
+            ResumeQueryRejectedAnchor {
+                frame_id: "1658".to_string(),
+                text_exact:
+                    "1 Napoleon's Fearful Presence on Battlefield - Google Gemini 1 Napoleon's Fearful Presence on Battlefield - Google Gemini"
+                        .to_string(),
+                bbox: Some(ResumeLineBounds {
+                    x: 1081.0,
+                    y: 31.0,
+                    w: 206.0,
+                    h: 34.0,
+                }),
+                source: "ax".to_string(),
+                semantic_role: "main_content".to_string(),
+                surface_zone: "browser_chrome".to_string(),
+                reject_reason: "surface_zone_browser_chrome".to_string(),
+            },
+        ];
+
+        let context = recent_surface_context_from_rejected_anchors(
+            &rejected,
+            Some("Napoleon's Fearful Presence on Battlefield - Google Gemini - Helium"),
+        );
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].context_kind, "briefly_visible_tab");
+        assert!(context[0].label.contains("Usage - OpenAI API"));
+        assert!(context[0].reason.contains("context, not a resume anchor"));
+    }
+
+    #[test]
     fn resume_query_session_068_style_promotes_current_draft_and_rejects_codex_sidebar() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -26373,6 +27654,7 @@ mod tests {
                 reason: "test anchor".to_string(),
             }],
             diagnostic_rejected_anchors: Vec::new(),
+            recent_surface_context: Vec::new(),
             diagnostic_artifacts: Vec::new(),
             branch_evidence: Vec::new(),
             dropped_frame_summary: Vec::new(),
@@ -26718,6 +28000,363 @@ mod tests {
 
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_writes_full_decision_folder() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-source-{}", now_millis()));
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-output-{}", now_millis()));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        let mut decision = crate::continuation::get_continue_decision(&conn, request.clone())
+            .expect("continue decision");
+
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &request,
+            "rebuild",
+            &mut decision,
+            &output_root,
+        )
+        .expect("continue output audit");
+        let audit_dir = PathBuf::from(&summary.path);
+
+        assert_eq!(summary.schema, "smalltalk.continue_output.full_audit.v1");
+        assert_eq!(summary.decision_id, decision.decision_id);
+        assert!(summary
+            .folder_name
+            .starts_with("session-001-session-test-1__continue-"));
+        assert!(summary.folder_name.contains("__rebuild__"));
+        assert!(audit_dir.join("manifest.json").exists());
+        assert!(audit_dir.join("explain.md").exists());
+        assert!(audit_dir
+            .join("request/get_continue_decision_request.json")
+            .exists());
+        assert!(audit_dir.join("raw/smalltalk-capture.sqlite").exists());
+        assert!(audit_dir.join("raw/tables/frames.ndjson").exists());
+        assert!(audit_dir
+            .join("capture/frames/frame-000001/images/frame-000001-snapshot.png")
+            .exists());
+        assert!(audit_dir
+            .join("capture/frames/frame-000001/accessibility/ax_nodes.json")
+            .exists());
+        assert!(audit_dir
+            .join("continue/layers/continue_artifacts.ndjson")
+            .exists());
+        assert!(audit_dir
+            .join("continue/candidates/continue_candidates.ndjson")
+            .exists());
+        assert!(audit_dir.join("inference/summary.json").exists());
+        assert!(audit_dir
+            .join("final/continue_decision_result.json")
+            .exists());
+        assert!(audit_dir.join("final/handoff.json").exists());
+        assert!(audit_dir.join("export_status.json").exists());
+        assert!(audit_dir.join("disk_status.json").exists());
+        assert!(audit_dir.join("raw/export_errors.json").exists());
+        assert!(audit_dir.join("raw/skipped_tables.json").exists());
+        assert_eq!(
+            decision.continue_output_path.as_deref(),
+            Some(summary.path.as_str())
+        );
+
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_keeps_critical_files_when_raw_export_fails() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root = std::env::temp_dir().join(format!(
+            "smalltalk-continue-rawfail-source-{}",
+            now_millis()
+        ));
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-continue-rawfail-output-{}",
+            now_millis()
+        ));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        let mut decision = crate::continuation::get_continue_decision(&conn, request.clone())
+            .expect("continue decision");
+
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &request,
+            "force_raw_failure_for_test",
+            &mut decision,
+            &output_root,
+        )
+        .expect("continue output audit survives raw failure");
+        let audit_dir = PathBuf::from(&summary.path);
+
+        assert!(audit_dir
+            .join("request/get_continue_decision_request.json")
+            .exists());
+        assert!(audit_dir.join("inference/summary.json").exists());
+        assert!(audit_dir
+            .join("continue/candidates/selected_candidate.json")
+            .exists());
+        assert!(audit_dir
+            .join("final/continue_decision_result.json")
+            .exists());
+        assert!(audit_dir.join("final/handoff.json").exists());
+        let status = fs::read_to_string(audit_dir.join("export_status.json")).unwrap();
+        assert!(status.contains("complete_with_raw_errors"));
+        let raw_errors = fs::read_to_string(audit_dir.join("raw/export_errors.json")).unwrap();
+        assert!(raw_errors.contains("forced_raw_table_failure"));
+        let skipped_tables = fs::read_to_string(audit_dir.join("raw/skipped_tables.json")).unwrap();
+        assert!(skipped_tables.contains("forced_raw_table_failure"));
+
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_writes_cache_hit_decision_folder() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-cache-source-{}", now_millis()));
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-cache-output-{}", now_millis()));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let rebuild_request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        crate::continuation::get_continue_decision(&conn, rebuild_request).unwrap();
+        let normal_request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("normal".to_string()),
+            rebuild_layers: Some(false),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        let mut cached = crate::continuation::get_continue_decision(&conn, normal_request.clone())
+            .expect("cached continue decision");
+        assert!(cached.cache_hit);
+
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &normal_request,
+            "normal",
+            &mut cached,
+            &output_root,
+        )
+        .expect("cached continue output audit");
+        let manifest =
+            fs::read_to_string(PathBuf::from(&summary.path).join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"cacheHit\": true"));
+        assert!(manifest.contains("\"sessionLabel\": \"session-001-session-test-1\""));
+        assert!(summary
+            .folder_name
+            .starts_with("session-001-session-test-1__continue-"));
+        assert!(summary.folder_name.contains("__normal__"));
+
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_logs_missing_key_inference_without_secret() {
+        if std::env::var("OPENAI_API_KEY")
+            .ok()
+            .and_then(non_empty)
+            .is_some()
+            || fs::read_to_string(project_root().unwrap().join(".env"))
+                .unwrap_or_default()
+                .lines()
+                .any(|line| {
+                    let trimmed = line.trim();
+                    trimmed.starts_with("OPENAI_API_KEY=")
+                        && !trimmed
+                            .trim_start_matches("OPENAI_API_KEY=")
+                            .trim()
+                            .is_empty()
+                })
+        {
+            return;
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-key-source-{}", now_millis()));
+        let output_root =
+            std::env::temp_dir().join(format!("smalltalk-continue-key-output-{}", now_millis()));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(true),
+            max_candidates_for_model: Some(5),
+            ..Default::default()
+        };
+        let mut decision = crate::continuation::get_continue_decision(&conn, request.clone())
+            .expect("continue decision");
+        assert_eq!(decision.source, "local_fallback");
+        assert!(!decision.audit_inference_events.is_empty());
+
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &request,
+            "rebuild",
+            &mut decision,
+            &output_root,
+        )
+        .expect("continue output audit");
+        let audit_dir = PathBuf::from(&summary.path);
+        let inference_summary =
+            fs::read_to_string(audit_dir.join("inference/summary.json")).unwrap();
+        assert!(inference_summary.contains("missing_openai_api_key"));
+        let all_event_json = fs::read_to_string(
+            audit_dir
+                .join("inference")
+                .join("inference-001-continue-micro")
+                .join("event.json"),
+        )
+        .unwrap_or_else(|_| inference_summary.clone());
+        assert!(!all_event_json.contains("Bearer "));
+        assert!(!all_event_json.contains("sk-"));
+
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_exports_rejected_micro_inference_response() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root = std::env::temp_dir().join(format!(
+            "smalltalk-continue-rejected-source-{}",
+            now_millis()
+        ));
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-continue-rejected-output-{}",
+            now_millis()
+        ));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        let request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        let mut decision = crate::continuation::get_continue_decision(&conn, request.clone())
+            .expect("continue decision");
+        decision.source = "local_fallback".to_string();
+        decision.model = Some("gpt-test".to_string());
+        decision.response_id = Some("resp-rejected-test".to_string());
+        decision.audit_inference_events = vec![crate::continuation::ContinueAuditInferenceEvent {
+            inference_id: "continue-micro-rejected-test".to_string(),
+            inference_kind: "continue_micro_inference".to_string(),
+            requested_at_ms: now_millis(),
+            model: Some("gpt-test".to_string()),
+            candidate_limit: Some(5),
+            pack: Some(serde_json::json!({"candidates": []})),
+            request: Some(serde_json::json!({"model": "gpt-test", "input": "bounded pack"})),
+            raw_response: Some(serde_json::json!({
+                "id": "resp-rejected-test",
+                "output": [{"content": [{"text": "{\"result\":\"selected_candidate\"}"}]}]
+            })),
+            parsed_output: Some(serde_json::json!({"result": "selected_candidate"})),
+            validation_result: Some("rejected".to_string()),
+            validation_failures: vec!["model_output_contains_internal_reference".to_string()],
+            validation_classification: Some(serde_json::json!({
+                "classification": "hard_rejected",
+                "candidate_preserved": false,
+                "model_copy_used": false,
+                "local_safe_copy_used": false
+            })),
+            error: None,
+            fallback_reason: Some("validation_failed".to_string()),
+            response_id: Some("resp-rejected-test".to_string()),
+        }];
+
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &request,
+            "rebuild",
+            &mut decision,
+            &output_root,
+        )
+        .expect("continue output audit");
+        let audit_dir = PathBuf::from(&summary.path);
+        let inference_dir = audit_dir
+            .join("inference")
+            .join("inference-001-continue-micro-rejected-test");
+        assert!(inference_dir.join("openai_request.json").exists());
+        assert!(inference_dir.join("openai_raw_response.json").exists());
+        assert!(inference_dir.join("validation.json").exists());
+        let validation = fs::read_to_string(inference_dir.join("validation.json")).unwrap();
+        assert!(validation.contains("validation_failed"));
+        assert!(validation.contains("resp-rejected-test"));
+        let final_decision =
+            fs::read_to_string(audit_dir.join("final/continue_decision_result.json")).unwrap();
+        assert!(final_decision.contains("\"source\": \"local_fallback\""));
+        assert!(final_decision.contains("resp-rejected-test"));
+
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn gitignore_excludes_continue_outputs() {
+        let gitignore = fs::read_to_string(project_root().unwrap().join(".gitignore")).unwrap();
+        assert!(gitignore
+            .lines()
+            .any(|line| line.trim() == "continue_outputs/"));
+        assert!(gitignore
+            .lines()
+            .any(|line| line.trim() == "resume_query_exports/"));
     }
 
     #[test]

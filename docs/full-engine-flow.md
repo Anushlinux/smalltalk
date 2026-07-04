@@ -18,7 +18,7 @@ Native local signals
   -> Continue layer 2: artifacts, observations, task actions
   -> Continue layer 3: episodes, workstreams, durable roles, unresolved state
   -> final layer: candidates, scoring, confidence caps, warnings
-  -> optional bounded micro-inference over candidate ids only
+  -> default bounded micro-inference over candidate ids only
   -> persisted Continue decision
   -> handoff payload for the UI
   -> open_resume_point by continue_decision_id when the user clicks Continue here
@@ -776,13 +776,13 @@ Default request behavior:
 - `limit`: 700.
 - `mode`: `normal`.
 - `rebuild_layers`: `false`.
-- `micro_inference_enabled`: `false`.
+- `micro_inference_enabled`: `true`.
 - `max_candidates_for_model`: 5.
 
 Normal mode may reuse a fresh cached decision when:
 
 - Rebuild is not forced.
-- Micro-inference is not enabled.
+- The cached decision matches the requested inference policy.
 - The cached decision is still fresh for the current evidence.
 
 If there is no cache hit, the engine may infer feedback for pending prior decisions, then lazily rebuild Continue layers when needed. In rebuild mode, it rebuilds from the start instead of only from the latest processed frame.
@@ -802,7 +802,7 @@ The final decision flow is:
 11. Score candidates.
 12. Persist generated candidates when not cached.
 13. Select the top local candidate.
-14. Optionally run bounded micro-inference.
+14. Run bounded micro-inference by default when candidates exist, unless the request explicitly disables it.
 15. Apply validation and fallback behavior.
 16. Compose/persist the Continue decision.
 17. Build evidence anchors and alternatives.
@@ -1219,4 +1219,3 @@ When changing or debugging this engine, verify these boundaries:
 - Model calls, when enabled, remain candidate-bounded and locally validated.
 - Branch/support surfaces do not become default return targets unless local evidence supports that.
 - Diagnostics remain secondary to the first-screen Continue answer.
-
