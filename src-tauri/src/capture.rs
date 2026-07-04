@@ -363,9 +363,11 @@ pub struct LocalMemoryHeavyEvidenceRows {
 pub struct LocalMemoryContinueObjectCounts {
     pub artifacts: i64,
     pub artifact_observations: i64,
+    pub semantic_moments: i64,
     pub task_actions: i64,
     pub episodes: i64,
     pub workstreams: i64,
+    pub open_loops: i64,
     pub candidates: i64,
     pub decisions: i64,
     pub feedback_events: i64,
@@ -2819,6 +2821,15 @@ pub fn get_recent_continue_task_actions(
 }
 
 #[tauri::command]
+pub fn get_recent_continue_semantic_moments(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<crate::continuation::RecentContinueSemanticMoment>, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::recent_continue_semantic_moments(&conn, limit)
+}
+
+#[tauri::command]
 pub fn get_recent_continue_episodes(
     app: AppHandle,
     limit: Option<i64>,
@@ -2869,6 +2880,15 @@ pub fn get_continue_decision(
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
     }
     Ok(result)
+}
+
+#[tauri::command]
+pub fn get_continue_decision_trace(
+    app: AppHandle,
+    input: crate::continuation::ContinueDecisionTraceInput,
+) -> Result<crate::continuation::ContinueDecisionTrace, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::get_continue_decision_trace(&conn, input)
 }
 
 #[tauri::command]
@@ -18053,6 +18073,8 @@ fn protected_cleanup_frame_ids(conn: &Connection) -> Result<HashSet<i64>, String
         "SELECT CAST(first_frame_id AS INTEGER) FROM continue_task_actions WHERE first_frame_id IS NOT NULL",
         "SELECT CAST(last_frame_id AS INTEGER) FROM continue_task_actions WHERE last_frame_id IS NOT NULL",
         "SELECT CAST(strongest_frame_id AS INTEGER) FROM continue_task_actions WHERE strongest_frame_id IS NOT NULL",
+        "SELECT pre_frame_id FROM continue_semantic_moments WHERE pre_frame_id IS NOT NULL",
+        "SELECT post_frame_id FROM continue_semantic_moments WHERE post_frame_id IS NOT NULL",
         "SELECT CAST(start_frame_id AS INTEGER) FROM continue_episodes WHERE start_frame_id IS NOT NULL",
         "SELECT CAST(end_frame_id AS INTEGER) FROM continue_episodes WHERE end_frame_id IS NOT NULL",
         "SELECT CAST(frame_id AS INTEGER) FROM continue_artifact_observations WHERE frame_id IS NOT NULL",
@@ -18113,9 +18135,11 @@ fn continue_object_counts(conn: &Connection) -> LocalMemoryContinueObjectCounts 
     LocalMemoryContinueObjectCounts {
         artifacts: count_if_present_capture(conn, "continue_artifacts"),
         artifact_observations: count_if_present_capture(conn, "continue_artifact_observations"),
+        semantic_moments: count_if_present_capture(conn, "continue_semantic_moments"),
         task_actions: count_if_present_capture(conn, "continue_task_actions"),
         episodes: count_if_present_capture(conn, "continue_episodes"),
         workstreams: count_if_present_capture(conn, "continue_workstreams"),
+        open_loops: count_if_present_capture(conn, "continue_open_loops"),
         candidates: count_if_present_capture(conn, "continue_candidates"),
         decisions: count_if_present_capture(conn, "continue_decisions"),
         feedback_events: count_if_present_capture(conn, "continue_feedback_events"),

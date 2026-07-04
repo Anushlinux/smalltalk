@@ -162,9 +162,11 @@ type LocalMemoryDiagnostics = {
   continue_object_counts: {
     artifacts: number;
     artifact_observations: number;
+    semantic_moments: number;
     task_actions: number;
     episodes: number;
     workstreams: number;
+    open_loops: number;
     candidates: number;
     decisions: number;
     feedback_events: number;
@@ -343,6 +345,9 @@ type ContinueMemoryStatus = {
     workstreams: number;
     workstream_episodes: number;
     workstream_artifacts: number;
+    open_loops: number;
+    open_loop_artifacts: number;
+    open_loop_evidence: number;
     candidates: number;
     decisions: number;
     feedback_events: number;
