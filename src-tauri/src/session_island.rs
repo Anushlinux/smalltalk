@@ -403,6 +403,7 @@ fn continue_from_island() {
                 rebuild_layers: Some(false),
                 micro_inference_enabled: Some(true),
                 max_candidates_for_model: Some(5),
+                audit_output_enabled: Some(true),
                 ..Default::default()
             }),
         ) {

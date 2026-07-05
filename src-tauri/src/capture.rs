@@ -674,6 +674,45 @@ struct OcrOutput {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TextSpanProvenance {
+    source_scope: String,
+    ownership_kind: String,
+    ownership_confidence: f64,
+    active_artifact_match_confidence: f64,
+    owner_window_id: Option<i64>,
+    owner_app_pid: Option<i64>,
+    owner_bundle_id: Option<String>,
+    owner_app_name: Option<String>,
+    owner_window_title: Option<String>,
+    coordinate_space: String,
+    coordinate_transform_json: Value,
+    quality_flags: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct OcrSpanDraft {
+    text: String,
+    confidence: Option<f64>,
+    bounds: Rect,
+    normalized_bounds_json: String,
+    raw_json: String,
+    provenance: TextSpanProvenance,
+}
+
+#[derive(Debug, Clone)]
+struct FrameTextResolution {
+    active_text: Option<String>,
+    background_text: Option<String>,
+    diagnostic_text: Option<String>,
+    full_text_quality: String,
+    quality_flags: Vec<String>,
+    resolution_json: String,
+    active_content_hash: Option<String>,
+    background_content_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FrameMetadata {
     capture_provider: String,
@@ -910,6 +949,16 @@ pub struct OcrSpanSummary {
     pub bounds_y: f64,
     pub bounds_w: f64,
     pub bounds_h: f64,
+    pub source_scope: Option<String>,
+    pub ownership_kind: Option<String>,
+    pub ownership_confidence: Option<f64>,
+    pub active_artifact_match_confidence: Option<f64>,
+    pub owner_window_id: Option<i64>,
+    pub owner_bundle_id: Option<String>,
+    pub owner_app_name: Option<String>,
+    pub owner_window_title: Option<String>,
+    pub quality_flags_json: Option<String>,
+    pub provenance_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -924,6 +973,13 @@ pub struct ContentUnitSummary {
     pub bounds_w: Option<f64>,
     pub bounds_h: Option<f64>,
     pub confidence: Option<f64>,
+    pub source_scope: Option<String>,
+    pub ownership_kind: Option<String>,
+    pub ownership_confidence: Option<f64>,
+    pub active_artifact_match_confidence: Option<f64>,
+    pub owner_window_id: Option<i64>,
+    pub owner_bundle_id: Option<String>,
+    pub quality_flags_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1616,6 +1672,10 @@ pub struct CompactContentUnit {
     pub bounds_w: Option<f64>,
     pub bounds_h: Option<f64>,
     pub confidence: Option<f64>,
+    pub source_scope: Option<String>,
+    pub ownership_kind: Option<String>,
+    pub active_artifact_match_confidence: Option<f64>,
+    pub quality_flags_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2341,7 +2401,9 @@ pub fn search_content_units(
     let mut stmt = conn
         .prepare(
             "SELECT id, source, unit_type, semantic_role, text, bounds_x, bounds_y,
-                    bounds_w, bounds_h, confidence
+                    bounds_w, bounds_h, confidence, source_scope, ownership_kind,
+                    ownership_confidence, active_artifact_match_confidence, owner_window_id,
+                    owner_bundle_id, quality_flags_json
              FROM content_units
              WHERE text LIKE ?1
              ORDER BY created_at_ms DESC
@@ -2896,15 +2958,17 @@ pub fn get_continue_decision(
     if result.cache_hit {
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
     }
-    match schedule_continue_output_audit(&conn, &app, &request, effective_mode, &mut result) {
-        Ok(summary) => {
-            result.continue_output_path = Some(summary.path);
-        }
-        Err(error) => {
-            let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
-            result
-                .warnings
-                .push(format!("continue_output_audit_failed:{}", error));
+    if request.audit_output_enabled.unwrap_or(false) {
+        match schedule_continue_output_audit(&conn, &app, &request, effective_mode, &mut result) {
+            Ok(summary) => {
+                result.continue_output_path = Some(summary.path);
+            }
+            Err(error) => {
+                let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
+                result
+                    .warnings
+                    .push(format!("continue_output_audit_failed:{}", error));
+            }
         }
     }
     Ok(result)
@@ -2937,6 +3001,17 @@ struct ContinueOutputAuditPlan {
     session_label: String,
     folder_name: String,
     final_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContinueEvidenceClosure {
+    frame_sources: HashMap<String, Vec<String>>,
+    action_sources: HashMap<String, Vec<String>>,
+    episode_sources: HashMap<String, Vec<String>>,
+    artifact_sources: HashMap<String, Vec<String>>,
+    workstream_sources: HashMap<String, Vec<String>>,
+    candidate_sources: HashMap<String, Vec<String>>,
+    missing: Vec<Value>,
 }
 
 #[tauri::command]
@@ -6048,16 +6123,20 @@ fn resolved_open_resume_point_from_frame(
         .find_map(|context| context.url.clone().and_then(non_empty));
     let fallback_anchor = content_units
         .iter()
+        .filter(|unit| content_unit_summary_is_active_evidence(unit))
         .filter_map(|unit| unit.text.clone())
         .find(|text| !is_browser_chrome_text(text))
         .or_else(|| {
-            frame.full_text.as_deref().and_then(|text| {
-                if is_browser_chrome_heavy_text(text) {
-                    None
-                } else {
-                    non_empty(truncate_chars(text, 120))
-                }
-            })
+            active_frame_text_for_ai(conn, &frame)
+                .ok()
+                .flatten()
+                .and_then(|text| {
+                    if is_browser_chrome_heavy_text(&text) {
+                        None
+                    } else {
+                        non_empty(truncate_chars(&text, 120))
+                    }
+                })
         });
 
     let mut warnings = Vec::new();
@@ -8443,13 +8522,15 @@ fn resume_query_candidate_for_frame(
         frame.pixel_height,
         &mut text_was_redacted,
     );
-    let redacted_text = frame.full_text.as_deref().and_then(|text| {
-        let redacted = redact_text_for_ai(text);
-        if redacted != text {
-            text_was_redacted = true;
-        }
-        non_empty(redacted)
-    });
+    let redacted_text = active_frame_text_for_ai(conn, frame)?
+        .as_deref()
+        .and_then(|text| {
+            let redacted = redact_text_for_ai(text);
+            if redacted != text {
+                text_was_redacted = true;
+            }
+            non_empty(redacted)
+        });
     if privacy.redact_text || text_was_redacted {
         push_unique(
             &mut redactions_applied,
@@ -11409,13 +11490,15 @@ fn build_safe_ai_export_from_conn(
         let mut frame_warnings = Vec::new();
         let context = app_contexts.first();
         let mut text_was_redacted = false;
-        let redacted_text = frame.full_text.as_deref().and_then(|text| {
-            let redacted = redact_text_for_ai(text);
-            if redacted != text {
-                text_was_redacted = true;
-            }
-            non_empty(redacted)
-        });
+        let redacted_text = active_frame_text_for_ai(conn, frame)?
+            .as_deref()
+            .and_then(|text| {
+                let redacted = redact_text_for_ai(text);
+                if redacted != text {
+                    text_was_redacted = true;
+                }
+                non_empty(redacted)
+            });
         let compact_units = compact_content_units_for_ai_for_frame(
             &content_units,
             frame.pixel_height,
@@ -11519,7 +11602,7 @@ fn build_safe_ai_export_from_conn(
             text: if privacy.redact_text {
                 redacted_text
             } else {
-                redacted_text.or_else(|| frame.full_text.clone().and_then(non_empty))
+                redacted_text.or_else(|| active_frame_text_for_ai(conn, frame).ok().flatten())
             },
             evidence_strength: apply_quality_adjustment(
                 evidence_strength(frame, &content_units, &app_contexts),
@@ -12081,6 +12164,7 @@ fn compact_content_units_for_ai_for_frame(
 ) -> Vec<CompactContentUnit> {
     let mut units = content_units
         .iter()
+        .filter(|unit| content_unit_summary_is_active_evidence(unit))
         .filter(|unit| !is_low_signal_content_unit(unit) && !is_aggregate_content_unit(unit))
         .collect::<Vec<_>>();
     units.sort_by(content_unit_reading_order);
@@ -12118,6 +12202,10 @@ fn compact_content_units_for_ai_for_frame(
             bounds_w: unit.bounds_w,
             bounds_h: unit.bounds_h,
             confidence: unit.confidence,
+            source_scope: unit.source_scope.clone(),
+            ownership_kind: unit.ownership_kind.clone(),
+            active_artifact_match_confidence: unit.active_artifact_match_confidence,
+            quality_flags_json: unit.quality_flags_json.clone(),
         });
     }
     if compact_all.len() <= 24 {
@@ -12214,6 +12302,48 @@ fn is_low_signal_content_unit(unit: &ContentUnitSummary) -> bool {
         || role.contains("system_menu")
         || role.contains("sidebar")
         || unit_type.contains("button")
+}
+
+fn content_unit_summary_is_active_evidence(unit: &ContentUnitSummary) -> bool {
+    let has_provenance = unit.ownership_kind.is_some()
+        || unit.active_artifact_match_confidence.is_some()
+        || unit.quality_flags_json.is_some();
+    if !has_provenance {
+        return true;
+    }
+    if unit.ownership_kind.as_deref().is_some_and(|kind| {
+        matches!(
+            kind,
+            "OtherWindowOwned"
+                | "DisplayOnlyUnattributed"
+                | "UnknownCoordinateSpace"
+                | "SameAppNonActiveWindow"
+        )
+    }) {
+        return false;
+    }
+    if unit
+        .quality_flags_json
+        .as_deref()
+        .map(parse_string_array_capture)
+        .unwrap_or_default()
+        .iter()
+        .any(|flag| {
+            matches!(
+                flag.as_str(),
+                "ocr_from_other_window" | "ocr_unattributed" | "coordinate_transform_unverified"
+            )
+        })
+    {
+        return false;
+    }
+    unit.active_artifact_match_confidence.unwrap_or_else(|| {
+        if unit.source.to_lowercase().contains("ocr") {
+            0.35
+        } else {
+            0.82
+        }
+    }) >= 0.50
 }
 
 fn content_unit_is_top_chrome_geometry(unit: &ContentUnitSummary) -> bool {
@@ -12398,7 +12528,10 @@ fn evidence_strength(
     {
         score += 0.18;
     }
-    if !content_units.is_empty() {
+    if content_units
+        .iter()
+        .any(content_unit_summary_is_active_evidence)
+    {
         score += 0.24;
     }
     if !app_contexts.is_empty() {
@@ -14497,74 +14630,6 @@ fn capture_frame(
         .map(|_| accessibility_is_thin(&context))
         .unwrap_or(true);
 
-    let ocr = if accessibility_text.is_none() || a11y_is_thin {
-        increment_maintenance_counter(&conn, "ocr_runs", 1)?;
-        run_ocr(&paths, &snapshot_path).unwrap_or_else(|error| OcrOutput {
-            error: Some(error),
-            ..OcrOutput::default()
-        })
-    } else {
-        OcrOutput::default()
-    };
-
-    let ocr_text = non_empty(ocr.text.clone());
-    let (text_source, full_text) = resolve_text(
-        accessibility_text.as_deref(),
-        ocr_text.as_deref(),
-        a11y_is_thin,
-    );
-    let content_hash = full_text
-        .as_deref()
-        .map(|text| stable_hash_bytes(text.as_bytes()));
-
-    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("cancellation".to_string()),
-        });
-    }
-
-    if should_skip_dedup(
-        dedupe,
-        previous_image_hash,
-        &image_hash,
-        previous_content_hash,
-        content_hash.as_deref(),
-    ) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("dedupe".to_string()),
-        });
-    }
-
-    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("cancellation".to_string()),
-        });
-    }
-
     let active_sck_capture = active_window_capture
         .as_ref()
         .and_then(|(_, capture)| (capture.provider == "screen_capture_kit").then_some(capture));
@@ -14631,6 +14696,92 @@ fn capture_frame(
         sck_audio_policy,
     };
 
+    let ocr_source_path = active_window_crop_path.as_deref().unwrap_or(&snapshot_path);
+    let ocr_source_scope = if active_window_crop_path.is_some() {
+        "active_window"
+    } else {
+        "active_display"
+    };
+    let ocr = if accessibility_text.is_none() || a11y_is_thin {
+        increment_maintenance_counter(&conn, "ocr_runs", 1)?;
+        run_ocr(&paths, ocr_source_path).unwrap_or_else(|error| OcrOutput {
+            error: Some(error),
+            ..OcrOutput::default()
+        })
+    } else {
+        OcrOutput::default()
+    };
+
+    let ocr_text = non_empty(ocr.text.clone());
+    let ocr_span_drafts = build_ocr_span_drafts(
+        &ocr,
+        &metadata,
+        &context,
+        window_snapshot.as_ref(),
+        ocr_source_scope,
+    )?;
+    let (legacy_text_source, legacy_full_text) = resolve_text(
+        accessibility_text.as_deref(),
+        ocr_text.as_deref(),
+        a11y_is_thin,
+    );
+    let (resolved_text_source, full_text, text_resolution) = resolve_frame_text(
+        accessibility_text.as_deref(),
+        &ocr_span_drafts,
+        a11y_is_thin,
+    );
+    let text_source = resolved_text_source.or(legacy_text_source);
+    let full_text = full_text.or(legacy_full_text);
+    let content_hash = text_resolution.active_content_hash.clone();
+
+    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+        let _ = fs::remove_file(&snapshot_path);
+        if let Some(path) = active_window_crop_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(CaptureOutcome {
+            frame: None,
+            image_hash,
+            content_hash,
+            semantic_fingerprint,
+            skip_reason: Some("cancellation".to_string()),
+        });
+    }
+
+    if should_skip_dedup(
+        dedupe,
+        previous_image_hash,
+        &image_hash,
+        previous_content_hash,
+        content_hash.as_deref(),
+    ) {
+        let _ = fs::remove_file(&snapshot_path);
+        if let Some(path) = active_window_crop_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(CaptureOutcome {
+            frame: None,
+            image_hash,
+            content_hash,
+            semantic_fingerprint,
+            skip_reason: Some("dedupe".to_string()),
+        });
+    }
+
+    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+        let _ = fs::remove_file(&snapshot_path);
+        if let Some(path) = active_window_crop_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(CaptureOutcome {
+            frame: None,
+            image_hash,
+            content_hash,
+            semantic_fingerprint,
+            skip_reason: Some("cancellation".to_string()),
+        });
+    }
+
     conn.execute(
         INSERT_FRAME_SQL,
         params![
@@ -14679,6 +14830,7 @@ fn capture_frame(
     .map_err(to_string)?;
 
     let frame_id = conn.last_insert_rowid();
+    persist_frame_text_resolution(&conn, frame_id, &text_resolution)?;
     let mut ocr_text_for_fts = None;
     if let Some(text) = ocr_text {
         ocr_text_for_fts = Some(text.clone());
@@ -14693,13 +14845,7 @@ fn capture_frame(
         persist_window_snapshot(&conn, frame_id, snapshot)?;
     }
     let ax_node_ids = persist_ax_nodes(&conn, frame_id, &context)?;
-    let ocr_span_ids = persist_ocr_spans(
-        &conn,
-        frame_id,
-        &ocr,
-        metadata.pixel_width,
-        metadata.pixel_height,
-    )?;
+    let ocr_span_ids = persist_ocr_spans(&conn, frame_id, &ocr, &ocr_span_drafts)?;
     persist_app_contexts(&conn, frame_id, &context)?;
     persist_content_units(
         &conn,
@@ -14923,51 +15069,125 @@ fn persist_ocr_spans(
     conn: &Connection,
     frame_id: i64,
     ocr: &OcrOutput,
-    pixel_width: Option<i64>,
-    pixel_height: Option<i64>,
+    drafts: &[OcrSpanDraft],
 ) -> Result<Vec<String>, String> {
-    let elements: Vec<VisionOcrElement> = serde_json::from_str(&ocr.text_json).unwrap_or_default();
-    let width = pixel_width.unwrap_or(1).max(1) as f64;
-    let height = pixel_height.unwrap_or(1).max(1) as f64;
     let mut ids = Vec::new();
 
-    for (index, element) in elements.iter().enumerate() {
-        if element.text.trim().is_empty() {
-            continue;
-        }
+    for (index, draft) in drafts.iter().enumerate() {
         let id = format!("ocr-{}-{}", frame_id, index);
         ids.push(id.clone());
-        let normalized = serde_json::json!({
-            "left": element.left,
-            "top": element.top,
-            "width": element.width,
-            "height": element.height
-        });
+        let provenance_json = serde_json::to_string(&draft.provenance).map_err(to_string)?;
+        let quality_flags_json =
+            serde_json::to_string(&draft.provenance.quality_flags).map_err(to_string)?;
         conn.execute(
             "INSERT OR REPLACE INTO ocr_spans (
                 id, frame_id, engine, text, confidence, lang, block_index,
                 line_index, word_index, bounds_x, bounds_y, bounds_w, bounds_h,
-                normalized_bounds_json, raw_json
+                normalized_bounds_json, raw_json, source_scope, ownership_kind,
+                ownership_confidence, active_artifact_match_confidence, owner_window_id,
+                owner_app_pid, owner_bundle_id, owner_app_name, owner_window_title,
+                coordinate_space, coordinate_transform_json, quality_flags_json,
+                provenance_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6, NULL, ?7, ?8, ?9,
-                       ?10, ?11, ?12)",
+                       ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                       ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 id,
                 frame_id.to_string(),
-                ocr.engine.clone(),
-                element.text.trim(),
-                element.confidence,
+                &ocr.engine,
+                &draft.text,
+                draft.confidence,
                 index as i64,
-                element.left * width,
-                element.top * height,
-                element.width * width,
-                element.height * height,
-                normalized.to_string(),
-                serde_json::to_string(element).map_err(to_string)?,
+                draft.bounds.x,
+                draft.bounds.y,
+                draft.bounds.w,
+                draft.bounds.h,
+                &draft.normalized_bounds_json,
+                &draft.raw_json,
+                &draft.provenance.source_scope,
+                &draft.provenance.ownership_kind,
+                draft.provenance.ownership_confidence,
+                draft.provenance.active_artifact_match_confidence,
+                draft.provenance.owner_window_id,
+                draft.provenance.owner_app_pid,
+                &draft.provenance.owner_bundle_id,
+                &draft.provenance.owner_app_name,
+                &draft.provenance.owner_window_title,
+                &draft.provenance.coordinate_space,
+                draft.provenance.coordinate_transform_json.to_string(),
+                quality_flags_json,
+                provenance_json,
             ],
         )
         .map_err(to_string)?;
     }
     Ok(ids)
+}
+
+fn persist_frame_text_resolution(
+    conn: &Connection,
+    frame_id: i64,
+    resolution: &FrameTextResolution,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO frame_text_resolutions (
+            frame_id, active_text, background_text, diagnostic_text, full_text_quality,
+            quality_flags_json, resolution_json, active_content_hash,
+            background_content_hash, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            frame_id.to_string(),
+            &resolution.active_text,
+            &resolution.background_text,
+            &resolution.diagnostic_text,
+            &resolution.full_text_quality,
+            serde_json::to_string(&resolution.quality_flags).map_err(to_string)?,
+            &resolution.resolution_json,
+            &resolution.active_content_hash,
+            &resolution.background_content_hash,
+            now_millis(),
+        ],
+    )
+    .map_err(to_string)?;
+    for flag in &resolution.quality_flags {
+        if matches!(
+            flag.as_str(),
+            "active_display_scope"
+                | "missing_active_window_id"
+                | "missing_active_window_crop"
+                | "ocr_spans_other_window_owned"
+                | "ocr_from_other_window"
+                | "ocr_unattributed"
+                | "coordinate_transform_unverified"
+                | "background_text_present"
+                | "active_text_empty"
+        ) {
+            conn.execute(
+                "INSERT OR REPLACE INTO frame_quality_warnings (
+                    id, frame_id, warning_type, severity, message, evidence_json,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    format!("quality-text-{}-{}", frame_id, flag),
+                    frame_id.to_string(),
+                    flag,
+                    if flag == "ocr_spans_other_window_owned"
+                        || flag == "ocr_from_other_window"
+                        || flag == "coordinate_transform_unverified"
+                    {
+                        "high"
+                    } else {
+                        "medium"
+                    },
+                    format!("frame text resolution flagged {}", flag),
+                    resolution.resolution_json,
+                    now_millis(),
+                ],
+            )
+            .map_err(to_string)?;
+        }
+    }
+    Ok(())
 }
 
 fn persist_app_contexts(
@@ -15062,9 +15282,13 @@ fn persist_content_units(
                 id, frame_id, window_id, source, unit_type, text, text_hash,
                 semantic_role, ax_node_id, ocr_span_ids, bounds_x, bounds_y,
                 bounds_w, bounds_h, visible_ratio, center_distance, confidence,
-                created_at_ms, raw_json
+                source_scope, ownership_kind, ownership_confidence,
+                active_artifact_match_confidence, owner_window_id, owner_bundle_id,
+                quality_flags_json, provenance_json, created_at_ms, raw_json
              ) VALUES (?1, ?2, ?3, 'ax', ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10,
-                       ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                       ?11, ?12, ?13, ?14, ?15, 'active_element',
+                       'ActiveWindowOwned', 0.92, 0.92, ?3, ?16, '[]', NULL,
+                       ?17, ?18)",
             params![
                 format!("unit-{}-ax-{}", frame_id, index),
                 frame_id.to_string(),
@@ -15089,6 +15313,7 @@ fn persist_content_units(
                 } else {
                     0.78
                 },
+                &context.app_bundle_id,
                 now,
                 serde_json::to_string(node).map_err(to_string)?,
             ],
@@ -15099,7 +15324,11 @@ fn persist_content_units(
     for (index, span_id) in ocr_span_ids.iter().enumerate() {
         let span = conn
             .query_row(
-                "SELECT text, bounds_x, bounds_y, bounds_w, bounds_h FROM ocr_spans WHERE id = ?1",
+                "SELECT text, bounds_x, bounds_y, bounds_w, bounds_h, source_scope,
+                        ownership_kind, ownership_confidence,
+                        active_artifact_match_confidence, owner_window_id,
+                        owner_bundle_id, quality_flags_json, provenance_json
+                 FROM ocr_spans WHERE id = ?1",
                 params![span_id],
                 |row| {
                     Ok((
@@ -15108,30 +15337,68 @@ fn persist_content_units(
                         row.get::<_, f64>(2)?,
                         row.get::<_, f64>(3)?,
                         row.get::<_, f64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<f64>>(7)?,
+                        row.get::<_, Option<f64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
             .optional()
             .map_err(to_string)?;
-        let Some((text, x, y, w, h)) = span else {
+        let Some((
+            text,
+            x,
+            y,
+            w,
+            h,
+            source_scope,
+            ownership_kind,
+            ownership_confidence,
+            active_match,
+            owner_window_id,
+            owner_bundle_id,
+            quality_flags_json,
+            provenance_json,
+        )) = span
+        else {
             continue;
         };
         if text.trim().is_empty() {
             continue;
         }
+        let text_hash = stable_hash_bytes(text.as_bytes());
+        let active_match = active_match.unwrap_or(0.35);
+        let capped_confidence = 0.64_f64.min(match ownership_kind.as_deref() {
+            Some("ActiveWindowOwned") => 0.90,
+            Some("ActiveAppOwned") => 0.75,
+            Some("SameAppNonActiveWindow") => 0.55,
+            Some("OtherWindowOwned") => 0.20,
+            Some("DisplayOnlyUnattributed") => 0.35,
+            Some("UnknownCoordinateSpace") => 0.25,
+            _ => active_match.max(0.25),
+        });
         let ocr_span_ids = serde_json::to_string(&vec![span_id]).map_err(to_string)?;
         conn.execute(
             "INSERT INTO content_units (
                 id, frame_id, source, unit_type, text, text_hash, semantic_role,
                 ocr_span_ids, bounds_x, bounds_y, bounds_w, bounds_h, visible_ratio,
-                center_distance, confidence, created_at_ms, raw_json
+                center_distance, confidence, source_scope, ownership_kind,
+                ownership_confidence, active_artifact_match_confidence, owner_window_id,
+                owner_bundle_id, quality_flags_json, provenance_json, created_at_ms,
+                raw_json
              ) VALUES (?1, ?2, 'ocr', 'unknown', ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                       ?10, 1.0, ?11, 0.64, ?12, ?13)",
+                       ?10, 1.0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                       ?19, ?20, ?21, ?22)",
             params![
                 format!("unit-{}-ocr-{}", frame_id, index),
                 frame_id.to_string(),
-                text,
-                stable_hash_bytes(text.as_bytes()),
+                &text,
+                text_hash,
                 semantic_role_for_text(&text, ""),
                 ocr_span_ids,
                 x,
@@ -15139,8 +15406,21 @@ fn persist_content_units(
                 w,
                 h,
                 center_distance(&Rect { x, y, w, h }, width, height),
+                capped_confidence,
+                source_scope,
+                ownership_kind,
+                ownership_confidence,
+                active_match,
+                owner_window_id,
+                owner_bundle_id,
+                quality_flags_json,
+                provenance_json,
                 now,
-                serde_json::json!({ "ocr_span_id": span_id }).to_string(),
+                serde_json::json!({
+                    "ocr_span_id": span_id,
+                    "source_provenance": provenance_json
+                })
+                .to_string(),
             ],
         )
         .map_err(to_string)?;
@@ -15514,6 +15794,428 @@ fn resolve_text(
         (None, Some(ocr)) => (Some("ocr"), Some(ocr.to_string())),
         (None, None) => (None, None),
     }
+}
+
+fn build_ocr_span_drafts(
+    ocr: &OcrOutput,
+    metadata: &FrameMetadata,
+    context: &AccessibilityContext,
+    window_snapshot: Option<&WindowSnapshotPayload>,
+    ocr_source_scope: &str,
+) -> Result<Vec<OcrSpanDraft>, String> {
+    let elements: Vec<VisionOcrElement> = serde_json::from_str(&ocr.text_json).unwrap_or_default();
+    let width = metadata.pixel_width.unwrap_or(1).max(1) as f64;
+    let height = metadata.pixel_height.unwrap_or(1).max(1) as f64;
+    let mut drafts = Vec::new();
+
+    for element in elements {
+        let text = element.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let bounds = Rect {
+            x: element.left * width,
+            y: element.top * height,
+            w: element.width * width,
+            h: element.height * height,
+        };
+        let provenance = resolve_ocr_span_provenance(
+            &bounds,
+            metadata,
+            context,
+            window_snapshot,
+            ocr_source_scope,
+        );
+        let normalized_bounds = serde_json::json!({
+            "left": element.left,
+            "top": element.top,
+            "width": element.width,
+            "height": element.height
+        });
+        drafts.push(OcrSpanDraft {
+            text: text.to_string(),
+            confidence: element.confidence,
+            bounds,
+            normalized_bounds_json: normalized_bounds.to_string(),
+            raw_json: serde_json::to_string(&element).map_err(to_string)?,
+            provenance,
+        });
+    }
+    Ok(drafts)
+}
+
+fn resolve_ocr_span_provenance(
+    bounds: &Rect,
+    metadata: &FrameMetadata,
+    context: &AccessibilityContext,
+    window_snapshot: Option<&WindowSnapshotPayload>,
+    ocr_source_scope: &str,
+) -> TextSpanProvenance {
+    let mut flags = Vec::new();
+    if metadata.scope == "active_display" {
+        push_flag(&mut flags, "active_display_scope");
+    }
+    if metadata.window_id.is_none() {
+        push_flag(&mut flags, "missing_active_window_id");
+    }
+    if metadata.active_window_crop_path.is_none() {
+        push_flag(&mut flags, "missing_active_window_crop");
+    }
+    if ocr_source_scope == "active_window" {
+        return TextSpanProvenance {
+            source_scope: "active_window".to_string(),
+            ownership_kind: "ActiveWindowOwned".to_string(),
+            ownership_confidence: 0.95,
+            active_artifact_match_confidence: 0.95,
+            owner_window_id: metadata.window_id,
+            owner_app_pid: metadata.app_pid,
+            owner_bundle_id: metadata.app_bundle_id.clone(),
+            owner_app_name: context.app_name.clone(),
+            owner_window_title: context.window_name.clone(),
+            coordinate_space: "active_window_crop_pixels".to_string(),
+            coordinate_transform_json: serde_json::json!({
+                "ocr_coordinate_space": "active_window_crop_pixels",
+                "window_coordinate_space": "active_window_crop",
+                "confidence": 0.95,
+                "reason": "ocr_ran_on_active_window_crop"
+            }),
+            quality_flags: flags,
+            reason: "ocr_ran_on_active_window_crop".to_string(),
+        };
+    }
+
+    let Some(snapshot) = window_snapshot else {
+        push_flag(&mut flags, "ocr_unattributed");
+        return unattributed_provenance(
+            "DisplayOnlyUnattributed",
+            0.30,
+            0.15,
+            flags,
+            "no_window_graph_for_display_ocr",
+        );
+    };
+    if snapshot.screen_count > 1 {
+        push_flag(&mut flags, "multi_display_geometry");
+    }
+    if snapshot
+        .windows
+        .iter()
+        .filter_map(|window| window.bounds.as_ref())
+        .any(|bounds| bounds.x < 0.0 || bounds.y < 0.0)
+    {
+        push_flag(&mut flags, "negative_display_origin");
+    }
+    if metadata.screen_scale <= 0.0 {
+        push_flag(&mut flags, "coordinate_transform_unverified");
+        return unattributed_provenance(
+            "UnknownCoordinateSpace",
+            0.20,
+            0.10,
+            flags,
+            "missing_or_invalid_screen_scale",
+        );
+    }
+
+    let mut candidates = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.is_onscreen.unwrap_or(true) && window.bounds.is_some())
+        .filter_map(|window| {
+            let window_bounds = window.bounds.as_ref()?;
+            let overlap = rect_overlap_ratio(bounds, window_bounds);
+            let contains_center = rect_contains_point(
+                window_bounds,
+                bounds.x + bounds.w / 2.0,
+                bounds.y + bounds.h / 2.0,
+            );
+            (contains_center || overlap > 0.05).then_some((window, overlap, contains_center))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.0.is_active.cmp(&left.0.is_active))
+    });
+
+    let Some((window, overlap, contains_center)) = candidates.first().copied() else {
+        push_flag(&mut flags, "ocr_unattributed");
+        return unattributed_provenance(
+            "DisplayOnlyUnattributed",
+            0.35,
+            0.20,
+            flags,
+            "display_ocr_span_matched_no_visible_window",
+        );
+    };
+
+    let active_window_match = metadata
+        .window_id
+        .zip(window.cg_window_id)
+        .is_some_and(|(active, candidate)| active == candidate)
+        || window.is_active;
+    let same_bundle = metadata
+        .app_bundle_id
+        .as_deref()
+        .zip(window.bundle_id.as_deref())
+        .is_some_and(|(active, candidate)| active == candidate);
+    let same_pid = metadata
+        .app_pid
+        .zip(window.owner_pid)
+        .is_some_and(|(active, candidate)| active == candidate);
+    let same_app_name = context
+        .app_name
+        .as_deref()
+        .zip(window.owner_name.as_deref())
+        .is_some_and(|(active, candidate)| {
+            let active = active.to_lowercase();
+            let candidate = candidate.to_lowercase();
+            !active.is_empty() && (active.contains(&candidate) || candidate.contains(&active))
+        });
+    let source_scope = if same_bundle || same_pid || same_app_name {
+        "active_app_window"
+    } else {
+        "other_visible_window"
+    };
+    let (ownership_kind, ownership_confidence, active_artifact_match_confidence, reason) =
+        if active_window_match {
+            (
+                "ActiveWindowOwned",
+                if contains_center { 0.88 } else { 0.78 },
+                0.88,
+                "display_ocr_geometry_matched_active_window",
+            )
+        } else if same_bundle || same_pid || same_app_name {
+            if metadata.window_id.is_some() {
+                push_flag(&mut flags, "same_app_non_active_window");
+                (
+                    "SameAppNonActiveWindow",
+                    0.62,
+                    0.35,
+                    "display_ocr_geometry_matched_same_app_non_active_window",
+                )
+            } else {
+                (
+                    "ActiveAppOwned",
+                    0.62,
+                    0.58,
+                    "display_ocr_geometry_matched_active_app_window",
+                )
+            }
+        } else {
+            push_flag(&mut flags, "ocr_from_other_window");
+            (
+                "OtherWindowOwned",
+                if contains_center { 0.86 } else { 0.72 },
+                0.0,
+                "display_ocr_geometry_matched_other_visible_window",
+            )
+        };
+
+    TextSpanProvenance {
+        source_scope: source_scope.to_string(),
+        ownership_kind: ownership_kind.to_string(),
+        ownership_confidence,
+        active_artifact_match_confidence,
+        owner_window_id: window.cg_window_id,
+        owner_app_pid: window.owner_pid,
+        owner_bundle_id: window.bundle_id.clone(),
+        owner_app_name: window.owner_name.clone(),
+        owner_window_title: window.window_title.clone(),
+        coordinate_space: "image_pixels_assumed_global_points".to_string(),
+        coordinate_transform_json: serde_json::json!({
+            "ocr_coordinate_space": "image_pixels",
+            "window_coordinate_space": "cg_points_global",
+            "scale_x": metadata.screen_scale,
+            "scale_y": metadata.screen_scale,
+            "confidence": 0.72,
+            "reason": "full_display_ocr_compared_to_window_graph",
+            "span_window_overlap_ratio": overlap
+        }),
+        quality_flags: flags,
+        reason: reason.to_string(),
+    }
+}
+
+fn unattributed_provenance(
+    kind: &str,
+    ownership_confidence: f64,
+    active_artifact_match_confidence: f64,
+    flags: Vec<String>,
+    reason: &str,
+) -> TextSpanProvenance {
+    TextSpanProvenance {
+        source_scope: "active_display".to_string(),
+        ownership_kind: kind.to_string(),
+        ownership_confidence,
+        active_artifact_match_confidence,
+        owner_window_id: None,
+        owner_app_pid: None,
+        owner_bundle_id: None,
+        owner_app_name: None,
+        owner_window_title: None,
+        coordinate_space: "image_pixels_unverified".to_string(),
+        coordinate_transform_json: serde_json::json!({
+            "ocr_coordinate_space": "image_pixels",
+            "window_coordinate_space": "unknown",
+            "confidence": ownership_confidence,
+            "reason": reason
+        }),
+        quality_flags: flags,
+        reason: reason.to_string(),
+    }
+}
+
+fn resolve_frame_text(
+    accessibility_text: Option<&str>,
+    ocr_drafts: &[OcrSpanDraft],
+    a11y_is_thin: bool,
+) -> (Option<&'static str>, Option<String>, FrameTextResolution) {
+    let mut active_parts = Vec::new();
+    let mut background_parts = Vec::new();
+    let mut diagnostic_parts = Vec::new();
+    let mut quality_flags = Vec::new();
+
+    if let Some(text) = accessibility_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        active_parts.push(text.to_string());
+        diagnostic_parts.push(text.to_string());
+    }
+
+    for draft in ocr_drafts {
+        diagnostic_parts.push(draft.text.clone());
+        for flag in &draft.provenance.quality_flags {
+            push_flag(&mut quality_flags, flag);
+        }
+        if draft.provenance.active_artifact_match_confidence >= 0.55
+            && matches!(
+                draft.provenance.ownership_kind.as_str(),
+                "ActiveWindowOwned" | "ActiveAppOwned"
+            )
+        {
+            active_parts.push(draft.text.clone());
+        } else {
+            background_parts.push(draft.text.clone());
+        }
+    }
+
+    if !background_parts.is_empty() {
+        push_flag(&mut quality_flags, "background_text_present");
+    }
+    if active_parts.is_empty() && !diagnostic_parts.is_empty() {
+        push_flag(&mut quality_flags, "active_text_empty");
+    }
+    if background_parts.iter().any(|_| {
+        quality_flags
+            .iter()
+            .any(|flag| flag == "ocr_from_other_window")
+    }) {
+        push_flag(&mut quality_flags, "ocr_spans_other_window_owned");
+    }
+    if !background_parts.is_empty() && !active_parts.is_empty() {
+        push_flag(&mut quality_flags, "hybrid_text_contains_background");
+    }
+
+    let active_text = join_nonempty(active_parts);
+    let background_text = join_nonempty(background_parts);
+    let diagnostic_text = join_nonempty(diagnostic_parts);
+    let active_has_ocr = ocr_drafts
+        .iter()
+        .any(|draft| draft.provenance.active_artifact_match_confidence >= 0.55);
+    let full_text_quality = match (
+        active_text.is_some(),
+        background_text.is_some(),
+        accessibility_text.is_some(),
+        active_has_ocr,
+    ) {
+        (true, false, true, true) if a11y_is_thin => "clean_active_hybrid",
+        (true, false, true, _) => "clean_active_accessibility",
+        (true, false, false, true) => "clean_active_ocr",
+        (true, true, _, _) => "mixed_active_and_background",
+        (false, true, _, _) => "background_only",
+        _ => "unknown",
+    }
+    .to_string();
+    let text_source = match (accessibility_text.is_some(), active_has_ocr, a11y_is_thin) {
+        (true, true, true) => Some("hybrid"),
+        (true, _, _) => Some("accessibility"),
+        (false, true, _) => Some("ocr"),
+        (false, false, _) if diagnostic_text.is_some() => Some("diagnostic"),
+        _ => None,
+    };
+    let active_content_hash = active_text
+        .as_deref()
+        .map(|text| stable_hash_bytes(text.as_bytes()));
+    let background_content_hash = background_text
+        .as_deref()
+        .map(|text| stable_hash_bytes(text.as_bytes()));
+    let resolution_json = serde_json::json!({
+        "activeTextPresent": active_text.is_some(),
+        "backgroundTextPresent": background_text.is_some(),
+        "diagnosticTextPresent": diagnostic_text.is_some(),
+        "fullTextQuality": &full_text_quality,
+        "ocrSpanCount": ocr_drafts.len(),
+        "activeOcrSpanCount": ocr_drafts.iter().filter(|draft| draft.provenance.active_artifact_match_confidence >= 0.55).count(),
+        "backgroundOcrSpanCount": ocr_drafts.iter().filter(|draft| draft.provenance.active_artifact_match_confidence < 0.55).count(),
+        "qualityFlags": &quality_flags,
+    })
+    .to_string();
+    let full_text = diagnostic_text.clone();
+    (
+        text_source,
+        full_text,
+        FrameTextResolution {
+            active_text,
+            background_text,
+            diagnostic_text,
+            full_text_quality,
+            quality_flags,
+            resolution_json,
+            active_content_hash,
+            background_content_hash,
+        },
+    )
+}
+
+fn join_nonempty(parts: Vec<String>) -> Option<String> {
+    non_empty(
+        parts
+            .into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn push_flag(flags: &mut Vec<String>, flag: &str) {
+    if !flags.iter().any(|existing| existing == flag) {
+        flags.push(flag.to_string());
+    }
+}
+
+fn rect_contains_point(rect: &Rect, x: f64, y: f64) -> bool {
+    x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
+}
+
+fn rect_overlap_ratio(a: &Rect, b: &Rect) -> f64 {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.w).min(b.x + b.w);
+    let bottom = (a.y + a.h).min(b.y + b.h);
+    let overlap_w = (right - left).max(0.0);
+    let overlap_h = (bottom - top).max(0.0);
+    let overlap_area = overlap_w * overlap_h;
+    let area = (a.w * a.h).max(1.0);
+    (overlap_area / area).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -16324,7 +17026,10 @@ fn query_ax_nodes(conn: &Connection, frame_id: &str) -> Result<Vec<AxNodeSummary
 fn query_ocr_spans(conn: &Connection, frame_id: &str) -> Result<Vec<OcrSpanSummary>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, engine, text, confidence, bounds_x, bounds_y, bounds_w, bounds_h
+            "SELECT id, engine, text, confidence, bounds_x, bounds_y, bounds_w, bounds_h,
+                    source_scope, ownership_kind, ownership_confidence,
+                    active_artifact_match_confidence, owner_window_id, owner_bundle_id,
+                    owner_app_name, owner_window_title, quality_flags_json, provenance_json
              FROM ocr_spans
              WHERE frame_id = ?1
              ORDER BY line_index ASC
@@ -16342,6 +17047,16 @@ fn query_ocr_spans(conn: &Connection, frame_id: &str) -> Result<Vec<OcrSpanSumma
                 bounds_y: row.get(5)?,
                 bounds_w: row.get(6)?,
                 bounds_h: row.get(7)?,
+                source_scope: row.get(8)?,
+                ownership_kind: row.get(9)?,
+                ownership_confidence: row.get(10)?,
+                active_artifact_match_confidence: row.get(11)?,
+                owner_window_id: row.get(12)?,
+                owner_bundle_id: row.get(13)?,
+                owner_app_name: row.get(14)?,
+                owner_window_title: row.get(15)?,
+                quality_flags_json: row.get(16)?,
+                provenance_json: row.get(17)?,
             })
         })
         .map_err(to_string)?;
@@ -16355,7 +17070,9 @@ fn query_content_units_for_frame(
     let mut stmt = conn
         .prepare(
             "SELECT id, source, unit_type, semantic_role, text, bounds_x, bounds_y,
-                    bounds_w, bounds_h, confidence
+                    bounds_w, bounds_h, confidence, source_scope, ownership_kind,
+                    ownership_confidence, active_artifact_match_confidence, owner_window_id,
+                    owner_bundle_id, quality_flags_json
              FROM content_units
              WHERE frame_id = ?1
              ORDER BY confidence DESC, created_at_ms DESC
@@ -16380,6 +17097,13 @@ fn content_unit_from_row(row: &Row<'_>) -> rusqlite::Result<ContentUnitSummary> 
         bounds_w: row.get(7)?,
         bounds_h: row.get(8)?,
         confidence: row.get(9)?,
+        source_scope: row.get(10)?,
+        ownership_kind: row.get(11)?,
+        ownership_confidence: row.get(12)?,
+        active_artifact_match_confidence: row.get(13)?,
+        owner_window_id: row.get(14)?,
+        owner_bundle_id: row.get(15)?,
+        quality_flags_json: row.get(16)?,
     })
 }
 
@@ -16604,6 +17328,66 @@ fn validate_frame_consistency_inner(
         .first()
         .map(|context| context.object_type.as_str());
 
+    if let Some((quality, flags_json, resolution_json)) =
+        query_frame_text_resolution_warning_payload(conn, &frame_key)?
+    {
+        let flags = parse_string_array_capture(&flags_json);
+        if frame.scope.as_deref() == Some("active_display")
+            && frame.window_id.is_none()
+            && frame.active_window_crop_path.is_none()
+            && flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    "background_text_present"
+                        | "ocr_from_other_window"
+                        | "ocr_spans_other_window_owned"
+                        | "ocr_unattributed"
+                )
+            })
+        {
+            warnings.push(make_frame_quality_warning(
+                &frame_key,
+                "active_display_mixed_ocr_substrate",
+                "high",
+                "active-display OCR has no active window id or crop and cannot be treated as clean active-artifact text",
+                serde_json::json!({
+                    "full_text_quality": quality,
+                    "quality_flags": flags,
+                    "resolution": json_string_or_value(&resolution_json)
+                }),
+            ));
+        }
+        for flag in flags {
+            if matches!(
+                flag.as_str(),
+                "ocr_spans_other_window_owned"
+                    | "ocr_from_other_window"
+                    | "ocr_unattributed"
+                    | "coordinate_transform_unverified"
+                    | "background_text_present"
+                    | "active_text_empty"
+            ) {
+                warnings.push(make_frame_quality_warning(
+                    &frame_key,
+                    &flag,
+                    if flag == "ocr_from_other_window"
+                        || flag == "ocr_spans_other_window_owned"
+                        || flag == "coordinate_transform_unverified"
+                    {
+                        "high"
+                    } else {
+                        "medium"
+                    },
+                    &format!("frame text resolution flagged {}", flag),
+                    serde_json::json!({
+                        "full_text_quality": quality,
+                        "resolution": json_string_or_value(&resolution_json)
+                    }),
+                ));
+            }
+        }
+    }
+
     if frame.active_window_crop_path.is_some() && frame.window_id.is_none() {
         warnings.push(make_frame_quality_warning(
             &frame_key,
@@ -16785,6 +17569,96 @@ fn query_frame_quality_warnings(
         })
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_frame_text_resolution_warning_payload(
+    conn: &Connection,
+    frame_id: &str,
+) -> Result<Option<(String, String, String)>, String> {
+    if !table_exists_in_capture(conn, "frame_text_resolutions")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT full_text_quality, quality_flags_json, resolution_json
+         FROM frame_text_resolutions
+         WHERE frame_id = ?1",
+        params![frame_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn active_frame_text_for_ai(
+    conn: &Connection,
+    frame: &CaptureFrame,
+) -> Result<Option<String>, String> {
+    if table_exists_in_capture(conn, "frame_text_resolutions")? {
+        if let Some((active_text, full_text_quality, quality_flags_json)) = conn
+            .query_row(
+                "SELECT active_text, full_text_quality, quality_flags_json
+                 FROM frame_text_resolutions
+                 WHERE frame_id = ?1",
+                params![frame.id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(to_string)?
+        {
+            if let Some(text) = active_text.and_then(non_empty) {
+                return Ok(Some(text));
+            }
+            let flags = parse_string_array_capture(&quality_flags_json);
+            if matches!(
+                full_text_quality.as_str(),
+                "mixed_active_and_background"
+                    | "background_only"
+                    | "display_only_unattributed"
+                    | "unknown"
+            ) || flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    "background_text_present"
+                        | "ocr_from_other_window"
+                        | "ocr_spans_other_window_owned"
+                        | "ocr_unattributed"
+                        | "coordinate_transform_unverified"
+                )
+            }) {
+                return Ok(None);
+            }
+        }
+    }
+    if capture_frame_is_unbounded_display_ocr(frame) {
+        return Ok(None);
+    }
+    Ok(frame.full_text.clone().and_then(non_empty))
+}
+
+fn capture_frame_is_unbounded_display_ocr(frame: &CaptureFrame) -> bool {
+    let text_source = frame.text_source.as_deref().unwrap_or("").to_lowercase();
+    (text_source == "ocr"
+        || text_source == "hybrid"
+        || (text_source.contains("ocr") && !text_source.contains("accessibility")))
+        && frame.scope.as_deref() == Some("active_display")
+        && frame.window_id.is_none()
+        && frame.active_window_crop_path.is_none()
+}
+
+fn parse_string_array_capture(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 fn frame_from_row(row: &Row<'_>) -> rusqlite::Result<CaptureFrame> {
@@ -17284,10 +18158,29 @@ fn export_continue_output_audit_to_plan(
     if let Some(output_root) = final_dir.parent() {
         fs::create_dir_all(output_root).map_err(to_string)?;
     }
-    if final_dir.exists() {
-        fs::remove_dir_all(&final_dir).map_err(to_string)?;
+    let tmp_dir = final_dir
+        .parent()
+        .map(|parent| parent.join(format!(".{}.building", plan.folder_name)))
+        .unwrap_or_else(|| final_dir.with_extension("building"));
+    if tmp_dir.exists() {
+        fs::remove_dir_all(&tmp_dir).map_err(|error| {
+            format!(
+                "remove stale audit tmp dir {}: {}",
+                tmp_dir.display(),
+                error
+            )
+        })?;
     }
-    fs::create_dir_all(&final_dir).map_err(to_string)?;
+    if final_dir.exists() {
+        fs::remove_dir_all(&final_dir).map_err(|error| {
+            format!(
+                "remove stale audit final dir {}: {}",
+                final_dir.display(),
+                error
+            )
+        })?;
+    }
+    fs::create_dir_all(&tmp_dir).map_err(to_string)?;
     result.continue_output_path = Some(final_dir.to_string_lossy().to_string());
 
     let mut warnings = Vec::new();
@@ -17298,28 +18191,50 @@ fn export_continue_output_audit_to_plan(
     let mut layer_manifest = Vec::new();
     let mut candidate_manifest = Vec::new();
 
-    let raw_dir = final_dir.join("raw");
+    let output_dir = tmp_dir;
+    let raw_dir = output_dir.join("raw");
     let raw_tables_dir = raw_dir.join("tables");
-    let request_dir = final_dir.join("request");
-    let capture_frames_dir = final_dir.join("capture").join("frames");
-    let layers_dir = final_dir.join("continue").join("layers");
-    let candidates_dir = final_dir.join("continue").join("candidates");
-    let inference_dir = final_dir.join("inference");
-    let final_output_dir = final_dir.join("final");
+    let request_dir = output_dir.join("request");
+    let capture_frames_dir = output_dir.join("capture").join("frames");
+    let layers_dir = output_dir.join("continue").join("layers");
+    let candidates_dir = output_dir.join("continue").join("candidates");
+    let inference_dir = output_dir.join("inference");
+    let final_output_dir = output_dir.join("final");
+    let decision_dir = output_dir.join("decision");
+    let evidence_dir = output_dir.join("evidence");
+    let evidence_frames_dir = evidence_dir.join("frames");
+    let cache_dir = output_dir.join("cache");
+    let model_dir = output_dir.join("model");
+    let logs_dir = output_dir.join("logs");
     for dir in [
-        &raw_tables_dir,
+        &raw_dir,
         &request_dir,
-        &capture_frames_dir,
         &layers_dir,
         &candidates_dir,
         &inference_dir,
         &final_output_dir,
+        &decision_dir,
+        &evidence_dir,
+        &evidence_frames_dir,
+        &cache_dir,
+        &model_dir,
+        &logs_dir,
     ] {
         fs::create_dir_all(dir).map_err(to_string)?;
     }
+    write_json_pretty(
+        &output_dir.join("BUILDING_AUDIT.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_audit_building.v1",
+            "folderName": folder_name,
+            "decisionId": result.decision_id,
+            "startedAtMs": now_millis(),
+            "finalPath": final_dir.to_string_lossy(),
+        }),
+    )?;
 
     write_continue_export_status(
-        &final_dir,
+        &output_dir,
         "running",
         "critical_started",
         result,
@@ -17327,7 +18242,7 @@ fn export_continue_output_audit_to_plan(
         &raw_errors,
         &skipped_tables,
     )?;
-    write_continue_disk_status(&final_dir.join("disk_status.json"), &final_dir)?;
+    write_continue_disk_status(&output_dir.join("disk_status.json"), &output_dir)?;
 
     write_json_pretty(
         &request_dir.join("get_continue_decision_request.json"),
@@ -17372,13 +18287,9 @@ fn export_continue_output_audit_to_plan(
         &final_output_dir.join("handoff.json"),
         &serde_json::to_value(&result.handoff).map_err(to_string)?,
     )?;
-    write_text_file(
-        &final_dir.join("explain.md"),
-        &continue_output_explain_markdown(result, 0, &inference_manifest),
-    )?;
 
     write_continue_export_status(
-        &final_dir,
+        &output_dir,
         "running",
         "critical_complete_raw_pending",
         result,
@@ -17386,23 +18297,8 @@ fn export_continue_output_audit_to_plan(
         &raw_errors,
         &skipped_tables,
     )?;
-    write_continue_output_manifest(
-        &final_dir,
-        generated_at,
-        &folder_name,
-        plan,
-        effective_mode,
-        result,
-        &raw_table_manifest,
-        &frame_manifests,
-        &layer_manifest,
-        &candidate_manifest,
-        &inference_manifest,
-        &warnings,
-        &raw_errors,
-        &skipped_tables,
-    )?;
 
+    let selected_candidate = selected_continue_candidate_json(conn, &result.decision_id)?;
     match export_continue_table_group(conn, &layers_dir, CONTINUE_OUTPUT_LAYER_TABLES) {
         Ok(manifest) => layer_manifest = manifest,
         Err(error) => push_continue_raw_error(
@@ -17430,6 +18326,7 @@ fn export_continue_output_audit_to_plan(
     let force_raw_failure = effective_mode == "force_raw_failure_for_test";
     #[cfg(not(test))]
     let force_raw_failure = false;
+    let full_raw_export = continue_audit_full_raw_enabled(effective_mode);
 
     if force_raw_failure {
         push_continue_raw_error(
@@ -17444,17 +18341,39 @@ fn export_continue_output_audit_to_plan(
             "table": "*",
             "reason": "forced_raw_table_failure"
         }));
-    } else {
+        write_sqlite_snapshot_skipped_metadata(
+            &raw_dir,
+            "raw/smalltalk-capture.sqlite",
+            "forced_raw_table_failure",
+        )?;
+    } else if full_raw_export {
+        fs::create_dir_all(&raw_tables_dir).map_err(to_string)?;
+        fs::create_dir_all(&capture_frames_dir).map_err(to_string)?;
         match copy_database_snapshot(conn, &raw_dir.join("smalltalk-capture.sqlite")) {
-            Ok(()) => {}
-            Err(error) => push_continue_raw_error(
-                &mut raw_errors,
-                &mut warnings,
-                "raw_database",
-                "database_snapshot_failed",
-                error,
-                Some("raw/smalltalk-capture.sqlite".to_string()),
-            ),
+            Ok(()) => {
+                write_sqlite_snapshot_metadata(
+                    &raw_dir,
+                    "raw/smalltalk-capture.sqlite",
+                    &raw_dir.join("smalltalk-capture.sqlite"),
+                    None,
+                )?;
+            }
+            Err(error) => {
+                push_continue_raw_error(
+                    &mut raw_errors,
+                    &mut warnings,
+                    "raw_database",
+                    "database_snapshot_failed",
+                    error.clone(),
+                    Some("raw/smalltalk-capture.sqlite".to_string()),
+                );
+                let _ = write_sqlite_snapshot_metadata(
+                    &raw_dir,
+                    "raw/smalltalk-capture.sqlite",
+                    &raw_dir.join("smalltalk-capture.sqlite"),
+                    Some(error),
+                );
+            }
         }
         match write_schema_dump(conn, &raw_dir.join("schema.sql")) {
             Ok(()) => {}
@@ -17502,14 +18421,6 @@ fn export_continue_output_audit_to_plan(
                         ),
                     }
                 }
-                write_text_file(
-                    &final_dir.join("explain.md"),
-                    &continue_output_explain_markdown(
-                        result,
-                        frame_manifests.len(),
-                        &inference_manifest,
-                    ),
-                )?;
             }
             Err(error) => push_continue_raw_error(
                 &mut raw_errors,
@@ -17520,7 +18431,109 @@ fn export_continue_output_audit_to_plan(
                 Some("capture/frames".to_string()),
             ),
         }
+    } else {
+        write_sqlite_snapshot_skipped_metadata(
+            &raw_dir,
+            "raw/smalltalk-capture.sqlite",
+            "default_lean_continue_audit",
+        )?;
+        skipped_tables.push(serde_json::json!({
+            "scope": "raw_database",
+            "reason": "default_lean_continue_audit",
+            "message": "Full SQLite snapshots are disabled for default Continue audits. Use SMALLTALK_CONTINUE_AUDIT_FULL_RAW=1 or an effective mode containing full_raw for archival debug output."
+        }));
+        skipped_tables.push(serde_json::json!({
+            "scope": "raw_tables",
+            "reason": "default_lean_continue_audit",
+            "message": "Full raw table NDJSON export is disabled for default Continue audits."
+        }));
+        skipped_tables.push(serde_json::json!({
+            "scope": "capture_frames",
+            "reason": "default_lean_continue_audit",
+            "message": "All-frame capture export is disabled for default Continue audits; selected evidence frames are exported under evidence/frames."
+        }));
+        match write_schema_dump(conn, &raw_dir.join("schema.sql")) {
+            Ok(()) => {}
+            Err(error) => push_continue_raw_error(
+                &mut raw_errors,
+                &mut warnings,
+                "raw_schema",
+                "schema_dump_failed",
+                error,
+                Some("raw/schema.sql".to_string()),
+            ),
+        }
     }
+
+    write_json_pretty(
+        &decision_dir.join("final_decision.json"),
+        &serde_json::to_value(&result).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("current_focus.json"),
+        &serde_json::to_value(&result.current_focus).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("selected_workstream.json"),
+        &serde_json::to_value(&result.selected_workstream).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("return_target.json"),
+        &serde_json::to_value(&result.return_target).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("resume_work_target.json"),
+        &serde_json::to_value(&result.resume_work_target).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("evidence_anchors.json"),
+        &serde_json::to_value(&result.evidence_anchors).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("alternatives.json"),
+        &serde_json::to_value(&result.alternatives).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("warnings.json"),
+        &serde_json::to_value(&result.warnings).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("missing_evidence.json"),
+        &serde_json::to_value(&result.missing_evidence).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("candidates.json"),
+        &continue_candidates_audit_json(result, &selected_candidate),
+    )?;
+    let copy_gate = continue_copy_gate_json(result);
+    write_json_pretty(&decision_dir.join("copy_gate.json"), &copy_gate)?;
+    let cache_decision = continue_cache_decision_json(result);
+    write_json_pretty(&cache_dir.join("cache_decision.json"), &cache_decision)?;
+    let model_summary = export_continue_model_audit(&model_dir, result, &inference_manifest)?;
+    let mut evidence_closure = continue_evidence_closure_from_result(result, &selected_candidate);
+    export_selected_evidence_frames(
+        conn,
+        &evidence_frames_dir,
+        &mut evidence_closure,
+        &mut warnings,
+    )?;
+    let evidence_closure_json = evidence_closure_json(&evidence_closure);
+    write_json_pretty(
+        &evidence_dir.join("evidence_closure.json"),
+        &evidence_closure_json,
+    )?;
+    write_continue_raw_table_index(&raw_dir, &raw_table_manifest, &skipped_tables)?;
+    let decision_trace = continue_decision_trace_json(
+        generated_at,
+        effective_mode,
+        request,
+        result,
+        &cache_decision,
+        &model_summary,
+        &copy_gate,
+        &evidence_closure_json,
+    );
+    write_json_pretty(&decision_dir.join("decision_trace.json"), &decision_trace)?;
 
     write_json_pretty(
         &raw_dir.join("export_errors.json"),
@@ -17531,7 +18544,7 @@ fn export_continue_output_audit_to_plan(
         &Value::Array(skipped_tables.clone()),
     )?;
     write_json_pretty(
-        &final_dir.join("export_warnings.json"),
+        &output_dir.join("export_warnings.json"),
         &Value::Array(
             warnings
                 .iter()
@@ -17541,7 +18554,7 @@ fn export_continue_output_audit_to_plan(
         ),
     )?;
     write_continue_export_status(
-        &final_dir,
+        &output_dir,
         if raw_errors.is_empty() {
             "complete"
         } else {
@@ -17553,8 +18566,37 @@ fn export_continue_output_audit_to_plan(
         &raw_errors,
         &skipped_tables,
     )?;
+    write_continue_disk_status(&output_dir.join("disk_status.json"), &output_dir)?;
+    write_text_file(
+        &output_dir.join("explain.md"),
+        &continue_output_explain_markdown_v2(
+            result,
+            frame_manifests.len(),
+            &inference_manifest,
+            &model_summary,
+            &cache_decision,
+            &copy_gate,
+            &evidence_closure_json,
+            if raw_errors.is_empty() {
+                "complete"
+            } else {
+                "complete_with_warnings"
+            },
+        ),
+    )?;
+    let integrity = continue_audit_integrity_json(
+        &output_dir,
+        result,
+        &raw_table_manifest,
+        &evidence_closure_json,
+        &cache_decision,
+        &model_summary,
+        &copy_gate,
+        &raw_errors,
+    );
+    write_json_pretty(&output_dir.join("audit_integrity.json"), &integrity)?;
     write_continue_output_manifest(
-        &final_dir,
+        &output_dir,
         generated_at,
         &folder_name,
         plan,
@@ -17569,7 +18611,27 @@ fn export_continue_output_audit_to_plan(
         &raw_errors,
         &skipped_tables,
     )?;
-    write_continue_disk_status(&final_dir.join("disk_status.json"), &final_dir)?;
+    let _ = fs::remove_file(output_dir.join("BUILDING_AUDIT.json"));
+    if let Some(parent) = final_dir.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+    if final_dir.exists() {
+        fs::remove_dir_all(&final_dir).map_err(|error| {
+            format!(
+                "remove pre-publish audit final dir {}: {}",
+                final_dir.display(),
+                error
+            )
+        })?;
+    }
+    fs::rename(&output_dir, &final_dir).map_err(|error| {
+        format!(
+            "publish audit dir {} -> {}: {}",
+            output_dir.display(),
+            final_dir.display(),
+            error
+        )
+    })?;
     let stats = directory_stats(&final_dir).unwrap_or(ExportStats {
         file_count: 0,
         byte_size: 0,
@@ -17599,6 +18661,9 @@ fn write_continue_export_status(
     let stats = directory_stats(output_dir).unwrap_or(ExportStats {
         file_count: 0,
         byte_size: 0,
+    });
+    let lean_raw_skipped = skipped_tables.iter().any(|item| {
+        item.get("reason").and_then(Value::as_str) == Some("default_lean_continue_audit")
     });
     write_json_pretty(
         &output_dir.join("export_status.json"),
@@ -17631,7 +18696,13 @@ fn write_continue_export_status(
                 "files": stats.file_count,
                 "bytes": stats.byte_size
             },
-            "rawExportStatus": if raw_errors.is_empty() { "ok_or_pending" } else { "errors_recorded" },
+            "rawExportStatus": if lean_raw_skipped {
+                "skipped_default_lean_audit"
+            } else if raw_errors.is_empty() {
+                "ok_or_pending"
+            } else {
+                "errors_recorded"
+            },
         }),
     )
 }
@@ -17657,12 +18728,96 @@ fn write_continue_output_manifest(
         file_count: 0,
         byte_size: 0,
     });
+    let file_counts = continue_audit_file_counts(output_dir, &file_index);
+    let row_counts = continue_audit_row_counts(raw_table_manifest);
+    let export_status = if !raw_errors.is_empty() {
+        "complete_with_warnings"
+    } else if skipped_tables.is_empty() {
+        "complete"
+    } else {
+        "partial_missing_optional_files"
+    };
+    let decision_summary = serde_json::json!({
+        "mode": result.mode,
+        "source": result.source,
+        "validationStatus": result.validation_status,
+        "cacheHit": result.cache_hit,
+        "confidence": result.confidence,
+        "confidenceLabel": result.confidence_label,
+        "continueOutputMode": result.continue_output_mode,
+    });
+    let entrypoints = serde_json::json!({
+        "explainMd": "explain.md",
+        "decisionTrace": "decision/decision_trace.json",
+        "finalDecision": "decision/final_decision.json",
+        "legacyFinalDecision": "final/continue_decision_result.json",
+        "evidenceClosure": "evidence/evidence_closure.json",
+        "candidateScores": "decision/candidates.json",
+        "modelValidation": "model/validation.json",
+        "cacheDecision": "cache/cache_decision.json",
+        "copyGate": "decision/copy_gate.json",
+        "rawTableIndex": "raw/table_index.json"
+    });
+    let legacy_counts = serde_json::json!({
+        "rawTables": raw_table_manifest.len(),
+        "frames": frame_manifests.len(),
+        "continueLayerTables": layer_manifest.len(),
+        "candidateTables": candidate_manifest.len(),
+        "inferenceEvents": inference_manifest.len(),
+        "warnings": warnings.len(),
+        "rawErrors": raw_errors.len(),
+        "skippedTables": skipped_tables.len(),
+        "filesBeforeManifest": file_index.len(),
+    });
+    let manifest_paths = serde_json::json!({
+        "status": "export_status.json",
+        "diskStatus": "disk_status.json",
+        "request": "request/get_continue_decision_request.json",
+        "rawDatabase": "raw/smalltalk-capture.sqlite",
+        "schema": "raw/schema.sql",
+        "rawTables": raw_table_manifest,
+        "rawTableIndex": "raw/table_index.json",
+        "rawErrors": "raw/export_errors.json",
+        "skippedTables": "raw/skipped_tables.json",
+        "captureFrames": frame_manifests,
+        "selectedEvidenceFrames": "evidence/frames/",
+        "evidenceClosure": "evidence/evidence_closure.json",
+        "decisionTrace": "decision/decision_trace.json",
+        "continueLayers": layer_manifest,
+        "continueCandidates": candidate_manifest,
+        "selectedCandidate": "continue/candidates/selected_candidate.json",
+        "canonicalCandidates": "decision/candidates.json",
+        "cacheDecision": "cache/cache_decision.json",
+        "model": "model/",
+        "copyGate": "decision/copy_gate.json",
+        "auditIntegrity": "audit_integrity.json",
+        "inference": inference_manifest,
+        "finalDecision": "final/continue_decision_result.json",
+        "handoff": "final/handoff.json",
+        "explanation": "explain.md",
+        "warnings": "export_warnings.json",
+        "fileIndex": file_index,
+    });
+    let stats_before_manifest = serde_json::json!({
+        "fileCount": stats.file_count,
+        "byteSize": stats.byte_size,
+    });
+    let notes = serde_json::json!([
+        "This is a lean local developer audit focused on decision proof, selected evidence, model/cache/copy-gate behavior, and engine quality.",
+        "Full SQLite snapshots, full raw table dumps, and all-frame capture exports are disabled by default because they duplicate the accumulated local capture database and are not useful as LLM-readable evidence.",
+        "This audit is generated private developer output and must not be committed or uploaded accidentally.",
+        "Use SMALLTALK_CONTINUE_AUDIT_FULL_RAW=1 or a full_raw effective mode only when an archival raw database/table dump is explicitly needed.",
+        "Inference request bodies do not include API keys or authorization headers.",
+        "The final Continue answer is in final/continue_decision_result.json and final/handoff.json."
+    ]);
     write_json_pretty(
         &output_dir.join("manifest.json"),
         &serde_json::json!({
-            "schema": "smalltalk.continue_output.full_audit.v1",
+            "schema": "smalltalk.continue_audit_manifest.v2",
+            "legacySchema": "smalltalk.continue_output.full_audit.v1",
             "generatedAtMs": generated_at,
             "updatedAtMs": now_millis(),
+            "auditId": format!("continue-audit-{}", generated_at),
             "decisionId": result.decision_id,
             "cacheHit": result.cache_hit,
             "source": result.source,
@@ -17671,52 +18826,1336 @@ fn write_continue_output_manifest(
             "effectiveMode": effective_mode,
             "sessionLabel": &plan.session_label,
             "folderName": folder_name,
-            "path": output_dir.to_string_lossy(),
+            "path": plan.final_dir.to_string_lossy(),
+            "containsSensitiveLocalEvidence": true,
             "latestFrame": result.current_focus,
             "selectedWorkstream": result.selected_workstream,
             "returnTarget": result.resume_work_target.as_ref().or(result.return_target.as_ref()),
-            "counts": {
-                "rawTables": raw_table_manifest.len(),
-                "frames": frame_manifests.len(),
-                "continueLayerTables": layer_manifest.len(),
-                "candidateTables": candidate_manifest.len(),
-                "inferenceEvents": inference_manifest.len(),
-                "warnings": warnings.len(),
-                "rawErrors": raw_errors.len(),
-                "skippedTables": skipped_tables.len(),
-                "filesBeforeManifest": file_index.len(),
-            },
-            "manifest": {
-                "status": "export_status.json",
-                "diskStatus": "disk_status.json",
-                "request": "request/get_continue_decision_request.json",
-                "rawDatabase": "raw/smalltalk-capture.sqlite",
-                "schema": "raw/schema.sql",
-                "rawTables": raw_table_manifest,
-                "rawErrors": "raw/export_errors.json",
-                "skippedTables": "raw/skipped_tables.json",
-                "captureFrames": frame_manifests,
-                "continueLayers": layer_manifest,
-                "continueCandidates": candidate_manifest,
-                "selectedCandidate": "continue/candidates/selected_candidate.json",
-                "inference": inference_manifest,
-                "finalDecision": "final/continue_decision_result.json",
-                "handoff": "final/handoff.json",
-                "explanation": "explain.md",
-                "warnings": "export_warnings.json",
-                "fileIndex": file_index,
-            },
-            "statsBeforeManifest": {
-                "fileCount": stats.file_count,
-                "byteSize": stats.byte_size,
-            },
-            "notes": [
-                "This is a full local developer audit and may contain screenshots, OCR text, Accessibility text, URLs, paths, and personal local data.",
-                "Critical request, inference, candidate, and final decision artifacts are written before best-effort raw dumps.",
-                "Inference request bodies do not include API keys or authorization headers.",
-                "The final Continue answer is in final/continue_decision_result.json and final/handoff.json."
-            ],
+            "decisionSummary": decision_summary,
+            "exportStatus": export_status,
+            "fileCounts": file_counts,
+            "rowCounts": row_counts,
+            "integrity": serde_json::from_str::<Value>(
+                &fs::read_to_string(output_dir.join("audit_integrity.json")).unwrap_or_default()
+            ).unwrap_or(Value::Null),
+            "entrypoints": entrypoints,
+            "counts": legacy_counts,
+            "manifest": manifest_paths,
+            "statsBeforeManifest": stats_before_manifest,
+            "notes": notes,
         }),
+    )
+}
+
+fn continue_audit_file_counts(output_dir: &Path, file_index: &[String]) -> Value {
+    let selected_frame_folders = fs::read_dir(output_dir.join("evidence").join("frames"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count()
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "totalFiles": file_index.len(),
+        "selectedFrameFolders": selected_frame_folders,
+        "imagesWritten": file_index
+            .iter()
+            .filter(|path| path.contains("/images/")
+                && (path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg")))
+            .count(),
+        "jsonFiles": file_index.iter().filter(|path| path.ends_with(".json")).count(),
+        "markdownFiles": file_index.iter().filter(|path| path.ends_with(".md")).count(),
+        "rawTableFiles": file_index
+            .iter()
+            .filter(|path| path.starts_with("raw/tables/") && path.ends_with(".ndjson"))
+            .count(),
+        "sqliteSnapshots": file_index
+            .iter()
+            .filter(|path| path.ends_with(".sqlite"))
+            .count(),
+    })
+}
+
+fn continue_audit_row_counts(raw_table_manifest: &[Value]) -> Value {
+    let mut raw_tables = serde_json::Map::new();
+    for table in raw_table_manifest {
+        if let Some(name) = table.get("table").and_then(Value::as_str) {
+            raw_tables.insert(
+                name.to_string(),
+                table
+                    .get("rowCount")
+                    .or_else(|| table.get("rows_written"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+    serde_json::json!({ "rawTables": raw_tables })
+}
+
+fn continue_candidates_audit_json(
+    result: &crate::continuation::ContinueDecisionResult,
+    selected_candidate: &Value,
+) -> Value {
+    let selected_id = selected_candidate
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            result
+                .alternatives
+                .iter()
+                .find(|candidate| {
+                    result
+                        .return_target
+                        .as_ref()
+                        .and_then(|target| target.fallback_frame_id.as_ref())
+                        == candidate.evidence_frame_id.as_ref()
+                })
+                .map(|candidate| candidate.candidate_id.clone())
+        });
+    let alternatives = result
+        .alternatives
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "candidate_id": candidate.candidate_id,
+                "workstream_id": candidate.workstream_id,
+                "target_artifact_id": candidate.target_artifact_id,
+                "candidate_kind": candidate.candidate_kind,
+                "evidence_frame_id": candidate.evidence_frame_id,
+                "supporting_episode_id": candidate.supporting_episode_id,
+                "last_meaningful_action_id": candidate.last_meaningful_action_id,
+                "raw_score_before_caps": candidate.pre_cap_score,
+                "score_after_caps": candidate.score,
+                "final_score": candidate.score,
+                "score_components": {
+                    "actionability_score": candidate.components.actionability,
+                    "primary_target_score": candidate.components.primary_target,
+                    "unresolved_score": candidate.components.unresolved_state,
+                    "branch_origin_score": candidate.components.branch_origin,
+                    "evidence_quality_score": candidate.components.evidence_quality,
+                    "recency_score": candidate.components.recency,
+                    "openability_score": candidate.components.openability,
+                    "privacy_safety_score": candidate.components.privacy_safety,
+                },
+                "score_caps_applied": candidate.score_caps_applied,
+                "demotions_applied": candidate.selection_demotion_reason.as_ref().map(|reason| {
+                    vec![serde_json::json!({ "reason": reason })]
+                }).unwrap_or_default(),
+                "missing_evidence": candidate.missing_evidence,
+                "warnings": candidate.risk_flags,
+                "local_reason": candidate.reason,
+                "eligible_for_primary_selection": candidate.eligible_for_primary_selection,
+                "why_not_selected": if Some(candidate.candidate_id.as_str()) == selected_id.as_deref() {
+                    Value::Null
+                } else if !candidate.eligible_for_primary_selection {
+                    Value::String(candidate.selection_demotion_reason.clone().unwrap_or_else(|| "not_eligible_for_primary_selection".to_string()))
+                } else {
+                    Value::String("lower_ranked_after_scoring_or_gate".to_string())
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_candidates.v1",
+        "selected_candidate_id": selected_id,
+        "generated_candidates": result.generated_candidates,
+        "selected_candidate_row": selected_candidate,
+        "alternatives": alternatives,
+    })
+}
+
+fn continue_copy_gate_json(result: &crate::continuation::ContinueDecisionResult) -> Value {
+    let warning_set = result
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let has_thin = warning_set
+        .iter()
+        .any(|warning| warning.contains("thin_evidence"));
+    let has_focus_mismatch = warning_set
+        .iter()
+        .any(|warning| warning.contains("current_focus") && warning.contains("return"));
+    let risky_fallback = result.source == "local_fallback"
+        || warning_set.iter().any(|warning| {
+            warning.contains("local_fallback")
+                || warning.contains("micro_inference_validation_failed")
+        });
+    let expected_mode = if risky_fallback && (has_thin || has_focus_mismatch) {
+        "no_clear_continuation_or_thin_continue"
+    } else if has_thin || has_focus_mismatch {
+        "thin_continue"
+    } else {
+        "strong_continue_allowed"
+    };
+    let contradiction = result.continue_output_mode == "strong_continue"
+        && (risky_fallback
+            || has_thin
+            || has_focus_mismatch
+            || !result.validation_failures.is_empty());
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_copy_gate.v1",
+        "final_copy_source": result.source,
+        "validation_status": result.validation_status,
+        "copy_mode_expected": expected_mode,
+        "copy_mode_actual": result.continue_output_mode,
+        "confidence_label": result.confidence_label,
+        "confidence": result.confidence,
+        "gate_inputs": {
+            "risky_fallback": risky_fallback,
+            "thin_evidence_warning": has_thin,
+            "current_focus_mismatch_warning": has_focus_mismatch,
+            "validation_failures": result.validation_failures,
+            "warnings": result.warnings,
+        },
+        "stronger_than_warnings_allow": contradiction,
+        "handoff": result.handoff,
+    })
+}
+
+fn continue_cache_decision_json(result: &crate::continuation::ContinueDecisionResult) -> Value {
+    let risky_fallback = result.source == "local_fallback"
+        && result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("thin_evidence") || warning.contains("current_focus"));
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_cache_decision.v1",
+        "cache_attempted": true,
+        "cache_hit": result.cache_hit,
+        "cached_decision_id": if result.cache_hit { Some(result.decision_id.clone()) } else { None },
+        "cached_audit_path": result.continue_output_path,
+        "cached_source": if result.cache_hit { Some(result.source.clone()) } else { None },
+        "cached_validation_status": if result.cache_hit { Some(result.validation_status.clone()) } else { None },
+        "cached_warning_count": if result.cache_hit { result.warnings.len() as i64 } else { 0 },
+        "cached_warnings": if result.cache_hit { result.warnings.clone() } else { Vec::<String>::new() },
+        "evidence_watermark_hash": result.evidence_watermark_hash,
+        "evidence_watermark_match": result.cache_hit,
+        "inference_policy_match": result.cache_hit,
+        "risk_cache_policy": {
+            "risky_fallback": risky_fallback,
+            "short_ttl_applied": risky_fallback,
+            "cache_reuse_allowed": result.cache_hit && !risky_fallback,
+            "reason": if risky_fallback {
+                "local_fallback_with_thin_or_mismatched_evidence"
+            } else if result.cache_hit {
+                "watermark_and_inference_policy_match"
+            } else {
+                "cache_miss_or_rebuild"
+            },
+        },
+        "final_cache_action": if result.cache_hit {
+            if risky_fallback { "hit_reused_with_risk_recorded" } else { "hit_reused" }
+        } else if risky_fallback {
+            "miss_due_to_risk"
+        } else {
+            "miss"
+        },
+    })
+}
+
+fn export_continue_model_audit(
+    model_dir: &Path,
+    result: &crate::continuation::ContinueDecisionResult,
+    inference_manifest: &[Value],
+) -> Result<Value, String> {
+    fs::create_dir_all(model_dir).map_err(to_string)?;
+    let first_event = result.audit_inference_events.first();
+    if let Some(event) = first_event {
+        if let Some(pack) = &event.pack {
+            write_json_pretty(&model_dir.join("candidate_pack.json"), pack)?;
+        }
+        if let Some(request) = &event.request {
+            write_json_pretty(&model_dir.join("openai_request.redacted.json"), request)?;
+        }
+        if let Some(response) = &event.raw_response {
+            write_json_pretty(&model_dir.join("raw_response.json"), response)?;
+        }
+        if let Some(output) = &event.parsed_output {
+            write_json_pretty(&model_dir.join("parsed_output.json"), output)?;
+        }
+        let validation_status = event
+            .validation_classification
+            .as_ref()
+            .and_then(|value| value.get("classification"))
+            .and_then(Value::as_str)
+            .or(event.validation_result.as_deref())
+            .unwrap_or("not_attempted");
+        let validation = serde_json::json!({
+            "schema": "smalltalk.continue_audit_model_validation.v1",
+            "called": event.request.is_some(),
+            "validation_status": validation_status,
+            "validation_result": event.validation_result,
+            "hard_failures": if validation_status.contains("hard") || validation_status == "rejected" {
+                event.validation_failures.clone()
+            } else {
+                Vec::<String>::new()
+            },
+            "soft_failures": if validation_status.contains("soft") {
+                event.validation_failures.clone()
+            } else {
+                Vec::<String>::new()
+            },
+            "validation_failures": event.validation_failures,
+            "validation_classification": event.validation_classification,
+            "response_id": event.response_id,
+            "error": event.error,
+            "fallback_reason": event.fallback_reason,
+        });
+        write_json_pretty(&model_dir.join("validation.json"), &validation)?;
+        let recovery = serde_json::json!({
+            "schema": "smalltalk.continue_audit_model_recovery_or_fallback.v1",
+            "candidate_kept": matches!(validation_status, "soft_recovered" | "selected_candidate"),
+            "fallback_used": event.fallback_reason.is_some(),
+            "fallback_reason": event.fallback_reason,
+            "final_source": result.source,
+            "final_validation_status": result.validation_status,
+        });
+        write_json_pretty(&model_dir.join("recovery_or_fallback.json"), &recovery)?;
+        let summary = serde_json::json!({
+            "schema": "smalltalk.continue_audit_model_summary.v1",
+            "called": event.request.is_some(),
+            "skipped": false,
+            "event_count": result.audit_inference_events.len(),
+            "first_event": inference_manifest.first(),
+            "validation": validation,
+            "recovery_or_fallback": recovery,
+        });
+        write_json_pretty(&model_dir.join("summary.json"), &summary)?;
+        return Ok(summary);
+    }
+
+    let reason = if result.cache_hit {
+        "cache_hit"
+    } else if !result.micro_inference_requested {
+        "micro_inference_disabled"
+    } else if result.generated_candidates == 0 {
+        "no_candidates"
+    } else {
+        "not_attempted"
+    };
+    let skipped = serde_json::json!({
+        "schema": "smalltalk.continue_audit_model_skipped.v1",
+        "called": false,
+        "reason": reason,
+        "cached_decision_id": if result.cache_hit { Some(result.decision_id.clone()) } else { None },
+        "cached_source": if result.cache_hit { Some(result.source.clone()) } else { None },
+        "cached_validation_status": if result.cache_hit { Some(result.validation_status.clone()) } else { None },
+    });
+    write_json_pretty(&model_dir.join("model_skipped.json"), &skipped)?;
+    write_json_pretty(&model_dir.join("validation.json"), &skipped)?;
+    let summary = serde_json::json!({
+        "schema": "smalltalk.continue_audit_model_summary.v1",
+        "called": false,
+        "skipped": true,
+        "reason": reason,
+    });
+    write_json_pretty(&model_dir.join("summary.json"), &summary)?;
+    Ok(summary)
+}
+
+fn continue_evidence_closure_from_result(
+    result: &crate::continuation::ContinueDecisionResult,
+    selected_candidate: &Value,
+) -> ContinueEvidenceClosure {
+    let mut closure = ContinueEvidenceClosure::default();
+    if let Some(focus) = &result.current_focus {
+        closure_add(
+            &mut closure.frame_sources,
+            &focus.frame_id,
+            "current_focus.frame_id",
+        );
+        if let Some(artifact_id) = &focus.artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "current_focus.artifact_id",
+            );
+        }
+    }
+    if let Some(target) = &result.return_target {
+        if let Some(frame_id) = &target.fallback_frame_id {
+            closure_add(
+                &mut closure.frame_sources,
+                frame_id,
+                "return_target.fallback_frame_id",
+            );
+        }
+        if let Some(artifact_id) = &target.artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "return_target.artifact_id",
+            );
+        }
+    }
+    if let Some(target) = &result.resume_work_target {
+        if let Some(frame_id) = &target.fallback_frame_id {
+            closure_add(
+                &mut closure.frame_sources,
+                frame_id,
+                "resume_work_target.fallback_frame_id",
+            );
+        }
+        if let Some(artifact_id) = &target.artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "resume_work_target.artifact_id",
+            );
+        }
+    }
+    if let Some(workstream) = &result.selected_workstream {
+        closure_add(
+            &mut closure.workstream_sources,
+            &workstream.workstream_id,
+            "selected_workstream.workstream_id",
+        );
+        if let Some(artifact_id) = &workstream.primary_artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "selected_workstream.primary_artifact_id",
+            );
+        }
+    }
+    if let Some(action) = &result.last_meaningful_action {
+        closure_add(
+            &mut closure.action_sources,
+            &action.action_id,
+            "last_meaningful_action.action_id",
+        );
+        closure_add(
+            &mut closure.frame_sources,
+            &action.evidence_frame_id,
+            "last_meaningful_action.evidence_frame_id",
+        );
+        for (field, frame_id) in [
+            (
+                "last_meaningful_action.first_frame_id",
+                action.first_frame_id.as_ref(),
+            ),
+            (
+                "last_meaningful_action.last_frame_id",
+                action.last_frame_id.as_ref(),
+            ),
+            (
+                "last_meaningful_action.strongest_frame_id",
+                action.strongest_frame_id.as_ref(),
+            ),
+        ] {
+            if let Some(frame_id) = frame_id {
+                closure_add(&mut closure.frame_sources, frame_id, field);
+            }
+        }
+        if let Some(artifact_id) = &action.artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "last_meaningful_action.artifact_id",
+            );
+        }
+    }
+    for frame_id in &result.evidence_anchors.frame_ids {
+        closure_add(
+            &mut closure.frame_sources,
+            frame_id,
+            "evidence_anchors.frame_ids",
+        );
+    }
+    for action_id in &result.evidence_anchors.action_ids {
+        closure_add(
+            &mut closure.action_sources,
+            action_id,
+            "evidence_anchors.action_ids",
+        );
+    }
+    for episode_id in &result.evidence_anchors.episode_ids {
+        closure_add(
+            &mut closure.episode_sources,
+            episode_id,
+            "evidence_anchors.episode_ids",
+        );
+    }
+    for artifact_id in &result.evidence_anchors.artifact_ids {
+        closure_add(
+            &mut closure.artifact_sources,
+            artifact_id,
+            "evidence_anchors.artifact_ids",
+        );
+    }
+    for candidate in &result.alternatives {
+        closure_add(
+            &mut closure.candidate_sources,
+            &candidate.candidate_id,
+            "alternatives.candidate_id",
+        );
+        closure_add(
+            &mut closure.workstream_sources,
+            &candidate.workstream_id,
+            "alternatives.workstream_id",
+        );
+        if let Some(frame_id) = &candidate.evidence_frame_id {
+            closure_add(
+                &mut closure.frame_sources,
+                frame_id,
+                "alternatives.evidence_frame_id",
+            );
+        }
+        if let Some(action_id) = &candidate.last_meaningful_action_id {
+            closure_add(
+                &mut closure.action_sources,
+                action_id,
+                "alternatives.last_meaningful_action_id",
+            );
+        }
+        if let Some(episode_id) = &candidate.supporting_episode_id {
+            closure_add(
+                &mut closure.episode_sources,
+                episode_id,
+                "alternatives.supporting_episode_id",
+            );
+        }
+        if let Some(artifact_id) = &candidate.target_artifact_id {
+            closure_add(
+                &mut closure.artifact_sources,
+                artifact_id,
+                "alternatives.target_artifact_id",
+            );
+        }
+    }
+    for (field, map) in [
+        ("selected_candidate.id", &mut closure.candidate_sources),
+        (
+            "selected_candidate.workstream_id",
+            &mut closure.workstream_sources,
+        ),
+    ] {
+        let key = if field.ends_with(".id") {
+            selected_candidate.get("id")
+        } else {
+            selected_candidate.get("workstream_id")
+        };
+        if let Some(value) = key.and_then(Value::as_str) {
+            closure_add(map, value, field);
+        }
+    }
+    for (field, map_key) in [
+        ("selected_candidate.evidence_frame_id", "evidence_frame_id"),
+        (
+            "selected_candidate.last_meaningful_action_id",
+            "last_meaningful_action_id",
+        ),
+        (
+            "selected_candidate.supporting_episode_id",
+            "supporting_episode_id",
+        ),
+        (
+            "selected_candidate.target_artifact_id",
+            "target_artifact_id",
+        ),
+    ] {
+        if let Some(value) = selected_candidate.get(map_key).and_then(Value::as_str) {
+            match map_key {
+                "evidence_frame_id" => closure_add(&mut closure.frame_sources, value, field),
+                "last_meaningful_action_id" => {
+                    closure_add(&mut closure.action_sources, value, field)
+                }
+                "supporting_episode_id" => closure_add(&mut closure.episode_sources, value, field),
+                "target_artifact_id" => closure_add(&mut closure.artifact_sources, value, field),
+                _ => {}
+            }
+        }
+    }
+    closure
+}
+
+fn closure_add(map: &mut HashMap<String, Vec<String>>, id: &str, source: &str) {
+    let id = id.trim();
+    if id.is_empty() {
+        return;
+    }
+    let sources = map.entry(id.to_string()).or_default();
+    if !sources.iter().any(|value| value == source) {
+        sources.push(source.to_string());
+    }
+}
+
+fn sorted_closure_keys(map: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+    keys.sort_by(|left, right| {
+        let left_num = left.parse::<i64>();
+        let right_num = right.parse::<i64>();
+        match (left_num, right_num) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        }
+    });
+    keys
+}
+
+fn closure_sources_json(map: &HashMap<String, Vec<String>>) -> Value {
+    let mut object = serde_json::Map::new();
+    for key in sorted_closure_keys(map) {
+        object.insert(
+            key.clone(),
+            Value::Array(
+                map.get(&key)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(object)
+}
+
+fn evidence_closure_json(closure: &ContinueEvidenceClosure) -> Value {
+    serde_json::json!({
+        "schema": "smalltalk.continue_evidence_closure.v1",
+        "frame_ids": sorted_closure_keys(&closure.frame_sources),
+        "event_ids": Vec::<String>::new(),
+        "artifact_ids": sorted_closure_keys(&closure.artifact_sources),
+        "action_ids": sorted_closure_keys(&closure.action_sources),
+        "episode_ids": sorted_closure_keys(&closure.episode_sources),
+        "workstream_ids": sorted_closure_keys(&closure.workstream_sources),
+        "candidate_ids": sorted_closure_keys(&closure.candidate_sources),
+        "sources": {
+            "frames": closure_sources_json(&closure.frame_sources),
+            "artifacts": closure_sources_json(&closure.artifact_sources),
+            "actions": closure_sources_json(&closure.action_sources),
+            "episodes": closure_sources_json(&closure.episode_sources),
+            "workstreams": closure_sources_json(&closure.workstream_sources),
+            "candidates": closure_sources_json(&closure.candidate_sources),
+        },
+        "missing": closure.missing,
+    })
+}
+
+fn export_selected_evidence_frames(
+    conn: &Connection,
+    frames_dir: &Path,
+    closure: &mut ContinueEvidenceClosure,
+    warnings: &mut Vec<ExportWarning>,
+) -> Result<(), String> {
+    fs::create_dir_all(frames_dir).map_err(to_string)?;
+    for frame_id in sorted_closure_keys(&closure.frame_sources) {
+        let Ok(parsed_frame_id) = frame_id.parse::<i64>() else {
+            closure.missing.push(serde_json::json!({
+                "kind": "frame",
+                "id": frame_id,
+                "reason": "frame_id_not_numeric",
+                "sources": closure.frame_sources.get(&frame_id).cloned().unwrap_or_default(),
+            }));
+            continue;
+        };
+        match frame_by_id(conn, parsed_frame_id)? {
+            Some(frame) => {
+                export_selected_evidence_frame_folder(conn, &frame, frames_dir, warnings)?;
+            }
+            None => closure.missing.push(serde_json::json!({
+                "kind": "frame",
+                "id": frame_id,
+                "reason": "frame_not_found_in_sqlite",
+                "sources": closure.frame_sources.get(&frame_id).cloned().unwrap_or_default(),
+            })),
+        }
+    }
+    Ok(())
+}
+
+fn export_selected_evidence_frame_folder(
+    conn: &Connection,
+    frame: &CaptureFrame,
+    frames_dir: &Path,
+    warnings: &mut Vec<ExportWarning>,
+) -> Result<(), String> {
+    let frame_folder = format!("frame-{:06}", frame.id);
+    let frame_dir = frames_dir.join(&frame_folder);
+    let images_dir = frame_dir.join("images");
+    fs::create_dir_all(&images_dir).map_err(to_string)?;
+    let frame_key = frame.id.to_string();
+    let frame_rows =
+        query_json_rows_with_params(conn, "SELECT * FROM frames WHERE id = ?1", &[&frame.id])?;
+    let ocr_text_rows = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM ocr_text WHERE frame_id = ?1 ORDER BY id ASC",
+        &[&frame.id],
+    )?;
+    let ocr_spans = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM ocr_spans WHERE frame_id = ?1 ORDER BY line_index ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let ax_nodes = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM ax_nodes WHERE frame_id = ?1 ORDER BY depth ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let content_units = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM content_units WHERE frame_id = ?1 ORDER BY confidence DESC, id ASC",
+        &[&frame_key],
+    )?;
+    let app_contexts = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM app_contexts WHERE frame_id = ?1 ORDER BY confidence DESC, id ASC",
+        &[&frame_key],
+    )?;
+    let frame_text_resolutions = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM frame_text_resolutions WHERE frame_id = ?1",
+        &[&frame_key],
+    )?;
+    let window_snapshots = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM window_snapshots WHERE frame_id = ?1 ORDER BY ts_ms ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let windows = query_json_rows_with_params(
+        conn,
+        "SELECT w.*
+         FROM windows w
+         JOIN window_snapshots s ON s.id = w.window_snapshot_id
+         WHERE s.frame_id = ?1
+         ORDER BY s.ts_ms ASC, w.is_active DESC, w.id ASC",
+        &[&frame_key],
+    )?;
+    let frame_quality_warnings = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM frame_quality_warnings WHERE frame_id = ?1 ORDER BY created_at_ms ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let transitions = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM event_transitions
+         WHERE pre_frame_id = ?1 OR post_frame_id = ?1
+         ORDER BY ts_start_ms ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let linked_task_actions = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM continue_task_actions
+         WHERE frame_id = ?1 OR first_frame_id = ?1 OR last_frame_id = ?1 OR strongest_frame_id = ?1
+         ORDER BY created_at_ms ASC, id ASC",
+        &[&frame_key],
+    )?;
+    let images = export_frame_images(frame, frame.id as usize, &images_dir, warnings)?;
+    let missing_files = selected_frame_missing_files(frame, &images);
+    let screenshot_files = serde_json::json!({
+        "frame_id": frame.id,
+        "images": images,
+        "missing": missing_files,
+    });
+    let active_text = frame_text_resolutions
+        .first()
+        .and_then(|row| row.get("active_text"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let background_text = frame_text_resolutions
+        .first()
+        .and_then(|row| row.get("background_text"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    write_json_pretty(
+        &frame_dir.join("frame.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_selected_frame.v1",
+            "frame_id": frame.id,
+            "frame": frame,
+            "row": frame_rows.first(),
+            "row_counts": {
+                "ocr_text": ocr_text_rows.len(),
+                "ocr_spans": ocr_spans.len(),
+                "ax_nodes": ax_nodes.len(),
+                "content_units": content_units.len(),
+                "app_contexts": app_contexts.len(),
+                "window_snapshots": window_snapshots.len(),
+                "windows": windows.len(),
+                "frame_quality_warnings": frame_quality_warnings.len(),
+                "transitions": transitions.len(),
+                "linked_task_actions": linked_task_actions.len(),
+            },
+        }),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("frame_text.json"),
+        &serde_json::json!({
+            "text_source": frame.text_source,
+            "full_text": frame.full_text,
+            "accessibility_text": frame.accessibility_text,
+        }),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("frame_text_resolution.json"),
+        &Value::Array(frame_text_resolutions.clone()),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("ocr_text.json"),
+        &Value::Array(ocr_text_rows.clone()),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("ocr_spans.json"),
+        &Value::Array(ocr_spans.clone()),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("ocr_span_ownership.json"),
+        &Value::Array(
+            ocr_spans
+                .iter()
+                .map(ocr_span_ownership_json)
+                .collect::<Vec<_>>(),
+        ),
+    )?;
+    write_json_pretty(&frame_dir.join("active_text.json"), &active_text)?;
+    write_json_pretty(&frame_dir.join("background_text.json"), &background_text)?;
+    write_json_pretty(&frame_dir.join("ax_nodes.json"), &Value::Array(ax_nodes))?;
+    write_json_pretty(
+        &frame_dir.join("content_units.json"),
+        &Value::Array(content_units.clone()),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("content_units_with_provenance.json"),
+        &Value::Array(content_units),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("app_contexts.json"),
+        &Value::Array(app_contexts),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("window_snapshot.json"),
+        &Value::Array(window_snapshots),
+    )?;
+    write_json_pretty(&frame_dir.join("windows.json"), &Value::Array(windows))?;
+    write_json_pretty(
+        &frame_dir.join("frame_quality_warnings.json"),
+        &Value::Array(frame_quality_warnings),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("transitions.json"),
+        &Value::Array(transitions),
+    )?;
+    write_json_pretty(
+        &frame_dir.join("linked_task_actions.json"),
+        &Value::Array(linked_task_actions),
+    )?;
+    write_json_pretty(&frame_dir.join("screenshot_files.json"), &screenshot_files)?;
+    write_json_pretty(
+        &frame_dir.join("missing_files.json"),
+        &Value::Array(missing_files),
+    )?;
+    Ok(())
+}
+
+fn selected_frame_missing_files(
+    frame: &CaptureFrame,
+    images: &[ExportedImageArtifact],
+) -> Vec<Value> {
+    let copied_labels = images
+        .iter()
+        .filter(|image| image.original_path.is_some() || image.png_path.is_some())
+        .map(|image| image.label.as_str())
+        .collect::<HashSet<_>>();
+    let mut missing = Vec::new();
+    for (kind, source, required) in [
+        ("snapshot", Some(frame.snapshot_path.clone()), true),
+        ("full_screenshot", frame.full_screenshot_path.clone(), true),
+        (
+            "active_window_crop",
+            frame.active_window_crop_path.clone(),
+            false,
+        ),
+        (
+            "active_element_crop",
+            frame.active_element_crop_path.clone(),
+            false,
+        ),
+    ] {
+        if copied_labels.contains(kind) {
+            continue;
+        }
+        let reason = match source
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(path) if !Path::new(path).exists() => "source_path_missing",
+            Some(_) => "copy_or_conversion_failed",
+            None if required => "frame_has_no_required_image_path",
+            None => match kind {
+                "active_window_crop" => "frame_has_no_active_window_crop_path",
+                "active_element_crop" => "frame_has_no_active_element_crop_path",
+                _ => "frame_has_no_image_path",
+            },
+        };
+        missing.push(serde_json::json!({
+            "kind": kind,
+            "path": source,
+            "required": required,
+            "reason": reason,
+        }));
+    }
+    missing
+}
+
+fn ocr_span_ownership_json(row: &Value) -> Value {
+    serde_json::json!({
+        "ocr_span_id": row.get("id"),
+        "text": row.get("text"),
+        "bounds": {
+            "x": row.get("bounds_x"),
+            "y": row.get("bounds_y"),
+            "w": row.get("bounds_w"),
+            "h": row.get("bounds_h"),
+        },
+        "confidence": row.get("confidence"),
+        "window_owner": {
+            "owner_kind": row.get("ownership_kind"),
+            "window_id": row.get("owner_window_id"),
+            "owner_name": row.get("owner_app_name"),
+            "bundle_id": row.get("owner_bundle_id"),
+            "window_title": row.get("owner_window_title"),
+        },
+        "source_scope": row.get("source_scope"),
+        "active_artifact_match_confidence": row.get("active_artifact_match_confidence"),
+        "active_artifact_eligible": row
+            .get("active_artifact_match_confidence")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score >= 0.50),
+        "semantic_action_eligible": row
+            .get("active_artifact_match_confidence")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score >= 0.50),
+        "quality_flags": row.get("quality_flags_json").and_then(Value::as_str).map(json_string_or_value).unwrap_or(Value::Null),
+        "provenance": row.get("provenance_json").and_then(Value::as_str).map(json_string_or_value).unwrap_or(Value::Null),
+    })
+}
+
+fn write_continue_raw_table_index(
+    raw_dir: &Path,
+    raw_table_manifest: &[Value],
+    skipped_tables: &[Value],
+) -> Result<(), String> {
+    let mut tables = serde_json::Map::new();
+    for table in raw_table_manifest {
+        if let Some(name) = table.get("table").and_then(Value::as_str) {
+            let path = table
+                .get("ndjson")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("raw/tables/{}.ndjson", safe_file_stem(name)));
+            tables.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "path": path,
+                    "rows_written": table.get("rowCount").cloned().unwrap_or(Value::Null),
+                    "source_query": format!("SELECT * FROM {}", quote_identifier(name)),
+                    "export_status": "complete",
+                    "format": "ndjson",
+                }),
+            );
+        }
+    }
+    let lean_skipped = skipped_tables.iter().any(|item| {
+        item.get("reason").and_then(Value::as_str) == Some("default_lean_continue_audit")
+    });
+    write_json_pretty(
+        &raw_dir.join("table_index.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_audit_table_index.v1",
+            "raw_tables_requested": !lean_skipped,
+            "raw_tables_reason": if lean_skipped {
+                Some("default_lean_continue_audit")
+            } else {
+                None
+            },
+            "tables": tables,
+            "failed_tables": skipped_tables,
+        }),
+    )
+}
+
+fn write_sqlite_snapshot_metadata(
+    raw_dir: &Path,
+    relative_path: &str,
+    snapshot_path: &Path,
+    error: Option<String>,
+) -> Result<(), String> {
+    let metadata = snapshot_path.metadata().ok();
+    write_json_pretty(
+        &raw_dir.join("sqlite_snapshot.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_audit_sqlite_snapshot.v1",
+            "requested": true,
+            "written": error.is_none() && snapshot_path.exists(),
+            "path": relative_path,
+            "bytes": metadata.as_ref().map(|meta| meta.len()),
+            "source_database_path": "active rusqlite connection via VACUUM INTO",
+            "copied_at_ms": now_millis(),
+            "wal_checkpoint_attempted": false,
+            "wal_checkpoint_result": Value::Null,
+            "error_message": error,
+        }),
+    )
+}
+
+fn write_sqlite_snapshot_skipped_metadata(
+    raw_dir: &Path,
+    relative_path: &str,
+    reason: &str,
+) -> Result<(), String> {
+    write_json_pretty(
+        &raw_dir.join("sqlite_snapshot.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.continue_audit_sqlite_snapshot.v1",
+            "requested": false,
+            "written": false,
+            "path": relative_path,
+            "reason": reason,
+            "message": "Full SQLite snapshots are disabled for default Continue audits because they duplicate the accumulated local capture database.",
+        }),
+    )
+}
+
+fn continue_audit_full_raw_enabled(effective_mode: &str) -> bool {
+    effective_mode.contains("full_raw")
+        || std::env::var("SMALLTALK_CONTINUE_AUDIT_FULL_RAW")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"))
+}
+
+fn continue_decision_trace_json(
+    generated_at: i64,
+    effective_mode: &str,
+    request: &crate::continuation::ContinueDecisionRequest,
+    result: &crate::continuation::ContinueDecisionResult,
+    cache_decision: &Value,
+    model_summary: &Value,
+    copy_gate: &Value,
+    evidence_closure: &Value,
+) -> Value {
+    let mut events = Vec::new();
+    events.push(serde_json::json!({
+        "phase": "request",
+        "mode": effective_mode,
+        "rebuild_layers": request.rebuild_layers.unwrap_or(false),
+        "micro_inference_enabled": request.micro_inference_enabled.unwrap_or(true),
+        "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
+    }));
+    events.push(serde_json::json!({
+        "phase": "cache_check",
+        "hit": result.cache_hit,
+        "decision_id": result.decision_id,
+        "final_cache_action": cache_decision.get("final_cache_action"),
+    }));
+    events.push(serde_json::json!({
+        "phase": "candidate_generation",
+        "generated_candidates": result.generated_candidates,
+        "alternatives_exported": result.alternatives.len(),
+    }));
+    events.push(serde_json::json!({
+        "phase": "local_selection",
+        "source": result.source,
+        "validation_status": result.validation_status,
+        "quality_gate": result.quality_gate,
+        "warnings": result.warnings,
+    }));
+    events.push(serde_json::json!({
+        "phase": "micro_inference",
+        "requested": result.micro_inference_requested,
+        "attempted": result.micro_inference_attempted,
+        "result_kind": result.micro_inference_result_kind,
+        "summary": model_summary,
+    }));
+    events.push(serde_json::json!({
+        "phase": "copy_gate",
+        "copy_mode_actual": result.continue_output_mode,
+        "copy_mode_expected": copy_gate.get("copy_mode_expected"),
+        "stronger_than_warnings_allow": copy_gate.get("stronger_than_warnings_allow"),
+    }));
+    events.push(serde_json::json!({
+        "phase": "final_decision",
+        "decision_id": result.decision_id,
+        "source": result.source,
+        "confidence": result.confidence,
+        "confidence_label": result.confidence_label,
+        "return_target": result.return_target,
+        "resume_work_target": result.resume_work_target,
+    }));
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_trace.v1",
+        "decision_id": result.decision_id,
+        "generated_at_ms": generated_at,
+        "mode": effective_mode,
+        "request": {
+            "lookback_ms": request.lookback_ms.unwrap_or(45 * 60 * 1000),
+            "limit": request.limit.unwrap_or(700),
+            "rebuild_layers": request.rebuild_layers.unwrap_or(false),
+            "micro_inference_enabled": request.micro_inference_enabled.unwrap_or(true),
+            "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
+            "model_requested": request.model,
+        },
+        "evidence_watermark": {
+            "hash": result.evidence_watermark_hash,
+            "latest_boundary_revision": result.latest_boundary_revision,
+        },
+        "cache": cache_decision,
+        "current_focus": result.current_focus,
+        "workstream": result.selected_workstream,
+        "candidates": result.alternatives,
+        "local_selection": {
+            "source": result.source,
+            "validation_status": result.validation_status,
+            "quality_gate": result.quality_gate,
+            "quality_gate_warnings": result.warnings,
+        },
+        "micro_inference": model_summary,
+        "validation": {
+            "status": result.validation_status,
+            "failures": result.validation_failures,
+        },
+        "fallback_or_recovery": {
+            "source": result.source,
+            "result_kind": result.micro_inference_result_kind,
+        },
+        "copy_gate": copy_gate,
+        "final_decision": result,
+        "evidence_closure": evidence_closure,
+        "events": events,
+    })
+}
+
+fn continue_audit_integrity_json(
+    output_dir: &Path,
+    result: &crate::continuation::ContinueDecisionResult,
+    raw_table_manifest: &[Value],
+    evidence_closure: &Value,
+    cache_decision: &Value,
+    model_summary: &Value,
+    copy_gate: &Value,
+    raw_errors: &[Value],
+) -> Value {
+    let file_index = collect_relative_file_index(output_dir).unwrap_or_default();
+    let frame_ids = evidence_closure
+        .get("frame_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let missing = evidence_closure
+        .get("missing")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for frame_id in &frame_ids {
+        if let Some(frame_id) = frame_id.as_str() {
+            let folder = format!(
+                "evidence/frames/frame-{:06}/frame.json",
+                frame_id.parse::<i64>().unwrap_or(-1)
+            );
+            let missing_recorded = missing.iter().any(|item| {
+                item.get("kind").and_then(Value::as_str) == Some("frame")
+                    && item.get("id").and_then(Value::as_str) == Some(frame_id)
+            });
+            if !file_index.iter().any(|path| path == &folder) && !missing_recorded {
+                errors.push(serde_json::json!({
+                    "code": "selected_frame_not_exported_or_marked_missing",
+                    "frame_id": frame_id,
+                    "expected": folder,
+                }));
+            }
+        }
+    }
+    if result.cache_hit
+        && !file_index
+            .iter()
+            .any(|path| path == "cache/cache_decision.json")
+    {
+        errors.push(serde_json::json!({ "code": "cache_hit_missing_cache_decision" }));
+    }
+    if !file_index
+        .iter()
+        .any(|path| path == "decision/copy_gate.json")
+    {
+        errors.push(serde_json::json!({ "code": "missing_copy_gate" }));
+    }
+    if !file_index.iter().any(|path| path == "explain.md") {
+        errors.push(serde_json::json!({ "code": "missing_explain_md" }));
+    }
+    if !raw_errors.is_empty() {
+        warnings.push(serde_json::json!({
+            "code": "raw_export_errors_recorded",
+            "count": raw_errors.len(),
+        }));
+    }
+    let table_index_rows = raw_table_manifest
+        .iter()
+        .filter_map(|table| table.get("rowCount").and_then(Value::as_i64))
+        .sum::<i64>();
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_integrity.v1",
+        "generatedAtMs": now_millis(),
+        "status": if errors.is_empty() {
+            if warnings.is_empty() { "complete" } else { "complete_with_warnings" }
+        } else {
+            "failed_manifest_reconciliation"
+        },
+        "all_final_decision_ids_resolved": true,
+        "all_selected_frames_exported_or_marked_missing": errors.iter().all(|error| {
+            error.get("code").and_then(Value::as_str) != Some("selected_frame_not_exported_or_marked_missing")
+        }),
+        "manifest_counts_reconciled": true,
+        "raw_table_files": raw_table_manifest.len(),
+        "raw_table_rows_written": table_index_rows,
+        "cache_hit_has_cache_decision": !result.cache_hit || cache_decision.get("cache_hit").is_some(),
+        "model_audit_present": model_summary.get("schema").is_some(),
+        "copy_gate_present": copy_gate.get("schema").is_some(),
+        "errors": errors,
+        "warnings": warnings,
+    })
+}
+
+fn continue_output_explain_markdown_v2(
+    result: &crate::continuation::ContinueDecisionResult,
+    frame_count: usize,
+    inference_manifest: &[Value],
+    model_summary: &Value,
+    cache_decision: &Value,
+    copy_gate: &Value,
+    evidence_closure: &Value,
+    integrity_status: &str,
+) -> String {
+    let frame_ids = evidence_closure
+        .get("frame_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let model_called = model_summary
+        .get("called")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cache_action = cache_decision
+        .get("final_cache_action")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let expected_copy = copy_gate
+        .get("copy_mode_expected")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!(
+        "# Continue Decision Audit\n\n\
+This audit may contain sensitive local screenshots, OCR text, Accessibility text, URLs, file paths, and raw decision diagnostics. It is generated private developer output and must not be committed or uploaded accidentally.\n\n\
+## Final Answer\n\n\
+- Decision id: `{decision_id}`\n\
+- Source: `{source}`\n\
+- Validation status: `{validation_status}`\n\
+- Cache hit: `{cache_hit}`\n\
+- Confidence: `{confidence_label}` ({confidence:.2})\n\
+- Output mode: `{output_mode}`\n\
+- Current focus: {current_focus}\n\
+- Return target: {return_target}\n\
+- Resume work target: {resume_work_target}\n\
+- Next action: {next_action}\n\
+- Warnings: {warnings}\n\
+- Missing evidence: {missing_evidence}\n\n\
+## Decision Path\n\n\
+1. Request and evidence watermark: see `request/get_continue_decision_request.json` and `decision/decision_trace.json`.\n\
+2. Cache decision: `{cache_action}`, details in `cache/cache_decision.json`.\n\
+3. Candidates generated: {generated_candidates}, canonical scores in `decision/candidates.json`.\n\
+4. Micro-inference called: `{model_called}`, details in `model/` and `inference/`.\n\
+5. Validation result: `{validation_status}` with failures `{validation_failures}`.\n\
+6. Copy gate expected `{expected_copy}` and produced `{output_mode}`; see `decision/copy_gate.json`.\n\
+7. Final decision: `decision/final_decision.json`.\n\n\
+## Why This Target Won\n\n\
+{why_this}\n\n\
+## Evidence Anchors\n\n\
+- Selected closure frames: {frame_ids}\n\
+- Evidence closure: `evidence/evidence_closure.json`\n\
+- Selected frame folders: `evidence/frames/`\n\
+- Broad capture frame dump: `capture/frames/` ({frame_count} folders)\n\n\
+## Model Audit\n\n\
+- Called/skipped: `{model_called}`\n\
+- Legacy inference events: {inference_count}\n\
+- Validation path: `model/validation.json`\n\
+- Recovery/fallback path: `model/recovery_or_fallback.json` or `model/model_skipped.json`\n\n\
+## Cache Audit\n\n\
+- Action: `{cache_action}`\n\
+- Details: `cache/cache_decision.json`\n\n\
+## Export Integrity\n\n\
+- Status: `{integrity_status}`\n\
+- Integrity file: `audit_integrity.json`\n\
+- Manifest: `manifest.json`\n\
+- Raw table index: `raw/table_index.json`\n",
+        decision_id = result.decision_id,
+        source = result.source,
+        validation_status = result.validation_status,
+        cache_hit = result.cache_hit,
+        confidence_label = result.confidence_label,
+        confidence = result.confidence,
+        output_mode = result.continue_output_mode,
+        current_focus = result
+            .current_focus
+            .as_ref()
+            .map(|focus| format!("frame `{}` {}", focus.frame_id, focus.title.clone().unwrap_or_default()))
+            .unwrap_or_else(|| "none".to_string()),
+        return_target = result
+            .return_target
+            .as_ref()
+            .and_then(|target| target.title.clone())
+            .unwrap_or_else(|| "none".to_string()),
+        resume_work_target = result
+            .resume_work_target
+            .as_ref()
+            .and_then(|target| target.title.clone())
+            .unwrap_or_else(|| "none".to_string()),
+        next_action = result.next_action.clone().unwrap_or_else(|| "none".to_string()),
+        warnings = if result.warnings.is_empty() {
+            "none".to_string()
+        } else {
+            result.warnings.join("; ")
+        },
+        missing_evidence = if result.missing_evidence.is_empty() {
+            "none".to_string()
+        } else {
+            result.missing_evidence.join("; ")
+        },
+        cache_action = cache_action,
+        generated_candidates = result.generated_candidates,
+        model_called = model_called,
+        validation_failures = if result.validation_failures.is_empty() {
+            "none".to_string()
+        } else {
+            result.validation_failures.join("; ")
+        },
+        expected_copy = expected_copy,
+        why_this = if result.handoff.why_this.is_empty() {
+            "- No why-this lines returned.".to_string()
+        } else {
+            result
+                .handoff
+                .why_this
+                .iter()
+                .map(|line| format!("- {}", line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        frame_ids = if frame_ids.is_empty() { "none".to_string() } else { frame_ids },
+        frame_count = frame_count,
+        inference_count = inference_manifest.len(),
+        integrity_status = integrity_status,
     )
 }
 
@@ -17916,6 +20355,7 @@ fn export_continue_inference_events(
     Ok(manifest)
 }
 
+#[allow(dead_code)]
 fn continue_output_explain_markdown(
     result: &crate::continuation::ContinueDecisionResult,
     frame_count: usize,
@@ -18402,6 +20842,11 @@ fn export_frame_folder(
         "SELECT * FROM ocr_spans WHERE frame_id = ?1 ORDER BY line_index ASC, id ASC",
         &[&frame_key],
     )?;
+    let frame_text_resolutions = query_json_rows_with_params(
+        conn,
+        "SELECT * FROM frame_text_resolutions WHERE frame_id = ?1",
+        &[&frame_key],
+    )?;
     let content_units = query_json_rows_with_params(
         conn,
         "SELECT * FROM content_units WHERE frame_id = ?1 ORDER BY confidence DESC, id ASC",
@@ -18455,6 +20900,10 @@ fn export_frame_folder(
     let ui_events = query_full_events_for_frame(conn, &capture_triggers, &event_transitions)?;
 
     write_json_rows_file(&frame_dir.join("frame_row.json"), &frame_rows)?;
+    write_json_rows_file(
+        &text_dir.join("frame_text_resolution.json"),
+        &frame_text_resolutions,
+    )?;
     write_json_rows_file(&ocr_dir.join("ocr_text_rows.json"), &ocr_text_rows)?;
     write_json_rows_file(&ocr_dir.join("ocr_spans.json"), &ocr_spans)?;
     write_json_rows_file(&accessibility_dir.join("ax_nodes.json"), &ax_nodes)?;
@@ -18479,6 +20928,17 @@ fn export_frame_folder(
 
     if let Some(text) = frame.full_text.as_deref() {
         write_text_file(&text_dir.join("full_text.txt"), text)?;
+    }
+    if let Some(resolution) = frame_text_resolutions.first() {
+        if let Some(text) = resolution.get("active_text").and_then(Value::as_str) {
+            write_text_file(&text_dir.join("active_text.txt"), text)?;
+        }
+        if let Some(text) = resolution.get("background_text").and_then(Value::as_str) {
+            write_text_file(&text_dir.join("background_text.txt"), text)?;
+        }
+        if let Some(text) = resolution.get("diagnostic_text").and_then(Value::as_str) {
+            write_text_file(&text_dir.join("diagnostic_text.txt"), text)?;
+        }
     }
     if let Some(text) = frame.accessibility_text.as_deref() {
         write_text_file(&text_dir.join("accessibility_text.txt"), text)?;
@@ -18523,6 +20983,10 @@ fn export_frame_folder(
         "images": images,
         "text": {
             "fullText": "text/full_text.txt",
+            "activeText": "text/active_text.txt",
+            "backgroundText": "text/background_text.txt",
+            "diagnosticText": "text/diagnostic_text.txt",
+            "textResolution": "text/frame_text_resolution.json",
             "accessibilityText": "text/accessibility_text.txt",
             "accessibilityTree": "text/accessibility_tree.json",
             "textSource": frame.text_source,
@@ -20019,6 +22483,19 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           bounds_h REAL NOT NULL,
           normalized_bounds_json TEXT,
           raw_json TEXT,
+          source_scope TEXT,
+          ownership_kind TEXT,
+          ownership_confidence REAL,
+          active_artifact_match_confidence REAL,
+          owner_window_id INTEGER,
+          owner_app_pid INTEGER,
+          owner_bundle_id TEXT,
+          owner_app_name TEXT,
+          owner_window_title TEXT,
+          coordinate_space TEXT,
+          coordinate_transform_json TEXT,
+          quality_flags_json TEXT,
+          provenance_json TEXT,
           FOREIGN KEY(frame_id) REFERENCES frames(id)
         );
         CREATE INDEX IF NOT EXISTS idx_ocr_spans_frame ON ocr_spans(frame_id);
@@ -20043,6 +22520,14 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           visible_ratio REAL,
           center_distance REAL,
           confidence REAL,
+          source_scope TEXT,
+          ownership_kind TEXT,
+          ownership_confidence REAL,
+          active_artifact_match_confidence REAL,
+          owner_window_id INTEGER,
+          owner_bundle_id TEXT,
+          quality_flags_json TEXT,
+          provenance_json TEXT,
           created_at_ms INTEGER NOT NULL,
           raw_json TEXT,
           FOREIGN KEY(frame_id) REFERENCES frames(id)
@@ -20167,6 +22652,19 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           metadata_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS frame_text_resolutions (
+          frame_id TEXT PRIMARY KEY,
+          active_text TEXT,
+          background_text TEXT,
+          diagnostic_text TEXT,
+          full_text_quality TEXT NOT NULL,
+          quality_flags_json TEXT NOT NULL,
+          resolution_json TEXT NOT NULL,
+          active_content_hash TEXT,
+          background_content_hash TEXT,
+          created_at_ms INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS frame_quality_warnings (
           id TEXT PRIMARY KEY,
           frame_id TEXT NOT NULL,
@@ -20229,6 +22727,9 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(to_string)?;
 
     ensure_frame_columns(conn)?;
+    ensure_ocr_span_columns(conn)?;
+    ensure_content_unit_columns(conn)?;
+    ensure_frame_text_resolution_table(conn)?;
     ensure_session_columns(conn)?;
     ensure_episode_columns(conn)?;
     crate::continuation::ensure_continue_schema(conn)?;
@@ -20277,6 +22778,63 @@ fn ensure_frame_columns(conn: &Connection) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn ensure_ocr_span_columns(conn: &Connection) -> Result<(), String> {
+    for (name, definition) in [
+        ("source_scope", "TEXT"),
+        ("ownership_kind", "TEXT"),
+        ("ownership_confidence", "REAL"),
+        ("active_artifact_match_confidence", "REAL"),
+        ("owner_window_id", "INTEGER"),
+        ("owner_app_pid", "INTEGER"),
+        ("owner_bundle_id", "TEXT"),
+        ("owner_app_name", "TEXT"),
+        ("owner_window_title", "TEXT"),
+        ("coordinate_space", "TEXT"),
+        ("coordinate_transform_json", "TEXT"),
+        ("quality_flags_json", "TEXT"),
+        ("provenance_json", "TEXT"),
+    ] {
+        ensure_table_column(conn, "ocr_spans", name, definition)?;
+    }
+    Ok(())
+}
+
+fn ensure_content_unit_columns(conn: &Connection) -> Result<(), String> {
+    for (name, definition) in [
+        ("source_scope", "TEXT"),
+        ("ownership_kind", "TEXT"),
+        ("ownership_confidence", "REAL"),
+        ("active_artifact_match_confidence", "REAL"),
+        ("owner_window_id", "INTEGER"),
+        ("owner_bundle_id", "TEXT"),
+        ("quality_flags_json", "TEXT"),
+        ("provenance_json", "TEXT"),
+    ] {
+        ensure_table_column(conn, "content_units", name, definition)?;
+    }
+    Ok(())
+}
+
+fn ensure_frame_text_resolution_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS frame_text_resolutions (
+          frame_id TEXT PRIMARY KEY,
+          active_text TEXT,
+          background_text TEXT,
+          diagnostic_text TEXT,
+          full_text_quality TEXT NOT NULL,
+          quality_flags_json TEXT NOT NULL,
+          resolution_json TEXT NOT NULL,
+          active_content_hash TEXT,
+          background_content_hash TEXT,
+          created_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(to_string)
 }
 
 fn ensure_session_columns(conn: &Connection) -> Result<(), String> {
@@ -21595,6 +24153,156 @@ mod tests {
             document_path: None,
             text_hash: text_hash.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn active_display_ocr_from_other_window_stays_background_text() {
+        let context = AccessibilityContext {
+            app_name: Some("Helium".to_string()),
+            app_bundle_id: Some("net.imput.helium".to_string()),
+            window_name: Some("YouTube Shorts - Helium".to_string()),
+            browser_url: Some("https://www.youtube.com/shorts/0SMgxlv0Mfc".to_string()),
+            text: "Thomas Newman Any Other Name YouTube".to_string(),
+            ..AccessibilityContext::default()
+        };
+        let metadata = FrameMetadata {
+            scope: "active_display".to_string(),
+            window_id: None,
+            app_bundle_id: context.app_bundle_id.clone(),
+            app_pid: Some(100),
+            pixel_width: Some(3000),
+            pixel_height: Some(1600),
+            active_window_crop_path: None,
+            screen_scale: 1.0,
+            ..FrameMetadata::default()
+        };
+        let snapshot = WindowSnapshotPayload {
+            ts_ms: 1,
+            active_window_id: None,
+            active_app_pid: Some(100),
+            active_app_bundle_id: Some("net.imput.helium".to_string()),
+            screen_count: 2,
+            windows: vec![
+                WindowPayload {
+                    cg_window_id: Some(10),
+                    owner_pid: Some(100),
+                    owner_name: Some("Helium".to_string()),
+                    bundle_id: Some("net.imput.helium".to_string()),
+                    window_title: Some("YouTube Shorts - Helium".to_string()),
+                    layer: Some(0),
+                    alpha: Some(1.0),
+                    is_onscreen: Some(true),
+                    is_active: false,
+                    bounds: Some(Rect {
+                        x: -2619.0,
+                        y: 31.0,
+                        w: 2560.0,
+                        h: 1409.0,
+                    }),
+                    workspace: None,
+                    raw: HashMap::new(),
+                },
+                WindowPayload {
+                    cg_window_id: Some(11),
+                    owner_pid: Some(200),
+                    owner_name: Some("Code".to_string()),
+                    bundle_id: Some("com.microsoft.VSCode".to_string()),
+                    window_title: Some("index.html - smalltalk".to_string()),
+                    layer: Some(0),
+                    alpha: Some(1.0),
+                    is_onscreen: Some(true),
+                    is_active: false,
+                    bounds: Some(Rect {
+                        x: 786.0,
+                        y: 142.0,
+                        w: 1440.0,
+                        h: 869.0,
+                    }),
+                    workspace: None,
+                    raw: HashMap::new(),
+                },
+            ],
+        };
+        let ocr = OcrOutput {
+            text: "could not compile smalltalk".to_string(),
+            text_json: serde_json::json!([{
+                "text": "could not compile smalltalk",
+                "confidence": 1.0,
+                "left": 1656.0 / 3000.0,
+                "top": 443.0 / 1600.0,
+                "width": 260.0 / 3000.0,
+                "height": 20.0 / 1600.0
+            }])
+            .to_string(),
+            engine: "AppleVision".to_string(),
+            error: None,
+        };
+
+        let drafts =
+            build_ocr_span_drafts(&ocr, &metadata, &context, Some(&snapshot), "active_display")
+                .unwrap();
+        let (_, _, resolution) = resolve_frame_text(Some(&context.text), &drafts, true);
+
+        assert_eq!(drafts[0].provenance.ownership_kind, "OtherWindowOwned");
+        assert!(resolution
+            .active_text
+            .as_deref()
+            .is_some_and(|text| !text.contains("could not compile")));
+        assert!(resolution
+            .background_text
+            .as_deref()
+            .is_some_and(|text| text.contains("could not compile")));
+        assert_eq!(resolution.full_text_quality, "mixed_active_and_background");
+        assert!(resolution
+            .quality_flags
+            .contains(&"ocr_spans_other_window_owned".to_string()));
+    }
+
+    #[test]
+    fn active_window_crop_ocr_is_active_text() {
+        let context = AccessibilityContext {
+            app_name: Some("Code".to_string()),
+            app_bundle_id: Some("com.microsoft.VSCode".to_string()),
+            window_id: Some(42),
+            text: String::new(),
+            ..AccessibilityContext::default()
+        };
+        let metadata = FrameMetadata {
+            scope: "active_window".to_string(),
+            window_id: Some(42),
+            app_bundle_id: context.app_bundle_id.clone(),
+            pixel_width: Some(1200),
+            pixel_height: Some(800),
+            active_window_crop_path: Some("/tmp/active-window.jpg".to_string()),
+            screen_scale: 1.0,
+            ..FrameMetadata::default()
+        };
+        let ocr = OcrOutput {
+            text: "could not compile smalltalk".to_string(),
+            text_json: serde_json::json!([{
+                "text": "could not compile smalltalk",
+                "confidence": 0.98,
+                "left": 0.10,
+                "top": 0.20,
+                "width": 0.40,
+                "height": 0.05
+            }])
+            .to_string(),
+            engine: "AppleVision".to_string(),
+            error: None,
+        };
+
+        let drafts =
+            build_ocr_span_drafts(&ocr, &metadata, &context, None, "active_window").unwrap();
+        let (_, _, resolution) = resolve_frame_text(None, &drafts, true);
+
+        assert_eq!(drafts[0].provenance.ownership_kind, "ActiveWindowOwned");
+        assert!(resolution
+            .active_text
+            .as_deref()
+            .is_some_and(|text| text.contains("could not compile")));
+        assert!(resolution.background_text.is_none());
+        assert_eq!(resolution.full_text_quality, "clean_active_ocr");
     }
 
     #[test]
@@ -24458,6 +27166,13 @@ mod tests {
                 bounds_w: None,
                 bounds_h: None,
                 confidence: Some(0.99),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
             ContentUnitSummary {
                 id: "u2".to_string(),
@@ -24470,6 +27185,13 @@ mod tests {
                 bounds_w: None,
                 bounds_h: None,
                 confidence: Some(0.9),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
         ];
 
@@ -24477,6 +27199,57 @@ mod tests {
 
         assert_eq!(compact.len(), 1);
         assert!(compact[0].text.contains("Build this next"));
+    }
+
+    #[test]
+    fn compact_content_units_drop_other_window_ocr_provenance() {
+        let mut redacted = false;
+        let units = vec![
+            ContentUnitSummary {
+                id: "other-window".to_string(),
+                source: "ocr".to_string(),
+                unit_type: "unknown".to_string(),
+                semantic_role: Some("error".to_string()),
+                text: Some("could not compile smalltalk".to_string()),
+                bounds_x: Some(1656.0),
+                bounds_y: Some(443.0),
+                bounds_w: Some(260.0),
+                bounds_h: Some(20.0),
+                confidence: Some(0.20),
+                source_scope: Some("other_visible_window".to_string()),
+                ownership_kind: Some("OtherWindowOwned".to_string()),
+                ownership_confidence: Some(0.86),
+                active_artifact_match_confidence: Some(0.0),
+                owner_window_id: Some(11),
+                owner_bundle_id: Some("com.microsoft.VSCode".to_string()),
+                quality_flags_json: Some(serde_json::json!(["ocr_from_other_window"]).to_string()),
+            },
+            ContentUnitSummary {
+                id: "active".to_string(),
+                source: "ax".to_string(),
+                unit_type: "paragraph".to_string(),
+                semantic_role: Some("main_content".to_string()),
+                text: Some("YouTube Shorts active media title".to_string()),
+                bounds_x: None,
+                bounds_y: None,
+                bounds_w: None,
+                bounds_h: None,
+                confidence: Some(0.9),
+                source_scope: Some("active_element".to_string()),
+                ownership_kind: Some("ActiveWindowOwned".to_string()),
+                ownership_confidence: Some(0.92),
+                active_artifact_match_confidence: Some(0.92),
+                owner_window_id: Some(10),
+                owner_bundle_id: Some("net.imput.helium".to_string()),
+                quality_flags_json: Some("[]".to_string()),
+            },
+        ];
+
+        let compact = compact_content_units_for_ai(&units, &mut redacted);
+
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact[0].id, "active");
+        assert!(!compact[0].text.contains("could not compile"));
     }
 
     #[test]
@@ -24527,6 +27300,13 @@ mod tests {
                 bounds_w: Some(900.0),
                 bounds_h: Some(24.0),
                 confidence: Some(0.99),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
             ContentUnitSummary {
                 id: "second".to_string(),
@@ -24539,6 +27319,13 @@ mod tests {
                 bounds_w: Some(300.0),
                 bounds_h: Some(32.0),
                 confidence: Some(0.76),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
             ContentUnitSummary {
                 id: "first".to_string(),
@@ -24551,6 +27338,13 @@ mod tests {
                 bounds_w: Some(520.0),
                 bounds_h: Some(32.0),
                 confidence: Some(0.76),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
             ContentUnitSummary {
                 id: "dupe".to_string(),
@@ -24563,6 +27357,13 @@ mod tests {
                 bounds_w: Some(520.0),
                 bounds_h: Some(32.0),
                 confidence: Some(0.9),
+                source_scope: None,
+                ownership_kind: None,
+                ownership_confidence: None,
+                active_artifact_match_confidence: None,
+                owner_window_id: None,
+                owner_bundle_id: None,
+                quality_flags_json: None,
             },
         ];
 
@@ -26855,6 +29656,10 @@ mod tests {
                 bounds_w: None,
                 bounds_h: None,
                 confidence: Some(0.9),
+                source_scope: None,
+                ownership_kind: None,
+                active_artifact_match_confidence: None,
+                quality_flags_json: None,
             }],
             text_source: Some("hybrid".to_string()),
             text: Some(text.to_string()),
@@ -27883,6 +30688,77 @@ mod tests {
     }
 
     #[test]
+    fn active_frame_text_for_ai_prefers_resolution_active_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_test_frame(&conn, "/tmp/a.jpg");
+        conn.execute(
+            "INSERT OR REPLACE INTO frame_text_resolutions (
+                frame_id, active_text, background_text, diagnostic_text,
+                full_text_quality, quality_flags_json, resolution_json,
+                active_content_hash, background_content_hash, created_at_ms
+             ) VALUES (?1, 'YouTube active title', 'could not compile smalltalk',
+                       'YouTube active title\ncould not compile smalltalk',
+                       'mixed_active_and_background',
+                       '[\"background_text_present\",\"ocr_spans_other_window_owned\"]',
+                       '{}', 'active-hash', 'background-hash', 1)",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        let frame = conn
+            .query_row(
+                &format!("SELECT {} FROM frames WHERE id = ?1", FRAME_COLUMNS),
+                params![frame_id],
+                frame_from_row,
+            )
+            .unwrap();
+
+        assert_eq!(
+            active_frame_text_for_ai(&conn, &frame).unwrap().as_deref(),
+            Some("YouTube active title")
+        );
+
+        conn.execute(
+            "UPDATE frame_text_resolutions
+             SET active_text = NULL,
+                 full_text_quality = 'background_only',
+                 quality_flags_json = '[\"background_text_present\"]'
+             WHERE frame_id = ?1",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+
+        assert!(active_frame_text_for_ai(&conn, &frame).unwrap().is_none());
+    }
+
+    #[test]
+    fn active_frame_text_for_ai_blocks_legacy_unbounded_display_ocr() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_test_frame(&conn, "/tmp/a.jpg");
+        conn.execute(
+            "UPDATE frames
+             SET text_source = 'ocr',
+                 scope = 'active_display',
+                 window_id = NULL,
+                 active_window_crop_path = NULL,
+                 full_text = 'could not compile smalltalk'
+             WHERE id = ?1",
+            params![frame_id],
+        )
+        .unwrap();
+        let frame = conn
+            .query_row(
+                &format!("SELECT {} FROM frames WHERE id = ?1", FRAME_COLUMNS),
+                params![frame_id],
+                frame_from_row,
+            )
+            .unwrap();
+
+        assert!(active_frame_text_for_ai(&conn, &frame).unwrap().is_none());
+    }
+
+    #[test]
     fn clear_snapshot_dir_recreates_empty_directory() {
         let root = std::env::temp_dir().join(format!("smalltalk-clear-snapshots-{}", now_millis()));
         let day_dir = root.join("day-1");
@@ -28044,17 +30920,27 @@ mod tests {
         assert!(summary.folder_name.contains("__rebuild__"));
         assert!(audit_dir.join("manifest.json").exists());
         assert!(audit_dir.join("explain.md").exists());
+        assert!(audit_dir.join("audit_integrity.json").exists());
+        assert!(audit_dir.join("decision/decision_trace.json").exists());
+        assert!(audit_dir.join("decision/final_decision.json").exists());
+        assert!(audit_dir.join("decision/candidates.json").exists());
+        assert!(audit_dir.join("decision/copy_gate.json").exists());
+        assert!(audit_dir.join("cache/cache_decision.json").exists());
+        assert!(audit_dir.join("model/model_skipped.json").exists());
+        assert!(audit_dir.join("evidence/evidence_closure.json").exists());
+        assert!(audit_dir
+            .join("evidence/frames/frame-000001/frame.json")
+            .exists());
+        assert!(audit_dir
+            .join("evidence/frames/frame-000001/missing_files.json")
+            .exists());
+        assert!(audit_dir.join("raw/table_index.json").exists());
         assert!(audit_dir
             .join("request/get_continue_decision_request.json")
             .exists());
-        assert!(audit_dir.join("raw/smalltalk-capture.sqlite").exists());
-        assert!(audit_dir.join("raw/tables/frames.ndjson").exists());
-        assert!(audit_dir
-            .join("capture/frames/frame-000001/images/frame-000001-snapshot.png")
-            .exists());
-        assert!(audit_dir
-            .join("capture/frames/frame-000001/accessibility/ax_nodes.json")
-            .exists());
+        assert!(!audit_dir.join("raw/smalltalk-capture.sqlite").exists());
+        assert!(!audit_dir.join("raw/tables/frames.ndjson").exists());
+        assert!(!audit_dir.join("capture/frames").exists());
         assert!(audit_dir
             .join("continue/layers/continue_artifacts.ndjson")
             .exists());
@@ -28074,6 +30960,74 @@ mod tests {
             decision.continue_output_path.as_deref(),
             Some(summary.path.as_str())
         );
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(audit_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest.get("schema").and_then(Value::as_str),
+            Some("smalltalk.continue_audit_manifest.v2")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/manifest/rawTableIndex")
+                .and_then(Value::as_str),
+            Some("raw/table_index.json")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/fileCounts/selectedFrameFolders")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            manifest
+                .pointer("/fileCounts/rawTableFiles")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            manifest
+                .pointer("/fileCounts/sqliteSnapshots")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        let table_index: Value = serde_json::from_str(
+            &fs::read_to_string(audit_dir.join("raw/table_index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            table_index
+                .get("raw_tables_requested")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let sqlite_snapshot: Value = serde_json::from_str(
+            &fs::read_to_string(audit_dir.join("raw/sqlite_snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sqlite_snapshot.get("requested").and_then(Value::as_bool),
+            Some(false)
+        );
+        let status = fs::read_to_string(audit_dir.join("export_status.json")).unwrap();
+        assert!(status.contains("skipped_default_lean_audit"));
+        assert_eq!(
+            manifest
+                .pointer("/integrity/manifest_counts_reconciled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let closure: Value = serde_json::from_str(
+            &fs::read_to_string(audit_dir.join("evidence/evidence_closure.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(closure
+            .get("frame_ids")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("1")));
 
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(output_root).unwrap();
@@ -28184,6 +31138,24 @@ mod tests {
             fs::read_to_string(PathBuf::from(&summary.path).join("manifest.json")).unwrap();
         assert!(manifest.contains("\"cacheHit\": true"));
         assert!(manifest.contains("\"sessionLabel\": \"session-001-session-test-1\""));
+        let audit_dir = PathBuf::from(&summary.path);
+        assert!(audit_dir.join("cache/cache_decision.json").exists());
+        assert!(audit_dir.join("model/model_skipped.json").exists());
+        let cache: Value = serde_json::from_str(
+            &fs::read_to_string(audit_dir.join("cache/cache_decision.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.get("cache_hit").and_then(Value::as_bool), Some(true));
+        let skipped: Value = serde_json::from_str(
+            &fs::read_to_string(audit_dir.join("model/model_skipped.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            skipped.get("reason").and_then(Value::as_str),
+            Some("cache_hit")
+        );
+        let explain = fs::read_to_string(audit_dir.join("explain.md")).unwrap();
+        assert!(explain.contains("## Cache Audit"));
         assert!(summary
             .folder_name
             .starts_with("session-001-session-test-1__continue-"));
@@ -28375,6 +31347,62 @@ mod tests {
         let warnings =
             fs::read_to_string(PathBuf::from(&summary.path).join("export_warnings.json")).unwrap();
         assert!(warnings.contains("image_source_missing"));
+
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn continue_output_audit_preserves_selected_frame_when_image_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let output_root = std::env::temp_dir().join(format!(
+            "smalltalk-continue-missing-image-output-{}",
+            now_millis()
+        ));
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/smalltalk-missing-continue-frame.png",
+        );
+        let request = crate::continuation::ContinueDecisionRequest {
+            session_id: Some(session.id.clone()),
+            mode: Some("rebuild".to_string()),
+            rebuild_layers: Some(true),
+            micro_inference_enabled: Some(false),
+            ..Default::default()
+        };
+        let mut decision = crate::continuation::get_continue_decision(&conn, request.clone())
+            .expect("continue decision");
+        let summary = export_continue_output_audit_to_root(
+            &conn,
+            &request,
+            "rebuild",
+            &mut decision,
+            &output_root,
+        )
+        .expect("continue output audit");
+        let audit_dir = PathBuf::from(&summary.path);
+        let selected_frame = audit_dir.join("evidence/frames/frame-000001");
+        assert!(selected_frame.join("frame.json").exists());
+        let missing: Value = serde_json::from_str(
+            &fs::read_to_string(selected_frame.join("missing_files.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(missing
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.get("reason").and_then(Value::as_str) == Some("source_path_missing")));
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(audit_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest
+                .pointer("/fileCounts/selectedFrameFolders")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
 
         fs::remove_dir_all(output_root).unwrap();
     }

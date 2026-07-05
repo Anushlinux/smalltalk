@@ -895,7 +895,7 @@ function App() {
     [selectFrame],
   );
 
-  const runContinueDecision = useCallback(async (options: { forceRebuild?: boolean } = {}) => {
+  const runContinueDecision = useCallback(async (options: { forceRebuild?: boolean; writeAudit?: boolean } = {}) => {
     setBusyAction("get_continue_decision");
     setContinueError(null);
     setContinueOpenResult(null);
@@ -907,6 +907,7 @@ function App() {
           rebuild_layers: options.forceRebuild === true,
           micro_inference_enabled: true,
           max_candidates_for_model: 5,
+          audit_output_enabled: options.writeAudit === true,
         },
       });
       setContinueDecision(decision);
@@ -1314,7 +1315,7 @@ function App() {
       return;
     }
     autoContinueRef.current = true;
-    void runContinueDecision();
+    void runContinueDecision({ writeAudit: false });
   }, [busyAction, continueDecision, runContinueDecision, status.frame_count]);
 
   useEffect(() => {
@@ -1555,7 +1556,7 @@ function App() {
           openResult={continueOpenResult}
           stale={continueIsStale}
           onStartMemory={() => void runAction("start_capture")}
-          onContinue={() => void runContinueDecision()}
+          onContinue={() => void runContinueDecision({ writeAudit: true })}
           onOpenTarget={() => void openContinueTarget()}
           onRecordFeedback={(kind) => void recordContinueFeedback(kind)}
           onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
@@ -1591,7 +1592,7 @@ function App() {
               className="primary-button"
               disabled={busyAction !== null}
               aria-busy={busyAction === "get_continue_decision"}
-              onClick={() => void runContinueDecision()}
+              onClick={() => void runContinueDecision({ writeAudit: true })}
             >
               {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
             </button>
@@ -1726,7 +1727,7 @@ function App() {
                 type="button"
                 disabled={busyAction !== null}
                 aria-busy={busyAction === "get_continue_decision"}
-                onClick={() => void runContinueDecision({ forceRebuild: true })}
+                onClick={() => void runContinueDecision({ forceRebuild: true, writeAudit: true })}
               >
                 {busyAction === "get_continue_decision" ? "Rebuilding" : "Rebuild Continue"}
               </button>

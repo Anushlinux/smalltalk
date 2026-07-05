@@ -548,6 +548,7 @@ pub struct ContinueDecisionRequest {
     pub micro_inference_enabled: Option<bool>,
     pub model: Option<String>,
     pub max_candidates_for_model: Option<i64>,
+    pub audit_output_enabled: Option<bool>,
 }
 
 impl Default for ContinueDecisionRequest {
@@ -561,6 +562,7 @@ impl Default for ContinueDecisionRequest {
             micro_inference_enabled: Some(true),
             model: None,
             max_candidates_for_model: Some(5),
+            audit_output_enabled: Some(false),
         }
     }
 }
@@ -1271,6 +1273,10 @@ struct EvidenceFrame {
     window_id: Option<i64>,
     active_window_crop_path: Option<String>,
     full_text: Option<String>,
+    active_text: Option<String>,
+    background_text: Option<String>,
+    full_text_quality: Option<String>,
+    text_quality_flags: Vec<String>,
     content_hash: Option<String>,
     image_hash: Option<String>,
     privacy_status: Option<String>,
@@ -1317,6 +1323,13 @@ struct EvidenceContentUnit {
     confidence: Option<f64>,
     ocr_span_ids: Vec<String>,
     bounds: Option<Rect>,
+    source_scope: Option<String>,
+    ownership_kind: Option<String>,
+    ownership_confidence: Option<f64>,
+    active_artifact_match_confidence: Option<f64>,
+    owner_window_id: Option<i64>,
+    owner_bundle_id: Option<String>,
+    quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1325,6 +1338,15 @@ struct EvidenceOcrSpan {
     text: String,
     confidence: Option<f64>,
     bounds: Rect,
+    source_scope: Option<String>,
+    ownership_kind: Option<String>,
+    ownership_confidence: Option<f64>,
+    active_artifact_match_confidence: Option<f64>,
+    owner_window_id: Option<i64>,
+    owner_bundle_id: Option<String>,
+    owner_app_name: Option<String>,
+    owner_window_title: Option<String>,
+    quality_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2150,6 +2172,7 @@ pub fn get_continue_decision(
         micro_inference_enabled: request.micro_inference_enabled.or(Some(true)),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
+        audit_output_enabled: request.audit_output_enabled.or(Some(false)),
     };
     let effective_mode = effective_continue_decision_mode(
         request.mode.as_deref(),
@@ -9961,6 +9984,10 @@ fn event_rows_to_evidence_frames(
             window_id: None,
             active_window_crop_path: None,
             full_text: Some(summary),
+            active_text: None,
+            background_text: None,
+            full_text_quality: None,
+            text_quality_flags: Vec::new(),
             content_hash: Some(content_hash),
             image_hash: None,
             privacy_status: None,
@@ -10080,6 +10107,10 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         window_id: None,
         active_window_crop_path: None,
         full_text: row.get(8)?,
+        active_text: None,
+        background_text: None,
+        full_text_quality: None,
+        text_quality_flags: Vec::new(),
         content_hash: row.get(9)?,
         image_hash: row.get(10)?,
         privacy_status: row.get(11)?,
@@ -10137,6 +10168,32 @@ fn load_frame_capture_attribution(
             .optional()
             .map_err(to_string)?
             .flatten();
+    }
+    if table_exists(conn, "frame_text_resolutions")? {
+        if let Some((active_text, background_text, full_text_quality, quality_flags_json)) = conn
+            .query_row(
+                "SELECT active_text, background_text, full_text_quality, quality_flags_json
+                 FROM frame_text_resolutions
+                 WHERE frame_id = ?1",
+                params![frame.id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(to_string)?
+        {
+            frame.active_text = active_text;
+            frame.background_text = background_text;
+            frame.full_text_quality = full_text_quality;
+            frame.text_quality_flags =
+                parse_string_array(quality_flags_json.as_deref().unwrap_or("[]"));
+        }
     }
     Ok(())
 }
@@ -10209,14 +10266,62 @@ fn load_frame_content_units(
     } else {
         "NULL"
     };
+    let source_scope_expr = if column_exists(conn, "content_units", "source_scope")? {
+        "source_scope"
+    } else {
+        "NULL"
+    };
+    let ownership_kind_expr = if column_exists(conn, "content_units", "ownership_kind")? {
+        "ownership_kind"
+    } else {
+        "NULL"
+    };
+    let ownership_confidence_expr = if column_exists(conn, "content_units", "ownership_confidence")?
+    {
+        "ownership_confidence"
+    } else {
+        "NULL"
+    };
+    let active_match_expr =
+        if column_exists(conn, "content_units", "active_artifact_match_confidence")? {
+            "active_artifact_match_confidence"
+        } else {
+            "NULL"
+        };
+    let owner_window_id_expr = if column_exists(conn, "content_units", "owner_window_id")? {
+        "owner_window_id"
+    } else {
+        "NULL"
+    };
+    let owner_bundle_id_expr = if column_exists(conn, "content_units", "owner_bundle_id")? {
+        "owner_bundle_id"
+    } else {
+        "NULL"
+    };
+    let quality_flags_expr = if column_exists(conn, "content_units", "quality_flags_json")? {
+        "quality_flags_json"
+    } else {
+        "'[]'"
+    };
     let sql = format!(
         "SELECT id, source, unit_type, semantic_role, text, text_hash, confidence,
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
          FROM content_units
          WHERE frame_id = ?1
          ORDER BY confidence DESC, created_at_ms DESC
          LIMIT 240",
-        ocr_span_ids_expr, bounds_x_expr, bounds_y_expr, bounds_w_expr, bounds_h_expr
+        ocr_span_ids_expr,
+        bounds_x_expr,
+        bounds_y_expr,
+        bounds_w_expr,
+        bounds_h_expr,
+        source_scope_expr,
+        ownership_kind_expr,
+        ownership_confidence_expr,
+        active_match_expr,
+        owner_window_id_expr,
+        owner_bundle_id_expr,
+        quality_flags_expr
     );
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
@@ -10238,6 +10343,15 @@ fn load_frame_content_units(
                 confidence: row.get(6)?,
                 ocr_span_ids: parse_evidence_id_array(ocr_span_ids_raw.as_deref()),
                 bounds,
+                source_scope: row.get(12)?,
+                ownership_kind: row.get(13)?,
+                ownership_confidence: row.get(14)?,
+                active_artifact_match_confidence: row.get(15)?,
+                owner_window_id: row.get(16)?,
+                owner_bundle_id: row.get(17)?,
+                quality_flags: parse_string_array(
+                    row.get::<_, Option<String>>(18)?.as_deref().unwrap_or("[]"),
+                ),
             })
         })
         .map_err(to_string)?;
@@ -10248,15 +10362,70 @@ fn load_frame_ocr_spans(conn: &Connection, frame_id: &str) -> Result<Vec<Evidenc
     if !table_exists(conn, "ocr_spans")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, text, confidence, bounds_x, bounds_y, bounds_w, bounds_h
-             FROM ocr_spans
-             WHERE frame_id = ?1
-             ORDER BY line_index ASC, word_index ASC, id ASC
-             LIMIT 600",
-        )
-        .map_err(to_string)?;
+    let source_scope_expr = if column_exists(conn, "ocr_spans", "source_scope")? {
+        "source_scope"
+    } else {
+        "NULL"
+    };
+    let ownership_kind_expr = if column_exists(conn, "ocr_spans", "ownership_kind")? {
+        "ownership_kind"
+    } else {
+        "NULL"
+    };
+    let ownership_confidence_expr = if column_exists(conn, "ocr_spans", "ownership_confidence")? {
+        "ownership_confidence"
+    } else {
+        "NULL"
+    };
+    let active_match_expr = if column_exists(conn, "ocr_spans", "active_artifact_match_confidence")?
+    {
+        "active_artifact_match_confidence"
+    } else {
+        "NULL"
+    };
+    let owner_window_id_expr = if column_exists(conn, "ocr_spans", "owner_window_id")? {
+        "owner_window_id"
+    } else {
+        "NULL"
+    };
+    let owner_bundle_id_expr = if column_exists(conn, "ocr_spans", "owner_bundle_id")? {
+        "owner_bundle_id"
+    } else {
+        "NULL"
+    };
+    let owner_app_name_expr = if column_exists(conn, "ocr_spans", "owner_app_name")? {
+        "owner_app_name"
+    } else {
+        "NULL"
+    };
+    let owner_window_title_expr = if column_exists(conn, "ocr_spans", "owner_window_title")? {
+        "owner_window_title"
+    } else {
+        "NULL"
+    };
+    let quality_flags_expr = if column_exists(conn, "ocr_spans", "quality_flags_json")? {
+        "quality_flags_json"
+    } else {
+        "'[]'"
+    };
+    let sql = format!(
+        "SELECT id, text, confidence, bounds_x, bounds_y, bounds_w, bounds_h,
+                {}, {}, {}, {}, {}, {}, {}, {}, {}
+         FROM ocr_spans
+         WHERE frame_id = ?1
+         ORDER BY line_index ASC, word_index ASC, id ASC
+         LIMIT 600",
+        source_scope_expr,
+        ownership_kind_expr,
+        ownership_confidence_expr,
+        active_match_expr,
+        owner_window_id_expr,
+        owner_bundle_id_expr,
+        owner_app_name_expr,
+        owner_window_title_expr,
+        quality_flags_expr
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(params![frame_id], |row| {
             Ok(EvidenceOcrSpan {
@@ -10269,6 +10438,17 @@ fn load_frame_ocr_spans(conn: &Connection, frame_id: &str) -> Result<Vec<Evidenc
                     w: row.get(5)?,
                     h: row.get(6)?,
                 },
+                source_scope: row.get(7)?,
+                ownership_kind: row.get(8)?,
+                ownership_confidence: row.get(9)?,
+                active_artifact_match_confidence: row.get(10)?,
+                owner_window_id: row.get(11)?,
+                owner_bundle_id: row.get(12)?,
+                owner_app_name: row.get(13)?,
+                owner_window_title: row.get(14)?,
+                quality_flags: parse_string_array(
+                    row.get::<_, Option<String>>(15)?.as_deref().unwrap_or("[]"),
+                ),
             })
         })
         .map_err(to_string)?;
@@ -11037,7 +11217,11 @@ fn upsert_continue_artifact_observation(
 ) -> Result<(), String> {
     let app_context_id = frame.app_contexts.first().map(|context| context.id.clone());
     let text_source = continue_text_source(frame);
-    let visible_text_length = frame.full_text.as_deref().unwrap_or("").chars().count() as i64;
+    let visible_text_length = active_frame_text_for_continue(frame)
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .count() as i64;
     let observation_confidence = (artifact.identity_confidence
         + if visible_text_length > 0 { 0.05 } else { -0.05 })
     .clamp(0.0, 0.98);
@@ -11801,31 +11985,131 @@ fn attributed_evidence_spans_for_frame(
         } else {
             "content_unit"
         };
-        let span = attributed_span_from_text_and_rect(
-            frame,
-            artifact,
-            source,
-            &unit.id,
-            text,
-            unit.confidence.unwrap_or(0.72),
-            unit.semantic_role.clone(),
-            unit.bounds,
-        );
+        let span =
+            if unit.ownership_kind.is_some() || unit.active_artifact_match_confidence.is_some() {
+                attributed_span_from_persisted_provenance(
+                    frame,
+                    artifact,
+                    source,
+                    &unit.id,
+                    text,
+                    unit.confidence.unwrap_or(0.72),
+                    unit.semantic_role.clone(),
+                    unit.ownership_kind.as_deref(),
+                    unit.active_artifact_match_confidence,
+                    unit.owner_bundle_id.clone(),
+                    None,
+                    None,
+                    unit.quality_flags.clone(),
+                )
+            } else {
+                attributed_span_from_text_and_rect(
+                    frame,
+                    artifact,
+                    source,
+                    &unit.id,
+                    text,
+                    unit.confidence.unwrap_or(0.72),
+                    unit.semantic_role.clone(),
+                    unit.bounds,
+                )
+            };
         spans.push(span);
     }
     for span in &frame.ocr_spans {
-        spans.push(attributed_span_from_text_and_rect(
-            frame,
-            artifact,
-            "ocr_span",
-            &span.id,
-            &span.text,
-            span.confidence.unwrap_or(0.70),
-            None,
-            Some(span.bounds),
-        ));
+        if span.ownership_kind.is_some() || span.active_artifact_match_confidence.is_some() {
+            spans.push(attributed_span_from_persisted_provenance(
+                frame,
+                artifact,
+                "ocr_span",
+                &span.id,
+                &span.text,
+                span.confidence.unwrap_or(0.70),
+                None,
+                span.ownership_kind.as_deref(),
+                span.active_artifact_match_confidence,
+                span.owner_bundle_id.clone(),
+                span.owner_app_name.clone(),
+                span.owner_window_title.clone(),
+                span.quality_flags.clone(),
+            ));
+        } else {
+            spans.push(attributed_span_from_text_and_rect(
+                frame,
+                artifact,
+                "ocr_span",
+                &span.id,
+                &span.text,
+                span.confidence.unwrap_or(0.70),
+                None,
+                Some(span.bounds),
+            ));
+        }
     }
     spans
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attributed_span_from_persisted_provenance(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+    source: &str,
+    source_id: &str,
+    text: &str,
+    confidence: f64,
+    semantic_role: Option<String>,
+    ownership_kind: Option<&str>,
+    active_artifact_match_confidence: Option<f64>,
+    owner_bundle_id: Option<String>,
+    owner_app_name: Option<String>,
+    owner_window_title: Option<String>,
+    quality_flags: Vec<String>,
+) -> AttributedEvidenceSpan {
+    let mut flags = frame_quality_flags(frame, artifact);
+    for flag in quality_flags {
+        push_string_once(&mut flags, &flag);
+    }
+    let artifact_match_score = active_artifact_match_confidence.unwrap_or_else(|| {
+        if source == "ocr_span" {
+            0.0
+        } else {
+            0.82
+        }
+    });
+    let attribution = match ownership_kind.unwrap_or("") {
+        "ActiveWindowOwned" => "active_window_owned",
+        "ActiveAppOwned" if artifact_match_score >= 0.50 => "artifact_owned",
+        "SameAppNonActiveWindow" => "same_app_non_active_window",
+        "OtherWindowOwned" => {
+            push_string_once(&mut flags, "ocr_inside_other_window");
+            "other_window_owned"
+        }
+        "UnknownCoordinateSpace" => {
+            push_string_once(&mut flags, "display_only_unattributed");
+            "display_only_unattributed"
+        }
+        "DisplayOnlyUnattributed" => {
+            push_string_once(&mut flags, "display_only_unattributed");
+            "display_only_unattributed"
+        }
+        _ if source != "ocr_span" => "artifact_owned",
+        _ => "display_only_unattributed",
+    }
+    .to_string();
+    AttributedEvidenceSpan {
+        source: source.to_string(),
+        source_id: source_id.to_string(),
+        text: text.to_string(),
+        confidence,
+        semantic_role,
+        nearest_window_owner: owner_app_name,
+        nearest_window_bundle_id: owner_bundle_id,
+        nearest_window_title: owner_window_title,
+        nearest_window_overlap_ratio: None,
+        attribution,
+        artifact_match_score,
+        flags,
+    }
 }
 
 fn attributed_span_from_text_and_rect(
@@ -11895,7 +12179,11 @@ fn frame_full_text_fallback_span(
     artifact: &ResolvedArtifact,
 ) -> AttributedEvidenceSpan {
     let text_source = continue_text_source(frame);
-    let attribution = if text_source == "accessibility" && !frame_is_unbounded_display_ocr(frame) {
+    let text = active_frame_text_for_continue(frame).unwrap_or_default();
+    let attribution = if !text.trim().is_empty()
+        && text_source == "accessibility"
+        && !frame_is_unbounded_display_ocr(frame)
+    {
         "artifact_owned"
     } else {
         "display_only_unattributed"
@@ -11907,7 +12195,7 @@ fn frame_full_text_fallback_span(
     AttributedEvidenceSpan {
         source: "frame_full_text_fallback".to_string(),
         source_id: format!("frame-full-text-{}", frame.id),
-        text: frame.full_text.clone().unwrap_or_default(),
+        text,
         confidence: if attribution == "artifact_owned" {
             0.58
         } else {
@@ -12148,7 +12436,12 @@ fn classify_task_action(
         )
     } else if is_navigation_signal(frame) {
         ("navigating", "primary", 0.55, "navigation_signal")
-    } else if frame.full_text.as_deref().unwrap_or("").trim().is_empty() {
+    } else if active_frame_text_for_continue(frame)
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         ("unknown", "unknown", 0.25, "thin_or_missing_text")
     } else {
         (
@@ -12682,7 +12975,12 @@ fn should_force_semantic_snapshot(promotion: &ContinueBoundaryPromotion) -> bool
 }
 
 fn moment_evidence_quality(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> String {
-    if artifact.evidence_quality == "strong" || !frame.content_units.is_empty() {
+    if artifact.evidence_quality == "strong"
+        || frame
+            .content_units
+            .iter()
+            .any(content_unit_is_active_evidence)
+    {
         "strong".to_string()
     } else if !frame.ui_events.is_empty() || !frame.typing_bursts.is_empty() {
         "medium".to_string()
@@ -12778,12 +13076,13 @@ fn safe_evidence_quote(frame: &EvidenceFrame, roles: &[&str]) -> Option<String> 
         .content_units
         .iter()
         .filter(|unit| {
-            roles.is_empty()
-                || unit
-                    .semantic_role
-                    .as_deref()
-                    .map(|role| roles.contains(&role))
-                    .unwrap_or(false)
+            content_unit_is_active_evidence(unit)
+                && (roles.is_empty()
+                    || unit
+                        .semantic_role
+                        .as_deref()
+                        .map(|role| roles.contains(&role))
+                        .unwrap_or(false))
         })
         .filter_map(|unit| unit.text.as_deref())
         .map(safe_label)
@@ -15327,22 +15626,102 @@ fn has_error_signal(frame: &EvidenceFrame) -> bool {
 
 fn has_content_role(frame: &EvidenceFrame, role: &str) -> bool {
     frame.content_units.iter().any(|unit| {
-        unit.semantic_role
-            .as_deref()
-            .map(|value| value == role)
-            .unwrap_or(false)
+        content_unit_is_active_evidence(unit)
+            && unit
+                .semantic_role
+                .as_deref()
+                .map(|value| value == role)
+                .unwrap_or(false)
     })
 }
 
 fn frame_text_lower(frame: &EvidenceFrame) -> String {
-    let mut text = frame.full_text.clone().unwrap_or_default();
+    let mut text = active_frame_text_for_continue(frame).unwrap_or_default();
     for unit in &frame.content_units {
-        if let Some(unit_text) = &unit.text {
-            text.push('\n');
-            text.push_str(unit_text);
+        if content_unit_is_active_evidence(unit) {
+            if let Some(unit_text) = &unit.text {
+                text.push('\n');
+                text.push_str(unit_text);
+            }
         }
     }
     text.to_lowercase()
+}
+
+fn active_frame_text_for_continue(frame: &EvidenceFrame) -> Option<String> {
+    if let Some(text) = frame
+        .active_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    if frame.full_text_quality.as_deref().is_some_and(|quality| {
+        matches!(
+            quality,
+            "mixed_active_and_background"
+                | "background_only"
+                | "display_only_unattributed"
+                | "unknown"
+        )
+    }) {
+        return None;
+    }
+    if frame.text_quality_flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "background_text_present"
+                | "ocr_from_other_window"
+                | "ocr_spans_other_window_owned"
+                | "ocr_unattributed"
+                | "coordinate_transform_unverified"
+        )
+    }) {
+        return None;
+    }
+    if frame_is_unbounded_display_ocr(frame) {
+        return None;
+    }
+    frame
+        .full_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn content_unit_is_active_evidence(unit: &EvidenceContentUnit) -> bool {
+    if unit.ownership_kind.as_deref().is_some_and(|kind| {
+        matches!(
+            kind,
+            "OtherWindowOwned"
+                | "DisplayOnlyUnattributed"
+                | "UnknownCoordinateSpace"
+                | "SameAppNonActiveWindow"
+        )
+    }) {
+        return false;
+    }
+    if unit.quality_flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "ocr_from_other_window" | "ocr_unattributed" | "coordinate_transform_unverified"
+        )
+    }) {
+        return false;
+    }
+    unit.active_artifact_match_confidence.unwrap_or_else(|| {
+        if unit.source.to_lowercase().contains("ocr") {
+            0.35
+        } else {
+            0.82
+        }
+    }) >= 0.50
+}
+
+fn content_unit_background_or_support(unit: &EvidenceContentUnit) -> bool {
+    !content_unit_is_active_evidence(unit)
 }
 
 fn is_primary_work_artifact(kind: &str) -> bool {
@@ -15659,6 +16038,12 @@ fn normalized_contains(left: &str, right: &str) -> bool {
 
 fn frame_quality_flags(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> Vec<String> {
     let mut flags = Vec::new();
+    for flag in &frame.text_quality_flags {
+        push_string_once(&mut flags, flag);
+    }
+    if let Some(quality) = frame.full_text_quality.as_deref() {
+        push_string_once(&mut flags, &format!("full_text_quality:{}", quality));
+    }
     if frame.scope.as_deref() == Some("active_display") {
         flags.push("active_display_scope".to_string());
     }
@@ -18851,6 +19236,40 @@ mod tests {
         assert!(flags.contains("missing_active_window_id"));
         assert!(flags.contains("missing_active_window_crop"));
         assert!(flags.contains("display_only_unattributed"));
+    }
+
+    #[test]
+    fn active_frame_text_for_continue_blocks_legacy_unbounded_display_ocr() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            11,
+            "Helium",
+            "Reference page - Helium",
+            Some("https://example.com/reference"),
+            None,
+            "event_burst",
+            "could not compile smalltalk",
+            Some("net.imput.helium"),
+            None,
+        );
+        set_frame_capture_scope(&conn, 11, "ocr", "active_display", None, None);
+
+        let frames = load_evidence_frames(
+            &conn,
+            &ContinueSecondLayerRebuildRequest {
+                start_frame_id: Some(11),
+                end_frame_id: Some(11),
+                limit: Some(1),
+                session_id: None,
+                lookback_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert!(active_frame_text_for_continue(&frames[0]).is_none());
     }
 
     #[test]
