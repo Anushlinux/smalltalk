@@ -420,6 +420,13 @@ type ContinueCandidateSummary = {
   evidence_frame_id?: string | null;
   supporting_episode_id?: string | null;
   last_meaningful_action_id?: string | null;
+  app_family?: string | null;
+  surface_type?: string | null;
+  activity_intent?: string | null;
+  task_phase?: string | null;
+  continuation_role?: string | null;
+  work_value_reason?: string | null;
+  why_not_primary?: string | null;
 };
 
 type ContinueScoreComponents = {
@@ -431,6 +438,25 @@ type ContinueScoreComponents = {
   recency: number;
   openability: number;
   privacy_safety: number;
+  memory_support?: number;
+  memory_contradiction?: number;
+  feedback_prior?: number;
+  retrieval_confidence?: number;
+  work_value?: number;
+  resume_likelihood?: number;
+  divergence?: number;
+  diagnostic?: number;
+  objective_relation?: number;
+  interaction_depth?: number;
+  evidence_sufficiency?: number;
+};
+
+type ContinueActivitySummary = {
+  main_work?: string | null;
+  support_context: string[];
+  recent_divergence: string[];
+  diagnostic_surfaces: string[];
+  missing_for_current_focus: string[];
 };
 
 type ContinueDecisionResult = {
@@ -459,6 +485,9 @@ type ContinueDecisionResult = {
   alternatives: ContinueCandidateSummary[];
   generated_candidates: number;
   validation_status: string;
+  observe_before_decide?: unknown | null;
+  app_activity?: unknown | null;
+  activity_summary?: ContinueActivitySummary | null;
 };
 
 type ContinueHandoff = {
@@ -625,6 +654,13 @@ type ContinueWorkstreamCandidateDetail = {
   reason?: string | null;
   missing_evidence: string[];
   components: ContinueScoreComponents;
+  app_family?: string | null;
+  surface_type?: string | null;
+  activity_intent?: string | null;
+  task_phase?: string | null;
+  continuation_role?: string | null;
+  work_value_reason?: string | null;
+  why_not_primary?: string | null;
   created_at_ms: number;
 };
 
@@ -3328,6 +3364,9 @@ function productizeCandidateKind(value?: string | null) {
     continue_edit: "Continue the edit in the primary target.",
     return_to_primary_artifact: "Return to the primary work target.",
     resolve_error: "Resolve the visible blocker.",
+    review_completed_changes: "Review completed changes, commit them, or verify the app behavior.",
+    commit_completed_changes: "Commit the completed changes.",
+    manual_verify_app_behavior: "Run the app and manually verify behavior.",
     verify_output: "Verify the output before moving on.",
     continue_reply: "Continue the draft or reply.",
     read_next_source: "Continue reading the next source.",
@@ -3346,6 +3385,7 @@ function productizeUnresolvedState(value?: string | null) {
     idle_after_progress: "Work paused after meaningful progress.",
     visible_error_or_failure: "Visible error still unresolved.",
     draft_or_composer_active: "Draft or composer still active.",
+    completed_progress: "Work appears completed and verified.",
     verification_without_return: "Verification branch has not been applied back to the target.",
     branch_without_return: "Search branch has not been applied back to the target.",
   };

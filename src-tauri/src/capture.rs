@@ -8,7 +8,7 @@ use crate::capture_core::resume_dossier::{
     bounded_json_chars, bounded_model_images, RESUME_QUERY_SCHEMA_V2,
 };
 use rusqlite::types::ValueRef as SqlValueRef;
-use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCESSIBILITY_SCRIPT: &str = r#"
 on replaceText(sourceText, oldText, newText)
   set oldDelims to AppleScript's text item delimiters
@@ -2955,6 +2956,30 @@ pub fn get_continue_decision(
         }
     }
     let mut result = crate::continuation::get_continue_decision(&conn, request.clone())?;
+    if let Some((probe_request, sufficiency)) =
+        crate::continuation::build_need_more_evidence_request_from_decision(&conn, &result)?
+    {
+        let probe_result = run_continue_evidence_probes(&app, &probe_request);
+        crate::continuation::record_continue_evidence_probe_result(
+            &conn,
+            &probe_request,
+            &probe_result,
+        )?;
+        let trace = crate::continuation::ObserveBeforeDecideTrace {
+            schema: "smalltalk.observe_before_decide_trace.v1".to_string(),
+            request: probe_request,
+            sufficiency,
+            reran_decision: true,
+            probe_result,
+        };
+        result = crate::continuation::get_continue_decision(&conn, request.clone())?;
+        result.observe_before_decide = Some(trace);
+        result
+            .warnings
+            .push("observe_before_decide:evidence_refreshed_before_decision".to_string());
+        result.warnings.sort();
+        result.warnings.dedup();
+    }
     if result.cache_hit {
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
     }
@@ -2972,6 +2997,127 @@ pub fn get_continue_decision(
         }
     }
     Ok(result)
+}
+
+fn run_continue_evidence_probes(
+    app: &AppHandle,
+    request: &crate::continuation::NeedMoreEvidenceRequest,
+) -> crate::continuation::NeedMoreEvidenceProbeResult {
+    let started_at_ms = now_millis();
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    let mut probes_succeeded = Vec::new();
+    let mut context = AccessibilityContext::default();
+    let mut window_count = 0_i64;
+
+    match capture_paths(app) {
+        Ok(paths) => {
+            context = collect_accessibility_context(&paths);
+            if context.error.is_some() {
+                warnings.push("accessibility_probe_returned_error".to_string());
+            } else if context_has_accessibility_signal(&context) {
+                probes_succeeded.push(crate::continuation::EvidenceProbeKind::FrontmostAppProbe);
+                probes_succeeded.push(crate::continuation::EvidenceProbeKind::ActiveWindowProbe);
+                if context.browser_url.is_some() {
+                    probes_succeeded.push(crate::continuation::EvidenceProbeKind::BrowserUrlProbe);
+                }
+                if context.document_path.is_some() {
+                    probes_succeeded
+                        .push(crate::continuation::EvidenceProbeKind::DocumentPathProbe);
+                }
+                if !context.text.trim().is_empty() {
+                    probes_succeeded
+                        .push(crate::continuation::EvidenceProbeKind::AccessibilityTextProbe);
+                }
+            }
+            match collect_window_snapshot(&paths) {
+                Ok(snapshot) => {
+                    window_count = snapshot.windows.len() as i64;
+                    probes_succeeded.push(crate::continuation::EvidenceProbeKind::WindowGraphProbe);
+                    if context.app_bundle_id.is_none() {
+                        context.app_bundle_id = snapshot.active_app_bundle_id.clone();
+                    }
+                    if context.window_id.is_none() {
+                        context.window_id = snapshot.active_window_id;
+                    }
+                    if context.app_name.is_none() || context.window_name.is_none() {
+                        if let Some(active) =
+                            snapshot.windows.iter().find(|window| window.is_active)
+                        {
+                            if context.app_name.is_none() {
+                                context.app_name = active.owner_name.clone();
+                            }
+                            if context.window_name.is_none() {
+                                context.window_name = active.window_title.clone();
+                            }
+                        }
+                    }
+                }
+                Err(error) => warnings.push(format!("window_graph_probe_failed:{}", error)),
+            }
+        }
+        Err(error) => errors.push(format!("capture_paths_failed:{}", error)),
+    }
+
+    let privacy = privacy_decision(app, &context).unwrap_or_else(|error| {
+        warnings.push(format!("privacy_probe_failed:{}", error));
+        PrivacyDecision {
+            skip_capture: false,
+            status: "unknown".to_string(),
+            regions: Vec::new(),
+        }
+    });
+    let privacy_blocked = privacy.skip_capture || privacy.status == "never_send_to_ai";
+    if privacy_blocked {
+        warnings.push("probe_privacy_blocked".to_string());
+    }
+    let redact_locators = privacy_blocked || privacy.status == "redacted";
+    let completed_at_ms = now_millis();
+    let observation_id = Some(format!(
+        "continue-probe-{}",
+        stable_hash_bytes(format!("{}:{}", request.id, completed_at_ms).as_bytes())
+    ));
+    let evidence_changed = !privacy_blocked
+        && (context.app_name.is_some()
+            || context.window_name.is_some()
+            || context.browser_url.is_some()
+            || context.document_path.is_some()
+            || window_count > 0);
+
+    crate::continuation::NeedMoreEvidenceProbeResult {
+        request_id: request.id.clone(),
+        started_at_ms,
+        completed_at_ms,
+        probes_attempted: request.requested_probes.clone(),
+        probes_succeeded,
+        evidence_changed,
+        privacy_blocked,
+        observation_id,
+        app_name: (!privacy_blocked)
+            .then(|| context.app_name.clone())
+            .flatten(),
+        app_bundle_id: (!privacy_blocked)
+            .then(|| context.app_bundle_id.clone())
+            .flatten(),
+        window_title: (!privacy_blocked)
+            .then(|| context.window_name.clone())
+            .flatten(),
+        browser_url: (!redact_locators)
+            .then(|| context.browser_url.clone())
+            .flatten(),
+        document_path: (!redact_locators)
+            .then(|| context.document_path.clone())
+            .flatten(),
+        accessibility_text_char_count: if privacy_blocked {
+            0
+        } else {
+            context.text.chars().count() as i64
+        },
+        window_count: if privacy_blocked { 0 } else { window_count },
+        privacy_status: Some(privacy.status),
+        warnings,
+        errors,
+    }
 }
 
 #[tauri::command]
@@ -3053,6 +3199,15 @@ pub fn run_continue_eval(
     eval_file_path: Option<String>,
 ) -> Result<crate::continuation::ContinueEvalReport, String> {
     crate::continuation::run_continue_eval(eval_file_path)
+}
+
+#[tauri::command]
+pub fn run_continue_replay_eval(
+    app: AppHandle,
+    input: Option<crate::continuation::ContinueReplayEvalInput>,
+) -> Result<crate::continuation::ContinueReplayEvalReport, String> {
+    let conn = open_db(&app)?;
+    crate::continuation::run_continue_replay_eval(&conn, input)
 }
 
 #[tauri::command]
@@ -16409,8 +16564,7 @@ fn capture_status_snapshot_inner(
     runtime_state: &Arc<Mutex<CaptureRuntime>>,
 ) -> Result<CaptureStatus, String> {
     let paths = capture_paths(app)?;
-    let _ = ensure_db(app);
-    let conn = open_db(app).ok();
+    let conn = open_readonly_db(app).ok();
 
     let runtime = runtime_state
         .lock()
@@ -17988,6 +18142,14 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
     "continue_open_loops",
     "continue_open_loop_artifacts",
     "continue_open_loop_evidence",
+    "continue_memory_cells",
+    "continue_memory_edges",
+    "continue_ranking_priors",
+    "continue_pairwise_preferences",
+    "continue_eval_fixtures",
+    "continue_evidence_probes",
+    "continue_app_activity_segments",
+    "continue_activity_classifications",
     "continue_boundary_revisions",
     "continue_feedback_events",
     "continue_breadcrumbs",
@@ -18023,9 +18185,7 @@ fn schedule_continue_output_audit(
     audit_result.continue_output_path = Some(summary.path.clone());
     thread::spawn(move || {
         let export_result = (|| -> Result<(), String> {
-            let conn = Connection::open(&db_path).map_err(to_string)?;
-            conn.busy_timeout(Duration::from_secs(5))
-                .map_err(to_string)?;
+            let conn = open_db_at_path(&db_path, true)?;
             export_continue_output_audit_to_plan(
                 &conn,
                 &request,
@@ -18037,7 +18197,7 @@ fn schedule_continue_output_audit(
         })();
         if let Err(error) = export_result {
             eprintln!("[continue_output_audit] failed: {}", error);
-            if let Ok(conn) = Connection::open(&db_path) {
+            if let Ok(conn) = open_db_at_path(&db_path, true) {
                 let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
             }
         }
@@ -18198,6 +18358,7 @@ fn export_continue_output_audit_to_plan(
     let capture_frames_dir = output_dir.join("capture").join("frames");
     let layers_dir = output_dir.join("continue").join("layers");
     let candidates_dir = output_dir.join("continue").join("candidates");
+    let semantic_dir = output_dir.join("semantic");
     let inference_dir = output_dir.join("inference");
     let final_output_dir = output_dir.join("final");
     let decision_dir = output_dir.join("decision");
@@ -18211,6 +18372,7 @@ fn export_continue_output_audit_to_plan(
         &request_dir,
         &layers_dir,
         &candidates_dir,
+        &semantic_dir,
         &inference_dir,
         &final_output_dir,
         &decision_dir,
@@ -18287,6 +18449,44 @@ fn export_continue_output_audit_to_plan(
         &final_output_dir.join("handoff.json"),
         &serde_json::to_value(&result.handoff).map_err(to_string)?,
     )?;
+    write_text_file(
+        &semantic_dir.join("app_activity_segments.ndjson"),
+        &continue_app_activity_segments_ndjson(result)?,
+    )?;
+    write_text_file(
+        &semantic_dir.join("activity_classifications.ndjson"),
+        &continue_activity_classifications_ndjson(result)?,
+    )?;
+    write_text_file(
+        &semantic_dir.join("work_value_summary.md"),
+        &continue_work_value_summary_markdown(result),
+    )?;
+    write_json_pretty(
+        &output_dir.join("memory_retrieval.json"),
+        &serde_json::to_value(&result.memory_retrieval).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &output_dir.join("continue_dossier.json"),
+        &serde_json::to_value(&result.continue_dossier).map_err(to_string)?,
+    )?;
+    write_text_file(
+        &output_dir.join("memory_retrieval_explain.md"),
+        &continue_memory_retrieval_explain_markdown(result),
+    )?;
+    if let Some(trace) = result.observe_before_decide.as_ref() {
+        write_json_pretty(
+            &output_dir.join("need_more_evidence_request.json"),
+            &serde_json::to_value(&trace.request).map_err(to_string)?,
+        )?;
+        write_json_pretty(
+            &output_dir.join("need_more_evidence_probe_result.json"),
+            &serde_json::to_value(&trace.probe_result).map_err(to_string)?,
+        )?;
+        write_text_file(
+            &output_dir.join("observe_before_decide_trace.md"),
+            &observe_before_decide_trace_markdown(trace),
+        )?;
+    }
 
     write_continue_export_status(
         &output_dir,
@@ -20168,6 +20368,214 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
         frame_count = frame_count,
         inference_count = inference_manifest.len(),
         integrity_status = integrity_status,
+    )
+}
+
+fn continue_memory_retrieval_explain_markdown(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> String {
+    let retrieved_count = result
+        .memory_retrieval
+        .as_ref()
+        .map(|report| report.retrieved_cells.len())
+        .unwrap_or(0);
+    let counter_count = result
+        .memory_retrieval
+        .as_ref()
+        .map(|report| report.counter_evidence.len())
+        .unwrap_or(0);
+    let missing = result
+        .memory_retrieval
+        .as_ref()
+        .map(|report| report.missing_evidence.join(", "))
+        .unwrap_or_else(|| "memory retrieval not available".to_string());
+    let privacy = result
+        .memory_retrieval
+        .as_ref()
+        .map(|report| report.privacy_notes.join(", "))
+        .unwrap_or_default();
+    format!(
+        "# Continue Memory Retrieval\n\n\
+This is a compact P3 retrieval proof. It contains memory-cell summaries and ids, not raw timelines, screenshots, typed text, or clipboard text.\n\n\
+- Decision id: `{}`\n\
+- Retrieved memory cells: {}\n\
+- Counter-evidence cells: {}\n\
+- Missing evidence: {}\n\
+- Privacy notes: {}\n\n\
+See `memory_retrieval.json` and `continue_dossier.json` for the bounded machine-readable dossier used by the decision path.\n",
+        result.decision_id,
+        retrieved_count,
+        counter_count,
+        if missing.is_empty() { "none" } else { &missing },
+        if privacy.is_empty() { "none" } else { &privacy },
+    )
+}
+
+fn continue_app_activity_segments_ndjson(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<String, String> {
+    let mut lines = Vec::new();
+    if let Some(activity) = result.app_activity.as_ref() {
+        for segment in &activity.segments {
+            lines.push(serde_json::to_string(segment).map_err(to_string)?);
+        }
+    }
+    Ok(if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    })
+}
+
+fn continue_activity_classifications_ndjson(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<String, String> {
+    let mut lines = Vec::new();
+    if let Some(activity) = result.app_activity.as_ref() {
+        for classification in &activity.classifications {
+            lines.push(serde_json::to_string(classification).map_err(to_string)?);
+        }
+    }
+    Ok(if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    })
+}
+
+fn continue_work_value_summary_markdown(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> String {
+    let Some(activity) = result.app_activity.as_ref() else {
+        return "# Work Value Summary\n\nP8 app activity intelligence was not available for this decision.\n".to_string();
+    };
+    let summary = &activity.summary;
+    let suppressed = activity
+        .classifications
+        .iter()
+        .filter(|classification| {
+            matches!(
+                classification.continuation_role.as_str(),
+                "background_consumption"
+                    | "divergence"
+                    | "diagnostic_only"
+                    | "support_context"
+                    | "current_focus_only"
+                    | "needs_fresh_capture"
+            )
+        })
+        .map(|classification| {
+            format!(
+                "- `{}` / `{}` / `{}`: {}",
+                classification.app_family,
+                classification.surface_type,
+                classification.continuation_role,
+                classification
+                    .why_not_primary
+                    .as_deref()
+                    .unwrap_or(classification.reason.as_str())
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "# Work Value Summary\n\n\
+This P8 summary contains deterministic app-activity roles and compact derived features only.\n\n\
+## Main Work\n{}\n\n\
+## High-Value But Evidence-Thin\n{}\n\n\
+## Support Context\n{}\n\n\
+## Divergence Or Background\n{}\n\n\
+## Diagnostic Or Self Surfaces\n{}\n\n\
+## Suppressed Candidate Reasons\n{}\n\n\
+## Decision\n- Output mode: `{}`\n- Candidate kind: `{}`\n- Confidence: `{}`\n",
+        summary
+            .main_work
+            .as_deref()
+            .map(|value| format!("- {}", value))
+            .unwrap_or_else(|| "- none".to_string()),
+        if summary.missing_for_current_focus.is_empty() {
+            "- none".to_string()
+        } else {
+            summary
+                .missing_for_current_focus
+                .iter()
+                .map(|value| format!("- {}", value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if summary.support_context.is_empty() {
+            "- none".to_string()
+        } else {
+            summary
+                .support_context
+                .iter()
+                .map(|value| format!("- {}", value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if summary.recent_divergence.is_empty() {
+            "- none".to_string()
+        } else {
+            summary
+                .recent_divergence
+                .iter()
+                .map(|value| format!("- {}", value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if summary.diagnostic_surfaces.is_empty() {
+            "- none".to_string()
+        } else {
+            summary
+                .diagnostic_surfaces
+                .iter()
+                .map(|value| format!("- {}", value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if suppressed.is_empty() {
+            "- none".to_string()
+        } else {
+            suppressed.join("\n")
+        },
+        result.continue_output_mode,
+        result.candidate_kind.as_deref().unwrap_or("none"),
+        result.confidence_label,
+    )
+}
+
+fn observe_before_decide_trace_markdown(
+    trace: &crate::continuation::ObserveBeforeDecideTrace,
+) -> String {
+    format!(
+        "# Observe Before Decide\n\n\
+This is a compact P5 probe trace. It records the bounded metadata probes used before the final Continue decision; it does not include raw typed text, clipboard text, screenshots, or OCR payloads.\n\n\
+- Source decision id: `{}`\n\
+- Reason: `{:?}`\n\
+- Sufficiency status: `{:?}`\n\
+- Probe request id: `{}`\n\
+- Probe evidence changed: {}\n\
+- Privacy blocked: {}\n\
+- Reran decision: {}\n\
+- Warnings: {}\n\
+- Errors: {}\n\n\
+See `need_more_evidence_request.json` and `need_more_evidence_probe_result.json` for the machine-readable probe metadata.\n",
+        trace.request.source_decision_id,
+        trace.request.reason,
+        trace.sufficiency.status,
+        trace.request.id,
+        trace.probe_result.evidence_changed,
+        trace.probe_result.privacy_blocked,
+        trace.reran_decision,
+        if trace.probe_result.warnings.is_empty() {
+            "none".to_string()
+        } else {
+            trace.probe_result.warnings.join(", ")
+        },
+        if trace.probe_result.errors.is_empty() {
+            "none".to_string()
+        } else {
+            trace.probe_result.errors.join(", ")
+        },
     )
 }
 
@@ -22213,9 +22621,7 @@ fn row_count(conn: &Connection, table: &str) -> Result<i64, String> {
 
 fn replace_capture_db(paths: &CapturePaths) -> Result<(), String> {
     drop_capture_db_files(&paths.db_path)?;
-    let conn = Connection::open(&paths.db_path).map_err(to_string)?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(to_string)?;
+    let conn = open_db_at_path(&paths.db_path, true)?;
     init_db(&conn)?;
     ensure_capture_db_empty(&conn)
 }
@@ -22273,12 +22679,34 @@ fn clear_directory_contents(dir: &Path) -> Result<(), String> {
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let paths = capture_paths(app)?;
     fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
-    let conn = Connection::open(&paths.db_path).map_err(to_string)?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(to_string)?;
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let conn = open_db_at_path(&paths.db_path, true)?;
     init_db(&conn)?;
     Ok(conn)
+}
+
+fn open_db_at_path(db_path: &Path, writable: bool) -> Result<Connection, String> {
+    let conn = if writable {
+        Connection::open(db_path).map_err(to_string)?
+    } else {
+        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(to_string)?
+    };
+    configure_db_connection(&conn, writable)?;
+    Ok(conn)
+}
+
+fn open_readonly_db(app: &AppHandle) -> Result<Connection, String> {
+    let paths = capture_paths(app)?;
+    open_db_at_path(&paths.db_path, false)
+}
+
+fn configure_db_connection(conn: &Connection, writable: bool) -> Result<(), String> {
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(to_string)?;
+    let _ = conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    if writable {
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    }
+    Ok(())
 }
 
 fn init_db(conn: &Connection) -> Result<(), String> {

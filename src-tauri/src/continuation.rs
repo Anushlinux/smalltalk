@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
-pub const CONTINUE_SCHEMA_VERSION: i64 = 1;
+pub const CONTINUE_SCHEMA_VERSION: i64 = 4;
 
 const CONTINUE_TABLES: &[&str] = &[
     "continue_schema_migrations",
@@ -32,6 +32,14 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_open_loop_artifacts",
     "continue_open_loop_evidence",
     "continue_boundary_revisions",
+    "continue_memory_cells",
+    "continue_memory_edges",
+    "continue_ranking_priors",
+    "continue_pairwise_preferences",
+    "continue_eval_fixtures",
+    "continue_evidence_probes",
+    "continue_app_activity_segments",
+    "continue_activity_classifications",
     "continue_candidates",
     "continue_decisions",
     "continue_feedback_events",
@@ -216,6 +224,342 @@ pub struct ContinueDecisionQualityGate {
     pub fatal_missing: Vec<String>,
     pub warnings: Vec<String>,
     pub output_mode: ContinueOutputMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSufficiencyStatus {
+    Sufficient,
+    ThinButUsable,
+    NeedsProbe,
+    NoClearWithoutProbe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedMoreEvidenceReason {
+    CurrentSurfaceStale,
+    CurrentSurfaceAmbiguous,
+    CandidateMarginLow,
+    TargetOpenabilityUnknown,
+    FrameFallbackOnly,
+    MissingUrlOrPath,
+    MemoryContradiction,
+    ModelRequestedMoreEvidence,
+    SelfCaptureRecent,
+    EventOnlyNeedsAppContext,
+}
+
+impl NeedMoreEvidenceReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::CurrentSurfaceStale => "current_surface_stale",
+            Self::CurrentSurfaceAmbiguous => "current_surface_ambiguous",
+            Self::CandidateMarginLow => "candidate_margin_low",
+            Self::TargetOpenabilityUnknown => "target_openability_unknown",
+            Self::FrameFallbackOnly => "frame_fallback_only",
+            Self::MissingUrlOrPath => "missing_url_or_path",
+            Self::MemoryContradiction => "memory_contradiction",
+            Self::ModelRequestedMoreEvidence => "model_requested_more_evidence",
+            Self::SelfCaptureRecent => "self_capture_recent",
+            Self::EventOnlyNeedsAppContext => "event_only_needs_app_context",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceProbeKind {
+    FrontmostAppProbe,
+    ActiveWindowProbe,
+    BrowserUrlProbe,
+    DocumentPathProbe,
+    AccessibilityTextProbe,
+    WindowGraphProbe,
+    AppContextProbe,
+    ActiveElementProbe,
+    ScopedActiveWindowCapture,
+    OcrIfAxThin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    MetadataOnly,
+    LocalPrivate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceSufficiencyDecision {
+    pub status: EvidenceSufficiencyStatus,
+    pub primary_reason: Option<NeedMoreEvidenceReason>,
+    pub reasons: Vec<NeedMoreEvidenceReason>,
+    pub requested_probes: Vec<EvidenceProbeKind>,
+    pub confidence: f64,
+    pub candidate_margin: Option<f64>,
+    pub allow_heavy_capture: bool,
+    pub max_probe_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedMoreEvidenceRequest {
+    pub id: String,
+    pub reason: NeedMoreEvidenceReason,
+    pub candidate_ids: Vec<String>,
+    pub workstream_ids: Vec<String>,
+    pub artifact_ids: Vec<String>,
+    pub requested_probes: Vec<EvidenceProbeKind>,
+    pub max_probe_ms: i64,
+    pub allow_heavy_capture: bool,
+    pub privacy_mode: PrivacyMode,
+    pub source_decision_id: String,
+    pub source_evidence_watermark_hash: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedMoreEvidenceProbeResult {
+    pub request_id: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub probes_attempted: Vec<EvidenceProbeKind>,
+    pub probes_succeeded: Vec<EvidenceProbeKind>,
+    pub evidence_changed: bool,
+    pub privacy_blocked: bool,
+    pub observation_id: Option<String>,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub window_title: Option<String>,
+    pub browser_url: Option<String>,
+    pub document_path: Option<String>,
+    pub accessibility_text_char_count: i64,
+    pub window_count: i64,
+    pub privacy_status: Option<String>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveBeforeDecideTrace {
+    pub schema: String,
+    pub request: NeedMoreEvidenceRequest,
+    pub sufficiency: EvidenceSufficiencyDecision,
+    pub probe_result: NeedMoreEvidenceProbeResult,
+    pub reran_decision: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContinueActivitySummary {
+    pub main_work: Option<String>,
+    pub support_context: Vec<String>,
+    pub recent_divergence: Vec<String>,
+    pub diagnostic_surfaces: Vec<String>,
+    pub missing_for_current_focus: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppActivityFeatures {
+    pub duration_ms: i64,
+    pub frame_count: usize,
+    pub event_count: usize,
+    pub typing_burst_count: usize,
+    pub typing_commit_count: usize,
+    pub click_count: usize,
+    pub scroll_count: usize,
+    pub accessibility_event_count: usize,
+    pub clipboard_copy_count: usize,
+    pub clipboard_paste_count: usize,
+    pub app_switch_count: usize,
+    pub distinct_window_title_count: usize,
+    pub distinct_artifact_count: usize,
+    pub reading_action_count: usize,
+    pub navigating_action_count: usize,
+    pub editing_action_count: usize,
+    pub composing_action_count: usize,
+    pub running_command_count: usize,
+    pub observing_output_count: usize,
+    pub error_action_count: usize,
+    pub verification_action_count: usize,
+    pub return_to_origin_count: usize,
+    pub has_heavy_frame: bool,
+    pub has_direct_url: bool,
+    pub has_document_path: bool,
+    pub has_visible_text: bool,
+    pub is_event_backed_only: bool,
+    pub media_audio_playing: bool,
+    pub title_indicates_video_or_feed: bool,
+    pub title_indicates_generated_audit: bool,
+    pub title_indicates_code_project: bool,
+    pub path_indicates_project_file: bool,
+    pub path_indicates_generated_output: bool,
+    pub p7_outcome_phase: Option<String>,
+    pub p7_objective_terms_overlap: f64,
+    pub current_surface_match: bool,
+    pub same_as_resume_work_target: bool,
+    pub recent_after_completed_outcome: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueAppActivitySegment {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub app_name: Option<String>,
+    pub bundle_id: Option<String>,
+    pub app_family: String,
+    pub surface_type: String,
+    pub window_title: Option<String>,
+    pub artifact_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub episode_id: Option<String>,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub evidence_kinds: Vec<String>,
+    pub evidence_anchor: Value,
+    pub features: AppActivityFeatures,
+    pub has_heavy_frame: bool,
+    pub has_direct_url: bool,
+    pub has_document_path: bool,
+    pub has_visible_text: bool,
+    pub is_event_backed_only: bool,
+    pub is_self_or_diagnostic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueActivityClassification {
+    pub id: String,
+    pub segment_id: String,
+    pub session_id: Option<String>,
+    pub artifact_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub app_family: String,
+    pub surface_type: String,
+    pub activity_intent: String,
+    pub task_phase: String,
+    pub continuation_role: String,
+    pub work_value_score: f64,
+    pub resume_likelihood_score: f64,
+    pub support_score: f64,
+    pub divergence_score: f64,
+    pub diagnostic_score: f64,
+    pub interaction_depth_score: f64,
+    pub objective_relation_score: f64,
+    pub evidence_sufficiency_score: f64,
+    pub reason: String,
+    pub why_not_primary: Option<String>,
+    pub missing_evidence: Vec<String>,
+    pub feature_json: Value,
+    pub evidence_anchor_json: Value,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContinueAppActivityIntelligence {
+    pub schema: String,
+    pub generated_at_ms: i64,
+    pub segments: Vec<ContinueAppActivitySegment>,
+    pub classifications: Vec<ContinueActivityClassification>,
+    pub summary: ContinueActivitySummary,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueMemoryCellSummary {
+    pub id: String,
+    pub workstream_id: Option<String>,
+    pub artifact_id: Option<String>,
+    pub episode_id: Option<String>,
+    pub action_id: Option<String>,
+    pub memory_type: String,
+    pub summary: String,
+    pub keywords: Vec<String>,
+    pub tags: Vec<String>,
+    pub source_anchor: Value,
+    pub last_seen_at_ms: i64,
+    pub confidence: f64,
+    pub importance: f64,
+    pub decay_score: f64,
+    pub privacy_status: Option<String>,
+    pub redaction_level: String,
+    pub feedback_score: f64,
+    pub retrieval_score: f64,
+    pub retrieval_reasons: Vec<String>,
+    pub supports_candidate_ids: Vec<String>,
+    pub contradicts_candidate_ids: Vec<String>,
+    pub model_visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueMemoryRetrievalReport {
+    pub schema: String,
+    pub generated_at_ms: i64,
+    pub query: ContinueMemoryRetrievalQuerySummary,
+    pub retrieved_cells: Vec<ContinueMemoryCellSummary>,
+    pub counter_evidence: Vec<ContinueMemoryCellSummary>,
+    pub missing_evidence: Vec<String>,
+    pub privacy_notes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueMemoryRetrievalQuerySummary {
+    pub active_workstream_ids: Vec<String>,
+    pub candidate_workstream_ids: Vec<String>,
+    pub candidate_artifact_ids: Vec<String>,
+    pub current_artifact_id: Option<String>,
+    pub current_activity_kind: Option<String>,
+    pub unresolved_state_kinds: Vec<String>,
+    pub recent_keywords: Vec<String>,
+    pub lookback_ms: i64,
+    pub max_cells: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueDossierV1 {
+    pub schema: String,
+    pub generated_at_ms: i64,
+    pub resolved_current_surface: Option<Value>,
+    pub selected_workstream_state: Option<ContinueDossierWorkstreamSummary>,
+    pub candidate_summaries: Vec<ContinueDossierCandidateSummary>,
+    pub retrieved_memory_cells: Vec<ContinueMemoryCellSummary>,
+    pub counter_evidence: Vec<ContinueMemoryCellSummary>,
+    pub missing_evidence: Vec<String>,
+    pub feedback_priors: Vec<ContinueDossierFeedbackPrior>,
+    pub privacy_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueDossierWorkstreamSummary {
+    pub workstream_id: String,
+    pub state: String,
+    pub primary_artifact_id: Option<String>,
+    pub unresolved_signal: Option<String>,
+    pub last_active_timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueDossierCandidateSummary {
+    pub candidate_id: String,
+    pub workstream_id: String,
+    pub target_artifact_id: Option<String>,
+    pub candidate_kind: String,
+    pub local_score: f64,
+    pub memory_support_score: f64,
+    pub memory_contradiction_score: f64,
+    pub feedback_prior_score: f64,
+    pub supporting_memory_ids: Vec<String>,
+    pub contradicting_memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueDossierFeedbackPrior {
+    pub candidate_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub target_artifact_id: Option<String>,
+    pub feedback_kind: String,
+    pub score: f64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +835,13 @@ pub struct ContinueMemoryCounts {
     pub open_loops: i64,
     pub open_loop_artifacts: i64,
     pub open_loop_evidence: i64,
+    pub memory_cells: i64,
+    pub memory_edges: i64,
+    pub ranking_priors: i64,
+    pub pairwise_preferences: i64,
+    pub eval_fixtures: i64,
+    pub app_activity_segments: i64,
+    pub activity_classifications: i64,
     pub candidates: i64,
     pub decisions: i64,
     pub feedback_events: i64,
@@ -635,6 +986,11 @@ pub struct ContinueDecisionResult {
     pub latest_boundary_revision: Option<i64>,
     pub current_surface_resolution: Option<Value>,
     pub evidence_freshness_ledger: Option<Value>,
+    pub continue_dossier: Option<ContinueDossierV1>,
+    pub memory_retrieval: Option<ContinueMemoryRetrievalReport>,
+    pub observe_before_decide: Option<ObserveBeforeDecideTrace>,
+    pub app_activity: Option<ContinueAppActivityIntelligence>,
+    pub activity_summary: Option<ContinueActivitySummary>,
     pub quality_gate: Option<ContinueDecisionQualityGate>,
     pub evidence_pack_v2_used: bool,
     pub micro_inference_requested: bool,
@@ -753,6 +1109,54 @@ pub struct ContinueEvalReport {
     pub cases: Vec<ContinueEvalCaseReport>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContinueReplayEvalInput {
+    pub include_inactive: Option<bool>,
+    pub fixture_kind: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueReplayEvalReport {
+    pub schema: String,
+    pub evaluated_at_ms: i64,
+    pub fixture_count: i64,
+    pub target_artifact_accuracy: f64,
+    pub workstream_accuracy: f64,
+    pub no_clear_accuracy: f64,
+    pub candidate_recall_at_k: f64,
+    pub mrr: f64,
+    pub branch_support_false_positive_rate: f64,
+    pub current_focus_false_positive_rate: f64,
+    pub stale_target_false_positive_rate: f64,
+    pub feedback_regression_count: i64,
+    pub privacy_violation_count: i64,
+    pub cases: Vec<ContinueReplayEvalCaseReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueReplayEvalCaseReport {
+    pub fixture_id: String,
+    pub fixture_kind: String,
+    pub source_decision_id: Option<String>,
+    pub expected_return_artifact_id: Option<String>,
+    pub actual_return_artifact_id: Option<String>,
+    pub expected_workstream_id: Option<String>,
+    pub actual_workstream_id: Option<String>,
+    pub expected_no_clear: bool,
+    pub target_artifact_correct: bool,
+    pub workstream_correct: bool,
+    pub no_clear_correct: bool,
+    pub candidate_rank: Option<i64>,
+    pub reciprocal_rank: f64,
+    pub branch_support_false_positive: bool,
+    pub current_focus_false_positive: bool,
+    pub stale_target_false_positive: bool,
+    pub privacy_violation: bool,
+    pub regression: bool,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContinueEvalCaseReport {
     pub name: String,
@@ -809,6 +1213,20 @@ pub struct ContinueEvidenceWatermark {
     pub latest_workstream_revision: Option<i64>,
     pub latest_open_loop_revision: Option<i64>,
     pub latest_boundary_revision: Option<i64>,
+    pub latest_memory_cell_at_ms: Option<i64>,
+    pub latest_memory_edge_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_evidence_probe_id: Option<String>,
+    #[serde(default)]
+    pub latest_evidence_probe_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_app_activity_segment_id: Option<String>,
+    #[serde(default)]
+    pub latest_app_activity_segment_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_activity_classification_id: Option<String>,
+    #[serde(default)]
+    pub latest_activity_classification_at_ms: Option<i64>,
     pub hash: String,
 }
 
@@ -1228,6 +1646,17 @@ pub struct ContinueScoreComponents {
     pub recency: f64,
     pub openability: f64,
     pub privacy_safety: f64,
+    pub memory_support: f64,
+    pub memory_contradiction: f64,
+    pub feedback_prior: f64,
+    pub retrieval_confidence: f64,
+    pub work_value: f64,
+    pub resume_likelihood: f64,
+    pub divergence: f64,
+    pub diagnostic: f64,
+    pub objective_relation: f64,
+    pub interaction_depth: f64,
+    pub evidence_sufficiency: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1248,6 +1677,15 @@ pub struct ContinueCandidateSummary {
     pub evidence_frame_id: Option<String>,
     pub supporting_episode_id: Option<String>,
     pub last_meaningful_action_id: Option<String>,
+    pub supporting_memory_ids: Vec<String>,
+    pub contradicting_memory_ids: Vec<String>,
+    pub app_family: Option<String>,
+    pub surface_type: Option<String>,
+    pub activity_intent: Option<String>,
+    pub task_phase: Option<String>,
+    pub continuation_role: Option<String>,
+    pub work_value_reason: Option<String>,
+    pub why_not_primary: Option<String>,
     pub components: ContinueScoreComponents,
 }
 
@@ -1650,6 +2088,8 @@ struct ContinueActionRecord {
     strongest_frame_id: Option<String>,
     semantic_delta_kind: Option<String>,
     semantic_subject: Option<String>,
+    semantic_after_hint: Option<String>,
+    semantic_evidence_quote: Option<String>,
     semantic_delta_confidence: Option<f64>,
     semantic_moment_id: Option<String>,
     artifact: Option<ContinueArtifactRecord>,
@@ -1835,6 +2275,28 @@ struct ScoredContinueCandidate {
     recency_score: f64,
     openability_score: f64,
     privacy_safety_score: f64,
+    memory_support_score: f64,
+    memory_contradiction_score: f64,
+    feedback_prior_score: f64,
+    retrieval_confidence_score: f64,
+    work_value_score: f64,
+    resume_likelihood_score: f64,
+    divergence_score: f64,
+    diagnostic_score: f64,
+    objective_relation_score: f64,
+    interaction_depth_score: f64,
+    evidence_sufficiency_score: f64,
+    app_activity_segment_id: Option<String>,
+    app_activity_classification_id: Option<String>,
+    app_family: Option<String>,
+    surface_type: Option<String>,
+    activity_intent: Option<String>,
+    task_phase: Option<String>,
+    continuation_role: Option<String>,
+    work_value_reason: Option<String>,
+    why_not_primary: Option<String>,
+    supporting_memory_ids: Vec<String>,
+    contradicting_memory_ids: Vec<String>,
     reason: Option<String>,
     missing_evidence: Vec<String>,
     warnings: Vec<String>,
@@ -1857,6 +2319,7 @@ struct ContinueMicroInferencePack {
     evidence_packs_v2: Vec<CandidateEvidencePackV2>,
     artifact_roles: Vec<ContinuePackArtifactRole>,
     breadcrumbs: Vec<ContinuePackBreadcrumb>,
+    continue_dossier: Option<ContinueDossierV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1876,6 +2339,17 @@ pub struct CandidateEvidencePackV2 {
     pub local_reasons: Vec<String>,
     pub missing_evidence: Vec<String>,
     pub candidate_failure_risks: Vec<String>,
+    pub app_family: Option<String>,
+    pub surface_type: Option<String>,
+    pub activity_intent: Option<String>,
+    pub task_phase: Option<String>,
+    pub continuation_role: Option<String>,
+    pub work_value_score: f64,
+    pub divergence_score: f64,
+    pub diagnostic_score: f64,
+    pub evidence_sufficiency_score: f64,
+    pub work_value_reason: Option<String>,
+    pub why_not_primary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1968,6 +2442,25 @@ struct ContinuePackCandidate {
     evidence_action_id: Option<String>,
     evidence_episode_id: Option<String>,
     missing_evidence: Vec<String>,
+    memory_support_score: f64,
+    memory_contradiction_score: f64,
+    feedback_prior_score: f64,
+    work_value_score: f64,
+    resume_likelihood_score: f64,
+    divergence_score: f64,
+    diagnostic_score: f64,
+    objective_relation_score: f64,
+    interaction_depth_score: f64,
+    evidence_sufficiency_score: f64,
+    app_family: Option<String>,
+    surface_type: Option<String>,
+    activity_intent: Option<String>,
+    task_phase: Option<String>,
+    continuation_role: Option<String>,
+    work_value_reason: Option<String>,
+    why_not_primary: Option<String>,
+    memory_supporting_cell_ids: Vec<String>,
+    memory_contradicting_cell_ids: Vec<String>,
     local_reason: Option<String>,
 }
 
@@ -2293,6 +2786,7 @@ pub fn rebuild_continue_third_layer(
     }
     rebuild_continue_workstream_state_memory(conn, &workstreams)?;
     rebuild_continue_open_loops(conn, &workstreams)?;
+    promote_continue_memory_cells(conn, current_time_millis())?;
 
     Ok(ContinueThirdLayerRebuildResult {
         processed_actions: actions.len() as i64,
@@ -2369,7 +2863,6 @@ pub fn get_continue_decision(
             ..Default::default()
         };
         rebuild_continue_third_layer(conn, third_request)?;
-        current_watermark = build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
     }
 
     let requested_at_ms = current_time_millis();
@@ -2390,7 +2883,34 @@ pub fn get_continue_decision(
     if workstreams.is_empty() {
         workstreams = load_any_recent_scorer_workstreams(conn, request.limit.unwrap_or(24))?;
     }
+    let app_activity = build_continue_app_activity_intelligence(
+        conn,
+        request.session_id.as_deref(),
+        lookback_ms,
+        requested_at_ms,
+        Some(&current_surface_resolution.selected),
+        &workstreams,
+    )?;
+    current_watermark = build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
     let mut candidates = generate_continue_candidates(&workstreams, current_focus.as_ref());
+    apply_app_activity_to_candidates(&mut candidates, &app_activity);
+    let memory_query = build_continue_memory_retrieval_query(
+        &current_surface_resolution.selected,
+        current_focus.as_ref(),
+        &workstreams,
+        &candidates,
+        lookback_ms,
+        8,
+    );
+    let memory_retrieval =
+        retrieve_continue_memory_cells(conn, &memory_query, &candidates, requested_at_ms)?;
+    apply_memory_features_to_candidates(&mut candidates, &memory_retrieval);
+    apply_feedback_ranking_priors_to_candidates(
+        conn,
+        &mut candidates,
+        &workstreams,
+        current_focus.as_ref(),
+    )?;
     score_continue_candidates(&mut candidates, &workstreams, current_focus.as_ref());
     candidates.sort_by(|left, right| {
         right
@@ -2398,6 +2918,13 @@ pub fn get_continue_decision(
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    let mut continue_dossier = build_continue_dossier_v1(
+        &current_surface_resolution,
+        None,
+        &candidates,
+        &memory_retrieval,
+        requested_at_ms,
+    );
 
     if cached_meta.is_none() {
         for candidate in &candidates {
@@ -2405,11 +2932,7 @@ pub fn get_continue_decision(
         }
     }
 
-    let local_selected = candidates
-        .iter()
-        .find(|candidate| candidate.eligible_for_primary_selection)
-        .cloned()
-        .or_else(|| candidates.first().cloned());
+    let local_selected = select_local_candidate_after_activity(&candidates, &app_activity);
     let mut selected = local_selected.clone();
     let mut selected_workstream = selected.as_ref().and_then(|candidate| {
         workstreams
@@ -2417,13 +2940,31 @@ pub fn get_continue_decision(
             .find(|workstream| workstream.id == candidate.workstream_id)
             .cloned()
     });
+    continue_dossier.selected_workstream_state =
+        selected_workstream
+            .as_ref()
+            .map(|workstream| ContinueDossierWorkstreamSummary {
+                workstream_id: workstream.id.clone(),
+                state: workstream.state.clone(),
+                primary_artifact_id: workstream.primary_artifact_id.clone(),
+                unresolved_signal: workstream.unresolved_signal.clone(),
+                last_active_timestamp_ms: workstream.last_active_timestamp_ms,
+            });
     let mut warnings = selected
         .as_ref()
         .map(|candidate| candidate.warnings.clone())
         .unwrap_or_default();
     warnings.extend(current_surface_resolution.warnings.clone());
+    warnings.extend(app_activity.warnings.clone());
     if selected.is_none() {
         warnings.push("thin_evidence:no_continue_workstream_candidate".to_string());
+        if app_activity
+            .classifications
+            .iter()
+            .any(|classification| classification.continuation_role == "needs_fresh_capture")
+        {
+            warnings.push("p8_activity:no_primary_candidate_until_fresh_capture".to_string());
+        }
     }
     if let (Some(focus), Some(candidate)) = (&current_focus, &selected) {
         if focus.artifact_id.as_deref() != candidate.target_artifact.as_ref().map(|a| a.id.as_str())
@@ -2513,6 +3054,7 @@ pub fn get_continue_decision(
                         &workstreams,
                         &candidates,
                         candidate_limit as usize,
+                        Some(&continue_dossier),
                     )?;
                     let mut audit_event = ContinueAuditInferenceEvent {
                         inference_id: format!("continue-micro-{}", current_time_millis()),
@@ -3063,16 +3605,29 @@ pub fn get_continue_decision(
                 confidence = round_score(f64::min(confidence, 0.34));
             }
         }
+        let selected_completed_progress = selected
+            .as_ref()
+            .is_some_and(candidate_is_completed_progress);
         if !matches!(
             continue_output_mode,
             ContinueOutputMode::NoClearContinuation
-        ) {
+        ) && !selected_completed_progress
+        {
             continue_output_mode = ContinueOutputMode::ThinContinue;
         }
-        confidence = round_score(f64::min(confidence, 0.48));
-        next_action = Some(fallback_next_action_for_output_mode(&continue_output_mode).to_string());
+        if selected_completed_progress {
+            if let Some(candidate) = selected.as_ref() {
+                next_action = Some(next_action_for_candidate(candidate));
+            }
+            confidence = round_score(f64::min(confidence, 0.72));
+            warnings.push("local_fallback_gate:kept_completed_progress_action".to_string());
+        } else {
+            confidence = round_score(f64::min(confidence, 0.48));
+            next_action =
+                Some(fallback_next_action_for_output_mode(&continue_output_mode).to_string());
+            warnings.push("local_fallback_gate:strong_continue_blocked".to_string());
+        }
         model_handoff_output = None;
-        warnings.push("local_fallback_gate:strong_continue_blocked".to_string());
         warnings.sort();
         warnings.dedup();
     }
@@ -3123,6 +3678,9 @@ pub fn get_continue_decision(
 
     if let Some(candidate) = selected.as_ref() {
         confidence = round_score(f64::min(confidence, candidate.score));
+        if candidate_is_completed_progress(candidate) {
+            next_action = Some(next_action_for_candidate(candidate));
+        }
     }
 
     evidence_freshness_ledger = build_evidence_freshness_ledger(
@@ -3186,6 +3744,7 @@ pub fn get_continue_decision(
                 model_handoff_output.as_ref(),
                 quality_gate.as_ref(),
                 &continue_output_mode,
+                Some(&app_activity.summary),
             )
         });
     if handoff_contains_internal_reference(&handoff) {
@@ -3201,6 +3760,7 @@ pub fn get_continue_decision(
             &validation_failures,
             quality_gate.as_ref(),
             &ContinueOutputMode::NoClearContinuation,
+            Some(&app_activity.summary),
         );
     }
 
@@ -3229,6 +3789,8 @@ pub fn get_continue_decision(
             micro_inference_requested,
             micro_inference_attempted,
             micro_inference_result_kind.as_deref(),
+            Some(&continue_dossier),
+            Some(&memory_retrieval),
         )?;
     }
 
@@ -3305,6 +3867,11 @@ pub fn get_continue_decision(
             .or(current_watermark.latest_boundary_revision),
         current_surface_resolution: serde_json::to_value(&current_surface_resolution).ok(),
         evidence_freshness_ledger: serde_json::to_value(&evidence_freshness_ledger).ok(),
+        continue_dossier: Some(continue_dossier),
+        memory_retrieval: Some(memory_retrieval),
+        observe_before_decide: None,
+        app_activity: Some(app_activity.clone()),
+        activity_summary: Some(app_activity.summary.clone()),
         quality_gate,
         evidence_pack_v2_used,
         micro_inference_requested,
@@ -3313,6 +3880,388 @@ pub fn get_continue_decision(
         continue_output_path: None,
         audit_inference_events,
     })
+}
+
+pub fn assess_continue_evidence_sufficiency(
+    result: &ContinueDecisionResult,
+) -> EvidenceSufficiencyDecision {
+    let mut reasons = Vec::new();
+    let mut requested_probes = Vec::new();
+    let now_ms = current_time_millis();
+    let candidate_margin = result
+        .alternatives
+        .first()
+        .zip(result.alternatives.get(1))
+        .map(|(top, next)| round_score((top.score - next.score).abs()));
+
+    let target_openability = result
+        .return_target
+        .as_ref()
+        .map(|target| target.openability.as_str())
+        .unwrap_or("unknown");
+    if matches!(target_openability, "unknown" | "frame_fallback") && result.confidence < 0.65 {
+        let reason = if target_openability == "frame_fallback" {
+            NeedMoreEvidenceReason::FrameFallbackOnly
+        } else {
+            NeedMoreEvidenceReason::TargetOpenabilityUnknown
+        };
+        push_reason_once(&mut reasons, reason);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
+    }
+
+    let selected_surface = result
+        .current_surface_resolution
+        .as_ref()
+        .and_then(|value| value.get("selected"));
+    let surface_observed_at = selected_surface
+        .and_then(|surface| surface.get("observed_at_ms"))
+        .and_then(Value::as_i64);
+    if surface_observed_at.is_some_and(|ts| now_ms.saturating_sub(ts) > 10 * 60 * 1000) {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CurrentSurfaceStale);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
+    }
+
+    let surface_warnings = selected_surface
+        .and_then(|surface| surface.get("warnings"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let all_warnings = result
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .chain(surface_warnings.iter().copied())
+        .collect::<Vec<_>>();
+    if all_warnings
+        .iter()
+        .any(|warning| warning.contains("current_surface:no_direct_url_or_path"))
+    {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::MissingUrlOrPath);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
+    }
+    if all_warnings
+        .iter()
+        .any(|warning| warning.contains("current_surface:event_backed_no_screenshot"))
+    {
+        push_reason_once(
+            &mut reasons,
+            NeedMoreEvidenceReason::EventOnlyNeedsAppContext,
+        );
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::WindowGraphProbe);
+        push_probe_once(
+            &mut requested_probes,
+            EvidenceProbeKind::AccessibilityTextProbe,
+        );
+    }
+    if all_warnings
+        .iter()
+        .any(|warning| warning.contains("p8_activity:high_value_surface_needs_fresh_capture"))
+        || result.app_activity.as_ref().is_some_and(|activity| {
+            activity.classifications.iter().any(|classification| {
+                classification.continuation_role == "needs_fresh_capture"
+                    && classification.work_value_score >= 0.60
+                    && classification.evidence_sufficiency_score < 0.50
+            })
+        })
+    {
+        push_reason_once(
+            &mut reasons,
+            NeedMoreEvidenceReason::EventOnlyNeedsAppContext,
+        );
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
+        push_probe_once(
+            &mut requested_probes,
+            EvidenceProbeKind::AccessibilityTextProbe,
+        );
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
+    }
+    if all_warnings.iter().any(|warning| {
+        warning.contains("evidence_freshness:stale_frame_fallback_selected_target")
+            || warning.contains("evidence_freshness:strong_continue_blocked_for_stale_target")
+    }) {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CurrentSurfaceStale);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
+    }
+    if all_warnings
+        .iter()
+        .any(|warning| warning.contains("current_surface:latest_surface_is_self_or_debug"))
+    {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::SelfCaptureRecent);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
+    }
+
+    if candidate_margin.is_some_and(|margin| margin < 0.12)
+        && current_focus_differs_from_return_target(result)
+    {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CandidateMarginLow);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
+    }
+
+    if result.micro_inference_result_kind.as_deref() == Some("need_more_evidence") {
+        push_reason_once(
+            &mut reasons,
+            NeedMoreEvidenceReason::ModelRequestedMoreEvidence,
+        );
+        push_probe_once(
+            &mut requested_probes,
+            EvidenceProbeKind::AccessibilityTextProbe,
+        );
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::WindowGraphProbe);
+    }
+
+    if result
+        .memory_retrieval
+        .as_ref()
+        .is_some_and(|retrieval| !retrieval.counter_evidence.is_empty())
+    {
+        push_reason_once(&mut reasons, NeedMoreEvidenceReason::MemoryContradiction);
+        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
+    }
+
+    if requested_probes.is_empty() {
+        requested_probes = vec![
+            EvidenceProbeKind::FrontmostAppProbe,
+            EvidenceProbeKind::ActiveWindowProbe,
+        ];
+    }
+
+    let status = if !reasons.is_empty() {
+        EvidenceSufficiencyStatus::NeedsProbe
+    } else if result.continue_output_mode == ContinueOutputMode::StrongContinue.as_str() {
+        EvidenceSufficiencyStatus::Sufficient
+    } else if result.generated_candidates == 0 {
+        EvidenceSufficiencyStatus::NoClearWithoutProbe
+    } else {
+        EvidenceSufficiencyStatus::ThinButUsable
+    };
+
+    EvidenceSufficiencyDecision {
+        status,
+        primary_reason: reasons.first().cloned(),
+        reasons,
+        requested_probes,
+        confidence: result.confidence,
+        candidate_margin,
+        allow_heavy_capture: false,
+        max_probe_ms: 1_500,
+    }
+}
+
+pub fn build_need_more_evidence_request_from_decision(
+    conn: &Connection,
+    result: &ContinueDecisionResult,
+) -> Result<Option<(NeedMoreEvidenceRequest, EvidenceSufficiencyDecision)>, String> {
+    ensure_continue_schema(conn)?;
+    let sufficiency = assess_continue_evidence_sufficiency(result);
+    if sufficiency.status != EvidenceSufficiencyStatus::NeedsProbe {
+        return Ok(None);
+    }
+    let Some(reason) = sufficiency.primary_reason.clone() else {
+        return Ok(None);
+    };
+    if recent_matching_probe_exists(conn, &reason, &result.evidence_watermark_hash)? {
+        return Ok(None);
+    }
+    let created_at_ms = current_time_millis();
+    let mut candidate_ids = result
+        .alternatives
+        .iter()
+        .take(3)
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(id) = result
+        .quality_gate
+        .as_ref()
+        .and_then(|_| result.alternatives.first())
+        .map(|candidate| candidate.candidate_id.clone())
+    {
+        push_string_once(&mut candidate_ids, &id);
+    }
+    let mut workstream_ids = result
+        .alternatives
+        .iter()
+        .take(3)
+        .map(|candidate| candidate.workstream_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(workstream) = result.selected_workstream.as_ref() {
+        push_string_once(&mut workstream_ids, &workstream.workstream_id);
+    }
+    let mut artifact_ids = result
+        .alternatives
+        .iter()
+        .take(5)
+        .filter_map(|candidate| candidate.target_artifact_id.clone())
+        .collect::<Vec<_>>();
+    for target in [
+        result.return_target.as_ref(),
+        result.resume_work_target.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(artifact_id) = target.artifact_id.as_ref() {
+            push_string_once(&mut artifact_ids, artifact_id);
+        }
+    }
+    let id = format!(
+        "need-evidence-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}",
+                result.decision_id,
+                result.evidence_watermark_hash,
+                reason.as_str()
+            )
+            .as_bytes()
+        )
+    );
+    Ok(Some((
+        NeedMoreEvidenceRequest {
+            id,
+            reason,
+            candidate_ids,
+            workstream_ids,
+            artifact_ids,
+            requested_probes: sufficiency.requested_probes.clone(),
+            max_probe_ms: sufficiency.max_probe_ms,
+            allow_heavy_capture: sufficiency.allow_heavy_capture,
+            privacy_mode: PrivacyMode::MetadataOnly,
+            source_decision_id: result.decision_id.clone(),
+            source_evidence_watermark_hash: result.evidence_watermark_hash.clone(),
+            created_at_ms,
+        },
+        sufficiency,
+    )))
+}
+
+pub fn record_continue_evidence_probe_result(
+    conn: &Connection,
+    request: &NeedMoreEvidenceRequest,
+    result: &NeedMoreEvidenceProbeResult,
+) -> Result<(), String> {
+    ensure_continue_schema(conn)?;
+    let requested_probes_json =
+        serde_json::to_string(&request.requested_probes).map_err(to_string)?;
+    let candidate_ids_json = serde_json::to_string(&request.candidate_ids).map_err(to_string)?;
+    let workstream_ids_json = serde_json::to_string(&request.workstream_ids).map_err(to_string)?;
+    let artifact_ids_json = serde_json::to_string(&request.artifact_ids).map_err(to_string)?;
+    let probes_succeeded_json =
+        serde_json::to_string(&result.probes_succeeded).map_err(to_string)?;
+    let warnings_json = serde_json::to_string(&result.warnings).map_err(to_string)?;
+    let errors_json = serde_json::to_string(&result.errors).map_err(to_string)?;
+    let result_json = serde_json::to_string(result).map_err(to_string)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_evidence_probes (
+            id, source_decision_id, source_evidence_watermark_hash, reason,
+            requested_probes_json, candidate_ids_json, workstream_ids_json,
+            artifact_ids_json, started_at_ms, completed_at_ms, max_probe_ms,
+            allow_heavy_capture, privacy_mode, privacy_status, privacy_blocked,
+            app_name, app_bundle_id, window_title, browser_url, document_path,
+            accessibility_text_char_count, window_count, evidence_changed,
+            probes_succeeded_json, warnings_json, errors_json, result_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                   ?25, ?26, ?27)",
+        params![
+            result.observation_id.as_deref().unwrap_or(&request.id),
+            request.source_decision_id,
+            request.source_evidence_watermark_hash,
+            request.reason.as_str(),
+            requested_probes_json,
+            candidate_ids_json,
+            workstream_ids_json,
+            artifact_ids_json,
+            result.started_at_ms,
+            result.completed_at_ms,
+            request.max_probe_ms,
+            request.allow_heavy_capture as i64,
+            serde_json::to_value(&request.privacy_mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "metadata_only".to_string()),
+            result.privacy_status,
+            result.privacy_blocked as i64,
+            result.app_name,
+            result.app_bundle_id,
+            result.window_title,
+            result.browser_url,
+            result.document_path,
+            result.accessibility_text_char_count,
+            result.window_count,
+            result.evidence_changed as i64,
+            probes_succeeded_json,
+            warnings_json,
+            errors_json,
+            result_json,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn current_focus_differs_from_return_target(result: &ContinueDecisionResult) -> bool {
+    let Some(focus) = result.current_focus.as_ref() else {
+        return false;
+    };
+    let Some(target) = result.return_target.as_ref() else {
+        return false;
+    };
+    if focus.artifact_id.is_some() && target.artifact_id.is_some() {
+        return focus.artifact_id != target.artifact_id;
+    }
+    let focus_locator = focus.browser_url.as_ref().or(focus.document_path.as_ref());
+    let target_locator = target
+        .browser_url
+        .as_ref()
+        .or(target.document_path.as_ref());
+    focus_locator.is_some() && target_locator.is_some() && focus_locator != target_locator
+}
+
+fn recent_matching_probe_exists(
+    conn: &Connection,
+    reason: &NeedMoreEvidenceReason,
+    watermark_hash: &str,
+) -> Result<bool, String> {
+    if !table_exists(conn, "continue_evidence_probes")? {
+        return Ok(false);
+    }
+    let cutoff_ms = current_time_millis().saturating_sub(60_000);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM continue_evidence_probes
+             WHERE reason = ?1
+               AND completed_at_ms >= ?2
+               AND (source_evidence_watermark_hash = ?3 OR evidence_changed = 0)",
+            params![reason.as_str(), cutoff_ms, watermark_hash],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    Ok(count > 0)
+}
+
+fn push_reason_once(values: &mut Vec<NeedMoreEvidenceReason>, value: NeedMoreEvidenceReason) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn push_probe_once(values: &mut Vec<EvidenceProbeKind>, value: EvidenceProbeKind) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 pub fn recent_continue_episodes(
@@ -3591,6 +4540,7 @@ fn load_recent_focus_evidence(
     load_recent_ui_event_focus_evidence(conn, session_id, since_ms, limit, &mut rows)?;
     load_recent_window_focus_evidence(conn, session_id, since_ms, limit, &mut rows)?;
     load_recent_typing_focus_evidence(conn, session_id, since_ms, limit, &mut rows)?;
+    load_recent_probe_focus_evidence(conn, since_ms, limit, &mut rows)?;
     rows.sort_by(|left, right| right.observed_at_ms.cmp(&left.observed_at_ms));
     rows.truncate(limit);
     Ok(rows)
@@ -3942,6 +4892,67 @@ fn load_recent_typing_focus_evidence(
                 has_content_units: false,
                 privacy_status: row.get(11)?,
                 quality_warnings: Vec::new(),
+            })
+        })
+        .map_err(to_string)?;
+    for row in mapped {
+        rows.push(row.map_err(to_string)?);
+    }
+    Ok(())
+}
+
+fn load_recent_probe_focus_evidence(
+    conn: &Connection,
+    since_ms: i64,
+    limit: usize,
+    rows: &mut Vec<FocusEvidenceRow>,
+) -> Result<(), String> {
+    if !table_exists(conn, "continue_evidence_probes")? {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, completed_at_ms, app_name, app_bundle_id, window_title,
+                    browser_url, document_path, privacy_status,
+                    accessibility_text_char_count, window_count,
+                    privacy_blocked, warnings_json
+             FROM continue_evidence_probes
+             WHERE completed_at_ms >= ?1
+             ORDER BY completed_at_ms DESC, id DESC
+             LIMIT ?2",
+        )
+        .map_err(to_string)?;
+    let mapped = stmt
+        .query_map(params![since_ms, limit as i64], |row| {
+            let privacy_blocked = row.get::<_, i64>(10)? != 0;
+            let warnings_json: String = row.get(11)?;
+            let mut quality_warnings = parse_string_array(&warnings_json);
+            if privacy_blocked {
+                push_string_once(&mut quality_warnings, "continue_probe:privacy_blocked");
+            }
+            Ok(FocusEvidenceRow {
+                evidence_id: row.get(0)?,
+                evidence_kind: "evidence_probe".to_string(),
+                observed_at_ms: row.get(1)?,
+                app_name: if privacy_blocked { None } else { row.get(2)? },
+                bundle_id: if privacy_blocked { None } else { row.get(3)? },
+                window_title: if privacy_blocked { None } else { row.get(4)? },
+                browser_url: if privacy_blocked { None } else { row.get(5)? },
+                document_path: if privacy_blocked { None } else { row.get(6)? },
+                trigger_type: Some("observe_before_decide".to_string()),
+                event_type: Some("evidence_probe".to_string()),
+                transition_label: None,
+                has_active_window: !privacy_blocked
+                    && (row.get::<_, Option<String>>(2)?.is_some()
+                        || row.get::<_, Option<String>>(4)?.is_some()),
+                has_screenshot: false,
+                has_ax: row.get::<_, i64>(8)? > 0,
+                has_ocr: false,
+                has_content_units: false,
+                privacy_status: row.get(7)?,
+                artifact_id: None,
+                artifact_kind: None,
+                quality_warnings,
             })
         })
         .map_err(to_string)?;
@@ -4749,7 +5760,24 @@ fn build_continue_evidence_watermark(
         max_i64_if_present(conn, "continue_open_loops", "last_updated_at_ms")?;
     let latest_boundary_revision =
         max_i64_if_present(conn, "continue_boundary_revisions", "revision")?;
+    let latest_memory_cell_at_ms =
+        max_i64_if_present(conn, "continue_memory_cells", "updated_at_ms")?;
+    let latest_memory_edge_at_ms =
+        max_i64_if_present(conn, "continue_memory_edges", "updated_at_ms")?;
+    let (latest_evidence_probe_id, latest_evidence_probe_at_ms) =
+        latest_string_marker(conn, "continue_evidence_probes", "id", "completed_at_ms")?;
+    let (latest_app_activity_segment_id, latest_app_activity_segment_at_ms) =
+        latest_string_marker(conn, "continue_app_activity_segments", "id", "ended_at_ms")?;
+    let (latest_activity_classification_id, latest_activity_classification_at_ms) =
+        latest_string_marker(
+            conn,
+            "continue_activity_classifications",
+            "id",
+            "updated_at_ms",
+        )?;
     let hash_seed = serde_json::json!({
+        "continue_schema_version": CONTINUE_SCHEMA_VERSION,
+        "p8_router_version": 1,
         "latest_frame_id": latest_frame_id,
         "latest_frame_at_ms": latest_frame_at_ms,
         "latest_cache_ui_event_id": latest_cache_ui_event_id,
@@ -4769,6 +5797,14 @@ fn build_continue_evidence_watermark(
         "latest_workstream_revision": latest_workstream_revision,
         "latest_open_loop_revision": latest_open_loop_revision,
         "latest_boundary_revision": latest_boundary_revision,
+        "latest_memory_cell_at_ms": latest_memory_cell_at_ms,
+        "latest_memory_edge_at_ms": latest_memory_edge_at_ms,
+        "latest_evidence_probe_id": latest_evidence_probe_id,
+        "latest_evidence_probe_at_ms": latest_evidence_probe_at_ms,
+        "latest_app_activity_segment_id": latest_app_activity_segment_id,
+        "latest_app_activity_segment_at_ms": latest_app_activity_segment_at_ms,
+        "latest_activity_classification_id": latest_activity_classification_id,
+        "latest_activity_classification_at_ms": latest_activity_classification_at_ms,
     });
     let hash = stable_hash(hash_seed.to_string().as_bytes());
     Ok(ContinueEvidenceWatermark {
@@ -4791,6 +5827,14 @@ fn build_continue_evidence_watermark(
         latest_workstream_revision,
         latest_open_loop_revision,
         latest_boundary_revision,
+        latest_memory_cell_at_ms,
+        latest_memory_edge_at_ms,
+        latest_evidence_probe_id,
+        latest_evidence_probe_at_ms,
+        latest_app_activity_segment_id,
+        latest_app_activity_segment_at_ms,
+        latest_activity_classification_id,
+        latest_activity_classification_at_ms,
         hash,
     })
 }
@@ -5192,7 +6236,8 @@ fn load_scorer_open_loops(
                     missing_fields_json, evidence_spans_json, local_reason,
                     last_updated_at_ms
              FROM continue_open_loops
-             WHERE workstream_id = ?1 AND state = 'open'
+             WHERE workstream_id = ?1
+               AND (state = 'open' OR boundary_kind = 'completed_progress')
              ORDER BY last_updated_at_ms DESC, confidence DESC
              LIMIT 4",
         )
@@ -5437,28 +6482,29 @@ pub fn record_continue_feedback(
             .as_bytes(),
         )
     );
-    conn.execute(
-        "INSERT OR IGNORE INTO continue_feedback_events (
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO continue_feedback_events (
             id, decision_id, event_kind, observed_frame_id, target_artifact_id,
             chosen_artifact_id, timestamp_ms, confidence, reason,
             selected_candidate_id, workstream_id, note, source
          ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            id,
-            request.decision_id,
-            feedback_kind,
-            request.target_artifact_id,
-            request.corrected_artifact_id,
-            timestamp_ms,
-            1.0_f64,
-            reason,
-            request.selected_candidate_id,
-            request.workstream_id,
-            note,
-            source,
-        ],
-    )
-    .map_err(to_string)?;
+            params![
+                id,
+                request.decision_id,
+                feedback_kind,
+                request.target_artifact_id,
+                request.corrected_artifact_id,
+                timestamp_ms,
+                1.0_f64,
+                reason,
+                request.selected_candidate_id,
+                request.workstream_id,
+                note,
+                source,
+            ],
+        )
+        .map_err(to_string)?;
     let affected_workstream = request.workstream_id.clone();
     if matches!(
         feedback_kind,
@@ -5479,7 +6525,7 @@ pub fn record_continue_feedback(
             timestamp_ms,
         )?;
     }
-    Ok(ContinueFeedbackEventResult {
+    let result = ContinueFeedbackEventResult {
         id,
         decision_id: request.decision_id,
         selected_candidate_id: request.selected_candidate_id,
@@ -5493,7 +6539,11 @@ pub fn record_continue_feedback(
         reason: Some(reason.to_string()),
         note,
         source: Some(source),
-    })
+    };
+    if inserted > 0 {
+        update_continue_ranking_priors_from_feedback(conn, &result)?;
+    }
+    Ok(result)
 }
 
 pub fn run_continue_eval(eval_file_path: Option<String>) -> Result<ContinueEvalReport, String> {
@@ -6406,6 +7456,12 @@ fn load_continue_workstream_candidate_details(
                     c.score, c.actionability_score, c.primary_target_score,
                     c.unresolved_score, c.branch_origin_score, c.evidence_quality_score,
                     c.recency_score, c.openability_score, c.privacy_safety_score,
+                    c.memory_support_score, c.memory_contradiction_score,
+                    c.feedback_prior_score, c.retrieval_confidence_score,
+                    c.work_value_score, c.resume_likelihood_score,
+                    c.divergence_score, c.diagnostic_score,
+                    c.objective_relation_score, c.interaction_depth_score,
+                    c.evidence_sufficiency_score,
                     c.reason, c.missing_evidence, c.created_at_ms
              FROM continue_candidates c
              LEFT JOIN continue_artifacts a ON a.id = c.target_artifact_id
@@ -6418,7 +7474,7 @@ fn load_continue_workstream_candidate_details(
         .query_map(params![workstream_id], |row| {
             let score: f64 = row.get(10)?;
             let missing_evidence = row
-                .get::<_, Option<String>>(20)?
+                .get::<_, Option<String>>(31)?
                 .map(|value| {
                     value
                         .split(';')
@@ -6439,7 +7495,7 @@ fn load_continue_workstream_candidate_details(
                 supporting_episode_id: row.get(9)?,
                 score: round_score(score),
                 confidence_label: confidence_label(score).to_string(),
-                reason: row.get(19)?,
+                reason: row.get(30)?,
                 missing_evidence,
                 components: ContinueScoreComponents {
                     actionability: round_score(row.get(11)?),
@@ -6450,8 +7506,19 @@ fn load_continue_workstream_candidate_details(
                     recency: round_score(row.get(16)?),
                     openability: round_score(row.get(17)?),
                     privacy_safety: round_score(row.get(18)?),
+                    memory_support: round_score(row.get(19)?),
+                    memory_contradiction: round_score(row.get(20)?),
+                    feedback_prior: round_signed_score(row.get(21)?),
+                    retrieval_confidence: round_score(row.get(22)?),
+                    work_value: round_score(row.get(23)?),
+                    resume_likelihood: round_score(row.get(24)?),
+                    divergence: round_score(row.get(25)?),
+                    diagnostic: round_score(row.get(26)?),
+                    objective_relation: round_score(row.get(27)?),
+                    interaction_depth: round_score(row.get(28)?),
+                    evidence_sufficiency: round_score(row.get(29)?),
                 },
-                created_at_ms: row.get(21)?,
+                created_at_ms: row.get(32)?,
             })
         })
         .map_err(to_string)?;
@@ -6744,6 +7811,2966 @@ fn load_last_meaningful_action(
     .map_err(to_string)
 }
 
+#[derive(Debug, Clone)]
+struct ContinueMemoryCellRecord {
+    id: String,
+    workstream_id: Option<String>,
+    artifact_id: Option<String>,
+    episode_id: Option<String>,
+    action_id: Option<String>,
+    memory_type: String,
+    summary: String,
+    keywords: Vec<String>,
+    tags: Vec<String>,
+    source_anchor: Value,
+    last_seen_at_ms: i64,
+    confidence: f64,
+    importance: f64,
+    decay_score: f64,
+    privacy_status: Option<String>,
+    redaction_level: String,
+    feedback_score: f64,
+}
+
+fn promote_continue_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    let promoted = promote_workstream_artifact_memory_cells(conn, now_ms)?
+        + promote_open_loop_memory_cells(conn, now_ms)?
+        + promote_feedback_memory_cells(conn, now_ms)?
+        + promote_breadcrumb_memory_cells(conn, now_ms)?;
+    rebuild_continue_memory_edges(conn, now_ms)?;
+    Ok(promoted)
+}
+
+fn promote_workstream_artifact_memory_cells(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT wa.workstream_id, wa.artifact_id, wa.durable_role,
+                    wa.importance_score, wa.first_seen_frame_id, wa.last_seen_frame_id,
+                    wa.reason, w.state, w.title_candidate, w.unresolved_signal,
+                    w.last_active_timestamp_ms, a.artifact_kind, a.display_title,
+                    a.browser_url, a.document_path, a.privacy_status, a.evidence_quality,
+                    a.openability, a.last_seen_timestamp
+             FROM continue_workstream_artifacts wa
+             JOIN continue_workstreams w ON w.id = wa.workstream_id
+             JOIN continue_artifacts a ON a.id = wa.artifact_id
+             ORDER BY w.last_active_timestamp_ms DESC, wa.importance_score DESC
+             LIMIT 500",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, i64>(18)?,
+            ))
+        })
+        .map_err(to_string)?;
+    let mut promoted = 0_usize;
+    for row in rows {
+        let (
+            workstream_id,
+            artifact_id,
+            durable_role,
+            importance_score,
+            first_frame_id,
+            last_frame_id,
+            reason,
+            state,
+            title_candidate,
+            unresolved_signal,
+            last_active_ms,
+            artifact_kind,
+            display_title,
+            browser_url,
+            document_path,
+            privacy_status,
+            evidence_quality,
+            openability,
+            last_seen_timestamp,
+        ) = row.map_err(to_string)?;
+        if memory_surface_excluded(
+            display_title.as_deref(),
+            browser_url.as_deref(),
+            document_path.as_deref(),
+            privacy_status.as_deref(),
+        ) {
+            continue;
+        }
+        let Some(memory_type) =
+            memory_type_for_durable_role(&durable_role, unresolved_signal.as_deref())
+        else {
+            continue;
+        };
+        let title = model_safe_label(
+            first_non_empty([
+                display_title.as_deref(),
+                title_candidate.as_deref(),
+                Some(artifact_kind.as_str()),
+            ])
+            .unwrap_or("work artifact"),
+            120,
+        );
+        let summary = match memory_type {
+            "origin_intent" => format!("Origin work target was {}.", title),
+            "branch_evidence" => format!("Support evidence was opened for {}.", title),
+            "unresolved_blocker" => format!("Unresolved blocker was associated with {}.", title),
+            "verification_result" => {
+                format!(
+                    "Verification or output surface was associated with {}.",
+                    title
+                )
+            }
+            "active_edit" => format!("Active work continued on {}.", title),
+            _ => format!("Work memory for {}.", title),
+        };
+        let mut keywords = memory_keywords(&[
+            Some(workstream_id.as_str()),
+            Some(artifact_id.as_str()),
+            Some(memory_type),
+            Some(durable_role.as_str()),
+            Some(artifact_kind.as_str()),
+            title_candidate.as_deref(),
+            display_title.as_deref(),
+            unresolved_signal.as_deref(),
+            reason.as_deref(),
+        ]);
+        keywords.truncate(16);
+        let tags = vec![durable_role.clone(), artifact_kind.clone(), state.clone()];
+        let source_anchor = serde_json::json!({
+            "kind": "workstream_artifact",
+            "workstream_id": workstream_id,
+            "artifact_id": artifact_id,
+            "durable_role": durable_role,
+            "first_frame_id": first_frame_id,
+            "last_frame_id": last_frame_id,
+            "evidence_quality": evidence_quality,
+            "openability": openability,
+        });
+        let id = format!(
+            "continue-memory-{}",
+            stable_hash(
+                format!(
+                    "workstream_artifact:{}:{}:{}",
+                    workstream_id, artifact_id, memory_type
+                )
+                .as_bytes()
+            )
+        );
+        upsert_continue_memory_cell(
+            conn,
+            &id,
+            Some(&workstream_id),
+            Some(&artifact_id),
+            None,
+            None,
+            memory_type,
+            &summary,
+            &keywords,
+            &tags,
+            &source_anchor,
+            last_active_ms.min(last_seen_timestamp),
+            last_active_ms.max(last_seen_timestamp),
+            importance_score.clamp(0.1, 1.0),
+            importance_score.clamp(0.1, 1.0),
+            privacy_status.as_deref(),
+            "summary_only",
+            0.0,
+            now_ms,
+            "p3_workstream_artifact_promotion",
+        )?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
+fn promote_open_loop_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workstream_id, boundary_kind, quality, confidence,
+                    origin_artifact_id, primary_return_artifact_id, resume_work_artifact_id,
+                    blocker_artifact_id, verification_artifact_id, objective_hint,
+                    last_concrete_progress, unfinished_state, next_evidence_backed_action,
+                    last_updated_at_ms
+             FROM continue_open_loops
+             ORDER BY last_updated_at_ms DESC
+             LIMIT 300",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, i64>(14)?,
+            ))
+        })
+        .map_err(to_string)?;
+    let mut promoted = 0_usize;
+    for row in rows {
+        let (
+            open_loop_id,
+            workstream_id,
+            boundary_kind,
+            quality,
+            confidence,
+            origin_artifact_id,
+            primary_return_artifact_id,
+            resume_work_artifact_id,
+            blocker_artifact_id,
+            verification_artifact_id,
+            objective_hint,
+            last_concrete_progress,
+            unfinished_state,
+            next_action,
+            last_updated_at_ms,
+        ) = row.map_err(to_string)?;
+        let memory_type = match boundary_kind.as_str() {
+            "error_without_resolution" => "unresolved_blocker",
+            "draft_active" => "draft_state",
+            "search_branch_without_return" => "return_to_origin",
+            "verification_without_return" => "output_waiting",
+            "completed_progress" => "completed_progress",
+            _ => "resume_instruction",
+        };
+        let target_artifact_id = primary_return_artifact_id
+            .as_ref()
+            .or(resume_work_artifact_id.as_ref())
+            .or(blocker_artifact_id.as_ref())
+            .or(origin_artifact_id.as_ref());
+        let summary = first_non_empty([
+            unfinished_state.as_deref(),
+            next_action.as_deref(),
+            last_concrete_progress.as_deref(),
+            objective_hint.as_deref(),
+            Some(boundary_kind.as_str()),
+        ])
+        .map(|value| model_safe_label(value, 180))
+        .unwrap_or_else(|| "Open continuation state was observed.".to_string());
+        let keywords = memory_keywords(&[
+            Some(workstream_id.as_str()),
+            Some(open_loop_id.as_str()),
+            Some(boundary_kind.as_str()),
+            Some(quality.as_str()),
+            objective_hint.as_deref(),
+            unfinished_state.as_deref(),
+            next_action.as_deref(),
+        ]);
+        let source_anchor = serde_json::json!({
+            "kind": "open_loop",
+            "open_loop_id": open_loop_id,
+            "boundary_kind": boundary_kind,
+            "quality": quality,
+            "origin_artifact_id": origin_artifact_id,
+            "primary_return_artifact_id": primary_return_artifact_id,
+            "resume_work_artifact_id": resume_work_artifact_id,
+            "blocker_artifact_id": blocker_artifact_id,
+            "verification_artifact_id": verification_artifact_id,
+        });
+        let id = format!(
+            "continue-memory-{}",
+            stable_hash(format!("open_loop:{}:{}", open_loop_id, memory_type).as_bytes())
+        );
+        upsert_continue_memory_cell(
+            conn,
+            &id,
+            Some(&workstream_id),
+            target_artifact_id.map(String::as_str),
+            None,
+            None,
+            memory_type,
+            &summary,
+            &keywords,
+            &[boundary_kind.clone(), quality.clone()],
+            &source_anchor,
+            last_updated_at_ms,
+            last_updated_at_ms,
+            confidence.clamp(0.1, 1.0),
+            confidence.clamp(0.1, 1.0),
+            None,
+            "summary_only",
+            0.0,
+            now_ms,
+            "p3_open_loop_promotion",
+        )?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
+fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
+                    target_artifact_id, chosen_artifact_id, timestamp_ms, confidence, source
+             FROM continue_feedback_events
+             ORDER BY timestamp_ms DESC
+             LIMIT 300",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, f64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })
+        .map_err(to_string)?;
+    let mut promoted = 0_usize;
+    for row in rows {
+        let (
+            feedback_id,
+            decision_id,
+            selected_candidate_id,
+            workstream_id,
+            event_kind,
+            target_artifact_id,
+            chosen_artifact_id,
+            timestamp_ms,
+            confidence,
+            source,
+        ) = row.map_err(to_string)?;
+        let memory_type = match event_kind.as_str() {
+            "accepted" | "inferred_acceptance" => "feedback_acceptance",
+            "corrected" | "explicit_correction" => "feedback_correction",
+            "rejected" | "ignored" | "inferred_rejection" => "feedback_rejection",
+            _ => "feedback_rejection",
+        };
+        let artifact_id = chosen_artifact_id.as_ref().or(target_artifact_id.as_ref());
+        let feedback_score = match memory_type {
+            "feedback_acceptance" => 0.55,
+            "feedback_correction" => 0.75,
+            "feedback_rejection" => -0.55,
+            _ => 0.0,
+        };
+        let summary = match memory_type {
+            "feedback_acceptance" => "User behavior accepted this continuation target.",
+            "feedback_correction" => "User corrected the continuation target.",
+            "feedback_rejection" => "User behavior rejected or ignored this continuation target.",
+            _ => "Feedback changed continuation prior.",
+        };
+        let keywords = memory_keywords(&[
+            workstream_id.as_deref(),
+            target_artifact_id.as_deref(),
+            chosen_artifact_id.as_deref(),
+            selected_candidate_id.as_deref(),
+            Some(event_kind.as_str()),
+            source.as_deref(),
+        ]);
+        let source_anchor = serde_json::json!({
+            "kind": "feedback",
+            "feedback_id": feedback_id,
+            "decision_id": decision_id,
+            "selected_candidate_id": selected_candidate_id,
+            "event_kind": event_kind,
+            "target_artifact_id": target_artifact_id,
+            "chosen_artifact_id": chosen_artifact_id,
+            "source": source,
+        });
+        let id = format!(
+            "continue-memory-{}",
+            stable_hash(format!("feedback:{}:{}", feedback_id, memory_type).as_bytes())
+        );
+        upsert_continue_memory_cell(
+            conn,
+            &id,
+            workstream_id.as_deref(),
+            artifact_id.map(String::as_str),
+            None,
+            None,
+            memory_type,
+            summary,
+            &keywords,
+            &[event_kind.clone()],
+            &source_anchor,
+            timestamp_ms,
+            timestamp_ms,
+            confidence.clamp(0.1, 1.0),
+            0.9,
+            None,
+            "summary_only",
+            feedback_score,
+            now_ms,
+            "p3_feedback_promotion",
+        )?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
+fn promote_breadcrumb_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workstream_id, text, source, created_at_ms
+             FROM continue_breadcrumbs
+             ORDER BY created_at_ms DESC
+             LIMIT 200",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(to_string)?;
+    let mut promoted = 0_usize;
+    for row in rows {
+        let (breadcrumb_id, workstream_id, text, source, created_at_ms) = row.map_err(to_string)?;
+        let summary = format!("User breadcrumb: {}", model_safe_label(&text, 180));
+        let keywords = memory_keywords(&[
+            Some(workstream_id.as_str()),
+            Some("breadcrumb"),
+            Some(source.as_str()),
+            Some(text.as_str()),
+        ]);
+        let source_anchor = serde_json::json!({
+            "kind": "breadcrumb",
+            "breadcrumb_id": breadcrumb_id,
+            "source": source,
+        });
+        let id = format!(
+            "continue-memory-{}",
+            stable_hash(format!("breadcrumb:{}", breadcrumb_id).as_bytes())
+        );
+        upsert_continue_memory_cell(
+            conn,
+            &id,
+            Some(&workstream_id),
+            None,
+            None,
+            None,
+            "user_breadcrumb",
+            &summary,
+            &keywords,
+            &["user_breadcrumb".to_string()],
+            &source_anchor,
+            created_at_ms,
+            created_at_ms,
+            0.9,
+            0.85,
+            None,
+            "summary_only",
+            0.35,
+            now_ms,
+            "p3_breadcrumb_promotion",
+        )?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_continue_memory_cell(
+    conn: &Connection,
+    id: &str,
+    workstream_id: Option<&str>,
+    artifact_id: Option<&str>,
+    episode_id: Option<&str>,
+    action_id: Option<&str>,
+    memory_type: &str,
+    summary: &str,
+    keywords: &[String],
+    tags: &[String],
+    source_anchor: &Value,
+    created_at_ms: i64,
+    last_seen_at_ms: i64,
+    confidence: f64,
+    importance: f64,
+    privacy_status: Option<&str>,
+    redaction_level: &str,
+    feedback_score: f64,
+    now_ms: i64,
+    created_by: &str,
+) -> Result<(), String> {
+    let keywords_json = serde_json::to_string(keywords).map_err(to_string)?;
+    let tags_json = serde_json::to_string(tags).map_err(to_string)?;
+    let source_anchor_json = serde_json::to_string(source_anchor).map_err(to_string)?;
+    let content_hash =
+        stable_hash(format!("{}:{}:{}", memory_type, summary, source_anchor_json).as_bytes());
+    conn.execute(
+        "INSERT INTO continue_memory_cells (
+            id, workstream_id, artifact_id, episode_id, action_id, memory_type,
+            summary, keywords_json, tags_json, source_anchor_json, created_at_ms,
+            last_seen_at_ms, last_reinforced_at_ms, confidence, importance,
+            decay_score, privacy_status, redaction_level, feedback_score, content_hash,
+            created_by, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL,
+                   ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+         ON CONFLICT(id) DO UPDATE SET
+            workstream_id = excluded.workstream_id,
+            artifact_id = excluded.artifact_id,
+            episode_id = excluded.episode_id,
+            action_id = excluded.action_id,
+            memory_type = excluded.memory_type,
+            summary = excluded.summary,
+            keywords_json = excluded.keywords_json,
+            tags_json = excluded.tags_json,
+            source_anchor_json = excluded.source_anchor_json,
+            last_seen_at_ms = MAX(continue_memory_cells.last_seen_at_ms, excluded.last_seen_at_ms),
+            confidence = excluded.confidence,
+            importance = excluded.importance,
+            decay_score = excluded.decay_score,
+            privacy_status = excluded.privacy_status,
+            redaction_level = excluded.redaction_level,
+            feedback_score = excluded.feedback_score,
+            content_hash = excluded.content_hash,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            id,
+            workstream_id,
+            artifact_id,
+            episode_id,
+            action_id,
+            memory_type,
+            summary,
+            keywords_json,
+            tags_json,
+            source_anchor_json,
+            created_at_ms,
+            last_seen_at_ms,
+            confidence.clamp(0.0, 1.0),
+            importance.clamp(0.0, 1.0),
+            recency_decay_score(last_seen_at_ms, now_ms),
+            privacy_status,
+            redaction_level,
+            feedback_score,
+            content_hash,
+            created_by,
+            now_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn rebuild_continue_memory_edges(conn: &Connection, now_ms: i64) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workstream_id, artifact_id
+             FROM continue_memory_cells
+             WHERE last_seen_at_ms >= ?1
+             ORDER BY last_seen_at_ms DESC
+             LIMIT 120",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![now_ms - 14 * 24 * 60 * 60 * 1000], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    for left in &rows {
+        for right in &rows {
+            if left.0 >= right.0 {
+                continue;
+            }
+            if left.1.is_some() && left.1 == right.1 {
+                upsert_continue_memory_edge(
+                    conn,
+                    &left.0,
+                    &right.0,
+                    "same_workstream",
+                    0.72,
+                    now_ms,
+                )?;
+            }
+            if left.2.is_some() && left.2 == right.2 {
+                upsert_continue_memory_edge(
+                    conn,
+                    &left.0,
+                    &right.0,
+                    "same_artifact",
+                    0.86,
+                    now_ms,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upsert_continue_memory_edge(
+    conn: &Connection,
+    source_memory_id: &str,
+    target_memory_id: &str,
+    edge_kind: &str,
+    confidence: f64,
+    now_ms: i64,
+) -> Result<(), String> {
+    let id = format!(
+        "continue-memory-edge-{}",
+        stable_hash(format!("{}:{}:{}", source_memory_id, target_memory_id, edge_kind).as_bytes())
+    );
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_memory_edges (
+            id, source_memory_id, target_memory_id, edge_kind, confidence,
+            created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            source_memory_id,
+            target_memory_id,
+            edge_kind,
+            confidence,
+            now_ms,
+            now_ms
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn retrieve_continue_memory_cells(
+    conn: &Connection,
+    query: &ContinueMemoryRetrievalQuerySummary,
+    candidates: &[ScoredContinueCandidate],
+    now_ms: i64,
+) -> Result<ContinueMemoryRetrievalReport, String> {
+    let cells = load_continue_memory_cell_records(conn, query.lookback_ms, now_ms)?;
+    let candidate_workstreams = query
+        .candidate_workstream_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let candidate_artifacts = query
+        .candidate_artifact_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let query_tokens = query
+        .recent_keywords
+        .iter()
+        .map(|value| normalize_memory_token(value))
+        .filter(|value| value.len() >= 3)
+        .collect::<HashSet<_>>();
+    let mut scored = Vec::new();
+    let mut privacy_notes = Vec::new();
+    for cell in cells {
+        if !memory_cell_model_visible(&cell) {
+            privacy_notes.push(format!("excluded_private_memory:{}", cell.id));
+            continue;
+        }
+        let workstream_match = cell
+            .workstream_id
+            .as_ref()
+            .is_some_and(|id| candidate_workstreams.contains(id));
+        let artifact_match = cell
+            .artifact_id
+            .as_ref()
+            .is_some_and(|id| candidate_artifacts.contains(id))
+            || cell.artifact_id == query.current_artifact_id;
+        let lexical_score = lexical_memory_score(&cell, &query_tokens);
+        if !workstream_match
+            && !artifact_match
+            && lexical_score <= 0.0
+            && cell.feedback_score == 0.0
+        {
+            continue;
+        }
+        let graph_score = if artifact_match {
+            1.0
+        } else if workstream_match {
+            0.78
+        } else {
+            0.0
+        };
+        let workstream_state_score = if query.unresolved_state_kinds.iter().any(|kind| {
+            cell.keywords
+                .iter()
+                .any(|keyword| keyword.contains(kind.as_str()))
+        }) {
+            0.82
+        } else {
+            0.0
+        };
+        let score = round_score(
+            0.24 * graph_score
+                + 0.18 * workstream_state_score
+                + 0.16 * lexical_score
+                + 0.14 * if artifact_match { 1.0 } else { 0.0 }
+                + 0.10 * unresolved_compatibility_memory_score(&cell)
+                + 0.08 * recency_decay_score(cell.last_seen_at_ms, now_ms)
+                + 0.06 * cell.feedback_score.max(0.0)
+                + 0.04 * cell.confidence.max(cell.importance),
+        );
+        let (supports, contradicts) = memory_candidate_links(&cell, candidates);
+        let mut reasons = Vec::new();
+        if graph_score > 0.0 {
+            reasons.push("graph_match".to_string());
+        }
+        if artifact_match {
+            reasons.push("artifact_match".to_string());
+        }
+        if lexical_score > 0.0 {
+            reasons.push("lexical_match".to_string());
+        }
+        if cell.feedback_score != 0.0 {
+            reasons.push("feedback_prior".to_string());
+        }
+        scored.push(ContinueMemoryCellSummary {
+            id: cell.id.clone(),
+            workstream_id: cell.workstream_id.clone(),
+            artifact_id: cell.artifact_id.clone(),
+            episode_id: cell.episode_id.clone(),
+            action_id: cell.action_id.clone(),
+            memory_type: cell.memory_type.clone(),
+            summary: model_safe_label(&cell.summary, 240),
+            keywords: cell.keywords.iter().take(12).cloned().collect(),
+            tags: cell.tags.iter().take(8).cloned().collect(),
+            source_anchor: redact_memory_anchor(&cell.source_anchor),
+            last_seen_at_ms: cell.last_seen_at_ms,
+            confidence: round_score(cell.confidence),
+            importance: round_score(cell.importance),
+            decay_score: round_score(cell.decay_score),
+            privacy_status: cell.privacy_status.clone(),
+            redaction_level: cell.redaction_level.clone(),
+            feedback_score: round_signed_score(cell.feedback_score),
+            retrieval_score: score,
+            retrieval_reasons: reasons,
+            supports_candidate_ids: supports,
+            contradicts_candidate_ids: contradicts,
+            model_visible: true,
+        });
+    }
+    scored.sort_by(|left, right| {
+        right
+            .retrieval_score
+            .partial_cmp(&left.retrieval_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.last_seen_at_ms.cmp(&left.last_seen_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut retrieved_cells = scored
+        .iter()
+        .filter(|cell| !memory_type_is_counter_evidence(&cell.memory_type))
+        .take(query.max_cells)
+        .cloned()
+        .collect::<Vec<_>>();
+    let counter_evidence = scored
+        .iter()
+        .filter(|cell| memory_type_is_counter_evidence(&cell.memory_type))
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    if retrieved_cells.is_empty() && !scored.is_empty() {
+        retrieved_cells = scored.iter().take(query.max_cells).cloned().collect();
+    }
+    for cell in retrieved_cells.iter().chain(counter_evidence.iter()) {
+        conn.execute(
+            "UPDATE continue_memory_cells
+             SET retrieval_count = retrieval_count + 1
+             WHERE id = ?1",
+            params![cell.id],
+        )
+        .map_err(to_string)?;
+    }
+    let mut missing_evidence = Vec::new();
+    if retrieved_cells.is_empty() {
+        missing_evidence.push("memory_retrieval_thin".to_string());
+    }
+    if query.candidate_artifact_ids.is_empty() {
+        missing_evidence.push("no_candidate_artifacts_for_memory_query".to_string());
+    }
+    Ok(ContinueMemoryRetrievalReport {
+        schema: "smalltalk.continue_memory_retrieval.v1".to_string(),
+        generated_at_ms: now_ms,
+        query: query.clone(),
+        retrieved_cells,
+        counter_evidence,
+        missing_evidence,
+        privacy_notes,
+        warnings: Vec::new(),
+    })
+}
+
+fn load_continue_memory_cell_records(
+    conn: &Connection,
+    lookback_ms: i64,
+    now_ms: i64,
+) -> Result<Vec<ContinueMemoryCellRecord>, String> {
+    let lower_bound = now_ms - lookback_ms.max(7 * 24 * 60 * 60 * 1000);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workstream_id, artifact_id, episode_id, action_id, memory_type,
+                    summary, keywords_json, tags_json, source_anchor_json,
+                    last_seen_at_ms, confidence, importance, decay_score, privacy_status,
+                    redaction_level, feedback_score
+             FROM continue_memory_cells
+             WHERE last_seen_at_ms >= ?1 OR feedback_score <> 0.0
+             ORDER BY last_seen_at_ms DESC, importance DESC
+             LIMIT 600",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![lower_bound], |row| {
+            let keywords_json: Option<String> = row.get(7)?;
+            let tags_json: Option<String> = row.get(8)?;
+            let anchor_json: String = row.get(9)?;
+            Ok(ContinueMemoryCellRecord {
+                id: row.get(0)?,
+                workstream_id: row.get(1)?,
+                artifact_id: row.get(2)?,
+                episode_id: row.get(3)?,
+                action_id: row.get(4)?,
+                memory_type: row.get(5)?,
+                summary: row.get(6)?,
+                keywords: keywords_json
+                    .as_deref()
+                    .map(parse_string_array)
+                    .unwrap_or_default(),
+                tags: tags_json
+                    .as_deref()
+                    .map(parse_string_array)
+                    .unwrap_or_default(),
+                source_anchor: serde_json::from_str(&anchor_json).unwrap_or(Value::Null),
+                last_seen_at_ms: row.get(10)?,
+                confidence: row.get(11)?,
+                importance: row.get(12)?,
+                decay_score: row.get(13)?,
+                privacy_status: row.get(14)?,
+                redaction_level: row.get(15)?,
+                feedback_score: row.get(16)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn build_continue_memory_retrieval_query(
+    current_surface: &ResolvedCurrentSurface,
+    current_focus: Option<&ContinueFocusSummary>,
+    workstreams: &[ScorerWorkstream],
+    candidates: &[ScoredContinueCandidate],
+    lookback_ms: i64,
+    max_cells: usize,
+) -> ContinueMemoryRetrievalQuerySummary {
+    let mut candidate_workstream_ids = candidates
+        .iter()
+        .map(|candidate| candidate.workstream_id.clone())
+        .collect::<Vec<_>>();
+    candidate_workstream_ids.sort();
+    candidate_workstream_ids.dedup();
+    let mut candidate_artifact_ids = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.clone())
+        })
+        .collect::<Vec<_>>();
+    candidate_artifact_ids.sort();
+    candidate_artifact_ids.dedup();
+    let active_workstream_ids = workstreams
+        .iter()
+        .filter(|workstream| matches!(workstream.state.as_str(), "active" | "resumed"))
+        .map(|workstream| workstream.id.clone())
+        .collect::<Vec<_>>();
+    let unresolved_state_kinds = workstreams
+        .iter()
+        .filter_map(|workstream| workstream.unresolved_signal.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut recent_keywords = Vec::new();
+    for value in [
+        current_surface.window_title.as_deref(),
+        current_surface.app_name.as_deref(),
+        Some(current_surface.artifact_kind.as_str()),
+        current_focus.and_then(|focus| focus.title.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        recent_keywords.extend(memory_keywords(&[Some(value)]));
+    }
+    for candidate in candidates.iter().take(12) {
+        recent_keywords.push(candidate.candidate_kind.clone());
+        if let Some(target) = &candidate.target_artifact {
+            recent_keywords.extend(memory_keywords(&[
+                Some(target.id.as_str()),
+                target.display_title.as_deref(),
+                Some(target.artifact_kind.as_str()),
+            ]));
+        }
+    }
+    recent_keywords.sort();
+    recent_keywords.dedup();
+    recent_keywords.truncate(40);
+    ContinueMemoryRetrievalQuerySummary {
+        active_workstream_ids,
+        candidate_workstream_ids,
+        candidate_artifact_ids,
+        current_artifact_id: current_surface
+            .artifact_id
+            .clone()
+            .or_else(|| current_focus.and_then(|focus| focus.artifact_id.clone())),
+        current_activity_kind: None,
+        unresolved_state_kinds,
+        recent_keywords,
+        lookback_ms: lookback_ms.max(7 * 24 * 60 * 60 * 1000),
+        max_cells,
+    }
+}
+
+fn apply_memory_features_to_candidates(
+    candidates: &mut [ScoredContinueCandidate],
+    report: &ContinueMemoryRetrievalReport,
+) {
+    for candidate in candidates {
+        candidate.supporting_memory_ids.clear();
+        candidate.contradicting_memory_ids.clear();
+        let mut support = 0.0_f64;
+        let mut contradiction = 0.0_f64;
+        let mut feedback = 0.0_f64;
+        let mut retrieval = 0.0_f64;
+        for cell in report
+            .retrieved_cells
+            .iter()
+            .chain(report.counter_evidence.iter())
+        {
+            if cell
+                .supports_candidate_ids
+                .iter()
+                .any(|id| id == &candidate.id)
+            {
+                support = support.max(cell.retrieval_score);
+                retrieval = retrieval.max(cell.retrieval_score);
+                candidate.supporting_memory_ids.push(cell.id.clone());
+                if cell.memory_type == "feedback_acceptance"
+                    || cell.memory_type == "feedback_correction"
+                {
+                    feedback = feedback.max(cell.feedback_score.max(0.0));
+                }
+                if cell.memory_type == "origin_intent" || cell.memory_type == "return_to_origin" {
+                    candidate
+                        .warnings
+                        .push("long_term_origin_retrieved".to_string());
+                }
+            }
+            if cell
+                .contradicts_candidate_ids
+                .iter()
+                .any(|id| id == &candidate.id)
+            {
+                contradiction =
+                    contradiction.max(cell.retrieval_score.max(cell.feedback_score.abs()));
+                candidate.contradicting_memory_ids.push(cell.id.clone());
+                if cell.memory_type == "feedback_rejection"
+                    || cell.memory_type == "feedback_correction"
+                {
+                    feedback = feedback.min(cell.feedback_score);
+                }
+            }
+        }
+        candidate.memory_support_score = round_score(support.clamp(0.0, 1.0));
+        candidate.memory_contradiction_score = round_score(contradiction.clamp(0.0, 1.0));
+        candidate.feedback_prior_score = round_signed_score(feedback.clamp(-0.25, 0.25));
+        candidate.retrieval_confidence_score = round_score(retrieval.clamp(0.0, 1.0));
+        candidate.supporting_memory_ids.sort();
+        candidate.supporting_memory_ids.dedup();
+        candidate.contradicting_memory_ids.sort();
+        candidate.contradicting_memory_ids.dedup();
+    }
+}
+
+fn apply_feedback_ranking_priors_to_candidates(
+    conn: &Connection,
+    candidates: &mut [ScoredContinueCandidate],
+    workstreams: &[ScorerWorkstream],
+    current_focus: Option<&ContinueFocusSummary>,
+) -> Result<(), String> {
+    if !table_exists(conn, "continue_ranking_priors")? {
+        return Ok(());
+    }
+    for candidate in candidates {
+        let workstream_state = workstreams
+            .iter()
+            .find(|workstream| workstream.id == candidate.workstream_id)
+            .map(|workstream| workstream.state.as_str());
+        let target = candidate.target_artifact.as_ref();
+        let target_artifact_id = target.map(|artifact| artifact.id.as_str());
+        let artifact_kind = target.map(|artifact| artifact.artifact_kind.as_str());
+        let openability = target.map(|artifact| artifact.openability.as_str());
+        let current_focus_match = current_focus
+            .and_then(|focus| focus.artifact_id.as_deref())
+            .zip(target_artifact_id)
+            .map(|(current, target)| current == target);
+        let structured = feedback_prior_score_for_features(
+            conn,
+            target_artifact_id,
+            Some(candidate.candidate_kind.as_str()),
+            artifact_kind,
+            openability,
+            workstream_state,
+            current_focus_match,
+        )?;
+        if structured.abs() > 0.0 {
+            candidate.feedback_prior_score = round_signed_score(
+                (candidate.feedback_prior_score + structured).clamp(-0.25, 0.25),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn feedback_prior_score_for_features(
+    conn: &Connection,
+    artifact_id: Option<&str>,
+    candidate_kind: Option<&str>,
+    artifact_kind: Option<&str>,
+    openability: Option<&str>,
+    workstream_state: Option<&str>,
+    current_focus_match: Option<bool>,
+) -> Result<f64, String> {
+    let mut total = 0.0_f64;
+    if let Some(artifact_id) = artifact_id.filter(|value| !value.is_empty()) {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "artifact_success",
+            &format!("artifact_id={}", artifact_id),
+        )?;
+    }
+    if let Some(candidate_kind) = candidate_kind.filter(|value| !value.is_empty()) {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "candidate_kind_success",
+            &format!("candidate_kind={}", candidate_kind),
+        )?;
+    }
+    if let Some(artifact_kind) = artifact_kind.filter(|value| !value.is_empty()) {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "artifact_kind_success",
+            &format!("artifact_kind={}", artifact_kind),
+        )?;
+    }
+    if let Some(openability) = openability.filter(|value| !value.is_empty()) {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "openability_reliability",
+            &format!("openability={}", openability),
+        )?;
+    }
+    if let Some(workstream_state) = workstream_state.filter(|value| !value.is_empty()) {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "workstream_state_success",
+            &format!("state={}", workstream_state),
+        )?;
+    }
+    if let Some(matches_focus) = current_focus_match {
+        total += lookup_continue_ranking_prior_weight(
+            conn,
+            "current_focus_mismatch_penalty",
+            if matches_focus {
+                "current_focus_match=true"
+            } else {
+                "current_focus_match=false"
+            },
+        )?;
+    }
+    Ok(round_signed_score(total.clamp(-0.25, 0.25)))
+}
+
+fn lookup_continue_ranking_prior_weight(
+    conn: &Connection,
+    prior_kind: &str,
+    key: &str,
+) -> Result<f64, String> {
+    conn.query_row(
+        "SELECT weight
+         FROM continue_ranking_priors
+         WHERE prior_kind = ?1 AND key = ?2",
+        params![prior_kind, key],
+        |row| row.get::<_, f64>(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(0.0))
+    .map_err(to_string)
+}
+
+fn build_continue_dossier_v1(
+    current_surface_resolution: &CurrentSurfaceResolutionAudit,
+    selected_workstream: Option<&ScorerWorkstream>,
+    candidates: &[ScoredContinueCandidate],
+    retrieval: &ContinueMemoryRetrievalReport,
+    now_ms: i64,
+) -> ContinueDossierV1 {
+    let candidate_summaries = candidates
+        .iter()
+        .take(8)
+        .map(|candidate| ContinueDossierCandidateSummary {
+            candidate_id: candidate.id.clone(),
+            workstream_id: candidate.workstream_id.clone(),
+            target_artifact_id: candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.clone()),
+            candidate_kind: candidate.candidate_kind.clone(),
+            local_score: round_score(candidate.score),
+            memory_support_score: round_score(candidate.memory_support_score),
+            memory_contradiction_score: round_score(candidate.memory_contradiction_score),
+            feedback_prior_score: round_signed_score(candidate.feedback_prior_score),
+            supporting_memory_ids: candidate.supporting_memory_ids.clone(),
+            contradicting_memory_ids: candidate.contradicting_memory_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let feedback_priors = retrieval
+        .retrieved_cells
+        .iter()
+        .chain(retrieval.counter_evidence.iter())
+        .filter(|cell| cell.memory_type.starts_with("feedback_"))
+        .take(4)
+        .map(|cell| ContinueDossierFeedbackPrior {
+            candidate_id: cell
+                .supports_candidate_ids
+                .first()
+                .or(cell.contradicts_candidate_ids.first())
+                .cloned(),
+            workstream_id: cell.workstream_id.clone(),
+            target_artifact_id: cell.artifact_id.clone(),
+            feedback_kind: cell.memory_type.clone(),
+            score: round_signed_score(cell.feedback_score),
+            reason: cell.summary.clone(),
+        })
+        .collect::<Vec<_>>();
+    ContinueDossierV1 {
+        schema: "smalltalk.continue_dossier.v1".to_string(),
+        generated_at_ms: now_ms,
+        resolved_current_surface: serde_json::to_value(current_surface_resolution).ok(),
+        selected_workstream_state: selected_workstream.map(|workstream| {
+            ContinueDossierWorkstreamSummary {
+                workstream_id: workstream.id.clone(),
+                state: workstream.state.clone(),
+                primary_artifact_id: workstream.primary_artifact_id.clone(),
+                unresolved_signal: workstream.unresolved_signal.clone(),
+                last_active_timestamp_ms: workstream.last_active_timestamp_ms,
+            }
+        }),
+        candidate_summaries,
+        retrieved_memory_cells: retrieval.retrieved_cells.iter().take(8).cloned().collect(),
+        counter_evidence: retrieval.counter_evidence.iter().take(4).cloned().collect(),
+        missing_evidence: retrieval.missing_evidence.clone(),
+        feedback_priors,
+        privacy_notes: retrieval.privacy_notes.clone(),
+    }
+}
+
+fn memory_candidate_links(
+    cell: &ContinueMemoryCellRecord,
+    candidates: &[ScoredContinueCandidate],
+) -> (Vec<String>, Vec<String>) {
+    let mut supports = Vec::new();
+    let mut contradicts = Vec::new();
+    for candidate in candidates {
+        let same_workstream = cell
+            .workstream_id
+            .as_ref()
+            .is_some_and(|id| id == &candidate.workstream_id);
+        let same_target = cell.artifact_id.as_ref().is_some_and(|artifact_id| {
+            candidate
+                .target_artifact
+                .as_ref()
+                .is_some_and(|target| &target.id == artifact_id)
+        });
+        let same_resume_target = cell.artifact_id.as_ref().is_some_and(|artifact_id| {
+            candidate
+                .resume_work_target
+                .as_ref()
+                .is_some_and(|target| &target.id == artifact_id)
+        });
+        let feedback_memory = cell.memory_type.starts_with("feedback_");
+        let support_match = if feedback_memory {
+            same_target || same_resume_target
+        } else {
+            same_target || same_resume_target || same_workstream
+        };
+        let contradiction_match = if feedback_memory {
+            same_target
+        } else {
+            same_target || same_workstream
+        };
+        if memory_type_is_counter_evidence(&cell.memory_type) && contradiction_match {
+            contradicts.push(candidate.id.clone());
+        } else if support_match {
+            supports.push(candidate.id.clone());
+        }
+    }
+    supports.sort();
+    supports.dedup();
+    contradicts.sort();
+    contradicts.dedup();
+    (supports, contradicts)
+}
+
+fn memory_type_for_durable_role(
+    durable_role: &str,
+    unresolved_signal: Option<&str>,
+) -> Option<&'static str> {
+    match durable_role {
+        "primary_target" => Some(if unresolved_signal.is_some() {
+            "origin_intent"
+        } else {
+            "active_edit"
+        }),
+        "branch" | "support_source" => Some("branch_evidence"),
+        "blocker_surface" => Some("unresolved_blocker"),
+        "verification_surface" => Some("verification_result"),
+        "communication_surface" => Some("draft_state"),
+        "distractor" => None,
+        _ => None,
+    }
+}
+
+fn memory_surface_excluded(
+    display_title: Option<&str>,
+    browser_url: Option<&str>,
+    document_path: Option<&str>,
+    privacy_status: Option<&str>,
+) -> bool {
+    privacy_status
+        .map(|value| value == "never_send_to_ai" || value == "private")
+        .unwrap_or(false)
+        || is_smalltalk_self_surface(None, None, display_title, browser_url, document_path)
+        || is_generated_debug_surface(None, display_title, browser_url, document_path)
+}
+
+fn memory_cell_model_visible(cell: &ContinueMemoryCellRecord) -> bool {
+    !matches!(
+        cell.privacy_status.as_deref(),
+        Some("never_send_to_ai" | "private")
+    ) && cell.redaction_level != "private"
+}
+
+fn memory_type_is_counter_evidence(memory_type: &str) -> bool {
+    matches!(
+        memory_type,
+        "feedback_rejection" | "abandoned_or_done" | "low_confidence_no_clear_target"
+    )
+}
+
+fn unresolved_compatibility_memory_score(cell: &ContinueMemoryCellRecord) -> f64 {
+    match cell.memory_type.as_str() {
+        "unresolved_blocker" | "draft_state" | "output_waiting" | "resume_instruction" => 0.9,
+        "return_to_origin" | "origin_intent" => 0.72,
+        _ => 0.0,
+    }
+}
+
+fn lexical_memory_score(cell: &ContinueMemoryCellRecord, query_tokens: &HashSet<String>) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut tokens = cell
+        .keywords
+        .iter()
+        .map(|value| normalize_memory_token(value))
+        .collect::<HashSet<_>>();
+    for value in cell.summary.split_whitespace() {
+        tokens.insert(normalize_memory_token(value));
+    }
+    let matches = query_tokens
+        .iter()
+        .filter(|token| tokens.contains(*token))
+        .count();
+    (matches as f64 / query_tokens.len().max(1) as f64).clamp(0.0, 1.0)
+}
+
+fn memory_keywords(values: &[Option<&str>]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for value in values.iter().flatten() {
+        for raw in value.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-') {
+            let token = normalize_memory_token(raw);
+            if token.len() >= 3 && !memory_stop_word(&token) {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn normalize_memory_token(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect()
+}
+
+fn memory_stop_word(value: &str) -> bool {
+    matches!(
+        value,
+        "the" | "and" | "for" | "with" | "from" | "this" | "that" | "continue" | "work"
+    )
+}
+
+fn recency_decay_score(last_seen_at_ms: i64, now_ms: i64) -> f64 {
+    let age_ms = now_ms.saturating_sub(last_seen_at_ms);
+    if age_ms <= 60 * 60 * 1000 {
+        1.0
+    } else if age_ms <= 24 * 60 * 60 * 1000 {
+        0.78
+    } else if age_ms <= 7 * 24 * 60 * 60 * 1000 {
+        0.54
+    } else {
+        0.28
+    }
+}
+
+fn build_continue_app_activity_intelligence(
+    conn: &Connection,
+    session_id: Option<&str>,
+    lookback_ms: i64,
+    now_ms: i64,
+    current_surface: Option<&ResolvedCurrentSurface>,
+    workstreams: &[ScorerWorkstream],
+) -> Result<ContinueAppActivityIntelligence, String> {
+    let lookback_ms = lookback_ms.max(60_000);
+    let since_ms = now_ms.saturating_sub(lookback_ms);
+    let mut rows = load_recent_focus_evidence(conn, session_id, now_ms, lookback_ms, 360)?;
+    if let Some(surface) = current_surface {
+        rows.push(focus_row_from_current_surface(surface));
+    }
+    rows.sort_by_key(|row| row.observed_at_ms);
+    rows.dedup_by(|left, right| {
+        left.evidence_id == right.evidence_id && left.evidence_kind == right.evidence_kind
+    });
+
+    let artifact_index = build_activity_artifact_workstream_index(workstreams);
+    let action_signals = load_recent_activity_action_signals(conn, since_ms)?;
+    let mut segments = segment_activity_rows(&rows, session_id, current_surface, &artifact_index);
+    apply_action_signals_to_segments(&mut segments, &action_signals);
+
+    let objective_tokens = objective_tokens_for_workstreams(workstreams);
+    let classifications = segments
+        .iter()
+        .map(|segment| classify_app_activity_segment(segment, &objective_tokens, now_ms))
+        .collect::<Vec<_>>();
+    persist_app_activity_intelligence(conn, session_id, since_ms, &segments, &classifications)?;
+    let summary = summarize_app_activity(&segments, &classifications);
+    let warnings = app_activity_warnings(&classifications);
+    Ok(ContinueAppActivityIntelligence {
+        schema: "smalltalk.continue_app_activity_intelligence.v1".to_string(),
+        generated_at_ms: now_ms,
+        segments,
+        classifications,
+        summary,
+        warnings,
+    })
+}
+
+fn focus_row_from_current_surface(surface: &ResolvedCurrentSurface) -> FocusEvidenceRow {
+    FocusEvidenceRow {
+        evidence_id: surface.surface_id.clone(),
+        evidence_kind: "current_surface".to_string(),
+        observed_at_ms: surface.observed_at_ms,
+        app_name: surface.app_name.clone(),
+        bundle_id: surface.bundle_id.clone(),
+        window_title: surface.window_title.clone(),
+        artifact_id: surface.artifact_id.clone(),
+        artifact_kind: Some(surface.artifact_kind.clone()),
+        browser_url: surface.browser_url.clone(),
+        document_path: surface.document_path.clone(),
+        trigger_type: Some("resolved_current_surface".to_string()),
+        event_type: Some(surface.evidence_kinds.join("+")),
+        transition_label: None,
+        has_active_window: true,
+        has_screenshot: surface.evidence_kinds.iter().any(|kind| kind == "frame"),
+        has_ax: surface
+            .evidence_kinds
+            .iter()
+            .any(|kind| kind == "app_context"),
+        has_ocr: false,
+        has_content_units: surface
+            .evidence_kinds
+            .iter()
+            .any(|kind| kind == "artifact_observation"),
+        privacy_status: None,
+        quality_warnings: surface.warnings.clone(),
+    }
+}
+
+fn build_activity_artifact_workstream_index(
+    workstreams: &[ScorerWorkstream],
+) -> HashMap<String, (String, Option<String>)> {
+    let mut index = HashMap::new();
+    for workstream in workstreams {
+        let latest_episode = latest_episode_id(workstream);
+        for artifact in &workstream.artifacts {
+            index.insert(
+                artifact.artifact.id.clone(),
+                (workstream.id.clone(), latest_episode.clone()),
+            );
+        }
+    }
+    index
+}
+
+#[derive(Debug, Clone)]
+struct ActivityActionSignal {
+    artifact_id: Option<String>,
+    action_kind: String,
+    action_role: String,
+    created_at_ms: i64,
+    collapse_count: i64,
+}
+
+fn load_recent_activity_action_signals(
+    conn: &Connection,
+    since_ms: i64,
+) -> Result<Vec<ActivityActionSignal>, String> {
+    if !table_exists(conn, "continue_task_actions")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT artifact_id, action_kind, action_role, created_at_ms, collapse_count
+             FROM continue_task_actions
+             WHERE created_at_ms >= ?1
+             ORDER BY created_at_ms ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![since_ms], |row| {
+            Ok(ActivityActionSignal {
+                artifact_id: row.get(0)?,
+                action_kind: row.get(1)?,
+                action_role: row.get(2)?,
+                created_at_ms: row.get(3)?,
+                collapse_count: row.get::<_, Option<i64>>(4)?.unwrap_or(1).max(1),
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn segment_activity_rows(
+    rows: &[FocusEvidenceRow],
+    session_id: Option<&str>,
+    current_surface: Option<&ResolvedCurrentSurface>,
+    artifact_index: &HashMap<String, (String, Option<String>)>,
+) -> Vec<ContinueAppActivitySegment> {
+    let mut segments = Vec::new();
+    let mut current_rows: Vec<FocusEvidenceRow> = Vec::new();
+    for row in rows {
+        if current_rows
+            .last()
+            .is_some_and(|previous| activity_row_boundary(previous, row))
+        {
+            if let Some(segment) = segment_from_activity_rows(
+                &current_rows,
+                session_id,
+                current_surface,
+                artifact_index,
+            ) {
+                segments.push(segment);
+            }
+            current_rows.clear();
+        }
+        current_rows.push(row.clone());
+    }
+    if let Some(segment) =
+        segment_from_activity_rows(&current_rows, session_id, current_surface, artifact_index)
+    {
+        segments.push(segment);
+    }
+    merge_adjacent_activity_segments(segments)
+}
+
+fn activity_row_boundary(previous: &FocusEvidenceRow, row: &FocusEvidenceRow) -> bool {
+    if row.observed_at_ms.saturating_sub(previous.observed_at_ms) > 90_000 {
+        return true;
+    }
+    let previous_family = resolve_app_family(
+        previous.app_name.as_deref().unwrap_or(""),
+        previous.bundle_id.as_deref(),
+        previous.window_title.as_deref(),
+    );
+    let row_family = resolve_app_family(
+        row.app_name.as_deref().unwrap_or(""),
+        row.bundle_id.as_deref(),
+        row.window_title.as_deref(),
+    );
+    if previous_family != row_family {
+        return true;
+    }
+    let previous_surface = resolve_surface_type_for_row(previous, &previous_family);
+    let row_surface = resolve_surface_type_for_row(row, &row_family);
+    if previous_surface != row_surface {
+        return true;
+    }
+    match (previous.artifact_id.as_deref(), row.artifact_id.as_deref()) {
+        (Some(left), Some(right)) if left != right => true,
+        _ => {
+            let left = stable_activity_title(previous);
+            let right = stable_activity_title(row);
+            !left.is_empty() && !right.is_empty() && left != right
+        }
+    }
+}
+
+fn stable_activity_title(row: &FocusEvidenceRow) -> String {
+    row.window_title
+        .as_deref()
+        .or(row.document_path.as_deref())
+        .or(row.browser_url.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn segment_from_activity_rows(
+    rows: &[FocusEvidenceRow],
+    session_id: Option<&str>,
+    current_surface: Option<&ResolvedCurrentSurface>,
+    artifact_index: &HashMap<String, (String, Option<String>)>,
+) -> Option<ContinueAppActivitySegment> {
+    let first = rows.first()?;
+    let latest = rows.iter().max_by_key(|row| row.observed_at_ms)?;
+    let best_identity = rows
+        .iter()
+        .find(|row| {
+            row.artifact_id.is_some() || row.browser_url.is_some() || row.document_path.is_some()
+        })
+        .unwrap_or(latest);
+    let app_name = latest.app_name.clone().or_else(|| first.app_name.clone());
+    let bundle_id = latest.bundle_id.clone().or_else(|| first.bundle_id.clone());
+    let window_title = latest
+        .window_title
+        .clone()
+        .or_else(|| best_identity.window_title.clone());
+    let artifact_id = best_identity
+        .artifact_id
+        .clone()
+        .or_else(|| latest.artifact_id.clone());
+    let app_family = resolve_app_family(
+        app_name.as_deref().unwrap_or(""),
+        bundle_id.as_deref(),
+        window_title.as_deref(),
+    );
+    let surface_type = resolve_surface_type_for_row(best_identity, &app_family);
+    let mut evidence_kinds = rows
+        .iter()
+        .map(|row| row.evidence_kind.clone())
+        .collect::<Vec<_>>();
+    evidence_kinds.sort();
+    evidence_kinds.dedup();
+    let evidence_ids = rows
+        .iter()
+        .map(|row| row.evidence_id.clone())
+        .take(32)
+        .collect::<Vec<_>>();
+    let mut features = AppActivityFeatures {
+        duration_ms: rows
+            .last()
+            .map(|row| row.observed_at_ms)
+            .unwrap_or(first.observed_at_ms)
+            .saturating_sub(first.observed_at_ms),
+        distinct_window_title_count: rows
+            .iter()
+            .filter_map(|row| row.window_title.clone())
+            .collect::<HashSet<_>>()
+            .len(),
+        distinct_artifact_count: rows
+            .iter()
+            .filter_map(|row| row.artifact_id.clone())
+            .collect::<HashSet<_>>()
+            .len(),
+        has_direct_url: rows.iter().any(|row| row.browser_url.is_some()),
+        has_document_path: rows.iter().any(|row| row.document_path.is_some()),
+        has_heavy_frame: rows.iter().any(|row| {
+            row.evidence_kind == "frame"
+                && (row.has_screenshot || row.has_ax || row.has_ocr || row.has_content_units)
+        }),
+        has_visible_text: rows
+            .iter()
+            .any(|row| row.has_ax || row.has_ocr || row.has_content_units),
+        current_surface_match: current_surface.is_some_and(|surface| {
+            surface
+                .artifact_id
+                .as_deref()
+                .zip(artifact_id.as_deref())
+                .is_some_and(|(left, right)| left == right)
+                || surface.surface_id == latest.evidence_id
+                || surface_identity_key(&focus_row_from_current_surface(surface))
+                    == surface_identity_key(latest)
+        }),
+        ..Default::default()
+    };
+    for row in rows {
+        match row.evidence_kind.as_str() {
+            "frame" => features.frame_count += 1,
+            "ui_event" | "window_snapshot" | "typing_burst" | "current_surface" => {
+                features.event_count += 1
+            }
+            _ => {}
+        }
+        if row.evidence_kind == "typing_burst" {
+            features.typing_burst_count += 1;
+        }
+        if row
+            .event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("committed=1") || event.contains("enter="))
+        {
+            features.typing_commit_count += 1;
+        }
+        if row
+            .event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("click"))
+        {
+            features.click_count += 1;
+        }
+        if row
+            .event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("scroll"))
+        {
+            features.scroll_count += 1;
+        }
+        if row
+            .event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("accessibility") || event.contains("ax"))
+        {
+            features.accessibility_event_count += 1;
+        }
+        if row
+            .event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("app_switch"))
+        {
+            features.app_switch_count += 1;
+        }
+    }
+    let label_haystack = activity_surface_haystack(&app_name, &bundle_id, &window_title, rows);
+    features.media_audio_playing = contains_any(
+        &label_haystack,
+        &[
+            "audio playing",
+            "now playing",
+            "youtube",
+            "youtu.be",
+            "spotify",
+            "netflix",
+        ],
+    );
+    features.title_indicates_video_or_feed = contains_any(
+        &label_haystack,
+        &[
+            "youtube",
+            "youtu.be",
+            "/shorts/",
+            "shorts",
+            "instagram",
+            "tiktok",
+            "reels",
+            "twitter",
+            "x.com",
+            "feed",
+        ],
+    );
+    features.title_indicates_generated_audit = contains_any(
+        &label_haystack,
+        &[
+            "continue_outputs",
+            "resume_query_exports",
+            "frame-",
+            "audit",
+        ],
+    );
+    features.title_indicates_code_project = contains_any(
+        &label_haystack,
+        &[
+            "src/",
+            "src-tauri",
+            ".rs",
+            ".tsx",
+            ".ts",
+            ".swift",
+            ".py",
+            "package.json",
+            "cargo.toml",
+        ],
+    );
+    features.path_indicates_project_file = rows.iter().any(|row| {
+        row.document_path.as_deref().is_some_and(|path| {
+            contains_any(
+                &path.to_ascii_lowercase(),
+                &[
+                    "/src/",
+                    "/src-tauri/",
+                    ".rs",
+                    ".tsx",
+                    ".ts",
+                    ".swift",
+                    ".py",
+                    "package.json",
+                    "cargo.toml",
+                ],
+            )
+        })
+    });
+    features.path_indicates_generated_output = rows.iter().any(|row| {
+        row.document_path.as_deref().is_some_and(|path| {
+            contains_any(
+                &path.to_ascii_lowercase(),
+                &[
+                    "continue_outputs",
+                    "resume_query_exports",
+                    "cloud_resume_exports",
+                    "/target/",
+                ],
+            )
+        })
+    });
+    features.is_event_backed_only = !features.has_heavy_frame
+        && !features.has_visible_text
+        && !features.has_direct_url
+        && !features.has_document_path
+        && rows.iter().all(|row| {
+            matches!(
+                row.evidence_kind.as_str(),
+                "ui_event" | "typing_burst" | "window_snapshot" | "current_surface"
+            )
+        });
+    let is_self_or_diagnostic = rows.iter().any(|row| {
+        is_smalltalk_self_surface(
+            row.app_name.as_deref(),
+            row.bundle_id.as_deref(),
+            row.window_title.as_deref(),
+            row.browser_url.as_deref(),
+            row.document_path.as_deref(),
+        ) || is_generated_debug_surface(
+            row.app_name.as_deref(),
+            row.window_title.as_deref(),
+            row.browser_url.as_deref(),
+            row.document_path.as_deref(),
+        )
+    }) || features.title_indicates_generated_audit
+        || features.path_indicates_generated_output;
+    let (workstream_id, episode_id) = artifact_id
+        .as_ref()
+        .and_then(|id| artifact_index.get(id).cloned())
+        .unwrap_or((String::new(), None));
+    let started_at_ms = rows
+        .first()
+        .map(|row| row.observed_at_ms)
+        .unwrap_or(latest.observed_at_ms);
+    let ended_at_ms = rows
+        .last()
+        .map(|row| row.observed_at_ms)
+        .unwrap_or(latest.observed_at_ms);
+    let id = format!(
+        "appseg:{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                session_id.unwrap_or(""),
+                app_family,
+                surface_type,
+                surface_identity_key(best_identity),
+                started_at_ms
+            )
+            .as_bytes()
+        )
+    );
+    Some(ContinueAppActivitySegment {
+        id,
+        session_id: session_id.map(str::to_string),
+        app_name,
+        bundle_id,
+        app_family,
+        surface_type,
+        window_title,
+        artifact_id,
+        workstream_id: non_empty(workstream_id),
+        episode_id,
+        started_at_ms,
+        ended_at_ms,
+        evidence_kinds,
+        evidence_anchor: serde_json::json!({
+            "evidence_ids": evidence_ids,
+            "surface_key": surface_identity_key(best_identity),
+            "latest_evidence_kind": latest.evidence_kind,
+        }),
+        has_heavy_frame: features.has_heavy_frame,
+        has_direct_url: features.has_direct_url,
+        has_document_path: features.has_document_path,
+        has_visible_text: features.has_visible_text,
+        is_event_backed_only: features.is_event_backed_only,
+        is_self_or_diagnostic,
+        features,
+    })
+}
+
+fn activity_surface_haystack(
+    app_name: &Option<String>,
+    bundle_id: &Option<String>,
+    window_title: &Option<String>,
+    rows: &[FocusEvidenceRow],
+) -> String {
+    let mut values = vec![
+        app_name.as_deref().unwrap_or(""),
+        bundle_id.as_deref().unwrap_or(""),
+        window_title.as_deref().unwrap_or(""),
+    ];
+    for row in rows {
+        values.push(row.browser_url.as_deref().unwrap_or(""));
+        values.push(row.document_path.as_deref().unwrap_or(""));
+        values.push(row.artifact_kind.as_deref().unwrap_or(""));
+    }
+    values.join(" ").to_ascii_lowercase()
+}
+
+fn merge_adjacent_activity_segments(
+    segments: Vec<ContinueAppActivitySegment>,
+) -> Vec<ContinueAppActivitySegment> {
+    let mut merged: Vec<ContinueAppActivitySegment> = Vec::new();
+    for segment in segments {
+        if let Some(previous) = merged.last_mut() {
+            let same_surface = previous.app_family == segment.app_family
+                && previous.surface_type == segment.surface_type
+                && previous.artifact_id == segment.artifact_id
+                && previous.window_title == segment.window_title
+                && segment.started_at_ms.saturating_sub(previous.ended_at_ms) < 15_000;
+            if same_surface {
+                previous.ended_at_ms = previous.ended_at_ms.max(segment.ended_at_ms);
+                previous.features.duration_ms =
+                    previous.ended_at_ms.saturating_sub(previous.started_at_ms);
+                previous.features.frame_count += segment.features.frame_count;
+                previous.features.event_count += segment.features.event_count;
+                previous.features.typing_burst_count += segment.features.typing_burst_count;
+                previous.features.typing_commit_count += segment.features.typing_commit_count;
+                previous.features.click_count += segment.features.click_count;
+                previous.features.scroll_count += segment.features.scroll_count;
+                previous.features.accessibility_event_count +=
+                    segment.features.accessibility_event_count;
+                previous.features.has_heavy_frame |= segment.features.has_heavy_frame;
+                previous.features.has_visible_text |= segment.features.has_visible_text;
+                previous.features.has_direct_url |= segment.features.has_direct_url;
+                previous.features.has_document_path |= segment.features.has_document_path;
+                previous.is_event_backed_only &=
+                    segment.is_event_backed_only && previous.features.is_event_backed_only;
+                for kind in segment.evidence_kinds {
+                    push_string_once(&mut previous.evidence_kinds, &kind);
+                }
+                continue;
+            }
+        }
+        merged.push(segment);
+    }
+    merged
+}
+
+fn apply_action_signals_to_segments(
+    segments: &mut [ContinueAppActivitySegment],
+    actions: &[ActivityActionSignal],
+) {
+    for segment in segments {
+        for action in actions {
+            let matches_artifact = action
+                .artifact_id
+                .as_deref()
+                .zip(segment.artifact_id.as_deref())
+                .is_some_and(|(left, right)| left == right);
+            let matches_time = action.created_at_ms >= segment.started_at_ms.saturating_sub(15_000)
+                && action.created_at_ms <= segment.ended_at_ms.saturating_add(15_000);
+            if !matches_artifact && !matches_time {
+                continue;
+            }
+            let count = action.collapse_count.max(1) as usize;
+            match action.action_kind.as_str() {
+                "reading" => segment.features.reading_action_count += count,
+                "navigating" | "switching_context" | "branching_away" | "searching" => {
+                    segment.features.navigating_action_count += count
+                }
+                "editing" | "idle_after_progress" => segment.features.editing_action_count += count,
+                "composing" | "messaging_interrupt" => {
+                    segment.features.composing_action_count += count
+                }
+                "running_command" => segment.features.running_command_count += count,
+                "observing_command_output" | "reviewing_output" => {
+                    segment.features.observing_output_count += count
+                }
+                "encountering_error" => segment.features.error_action_count += count,
+                "verification_branch" => segment.features.verification_action_count += count,
+                "returning_to_origin" => segment.features.return_to_origin_count += count,
+                "copying_evidence" => segment.features.clipboard_copy_count += count,
+                _ => {}
+            }
+            if action.action_role == "return" {
+                segment.features.return_to_origin_count += count;
+            }
+        }
+        segment.features.is_event_backed_only = segment.is_event_backed_only
+            && segment.features.editing_action_count == 0
+            && segment.features.composing_action_count == 0
+            && segment.features.running_command_count == 0
+            && segment.features.observing_output_count == 0;
+    }
+}
+
+fn resolve_app_family(
+    app_name: &str,
+    bundle_id: Option<&str>,
+    window_title: Option<&str>,
+) -> String {
+    let haystack = format!(
+        "{} {} {}",
+        app_name,
+        bundle_id.unwrap_or(""),
+        window_title.unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    if contains_any(&haystack, &["codex", "com.openai.codex", "claude code"]) {
+        "ai_coding_agent"
+    } else if contains_any(
+        &haystack,
+        &[
+            "visual studio code",
+            "vscode",
+            "com.microsoft.vscode",
+            "cursor",
+            "xcode",
+            "intellij",
+            "jetbrains",
+        ],
+    ) {
+        "code_editor"
+    } else if contains_any(&haystack, &["terminal", "iterm", "warp"]) {
+        "terminal"
+    } else if contains_any(
+        &haystack,
+        &[
+            "helium", "safari", "chrome", "arc", "brave", "firefox", "browser",
+        ],
+    ) {
+        "browser"
+    } else if contains_any(&haystack, &["finder"]) {
+        "finder"
+    } else if contains_any(&haystack, &["preview", "quick look", "quicklook"]) {
+        "preview"
+    } else if contains_any(
+        &haystack,
+        &["slack", "discord", "messages", "whatsapp", "telegram"],
+    ) {
+        "messaging"
+    } else if contains_any(&haystack, &["notion", "notes", "google docs", "docs"]) {
+        "notes_docs"
+    } else if contains_any(
+        &haystack,
+        &["smalltalk", "continue_outputs", "resume_query_exports"],
+    ) {
+        "smalltalk_diagnostic"
+    } else {
+        "unknown"
+    }
+    .to_string()
+}
+
+fn resolve_surface_type_for_row(row: &FocusEvidenceRow, app_family: &str) -> String {
+    let haystack = [
+        row.app_name.as_deref(),
+        row.bundle_id.as_deref(),
+        row.window_title.as_deref(),
+        row.browser_url.as_deref(),
+        row.document_path.as_deref(),
+        row.artifact_kind.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    if contains_any(
+        &haystack,
+        &[
+            "continue_outputs",
+            "resume_query_exports",
+            "cloud_resume_exports",
+            "frame-",
+        ],
+    ) {
+        return "smalltalk_audit_output".to_string();
+    }
+    match app_family {
+        "ai_coding_agent" => "coding_agent_thread".to_string(),
+        "code_editor" => {
+            if contains_any(&haystack, &[".png", ".jpg", ".jpeg", "frame-"]) {
+                "preview_screenshot".to_string()
+            } else if contains_any(&haystack, &["diff", "changes", "source control"]) {
+                "diff_view".to_string()
+            } else {
+                "code_file".to_string()
+            }
+        }
+        "terminal" => "terminal_output".to_string(),
+        "browser" => {
+            if contains_any(
+                &haystack,
+                &[
+                    "youtube",
+                    "youtu.be",
+                    "/shorts/",
+                    "spotify",
+                    "netflix",
+                    "audio playing",
+                ],
+            ) {
+                "browser_media".to_string()
+            } else if contains_any(&haystack, &["chatgpt", "claude", "gemini", "perplexity"]) {
+                "browser_chat".to_string()
+            } else if contains_any(
+                &haystack,
+                &[
+                    "docs.",
+                    "documentation",
+                    "reference",
+                    "api",
+                    "developer",
+                    "mdn",
+                    "stackoverflow",
+                ],
+            ) {
+                "browser_docs".to_string()
+            } else if contains_any(
+                &haystack,
+                &[
+                    "search",
+                    "google.com/search",
+                    "bing.com/search",
+                    "duckduckgo",
+                ],
+            ) {
+                "browser_search".to_string()
+            } else if contains_any(
+                &haystack,
+                &["twitter", "x.com", "instagram", "tiktok", "reddit", "feed"],
+            ) {
+                "browser_social".to_string()
+            } else if contains_any(
+                &haystack,
+                &["docs.google", "notion", "linear", "github", "figma"],
+            ) {
+                "browser_web_app".to_string()
+            } else {
+                "browser_unknown".to_string()
+            }
+        }
+        "finder" => {
+            if contains_any(
+                &haystack,
+                &[
+                    "downloads",
+                    "continue_outputs",
+                    "resume_query_exports",
+                    "frame-",
+                ],
+            ) {
+                "finder_generated_output".to_string()
+            } else {
+                "finder_folder".to_string()
+            }
+        }
+        "preview" => {
+            if contains_any(&haystack, &[".png", ".jpg", ".jpeg", "frame-"]) {
+                "preview_screenshot".to_string()
+            } else {
+                "preview_document".to_string()
+            }
+        }
+        "messaging" => "messaging_thread".to_string(),
+        "smalltalk_diagnostic" => "smalltalk_continue_ui".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn objective_tokens_for_workstreams(workstreams: &[ScorerWorkstream]) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for workstream in workstreams {
+        push_activity_tokens(&mut tokens, workstream.title_candidate.as_deref());
+        push_activity_tokens(&mut tokens, workstream.unresolved_signal.as_deref());
+        for artifact in &workstream.artifacts {
+            push_activity_tokens(&mut tokens, artifact.artifact.display_title.as_deref());
+            push_activity_tokens(
+                &mut tokens,
+                artifact
+                    .artifact
+                    .document_path
+                    .as_deref()
+                    .and_then(|path| Path::new(path).file_name().and_then(|value| value.to_str())),
+            );
+        }
+        for open_loop in &workstream.open_loops {
+            push_activity_tokens(&mut tokens, open_loop.objective_hint.as_deref());
+            push_activity_tokens(&mut tokens, open_loop.last_concrete_progress.as_deref());
+            push_activity_tokens(&mut tokens, open_loop.unfinished_state.as_deref());
+            push_activity_tokens(
+                &mut tokens,
+                open_loop.next_evidence_backed_action.as_deref(),
+            );
+        }
+    }
+    tokens
+}
+
+fn push_activity_tokens(tokens: &mut HashSet<String>, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    for raw in value.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-') {
+        let token = normalize_memory_token(raw);
+        if token.len() >= 3 && !memory_stop_word(&token) {
+            tokens.insert(token);
+        }
+    }
+}
+
+fn classify_app_activity_segment(
+    segment: &ContinueAppActivitySegment,
+    objective_tokens: &HashSet<String>,
+    now_ms: i64,
+) -> ContinueActivityClassification {
+    let mut objective_relation_score = compute_objective_relation_score(segment, objective_tokens);
+    let interaction_depth_score = compute_interaction_depth_score(segment);
+    let mut evidence_sufficiency_score = compute_evidence_sufficiency_score(segment);
+    let features = &segment.features;
+    let activity_intent: String;
+    let task_phase: String;
+    let continuation_role: String;
+    let mut work_value_score = (interaction_depth_score * 0.45
+        + objective_relation_score * 0.35
+        + evidence_sufficiency_score * 0.20)
+        .clamp(0.0, 1.0);
+    let mut resume_likelihood_score =
+        (work_value_score * 0.7 + evidence_sufficiency_score * 0.3).clamp(0.0, 1.0);
+    let mut support_score = 0.0_f64;
+    let mut divergence_score = 0.0_f64;
+    let mut diagnostic_score = if segment.is_self_or_diagnostic {
+        0.92
+    } else {
+        0.0
+    };
+    let mut reason = "Deterministic app activity routing from local evidence.".to_string();
+    let mut why_not_primary = None;
+
+    if segment.is_self_or_diagnostic || segment.app_family == "smalltalk_diagnostic" {
+        activity_intent = "diagnostic_inspection".to_string();
+        task_phase = "supporting".to_string();
+        continuation_role = "diagnostic_only".to_string();
+        work_value_score = 0.08;
+        resume_likelihood_score = 0.02;
+        diagnostic_score = 0.95;
+        reason = "Smalltalk/generated diagnostic surface; useful as evidence, never a primary return target.".to_string();
+        why_not_primary = Some("Diagnostic or generated output surface.".to_string());
+    } else {
+        match segment.app_family.as_str() {
+            "ai_coding_agent" => {
+                work_value_score = work_value_score.max(0.68);
+                if features.error_action_count > 0 {
+                    activity_intent = "debugging_error".to_string();
+                    task_phase = "failed_or_blocked".to_string();
+                    continuation_role = "resume_target".to_string();
+                    resume_likelihood_score = 0.86;
+                    reason = "Coding-agent surface contained error/debugging activity.".to_string();
+                } else if features.observing_output_count > 0
+                    || features.verification_action_count > 0
+                {
+                    activity_intent = "reviewing_output".to_string();
+                    task_phase = "awaiting_review".to_string();
+                    continuation_role = "resume_target_if_unfinished".to_string();
+                    resume_likelihood_score = 0.78;
+                    reason =
+                        "Coding-agent output looked ready for review or verification.".to_string();
+                } else if features.is_event_backed_only && features.typing_burst_count > 0 {
+                    activity_intent = "implementing".to_string();
+                    task_phase = "unknown".to_string();
+                    continuation_role = "needs_fresh_capture".to_string();
+                    evidence_sufficiency_score = evidence_sufficiency_score.min(0.45);
+                    resume_likelihood_score = 0.58;
+                    reason = "Codex/coding-agent activity was high-value, but only event-backed typing/window evidence exists.".to_string();
+                    why_not_primary =
+                        Some("Need fresh app content before naming the exact task.".to_string());
+                } else if features.typing_burst_count > 0
+                    || features.editing_action_count > 0
+                    || features.composing_action_count > 0
+                {
+                    activity_intent = "implementing".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target".to_string();
+                    resume_likelihood_score = 0.82;
+                    reason = "Coding-agent activity had active implementation/composition signals."
+                        .to_string();
+                } else {
+                    activity_intent = "idle_current_focus".to_string();
+                    task_phase = "current_only".to_string();
+                    continuation_role = "current_focus_only".to_string();
+                    resume_likelihood_score = 0.28;
+                    why_not_primary =
+                        Some("Current coding-agent surface lacked task content.".to_string());
+                }
+            }
+            "code_editor" => {
+                if matches!(
+                    segment.surface_type.as_str(),
+                    "preview_screenshot" | "smalltalk_audit_output"
+                ) || features.path_indicates_generated_output
+                {
+                    activity_intent = "previewing_generated_artifact".to_string();
+                    task_phase = "current_only".to_string();
+                    continuation_role = "diagnostic_only".to_string();
+                    diagnostic_score = 0.88;
+                    resume_likelihood_score = 0.05;
+                    work_value_score = 0.12;
+                    why_not_primary = Some(
+                        "Editor was showing generated screenshot/audit output, not source work."
+                            .to_string(),
+                    );
+                } else if features.editing_action_count > 0
+                    || features.typing_burst_count > 0
+                    || features.path_indicates_project_file
+                {
+                    activity_intent = "editing_code".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target".to_string();
+                    work_value_score = work_value_score.max(0.72);
+                    resume_likelihood_score = resume_likelihood_score.max(0.78);
+                    reason = "Code editor segment had project-file or editing signals.".to_string();
+                } else {
+                    activity_intent = "idle_current_focus".to_string();
+                    task_phase = "current_only".to_string();
+                    continuation_role = "current_focus_only".to_string();
+                    why_not_primary =
+                        Some("Editor focus lacked editing or project evidence.".to_string());
+                }
+            }
+            "terminal" => {
+                if features.error_action_count > 0 {
+                    activity_intent = "debugging_error".to_string();
+                    task_phase = "failed_or_blocked".to_string();
+                    continuation_role = "resume_target".to_string();
+                    work_value_score = work_value_score.max(0.82);
+                    resume_likelihood_score = 0.88;
+                } else if features.running_command_count > 0 || features.observing_output_count > 0
+                {
+                    activity_intent = "running_tests".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target_if_unfinished".to_string();
+                    work_value_score = work_value_score.max(0.74);
+                    resume_likelihood_score = 0.72;
+                } else {
+                    activity_intent = "idle_current_focus".to_string();
+                    task_phase = "current_only".to_string();
+                    continuation_role = "current_focus_only".to_string();
+                    why_not_primary =
+                        Some("Terminal focus had no command/output signal.".to_string());
+                }
+            }
+            "browser" => {
+                if segment.surface_type == "browser_media"
+                    && features.typing_burst_count == 0
+                    && features.clipboard_copy_count == 0
+                    && objective_relation_score < 0.25
+                {
+                    activity_intent = "media_consumption".to_string();
+                    task_phase = "passive".to_string();
+                    continuation_role = "background_consumption".to_string();
+                    divergence_score = 0.9;
+                    work_value_score = 0.06;
+                    resume_likelihood_score = 0.05;
+                    reason = "Browser media/audio activity had no typing, copy/apply edge, or objective relation.".to_string();
+                    why_not_primary =
+                        Some("Passive media/browser activity is not work to resume.".to_string());
+                } else if segment.surface_type == "browser_social"
+                    && features.typing_burst_count == 0
+                    && objective_relation_score < 0.35
+                {
+                    activity_intent = "social_browsing".to_string();
+                    task_phase = "passive".to_string();
+                    continuation_role = "divergence".to_string();
+                    divergence_score = 0.82;
+                    resume_likelihood_score = 0.12;
+                    why_not_primary =
+                        Some("Recent social/feed browsing lacked work relation.".to_string());
+                } else if segment.surface_type == "browser_chat" && features.typing_burst_count > 0
+                {
+                    activity_intent = "chat_reasoning".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = if objective_relation_score >= 0.35 {
+                        "resume_target"
+                    } else {
+                        "support_context"
+                    }
+                    .to_string();
+                    work_value_score = work_value_score.max(0.62);
+                    resume_likelihood_score = resume_likelihood_score.max(0.62);
+                } else if matches!(
+                    segment.surface_type.as_str(),
+                    "browser_docs" | "browser_search"
+                ) && (features.clipboard_copy_count > 0
+                    || features.return_to_origin_count > 0
+                    || objective_relation_score >= 0.30)
+                {
+                    activity_intent = if segment.surface_type == "browser_search" {
+                        "searching_reference"
+                    } else {
+                        "reading_docs"
+                    }
+                    .to_string();
+                    task_phase = "supporting".to_string();
+                    continuation_role = "support_context".to_string();
+                    support_score = 0.74;
+                    work_value_score = work_value_score.max(0.48);
+                    resume_likelihood_score = 0.32;
+                    why_not_primary = Some(
+                        "Browser research looked like support context, not the unfinished target."
+                            .to_string(),
+                    );
+                } else if features.typing_burst_count > 0 || features.editing_action_count > 0 {
+                    activity_intent = "filling_form".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target_if_unfinished".to_string();
+                    work_value_score = work_value_score.max(0.60);
+                    resume_likelihood_score = 0.62;
+                } else {
+                    activity_intent = "reading_docs".to_string();
+                    task_phase = "supporting".to_string();
+                    continuation_role = if objective_relation_score >= 0.40 {
+                        "support_context"
+                    } else {
+                        "current_focus_only"
+                    }
+                    .to_string();
+                    support_score = objective_relation_score.max(0.2);
+                    why_not_primary =
+                        Some("Browser surface lacked unfinished-work interaction.".to_string());
+                }
+            }
+            "finder" => {
+                activity_intent = "file_browsing".to_string();
+                if segment.surface_type == "finder_generated_output"
+                    || features.path_indicates_generated_output
+                {
+                    task_phase = "supporting".to_string();
+                    continuation_role = "diagnostic_only".to_string();
+                    diagnostic_score = 0.82;
+                    resume_likelihood_score = 0.04;
+                    why_not_primary =
+                        Some("Finder was on generated audit/output files.".to_string());
+                } else if features.has_document_path && objective_relation_score >= 0.35 {
+                    task_phase = "supporting".to_string();
+                    continuation_role = "support_context".to_string();
+                    support_score = 0.55;
+                } else {
+                    task_phase = "current_only".to_string();
+                    continuation_role = "current_focus_only".to_string();
+                    why_not_primary =
+                        Some("Finder browsing did not show unfinished document work.".to_string());
+                }
+            }
+            "preview" => {
+                if segment.surface_type == "preview_screenshot"
+                    || features.path_indicates_generated_output
+                {
+                    activity_intent = "previewing_generated_artifact".to_string();
+                    task_phase = "current_only".to_string();
+                    continuation_role = "diagnostic_only".to_string();
+                    diagnostic_score = 0.82;
+                    resume_likelihood_score = 0.05;
+                    why_not_primary =
+                        Some("Preview was showing generated/screenshot evidence.".to_string());
+                } else {
+                    activity_intent = "reading_docs".to_string();
+                    task_phase = "supporting".to_string();
+                    continuation_role = if objective_relation_score >= 0.45 {
+                        "resume_target_if_unfinished"
+                    } else {
+                        "support_context"
+                    }
+                    .to_string();
+                    support_score = 0.5;
+                }
+            }
+            "messaging" => {
+                activity_intent = "replying_message".to_string();
+                if features.typing_burst_count > 0 && objective_relation_score >= 0.35 {
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target_if_unfinished".to_string();
+                    work_value_score = work_value_score.max(0.56);
+                    resume_likelihood_score = 0.58;
+                } else {
+                    task_phase = "interrupted".to_string();
+                    continuation_role = "interruption".to_string();
+                    divergence_score = 0.55;
+                    why_not_primary =
+                        Some("Brief messaging looked like an interruption.".to_string());
+                }
+            }
+            _ => {
+                if interaction_depth_score >= 0.65 && evidence_sufficiency_score >= 0.50 {
+                    activity_intent = "unknown".to_string();
+                    task_phase = "in_progress".to_string();
+                    continuation_role = "resume_target_if_unfinished".to_string();
+                    work_value_score = work_value_score.max(0.58);
+                    resume_likelihood_score = 0.55;
+                    reason = "Unknown app had sustained interaction and enough local evidence."
+                        .to_string();
+                } else {
+                    activity_intent = "unknown".to_string();
+                    task_phase = "unknown".to_string();
+                    continuation_role = "unknown".to_string();
+                    why_not_primary =
+                        Some("Unknown app activity lacked enough evidence.".to_string());
+                }
+            }
+        }
+    }
+
+    if matches!(
+        continuation_role.as_str(),
+        "background_consumption" | "divergence" | "diagnostic_only" | "interruption"
+    ) {
+        objective_relation_score = objective_relation_score.min(0.25);
+    }
+    let missing_evidence = activity_missing_evidence(segment, evidence_sufficiency_score);
+    let id = format!("actcls:{}", segment.id);
+    ContinueActivityClassification {
+        id,
+        segment_id: segment.id.clone(),
+        session_id: segment.session_id.clone(),
+        artifact_id: segment.artifact_id.clone(),
+        workstream_id: segment.workstream_id.clone(),
+        app_family: segment.app_family.clone(),
+        surface_type: segment.surface_type.clone(),
+        activity_intent,
+        task_phase,
+        continuation_role,
+        work_value_score: round_score(work_value_score),
+        resume_likelihood_score: round_score(resume_likelihood_score),
+        support_score: round_score(support_score),
+        divergence_score: round_score(divergence_score),
+        diagnostic_score: round_score(diagnostic_score),
+        interaction_depth_score: round_score(interaction_depth_score),
+        objective_relation_score: round_score(objective_relation_score),
+        evidence_sufficiency_score: round_score(evidence_sufficiency_score),
+        reason,
+        why_not_primary,
+        missing_evidence,
+        feature_json: serde_json::to_value(&segment.features)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        evidence_anchor_json: segment.evidence_anchor.clone(),
+        created_by: "deterministic".to_string(),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    }
+}
+
+fn compute_objective_relation_score(
+    segment: &ContinueAppActivitySegment,
+    objective_tokens: &HashSet<String>,
+) -> f64 {
+    let mut score: f64 = 0.0;
+    if segment.workstream_id.is_some() {
+        score += 0.35;
+    }
+    if segment.features.path_indicates_project_file || segment.features.title_indicates_code_project
+    {
+        score += 0.25;
+    }
+    let mut surface_tokens = HashSet::new();
+    push_activity_tokens(&mut surface_tokens, segment.window_title.as_deref());
+    push_activity_tokens(&mut surface_tokens, segment.app_name.as_deref());
+    if let Some(path) = segment
+        .evidence_anchor
+        .get("surface_key")
+        .and_then(Value::as_str)
+    {
+        push_activity_tokens(&mut surface_tokens, Some(path));
+    }
+    if !objective_tokens.is_empty() && !surface_tokens.is_empty() {
+        let matches = surface_tokens
+            .iter()
+            .filter(|token| objective_tokens.contains(*token))
+            .count();
+        score += (matches as f64 / objective_tokens.len().max(1) as f64).min(1.0) * 0.25;
+    }
+    if segment.features.clipboard_copy_count > 0 || segment.features.return_to_origin_count > 0 {
+        score += 0.15;
+    }
+    if segment.features.media_audio_playing || segment.features.title_indicates_video_or_feed {
+        score -= 0.25;
+    }
+    if segment.features.navigating_action_count > 6
+        && segment.features.editing_action_count == 0
+        && segment.features.composing_action_count == 0
+    {
+        score -= 0.20;
+    }
+    if segment.is_self_or_diagnostic {
+        score -= 0.15;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn compute_interaction_depth_score(segment: &ContinueAppActivitySegment) -> f64 {
+    let features = &segment.features;
+    let mut score: f64 = 0.10;
+    if features.editing_action_count > 0 || features.composing_action_count > 0 {
+        score += 0.30;
+    }
+    if features.running_command_count > 0
+        || features.observing_output_count > 0
+        || features.verification_action_count > 0
+    {
+        score += 0.25;
+    }
+    if features.typing_commit_count > 0 || features.typing_burst_count > 0 {
+        score += 0.20;
+    }
+    if features.clipboard_copy_count > 0 || features.return_to_origin_count > 0 {
+        score += 0.15;
+    }
+    if features.duration_ms > 60_000 && features.distinct_artifact_count <= 2 {
+        score += 0.10;
+    }
+    if features.media_audio_playing || features.title_indicates_video_or_feed {
+        score -= 0.25;
+    }
+    if features.navigating_action_count > 6
+        && features.editing_action_count == 0
+        && features.composing_action_count == 0
+    {
+        score -= 0.20;
+    }
+    if features.is_event_backed_only {
+        score -= 0.20;
+    }
+    if segment.is_self_or_diagnostic {
+        score -= 0.20;
+    }
+    if features.scroll_count > 0
+        && features.typing_burst_count == 0
+        && features.click_count == 0
+        && features.clipboard_copy_count == 0
+    {
+        score -= 0.15;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn compute_evidence_sufficiency_score(segment: &ContinueAppActivitySegment) -> f64 {
+    let mut score: f64 = 0.10;
+    if segment.has_direct_url || segment.has_document_path {
+        score += 0.30;
+    }
+    if segment.has_heavy_frame {
+        score += 0.25;
+    }
+    if segment.artifact_id.is_some() {
+        score += 0.20;
+    }
+    if segment.workstream_id.is_some() {
+        score += 0.10;
+    }
+    if segment.has_visible_text {
+        score += 0.15;
+    }
+    if segment.features.editing_action_count > 0
+        || segment.features.running_command_count > 0
+        || segment.features.observing_output_count > 0
+    {
+        score += 0.15;
+    }
+    if segment.is_event_backed_only {
+        score -= 0.25;
+    }
+    if segment.artifact_id.is_none() {
+        score -= 0.20;
+    }
+    if !segment.has_direct_url && !segment.has_document_path {
+        score -= 0.20;
+    }
+    if segment.features.editing_action_count == 0
+        && segment.features.composing_action_count == 0
+        && segment.features.running_command_count == 0
+        && segment.features.observing_output_count == 0
+    {
+        score -= 0.10;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn activity_missing_evidence(
+    segment: &ContinueAppActivitySegment,
+    evidence_sufficiency_score: f64,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !segment.has_direct_url && !segment.has_document_path {
+        missing.push("no_direct_url_or_document_path".to_string());
+    }
+    if !segment.has_heavy_frame && !segment.has_visible_text {
+        missing.push("no_visible_app_content".to_string());
+    }
+    if segment.artifact_id.is_none() {
+        missing.push("no_durable_artifact_id".to_string());
+    }
+    if segment.features.editing_action_count == 0
+        && segment.features.composing_action_count == 0
+        && segment.features.running_command_count == 0
+        && segment.features.observing_output_count == 0
+    {
+        missing.push("no_last_meaningful_action".to_string());
+    }
+    if evidence_sufficiency_score < 0.5
+        && matches!(
+            segment.app_family.as_str(),
+            "ai_coding_agent" | "code_editor" | "terminal" | "browser" | "notes_docs"
+        )
+    {
+        missing.push("needs_fresh_app_content".to_string());
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+fn summarize_app_activity(
+    segments: &[ContinueAppActivitySegment],
+    classifications: &[ContinueActivityClassification],
+) -> ContinueActivitySummary {
+    let mut summary = ContinueActivitySummary::default();
+    let mut by_segment = segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment))
+        .collect::<HashMap<_, _>>();
+    let best_main = classifications
+        .iter()
+        .filter(|classification| {
+            matches!(
+                classification.continuation_role.as_str(),
+                "resume_target" | "resume_target_if_unfinished" | "needs_fresh_capture"
+            )
+        })
+        .max_by(|left, right| {
+            (left.work_value_score + left.resume_likelihood_score)
+                .partial_cmp(&(right.work_value_score + right.resume_likelihood_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(classification) = best_main {
+        summary.main_work = by_segment
+            .remove(classification.segment_id.as_str())
+            .map(|segment| activity_summary_label(segment, classification));
+        if classification.continuation_role == "needs_fresh_capture" {
+            push_string_once(
+                &mut summary.missing_for_current_focus,
+                "fresh app content for the high-value current surface",
+            );
+        }
+        for missing in &classification.missing_evidence {
+            push_string_once(&mut summary.missing_for_current_focus, missing);
+        }
+    }
+    for classification in classifications {
+        let Some(segment) = segments
+            .iter()
+            .find(|segment| segment.id == classification.segment_id)
+        else {
+            continue;
+        };
+        let label = activity_summary_label(segment, classification);
+        match classification.continuation_role.as_str() {
+            "support_context" => push_string_once(&mut summary.support_context, &label),
+            "divergence" | "background_consumption" | "interruption" => {
+                push_string_once(&mut summary.recent_divergence, &label)
+            }
+            "diagnostic_only" => push_string_once(&mut summary.diagnostic_surfaces, &label),
+            _ => {}
+        }
+    }
+    summary.support_context.truncate(3);
+    summary.recent_divergence.truncate(3);
+    summary.diagnostic_surfaces.truncate(3);
+    summary.missing_for_current_focus.truncate(4);
+    summary
+}
+
+fn activity_summary_label(
+    segment: &ContinueAppActivitySegment,
+    classification: &ContinueActivityClassification,
+) -> String {
+    let surface = segment
+        .window_title
+        .as_deref()
+        .or(segment.app_name.as_deref())
+        .unwrap_or("unknown surface");
+    let label = if classification.continuation_role == "needs_fresh_capture" {
+        format!("{} active work needs fresh content", surface)
+    } else if classification.continuation_role == "background_consumption" {
+        format!("{} passive media/background activity", surface)
+    } else {
+        format!(
+            "{} {}",
+            surface,
+            classification.activity_intent.replace('_', " ")
+        )
+    };
+    clean_handoff_line(label, 120).unwrap_or_else(|| classification.activity_intent.clone())
+}
+
+fn app_activity_warnings(classifications: &[ContinueActivityClassification]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for classification in classifications {
+        match classification.continuation_role.as_str() {
+            "background_consumption" => push_string_once(
+                &mut warnings,
+                "p8_activity:background_consumption_suppressed",
+            ),
+            "diagnostic_only" => {
+                push_string_once(&mut warnings, "p8_activity:diagnostic_surface_suppressed")
+            }
+            "needs_fresh_capture" => push_string_once(
+                &mut warnings,
+                "p8_activity:high_value_surface_needs_fresh_capture",
+            ),
+            _ => {}
+        }
+    }
+    warnings
+}
+
+fn persist_app_activity_intelligence(
+    conn: &Connection,
+    session_id: Option<&str>,
+    since_ms: i64,
+    segments: &[ContinueAppActivitySegment],
+    classifications: &[ContinueActivityClassification],
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM continue_activity_classifications
+         WHERE segment_id IN (
+           SELECT id FROM continue_app_activity_segments
+           WHERE (?1 IS NULL OR session_id = ?1)
+             AND ended_at_ms >= ?2
+         )",
+        params![session_id, since_ms],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "DELETE FROM continue_app_activity_segments
+         WHERE (?1 IS NULL OR session_id = ?1)
+           AND ended_at_ms >= ?2",
+        params![session_id, since_ms],
+    )
+    .map_err(to_string)?;
+    for segment in segments {
+        insert_app_activity_segment(conn, segment)?;
+    }
+    for classification in classifications {
+        insert_activity_classification(conn, classification)?;
+    }
+    Ok(())
+}
+
+fn insert_app_activity_segment(
+    conn: &Connection,
+    segment: &ContinueAppActivitySegment,
+) -> Result<(), String> {
+    let now_ms = current_time_millis();
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_app_activity_segments (
+            id, session_id, app_name, bundle_id, app_family, surface_type,
+            window_title, artifact_id, workstream_id, episode_id,
+            started_at_ms, ended_at_ms, evidence_kinds_json, evidence_anchor_json,
+            feature_json, has_heavy_frame, has_direct_url, has_document_path,
+            has_visible_text, is_event_backed_only, is_self_or_diagnostic,
+            created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                   ?19, ?20, ?21, ?22, ?23)",
+        params![
+            segment.id,
+            segment.session_id,
+            segment.app_name,
+            segment.bundle_id,
+            segment.app_family,
+            segment.surface_type,
+            segment.window_title,
+            segment.artifact_id,
+            segment.workstream_id,
+            segment.episode_id,
+            segment.started_at_ms,
+            segment.ended_at_ms,
+            serde_json::to_string(&segment.evidence_kinds).map_err(to_string)?,
+            serde_json::to_string(&segment.evidence_anchor).map_err(to_string)?,
+            serde_json::to_string(&segment.features).map_err(to_string)?,
+            if segment.has_heavy_frame {
+                1_i64
+            } else {
+                0_i64
+            },
+            if segment.has_direct_url { 1_i64 } else { 0_i64 },
+            if segment.has_document_path {
+                1_i64
+            } else {
+                0_i64
+            },
+            if segment.has_visible_text {
+                1_i64
+            } else {
+                0_i64
+            },
+            if segment.is_event_backed_only {
+                1_i64
+            } else {
+                0_i64
+            },
+            if segment.is_self_or_diagnostic {
+                1_i64
+            } else {
+                0_i64
+            },
+            now_ms,
+            now_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_activity_classification(
+    conn: &Connection,
+    classification: &ContinueActivityClassification,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_activity_classifications (
+            id, segment_id, session_id, artifact_id, workstream_id,
+            app_family, surface_type, activity_intent, task_phase, continuation_role,
+            work_value_score, resume_likelihood_score, support_score,
+            divergence_score, diagnostic_score, interaction_depth_score,
+            objective_relation_score, evidence_sufficiency_score, reason,
+            why_not_primary, missing_evidence_json, feature_json,
+            evidence_anchor_json, created_by, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                   ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+        params![
+            classification.id,
+            classification.segment_id,
+            classification.session_id,
+            classification.artifact_id,
+            classification.workstream_id,
+            classification.app_family,
+            classification.surface_type,
+            classification.activity_intent,
+            classification.task_phase,
+            classification.continuation_role,
+            classification.work_value_score,
+            classification.resume_likelihood_score,
+            classification.support_score,
+            classification.divergence_score,
+            classification.diagnostic_score,
+            classification.interaction_depth_score,
+            classification.objective_relation_score,
+            classification.evidence_sufficiency_score,
+            classification.reason,
+            classification.why_not_primary,
+            serde_json::to_string(&classification.missing_evidence).map_err(to_string)?,
+            serde_json::to_string(&classification.feature_json).map_err(to_string)?,
+            serde_json::to_string(&classification.evidence_anchor_json).map_err(to_string)?,
+            classification.created_by,
+            classification.created_at_ms,
+            classification.updated_at_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn model_safe_label(value: &str, max_chars: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn redact_memory_anchor(anchor: &Value) -> Value {
+    match anchor {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "browser_url" | "document_path" | "raw_text" | "clipboard"
+                ) {
+                    redacted.insert(key.clone(), Value::String("[redacted]".to_string()));
+                } else {
+                    redacted.insert(key.clone(), value.clone());
+                }
+            }
+            Value::Object(redacted)
+        }
+        _ => anchor.clone(),
+    }
+}
+
 fn generate_continue_candidates(
     workstreams: &[ScorerWorkstream],
     current_focus: Option<&ContinueFocusSummary>,
@@ -6797,6 +10824,25 @@ fn generate_continue_candidates(
                 );
             }
             Some("verification_without_return") => {
+                if last_action
+                    .as_ref()
+                    .is_some_and(scorer_action_completed_successfully)
+                {
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        workstream,
+                        primary
+                            .clone()
+                            .or_else(|| action_artifact(workstream, &last_action)),
+                        primary.clone(),
+                        "review_completed_changes",
+                        last_action.clone(),
+                        supporting_episode_id.clone(),
+                        "completed_progress_ready_for_review",
+                    );
+                    continue;
+                }
                 let target = action_artifact(workstream, &last_action).or_else(|| primary.clone());
                 push_candidate(
                     &mut candidates,
@@ -6947,6 +10993,254 @@ fn generate_continue_candidates(
     candidates
 }
 
+fn apply_app_activity_to_candidates(
+    candidates: &mut [ScoredContinueCandidate],
+    app_activity: &ContinueAppActivityIntelligence,
+) {
+    for candidate in candidates {
+        let classification =
+            match_activity_classification_for_candidate(candidate, &app_activity.classifications);
+        if let Some(classification) = classification {
+            candidate.app_activity_classification_id = Some(classification.id.clone());
+            candidate.app_activity_segment_id = Some(classification.segment_id.clone());
+            candidate.app_family = Some(classification.app_family.clone());
+            candidate.surface_type = Some(classification.surface_type.clone());
+            candidate.activity_intent = Some(classification.activity_intent.clone());
+            candidate.task_phase = Some(classification.task_phase.clone());
+            candidate.continuation_role = Some(classification.continuation_role.clone());
+            candidate.work_value_score = classification.work_value_score;
+            candidate.resume_likelihood_score = classification.resume_likelihood_score;
+            candidate.divergence_score = classification.divergence_score;
+            candidate.diagnostic_score = classification.diagnostic_score;
+            candidate.objective_relation_score = classification.objective_relation_score;
+            candidate.interaction_depth_score = classification.interaction_depth_score;
+            candidate.evidence_sufficiency_score = classification.evidence_sufficiency_score;
+            candidate.work_value_reason = Some(classification.reason.clone());
+            candidate.why_not_primary = classification.why_not_primary.clone();
+            for missing in &classification.missing_evidence {
+                push_string_once(&mut candidate.missing_evidence, missing);
+            }
+            if !activity_role_can_be_primary(&classification.continuation_role) {
+                candidate.eligible_for_primary_selection = false;
+                candidate.selection_demotion_reason = classification
+                    .why_not_primary
+                    .clone()
+                    .or_else(|| Some(format!("P8 role {}", classification.continuation_role)));
+                candidate
+                    .risk_flags
+                    .push(format!("p8_role:{}", classification.continuation_role));
+                candidate
+                    .warnings
+                    .push(format!("p8_activity:{}", classification.continuation_role));
+            }
+            if classification.continuation_role == "needs_fresh_capture" {
+                candidate.candidate_kind = "needs_fresh_capture".to_string();
+                candidate.eligible_for_primary_selection = false;
+                candidate.selection_demotion_reason = classification
+                    .why_not_primary
+                    .clone()
+                    .or_else(|| Some("needs fresh app content".to_string()));
+            }
+        } else {
+            apply_fallback_activity_labels_to_candidate(candidate);
+        }
+    }
+}
+
+fn match_activity_classification_for_candidate<'a>(
+    candidate: &ScoredContinueCandidate,
+    classifications: &'a [ContinueActivityClassification],
+) -> Option<&'a ContinueActivityClassification> {
+    if let Some(target_id) = candidate
+        .target_artifact
+        .as_ref()
+        .map(|artifact| artifact.id.as_str())
+    {
+        if let Some(classification) = classifications
+            .iter()
+            .filter(|classification| classification.artifact_id.as_deref() == Some(target_id))
+            .max_by(activity_classification_rank)
+        {
+            return Some(classification);
+        }
+    }
+    let target_label = candidate
+        .target_artifact
+        .as_ref()
+        .and_then(artifact_title_for_scorer)
+        .map(|value| value.to_ascii_lowercase());
+    if let Some(target_label) = target_label {
+        classifications
+            .iter()
+            .filter(|classification| {
+                classification
+                    .evidence_anchor_json
+                    .get("surface_key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|surface_key| target_label.contains(surface_key))
+                    || classification
+                        .feature_json
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains(&target_label)
+            })
+            .max_by(activity_classification_rank)
+    } else {
+        None
+    }
+}
+
+fn activity_classification_rank(
+    left: &&ContinueActivityClassification,
+    right: &&ContinueActivityClassification,
+) -> std::cmp::Ordering {
+    (left.work_value_score + left.resume_likelihood_score + left.evidence_sufficiency_score)
+        .partial_cmp(
+            &(right.work_value_score
+                + right.resume_likelihood_score
+                + right.evidence_sufficiency_score),
+        )
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn apply_fallback_activity_labels_to_candidate(candidate: &mut ScoredContinueCandidate) {
+    let Some(target) = candidate.target_artifact.as_ref() else {
+        candidate.evidence_sufficiency_score = 0.15;
+        candidate.continuation_role = Some("unknown".to_string());
+        return;
+    };
+    let app_family = resolve_app_family(
+        "",
+        None,
+        target
+            .display_title
+            .as_deref()
+            .or(target.document_path.as_deref())
+            .or(target.browser_url.as_deref()),
+    );
+    candidate.app_family = Some(app_family.clone());
+    candidate.surface_type = Some(surface_type_for_scorer_artifact(target, &app_family));
+    candidate.evidence_sufficiency_score = if target.browser_url.is_some()
+        || target.document_path.is_some()
+        || target.openability == "openable"
+    {
+        0.62
+    } else if target.last_seen_frame_id.is_some() {
+        0.42
+    } else {
+        0.22
+    };
+    candidate.objective_relation_score = if target.artifact_kind == "code_editor" {
+        0.55
+    } else {
+        0.25
+    };
+    candidate.interaction_depth_score = if candidate.last_meaningful_action.is_some() {
+        0.55
+    } else {
+        0.18
+    };
+    candidate.work_value_score = (candidate.objective_relation_score * 0.45
+        + candidate.interaction_depth_score * 0.35
+        + candidate.evidence_sufficiency_score * 0.20)
+        .clamp(0.0, 1.0);
+    candidate.resume_likelihood_score = candidate.work_value_score;
+    candidate.continuation_role = Some(
+        if media_or_background_browser_target(target) {
+            candidate.divergence_score = 0.82;
+            "background_consumption"
+        } else if is_smalltalk_artifact(target) {
+            candidate.diagnostic_score = 0.88;
+            "diagnostic_only"
+        } else {
+            "resume_target_if_unfinished"
+        }
+        .to_string(),
+    );
+}
+
+fn surface_type_for_scorer_artifact(target: &ScorerArtifact, app_family: &str) -> String {
+    let row = FocusEvidenceRow {
+        evidence_id: target.id.clone(),
+        evidence_kind: "candidate_target".to_string(),
+        observed_at_ms: target.last_seen_timestamp,
+        app_name: None,
+        bundle_id: None,
+        window_title: target.display_title.clone(),
+        artifact_id: Some(target.id.clone()),
+        artifact_kind: Some(target.artifact_kind.clone()),
+        browser_url: target.browser_url.clone(),
+        document_path: target.document_path.clone(),
+        trigger_type: None,
+        event_type: None,
+        transition_label: None,
+        has_active_window: false,
+        has_screenshot: target.last_seen_frame_id.is_some(),
+        has_ax: false,
+        has_ocr: false,
+        has_content_units: false,
+        privacy_status: target.privacy_status.clone(),
+        quality_warnings: Vec::new(),
+    };
+    resolve_surface_type_for_row(&row, app_family)
+}
+
+fn activity_role_can_be_primary(role: &str) -> bool {
+    matches!(role, "resume_target" | "resume_target_if_unfinished")
+}
+
+fn activity_role_is_suppressed(role: Option<&str>) -> bool {
+    matches!(
+        role,
+        Some(
+            "divergence"
+                | "diagnostic_only"
+                | "interruption"
+                | "background_consumption"
+                | "suppressed"
+                | "current_focus_only"
+                | "support_context"
+                | "needs_fresh_capture"
+        )
+    )
+}
+
+fn select_local_candidate_after_activity(
+    candidates: &[ScoredContinueCandidate],
+    app_activity: &ContinueAppActivityIntelligence,
+) -> Option<ScoredContinueCandidate> {
+    if let Some(candidate) = candidates.iter().find(|candidate| {
+        candidate.eligible_for_primary_selection
+            && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+    }) {
+        return Some(candidate.clone());
+    }
+    let has_high_value_needs_capture = app_activity.classifications.iter().any(|classification| {
+        classification.continuation_role == "needs_fresh_capture"
+            && classification.work_value_score >= 0.60
+    });
+    let only_suppressed_candidates = !candidates.is_empty()
+        && candidates.iter().all(|candidate| {
+            activity_role_is_suppressed(candidate.continuation_role.as_deref())
+                || candidate.candidate_kind == "evidence_only"
+                || !candidate.eligible_for_primary_selection
+        });
+    if has_high_value_needs_capture && only_suppressed_candidates {
+        return None;
+    }
+    candidates
+        .iter()
+        .find(|candidate| !activity_role_is_suppressed(candidate.continuation_role.as_deref()))
+        .cloned()
+        .or_else(|| {
+            if has_high_value_needs_capture {
+                None
+            } else {
+                candidates.first().cloned()
+            }
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_candidate(
     candidates: &mut Vec<ScoredContinueCandidate>,
@@ -7029,6 +11323,28 @@ fn push_candidate_with_open_loop(
         recency_score: 0.0,
         openability_score: 0.0,
         privacy_safety_score: 0.0,
+        memory_support_score: 0.0,
+        memory_contradiction_score: 0.0,
+        feedback_prior_score: 0.0,
+        retrieval_confidence_score: 0.0,
+        work_value_score: 0.0,
+        resume_likelihood_score: 0.0,
+        divergence_score: 0.0,
+        diagnostic_score: 0.0,
+        objective_relation_score: 0.0,
+        interaction_depth_score: 0.0,
+        evidence_sufficiency_score: 0.0,
+        app_activity_segment_id: None,
+        app_activity_classification_id: None,
+        app_family: None,
+        surface_type: None,
+        activity_intent: None,
+        task_phase: None,
+        continuation_role: None,
+        work_value_reason: None,
+        why_not_primary: None,
+        supporting_memory_ids: Vec::new(),
+        contradicting_memory_ids: Vec::new(),
         reason: Some(reason.to_string()),
         missing_evidence: Vec::new(),
         warnings: Vec::new(),
@@ -7109,6 +11425,7 @@ fn candidate_kind_for_open_loop(
     resume_work_target: Option<&ScorerArtifact>,
 ) -> &'static str {
     match open_loop.boundary_kind.as_str() {
+        "completed_progress" => "review_completed_changes",
         "error_without_resolution" if open_loop.blocker_artifact_id.is_some() => "resolve_error",
         "draft_active" => "continue_reply",
         "search_branch_without_return" => "return_to_primary_artifact",
@@ -7166,11 +11483,22 @@ fn score_continue_candidates(
                 + candidate.unresolved_score * 0.18
                 + candidate.branch_origin_score * 0.14
                 + candidate.evidence_quality_score * 0.13
-                + candidate.recency_score * 0.07
+                + candidate.memory_support_score * 0.08
+                + candidate.feedback_prior_score
+                + candidate.retrieval_confidence_score * 0.04
+                + candidate.work_value_score * 0.22
+                + candidate.resume_likelihood_score * 0.20
+                + candidate.objective_relation_score * 0.12
+                + candidate.interaction_depth_score * 0.10
+                + candidate.evidence_sufficiency_score * 0.08
+                + candidate.recency_score * 0.05
                 + candidate.privacy_safety_score * 0.03
-                + candidate.openability_score * 0.02,
+                + candidate.openability_score * 0.02
+                - candidate.memory_contradiction_score * 0.10
+                - candidate.divergence_score * 0.30
+                - candidate.diagnostic_score * 0.40,
         );
-        candidate.score = candidate.pre_cap_score;
+        candidate.score = candidate.pre_cap_score.clamp(0.0, 1.0);
         candidate.missing_evidence = missing_evidence_for_candidate(candidate, workstream);
         candidate.warnings = warnings_for_candidate(candidate, workstream, current_focus);
         apply_candidate_risk_caps(candidate, workstream, current_focus);
@@ -7191,6 +11519,64 @@ fn apply_candidate_risk_caps(
 
     if candidate.candidate_kind == "evidence_only" {
         cap_candidate_score(candidate, 0.42, "evidence_only_candidate");
+    }
+    match candidate.continuation_role.as_deref() {
+        Some("background_consumption") => {
+            cap_candidate_score(candidate, 0.20, "p8_background_consumption");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("background media or passive browsing".to_string()));
+        }
+        Some("divergence") => {
+            cap_candidate_score(candidate, 0.25, "p8_divergence");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("recent activity diverged from work".to_string()));
+        }
+        Some("diagnostic_only") => {
+            cap_candidate_score(candidate, 0.10, "p8_diagnostic_only");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("diagnostic output is evidence only".to_string()));
+        }
+        Some("current_focus_only") => {
+            cap_candidate_score(candidate, 0.35, "p8_current_focus_only");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("current surface was not an unfinished work target".to_string()));
+        }
+        Some("support_context") => {
+            cap_candidate_score(candidate, 0.42, "p8_support_context_only");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("support context is evidence, not the return target".to_string()));
+        }
+        Some("needs_fresh_capture") => {
+            cap_candidate_score(candidate, 0.42, "p8_needs_fresh_capture");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate
+                .why_not_primary
+                .clone()
+                .or_else(|| Some("needs fresh app content before selection".to_string()));
+        }
+        Some("interruption" | "suppressed") => {
+            cap_candidate_score(candidate, 0.25, "p8_interruption_or_suppressed");
+            candidate.eligible_for_primary_selection = false;
+        }
+        _ => {}
+    }
+    if candidate.evidence_sufficiency_score > 0.0 && candidate.evidence_sufficiency_score < 0.35 {
+        cap_candidate_score(candidate, 0.42, "p8_low_evidence_sufficiency");
     }
     if candidate.target_artifact.is_none() {
         cap_candidate_score(candidate, 0.44, "no_target_artifact");
@@ -7257,16 +11643,29 @@ fn apply_candidate_risk_caps(
             _ => {}
         }
     }
+    if candidate.memory_contradiction_score >= 0.72 {
+        cap_candidate_score(candidate, 0.42, "memory_contradicts_candidate");
+        candidate
+            .warnings
+            .push("memory_contradicts_candidate".to_string());
+    }
+    if candidate.retrieval_confidence_score > 0.0 && candidate.retrieval_confidence_score < 0.28 {
+        candidate.warnings.push("memory_retrieval_thin".to_string());
+    }
 
     let current_focus_mismatch = candidate_has_current_focus_mismatch(candidate, current_focus);
     let explicit_return = has_explicit_current_focus_return_evidence(candidate, workstream);
-    if current_focus_mismatch && !explicit_return {
+    if current_focus_mismatch && !explicit_return && !candidate_is_completed_progress(candidate) {
         cap_candidate_score(candidate, 0.45, "current_focus_mismatch_no_return_origin");
         candidate
             .risk_flags
             .push("current_focus_differs_from_return_target".to_string());
     }
-    if current_focus_mismatch && candidate.recency_score < 0.40 && !explicit_return {
+    if current_focus_mismatch
+        && candidate.recency_score < 0.40
+        && !explicit_return
+        && !candidate_is_completed_progress(candidate)
+    {
         cap_candidate_score(candidate, 0.45, "stale_openable_target");
     }
     if let Some(target_id) = candidate
@@ -7279,6 +11678,11 @@ fn apply_candidate_risk_caps(
             Some("branch" | "support_source")
         ) && !branch_became_primary(candidate, workstream)
         {
+            if candidate.memory_support_score > 0.0 {
+                candidate
+                    .warnings
+                    .push("memory_supports_branch_not_target".to_string());
+            }
             cap_candidate_score(candidate, 0.42, "branch_support_not_default_return_target");
             candidate.eligible_for_primary_selection = false;
             candidate.selection_demotion_reason =
@@ -7341,8 +11745,15 @@ fn confidence_cap_for_candidate(
             cap = f64::min(
                 cap,
                 match reason {
+                    "p8_diagnostic_only" => 0.10,
+                    "p8_background_consumption" => 0.20,
+                    "p8_divergence" | "p8_interruption_or_suppressed" => 0.25,
+                    "p8_current_focus_only" => 0.35,
+                    "p8_support_context_only" | "p8_needs_fresh_capture" => 0.42,
+                    "p8_low_evidence_sufficiency" => 0.42,
                     "media_tab_resolve_error_without_owned_error" => 0.35,
                     "evidence_only_candidate" | "unknown_open_loop" => 0.42,
+                    "memory_contradicts_candidate" => 0.42,
                     "no_target_artifact" => 0.44,
                     "current_focus_mismatch_no_return_origin"
                     | "stale_openable_target"
@@ -7373,6 +11784,10 @@ fn actionability_score(candidate: &ScoredContinueCandidate) -> f64 {
         "resolve_error" => 0.96,
         "continue_edit" => 0.92,
         "continue_reply" => 0.9,
+        "review_completed_changes" => 0.88,
+        "commit_completed_changes" => 0.86,
+        "manual_verify_app_behavior" => 0.84,
+        "needs_fresh_capture" => 0.48,
         "rerun_command" => 0.86,
         "verify_output" => 0.82,
         "resume_chat_reasoning" => 0.78,
@@ -7412,6 +11827,9 @@ fn unresolved_score(candidate: &ScoredContinueCandidate, workstream: &ScorerWork
         ) {
             ("resolve_error", "error_without_resolution") => 1.0,
             ("continue_reply", "draft_active") => 0.94,
+            ("review_completed_changes", "completed_progress") => 0.86,
+            ("commit_completed_changes", "completed_progress") => 0.84,
+            ("manual_verify_app_behavior", "completed_progress") => 0.82,
             ("return_to_primary_artifact", "search_branch_without_return") => 0.92,
             ("return_to_primary_artifact", "verification_without_return") => 0.88,
             ("verify_output", "verification_without_return") => 0.86,
@@ -7427,6 +11845,7 @@ fn unresolved_score(candidate: &ScoredContinueCandidate, workstream: &ScorerWork
     ) {
         ("resolve_error", Some("visible_error_or_failure")) => 1.0,
         ("continue_reply", Some("draft_or_composer_active")) => 0.92,
+        ("review_completed_changes", Some("completed_progress")) => 0.86,
         ("verify_output", Some("verification_without_return")) => 0.88,
         ("return_to_primary_artifact", Some("branch_without_return")) => 0.86,
         ("continue_edit", Some("idle_after_progress")) => 0.84,
@@ -7715,6 +12134,20 @@ fn candidate_has_target_owned_blocker(candidate: &ScoredContinueCandidate) -> bo
         })
 }
 
+fn candidate_is_completed_progress(candidate: &ScoredContinueCandidate) -> bool {
+    matches!(
+        candidate.candidate_kind.as_str(),
+        "review_completed_changes" | "commit_completed_changes" | "manual_verify_app_behavior"
+    ) || candidate
+        .open_loop
+        .as_ref()
+        .is_some_and(|open_loop| open_loop.boundary_kind == "completed_progress")
+        || candidate
+            .last_meaningful_action
+            .as_ref()
+            .is_some_and(scorer_action_completed_successfully)
+}
+
 fn candidate_has_high_risk_selection(candidate: &ScoredContinueCandidate) -> bool {
     !candidate.eligible_for_primary_selection
         || candidate.score_caps_applied.iter().any(|cap| {
@@ -7724,8 +12157,9 @@ fn candidate_has_high_risk_selection(candidate: &ScoredContinueCandidate) -> boo
                     | "score_capped:stale_openable_target"
                     | "score_capped:media_tab_resolve_error_without_owned_error"
                     | "score_capped:branch_support_not_default_return_target"
-            )
+            ) || cap.starts_with("score_capped:p8_")
         })
+        || activity_role_is_suppressed(candidate.continuation_role.as_deref())
 }
 
 fn apply_candidate_dominance_rules(
@@ -7790,6 +12224,8 @@ fn warnings_have_local_fallback_risk(warnings: &[String]) -> bool {
             || warning == "current_focus_differs_from_return_target"
             || warning.starts_with("score_capped:")
             || warning.starts_with("selection_demoted:")
+            || warning.starts_with("p8_activity:")
+            || warning.starts_with("p8_role:")
             || warning == "candidate_score_capped_or_demoted"
             || warning.starts_with("micro_inference_validation_failed:")
     })
@@ -7937,6 +12373,12 @@ fn candidate_kind_for_action(
     target: Option<&ScorerArtifact>,
     primary: Option<&ScorerArtifact>,
 ) -> (&'static str, &'static str) {
+    if scorer_action_completed_successfully(action) {
+        return (
+            "review_completed_changes",
+            "completed_progress_ready_for_review",
+        );
+    }
     match action.action_kind.as_str() {
         "editing" | "idle_after_progress"
             if target
@@ -8048,6 +12490,15 @@ fn productize_continue_label(raw: &str) -> Option<String> {
         "last_meaningful_composer" => "A draft or composer was active.",
         "last_meaningful_command" => "A command had just been run.",
         "last_meaningful_output_review" => "Output was being reviewed.",
+        "completed_progress" => "Work appears completed and verified.",
+        "completed_progress_ready_for_review" => {
+            "Completed work is ready for review, commit, or manual verification."
+        }
+        "review_completed_changes" => {
+            "Review completed changes, commit them, or manually verify behavior."
+        }
+        "commit_completed_changes" => "Commit the completed changes.",
+        "manual_verify_app_behavior" => "Run the app and manually verify behavior.",
         "last_meaningful_search" => "Search was the last meaningful branch.",
         "last_meaningful_reading" => "Reading was the last meaningful activity.",
         "last_meaningful_action_fallback" => "This is based on the last visible meaningful action.",
@@ -8114,7 +12565,7 @@ fn missing_evidence_for_candidate(
     if candidate.last_meaningful_action.is_none() {
         missing.push("no_last_meaningful_action".to_string());
     }
-    if workstream.unresolved_signal.is_none() {
+    if workstream.unresolved_signal.is_none() && !candidate_is_completed_progress(candidate) {
         missing.push("no_unresolved_signal".to_string());
     }
     if candidate
@@ -8186,6 +12637,10 @@ fn warnings_for_candidate(
 }
 
 fn next_action_for_candidate(candidate: &ScoredContinueCandidate) -> String {
+    if candidate_is_completed_progress(candidate) {
+        return "Review the completed changes, commit them, or run the app to manually verify behavior."
+            .to_string();
+    }
     if let Some(next_action) = candidate
         .open_loop
         .as_ref()
@@ -8202,6 +12657,19 @@ fn next_action_for_candidate(candidate: &ScoredContinueCandidate) -> String {
         "resolve_error" => format!("Return to {} and resolve the visible error.", target),
         "continue_edit" => format!("Return to {} and continue the last edit.", target),
         "continue_reply" => format!("Return to {} and finish the draft or reply.", target),
+        "review_completed_changes" => {
+            "Review the completed changes, commit them, or run the app to manually verify behavior."
+                .to_string()
+        }
+        "commit_completed_changes" => {
+            format!("Return to {} and commit the completed changes.", target)
+        }
+        "manual_verify_app_behavior" => {
+            format!("Return to {} and manually verify the app behavior.", target)
+        }
+        "needs_fresh_capture" => {
+            "Capture fresh app content before naming an exact continuation target.".to_string()
+        }
         "verify_output" => format!("Inspect {} and verify the last output.", target),
         "rerun_command" => format!(
             "Return to {} and rerun or continue the command flow.",
@@ -8246,8 +12714,10 @@ fn evaluate_continue_decision_quality(
     evidence: &CandidateEvidencePackV2,
 ) -> ContinueDecisionQualityGate {
     let target_role = evidence.target.output_risk.as_str();
+    let p8_suppressed_role = activity_role_is_suppressed(candidate.continuation_role.as_deref());
     let target_grounded = candidate.target_artifact.is_some()
         && candidate.candidate_kind != "evidence_only"
+        && !p8_suppressed_role
         && !matches!(
             target_role,
             "current_focus_only" | "distractor" | "support_only"
@@ -8304,6 +12774,9 @@ fn evaluate_continue_decision_quality(
         "resolve_error"
             | "continue_edit"
             | "continue_reply"
+            | "review_completed_changes"
+            | "commit_completed_changes"
+            | "manual_verify_app_behavior"
             | "verify_output"
             | "rerun_command"
             | "return_to_primary_artifact"
@@ -8322,7 +12795,12 @@ fn evaluate_continue_decision_quality(
             .is_some_and(|(focus_id, target_id)| focus_id == target_id)
         || matches!(
             candidate.candidate_kind.as_str(),
-            "return_to_primary_artifact" | "finish_search" | "evidence_only"
+            "return_to_primary_artifact"
+                | "finish_search"
+                | "evidence_only"
+                | "review_completed_changes"
+                | "commit_completed_changes"
+                | "manual_verify_app_behavior"
         );
     let source_provenance_clear = candidate.reason.is_some()
         || open_loop
@@ -8334,6 +12812,18 @@ fn evaluate_continue_decision_quality(
     let mut warnings = candidate.warnings.clone();
     if !target_grounded {
         fatal_missing.push("target_not_grounded".to_string());
+    }
+    if p8_suppressed_role {
+        fatal_missing.push(
+            candidate
+                .continuation_role
+                .as_deref()
+                .map(|role| format!("p8_suppressed_role:{}", role))
+                .unwrap_or_else(|| "p8_suppressed_role".to_string()),
+        );
+    }
+    if candidate.evidence_sufficiency_score > 0.0 && candidate.evidence_sufficiency_score < 0.50 {
+        warnings.push("p8_low_evidence_sufficiency".to_string());
     }
     if !target_openable_or_inspectable {
         warnings.push("target_not_openable_or_inspectable".to_string());
@@ -8464,6 +12954,8 @@ fn evaluate_continue_decision_quality(
             || warning == "current_focus_differs_from_return_target"
             || warning.starts_with("score_capped:")
             || warning.starts_with("selection_demoted:")
+            || warning.starts_with("p8_activity:")
+            || warning.starts_with("p8_role:")
             || warning == "candidate_score_capped_or_demoted"
     }) || !candidate.eligible_for_primary_selection;
     if matches!(output_mode, ContinueOutputMode::StrongContinue) && risky_for_strong_output {
@@ -8724,6 +13216,17 @@ fn build_candidate_evidence_pack_v2(
             .cloned()
             .collect(),
         candidate_failure_risks: candidate.warnings.iter().take(10).cloned().collect(),
+        app_family: candidate.app_family.clone(),
+        surface_type: candidate.surface_type.clone(),
+        activity_intent: candidate.activity_intent.clone(),
+        task_phase: candidate.task_phase.clone(),
+        continuation_role: candidate.continuation_role.clone(),
+        work_value_score: round_score(candidate.work_value_score),
+        divergence_score: round_score(candidate.divergence_score),
+        diagnostic_score: round_score(candidate.diagnostic_score),
+        evidence_sufficiency_score: round_score(candidate.evidence_sufficiency_score),
+        work_value_reason: candidate.work_value_reason.clone(),
+        why_not_primary: candidate.why_not_primary.clone(),
     }
 }
 
@@ -8816,6 +13319,7 @@ fn build_micro_inference_pack(
     workstreams: &[ScorerWorkstream],
     candidates: &[ScoredContinueCandidate],
     candidate_limit: usize,
+    continue_dossier: Option<&ContinueDossierV1>,
 ) -> Result<ContinueMicroInferencePack, String> {
     let selected_candidates =
         select_recall_first_candidates(current_focus, workstreams, candidates, candidate_limit);
@@ -8912,6 +13416,25 @@ fn build_micro_inference_pack(
                     .map(|action| action.id.clone()),
                 evidence_episode_id: candidate.supporting_episode_id.clone(),
                 missing_evidence: candidate.missing_evidence.clone(),
+                memory_support_score: round_score(candidate.memory_support_score),
+                memory_contradiction_score: round_score(candidate.memory_contradiction_score),
+                feedback_prior_score: round_signed_score(candidate.feedback_prior_score),
+                work_value_score: round_score(candidate.work_value_score),
+                resume_likelihood_score: round_score(candidate.resume_likelihood_score),
+                divergence_score: round_score(candidate.divergence_score),
+                diagnostic_score: round_score(candidate.diagnostic_score),
+                objective_relation_score: round_score(candidate.objective_relation_score),
+                interaction_depth_score: round_score(candidate.interaction_depth_score),
+                evidence_sufficiency_score: round_score(candidate.evidence_sufficiency_score),
+                app_family: candidate.app_family.clone(),
+                surface_type: candidate.surface_type.clone(),
+                activity_intent: candidate.activity_intent.clone(),
+                task_phase: candidate.task_phase.clone(),
+                continuation_role: candidate.continuation_role.clone(),
+                work_value_reason: candidate.work_value_reason.clone(),
+                why_not_primary: candidate.why_not_primary.clone(),
+                memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
+                memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
                 local_reason: candidate
                     .open_loop
                     .as_ref()
@@ -8934,7 +13457,7 @@ fn build_micro_inference_pack(
 
     Ok(ContinueMicroInferencePack {
         schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
-        instructions: "Candidate IDs provided are the only valid choices. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
+        instructions: "Candidate IDs provided are the only valid choices. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Never select a candidate whose continuation_role is divergence, diagnostic_only, interruption, background_consumption, support_context, current_focus_only, suppressed, or needs_fresh_capture. Reject high confidence when evidence_sufficiency_score is below 0.50. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
         current_focus: model_safe_current_focus(current_focus),
         current_surface: current_surface.and_then(|surface| current_surface_for_model(surface, now_ms)),
         workstreams: pack_workstreams,
@@ -8942,6 +13465,7 @@ fn build_micro_inference_pack(
         evidence_packs_v2,
         artifact_roles,
         breadcrumbs,
+        continue_dossier: continue_dossier.cloned(),
     })
 }
 
@@ -8996,7 +13520,13 @@ fn select_recall_first_candidates(
             .filter(|candidate| {
                 matches!(
                     candidate.candidate_kind.as_str(),
-                    "continue_edit" | "continue_reply" | "rerun_command" | "verify_output"
+                    "continue_edit"
+                        | "continue_reply"
+                        | "review_completed_changes"
+                        | "commit_completed_changes"
+                        | "manual_verify_app_behavior"
+                        | "rerun_command"
+                        | "verify_output"
                 ) || candidate
                     .last_meaningful_action
                     .as_ref()
@@ -9377,6 +13907,7 @@ fn classify_micro_inference_validation_failure(
         | "handoff_why_this_count_invalid"
         | "handoff_why_this_empty"
         | "high_confidence_with_thin_local_evidence"
+        | "high_confidence_with_low_p8_evidence_sufficiency"
         | "high_confidence_with_quality_gate_risks" => MicroInferenceValidationSeverity::Soft,
         "next_action_incompatible_with_candidate" => {
             if model_next_action_can_be_locally_replaced(output, candidate) {
@@ -9393,6 +13924,7 @@ fn classify_micro_inference_validation_failure(
         | "escape_hatch_cannot_claim_high_confidence"
         | "need_more_evidence_requires_capture_recommendation"
         | "escape_hatch_must_not_select_candidate"
+        | "p8_suppressed_candidate_role"
         | "branch_or_support_target_promoted_without_strong_local_score" => {
             MicroInferenceValidationSeverity::Hard
         }
@@ -9483,6 +14015,9 @@ fn classify_micro_inference_validation_failures(
         if !candidate_has_human_return_target(candidate) {
             hard_failures.push("selected_candidate_without_human_return_target".to_string());
         }
+        if activity_role_is_suppressed(candidate.continuation_role.as_deref()) {
+            hard_failures.push("p8_suppressed_candidate_role".to_string());
+        }
     }
 
     for failure in failures {
@@ -9527,6 +14062,12 @@ fn confidence_for_soft_recovered_micro_inference(
     if soft_failures
         .iter()
         .any(|failure| failure == "high_confidence_with_thin_local_evidence")
+    {
+        cap = f64::min(cap, 0.49);
+    }
+    if soft_failures
+        .iter()
+        .any(|failure| failure == "high_confidence_with_low_p8_evidence_sufficiency")
     {
         cap = f64::min(cap, 0.49);
     }
@@ -9665,6 +14206,15 @@ fn validate_micro_inference_output(
             })
     {
         failures.push("high_confidence_with_quality_gate_risks".to_string());
+    }
+    if output.confidence == "high"
+        && candidate.evidence_sufficiency_score > 0.0
+        && candidate.evidence_sufficiency_score < 0.50
+    {
+        failures.push("high_confidence_with_low_p8_evidence_sufficiency".to_string());
+    }
+    if activity_role_is_suppressed(candidate.continuation_role.as_deref()) {
+        failures.push("p8_suppressed_candidate_role".to_string());
     }
     if branch_support_target_requires_local_candidate_guard(&candidate) {
         failures.push("branch_or_support_target_promoted_without_strong_local_score".to_string());
@@ -10122,30 +14672,31 @@ fn insert_feedback_event(
         "continue-feedback-{}",
         stable_hash(format!("{}:{}:{}", decision_id, event_kind, timestamp_ms).as_bytes())
     );
-    conn.execute(
-        "INSERT OR IGNORE INTO continue_feedback_events (
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO continue_feedback_events (
             id, decision_id, event_kind, observed_frame_id, target_artifact_id,
             chosen_artifact_id, timestamp_ms, confidence, reason,
             selected_candidate_id, workstream_id, note, source
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            id,
-            decision_id,
-            event_kind,
-            observed_frame_id,
-            target_artifact_id,
-            chosen_artifact_id,
-            timestamp_ms,
-            confidence,
-            reason,
-            Option::<String>::None,
-            Option::<String>::None,
-            Option::<String>::None,
-            "inferred",
-        ],
-    )
-    .map_err(to_string)?;
-    Ok(ContinueFeedbackEventResult {
+            params![
+                id,
+                decision_id,
+                event_kind,
+                observed_frame_id,
+                target_artifact_id,
+                chosen_artifact_id,
+                timestamp_ms,
+                confidence,
+                reason,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                "inferred",
+            ],
+        )
+        .map_err(to_string)?;
+    let result = ContinueFeedbackEventResult {
         id,
         decision_id: Some(decision_id.to_string()),
         selected_candidate_id: None,
@@ -10159,7 +14710,700 @@ fn insert_feedback_event(
         reason: Some(reason.to_string()),
         note: None,
         source: Some("inferred".to_string()),
-    })
+    };
+    if inserted > 0 {
+        update_continue_ranking_priors_from_feedback(conn, &result)?;
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackLearningContext {
+    decision_source: Option<String>,
+    decision_model: Option<String>,
+    current_focus_artifact_id: Option<String>,
+    selected_workstream_id: Option<String>,
+    selected_candidate_id: Option<String>,
+    return_target_artifact_id: Option<String>,
+    selected_candidate_kind: Option<String>,
+    selected_target_artifact_id: Option<String>,
+    selected_target_kind: Option<String>,
+    selected_target_openability: Option<String>,
+    workstream_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackArtifactFeatures {
+    artifact_id: String,
+    artifact_kind: Option<String>,
+    openability: Option<String>,
+}
+
+fn update_continue_ranking_priors_from_feedback(
+    conn: &Connection,
+    event: &ContinueFeedbackEventResult,
+) -> Result<(), String> {
+    if matches!(event.event_kind.as_str(), "user_next_step_note") {
+        return Ok(());
+    }
+    let now_ms = event.timestamp_ms;
+    let context = event
+        .decision_id
+        .as_deref()
+        .and_then(|decision_id| load_feedback_learning_context(conn, decision_id).transpose())
+        .transpose()?;
+    let source = event
+        .source
+        .as_deref()
+        .or_else(|| {
+            context
+                .as_ref()
+                .and_then(|ctx| ctx.decision_source.as_deref())
+        })
+        .unwrap_or("unknown");
+
+    match event.event_kind.as_str() {
+        "accepted" | "auto_resumed" => {
+            let target_id = event
+                .chosen_artifact_id
+                .as_deref()
+                .or(event.target_artifact_id.as_deref())
+                .or_else(|| {
+                    context
+                        .as_ref()
+                        .and_then(|ctx| ctx.return_target_artifact_id.as_deref())
+                });
+            update_feedback_priors_for_target(
+                conn,
+                &context,
+                target_id,
+                "positive",
+                event.confidence,
+                source,
+                event,
+                now_ms,
+            )?;
+            maybe_insert_continue_eval_fixture_from_feedback(conn, event, &context, now_ms)?;
+        }
+        "corrected" => {
+            let rejected_id = event.target_artifact_id.as_deref().or_else(|| {
+                context
+                    .as_ref()
+                    .and_then(|ctx| ctx.return_target_artifact_id.as_deref())
+            });
+            let preferred_id = event.chosen_artifact_id.as_deref();
+            update_feedback_priors_for_target(
+                conn,
+                &context,
+                rejected_id,
+                "negative",
+                event.confidence,
+                source,
+                event,
+                now_ms,
+            )?;
+            update_feedback_priors_for_target(
+                conn,
+                &context,
+                preferred_id,
+                "corrected",
+                event.confidence,
+                source,
+                event,
+                now_ms,
+            )?;
+            insert_pairwise_preference_from_feedback(conn, event, &context, now_ms, source)?;
+            maybe_insert_continue_eval_fixture_from_feedback(conn, event, &context, now_ms)?;
+        }
+        "rejected" | "artifact_only_evidence" | "ignored_workstream" => {
+            let target_id = event.target_artifact_id.as_deref().or_else(|| {
+                context
+                    .as_ref()
+                    .and_then(|ctx| ctx.return_target_artifact_id.as_deref())
+            });
+            update_feedback_priors_for_target(
+                conn,
+                &context,
+                target_id,
+                "negative",
+                event.confidence,
+                source,
+                event,
+                now_ms,
+            )?;
+            maybe_insert_continue_eval_fixture_from_feedback(conn, event, &context, now_ms)?;
+        }
+        "ignored" => {
+            let target_id = event.target_artifact_id.as_deref().or_else(|| {
+                context
+                    .as_ref()
+                    .and_then(|ctx| ctx.return_target_artifact_id.as_deref())
+            });
+            update_feedback_priors_for_target(
+                conn,
+                &context,
+                target_id,
+                "ignored",
+                event.confidence.min(0.55),
+                source,
+                event,
+                now_ms,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_feedback_learning_context(
+    conn: &Connection,
+    decision_id: &str,
+) -> Result<Option<FeedbackLearningContext>, String> {
+    conn.query_row(
+        "SELECT d.source, d.model, d.current_focus_artifact_id,
+                d.selected_workstream_id, d.selected_candidate_id,
+                d.return_target_artifact_id, c.candidate_kind,
+                c.target_artifact_id, a.artifact_kind, a.openability,
+                w.state
+         FROM continue_decisions d
+         LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
+         LEFT JOIN continue_artifacts a ON a.id = COALESCE(c.target_artifact_id, d.return_target_artifact_id)
+         LEFT JOIN continue_workstreams w ON w.id = COALESCE(c.workstream_id, d.selected_workstream_id)
+         WHERE d.id = ?1",
+        params![decision_id],
+        |row| {
+            Ok(FeedbackLearningContext {
+                decision_source: row.get(0)?,
+                decision_model: row.get(1)?,
+                current_focus_artifact_id: row.get(2)?,
+                selected_workstream_id: row.get(3)?,
+                selected_candidate_id: row.get(4)?,
+                return_target_artifact_id: row.get(5)?,
+                selected_candidate_kind: row.get(6)?,
+                selected_target_artifact_id: row.get(7)?,
+                selected_target_kind: row.get(8)?,
+                selected_target_openability: row.get(9)?,
+                workstream_state: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn load_feedback_artifact_features(
+    conn: &Connection,
+    artifact_id: &str,
+) -> Result<FeedbackArtifactFeatures, String> {
+    let loaded = conn
+        .query_row(
+            "SELECT artifact_kind, openability
+             FROM continue_artifacts
+             WHERE id = ?1",
+            params![artifact_id],
+            |row| {
+                Ok(FeedbackArtifactFeatures {
+                    artifact_id: artifact_id.to_string(),
+                    artifact_kind: row.get(0)?,
+                    openability: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    Ok(loaded.unwrap_or_else(|| FeedbackArtifactFeatures {
+        artifact_id: artifact_id.to_string(),
+        artifact_kind: None,
+        openability: None,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_feedback_priors_for_target(
+    conn: &Connection,
+    context: &Option<FeedbackLearningContext>,
+    target_artifact_id: Option<&str>,
+    outcome: &str,
+    confidence: f64,
+    source: &str,
+    event: &ContinueFeedbackEventResult,
+    now_ms: i64,
+) -> Result<(), String> {
+    let raw = serde_json::json!({
+        "feedback_event_id": event.id,
+        "feedback_kind": event.event_kind,
+        "decision_id": event.decision_id,
+        "target_artifact_id": target_artifact_id,
+        "source": source,
+        "note_present": event.note.as_ref().is_some_and(|note| !note.trim().is_empty()),
+    });
+    if let Some(artifact_id) = target_artifact_id.filter(|value| !value.trim().is_empty()) {
+        update_continue_ranking_prior(
+            conn,
+            "artifact_success",
+            &format!("artifact_id={}", artifact_id),
+            outcome,
+            confidence,
+            source,
+            &raw,
+            now_ms,
+        )?;
+        let artifact = load_feedback_artifact_features(conn, artifact_id)?;
+        if let Some(kind) = artifact
+            .artifact_kind
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "artifact_kind_success",
+                &format!("artifact_kind={}", kind),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+        if let Some(openability) = artifact
+            .openability
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "openability_reliability",
+                &format!("openability={}", openability),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+    }
+    if let Some(ctx) = context {
+        if let Some(candidate_kind) = ctx
+            .selected_candidate_kind
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "candidate_kind_success",
+                &format!("candidate_kind={}", candidate_kind),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+        if let Some(state) = ctx
+            .workstream_state
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "workstream_state_success",
+                &format!("state={}", state),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+        if let Some(decision_source) = ctx
+            .decision_source
+            .as_deref()
+            .or(Some(source))
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "source_surface_reliability",
+                &format!("source={}", decision_source),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+        if let Some(model) = ctx
+            .decision_model
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            update_continue_ranking_prior(
+                conn,
+                "model_source_success",
+                &format!("model={}", model),
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+        let target_for_mismatch = target_artifact_id.or(ctx.selected_target_artifact_id.as_deref());
+        if let (Some(current), Some(target)) = (
+            ctx.current_focus_artifact_id.as_deref(),
+            target_for_mismatch,
+        ) {
+            let mismatch_key = if current == target {
+                "current_focus_match=true"
+            } else {
+                "current_focus_match=false"
+            };
+            update_continue_ranking_prior(
+                conn,
+                "current_focus_mismatch_penalty",
+                mismatch_key,
+                outcome,
+                confidence,
+                source,
+                &raw,
+                now_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_continue_ranking_prior(
+    conn: &Connection,
+    prior_kind: &str,
+    key: &str,
+    outcome: &str,
+    _confidence: f64,
+    source: &str,
+    raw_json: &Value,
+    now_ms: i64,
+) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Ok(());
+    }
+    let (positive, negative, corrected, ignored) = match outcome {
+        "positive" => (1_i64, 0_i64, 0_i64, 0_i64),
+        "corrected" => (1_i64, 0_i64, 1_i64, 0_i64),
+        "negative" => (0_i64, 1_i64, 0_i64, 0_i64),
+        "ignored" => (0_i64, 0_i64, 0_i64, 1_i64),
+        _ => (0_i64, 0_i64, 0_i64, 0_i64),
+    };
+    let id = format!(
+        "continue-prior-{}",
+        stable_hash(format!("{}:{}", prior_kind, key).as_bytes())
+    );
+    conn.execute(
+        "INSERT INTO continue_ranking_priors (
+            id, prior_kind, key, positive_count, negative_count, corrected_count,
+            ignored_count, weight, confidence, last_updated_ms, source, raw_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, ?8, ?9, ?10)
+         ON CONFLICT(prior_kind, key) DO UPDATE SET
+            positive_count = positive_count + excluded.positive_count,
+            negative_count = negative_count + excluded.negative_count,
+            corrected_count = corrected_count + excluded.corrected_count,
+            ignored_count = ignored_count + excluded.ignored_count,
+            last_updated_ms = excluded.last_updated_ms,
+            source = excluded.source,
+            raw_json = excluded.raw_json",
+        params![
+            id,
+            prior_kind,
+            key,
+            positive,
+            negative,
+            corrected,
+            ignored,
+            now_ms,
+            source,
+            serde_json::to_string(raw_json).map_err(to_string)?,
+        ],
+    )
+    .map_err(to_string)?;
+    refresh_continue_ranking_prior_weight(conn, prior_kind, key)
+}
+
+fn refresh_continue_ranking_prior_weight(
+    conn: &Connection,
+    prior_kind: &str,
+    key: &str,
+) -> Result<(), String> {
+    let (positive, negative, corrected, ignored) = conn
+        .query_row(
+            "SELECT positive_count, negative_count, corrected_count, ignored_count
+             FROM continue_ranking_priors
+             WHERE prior_kind = ?1 AND key = ?2",
+            params![prior_kind, key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .map_err(to_string)?;
+    let total = (positive + negative + corrected + ignored).max(1) as f64;
+    let confidence = (total / 5.0).min(1.0);
+    let signed =
+        (positive as f64 + corrected as f64 * 0.75 - negative as f64 - ignored as f64 * 0.35)
+            / total;
+    let weight = round_signed_score((signed * confidence * 0.25).clamp(-0.25, 0.25));
+    conn.execute(
+        "UPDATE continue_ranking_priors
+         SET weight = ?3, confidence = ?4
+         WHERE prior_kind = ?1 AND key = ?2",
+        params![prior_kind, key, weight, round_score(confidence)],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn insert_pairwise_preference_from_feedback(
+    conn: &Connection,
+    event: &ContinueFeedbackEventResult,
+    context: &Option<FeedbackLearningContext>,
+    now_ms: i64,
+    source: &str,
+) -> Result<(), String> {
+    let Some(decision_id) = event.decision_id.as_deref() else {
+        return Ok(());
+    };
+    let preferred_artifact_id = event.chosen_artifact_id.as_deref();
+    let rejected_artifact_id = event.target_artifact_id.as_deref().or_else(|| {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.return_target_artifact_id.as_deref())
+    });
+    if preferred_artifact_id.is_none() || rejected_artifact_id.is_none() {
+        return Ok(());
+    }
+    let workstream_id = event.workstream_id.as_deref().or_else(|| {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.selected_workstream_id.as_deref())
+    });
+    let preferred_candidate_id =
+        find_candidate_id_for_artifact(conn, workstream_id, preferred_artifact_id)?;
+    let rejected_candidate_id = event.selected_candidate_id.as_deref().or_else(|| {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.selected_candidate_id.as_deref())
+    });
+    let snapshot = serde_json::json!({
+        "feedback_event_id": event.id,
+        "feedback_kind": event.event_kind,
+        "preferred_artifact_id": preferred_artifact_id,
+        "rejected_artifact_id": rejected_artifact_id,
+        "preferred_candidate_id": preferred_candidate_id,
+        "rejected_candidate_id": rejected_candidate_id,
+        "workstream_id": workstream_id,
+        "selected_candidate_kind": context.as_ref().and_then(|ctx| ctx.selected_candidate_kind.clone()),
+        "selected_target_kind": context.as_ref().and_then(|ctx| ctx.selected_target_kind.clone()),
+        "selected_target_openability": context.as_ref().and_then(|ctx| ctx.selected_target_openability.clone()),
+        "workstream_state": context.as_ref().and_then(|ctx| ctx.workstream_state.clone()),
+        "note_present": event.note.as_ref().is_some_and(|note| !note.trim().is_empty()),
+    });
+    let id = format!(
+        "continue-pairwise-{}",
+        stable_hash(format!("{}:{}", decision_id, event.id).as_bytes())
+    );
+    conn.execute(
+        "INSERT OR IGNORE INTO continue_pairwise_preferences (
+            id, decision_id, preferred_candidate_id, rejected_candidate_id,
+            preferred_artifact_id, rejected_artifact_id, workstream_id,
+            feature_snapshot_json, created_at_ms, source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            id,
+            decision_id,
+            preferred_candidate_id,
+            rejected_candidate_id,
+            preferred_artifact_id,
+            rejected_artifact_id,
+            workstream_id,
+            serde_json::to_string(&snapshot).map_err(to_string)?,
+            now_ms,
+            source,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn find_candidate_id_for_artifact(
+    conn: &Connection,
+    workstream_id: Option<&str>,
+    artifact_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(None);
+    };
+    if let Some(workstream_id) = workstream_id {
+        return conn
+            .query_row(
+                "SELECT id
+                 FROM continue_candidates
+                 WHERE workstream_id = ?1 AND target_artifact_id = ?2
+                 ORDER BY score DESC
+                 LIMIT 1",
+                params![workstream_id, artifact_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string);
+    }
+    conn.query_row(
+        "SELECT id
+         FROM continue_candidates
+         WHERE target_artifact_id = ?1
+         ORDER BY score DESC
+         LIMIT 1",
+        params![artifact_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn maybe_insert_continue_eval_fixture_from_feedback(
+    conn: &Connection,
+    event: &ContinueFeedbackEventResult,
+    context: &Option<FeedbackLearningContext>,
+    now_ms: i64,
+) -> Result<(), String> {
+    if event.confidence < 0.6 {
+        return Ok(());
+    }
+    let Some(decision_id) = event.decision_id.as_deref() else {
+        return Ok(());
+    };
+    let fixture_kind = match event.event_kind.as_str() {
+        "corrected" => "corrected_target",
+        "rejected" => "rejected_target",
+        "ignored_workstream" => "ignored_workstream",
+        "artifact_only_evidence" => "source_false_positive",
+        "accepted" | "auto_resumed" => "accepted_regression_guard",
+        _ => return Ok(()),
+    };
+    let expected_return_artifact_id = match event.event_kind.as_str() {
+        "corrected" => event.chosen_artifact_id.clone(),
+        "accepted" | "auto_resumed" => event
+            .chosen_artifact_id
+            .clone()
+            .or_else(|| event.target_artifact_id.clone())
+            .or_else(|| {
+                context
+                    .as_ref()
+                    .and_then(|ctx| ctx.return_target_artifact_id.clone())
+            }),
+        _ => None,
+    };
+    let expected_no_clear = matches!(
+        event.event_kind.as_str(),
+        "rejected" | "ignored_workstream" | "artifact_only_evidence"
+    );
+    let expected_workstream_id = event.workstream_id.clone().or_else(|| {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.selected_workstream_id.clone())
+    });
+    let input_snapshot = build_feedback_eval_input_snapshot(conn, decision_id, context, event)?;
+    let expected_assertions = serde_json::json!({
+        "feedback_event_id": event.id,
+        "feedback_kind": event.event_kind,
+        "expected_return_artifact_id": expected_return_artifact_id,
+        "expected_workstream_id": expected_workstream_id,
+        "expected_no_clear": expected_no_clear,
+        "privacy": "summary_only_no_note_text",
+    });
+    let id = format!(
+        "continue-fixture-{}",
+        stable_hash(format!("{}:{}:{}", decision_id, event.id, fixture_kind).as_bytes())
+    );
+    conn.execute(
+        "INSERT OR IGNORE INTO continue_eval_fixtures (
+            id, created_at_ms, source_decision_id, fixture_kind,
+            expected_return_artifact_id, expected_workstream_id, expected_no_clear,
+            input_snapshot_json, expected_assertions_json, status
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')",
+        params![
+            id,
+            now_ms,
+            decision_id,
+            fixture_kind,
+            expected_return_artifact_id,
+            expected_workstream_id,
+            if expected_no_clear { 1_i64 } else { 0_i64 },
+            serde_json::to_string(&input_snapshot).map_err(to_string)?,
+            serde_json::to_string(&expected_assertions).map_err(to_string)?,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn build_feedback_eval_input_snapshot(
+    conn: &Connection,
+    decision_id: &str,
+    context: &Option<FeedbackLearningContext>,
+    event: &ContinueFeedbackEventResult,
+) -> Result<Value, String> {
+    let workstream_id = event.workstream_id.as_deref().or_else(|| {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.selected_workstream_id.as_deref())
+    });
+    let mut candidates = Vec::new();
+    if let Some(workstream_id) = workstream_id {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.workstream_id, c.target_artifact_id, c.candidate_kind,
+                        c.score, c.created_at_ms, a.artifact_kind, a.openability,
+                        w.state, c.missing_evidence
+                 FROM continue_candidates c
+                 LEFT JOIN continue_artifacts a ON a.id = c.target_artifact_id
+                 LEFT JOIN continue_workstreams w ON w.id = c.workstream_id
+                 WHERE c.workstream_id = ?1
+                 ORDER BY c.score DESC
+                 LIMIT 12",
+            )
+            .map_err(to_string)?;
+        let rows = stmt
+            .query_map(params![workstream_id], |row| {
+                Ok(serde_json::json!({
+                    "candidate_id": row.get::<_, String>(0)?,
+                    "workstream_id": row.get::<_, String>(1)?,
+                    "target_artifact_id": row.get::<_, Option<String>>(2)?,
+                    "candidate_kind": row.get::<_, String>(3)?,
+                    "score": row.get::<_, f64>(4)?,
+                    "created_at_ms": row.get::<_, i64>(5)?,
+                    "artifact_kind": row.get::<_, Option<String>>(6)?,
+                    "openability": row.get::<_, Option<String>>(7)?,
+                    "workstream_state": row.get::<_, Option<String>>(8)?,
+                    "warnings": row.get::<_, Option<String>>(9)?,
+                }))
+            })
+            .map_err(to_string)?;
+        candidates = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
+    }
+    Ok(serde_json::json!({
+        "schema": "smalltalk.continue_feedback_fixture_input.v1",
+        "decision_id": decision_id,
+        "feedback_event_id": event.id,
+        "selected_candidate_id": context.as_ref().and_then(|ctx| ctx.selected_candidate_id.clone()),
+        "return_target_artifact_id": context.as_ref().and_then(|ctx| ctx.return_target_artifact_id.clone()),
+        "current_focus_artifact_id": context.as_ref().and_then(|ctx| ctx.current_focus_artifact_id.clone()),
+        "workstream_id": workstream_id,
+        "candidates": candidates,
+        "note_present": event.note.as_ref().is_some_and(|note| !note.trim().is_empty()),
+    }))
 }
 
 fn default_continue_eval_fixture() -> ContinueEvalFixture {
@@ -10687,6 +15931,273 @@ fn summarize_continue_eval_fixture(
     })
 }
 
+pub fn run_continue_replay_eval(
+    conn: &Connection,
+    input: Option<ContinueReplayEvalInput>,
+) -> Result<ContinueReplayEvalReport, String> {
+    ensure_continue_schema(conn)?;
+    let input = input.unwrap_or(ContinueReplayEvalInput {
+        include_inactive: None,
+        fixture_kind: None,
+        limit: None,
+    });
+    let include_inactive = input.include_inactive.unwrap_or(false);
+    let limit = input.limit.unwrap_or(100).clamp(1, 500);
+    let mut sql = "SELECT id, fixture_kind, source_decision_id, expected_return_artifact_id,
+                          expected_workstream_id, expected_no_clear, input_snapshot_json,
+                          expected_assertions_json
+                   FROM continue_eval_fixtures"
+        .to_string();
+    let mut filters = Vec::new();
+    if !include_inactive {
+        filters.push("status = 'active'".to_string());
+    }
+    if input
+        .fixture_kind
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        filters.push("fixture_kind = ?1".to_string());
+    }
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&filters.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_at_ms DESC LIMIT ");
+    sql.push_str(&limit.to_string());
+
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
+    let rows = if let Some(kind) = input
+        .fixture_kind
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        stmt.query_map(params![kind], |row| replay_fixture_row_to_report(conn, row))
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    } else {
+        stmt.query_map([], |row| replay_fixture_row_to_report(conn, row))
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    };
+    let fixture_count = rows.len() as i64;
+    let denom = if fixture_count == 0 {
+        1.0
+    } else {
+        fixture_count as f64
+    };
+    let target_correct = rows
+        .iter()
+        .filter(|case| case.target_artifact_correct)
+        .count() as f64;
+    let workstream_correct = rows.iter().filter(|case| case.workstream_correct).count() as f64;
+    let no_clear_correct = rows.iter().filter(|case| case.no_clear_correct).count() as f64;
+    let recall = rows
+        .iter()
+        .filter(|case| case.candidate_rank.is_some_and(|rank| rank <= 3))
+        .count() as f64;
+    let mrr = rows.iter().map(|case| case.reciprocal_rank).sum::<f64>();
+    let branch_fp = rows
+        .iter()
+        .filter(|case| case.branch_support_false_positive)
+        .count() as f64;
+    let focus_fp = rows
+        .iter()
+        .filter(|case| case.current_focus_false_positive)
+        .count() as f64;
+    let stale_fp = rows
+        .iter()
+        .filter(|case| case.stale_target_false_positive)
+        .count() as f64;
+    let privacy_violation_count = rows.iter().filter(|case| case.privacy_violation).count() as i64;
+    let feedback_regression_count = rows.iter().filter(|case| case.regression).count() as i64;
+    Ok(ContinueReplayEvalReport {
+        schema: "smalltalk.continue_replay_eval.v1".to_string(),
+        evaluated_at_ms: current_time_millis(),
+        fixture_count,
+        target_artifact_accuracy: round_score(target_correct / denom),
+        workstream_accuracy: round_score(workstream_correct / denom),
+        no_clear_accuracy: round_score(no_clear_correct / denom),
+        candidate_recall_at_k: round_score(recall / denom),
+        mrr: round_score(mrr / denom),
+        branch_support_false_positive_rate: round_score(branch_fp / denom),
+        current_focus_false_positive_rate: round_score(focus_fp / denom),
+        stale_target_false_positive_rate: round_score(stale_fp / denom),
+        feedback_regression_count,
+        privacy_violation_count,
+        cases: rows,
+    })
+}
+
+fn replay_fixture_row_to_report(
+    conn: &Connection,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContinueReplayEvalCaseReport> {
+    let fixture_id: String = row.get(0)?;
+    let fixture_kind: String = row.get(1)?;
+    let source_decision_id: Option<String> = row.get(2)?;
+    let expected_return_artifact_id: Option<String> = row.get(3)?;
+    let expected_workstream_id: Option<String> = row.get(4)?;
+    let expected_no_clear = row.get::<_, i64>(5)? != 0;
+    let input_snapshot_json: String = row.get(6)?;
+    let expected_assertions_json: String = row.get(7)?;
+    let input_snapshot: Value =
+        serde_json::from_str(&input_snapshot_json).unwrap_or_else(|_| serde_json::json!({}));
+    let expected_assertions: Value =
+        serde_json::from_str(&expected_assertions_json).unwrap_or_else(|_| serde_json::json!({}));
+    Ok(evaluate_replay_fixture_snapshot(
+        conn,
+        fixture_id,
+        fixture_kind,
+        source_decision_id,
+        expected_return_artifact_id,
+        expected_workstream_id,
+        expected_no_clear,
+        input_snapshot,
+        expected_assertions,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_replay_fixture_snapshot(
+    conn: &Connection,
+    fixture_id: String,
+    fixture_kind: String,
+    source_decision_id: Option<String>,
+    expected_return_artifact_id: Option<String>,
+    expected_workstream_id: Option<String>,
+    expected_no_clear: bool,
+    input_snapshot: Value,
+    expected_assertions: Value,
+) -> ContinueReplayEvalCaseReport {
+    let current_focus_artifact_id = input_snapshot
+        .get("current_focus_artifact_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut candidates = input_snapshot
+        .get("candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    candidates.sort_by(|left, right| {
+        replay_adjusted_candidate_score(conn, right)
+            .partial_cmp(&replay_adjusted_candidate_score(conn, left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let selected = candidates.first();
+    let actual_return_artifact_id = selected
+        .and_then(|candidate| candidate.get("target_artifact_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let actual_workstream_id = selected
+        .and_then(|candidate| candidate.get("workstream_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let candidate_rank = expected_return_artifact_id.as_ref().and_then(|expected| {
+        candidates
+            .iter()
+            .position(|candidate| {
+                candidate
+                    .get("target_artifact_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| target == expected)
+            })
+            .map(|index| index as i64 + 1)
+    });
+    let reciprocal_rank = candidate_rank.map(|rank| 1.0 / rank as f64).unwrap_or(0.0);
+    let target_artifact_correct = if expected_no_clear {
+        actual_return_artifact_id.is_none()
+    } else {
+        expected_return_artifact_id == actual_return_artifact_id
+    };
+    let selected_score = selected
+        .map(|candidate| replay_adjusted_candidate_score(conn, candidate))
+        .unwrap_or(0.0);
+    let no_clear_correct = if expected_no_clear {
+        selected_score < 0.45
+    } else {
+        !expected_no_clear
+    };
+    let workstream_correct = expected_workstream_id
+        .as_ref()
+        .map(|expected| actual_workstream_id.as_deref() == Some(expected.as_str()))
+        .unwrap_or(true);
+    let warnings = selected
+        .and_then(|candidate| candidate.get("warnings"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let branch_support_false_positive =
+        !target_artifact_correct && warnings.contains("branch_support_not_default_return_target");
+    let current_focus_false_positive = !target_artifact_correct
+        && actual_return_artifact_id.is_some()
+        && actual_return_artifact_id == current_focus_artifact_id;
+    let stale_target_false_positive =
+        !target_artifact_correct && warnings.contains("stale_selected_target");
+    let serialized_assertions = expected_assertions.to_string();
+    let serialized_input = input_snapshot.to_string();
+    let privacy_violation = serialized_assertions.contains("\"note\"")
+        || serialized_input.contains("\"note\":\"")
+        || serialized_input.contains("\"raw_text\"");
+    let regression = !target_artifact_correct || !workstream_correct || !no_clear_correct;
+    let mut notes = Vec::new();
+    if expected_no_clear && selected_score >= 0.45 {
+        notes.push(format!(
+            "expected no clear continuation but top adjusted score was {}",
+            round_score(selected_score)
+        ));
+    }
+    if privacy_violation {
+        notes.push("fixture appears to contain raw note or raw text".to_string());
+    }
+    ContinueReplayEvalCaseReport {
+        fixture_id,
+        fixture_kind,
+        source_decision_id,
+        expected_return_artifact_id,
+        actual_return_artifact_id,
+        expected_workstream_id,
+        actual_workstream_id,
+        expected_no_clear,
+        target_artifact_correct,
+        workstream_correct,
+        no_clear_correct,
+        candidate_rank,
+        reciprocal_rank: round_score(reciprocal_rank),
+        branch_support_false_positive,
+        current_focus_false_positive,
+        stale_target_false_positive,
+        privacy_violation,
+        regression,
+        notes,
+    }
+}
+
+fn replay_adjusted_candidate_score(conn: &Connection, candidate: &Value) -> f64 {
+    let base = candidate
+        .get("score")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let artifact_id = candidate.get("target_artifact_id").and_then(Value::as_str);
+    let candidate_kind = candidate.get("candidate_kind").and_then(Value::as_str);
+    let artifact_kind = candidate.get("artifact_kind").and_then(Value::as_str);
+    let openability = candidate.get("openability").and_then(Value::as_str);
+    let workstream_state = candidate.get("workstream_state").and_then(Value::as_str);
+    let prior = feedback_prior_score_for_features(
+        conn,
+        artifact_id,
+        candidate_kind,
+        artifact_kind,
+        openability,
+        workstream_state,
+        None,
+    )
+    .unwrap_or(0.0);
+    round_score((base + prior).clamp(0.0, 1.0))
+}
+
 fn metric_ratio<F>(reports: &[ContinueEvalCaseReport], predicate: F) -> f64
 where
     F: Fn(&ContinueEvalCaseReport) -> bool,
@@ -10977,6 +16488,7 @@ fn compose_continue_handoff(
     model_output: Option<&ContinueMicroInferenceOutput>,
     quality_gate: Option<&ContinueDecisionQualityGate>,
     output_mode: &ContinueOutputMode,
+    activity_summary: Option<&ContinueActivitySummary>,
 ) -> ContinueHandoff {
     let confidence_label_value = handoff_confidence_label(confidence, output_mode);
     if matches!(
@@ -10994,6 +16506,7 @@ fn compose_continue_handoff(
             validation_failures,
             quality_gate,
             output_mode,
+            activity_summary,
         );
     }
     if let Some(output) = model_output {
@@ -11008,6 +16521,7 @@ fn compose_continue_handoff(
             validation_failures,
             quality_gate,
             output_mode,
+            activity_summary,
         );
         return ContinueHandoff {
             headline: clean_user_handoff_line(output.headline.clone(), 90)
@@ -11049,6 +16563,7 @@ fn compose_continue_handoff(
         validation_failures,
         quality_gate,
         output_mode,
+        activity_summary,
     )
 }
 
@@ -11063,6 +16578,7 @@ fn compose_local_continue_handoff(
     validation_failures: &[String],
     quality_gate: Option<&ContinueDecisionQualityGate>,
     output_mode: &ContinueOutputMode,
+    activity_summary: Option<&ContinueActivitySummary>,
 ) -> ContinueHandoff {
     let target_label = selected.and_then(human_return_target_label);
     if matches!(output_mode, ContinueOutputMode::NoClearContinuation)
@@ -11108,20 +16624,57 @@ fn compose_local_continue_handoff(
             .or_else(|| {
                 Some("I don't have a reliable app or page target for this yet.".to_string())
             });
+        let activity_main = activity_summary.and_then(|summary| summary.main_work.clone());
+        let activity_divergence =
+            activity_summary.and_then(|summary| summary.recent_divergence.first().cloned());
+        let activity_missing = activity_summary.and_then(|summary| {
+            if summary.missing_for_current_focus.is_empty() {
+                None
+            } else {
+                Some(summary.missing_for_current_focus.join(", "))
+            }
+        });
+        let last_state_line = if let Some(main) = activity_main.as_ref() {
+            format!(
+                "Latest meaningful signal: {}, but I do not have enough app content to name an exact task.",
+                main
+            )
+        } else {
+            "I do not have enough local evidence to identify a reliable unfinished task."
+                .to_string()
+        };
+        let mut why_this =
+            vec!["Local evidence is not specific enough for a confident continuation.".to_string()];
+        if let Some(divergence) = activity_divergence {
+            why_this.push(format!("Not using: {}.", divergence));
+        }
+        why_this.truncate(3);
+        let activity_uncertainty = activity_main.map(|main| {
+            if let Some(missing) = activity_missing {
+                format!(
+                    "{} looks like the main work, but missing: {}.",
+                    main, missing
+                )
+            } else {
+                format!("{} looks like the main work, but evidence is thin.", main)
+            }
+        });
         return ContinueHandoff {
             headline: "No reliable continuation target yet".to_string(),
             return_line: "No reliable return target is grounded yet.".to_string(),
             current_focus_line: focus_line,
-            last_state_line:
+            last_state_line: clean_user_handoff_line(last_state_line, 180).unwrap_or_else(|| {
                 "I do not have enough local evidence to identify a reliable unfinished task."
-                    .to_string(),
+                    .to_string()
+            }),
             next_action: fallback_next_action_for_output_mode(output_mode).to_string(),
-            why_this: vec![
-                "Local evidence is not specific enough for a confident continuation.".to_string(),
-            ],
+            why_this,
             missing_evidence_line: missing_line.clone(),
             confidence_label: "Thin".to_string(),
-            user_visible_uncertainty: uncertainty.or(missing_line),
+            user_visible_uncertainty: activity_uncertainty
+                .and_then(|line| clean_user_handoff_line(line, 180))
+                .or(uncertainty)
+                .or(missing_line),
         };
     }
     let target_label =
@@ -11161,11 +16714,69 @@ fn compose_local_continue_handoff(
             "Open the target and continue from the last meaningful state.".to_string()
         });
     let confidence_text = handoff_confidence_label(confidence, output_mode);
+    let missing_line =
+        visible_missing_evidence_line(missing_evidence, warnings, validation_failures);
+    if selected.is_some_and(candidate_is_completed_progress) {
+        let completed_state = selected
+            .and_then(|candidate| {
+                candidate
+                    .open_loop
+                    .as_ref()
+                    .and_then(|open_loop| open_loop.last_concrete_progress.as_deref())
+            })
+            .or_else(|| {
+                selected.and_then(|candidate| {
+                    candidate
+                        .last_meaningful_action
+                        .as_ref()
+                        .and_then(|action| action.semantic_after_hint.as_deref())
+                })
+            })
+            .unwrap_or("Completed verified work was observed");
+        let current_focus_line = if selected
+            .as_ref()
+            .is_some_and(|candidate| candidate_has_current_focus_mismatch(candidate, current_focus))
+        {
+            format!(
+                "Current focus later moved to {}; this completed workstream is still the strongest return point.",
+                focus_label
+            )
+        } else {
+            format!("Current focus is {}.", focus_label)
+        };
+        let mut why_this = vec![
+            "Local evidence marked the work as completed successfully.".to_string(),
+            "The next useful step is review, commit, or manual app verification.".to_string(),
+        ];
+        if selected
+            .as_ref()
+            .and_then(|candidate| candidate.open_loop.as_ref())
+            .is_some()
+        {
+            why_this.push("Anchored to an evidence-backed completed workstream.".to_string());
+        }
+        why_this.truncate(3);
+        return ContinueHandoff {
+            headline: "Review completed work".to_string(),
+            return_line: clean_user_handoff_line(format!("Continue from {}", target_label), 180)
+                .unwrap_or_else(|| "Continue from the completed workstream.".to_string()),
+            current_focus_line: clean_user_handoff_line(current_focus_line, 180)
+                .unwrap_or_else(|| "Current focus differs from the completed work.".to_string()),
+            last_state_line: clean_user_handoff_line(
+                format!("Completed state: {}", completed_state),
+                180,
+            )
+            .unwrap_or_else(|| "Completed verified work was observed.".to_string()),
+            next_action: local_next_action,
+            why_this,
+            missing_evidence_line: missing_line.clone(),
+            confidence_label: confidence_text,
+            user_visible_uncertainty: if confidence < 0.5 { missing_line } else { None },
+        };
+    }
     let thin = confidence < 0.5
         || selected.is_none()
         || matches!(output_mode, ContinueOutputMode::ThinContinue);
-    let missing_line =
-        visible_missing_evidence_line(missing_evidence, warnings, validation_failures);
     let uncertainty = if thin {
         Some(missing_line.clone().unwrap_or_else(|| {
             "Evidence is thin, so this is the best available handoff.".to_string()
@@ -11432,6 +17043,15 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
             .last_meaningful_action
             .as_ref()
             .map(|action| action.id.clone()),
+        supporting_memory_ids: candidate.supporting_memory_ids.clone(),
+        contradicting_memory_ids: candidate.contradicting_memory_ids.clone(),
+        app_family: candidate.app_family.clone(),
+        surface_type: candidate.surface_type.clone(),
+        activity_intent: candidate.activity_intent.clone(),
+        task_phase: candidate.task_phase.clone(),
+        continuation_role: candidate.continuation_role.clone(),
+        work_value_reason: candidate.work_value_reason.clone(),
+        why_not_primary: candidate.why_not_primary.clone(),
         components: ContinueScoreComponents {
             actionability: round_score(candidate.actionability_score),
             primary_target: round_score(candidate.primary_target_score),
@@ -11441,6 +17061,17 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
             recency: round_score(candidate.recency_score),
             openability: round_score(candidate.openability_score),
             privacy_safety: round_score(candidate.privacy_safety_score),
+            memory_support: round_score(candidate.memory_support_score),
+            memory_contradiction: round_score(candidate.memory_contradiction_score),
+            feedback_prior: round_signed_score(candidate.feedback_prior_score),
+            retrieval_confidence: round_score(candidate.retrieval_confidence_score),
+            work_value: round_score(candidate.work_value_score),
+            resume_likelihood: round_score(candidate.resume_likelihood_score),
+            divergence: round_score(candidate.divergence_score),
+            diagnostic: round_score(candidate.diagnostic_score),
+            objective_relation: round_score(candidate.objective_relation_score),
+            interaction_depth: round_score(candidate.interaction_depth_score),
+            evidence_sufficiency: round_score(candidate.evidence_sufficiency_score),
         },
     }
 }
@@ -11552,6 +17183,10 @@ fn confidence_label(score: f64) -> &'static str {
 
 fn round_score(score: f64) -> f64 {
     (score.clamp(0.0, 1.0) * 100.0).round() / 100.0
+}
+
+fn round_signed_score(score: f64) -> f64 {
+    (score.clamp(-1.0, 1.0) * 100.0).round() / 100.0
 }
 
 fn load_evidence_frames(
@@ -12599,6 +18234,8 @@ fn clear_third_layer_rows(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         DELETE FROM continue_candidates;
+        DELETE FROM continue_activity_classifications;
+        DELETE FROM continue_app_activity_segments;
         DELETE FROM continue_boundary_revisions;
         DELETE FROM continue_open_loop_evidence;
         DELETE FROM continue_open_loop_artifacts;
@@ -12640,8 +18277,8 @@ fn load_continue_action_records(
                    ta.secondary_artifact_id, ta.action_kind, ta.action_role,
                    ta.confidence, ta.reason, ta.created_at_ms,
                    ta.collapse_count, ta.first_frame_id, ta.last_frame_id, ta.strongest_frame_id,
-                   ta.semantic_delta_kind, ta.semantic_subject, ta.semantic_delta_confidence,
-                   ta.semantic_moment_id,
+                   ta.semantic_delta_kind, ta.semantic_subject, ta.semantic_after_hint,
+                   ta.semantic_evidence_quote, ta.semantic_delta_confidence, ta.semantic_moment_id,
                    a.id, a.artifact_kind, a.stable_key, a.app_name, a.display_title,
                    a.browser_url, a.document_path, a.evidence_quality,
                    sa.id, sa.artifact_kind, sa.stable_key, sa.app_name, sa.display_title,
@@ -12670,8 +18307,8 @@ fn load_continue_action_records(
                 limit,
             ],
             |row| {
-                let artifact = artifact_record_from_row(row, 18)?;
-                let secondary_artifact = artifact_record_from_row(row, 26)?;
+                let artifact = artifact_record_from_row(row, 20)?;
+                let secondary_artifact = artifact_record_from_row(row, 28)?;
                 Ok(ContinueActionRecord {
                     id: row.get(0)?,
                     frame_id: row.get(1)?,
@@ -12689,8 +18326,10 @@ fn load_continue_action_records(
                     strongest_frame_id: row.get(13)?,
                     semantic_delta_kind: row.get(14)?,
                     semantic_subject: row.get(15)?,
-                    semantic_delta_confidence: row.get(16)?,
-                    semantic_moment_id: row.get(17)?,
+                    semantic_after_hint: row.get(16)?,
+                    semantic_evidence_quote: row.get(17)?,
+                    semantic_delta_confidence: row.get(18)?,
+                    semantic_moment_id: row.get(19)?,
                     artifact,
                     secondary_artifact,
                 })
@@ -14534,6 +20173,25 @@ fn derive_semantic_delta(
     action: &ExtractedTaskAction,
 ) -> Option<SemanticDelta> {
     let subject = semantic_subject(frame, artifact);
+    if matches!(
+        action.action_kind.as_str(),
+        "running_command"
+            | "verification_branch"
+            | "observing_command_output"
+            | "reviewing_output"
+            | "reading"
+    ) {
+        if let Some(hint) = dev_completion_hint_for_frame(frame, artifact) {
+            return Some(SemanticDelta {
+                kind: "completed_successfully".to_string(),
+                subject: subject.or_else(|| Some("verification".to_string())),
+                before_hint: None,
+                after_hint: Some(hint.clone()),
+                evidence_quote: Some(hint),
+                confidence: 0.88,
+            });
+        }
+    }
     match action.action_kind.as_str() {
         "editing" => Some(SemanticDelta {
             kind: if artifact.kind == "notes_doc" {
@@ -14867,6 +20525,156 @@ fn safe_diff_hint(frame: &EvidenceFrame) -> Option<String> {
         .as_ref()
         .and_then(|diff| diff.summary.as_deref().or(diff.diff_type.as_deref()))
         .map(safe_label)
+}
+
+fn dev_completion_hint_for_frame(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+) -> Option<String> {
+    if !frame_is_dev_or_agent_surface(frame, artifact) {
+        return None;
+    }
+    dev_completion_hint_from_text(&frame_text_lower(frame))
+}
+
+fn frame_is_dev_or_agent_surface(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> bool {
+    if matches!(
+        artifact.kind.as_str(),
+        "terminal" | "code_editor" | "chat_conversation"
+    ) {
+        return true;
+    }
+    let haystack = [
+        frame.app_name.as_deref(),
+        frame.app_bundle_id.as_deref(),
+        frame.window_name.as_deref(),
+        artifact.display_title.as_deref(),
+        artifact.document_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    contains_any(
+        &haystack,
+        &[
+            "codex",
+            "cursor",
+            "visual studio code",
+            "vscode",
+            "xcode",
+            "terminal",
+            "iterm",
+            "smalltalk",
+        ],
+    )
+}
+
+fn dev_completion_hint_from_text(lower: &str) -> Option<String> {
+    if lower.trim().is_empty() || text_has_failure_marker(lower) {
+        return None;
+    }
+    let mut cues = Vec::new();
+    if contains_any(lower, &["goal achieved", "objective achieved"]) {
+        cues.push("Goal achieved".to_string());
+    }
+    if contains_any(
+        lower,
+        &[
+            "verification passed",
+            "checks passed",
+            "all checks passed",
+            "verification succeeded",
+        ],
+    ) {
+        cues.push("Verification passed".to_string());
+    }
+    if contains_any(
+        lower,
+        &[
+            "tests passed",
+            "test passed",
+            "test result: ok",
+            "0 failed",
+            "0 failures",
+        ],
+    ) || (lower.contains("cargo test") && contains_any(lower, &["passed", "ok"]))
+    {
+        cues.push("Tests passed".to_string());
+    }
+    if lower.contains("cargo check")
+        && contains_any(
+            lower,
+            &[
+                "finished",
+                "check passed",
+                "cargo check passed",
+                "verification passed",
+                "checks passed",
+            ],
+        )
+    {
+        cues.push("Cargo check passed".to_string());
+    }
+    if contains_any(lower, &["npm run build", "vite build", "npm build"])
+        && contains_any(
+            lower,
+            &[
+                "built",
+                "build passed",
+                "compiled successfully",
+                "verification passed",
+                "checks passed",
+            ],
+        )
+    {
+        cues.push("Frontend build passed".to_string());
+    }
+    if contains_any(lower, &["edited 3 files", "edited files", "changed files"]) {
+        cues.push("Changed files were observed".to_string());
+    }
+    if cues.is_empty()
+        && lower.contains("passed")
+        && contains_any(lower, &["test", "build", "check", "verification"])
+    {
+        cues.push("Verification passed".to_string());
+    }
+    cues.sort();
+    cues.dedup();
+    if cues.is_empty() {
+        None
+    } else {
+        Some(cues.into_iter().take(4).collect::<Vec<_>>().join("; "))
+    }
+}
+
+fn text_has_failure_marker(lower: &str) -> bool {
+    if contains_any(
+        lower,
+        &[
+            "0 failed",
+            "0 failures",
+            "failed: 0",
+            "failures: 0",
+            "no failures",
+        ],
+    ) {
+        return false;
+    }
+    contains_any(
+        lower,
+        &[
+            "error:",
+            "failed",
+            "failure",
+            "panicked",
+            "could not compile",
+            "exit code 1",
+            "tests failed",
+            "build failed",
+        ],
+    )
 }
 
 fn safe_command_class(frame: &EvidenceFrame) -> String {
@@ -15848,6 +21656,9 @@ fn artifact_title(artifact: &ContinueArtifactRecord) -> Option<String> {
 
 fn unresolved_signal_for_workstream(workstream: &BuiltWorkstream) -> Option<String> {
     let actions = workstream_actions(workstream);
+    if latest_completed_action_index(&actions).is_some() {
+        return None;
+    }
     let mut branch_without_return: Option<&ContinueActionRecord> = None;
     let mut terminal_without_return: Option<&ContinueActionRecord> = None;
     let mut unresolved_error: Option<&ContinueActionRecord> = None;
@@ -16441,6 +22252,10 @@ fn resolved_lifecycle_boundary_kind(
     actions: &[&ContinueActionRecord],
     origin_artifact_id: Option<&str>,
 ) -> Option<&'static str> {
+    if latest_completed_action_index(actions).is_some() {
+        return Some("completed_progress");
+    }
+
     let last_error_index = actions
         .iter()
         .rposition(|action| action.action_kind == "encountering_error");
@@ -16730,6 +22545,11 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
         primary_return_artifact_id.as_deref(),
         current_focus_artifact_id.as_deref(),
     );
+    let local_reason = if boundary_kind == "completed_progress" {
+        "completed_progress_ready_for_review".to_string()
+    } else {
+        open_loop_local_reason(&graph)
+    };
 
     Some(ContinueOpenLoop {
         id: format!("open-loop-{}", stable_hash(id_seed.as_bytes())),
@@ -16751,7 +22571,7 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
         current_focus_relation,
         missing_fields,
         evidence_spans,
-        local_reason: Some(open_loop_local_reason(&graph)),
+        local_reason: Some(local_reason),
         first_seen_at_ms,
         last_updated_at_ms,
         revision: 1,
@@ -16772,6 +22592,79 @@ fn workstream_actions(workstream: &BuiltWorkstream) -> Vec<&ContinueActionRecord
         )
     });
     actions
+}
+
+fn continue_action_outcome_text(action: &ContinueActionRecord) -> String {
+    [
+        Some(action.action_kind.as_str()),
+        action.reason.as_deref(),
+        action.semantic_delta_kind.as_deref(),
+        action.semantic_subject.as_deref(),
+        action.semantic_after_hint.as_deref(),
+        action.semantic_evidence_quote.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn scorer_action_outcome_text(action: &ScorerAction) -> String {
+    [
+        Some(action.action_kind.as_str()),
+        action.reason.as_deref(),
+        action.semantic_delta_kind.as_deref(),
+        action.semantic_subject.as_deref(),
+        action.semantic_after_hint.as_deref(),
+        action.semantic_evidence_quote.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn continue_action_completed_successfully(action: &ContinueActionRecord) -> bool {
+    action.semantic_delta_kind.as_deref() == Some("completed_successfully")
+        || dev_completion_hint_from_text(&continue_action_outcome_text(action)).is_some()
+}
+
+fn scorer_action_completed_successfully(action: &ScorerAction) -> bool {
+    action.semantic_delta_kind.as_deref() == Some("completed_successfully")
+        || dev_completion_hint_from_text(&scorer_action_outcome_text(action)).is_some()
+}
+
+fn continue_action_has_failure(action: &ContinueActionRecord) -> bool {
+    action.action_kind == "encountering_error"
+        || text_has_failure_marker(&continue_action_outcome_text(action))
+}
+
+fn has_later_failure(actions: &[&ContinueActionRecord], index: usize) -> bool {
+    actions
+        .iter()
+        .skip(index + 1)
+        .any(|action| continue_action_has_failure(action))
+}
+
+fn latest_completed_action_index(actions: &[&ContinueActionRecord]) -> Option<usize> {
+    actions
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, action)| {
+            continue_action_completed_successfully(action) && !has_later_failure(actions, *index)
+        })
+        .map(|(index, _)| index)
+}
+
+fn completed_progress_text(action: &ContinueActionRecord) -> String {
+    let text = continue_action_outcome_text(action);
+    dev_completion_hint_from_text(&text)
+        .or_else(|| action.semantic_after_hint.clone())
+        .or_else(|| action.semantic_evidence_quote.clone())
+        .unwrap_or_else(|| "Completed verified work was observed".to_string())
 }
 
 fn recovery_graph_for_workstream(workstream: &BuiltWorkstream) -> WorkstreamRecoveryGraph {
@@ -17008,6 +22901,9 @@ fn open_loop_objective_hint(
 }
 
 fn open_loop_last_progress_text(action: &ContinueActionRecord) -> String {
+    if continue_action_completed_successfully(action) {
+        return completed_progress_text(action);
+    }
     if let Some(subject) = action.semantic_subject.as_deref() {
         if let Some(kind) = action.semantic_delta_kind.as_deref() {
             return format!(
@@ -17045,6 +22941,9 @@ fn open_loop_unfinished_state(
         "verification_without_return" => {
             "Verification output was observed without an apply-back action to the work target".to_string()
         }
+        "completed_progress" => {
+            "Work appears completed and verified by local evidence".to_string()
+        }
         "draft_active" => "Draft or composer appears active".to_string(),
         "idle_after_progress" => "Work paused after meaningful progress".to_string(),
         _ if unresolved_signal.is_none() => {
@@ -17070,6 +22969,10 @@ fn open_loop_next_action(boundary_kind: &str, target: Option<&ContinueArtifactRe
         }
         "verification_without_return" => {
             format!("Return to {} and apply or verify the output", target_label)
+        }
+        "completed_progress" => {
+            "Review the completed changes, commit them, or run the app to manually verify behavior"
+                .to_string()
         }
         "draft_active" => format!("Continue writing in {}", target_label),
         "idle_after_progress" => format!("Return to {} and continue the last edit", target_label),
@@ -17517,10 +23420,19 @@ fn insert_continue_candidate(
             last_meaningful_action_id, evidence_frame_id, supporting_episode_id,
             score, actionability_score, primary_target_score, unresolved_score,
             branch_origin_score, evidence_quality_score, recency_score,
-            openability_score, privacy_safety_score, reason, missing_evidence,
+            openability_score, privacy_safety_score, memory_support_score,
+            memory_contradiction_score, feedback_prior_score, retrieval_confidence_score,
+            work_value_score, resume_likelihood_score, divergence_score,
+            diagnostic_score, objective_relation_score, interaction_depth_score,
+            evidence_sufficiency_score, app_activity_segment_id,
+            app_activity_classification_id, app_family, surface_type, activity_intent,
+            task_phase, continuation_role, work_value_reason, why_not_primary,
+            retrieved_memory_cell_ids_json, memory_warning_json, reason, missing_evidence,
             created_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                   ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                   ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
+                   ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+                   ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
         params![
             candidate.id,
             candidate.workstream_id,
@@ -17544,6 +23456,28 @@ fn insert_continue_candidate(
             candidate.recency_score,
             candidate.openability_score,
             candidate.privacy_safety_score,
+            candidate.memory_support_score,
+            candidate.memory_contradiction_score,
+            candidate.feedback_prior_score,
+            candidate.retrieval_confidence_score,
+            candidate.work_value_score,
+            candidate.resume_likelihood_score,
+            candidate.divergence_score,
+            candidate.diagnostic_score,
+            candidate.objective_relation_score,
+            candidate.interaction_depth_score,
+            candidate.evidence_sufficiency_score,
+            candidate.app_activity_segment_id,
+            candidate.app_activity_classification_id,
+            candidate.app_family,
+            candidate.surface_type,
+            candidate.activity_intent,
+            candidate.task_phase,
+            candidate.continuation_role,
+            candidate.work_value_reason,
+            candidate.why_not_primary,
+            serde_json::to_string(&candidate.supporting_memory_ids).map_err(to_string)?,
+            serde_json::to_string(&candidate.contradicting_memory_ids).map_err(to_string)?,
             candidate.reason,
             if candidate.missing_evidence.is_empty() {
                 None
@@ -17582,12 +23516,22 @@ fn insert_continue_decision(
     micro_inference_requested: bool,
     micro_inference_attempted: bool,
     micro_inference_result_kind: Option<&str>,
+    continue_dossier: Option<&ContinueDossierV1>,
+    memory_retrieval: Option<&ContinueMemoryRetrievalReport>,
 ) -> Result<(), String> {
     let quality_gate_json = quality_gate
         .map(serde_json::to_string)
         .transpose()
         .map_err(to_string)?;
     let evidence_watermark_json = serde_json::to_string(evidence_watermark).map_err(to_string)?;
+    let continue_dossier_json = continue_dossier
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(to_string)?;
+    let memory_retrieval_json = memory_retrieval
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(to_string)?;
     conn.execute(
         "INSERT OR REPLACE INTO continue_decisions (
             id, requested_at_ms, source, current_focus_frame_id,
@@ -17601,11 +23545,12 @@ fn insert_continue_decision(
             continue_output_mode, evidence_pack_v2_used, evidence_watermark_json,
             evidence_watermark_hash, latest_boundary_revision,
             micro_inference_requested, micro_inference_attempted,
-            micro_inference_result_kind
+            micro_inference_result_kind, continue_dossier_json,
+            memory_retrieval_summary_json
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30, ?31, ?32, ?33, ?34
+            ?30, ?31, ?32, ?33, ?34, ?35, ?36
          )",
         params![
             decision_id,
@@ -17659,6 +23604,8 @@ fn insert_continue_decision(
                 0_i64
             },
             micro_inference_result_kind,
+            continue_dossier_json,
+            memory_retrieval_json,
         ],
     )
     .map_err(to_string)?;
@@ -18975,6 +24922,15 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
         VALUES (1, 'continue_semantic_memory_foundation', CAST(strftime('%s','now') AS INTEGER) * 1000);
 
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (2, 'continue_long_term_memory_cells', CAST(strftime('%s','now') AS INTEGER) * 1000);
+
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (3, 'continue_feedback_learning_eval_flywheel', CAST(strftime('%s','now') AS INTEGER) * 1000);
+
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (4, 'continue_app_activity_work_value_router', CAST(strftime('%s','now') AS INTEGER) * 1000);
+
         CREATE TABLE IF NOT EXISTS continue_artifacts (
           id TEXT PRIMARY KEY,
           artifact_kind TEXT NOT NULL,
@@ -19285,6 +25241,122 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_continue_open_loop_evidence_lookup
           ON continue_open_loop_evidence(evidence_kind, evidence_id);
 
+        CREATE TABLE IF NOT EXISTS continue_memory_cells (
+          id TEXT PRIMARY KEY,
+          workstream_id TEXT,
+          artifact_id TEXT,
+          episode_id TEXT,
+          action_id TEXT,
+          memory_type TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          keywords_json TEXT,
+          tags_json TEXT,
+          source_anchor_json TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          last_seen_at_ms INTEGER NOT NULL,
+          last_reinforced_at_ms INTEGER,
+          confidence REAL NOT NULL,
+          importance REAL NOT NULL,
+          decay_score REAL NOT NULL,
+          privacy_status TEXT,
+          redaction_level TEXT NOT NULL,
+          feedback_score REAL NOT NULL DEFAULT 0.0,
+          retrieval_count INTEGER NOT NULL DEFAULT 0,
+          accepted_count INTEGER NOT NULL DEFAULT 0,
+          rejected_count INTEGER NOT NULL DEFAULT 0,
+          corrected_count INTEGER NOT NULL DEFAULT 0,
+          content_hash TEXT,
+          embedding_model TEXT,
+          embedding_ref TEXT,
+          created_by TEXT NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_cells_workstream
+          ON continue_memory_cells(workstream_id, last_seen_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_cells_artifact
+          ON continue_memory_cells(artifact_id, last_seen_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_cells_type
+          ON continue_memory_cells(memory_type, last_seen_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_cells_updated
+          ON continue_memory_cells(updated_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_memory_edges (
+          id TEXT PRIMARY KEY,
+          source_memory_id TEXT NOT NULL,
+          target_memory_id TEXT NOT NULL,
+          edge_kind TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_edges_source
+          ON continue_memory_edges(source_memory_id, edge_kind);
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_edges_target
+          ON continue_memory_edges(target_memory_id, edge_kind);
+        CREATE INDEX IF NOT EXISTS idx_continue_memory_edges_updated
+          ON continue_memory_edges(updated_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_ranking_priors (
+          id TEXT PRIMARY KEY,
+          prior_kind TEXT NOT NULL,
+          key TEXT NOT NULL,
+          positive_count INTEGER NOT NULL DEFAULT 0,
+          negative_count INTEGER NOT NULL DEFAULT 0,
+          corrected_count INTEGER NOT NULL DEFAULT 0,
+          ignored_count INTEGER NOT NULL DEFAULT 0,
+          weight REAL NOT NULL DEFAULT 0.0,
+          confidence REAL NOT NULL DEFAULT 0.0,
+          last_updated_ms INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          raw_json TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_continue_ranking_priors_kind_key
+          ON continue_ranking_priors(prior_kind, key);
+        CREATE INDEX IF NOT EXISTS idx_continue_ranking_priors_updated
+          ON continue_ranking_priors(last_updated_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_pairwise_preferences (
+          id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL,
+          preferred_candidate_id TEXT,
+          rejected_candidate_id TEXT,
+          preferred_artifact_id TEXT,
+          rejected_artifact_id TEXT,
+          workstream_id TEXT,
+          feature_snapshot_json TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          FOREIGN KEY(decision_id) REFERENCES continue_decisions(id) ON DELETE CASCADE,
+          FOREIGN KEY(preferred_candidate_id) REFERENCES continue_candidates(id) ON DELETE SET NULL,
+          FOREIGN KEY(rejected_candidate_id) REFERENCES continue_candidates(id) ON DELETE SET NULL,
+          FOREIGN KEY(preferred_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
+          FOREIGN KEY(rejected_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_pairwise_preferences_decision
+          ON continue_pairwise_preferences(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_continue_pairwise_preferences_workstream
+          ON continue_pairwise_preferences(workstream_id, created_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_eval_fixtures (
+          id TEXT PRIMARY KEY,
+          created_at_ms INTEGER NOT NULL,
+          source_decision_id TEXT,
+          fixture_kind TEXT NOT NULL,
+          expected_return_artifact_id TEXT,
+          expected_workstream_id TEXT,
+          expected_no_clear INTEGER NOT NULL DEFAULT 0,
+          input_snapshot_json TEXT NOT NULL,
+          expected_assertions_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          FOREIGN KEY(source_decision_id) REFERENCES continue_decisions(id) ON DELETE SET NULL,
+          FOREIGN KEY(expected_return_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
+          FOREIGN KEY(expected_workstream_id) REFERENCES continue_workstreams(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_eval_fixtures_status
+          ON continue_eval_fixtures(status, created_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_eval_fixtures_decision
+          ON continue_eval_fixtures(source_decision_id);
+
         CREATE TABLE IF NOT EXISTS continue_boundary_revisions (
           revision INTEGER PRIMARY KEY AUTOINCREMENT,
           created_at_ms INTEGER NOT NULL,
@@ -19320,6 +25392,28 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           recency_score REAL NOT NULL DEFAULT 0.0,
           openability_score REAL NOT NULL DEFAULT 0.0,
           privacy_safety_score REAL NOT NULL DEFAULT 0.0,
+          memory_support_score REAL NOT NULL DEFAULT 0.0,
+          memory_contradiction_score REAL NOT NULL DEFAULT 0.0,
+          feedback_prior_score REAL NOT NULL DEFAULT 0.0,
+          retrieval_confidence_score REAL NOT NULL DEFAULT 0.0,
+          work_value_score REAL NOT NULL DEFAULT 0.0,
+          resume_likelihood_score REAL NOT NULL DEFAULT 0.0,
+          divergence_score REAL NOT NULL DEFAULT 0.0,
+          diagnostic_score REAL NOT NULL DEFAULT 0.0,
+          objective_relation_score REAL NOT NULL DEFAULT 0.0,
+          interaction_depth_score REAL NOT NULL DEFAULT 0.0,
+          evidence_sufficiency_score REAL NOT NULL DEFAULT 0.0,
+          app_activity_segment_id TEXT,
+          app_activity_classification_id TEXT,
+          app_family TEXT,
+          surface_type TEXT,
+          activity_intent TEXT,
+          task_phase TEXT,
+          continuation_role TEXT,
+          work_value_reason TEXT,
+          why_not_primary TEXT,
+          retrieved_memory_cell_ids_json TEXT NOT NULL DEFAULT '[]',
+          memory_warning_json TEXT NOT NULL DEFAULT '[]',
           reason TEXT,
           missing_evidence TEXT,
           created_at_ms INTEGER NOT NULL,
@@ -19334,6 +25428,108 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           ON continue_candidates(target_artifact_id);
         CREATE INDEX IF NOT EXISTS idx_continue_candidates_frame
           ON continue_candidates(evidence_frame_id);
+
+        CREATE TABLE IF NOT EXISTS continue_evidence_probes (
+          id TEXT PRIMARY KEY,
+          source_decision_id TEXT NOT NULL,
+          source_evidence_watermark_hash TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          requested_probes_json TEXT NOT NULL,
+          candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+          workstream_ids_json TEXT NOT NULL DEFAULT '[]',
+          artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+          started_at_ms INTEGER NOT NULL,
+          completed_at_ms INTEGER NOT NULL,
+          max_probe_ms INTEGER NOT NULL DEFAULT 0,
+          allow_heavy_capture INTEGER NOT NULL DEFAULT 0,
+          privacy_mode TEXT NOT NULL DEFAULT 'metadata_only',
+          privacy_status TEXT,
+          privacy_blocked INTEGER NOT NULL DEFAULT 0,
+          app_name TEXT,
+          app_bundle_id TEXT,
+          window_title TEXT,
+          browser_url TEXT,
+          document_path TEXT,
+          accessibility_text_char_count INTEGER NOT NULL DEFAULT 0,
+          window_count INTEGER NOT NULL DEFAULT 0,
+          evidence_changed INTEGER NOT NULL DEFAULT 0,
+          probes_succeeded_json TEXT NOT NULL DEFAULT '[]',
+          warnings_json TEXT NOT NULL DEFAULT '[]',
+          errors_json TEXT NOT NULL DEFAULT '[]',
+          result_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_evidence_probes_completed
+          ON continue_evidence_probes(completed_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_evidence_probes_watermark
+          ON continue_evidence_probes(source_evidence_watermark_hash, completed_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_app_activity_segments (
+          id TEXT PRIMARY KEY,
+          session_id TEXT,
+          app_name TEXT,
+          bundle_id TEXT,
+          app_family TEXT NOT NULL,
+          surface_type TEXT NOT NULL,
+          window_title TEXT,
+          artifact_id TEXT,
+          workstream_id TEXT,
+          episode_id TEXT,
+          started_at_ms INTEGER NOT NULL,
+          ended_at_ms INTEGER NOT NULL,
+          evidence_kinds_json TEXT NOT NULL,
+          evidence_anchor_json TEXT NOT NULL,
+          feature_json TEXT NOT NULL,
+          has_heavy_frame INTEGER NOT NULL DEFAULT 0,
+          has_direct_url INTEGER NOT NULL DEFAULT 0,
+          has_document_path INTEGER NOT NULL DEFAULT 0,
+          has_visible_text INTEGER NOT NULL DEFAULT 0,
+          is_event_backed_only INTEGER NOT NULL DEFAULT 0,
+          is_self_or_diagnostic INTEGER NOT NULL DEFAULT 0,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_app_segments_session_time
+          ON continue_app_activity_segments(session_id, ended_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_app_segments_artifact
+          ON continue_app_activity_segments(artifact_id, ended_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_app_segments_workstream
+          ON continue_app_activity_segments(workstream_id, ended_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_activity_classifications (
+          id TEXT PRIMARY KEY,
+          segment_id TEXT NOT NULL,
+          session_id TEXT,
+          artifact_id TEXT,
+          workstream_id TEXT,
+          app_family TEXT NOT NULL,
+          surface_type TEXT NOT NULL,
+          activity_intent TEXT NOT NULL,
+          task_phase TEXT NOT NULL,
+          continuation_role TEXT NOT NULL,
+          work_value_score REAL NOT NULL,
+          resume_likelihood_score REAL NOT NULL,
+          support_score REAL NOT NULL,
+          divergence_score REAL NOT NULL,
+          diagnostic_score REAL NOT NULL,
+          interaction_depth_score REAL NOT NULL,
+          objective_relation_score REAL NOT NULL,
+          evidence_sufficiency_score REAL NOT NULL,
+          reason TEXT NOT NULL,
+          why_not_primary TEXT,
+          missing_evidence_json TEXT NOT NULL,
+          feature_json TEXT NOT NULL,
+          evidence_anchor_json TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          FOREIGN KEY(segment_id) REFERENCES continue_app_activity_segments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_activity_class_segment
+          ON continue_activity_classifications(segment_id);
+        CREATE INDEX IF NOT EXISTS idx_continue_activity_class_role
+          ON continue_activity_classifications(continuation_role, updated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_activity_class_artifact
+          ON continue_activity_classifications(artifact_id, updated_at_ms DESC);
 
         CREATE TABLE IF NOT EXISTS continue_decisions (
           id TEXT PRIMARY KEY,
@@ -19353,6 +25549,8 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           continue_output_mode TEXT NOT NULL DEFAULT 'thin_continue',
           evidence_pack_v2_used INTEGER NOT NULL DEFAULT 0,
           micro_inference_result_kind TEXT,
+          continue_dossier_json TEXT,
+          memory_retrieval_summary_json TEXT,
           FOREIGN KEY(current_focus_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
           FOREIGN KEY(selected_workstream_id) REFERENCES continue_workstreams(id) ON DELETE SET NULL,
           FOREIGN KEY(selected_candidate_id) REFERENCES continue_candidates(id) ON DELETE SET NULL,
@@ -19475,6 +25673,103 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "privacy_safety_score",
         "REAL NOT NULL DEFAULT 0.0",
     )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "memory_support_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "memory_contradiction_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_prior_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "retrieval_confidence_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "retrieved_memory_cell_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "memory_warning_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "work_value_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "resume_likelihood_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "divergence_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "diagnostic_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "objective_relation_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "interaction_depth_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "evidence_sufficiency_score",
+        "REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "app_activity_segment_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "app_activity_classification_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(conn, "continue_candidates", "app_family", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "surface_type", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "activity_intent", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "task_phase", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "continuation_role", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "work_value_reason", "TEXT")?;
+    ensure_column_exists(conn, "continue_candidates", "why_not_primary", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "response_id", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "model", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "validation_notes", "TEXT")?;
@@ -19536,6 +25831,13 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "micro_inference_result_kind",
         "TEXT",
     )?;
+    ensure_column_exists(conn, "continue_decisions", "continue_dossier_json", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "memory_retrieval_summary_json",
+        "TEXT",
+    )?;
     ensure_column_exists(
         conn,
         "continue_decisions",
@@ -19593,6 +25895,14 @@ pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
         DELETE FROM continue_feedback_events;
         DELETE FROM continue_decisions;
         DELETE FROM continue_candidates;
+        DELETE FROM continue_activity_classifications;
+        DELETE FROM continue_app_activity_segments;
+        DELETE FROM continue_evidence_probes;
+        DELETE FROM continue_eval_fixtures;
+        DELETE FROM continue_pairwise_preferences;
+        DELETE FROM continue_ranking_priors;
+        DELETE FROM continue_memory_edges;
+        DELETE FROM continue_memory_cells;
         DELETE FROM continue_boundary_revisions;
         DELETE FROM continue_open_loop_evidence;
         DELETE FROM continue_open_loop_artifacts;
@@ -19636,6 +25946,13 @@ pub fn continue_memory_status(conn: &Connection) -> Result<ContinueMemoryStatus,
             open_loops: count_if_present(conn, "continue_open_loops")?,
             open_loop_artifacts: count_if_present(conn, "continue_open_loop_artifacts")?,
             open_loop_evidence: count_if_present(conn, "continue_open_loop_evidence")?,
+            memory_cells: count_if_present(conn, "continue_memory_cells")?,
+            memory_edges: count_if_present(conn, "continue_memory_edges")?,
+            ranking_priors: count_if_present(conn, "continue_ranking_priors")?,
+            pairwise_preferences: count_if_present(conn, "continue_pairwise_preferences")?,
+            eval_fixtures: count_if_present(conn, "continue_eval_fixtures")?,
+            app_activity_segments: count_if_present(conn, "continue_app_activity_segments")?,
+            activity_classifications: count_if_present(conn, "continue_activity_classifications")?,
             candidates: count_if_present(conn, "continue_candidates")?,
             decisions: count_if_present(conn, "continue_decisions")?,
             feedback_events: count_if_present(conn, "continue_feedback_events")?,
@@ -19764,9 +26081,520 @@ mod tests {
         assert_eq!(status.schema, CONTINUE_SCHEMA_NAME);
         assert_eq!(status.schema_version, Some(CONTINUE_SCHEMA_VERSION));
         assert_eq!(status.counts.artifacts, 0);
+        assert_eq!(status.counts.memory_cells, 0);
+        assert_eq!(status.counts.memory_edges, 0);
         assert_eq!(status.counts.decisions, 0);
         assert_eq!(status.latest_artifact_timestamp, None);
         assert_eq!(status.latest_workstream_timestamp, None);
+    }
+
+    #[test]
+    fn p3_memory_promotion_is_idempotent_and_skips_debug_or_private_surfaces() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO continue_workstreams (
+                id, state, title_candidate, primary_artifact_id, created_at_ms,
+                last_active_timestamp_ms, confidence, unresolved_signal, source
+             ) VALUES ('workstream-a', 'active', 'Smalltalk patch', NULL,
+                       1000, 2000, 0.9, 'branch_without_return', 'test')",
+            [],
+        )
+        .unwrap();
+        for (id, title, path, privacy) in [
+            (
+                "artifact-code",
+                "continuation.rs",
+                "/Users/me/project/src/continuation.rs",
+                None,
+            ),
+            (
+                "artifact-debug",
+                "final_decision.json",
+                "/Users/me/project/continue_outputs/session/final_decision.json",
+                None,
+            ),
+            (
+                "artifact-private",
+                "private note",
+                "/Users/me/project/private.md",
+                Some("never_send_to_ai"),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO continue_artifacts (
+                    id, artifact_kind, stable_key, display_title, document_path,
+                    first_seen_timestamp, last_seen_timestamp, identity_confidence,
+                    evidence_quality, privacy_status, openability, created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'code_editor', ?1, ?2, ?3, 1000, 2000, 0.9,
+                           'strong', ?4, 'openable', 1000, 2000)",
+                params![id, title, path, privacy],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO continue_workstream_artifacts (
+                    workstream_id, artifact_id, durable_role, importance_score,
+                    first_seen_frame_id, last_seen_frame_id, reason
+                 ) VALUES ('workstream-a', ?1, 'primary_target', 1.0, '1', '2', 'test')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        promote_continue_memory_cells(&conn, 3000).unwrap();
+        promote_continue_memory_cells(&conn, 4000).unwrap();
+
+        let cells: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_memory_cells", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cells, 1);
+        let memory_type: String = conn
+            .query_row(
+                "SELECT memory_type FROM continue_memory_cells WHERE artifact_id = 'artifact-code'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_type, "origin_intent");
+    }
+
+    #[test]
+    fn p3_long_gap_origin_memory_supports_primary_not_support_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let origin = test_artifact("artifact-origin", "code_editor", "lib.rs");
+        let mut branch = test_artifact("artifact-branch", "browser_tab", "Search results");
+        branch.document_path = None;
+        branch.browser_url = Some("https://example.com/search?q=rust".to_string());
+        let action = test_action(&origin.id, "searching");
+        let workstream = ScorerWorkstream {
+            id: "workstream-test".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("Rust fix".to_string()),
+            primary_artifact_id: Some(origin.id.clone()),
+            last_active_timestamp_ms: 86_400_000,
+            confidence: 0.9,
+            unresolved_signal: Some("branch_without_return".to_string()),
+            episodes: Vec::new(),
+            artifacts: vec![
+                ScorerWorkstreamArtifact {
+                    artifact: origin.clone(),
+                    durable_role: "primary_target".to_string(),
+                    importance_score: 1.0,
+                    first_seen_frame_id: Some("1".to_string()),
+                    last_seen_frame_id: Some("1".to_string()),
+                },
+                ScorerWorkstreamArtifact {
+                    artifact: branch.clone(),
+                    durable_role: "branch".to_string(),
+                    importance_score: 0.6,
+                    first_seen_frame_id: Some("2".to_string()),
+                    last_seen_frame_id: Some("2".to_string()),
+                },
+            ],
+            last_meaningful_action: Some(action.clone()),
+            open_loops: Vec::new(),
+        };
+        upsert_continue_memory_cell(
+            &conn,
+            "memory-origin",
+            Some(&workstream.id),
+            Some(&origin.id),
+            None,
+            None,
+            "origin_intent",
+            "Origin work target was lib.rs.",
+            &memory_keywords(&[Some("lib.rs"), Some("rust fix")]),
+            &["primary_target".to_string()],
+            &serde_json::json!({"kind": "test"}),
+            1_000,
+            1_000,
+            0.9,
+            0.9,
+            None,
+            "summary_only",
+            0.0,
+            90_000_000,
+            "test",
+        )
+        .unwrap();
+        upsert_continue_memory_cell(
+            &conn,
+            "memory-branch",
+            Some(&workstream.id),
+            Some(&branch.id),
+            None,
+            None,
+            "branch_evidence",
+            "Support evidence was opened for Search results.",
+            &memory_keywords(&[Some("search"), Some("rust")]),
+            &["branch".to_string()],
+            &serde_json::json!({"kind": "test"}),
+            86_000_000,
+            86_000_000,
+            0.8,
+            0.6,
+            None,
+            "summary_only",
+            0.0,
+            90_000_000,
+            "test",
+        )
+        .unwrap();
+        let mut candidates = vec![
+            test_candidate(
+                "return_to_primary_artifact",
+                Some(origin),
+                Some(action.clone()),
+                None,
+            ),
+            test_candidate("finish_search", Some(branch), Some(action), None),
+        ];
+        candidates[0].id = "candidate-origin".to_string();
+        candidates[1].id = "candidate-branch".to_string();
+        let query = ContinueMemoryRetrievalQuerySummary {
+            active_workstream_ids: vec![workstream.id.clone()],
+            candidate_workstream_ids: vec![workstream.id.clone()],
+            candidate_artifact_ids: candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .target_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.id.clone())
+                })
+                .collect(),
+            current_artifact_id: Some("artifact-branch".to_string()),
+            current_activity_kind: None,
+            unresolved_state_kinds: vec!["branch_without_return".to_string()],
+            recent_keywords: vec!["rust".to_string(), "lib".to_string()],
+            lookback_ms: 7 * 24 * 60 * 60 * 1000,
+            max_cells: 8,
+        };
+        let report =
+            retrieve_continue_memory_cells(&conn, &query, &candidates, 90_000_000).unwrap();
+        apply_memory_features_to_candidates(&mut candidates, &report);
+        score_continue_candidates(&mut candidates, &[workstream], None);
+
+        let origin_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-origin")
+            .unwrap();
+        let branch_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-branch")
+            .unwrap();
+        assert!(origin_candidate.memory_support_score > 0.0);
+        assert!(!branch_candidate.eligible_for_primary_selection);
+        assert!(branch_candidate
+            .warnings
+            .iter()
+            .any(|warning| warning == "branch_support_not_default_return_target"));
+    }
+
+    #[test]
+    fn p3_feedback_correction_downweights_wrong_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let wrong = test_artifact("artifact-wrong", "browser_tab", "Search");
+        let right = test_artifact("artifact-right", "code_editor", "lib.rs");
+        upsert_continue_memory_cell(
+            &conn,
+            "memory-correction",
+            Some("workstream-test"),
+            Some(&wrong.id),
+            None,
+            None,
+            "feedback_rejection",
+            "User behavior rejected or ignored this continuation target.",
+            &memory_keywords(&[Some("wrong"), Some("search")]),
+            &["feedback".to_string()],
+            &serde_json::json!({"kind": "feedback"}),
+            1_000,
+            1_000,
+            0.9,
+            0.9,
+            None,
+            "summary_only",
+            -0.55,
+            2_000,
+            "test",
+        )
+        .unwrap();
+        upsert_continue_memory_cell(
+            &conn,
+            "memory-accepted",
+            Some("workstream-test"),
+            Some(&right.id),
+            None,
+            None,
+            "feedback_acceptance",
+            "User behavior accepted this continuation target.",
+            &memory_keywords(&[Some("right"), Some("lib")]),
+            &["feedback".to_string()],
+            &serde_json::json!({"kind": "feedback"}),
+            1_000,
+            1_000,
+            0.9,
+            0.9,
+            None,
+            "summary_only",
+            0.55,
+            2_000,
+            "test",
+        )
+        .unwrap();
+        let mut candidates = vec![
+            test_candidate("finish_search", Some(wrong), None, None),
+            test_candidate("continue_edit", Some(right), None, None),
+        ];
+        candidates[0].id = "candidate-wrong".to_string();
+        candidates[1].id = "candidate-right".to_string();
+        let query = ContinueMemoryRetrievalQuerySummary {
+            active_workstream_ids: vec!["workstream-test".to_string()],
+            candidate_workstream_ids: vec!["workstream-test".to_string()],
+            candidate_artifact_ids: candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .target_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.id.clone())
+                })
+                .collect(),
+            current_artifact_id: None,
+            current_activity_kind: None,
+            unresolved_state_kinds: Vec::new(),
+            recent_keywords: vec!["lib".to_string(), "search".to_string()],
+            lookback_ms: 7 * 24 * 60 * 60 * 1000,
+            max_cells: 8,
+        };
+        let report = retrieve_continue_memory_cells(&conn, &query, &candidates, 2_000).unwrap();
+        apply_memory_features_to_candidates(&mut candidates, &report);
+
+        assert!(candidates[0].memory_contradiction_score > 0.0);
+        assert!(candidates[0].feedback_prior_score < 0.0);
+        assert!(candidates[1].memory_support_score > 0.0);
+        assert!(candidates[1].feedback_prior_score > 0.0);
+    }
+
+    #[test]
+    fn p4_corrected_feedback_records_priors_pairwise_fixture_and_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+
+        let feedback = record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: Some("workstream-p4".to_string()),
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                corrected_artifact_id: Some("artifact-right".to_string()),
+                feedback_kind: "corrected".to_string(),
+                note: Some("right target".to_string()),
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(feedback.event_kind, "corrected");
+        let right_weight: f64 = conn
+            .query_row(
+                "SELECT weight FROM continue_ranking_priors
+                 WHERE prior_kind = 'artifact_success' AND key = 'artifact_id=artifact-right'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let wrong_weight: f64 = conn
+            .query_row(
+                "SELECT weight FROM continue_ranking_priors
+                 WHERE prior_kind = 'artifact_success' AND key = 'artifact_id=artifact-wrong'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(right_weight > 0.0);
+        assert!(wrong_weight < 0.0);
+
+        let pairwise_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_pairwise_preferences",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pairwise_count, 1);
+        let fixture_kind: String = conn
+            .query_row(
+                "SELECT fixture_kind FROM continue_eval_fixtures LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fixture_kind, "corrected_target");
+
+        let report = run_continue_replay_eval(&conn, None).unwrap();
+        assert_eq!(report.fixture_count, 1);
+        assert_eq!(report.target_artifact_accuracy, 1.0);
+        assert_eq!(report.feedback_regression_count, 0);
+        assert_eq!(report.privacy_violation_count, 0);
+    }
+
+    #[test]
+    fn p4_feedback_prior_changes_close_ranking_without_overriding_branch_gate() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: Some("workstream-p4".to_string()),
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                corrected_artifact_id: Some("artifact-right".to_string()),
+                feedback_kind: "corrected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        let wrong = test_artifact("artifact-wrong", "browser_tab", "Search");
+        let right = test_artifact("artifact-right", "code_editor", "lib.rs");
+        let workstream = ScorerWorkstream {
+            id: "workstream-p4".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("P4 learning".to_string()),
+            primary_artifact_id: Some(right.id.clone()),
+            last_active_timestamp_ms: 1_000,
+            confidence: 0.9,
+            unresolved_signal: Some("branch_without_return".to_string()),
+            episodes: Vec::new(),
+            artifacts: vec![
+                ScorerWorkstreamArtifact {
+                    artifact: right.clone(),
+                    durable_role: "primary_target".to_string(),
+                    importance_score: 1.0,
+                    first_seen_frame_id: Some("1".to_string()),
+                    last_seen_frame_id: Some("1".to_string()),
+                },
+                ScorerWorkstreamArtifact {
+                    artifact: wrong.clone(),
+                    durable_role: "branch".to_string(),
+                    importance_score: 0.8,
+                    first_seen_frame_id: Some("1".to_string()),
+                    last_seen_frame_id: Some("1".to_string()),
+                },
+            ],
+            last_meaningful_action: Some(test_action(&right.id, "editing")),
+            open_loops: Vec::new(),
+        };
+        let mut candidates = vec![
+            test_candidate(
+                "return_to_primary_artifact",
+                Some(wrong),
+                Some(test_action("artifact-wrong", "searching")),
+                None,
+            ),
+            test_candidate(
+                "continue_edit",
+                Some(right),
+                Some(test_action("artifact-right", "editing")),
+                None,
+            ),
+        ];
+        candidates[0].id = "candidate-wrong-later".to_string();
+        candidates[0].workstream_id = "workstream-p4".to_string();
+        candidates[1].id = "candidate-right-later".to_string();
+        candidates[1].workstream_id = "workstream-p4".to_string();
+        apply_feedback_ranking_priors_to_candidates(
+            &conn,
+            &mut candidates,
+            &[workstream.clone()],
+            None,
+        )
+        .unwrap();
+        assert!(candidates[1].feedback_prior_score > candidates[0].feedback_prior_score);
+        assert!(candidates[1].feedback_prior_score > 0.0);
+        score_continue_candidates(&mut candidates, &[workstream], None);
+        let wrong = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-wrong-later")
+            .unwrap();
+        assert!(!wrong.eligible_for_primary_selection);
+        assert!(wrong.score <= 0.42);
+    }
+
+    fn insert_p4_learning_rows(conn: &Connection) {
+        for (id, kind, title, path) in [
+            (
+                "artifact-wrong",
+                "browser_tab",
+                "Search",
+                "/Users/me/project/search.html",
+            ),
+            (
+                "artifact-right",
+                "code_editor",
+                "lib.rs",
+                "/Users/me/project/src/lib.rs",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO continue_artifacts (
+                    id, artifact_kind, stable_key, display_title, document_path,
+                    first_seen_timestamp, last_seen_timestamp, identity_confidence,
+                    evidence_quality, openability, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?1, ?3, ?4, 1000, 1000, 0.9,
+                           'strong', 'openable', 1000, 1000)",
+                params![id, kind, title, path],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO continue_workstreams (
+                id, state, title_candidate, primary_artifact_id, created_at_ms,
+                last_active_timestamp_ms, confidence, unresolved_signal, source
+             ) VALUES ('workstream-p4', 'active', 'P4 learning', 'artifact-right',
+                       1000, 1000, 0.9, 'branch_without_return', 'test')",
+            [],
+        )
+        .unwrap();
+        for (id, artifact_id, kind, score) in [
+            (
+                "candidate-wrong",
+                "artifact-wrong",
+                "return_to_primary_artifact",
+                0.70,
+            ),
+            ("candidate-right", "artifact-right", "continue_edit", 0.69),
+        ] {
+            conn.execute(
+                "INSERT INTO continue_candidates (
+                    id, workstream_id, target_artifact_id, candidate_kind,
+                    score, created_at_ms
+                 ) VALUES (?1, 'workstream-p4', ?2, ?3, ?4, 1000)",
+                params![id, artifact_id, kind, score],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO continue_decisions (
+                id, requested_at_ms, source, current_focus_artifact_id,
+                selected_workstream_id, selected_candidate_id, return_target_artifact_id,
+                confidence, validation_status, continue_output_mode
+             ) VALUES ('decision-p4', 1000, 'local_test', 'artifact-wrong',
+                       'workstream-p4', 'candidate-wrong', 'artifact-wrong',
+                       0.7, 'valid', 'strong_continue')",
+            [],
+        )
+        .unwrap();
     }
 
     fn test_extracted_action(frame_id: &str, confidence: f64) -> ExtractedTaskAction {
@@ -19855,6 +26683,28 @@ mod tests {
             recency_score: 1.0,
             openability_score: 0.58,
             privacy_safety_score: 0.85,
+            memory_support_score: 0.0,
+            memory_contradiction_score: 0.0,
+            feedback_prior_score: 0.0,
+            retrieval_confidence_score: 0.0,
+            work_value_score: 0.0,
+            resume_likelihood_score: 0.0,
+            divergence_score: 0.0,
+            diagnostic_score: 0.0,
+            objective_relation_score: 0.0,
+            interaction_depth_score: 0.0,
+            evidence_sufficiency_score: 0.0,
+            app_activity_segment_id: None,
+            app_activity_classification_id: None,
+            app_family: None,
+            surface_type: None,
+            activity_intent: None,
+            task_phase: None,
+            continuation_role: None,
+            work_value_reason: None,
+            why_not_primary: None,
+            supporting_memory_ids: Vec::new(),
+            contradicting_memory_ids: Vec::new(),
             reason: Some("primary_artifact_fallback".to_string()),
             missing_evidence: Vec::new(),
             warnings: Vec::new(),
@@ -20046,6 +26896,28 @@ mod tests {
             recency_score: 1.0,
             openability_score: 1.0,
             privacy_safety_score: 1.0,
+            memory_support_score: 0.0,
+            memory_contradiction_score: 0.0,
+            feedback_prior_score: 0.0,
+            retrieval_confidence_score: 0.0,
+            work_value_score: 0.0,
+            resume_likelihood_score: 0.0,
+            divergence_score: 0.0,
+            diagnostic_score: 0.0,
+            objective_relation_score: 0.0,
+            interaction_depth_score: 0.0,
+            evidence_sufficiency_score: 0.0,
+            app_activity_segment_id: None,
+            app_activity_classification_id: None,
+            app_family: None,
+            surface_type: None,
+            activity_intent: None,
+            task_phase: None,
+            continuation_role: None,
+            work_value_reason: None,
+            why_not_primary: None,
+            supporting_memory_ids: Vec::new(),
+            contradicting_memory_ids: Vec::new(),
             reason: Some("test_candidate".to_string()),
             missing_evidence: Vec::new(),
             warnings: Vec::new(),
@@ -20117,6 +26989,25 @@ mod tests {
                 .map(|action| action.id.clone()),
             evidence_episode_id: candidate.supporting_episode_id.clone(),
             missing_evidence: candidate.missing_evidence.clone(),
+            memory_support_score: candidate.memory_support_score,
+            memory_contradiction_score: candidate.memory_contradiction_score,
+            feedback_prior_score: candidate.feedback_prior_score,
+            work_value_score: candidate.work_value_score,
+            resume_likelihood_score: candidate.resume_likelihood_score,
+            divergence_score: candidate.divergence_score,
+            diagnostic_score: candidate.diagnostic_score,
+            objective_relation_score: candidate.objective_relation_score,
+            interaction_depth_score: candidate.interaction_depth_score,
+            evidence_sufficiency_score: candidate.evidence_sufficiency_score,
+            app_family: candidate.app_family.clone(),
+            surface_type: candidate.surface_type.clone(),
+            activity_intent: candidate.activity_intent.clone(),
+            task_phase: candidate.task_phase.clone(),
+            continuation_role: candidate.continuation_role.clone(),
+            work_value_reason: candidate.work_value_reason.clone(),
+            why_not_primary: candidate.why_not_primary.clone(),
+            memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
+            memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
             local_reason: candidate.reason.clone(),
         }
     }
@@ -20137,11 +27028,178 @@ mod tests {
                 .collect(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
+            continue_dossier: None,
         }
     }
 
     fn micro_pack_for_candidate(candidate: &ScoredContinueCandidate) -> ContinueMicroInferencePack {
         micro_pack_for_candidates(std::slice::from_ref(candidate))
+    }
+
+    fn p5_thin_frame_fallback_decision() -> ContinueDecisionResult {
+        ContinueDecisionResult {
+            decision_id: "decision-p5-thin".to_string(),
+            mode: "normal".to_string(),
+            cache_hit: false,
+            source: "local_scorer".to_string(),
+            model: None,
+            response_id: None,
+            current_focus: Some(ContinueFocusSummary {
+                frame_id: "event-browser".to_string(),
+                artifact_id: None,
+                artifact_kind: Some("browser_tab".to_string()),
+                app_name: Some("Helium".to_string()),
+                window_title: Some("Smalltalk planning".to_string()),
+                title: Some("Smalltalk planning".to_string()),
+                browser_url: None,
+                document_path: None,
+                captured_at_ms: current_time_millis(),
+            }),
+            current_activity: Some("Reviewing local evidence".to_string()),
+            selected_workstream: Some(ContinueSelectedWorkstream {
+                workstream_id: "workstream-p5".to_string(),
+                state: "active".to_string(),
+                title_candidate: Some("P5 Continue".to_string()),
+                primary_artifact_id: Some("artifact-old".to_string()),
+                last_active_timestamp_ms: current_time_millis().saturating_sub(20 * 60 * 1000),
+                unresolved_signal: Some("visible_error_or_failure".to_string()),
+            }),
+            return_target: Some(ContinueReturnTarget {
+                artifact_id: Some("artifact-old".to_string()),
+                artifact_kind: Some("finder".to_string()),
+                title: Some("Downloads".to_string()),
+                browser_url: None,
+                document_path: None,
+                openability: "frame_fallback".to_string(),
+                fallback_frame_id: Some("12".to_string()),
+            }),
+            resume_work_target: None,
+            candidate_kind: Some("resolve_error".to_string()),
+            last_meaningful_action: None,
+            unresolved_state: Some("Error or failure evidence is unresolved.".to_string()),
+            next_action: Some("Capture evidence now.".to_string()),
+            confidence: 0.52,
+            confidence_label: "Thin".to_string(),
+            evidence_anchors: ContinueEvidenceAnchors::default(),
+            missing_evidence: vec!["no_direct_url_or_document_path".to_string()],
+            warnings: vec![
+                "current_surface:event_backed_no_screenshot".to_string(),
+                "current_surface:no_direct_url_or_path".to_string(),
+            ],
+            validation_failures: Vec::new(),
+            handoff: ContinueHandoff {
+                headline: "Evidence is thin".to_string(),
+                return_line: "No reliable return target is grounded yet.".to_string(),
+                current_focus_line: "Current focus is event-backed browser activity.".to_string(),
+                last_state_line: "The target lacks direct metadata.".to_string(),
+                next_action: "Capture current evidence.".to_string(),
+                why_this: vec!["Missing URL or document path.".to_string()],
+                missing_evidence_line: Some("Missing direct URL or document path.".to_string()),
+                confidence_label: "Thin".to_string(),
+                user_visible_uncertainty: Some("Evidence is thin.".to_string()),
+            },
+            alternatives: vec![
+                p5_candidate_summary("candidate-old", "workstream-p5", Some("artifact-old"), 0.52),
+                p5_candidate_summary("candidate-current", "workstream-current", None, 0.46),
+            ],
+            generated_candidates: 2,
+            validation_status: "thin_evidence".to_string(),
+            continue_output_mode: "thin_continue".to_string(),
+            evidence_watermark_hash: "watermark-p5-thin".to_string(),
+            latest_boundary_revision: None,
+            current_surface_resolution: Some(serde_json::json!({
+                "schema": "smalltalk.continue_current_surface_resolution.v1",
+                "selected": {
+                    "surface_id": "event:browser",
+                    "artifact_id": null,
+                    "app_name": "Helium",
+                    "bundle_id": "app.helium",
+                    "window_title": "Smalltalk planning",
+                    "artifact_kind": "browser_tab",
+                    "browser_url": null,
+                    "document_path": null,
+                    "evidence_ids": ["event-browser"],
+                    "evidence_kinds": ["ui_event"],
+                    "observed_at_ms": current_time_millis(),
+                    "focus_confidence": 0.44,
+                    "evidence_quality": "thin",
+                    "openability": "unknown",
+                    "warnings": [
+                        "current_surface:event_backed_no_screenshot",
+                        "current_surface:no_direct_url_or_path"
+                    ]
+                }
+            })),
+            evidence_freshness_ledger: None,
+            continue_dossier: None,
+            memory_retrieval: None,
+            observe_before_decide: None,
+            app_activity: None,
+            activity_summary: None,
+            quality_gate: None,
+            evidence_pack_v2_used: false,
+            micro_inference_requested: false,
+            micro_inference_attempted: false,
+            micro_inference_result_kind: None,
+            continue_output_path: None,
+            audit_inference_events: Vec::new(),
+        }
+    }
+
+    fn p5_candidate_summary(
+        candidate_id: &str,
+        workstream_id: &str,
+        target_artifact_id: Option<&str>,
+        score: f64,
+    ) -> ContinueCandidateSummary {
+        ContinueCandidateSummary {
+            candidate_id: candidate_id.to_string(),
+            workstream_id: workstream_id.to_string(),
+            target_artifact_id: target_artifact_id.map(str::to_string),
+            candidate_kind: "resolve_error".to_string(),
+            pre_cap_score: score,
+            score,
+            confidence_label: confidence_label(score).to_string(),
+            reason: Some("test".to_string()),
+            missing_evidence: vec!["no_direct_url_or_document_path".to_string()],
+            risk_flags: Vec::new(),
+            score_caps_applied: Vec::new(),
+            eligible_for_primary_selection: true,
+            selection_demotion_reason: None,
+            evidence_frame_id: Some("12".to_string()),
+            supporting_episode_id: None,
+            last_meaningful_action_id: None,
+            supporting_memory_ids: Vec::new(),
+            contradicting_memory_ids: Vec::new(),
+            app_family: None,
+            surface_type: None,
+            activity_intent: None,
+            task_phase: None,
+            continuation_role: None,
+            work_value_reason: None,
+            why_not_primary: None,
+            components: ContinueScoreComponents {
+                actionability: 0.5,
+                primary_target: 0.5,
+                unresolved_state: 0.5,
+                branch_origin: 0.0,
+                evidence_quality: 0.3,
+                recency: 0.3,
+                openability: 0.2,
+                privacy_safety: 1.0,
+                memory_support: 0.0,
+                memory_contradiction: 0.0,
+                feedback_prior: 0.0,
+                retrieval_confidence: 0.0,
+                work_value: 0.0,
+                resume_likelihood: 0.0,
+                divergence: 0.0,
+                diagnostic: 0.0,
+                objective_relation: 0.0,
+                interaction_depth: 0.0,
+                evidence_sufficiency: 0.0,
+            },
+        }
     }
 
     fn selected_candidate_model_output(
@@ -20166,6 +27224,175 @@ mod tests {
             missing_evidence: Vec::new(),
             recommended_local_capture: None,
         }
+    }
+
+    fn p8_segment_for_test(
+        id: &str,
+        app_family: &str,
+        surface_type: &str,
+        title: &str,
+        artifact_id: Option<&str>,
+        mut features: AppActivityFeatures,
+    ) -> ContinueAppActivitySegment {
+        features.is_event_backed_only = !features.has_heavy_frame
+            && !features.has_visible_text
+            && !features.has_direct_url
+            && !features.has_document_path;
+        ContinueAppActivitySegment {
+            id: id.to_string(),
+            session_id: Some("session-p8".to_string()),
+            app_name: Some(
+                match app_family {
+                    "ai_coding_agent" => "Codex",
+                    "browser" => "Helium",
+                    "finder" => "Finder",
+                    "code_editor" => "VS Code",
+                    _ => "Unknown",
+                }
+                .to_string(),
+            ),
+            bundle_id: None,
+            app_family: app_family.to_string(),
+            surface_type: surface_type.to_string(),
+            window_title: Some(title.to_string()),
+            artifact_id: artifact_id.map(str::to_string),
+            workstream_id: artifact_id.map(|_| "workstream-p8".to_string()),
+            episode_id: None,
+            started_at_ms: 1_000,
+            ended_at_ms: 2_000,
+            evidence_kinds: vec!["ui_event".to_string()],
+            evidence_anchor: serde_json::json!({"evidence_ids": ["event-p8"]}),
+            has_heavy_frame: features.has_heavy_frame,
+            has_direct_url: features.has_direct_url,
+            has_document_path: features.has_document_path,
+            has_visible_text: features.has_visible_text,
+            is_event_backed_only: features.is_event_backed_only,
+            is_self_or_diagnostic: features.title_indicates_generated_audit
+                || features.path_indicates_generated_output,
+            features,
+        }
+    }
+
+    #[test]
+    fn p8_codex_event_only_blocks_youtube_background_candidate() {
+        let codex = p8_segment_for_test(
+            "appseg-codex",
+            "ai_coding_agent",
+            "coding_agent_thread",
+            "Codex",
+            None,
+            AppActivityFeatures {
+                typing_burst_count: 1,
+                event_count: 1,
+                ..Default::default()
+            },
+        );
+        let youtube = p8_segment_for_test(
+            "appseg-youtube",
+            "browser",
+            "browser_media",
+            "Harrison Ford Reacts - YouTube - Audio playing - Helium",
+            Some("artifact-youtube"),
+            AppActivityFeatures {
+                event_count: 24,
+                scroll_count: 12,
+                navigating_action_count: 8,
+                media_audio_playing: true,
+                title_indicates_video_or_feed: true,
+                has_direct_url: true,
+                ..Default::default()
+            },
+        );
+        let tokens = HashSet::from(["smalltalk".to_string(), "continue".to_string()]);
+        let codex_classification = classify_app_activity_segment(&codex, &tokens, 2_000);
+        let youtube_classification = classify_app_activity_segment(&youtube, &tokens, 2_000);
+        assert_eq!(
+            codex_classification.continuation_role,
+            "needs_fresh_capture"
+        );
+        assert_eq!(
+            youtube_classification.continuation_role,
+            "background_consumption"
+        );
+
+        let mut youtube_artifact =
+            test_artifact("artifact-youtube", "browser_tab", "YouTube - Helium");
+        youtube_artifact.browser_url = Some("https://youtube.com/watch?v=test".to_string());
+        youtube_artifact.document_path = None;
+        let mut candidates = vec![test_candidate(
+            "evidence_only",
+            Some(youtube_artifact),
+            None,
+            None,
+        )];
+        let classifications = vec![codex_classification, youtube_classification];
+        let activity = ContinueAppActivityIntelligence {
+            schema: "test".to_string(),
+            generated_at_ms: 2_000,
+            segments: vec![codex, youtube],
+            summary: ContinueActivitySummary::default(),
+            warnings: app_activity_warnings(&classifications),
+            classifications,
+        };
+        apply_app_activity_to_candidates(&mut candidates, &activity);
+
+        assert!(!candidates[0].eligible_for_primary_selection);
+        assert_eq!(
+            candidates[0].continuation_role.as_deref(),
+            Some("background_consumption")
+        );
+        assert!(select_local_candidate_after_activity(&candidates, &activity).is_none());
+    }
+
+    #[test]
+    fn p8_browser_composing_can_be_primary_work() {
+        let browser = p8_segment_for_test(
+            "appseg-browser-chat",
+            "browser",
+            "browser_chat",
+            "Smalltalk Continue prompt - ChatGPT - Helium",
+            Some("artifact-chat"),
+            AppActivityFeatures {
+                typing_burst_count: 3,
+                typing_commit_count: 1,
+                composing_action_count: 2,
+                has_direct_url: true,
+                has_visible_text: true,
+                ..Default::default()
+            },
+        );
+        let tokens = HashSet::from(["smalltalk".to_string(), "continue".to_string()]);
+        let classification = classify_app_activity_segment(&browser, &tokens, 2_000);
+
+        assert_eq!(classification.app_family, "browser");
+        assert_ne!(classification.continuation_role, "background_consumption");
+        assert!(matches!(
+            classification.continuation_role.as_str(),
+            "resume_target" | "support_context"
+        ));
+        assert!(classification.work_value_score >= 0.55);
+    }
+
+    #[test]
+    fn p8_finder_generated_audit_is_diagnostic_only() {
+        let finder = p8_segment_for_test(
+            "appseg-finder",
+            "finder",
+            "finder_generated_output",
+            "Downloads/continue_outputs/frame-001388-origin.jpg",
+            Some("artifact-frame"),
+            AppActivityFeatures {
+                has_document_path: true,
+                path_indicates_generated_output: true,
+                title_indicates_generated_audit: true,
+                ..Default::default()
+            },
+        );
+        let classification = classify_app_activity_segment(&finder, &HashSet::new(), 2_000);
+
+        assert_eq!(classification.continuation_role, "diagnostic_only");
+        assert!(classification.diagnostic_score >= 0.8);
+        assert!(classification.resume_likelihood_score <= 0.1);
     }
 
     #[test]
@@ -20315,6 +27542,28 @@ mod tests {
                 recency_score: 0.0,
                 openability_score: 0.0,
                 privacy_safety_score: 0.0,
+                memory_support_score: 0.0,
+                memory_contradiction_score: 0.0,
+                feedback_prior_score: 0.0,
+                retrieval_confidence_score: 0.0,
+                work_value_score: 0.0,
+                resume_likelihood_score: 0.0,
+                divergence_score: 0.9,
+                diagnostic_score: 0.0,
+                objective_relation_score: 0.0,
+                interaction_depth_score: 0.05,
+                evidence_sufficiency_score: 0.8,
+                app_activity_segment_id: None,
+                app_activity_classification_id: None,
+                app_family: Some("browser".to_string()),
+                surface_type: Some("browser_media".to_string()),
+                activity_intent: Some("media_consumption".to_string()),
+                task_phase: Some("passive".to_string()),
+                continuation_role: Some("background_consumption".to_string()),
+                work_value_reason: Some("Passive YouTube media".to_string()),
+                why_not_primary: Some("Passive media is not a return target".to_string()),
+                supporting_memory_ids: Vec::new(),
+                contradicting_memory_ids: Vec::new(),
                 reason: Some("recent_progress_still_open".to_string()),
                 missing_evidence: Vec::new(),
                 warnings: Vec::new(),
@@ -20343,6 +27592,28 @@ mod tests {
                 recency_score: 0.0,
                 openability_score: 0.0,
                 privacy_safety_score: 0.0,
+                memory_support_score: 0.0,
+                memory_contradiction_score: 0.0,
+                feedback_prior_score: 0.0,
+                retrieval_confidence_score: 0.0,
+                work_value_score: 0.72,
+                resume_likelihood_score: 0.68,
+                divergence_score: 0.0,
+                diagnostic_score: 0.0,
+                objective_relation_score: 0.7,
+                interaction_depth_score: 0.75,
+                evidence_sufficiency_score: 0.55,
+                app_activity_segment_id: None,
+                app_activity_classification_id: None,
+                app_family: Some("code_editor".to_string()),
+                surface_type: Some("code_file".to_string()),
+                activity_intent: Some("debugging_error".to_string()),
+                task_phase: Some("failed_or_blocked".to_string()),
+                continuation_role: Some("resume_target".to_string()),
+                work_value_reason: Some("Current code work has blocker evidence".to_string()),
+                why_not_primary: None,
+                supporting_memory_ids: Vec::new(),
+                contradicting_memory_ids: Vec::new(),
                 reason: Some("recent_progress_still_open".to_string()),
                 missing_evidence: Vec::new(),
                 warnings: Vec::new(),
@@ -20478,6 +27749,7 @@ mod tests {
             &workstreams,
             &candidates,
             3,
+            None,
         )
         .unwrap();
         let ids = pack
@@ -20583,6 +27855,120 @@ mod tests {
         assert!(audit
             .warnings
             .contains(&"current_surface:event_backed_no_screenshot".to_string()));
+    }
+
+    #[test]
+    fn p5_sufficiency_classifier_requests_probe_for_thin_frame_fallback() {
+        let result = p5_thin_frame_fallback_decision();
+
+        let sufficiency = assess_continue_evidence_sufficiency(&result);
+
+        assert_eq!(sufficiency.status, EvidenceSufficiencyStatus::NeedsProbe);
+        assert!(sufficiency
+            .reasons
+            .contains(&NeedMoreEvidenceReason::FrameFallbackOnly));
+        assert!(sufficiency
+            .reasons
+            .contains(&NeedMoreEvidenceReason::MissingUrlOrPath));
+        assert!(sufficiency
+            .requested_probes
+            .contains(&EvidenceProbeKind::BrowserUrlProbe));
+        assert!(!sufficiency.allow_heavy_capture);
+    }
+
+    #[test]
+    fn p5_need_more_evidence_request_uses_probe_cooldown() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let result = p5_thin_frame_fallback_decision();
+
+        let (request, _sufficiency) =
+            build_need_more_evidence_request_from_decision(&conn, &result)
+                .unwrap()
+                .expect("thin frame fallback should request a probe");
+        let probe_result = NeedMoreEvidenceProbeResult {
+            request_id: request.id.clone(),
+            started_at_ms: current_time_millis(),
+            completed_at_ms: current_time_millis(),
+            probes_attempted: request.requested_probes.clone(),
+            probes_succeeded: Vec::new(),
+            evidence_changed: false,
+            privacy_blocked: false,
+            observation_id: Some("probe-test".to_string()),
+            app_name: None,
+            app_bundle_id: None,
+            window_title: None,
+            browser_url: None,
+            document_path: None,
+            accessibility_text_char_count: 0,
+            window_count: 0,
+            privacy_status: Some("normal".to_string()),
+            warnings: vec!["no_new_metadata".to_string()],
+            errors: Vec::new(),
+        };
+        record_continue_evidence_probe_result(&conn, &request, &probe_result).unwrap();
+
+        let repeated = build_need_more_evidence_request_from_decision(&conn, &result).unwrap();
+
+        assert!(repeated.is_none());
+    }
+
+    #[test]
+    fn p5_probe_row_can_become_current_surface_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        ensure_continue_schema(&conn).unwrap();
+        let request = NeedMoreEvidenceRequest {
+            id: "need-evidence-test".to_string(),
+            reason: NeedMoreEvidenceReason::MissingUrlOrPath,
+            candidate_ids: vec!["candidate-test".to_string()],
+            workstream_ids: vec!["workstream-test".to_string()],
+            artifact_ids: Vec::new(),
+            requested_probes: vec![
+                EvidenceProbeKind::FrontmostAppProbe,
+                EvidenceProbeKind::DocumentPathProbe,
+            ],
+            max_probe_ms: 1_500,
+            allow_heavy_capture: false,
+            privacy_mode: PrivacyMode::MetadataOnly,
+            source_decision_id: "decision-test".to_string(),
+            source_evidence_watermark_hash: "watermark-before".to_string(),
+            created_at_ms: 10_000,
+        };
+        let probe_result = NeedMoreEvidenceProbeResult {
+            request_id: request.id.clone(),
+            started_at_ms: 10_000,
+            completed_at_ms: 10_100,
+            probes_attempted: request.requested_probes.clone(),
+            probes_succeeded: request.requested_probes.clone(),
+            evidence_changed: true,
+            privacy_blocked: false,
+            observation_id: Some("probe-current-cursor".to_string()),
+            app_name: Some("Cursor".to_string()),
+            app_bundle_id: Some("com.todesktop.230313mzl4w4u92".to_string()),
+            window_title: Some("continuation.rs".to_string()),
+            browser_url: None,
+            document_path: Some("/Users/me/smalltalk/src-tauri/src/continuation.rs".to_string()),
+            accessibility_text_char_count: 120,
+            window_count: 3,
+            privacy_status: Some("normal".to_string()),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        let before = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+        record_continue_evidence_probe_result(&conn, &request, &probe_result).unwrap();
+        let after = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+
+        let audit =
+            resolve_current_surface(&conn, Some("session-a"), 10_200, 45 * 60 * 1000).unwrap();
+
+        assert_ne!(before.hash, after.hash);
+        assert_eq!(audit.selected.app_name.as_deref(), Some("Cursor"));
+        assert_eq!(audit.selected.openability, "openable");
+        assert!(audit
+            .selected
+            .evidence_kinds
+            .contains(&"evidence_probe".to_string()));
     }
 
     #[test]
@@ -20700,9 +28086,17 @@ mod tests {
             warnings: vec!["current_surface:event_backed_no_screenshot".to_string()],
         };
 
-        let pack =
-            build_micro_inference_pack(&conn, Some(&focus), Some(&surface), 11_000, &[], &[], 0)
-                .unwrap();
+        let pack = build_micro_inference_pack(
+            &conn,
+            Some(&focus),
+            Some(&surface),
+            11_000,
+            &[],
+            &[],
+            0,
+            None,
+        )
+        .unwrap();
         let serialized = serde_json::to_string(&pack).unwrap();
 
         assert!(!serialized.contains("https://example.com/private"));
@@ -20839,6 +28233,7 @@ mod tests {
             None,
             Some(&gate),
             &gate.output_mode,
+            None,
         );
         assert_eq!(handoff.confidence_label, "Thin");
         assert!(handoff
@@ -20881,6 +28276,7 @@ mod tests {
             None,
             None,
             &ContinueOutputMode::ThinContinue,
+            None,
         );
 
         let joined = format!(
@@ -21060,6 +28456,7 @@ mod tests {
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
+            continue_dossier: None,
         };
         let mut output = selected_candidate_model_output(&candidate);
         output.return_line = "Return to continue-candidate-known.".to_string();
@@ -21137,6 +28534,9 @@ mod tests {
         let mut candidate = test_candidate("finish_search", Some(branch), Some(action), None);
         candidate.resume_work_target = Some(primary);
         candidate.score = 0.7;
+        candidate.continuation_role = Some("support_context".to_string());
+        candidate.why_not_primary =
+            Some("Support search is not the primary return target.".to_string());
         let pack = ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
@@ -21169,11 +28569,31 @@ mod tests {
                     .map(|action| action.id.clone()),
                 evidence_episode_id: candidate.supporting_episode_id.clone(),
                 missing_evidence: Vec::new(),
+                memory_support_score: candidate.memory_support_score,
+                memory_contradiction_score: candidate.memory_contradiction_score,
+                feedback_prior_score: candidate.feedback_prior_score,
+                work_value_score: candidate.work_value_score,
+                resume_likelihood_score: candidate.resume_likelihood_score,
+                divergence_score: candidate.divergence_score,
+                diagnostic_score: candidate.diagnostic_score,
+                objective_relation_score: candidate.objective_relation_score,
+                interaction_depth_score: candidate.interaction_depth_score,
+                evidence_sufficiency_score: candidate.evidence_sufficiency_score,
+                app_family: candidate.app_family.clone(),
+                surface_type: candidate.surface_type.clone(),
+                activity_intent: candidate.activity_intent.clone(),
+                task_phase: candidate.task_phase.clone(),
+                continuation_role: candidate.continuation_role.clone(),
+                work_value_reason: candidate.work_value_reason.clone(),
+                why_not_primary: candidate.why_not_primary.clone(),
+                memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
+                memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
                 local_reason: candidate.reason.clone(),
             }],
             evidence_packs_v2: vec![build_candidate_evidence_pack_v2(&candidate, None, None)],
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
+            continue_dossier: None,
         };
         let output = ContinueMicroInferenceOutput {
             result: "selected_candidate".to_string(),
@@ -21232,6 +28652,7 @@ mod tests {
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
+            continue_dossier: None,
         };
 
         let validated = validate_micro_inference_output(&output, &[], &pack).unwrap();
@@ -21270,6 +28691,7 @@ mod tests {
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
+            continue_dossier: None,
         };
 
         let validated = validate_micro_inference_output(&output, &[], &pack).unwrap();
@@ -23066,7 +30488,7 @@ mod tests {
     }
 
     #[test]
-    fn verification_open_loop_keeps_editor_as_resume_work_target() {
+    fn successful_verification_becomes_completed_progress_candidate() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
         insert_frame(
@@ -23123,31 +30545,88 @@ mod tests {
         rebuild_second_and_third(&conn);
         let editor_artifact = artifact_id_for_document(&conn, "/Users/me/smalltalk/src/lib.rs");
         let terminal_artifact = artifact_id_for_kind(&conn, "terminal");
-        let (boundary, resume, verification): (String, String, String) = conn
+        let (state, boundary, resume, verification): (String, String, String, String) = conn
             .query_row(
-                "SELECT boundary_kind, resume_work_artifact_id, verification_artifact_id
+                "SELECT state, boundary_kind, resume_work_artifact_id, verification_artifact_id
+                 FROM continue_open_loops
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), boundary.as_str()),
+            ("resolved", "completed_progress")
+        );
+        assert_eq!(resume, editor_artifact);
+        assert_eq!(verification, terminal_artifact);
+
+        generate_local_decision(&conn);
+        let (candidate_kind, target_artifact): (String, String) = conn
+            .query_row(
+                "SELECT candidate_kind, target_artifact_id
+                 FROM continue_candidates
+                 ORDER BY score DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(candidate_kind, "review_completed_changes");
+        assert_eq!(target_artifact, editor_artifact);
+    }
+
+    #[test]
+    fn codex_goal_achieved_output_becomes_review_completed_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Codex",
+            "Smalltalk Continue implementation",
+            None,
+            None,
+            "manual",
+            "Implemented observe_before_decide. Edited 3 files. cargo check passed. cargo test continue passed. npm run build built. Goal achieved.",
+            Some("com.openai.codex"),
+            None,
+        );
+        insert_context(&conn, 1, "chat_conversation", "Codex", None, None, None);
+        insert_unit(
+            &conn,
+            1,
+            "output",
+            "terminal_output",
+            "cargo check passed. cargo test continue passed. npm run build built. Goal achieved.",
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let (state, boundary, progress): (String, String, String) = conn
+            .query_row(
+                "SELECT state, boundary_kind, COALESCE(last_concrete_progress, '')
                  FROM continue_open_loops
                  LIMIT 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(boundary, "verification_without_return");
-        assert_eq!(resume, editor_artifact);
-        assert_eq!(verification, terminal_artifact);
+        assert_eq!(state, "resolved");
+        assert_eq!(boundary, "completed_progress");
+        assert!(progress.contains("Goal achieved") || progress.contains("Tests passed"));
 
-        generate_local_decision(&conn);
-        let target_artifact: String = conn
-            .query_row(
-                "SELECT target_artifact_id
-                 FROM continue_candidates
-                 ORDER BY score DESC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(target_artifact, editor_artifact);
+        let decision = generate_local_decision(&conn);
+        assert_eq!(
+            decision.candidate_kind.as_deref(),
+            Some("review_completed_changes")
+        );
+        assert!(decision
+            .next_action
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Review the completed changes"));
+        assert_eq!(decision.handoff.headline, "Review completed work");
     }
 
     fn distinct_episode_count_for_frames(conn: &Connection, frame_ids: &[&str]) -> i64 {

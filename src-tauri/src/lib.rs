@@ -54,6 +54,7 @@ pub fn run() {
             capture::infer_continue_feedback,
             capture::record_continue_feedback,
             capture::run_continue_eval,
+            capture::run_continue_replay_eval,
             capture::open_resume_point,
             capture::get_native_storyboard_dossier,
             capture::classify_episode_transitions,
