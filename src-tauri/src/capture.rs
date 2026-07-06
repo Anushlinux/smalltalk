@@ -18474,6 +18474,14 @@ fn export_continue_output_audit_to_plan(
         &serde_json::to_value(&result.current_focus).map_err(to_string)?,
     )?;
     write_json_pretty(
+        &decision_dir.join("current_surface_resolution.json"),
+        &serde_json::to_value(&result.current_surface_resolution).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("evidence_freshness_ledger.json"),
+        &serde_json::to_value(&result.evidence_freshness_ledger).map_err(to_string)?,
+    )?;
+    write_json_pretty(
         &decision_dir.join("selected_workstream.json"),
         &serde_json::to_value(&result.selected_workstream).map_err(to_string)?,
     )?;
@@ -18681,7 +18689,9 @@ fn write_continue_export_status(
                 "inferenceSummary": "inference/summary.json",
                 "selectedCandidate": "continue/candidates/selected_candidate.json",
                 "finalDecision": "final/continue_decision_result.json",
-                "handoff": "final/handoff.json"
+                "handoff": "final/handoff.json",
+                "currentSurfaceResolution": "decision/current_surface_resolution.json",
+                "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json"
             },
             "rawArtifacts": {
                 "database": "raw/smalltalk-capture.sqlite",
@@ -18750,6 +18760,8 @@ fn write_continue_output_manifest(
         "explainMd": "explain.md",
         "decisionTrace": "decision/decision_trace.json",
         "finalDecision": "decision/final_decision.json",
+        "currentSurfaceResolution": "decision/current_surface_resolution.json",
+        "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json",
         "legacyFinalDecision": "final/continue_decision_result.json",
         "evidenceClosure": "evidence/evidence_closure.json",
         "candidateScores": "decision/candidates.json",
