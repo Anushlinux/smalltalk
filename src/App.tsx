@@ -433,6 +433,17 @@ type ContinueCandidateSummary = {
   confidence_label: string;
   reason?: string | null;
   missing_evidence: string[];
+  risk_flags?: string[];
+  score_caps_applied?: string[];
+  eligible_for_primary_selection?: boolean;
+  public_alternative_eligible_after_feedback?: boolean;
+  feedback_suppression_state?: string;
+  feedback_negative_weight?: number;
+  feedback_positive_weight_after_last_negative?: number;
+  feedback_last_negative_ms?: number | null;
+  feedback_last_reconfirming_evidence_ms?: number | null;
+  feedback_score_cap?: number | null;
+  feedback_reason_codes?: string[];
   evidence_frame_id?: string | null;
   supporting_episode_id?: string | null;
   last_meaningful_action_id?: string | null;
@@ -475,6 +486,11 @@ type ContinueCandidateScoreTrace = {
   openability_score: number;
   recency_score: number;
   evidence_quality_score: number;
+  feedback_suppression_state?: string;
+  feedback_negative_weight?: number;
+  feedback_last_negative_ms?: number | null;
+  feedback_last_reconfirming_evidence_ms?: number | null;
+  feedback_reason_codes?: string[];
 };
 
 type ContinueActivitySummary = {
@@ -517,6 +533,7 @@ type ContinueDecisionResult = {
   active_current_work_unresolved?: ActiveCurrentWorkUnresolved | null;
   current_activity?: string | null;
   selected_workstream?: ContinueSelectedWorkstream | null;
+  selected_candidate_id?: string | null;
   return_target?: ContinueReturnTarget | null;
   resume_work_target?: ContinueReturnTarget | null;
   candidate_kind?: string | null;
@@ -533,6 +550,14 @@ type ContinueDecisionResult = {
   alternatives: ContinueCandidateSummary[];
   generated_candidates: number;
   validation_status: string;
+  feedback_policy_version?: string;
+  feedback_watermark_ms?: number | null;
+  open_watermark_ms?: number | null;
+  feedback_suppressed_candidate_count?: number;
+  feedback_score_capped_candidate_count?: number;
+  eligible_candidate_count_after_feedback_gate?: number;
+  model_candidate_count_before_feedback_filter?: number;
+  model_candidate_count_after_feedback_filter?: number;
   observe_before_decide?: unknown | null;
   app_activity?: unknown | null;
   activity_summary?: ContinueActivitySummary | null;
@@ -714,6 +739,10 @@ type ContinueWorkstreamCandidateDetail = {
   continuation_role?: string | null;
   work_value_reason?: string | null;
   why_not_primary?: string | null;
+  feedback_suppression_state?: string;
+  feedback_reason_codes?: string[];
+  eligible_for_primary_selection?: boolean;
+  public_alternative_eligible_after_feedback?: boolean;
   created_at_ms: number;
 };
 
@@ -1278,6 +1307,7 @@ function App() {
               decision_id: continueDecision?.decision_id || workstreamDetail?.latest_decision?.decision_id || null,
               selected_candidate_id:
                 options.selectedCandidateId ||
+                continueDecision?.selected_candidate_id ||
                 workstreamDetail?.latest_decision?.selected_candidate_id ||
                 null,
               workstream_id: workstreamId,
@@ -1296,24 +1326,50 @@ function App() {
         );
         setFeedbackStatus("Got it. Smalltalk will use that correction next time.");
         await loadWorkstreamDetail(workstreamId);
+        if (
+          feedbackKind === "rejected" ||
+          feedbackKind === "ignored" ||
+          feedbackKind === "corrected" ||
+          feedbackKind === "artifact_only_evidence" ||
+          feedbackKind === "ignored_workstream"
+        ) {
+          setContinueDecision(null);
+          await runContinueDecision({ forceRebuild: true, trigger: "manual" });
+        }
       } catch (err) {
         setContinueError(`Feedback failed: ${String(err)}`);
       } finally {
         setBusyAction(null);
       }
     },
-    [continueDecision, loadWorkstreamDetail, selectedWorkstreamId, workstreamDetail],
+    [
+      continueDecision,
+      loadWorkstreamDetail,
+      runContinueDecision,
+      selectedWorkstreamId,
+      workstreamDetail,
+    ],
   );
 
   const continueFromAlternative = useCallback(
     async (candidate: ContinueWorkstreamCandidateDetail | ContinueCandidateSummary) => {
+      const originalTarget =
+        continueDecision?.resume_work_target?.artifact_id ||
+        continueDecision?.return_target?.artifact_id ||
+        workstreamDetail?.latest_decision?.return_target_artifact_id ||
+        null;
       await recordContinueFeedback("corrected", {
-        selectedCandidateId: candidate.candidate_id,
-        workstreamId: candidate.workstream_id,
-        targetArtifactId:
-          "target_artifact_id" in candidate
-            ? candidate.target_artifact_id
-            : null,
+        selectedCandidateId:
+          continueDecision?.selected_candidate_id ||
+          workstreamDetail?.latest_decision?.selected_candidate_id ||
+          null,
+        workstreamId:
+          continueDecision?.selected_workstream?.workstream_id ||
+          workstreamDetail?.workstream.id ||
+          selectedWorkstreamId ||
+          candidate.workstream_id ||
+          null,
+        targetArtifactId: originalTarget,
         correctedArtifactId:
           "target_artifact_id" in candidate
             ? candidate.target_artifact_id
@@ -1333,7 +1389,7 @@ function App() {
         }
       }
     },
-    [recordContinueFeedback],
+    [continueDecision, recordContinueFeedback, selectedWorkstreamId, workstreamDetail],
   );
 
   const runContinueEval = useCallback(async () => {
@@ -4976,6 +5032,10 @@ function productizeInternalLabel(value?: string | null) {
     missing_current_work_thread_or_document_id: "Current work needs a thread or document identity.",
     active_current_work_unresolved: "Fresh current work is visible but not safely reopenable yet.",
     stale_return_target_suppressed_newer_current_focus: "An older return point was hidden because newer work was detected elsewhere.",
+    feedback_no_eligible_candidates_after_suppression: "I won't suggest the target you marked wrong unless there is fresh evidence that you returned to it.",
+    feedback_fresh_reconfirmation_required_before_target_reuse: "Fresh evidence is required before a corrected target can be recommended again.",
+    feedback_suppressed_target_not_opened: "That target is no longer recommended because of your correction.",
+    feedback_all_candidates_suppressed: "I won't suggest targets you marked wrong unless there is fresh evidence that you returned to them.",
     micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local evidence.",
     smalltalk_self_observation_downranked: "Smalltalk ignored its own UI as evidence.",
     branch_surface_is_evidence_not_default_return_target: "Branch surface is evidence, not the default return target.",
@@ -5101,6 +5161,9 @@ function isInternalFacingText(value?: string | null) {
 
 function presentOpenResult(result: OpenResumePointResult) {
   if (result.warnings.length > 0) {
+    if (result.warnings.some((warning) => warning.includes("suppressed by feedback"))) {
+      return "That target is no longer recommended because of your correction.";
+    }
     return productizeInternalLabel(result.warnings[0]);
   }
   if (result.opened_url) return "Opened the selected target.";

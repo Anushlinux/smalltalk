@@ -5818,6 +5818,7 @@ struct ResolvedOpenResumePoint {
 
 #[derive(Debug, Clone)]
 struct ContinueOpenDecisionRow {
+    selected_candidate_id: Option<String>,
     return_target_artifact_id: Option<String>,
     confidence: f64,
     selected_workstream_id: Option<String>,
@@ -5843,6 +5844,35 @@ struct BrowserOpenOutcome {
     warnings: Vec<String>,
 }
 
+fn finalize_open_resume_point_result(
+    conn: &Connection,
+    input: &OpenResumePointInput,
+    mut result: OpenResumePointResult,
+) -> OpenResumePointResult {
+    let Some(decision_id) = input.continue_decision_id.as_deref() else {
+        return result;
+    };
+    let telemetry = crate::continuation::ContinueDecisionOpenEventRequest {
+        decision_id: decision_id.to_string(),
+        selected_candidate_id: None,
+        workstream_id: None,
+        target_artifact_id: input.target_artifact_id.clone(),
+        opened_at_ms: None,
+        strategy: result.strategy.clone(),
+        opened_url: result.opened_url.is_some(),
+        opened_path: false,
+        opened_frame_fallback: result.opened_url.is_none() && result.frame_id.is_some(),
+        warnings: result.warnings.clone(),
+    };
+    if let Err(error) = crate::continuation::record_continue_decision_open_event(conn, telemetry) {
+        result.warnings.push(format!(
+            "Continue open telemetry could not be recorded: {}",
+            error
+        ));
+    }
+    result
+}
+
 fn open_resume_point_impl(
     app: &AppHandle,
     input: OpenResumePointInput,
@@ -5865,14 +5895,15 @@ fn open_resume_point_impl(
         resolve_open_resume_point(app, &conn, &input, cloud_file.as_ref(), &mut warnings)?
     else {
         focus_main_window_for_resume(app);
-        return Ok(OpenResumePointResult {
+        let result = OpenResumePointResult {
             strategy: "smalltalk_fallback".to_string(),
             frame_id: None,
             opened_url: None,
             anchor_text: None,
             confidence: 0.0,
             warnings,
-        });
+        };
+        return Ok(finalize_open_resume_point_result(&conn, &input, result));
     };
 
     warnings.extend(resolved.warnings.clone());
@@ -5885,14 +5916,15 @@ fn open_resume_point_impl(
             frame_key, privacy.exclude_reason
         ));
         focus_main_window_for_resume(app);
-        return Ok(OpenResumePointResult {
+        let result = OpenResumePointResult {
             strategy: "smalltalk_privacy_fallback".to_string(),
             frame_id: Some(resolved.frame_id),
             opened_url: None,
             anchor_text: resolved.anchor_text,
             confidence: resolved.confidence,
             warnings,
-        });
+        };
+        return Ok(finalize_open_resume_point_result(&conn, &input, result));
     }
 
     let Some(url) = resolved.url.clone() else {
@@ -5901,14 +5933,15 @@ fn open_resume_point_impl(
             resolved.frame_id
         ));
         focus_main_window_for_resume(app);
-        return Ok(OpenResumePointResult {
+        let result = OpenResumePointResult {
             strategy: "smalltalk_fallback".to_string(),
             frame_id: Some(resolved.frame_id),
             opened_url: None,
             anchor_text: resolved.anchor_text,
             confidence: resolved.confidence,
             warnings,
-        });
+        };
+        return Ok(finalize_open_resume_point_result(&conn, &input, result));
     };
 
     match open_browser_resume_point(
@@ -5918,14 +5951,15 @@ fn open_resume_point_impl(
     ) {
         Ok(outcome) => {
             warnings.extend(outcome.warnings);
-            Ok(OpenResumePointResult {
+            let result = OpenResumePointResult {
                 strategy: outcome.strategy,
                 frame_id: Some(resolved.frame_id),
                 opened_url: Some(url),
                 anchor_text: resolved.anchor_text,
                 confidence: resolved.confidence,
                 warnings,
-            })
+            };
+            Ok(finalize_open_resume_point_result(&conn, &input, result))
         }
         Err(error) => {
             warnings.push(error);
@@ -5934,14 +5968,15 @@ fn open_resume_point_impl(
                     .to_string(),
             );
             focus_main_window_for_resume(app);
-            Ok(OpenResumePointResult {
+            let result = OpenResumePointResult {
                 strategy: "smalltalk_automation_fallback".to_string(),
                 frame_id: Some(resolved.frame_id),
                 opened_url: Some(url),
                 anchor_text: resolved.anchor_text,
                 confidence: resolved.confidence,
                 warnings,
-            })
+            };
+            Ok(finalize_open_resume_point_result(&conn, &input, result))
         }
     }
 }
@@ -6107,6 +6142,18 @@ fn resolve_open_resume_point(
     cloud_file: Option<&OpenResumeCloudFile>,
     warnings: &mut Vec<String>,
 ) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    if input.strict_continue_target {
+        if let Some(decision_id) = input.continue_decision_id.as_deref() {
+            return resolve_continue_decision_for_open(
+                conn,
+                decision_id,
+                input.target_artifact_id.as_deref(),
+                input.strict_continue_target,
+                warnings,
+            );
+        }
+    }
+
     if let Some(target_frame_id) = input.target_frame_id {
         if let Some(frame) = frame_by_id(conn, target_frame_id)? {
             let preferred_anchor =
@@ -6179,7 +6226,7 @@ fn resolve_continue_decision_for_open(
 ) -> Result<Option<ResolvedOpenResumePoint>, String> {
     let row = conn
         .query_row(
-            "SELECT d.return_target_artifact_id, d.confidence,
+            "SELECT d.selected_candidate_id, d.return_target_artifact_id, d.confidence,
                     d.selected_workstream_id,
                     c.target_artifact_id, c.evidence_frame_id, c.workstream_id,
                     a.last_seen_frame_id
@@ -6190,13 +6237,14 @@ fn resolve_continue_decision_for_open(
             params![decision_id],
             |row| {
                 Ok(ContinueOpenDecisionRow {
-                    return_target_artifact_id: row.get(0)?,
-                    confidence: row.get(1)?,
-                    selected_workstream_id: row.get(2)?,
-                    candidate_target_artifact_id: row.get(3)?,
-                    candidate_evidence_frame_id: row.get(4)?,
-                    candidate_workstream_id: row.get(5)?,
-                    return_target_last_seen_frame_id: row.get(6)?,
+                    selected_candidate_id: row.get(0)?,
+                    return_target_artifact_id: row.get(1)?,
+                    confidence: row.get(2)?,
+                    selected_workstream_id: row.get(3)?,
+                    candidate_target_artifact_id: row.get(4)?,
+                    candidate_evidence_frame_id: row.get(5)?,
+                    candidate_workstream_id: row.get(6)?,
+                    return_target_last_seen_frame_id: row.get(7)?,
                 })
             },
         )
@@ -6207,11 +6255,27 @@ fn resolve_continue_decision_for_open(
         return Ok(None);
     };
 
+    let decision_target_artifact_id = requested_artifact_id
+        .and_then(|value| non_empty(value.to_string()))
+        .or_else(|| row.candidate_target_artifact_id.clone())
+        .or_else(|| row.return_target_artifact_id.clone());
+    if let Some(reason) = crate::continuation::continue_feedback_suppression_for_target(
+        conn,
+        row.selected_candidate_id.as_deref(),
+        row.candidate_workstream_id
+            .as_deref()
+            .or(row.selected_workstream_id.as_deref()),
+        decision_target_artifact_id.as_deref(),
+    )? {
+        warnings.push(format!(
+            "Continue decision {} target was suppressed by feedback: {}; staying in Smalltalk instead of opening a stale target.",
+            decision_id, reason
+        ));
+        return Ok(None);
+    }
+
     if strict_continue_target {
-        let target_artifact_id = requested_artifact_id
-            .and_then(|value| non_empty(value.to_string()))
-            .or_else(|| row.candidate_target_artifact_id.clone())
-            .or_else(|| row.return_target_artifact_id.clone());
+        let target_artifact_id = decision_target_artifact_id;
         let Some(target_artifact_id) = target_artifact_id else {
             warnings.push(format!(
                 "Strict Continue decision {} has no displayed target artifact; staying in Smalltalk instead of using a fallback target.",
@@ -19629,10 +19693,20 @@ fn continue_candidates_audit_json(
         .alternatives
         .iter()
         .map(|candidate| {
+            let score_after_feedback_gate = if candidate.eligible_for_primary_selection {
+                Value::from(candidate.score)
+            } else {
+                Value::Null
+            };
             serde_json::json!({
                 "candidate_id": candidate.candidate_id,
                 "workstream_id": candidate.workstream_id,
                 "target_artifact_id": candidate.target_artifact_id,
+                "feedback_target_keys": continue_candidate_feedback_target_keys(
+                    candidate.candidate_id.as_str(),
+                    candidate.workstream_id.as_str(),
+                    candidate.target_artifact_id.as_deref(),
+                ),
                 "candidate_kind": candidate.candidate_kind,
                 "evidence_frame_id": candidate.evidence_frame_id,
                 "supporting_episode_id": candidate.supporting_episode_id,
@@ -19640,6 +19714,16 @@ fn continue_candidates_audit_json(
                 "raw_score_before_caps": candidate.pre_cap_score,
                 "score_after_caps": candidate.score,
                 "final_score": candidate.score,
+                "feedback_suppression_state": candidate.feedback_suppression_state,
+                "feedback_negative_weight_since_reconfirmation": candidate.feedback_negative_weight,
+                "feedback_last_negative_ms": candidate.feedback_last_negative_ms,
+                "feedback_last_positive_ms": Value::Null,
+                "feedback_last_reconfirming_evidence_ms": candidate.feedback_last_reconfirming_evidence_ms,
+                "feedback_reason_codes": candidate.feedback_reason_codes,
+                "primary_eligible_after_feedback": candidate.eligible_for_primary_selection,
+                "public_alternative_eligible_after_feedback": candidate.public_alternative_eligible_after_feedback,
+                "score_before_feedback_gate": candidate.pre_cap_score,
+                "score_after_feedback_gate": score_after_feedback_gate,
                 "score_components": {
                     "actionability_score": candidate.components.actionability,
                     "primary_target_score": candidate.components.primary_target,
@@ -19649,6 +19733,14 @@ fn continue_candidates_audit_json(
                     "recency_score": candidate.components.recency,
                     "openability_score": candidate.components.openability,
                     "privacy_safety_score": candidate.components.privacy_safety,
+                    "feedback_prior_score": candidate.components.feedback_prior,
+                    "feedback_suppression_state": candidate.feedback_suppression_state.clone(),
+                    "feedback_negative_weight": candidate.feedback_negative_weight,
+                    "feedback_positive_weight_after_last_negative": candidate.feedback_positive_weight_after_last_negative,
+                    "feedback_last_negative_ms": candidate.feedback_last_negative_ms,
+                    "feedback_last_reconfirming_evidence_ms": candidate.feedback_last_reconfirming_evidence_ms,
+                    "feedback_score_cap": candidate.feedback_score_cap,
+                    "feedback_reason_codes": candidate.feedback_reason_codes.clone(),
                 },
                 "score_caps_applied": candidate.score_caps_applied,
                 "demotions_applied": candidate.selection_demotion_reason.as_ref().map(|reason| {
@@ -19672,9 +19764,30 @@ fn continue_candidates_audit_json(
         "schema": "smalltalk.continue_audit_candidates.v1",
         "selected_candidate_id": selected_id,
         "generated_candidates": result.generated_candidates,
+        "feedback_policy_version": result.feedback_policy_version,
+        "feedback_suppressed_candidate_count": result.feedback_suppressed_candidate_count,
+        "feedback_score_capped_candidate_count": result.feedback_score_capped_candidate_count,
+        "eligible_candidate_count_after_feedback_gate": result.eligible_candidate_count_after_feedback_gate,
+        "model_candidate_count_before_feedback_filter": result.model_candidate_count_before_feedback_filter,
+        "model_candidate_count_after_feedback_filter": result.model_candidate_count_after_feedback_filter,
         "selected_candidate_row": selected_candidate,
         "alternatives": alternatives,
     })
+}
+
+fn continue_candidate_feedback_target_keys(
+    candidate_id: &str,
+    workstream_id: &str,
+    target_artifact_id: Option<&str>,
+) -> Vec<String> {
+    let mut keys = vec![
+        format!("Candidate:{}", candidate_id),
+        format!("Workstream:{}", workstream_id),
+    ];
+    if let Some(target_artifact_id) = target_artifact_id.filter(|value| !value.trim().is_empty()) {
+        keys.push(format!("TargetArtifact:{}", target_artifact_id));
+    }
+    keys
 }
 
 fn continue_copy_gate_json(result: &crate::continuation::ContinueDecisionResult) -> Value {
@@ -19811,6 +19924,10 @@ fn export_continue_model_audit(
             },
             "validation_failures": event.validation_failures,
             "validation_classification": event.validation_classification,
+            "model_candidate_count_before_feedback_filter": event.model_candidate_count_before_feedback_filter,
+            "model_candidate_count_after_feedback_filter": event.model_candidate_count_after_feedback_filter,
+            "suppressed_candidate_ids_not_sent": event.suppressed_candidate_ids_not_sent,
+            "feedback_policy_version": event.feedback_policy_version,
             "response_id": event.response_id,
             "error": event.error,
             "fallback_reason": event.fallback_reason,
@@ -19831,6 +19948,10 @@ fn export_continue_model_audit(
             "skipped": false,
             "event_count": result.audit_inference_events.len(),
             "first_event": inference_manifest.first(),
+            "model_candidate_count_before_feedback_filter": event.model_candidate_count_before_feedback_filter,
+            "model_candidate_count_after_feedback_filter": event.model_candidate_count_after_feedback_filter,
+            "suppressed_candidate_ids_not_sent": event.suppressed_candidate_ids_not_sent,
+            "feedback_policy_version": event.feedback_policy_version,
             "validation": validation,
             "recovery_or_fallback": recovery,
         });
@@ -20843,6 +20964,17 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
 ## Cache Audit\n\n\
 - Action: `{cache_action}`\n\
 - Details: `cache/cache_decision.json`\n\n\
+## Feedback Policy\n\n\
+- Policy version: `{feedback_policy_version}`\n\
+- Feedback watermark: `{feedback_watermark}`\n\
+- Open watermark: `{open_watermark}`\n\
+- Suppressed candidates: {feedback_suppressed_count}\n\
+- Score-capped candidates: {feedback_score_capped_count}\n\
+- Eligible candidates after feedback gate: {eligible_after_feedback_gate}\n\
+- Model candidates before feedback filter: {model_candidates_before_feedback_filter}\n\
+- Model candidates after feedback filter: {model_candidates_after_feedback_filter}\n\
+- Selected candidate feedback state: `{selected_feedback_state}`\n\
+- Cache bypass: {cache_bypass_reasons}\n\n\
 ## Export Integrity\n\n\
 - Status: `{integrity_status}`\n\
 - Integrity file: `audit_integrity.json`\n\
@@ -20890,6 +21022,26 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
             result.validation_failures.join("; ")
         },
         expected_copy = expected_copy,
+        feedback_policy_version = result.feedback_policy_version,
+        feedback_watermark = result
+            .feedback_watermark_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        open_watermark = result
+            .open_watermark_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        feedback_suppressed_count = result.feedback_suppressed_candidate_count,
+        feedback_score_capped_count = result.feedback_score_capped_candidate_count,
+        eligible_after_feedback_gate = result.eligible_candidate_count_after_feedback_gate,
+        model_candidates_before_feedback_filter = result.model_candidate_count_before_feedback_filter,
+        model_candidates_after_feedback_filter = result.model_candidate_count_after_feedback_filter,
+        selected_feedback_state = selected_candidate_feedback_state(result),
+        cache_bypass_reasons = if result.cache_bypass_reasons.is_empty() {
+            "none".to_string()
+        } else {
+            result.cache_bypass_reasons.join("; ")
+        },
         why_this = if result.handoff.why_this.is_empty() {
             "- No why-this lines returned.".to_string()
         } else {
@@ -20906,6 +21058,22 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
         inference_count = inference_manifest.len(),
         integrity_status = integrity_status,
     )
+}
+
+fn selected_candidate_feedback_state(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> String {
+    result
+        .selected_candidate_id
+        .as_deref()
+        .and_then(|selected_id| {
+            result
+                .alternatives
+                .iter()
+                .find(|candidate| candidate.candidate_id == selected_id)
+        })
+        .map(|candidate| candidate.feedback_suppression_state.clone())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn continue_memory_retrieval_explain_markdown(
@@ -31325,6 +31493,264 @@ mod tests {
     }
 
     #[test]
+    fn strict_continue_decision_refuses_rejected_feedback_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/rejected-continue.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "ChatGPT rejected target",
+            "https://chatgpt.com/c/rejected",
+            "chat_conversation",
+            "Rejected Continue target.",
+            "phash-rejected-continue",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-rejected-continue",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/rejected"),
+            None,
+            Some(frame_id.to_string()),
+            "openable",
+            "ChatGPT rejected target",
+            10,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-rejected",
+            "workstream-rejected",
+            "candidate-rejected",
+            "artifact-rejected-continue",
+            &frame_id.to_string(),
+            20,
+        );
+        crate::continuation::record_continue_feedback(
+            &conn,
+            crate::continuation::ContinueExplicitFeedbackRequest {
+                decision_id: Some("continue-decision-rejected".to_string()),
+                selected_candidate_id: Some("candidate-rejected".to_string()),
+                workstream_id: Some("workstream-rejected".to_string()),
+                target_artifact_id: Some("artifact-rejected-continue".to_string()),
+                corrected_artifact_id: None,
+                feedback_kind: "rejected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-rejected",
+            Some("artifact-rejected-continue"),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("suppressed by feedback") && warning.contains("feedback:")
+        }));
+    }
+
+    #[test]
+    fn strict_continue_decision_allows_rejected_target_after_fresh_reconfirmation() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/reconfirmed-continue.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "ChatGPT reconfirmed target",
+            "https://chatgpt.com/c/reconfirmed",
+            "chat_conversation",
+            "Reconfirmed Continue target.",
+            "phash-reconfirmed-continue",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-reconfirmed-continue",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/reconfirmed"),
+            None,
+            Some(frame_id.to_string()),
+            "openable",
+            "ChatGPT reconfirmed target",
+            10,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-reconfirmed",
+            "workstream-reconfirmed",
+            "candidate-reconfirmed",
+            "artifact-reconfirmed-continue",
+            &frame_id.to_string(),
+            20,
+        );
+        crate::continuation::record_continue_feedback(
+            &conn,
+            crate::continuation::ContinueExplicitFeedbackRequest {
+                decision_id: Some("continue-decision-reconfirmed".to_string()),
+                selected_candidate_id: Some("candidate-reconfirmed".to_string()),
+                workstream_id: Some("workstream-reconfirmed".to_string()),
+                target_artifact_id: Some("artifact-reconfirmed-continue".to_string()),
+                corrected_artifact_id: None,
+                feedback_kind: "rejected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continue_feedback_events
+             SET timestamp_ms = 1000
+             WHERE decision_id = 'continue-decision-reconfirmed'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_task_actions (
+                id, frame_id, artifact_id, action_kind, action_role,
+                evidence_event_ids_json, confidence, reason, created_at_ms,
+                collapse_count, first_frame_id, last_frame_id, strongest_frame_id
+             ) VALUES (
+                'action-reconfirmed-open', ?1, 'artifact-reconfirmed-continue',
+                'editing', 'primary', '[]', 0.9, 'fresh direct action',
+                2000, 1, ?1, ?1, ?1
+             )",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-reconfirmed",
+            Some("artifact-reconfirmed-continue"),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_some());
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("suppressed by feedback")));
+    }
+
+    #[test]
+    fn strict_continue_decision_refuses_corrected_away_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let wrong_frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/corrected-wrong.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Wrong ChatGPT target",
+            "https://chatgpt.com/c/wrong",
+            "chat_conversation",
+            "Wrong Continue target.",
+            "phash-corrected-wrong",
+            None,
+        );
+        let right_frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/corrected-right.jpg",
+            30,
+            "VS Code",
+            "com.microsoft.VSCode",
+            "lib.rs",
+            "",
+            "code_editor",
+            "Corrected Continue target.",
+            "phash-corrected-right",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-corrected-wrong",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/wrong"),
+            None,
+            Some(wrong_frame_id.to_string()),
+            "openable",
+            "Wrong ChatGPT target",
+            10,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-corrected-right",
+            "code_editor",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            Some(right_frame_id.to_string()),
+            "openable",
+            "lib.rs",
+            30,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-corrected",
+            "workstream-corrected",
+            "candidate-corrected-wrong",
+            "artifact-corrected-wrong",
+            &wrong_frame_id.to_string(),
+            20,
+        );
+        crate::continuation::record_continue_feedback(
+            &conn,
+            crate::continuation::ContinueExplicitFeedbackRequest {
+                decision_id: Some("continue-decision-corrected".to_string()),
+                selected_candidate_id: Some("candidate-corrected-wrong".to_string()),
+                workstream_id: Some("workstream-corrected".to_string()),
+                target_artifact_id: Some("artifact-corrected-wrong".to_string()),
+                corrected_artifact_id: Some("artifact-corrected-right".to_string()),
+                feedback_kind: "corrected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-corrected",
+            Some("artifact-corrected-wrong"),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("suppressed by feedback") && warning.contains("feedback:")
+        }));
+    }
+
+    #[test]
     fn strict_continue_decision_opens_exact_displayed_openable_target() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -31410,6 +31836,110 @@ mod tests {
         assert!(warnings.iter().any(|warning| warning.contains(
             "Opening strict Continue decision continue-decision-strict-openable target artifact-x-openable"
         )));
+    }
+
+    #[test]
+    fn continue_open_result_records_open_event_without_raw_url_or_path_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/open-telemetry.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Open telemetry target",
+            "https://example.com/private-target",
+            "browser_tab",
+            "Open telemetry target.",
+            "phash-open-telemetry",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-open-telemetry",
+            "browser_tab",
+            Some("https://example.com/private-target"),
+            Some("/Users/me/private-target.md"),
+            Some(frame_id.to_string()),
+            "openable",
+            "Open telemetry target",
+            10,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-open-telemetry",
+            "workstream-open-telemetry",
+            "candidate-open-telemetry",
+            "artifact-open-telemetry",
+            &frame_id.to_string(),
+            20,
+        );
+        let input = OpenResumePointInput {
+            continue_decision_id: Some("continue-decision-open-telemetry".to_string()),
+            target_artifact_id: Some("artifact-open-telemetry".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let result = finalize_open_resume_point_result(
+            &conn,
+            &input,
+            OpenResumePointResult {
+                strategy: "browser_url".to_string(),
+                frame_id: Some(frame_id.to_string()),
+                opened_url: Some("https://example.com/private-target".to_string()),
+                anchor_text: None,
+                confidence: 0.8,
+                warnings: Vec::new(),
+            },
+        );
+
+        assert!(result
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("private-target")));
+        let (count, decision_id, target_artifact_id, opened_url, opened_path): (
+            i64,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*), decision_id, target_artifact_id, opened_url, opened_path
+                 FROM continue_decision_open_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(decision_id, "continue-decision-open-telemetry");
+        assert_eq!(target_artifact_id, "artifact-open-telemetry");
+        assert_eq!(opened_url, 1);
+        assert_eq!(opened_path, 0);
+
+        let columns = conn
+            .prepare("PRAGMA table_info(continue_decision_open_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| {
+            column.contains("url") && column != "opened_url"
+                || column.contains("path") && column != "opened_path"
+        }));
     }
 
     #[test]
@@ -32650,6 +33180,8 @@ mod tests {
         );
         let explain = fs::read_to_string(audit_dir.join("explain.md")).unwrap();
         assert!(explain.contains("## Cache Audit"));
+        assert!(explain.contains("## Feedback Policy"));
+        assert!(explain.contains("Policy version: `feedback_obedience.v1`"));
         assert!(summary
             .folder_name
             .starts_with("session-001-session-test-1__continue-"));
@@ -32767,6 +33299,10 @@ mod tests {
             requested_at_ms: now_millis(),
             model: Some("gpt-test".to_string()),
             candidate_limit: Some(5),
+            model_candidate_count_before_feedback_filter: 0,
+            model_candidate_count_after_feedback_filter: 0,
+            suppressed_candidate_ids_not_sent: Vec::new(),
+            feedback_policy_version: crate::continuation::FEEDBACK_POLICY_VERSION.to_string(),
             pack: Some(serde_json::json!({"candidates": []})),
             request: Some(serde_json::json!({"model": "gpt-test", "input": "bounded pack"})),
             raw_response: Some(serde_json::json!({

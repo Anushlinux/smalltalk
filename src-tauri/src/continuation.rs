@@ -13,6 +13,15 @@ use std::process::Command;
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
 pub const CONTINUE_SCHEMA_VERSION: i64 = 4;
 
+const FEEDBACK_INFERENCE_MIN_AGE_MS: i64 = 2 * 60 * 1000;
+const FEEDBACK_ACCEPTED_MIN_DWELL_MS: i64 = 30 * 1000;
+const FEEDBACK_REJECTED_MAX_DWELL_MS: i64 = 20 * 1000;
+pub(crate) const FEEDBACK_POLICY_VERSION: &str = "feedback_obedience.v1";
+const FEEDBACK_NEGATIVE_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const FEEDBACK_HARD_NEGATIVE_RECENT_MS: i64 = 48 * 60 * 60 * 1000;
+const FEEDBACK_SCORE_CAP_AFTER_SOFT_NEGATIVE: f64 = 0.44;
+const FEEDBACK_SCORE_CAP_AFTER_REPEATED_IGNORES: f64 = 0.35;
+
 const CONTINUE_TABLES: &[&str] = &[
     "continue_schema_migrations",
     "continue_artifacts",
@@ -42,6 +51,7 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_activity_classifications",
     "continue_candidates",
     "continue_decisions",
+    "continue_decision_open_events",
     "continue_feedback_events",
     "continue_breadcrumbs",
 ];
@@ -1018,6 +1028,7 @@ pub struct ContinueDecisionResult {
     pub decision_id: String,
     pub mode: String,
     pub cache_hit: bool,
+    pub cache_bypass_reasons: Vec<String>,
     pub source: String,
     pub model: Option<String>,
     pub response_id: Option<String>,
@@ -1026,6 +1037,7 @@ pub struct ContinueDecisionResult {
     pub p0_quality_signals: P0QualitySignals,
     pub current_activity: Option<String>,
     pub selected_workstream: Option<ContinueSelectedWorkstream>,
+    pub selected_candidate_id: Option<String>,
     pub return_target: Option<ContinueReturnTarget>,
     pub resume_work_target: Option<ContinueReturnTarget>,
     pub candidate_kind: Option<String>,
@@ -1042,6 +1054,14 @@ pub struct ContinueDecisionResult {
     pub alternatives: Vec<ContinueCandidateSummary>,
     pub generated_candidates: i64,
     pub validation_status: String,
+    pub feedback_policy_version: String,
+    pub feedback_watermark_ms: Option<i64>,
+    pub open_watermark_ms: Option<i64>,
+    pub feedback_suppressed_candidate_count: usize,
+    pub feedback_score_capped_candidate_count: usize,
+    pub eligible_candidate_count_after_feedback_gate: usize,
+    pub model_candidate_count_before_feedback_filter: usize,
+    pub model_candidate_count_after_feedback_filter: usize,
     pub continue_output_mode: String,
     pub evidence_watermark_hash: String,
     pub latest_boundary_revision: Option<i64>,
@@ -1095,6 +1115,10 @@ pub struct ContinueAuditInferenceEvent {
     pub requested_at_ms: i64,
     pub model: Option<String>,
     pub candidate_limit: Option<i64>,
+    pub model_candidate_count_before_feedback_filter: usize,
+    pub model_candidate_count_after_feedback_filter: usize,
+    pub suppressed_candidate_ids_not_sent: Vec<String>,
+    pub feedback_policy_version: String,
     pub pack: Option<Value>,
     pub request: Option<Value>,
     pub raw_response: Option<Value>,
@@ -1142,6 +1166,142 @@ pub struct ContinueExplicitFeedbackRequest {
     pub source: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContinueDecisionOpenEventRequest {
+    pub decision_id: String,
+    pub selected_candidate_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub target_artifact_id: Option<String>,
+    pub opened_at_ms: Option<i64>,
+    pub strategy: String,
+    pub opened_url: bool,
+    pub opened_path: bool,
+    pub opened_frame_fallback: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinueDecisionOpenEventResult {
+    pub id: String,
+    pub decision_id: String,
+    pub selected_candidate_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub target_artifact_id: Option<String>,
+    pub opened_at_ms: i64,
+    pub strategy: String,
+    pub opened_url: bool,
+    pub opened_path: bool,
+    pub opened_frame_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackTargetScope {
+    Candidate,
+    TargetArtifact,
+    ResumeWorkTargetArtifact,
+    Workstream,
+    ArtifactStableKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FeedbackTargetKey {
+    pub scope: FeedbackTargetScope,
+    pub id_or_key: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeedbackEventTargets {
+    pub negative_targets: Vec<FeedbackTargetKey>,
+    pub positive_targets: Vec<FeedbackTargetKey>,
+    pub neutral_targets: Vec<FeedbackTargetKey>,
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackEventRow {
+    id: String,
+    decision_id: Option<String>,
+    selected_candidate_id: Option<String>,
+    workstream_id: Option<String>,
+    event_kind: String,
+    observed_frame_id: Option<String>,
+    target_artifact_id: Option<String>,
+    chosen_artifact_id: Option<String>,
+    target_artifact_stable_key: Option<String>,
+    resume_work_target_artifact_id: Option<String>,
+    timestamp_ms: i64,
+    confidence: f64,
+    reason: Option<String>,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackSuppressionState {
+    None,
+    SoftPenalty,
+    ScoreCapped,
+    HardSuppressed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedbackDecision {
+    pub state: FeedbackSuppressionState,
+    pub negative_weight_since_reconfirmation: i32,
+    pub positive_weight_after_last_negative: i32,
+    pub last_negative_ms: Option<i64>,
+    pub last_positive_ms: Option<i64>,
+    pub last_reconfirming_evidence_ms: Option<i64>,
+    pub suppress_primary: bool,
+    pub score_cap: Option<f64>,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FeedbackAggregate {
+    negative_count: i64,
+    positive_count: i64,
+    ignored_count_since_reconfirmation: i64,
+    negative_weight_since_reconfirmation: i32,
+    positive_weight_after_last_negative: i32,
+    last_negative_ms: Option<i64>,
+    last_positive_ms: Option<i64>,
+    last_reconfirming_evidence_ms: Option<i64>,
+    hard_negative_after_reconfirmation: bool,
+    ignored_workstream_after_reconfirmation: bool,
+    artifact_only_evidence_after_reconfirmation: bool,
+    hard_negative_recent: bool,
+    last_negative_kind: Option<String>,
+    reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconfirmingEvidence {
+    pub evidence_kind: String,
+    pub evidence_id: String,
+    pub timestamp_ms: i64,
+    pub weight: i32,
+    pub reason_code: String,
+}
+
+impl FeedbackSuppressionState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FeedbackSuppressionState::None => "none",
+            FeedbackSuppressionState::SoftPenalty => "soft_penalty",
+            FeedbackSuppressionState::ScoreCapped => "score_capped",
+            FeedbackSuppressionState::HardSuppressed => "hard_suppressed",
+        }
+    }
+}
+
+impl FeedbackDecision {
+    fn state_label(&self) -> &'static str {
+        self.state.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContinueBreadcrumbRequest {
     pub workstream_id: String,
@@ -1184,6 +1344,12 @@ pub struct ContinueEvalReport {
     pub stale_target_suppression_rate: f64,
     pub support_branch_false_promotion_rate: f64,
     pub truthful_thin_mode_rate: f64,
+    pub feedback_obedience_case_count: i64,
+    pub feedback_suppressed_target_exposed_count: i64,
+    pub feedback_suppressed_target_exposed_rate: f64,
+    pub corrected_artifact_preferred_count: i64,
+    pub feedback_cache_stale_hit_count: i64,
+    pub model_feedback_validation_failure_count: i64,
     pub feedback_obedience_placeholder_rate: f64,
     pub suppressed_target_open_attempt_count: usize,
     pub cases: Vec<ContinueEvalCaseReport>,
@@ -1266,6 +1432,11 @@ pub struct ContinueEvalCaseReport {
     pub stale_target_suppressed: bool,
     pub support_branch_false_promotion: bool,
     pub truthful_thin_mode: bool,
+    pub feedback_obedience_case: bool,
+    pub feedback_suppressed_target_exposed: bool,
+    pub corrected_artifact_preferred: bool,
+    pub feedback_cache_stale_hit: bool,
+    pub model_feedback_validation_failure: bool,
     pub feedback_obedience_placeholder: bool,
     pub suppressed_target_open_attempted: bool,
 }
@@ -1804,6 +1975,11 @@ pub struct ContinueCandidateScoreTrace {
     pub openability_score: f64,
     pub recency_score: f64,
     pub evidence_quality_score: f64,
+    pub feedback_suppression_state: String,
+    pub feedback_negative_weight: i32,
+    pub feedback_last_negative_ms: Option<i64>,
+    pub feedback_last_reconfirming_evidence_ms: Option<i64>,
+    pub feedback_reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1820,7 +1996,15 @@ pub struct ContinueCandidateSummary {
     pub risk_flags: Vec<String>,
     pub score_caps_applied: Vec<String>,
     pub eligible_for_primary_selection: bool,
+    pub public_alternative_eligible_after_feedback: bool,
     pub selection_demotion_reason: Option<String>,
+    pub feedback_suppression_state: String,
+    pub feedback_negative_weight: i32,
+    pub feedback_positive_weight_after_last_negative: i32,
+    pub feedback_last_negative_ms: Option<i64>,
+    pub feedback_last_reconfirming_evidence_ms: Option<i64>,
+    pub feedback_score_cap: Option<f64>,
+    pub feedback_reason_codes: Vec<String>,
     pub evidence_frame_id: Option<String>,
     pub supporting_episode_id: Option<String>,
     pub last_meaningful_action_id: Option<String>,
@@ -2451,6 +2635,14 @@ struct ScoredContinueCandidate {
     warnings: Vec<String>,
     risk_flags: Vec<String>,
     score_caps_applied: Vec<String>,
+    feedback_suppression_state: String,
+    feedback_negative_weight: i32,
+    feedback_positive_weight_after_last_negative: i32,
+    feedback_last_negative_ms: Option<i64>,
+    feedback_last_positive_ms: Option<i64>,
+    feedback_last_reconfirming_evidence_ms: Option<i64>,
+    feedback_score_cap: Option<f64>,
+    feedback_reason_codes: Vec<String>,
     eligible_for_primary_selection: bool,
     selection_demotion_reason: Option<String>,
     resume_work_target: Option<ScorerArtifact>,
@@ -2461,6 +2653,10 @@ struct ScoredContinueCandidate {
 struct ContinueMicroInferencePack {
     schema: String,
     instructions: String,
+    feedback_policy_version: String,
+    model_candidate_count_before_feedback_filter: usize,
+    model_candidate_count_after_feedback_filter: usize,
+    suppressed_candidate_ids_not_sent: Vec<String>,
     current_focus: Option<ContinueFocusSummary>,
     active_current_work_unresolved: Option<ActiveCurrentWorkUnresolvedForModel>,
     current_surface: Option<CurrentSurfaceForModel>,
@@ -2500,6 +2696,13 @@ pub struct CandidateEvidencePackV2 {
     pub evidence_sufficiency_score: f64,
     pub work_value_reason: Option<String>,
     pub why_not_primary: Option<String>,
+    pub feedback_state: String,
+    pub feedback_suppression_state: String,
+    pub feedback_negative_weight: i32,
+    pub feedback_reconfirmed_after_negative: bool,
+    pub feedback_last_negative_ms: Option<i64>,
+    pub feedback_last_reconfirming_evidence_ms: Option<i64>,
+    pub feedback_reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2613,6 +2816,13 @@ struct ContinuePackCandidate {
     why_not_primary: Option<String>,
     memory_supporting_cell_ids: Vec<String>,
     memory_contradicting_cell_ids: Vec<String>,
+    feedback_state: String,
+    feedback_suppression_state: String,
+    feedback_negative_weight: i32,
+    feedback_reconfirmed_after_negative: bool,
+    feedback_last_negative_ms: Option<i64>,
+    feedback_last_reconfirming_evidence_ms: Option<i64>,
+    feedback_reason_codes: Vec<String>,
     local_reason: Option<String>,
 }
 
@@ -2698,6 +2908,32 @@ struct ContinueEvalCaseFixture {
     model_output: Option<ContinueMicroInferenceOutput>,
     #[serde(default)]
     expected_feedback_obedience_placeholder: Option<bool>,
+    #[serde(default)]
+    negative_feedback: Vec<ContinueEvalFeedbackFixture>,
+    #[serde(default)]
+    expected_suppressed_artifact_ids: Vec<String>,
+    #[serde(default)]
+    expected_not_return_target_artifact_ids: Vec<String>,
+    #[serde(default)]
+    expected_feedback_return_target_artifact_id: Option<String>,
+    #[serde(default)]
+    expected_validation_status: Option<String>,
+    #[serde(default)]
+    corrected_artifact_id: Option<String>,
+    #[serde(default)]
+    cached_decision_target_artifact_id: Option<String>,
+    #[serde(default)]
+    cache_feedback_newer_than_cached_decision: Option<bool>,
+    #[serde(default)]
+    model_feedback_validation_failure_expected: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContinueEvalFeedbackFixture {
+    target_artifact_id: Option<String>,
+    kind: String,
+    source: Option<String>,
+    at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2726,6 +2962,10 @@ struct ContinueEvalCandidateFixture {
     stale_target_suppressed: Option<bool>,
     #[serde(default)]
     suppressed_target_open_attempted: Option<bool>,
+    #[serde(default)]
+    feedback_suppression_state: Option<String>,
+    #[serde(default)]
+    feedback_score_capped: Option<bool>,
 }
 
 pub fn rebuild_continue_second_layer(
@@ -2994,8 +3234,19 @@ pub fn get_continue_decision(
     );
     let force_rebuild = effective_mode == "rebuild";
     let micro_inference_enabled = request.micro_inference_enabled.unwrap_or(false);
+    infer_pending_continue_feedback(conn, FEEDBACK_INFERENCE_MIN_AGE_MS)?;
     let mut current_watermark =
         build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
+    let mut cache_bypass_reasons = if force_rebuild {
+        Vec::new()
+    } else {
+        continue_cache_bypass_reasons(
+            conn,
+            request.session_id.as_deref(),
+            &current_watermark,
+            micro_inference_enabled,
+        )?
+    };
     let cached_meta = if !force_rebuild {
         fresh_cached_continue_decision(
             conn,
@@ -3006,8 +3257,8 @@ pub fn get_continue_decision(
     } else {
         None
     };
-    if cached_meta.is_none() {
-        infer_pending_continue_feedback(conn, 15 * 60 * 1000)?;
+    if cached_meta.is_some() {
+        cache_bypass_reasons.clear();
     }
 
     let semantic_rebuild_needed = cached_meta.is_none()
@@ -3102,6 +3353,7 @@ pub fn get_continue_decision(
         current_focus.as_ref(),
         active_current_work_unresolved.as_ref(),
     );
+    apply_feedback_obedience_to_candidates(conn, &mut candidates)?;
     candidates.sort_by(|left, right| {
         right
             .score
@@ -3130,6 +3382,16 @@ pub fn get_continue_decision(
             .find(|workstream| workstream.id == candidate.workstream_id)
             .cloned()
     });
+    let all_candidates_hard_suppressed =
+        !candidates.is_empty() && candidates.iter().all(candidate_feedback_hard_suppressed);
+    let primary_eligible_candidates_after_feedback_gate = candidates
+        .iter()
+        .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+        .count();
+    let available_candidates_after_feedback_gate = candidates
+        .iter()
+        .filter(|candidate| candidate_available_after_feedback_gate(candidate))
+        .count();
     continue_dossier.selected_workstream_state =
         selected_workstream
             .as_ref()
@@ -3148,6 +3410,10 @@ pub fn get_continue_decision(
     warnings.extend(app_activity.warnings.clone());
     if selected.is_none() {
         warnings.push("thin_evidence:no_continue_workstream_candidate".to_string());
+        if all_candidates_hard_suppressed {
+            warnings.push("feedback:all_candidates_suppressed".to_string());
+            warnings.push("feedback:fresh_reconfirmation_required_before_target_reuse".to_string());
+        }
         if app_activity
             .classifications
             .iter()
@@ -3228,8 +3494,59 @@ pub fn get_continue_decision(
                 .to_string(),
         );
     }
+    if all_candidates_hard_suppressed && selected.is_none() {
+        continue_output_mode = ContinueOutputMode::NoClearContinuation;
+        validation_status = "thin_evidence".to_string();
+        confidence = round_score(f64::min(confidence, 0.22));
+        next_action = Some(
+            "Wait for fresh confirming evidence before suggesting a rejected target again."
+                .to_string(),
+        );
+        model_handoff_output = None;
+    }
+    if !candidates.is_empty() && available_candidates_after_feedback_gate == 0 {
+        selected = None;
+        selected_workstream = None;
+        quality_gate = None;
+        continue_output_mode = ContinueOutputMode::NoClearContinuation;
+        validation_status = "thin_evidence".to_string();
+        confidence = round_score(f64::min(confidence, 0.22));
+        next_action = Some(
+            "Wait for fresh confirming evidence before suggesting a rejected target again."
+                .to_string(),
+        );
+        model_handoff_output = None;
+        warnings.push("feedback:no_eligible_candidates_after_suppression".to_string());
+        warnings.push("feedback:fresh_reconfirmation_required_before_target_reuse".to_string());
+    }
 
-    if micro_inference_enabled && !candidates.is_empty() {
+    let has_model_eligible_candidate = primary_eligible_candidates_after_feedback_gate > 0;
+    if micro_inference_enabled && !has_model_eligible_candidate && !candidates.is_empty() {
+        audit_inference_events.push(ContinueAuditInferenceEvent {
+            inference_id: format!("continue-micro-{}", current_time_millis()),
+            inference_kind: "continue_micro_inference".to_string(),
+            requested_at_ms: current_time_millis(),
+            model: request.model.clone(),
+            candidate_limit: request.max_candidates_for_model,
+            model_candidate_count_before_feedback_filter: candidates.len(),
+            model_candidate_count_after_feedback_filter: 0,
+            suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(&candidates),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            pack: None,
+            request: None,
+            raw_response: None,
+            parsed_output: None,
+            validation_result: Some("not_attempted".to_string()),
+            validation_failures: vec![
+                "feedback:no_eligible_candidates_after_suppression".to_string()
+            ],
+            validation_classification: None,
+            error: None,
+            fallback_reason: Some("no_eligible_candidates_after_feedback_gate".to_string()),
+            response_id: None,
+        });
+    }
+    if micro_inference_enabled && has_model_eligible_candidate {
         match continue_openai_config(request.model.clone()) {
             Ok(config) => {
                 model = Some(config.model.clone());
@@ -3253,6 +3570,14 @@ pub fn get_continue_decision(
                         requested_at_ms: current_time_millis(),
                         model: Some(config.model.clone()),
                         candidate_limit: Some(candidate_limit),
+                        model_candidate_count_before_feedback_filter: pack
+                            .model_candidate_count_before_feedback_filter,
+                        model_candidate_count_after_feedback_filter: pack
+                            .model_candidate_count_after_feedback_filter,
+                        suppressed_candidate_ids_not_sent: pack
+                            .suppressed_candidate_ids_not_sent
+                            .clone(),
+                        feedback_policy_version: pack.feedback_policy_version.clone(),
                         pack: serde_json::to_value(&pack).ok(),
                         request: None,
                         raw_response: None,
@@ -3682,6 +4007,13 @@ pub fn get_continue_decision(
                         requested_at_ms: current_time_millis(),
                         model: Some(config.model.clone()),
                         candidate_limit: request.max_candidates_for_model,
+                        model_candidate_count_before_feedback_filter: candidates.len(),
+                        model_candidate_count_after_feedback_filter:
+                            primary_eligible_candidates_after_feedback_gate,
+                        suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(
+                            &candidates,
+                        ),
+                        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
                         pack: None,
                         request: None,
                         raw_response: None,
@@ -3706,6 +4038,13 @@ pub fn get_continue_decision(
                     requested_at_ms: current_time_millis(),
                     model: request.model.clone(),
                     candidate_limit: request.max_candidates_for_model,
+                    model_candidate_count_before_feedback_filter: candidates.len(),
+                    model_candidate_count_after_feedback_filter:
+                        primary_eligible_candidates_after_feedback_gate,
+                    suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(
+                        &candidates,
+                    ),
+                    feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
                     pack: None,
                     request: None,
                     raw_response: None,
@@ -3897,6 +4236,12 @@ pub fn get_continue_decision(
         .as_ref()
         .map(|candidate| candidate.missing_evidence.clone())
         .unwrap_or_else(|| vec!["no_candidate_generated".to_string()]);
+    if all_candidates_hard_suppressed {
+        push_string_once(
+            &mut missing_evidence,
+            "rejected_targets_need_fresh_confirming_evidence",
+        );
+    }
     let suppress_public_return_target = stale_target_suppression.suppressed;
     if suppress_public_return_target {
         push_string_once(
@@ -4054,9 +4399,31 @@ pub fn get_continue_decision(
     );
     let alternatives = candidates
         .iter()
+        .filter(|candidate| candidate_available_after_feedback_gate(candidate))
         .take(3)
         .map(candidate_summary)
         .collect::<Vec<_>>();
+    let feedback_watermark_ms = latest_continue_feedback_watermark_ms(conn)?;
+    let open_watermark_ms = latest_continue_open_watermark_ms(conn)?;
+    let feedback_suppressed_candidate_count = candidates
+        .iter()
+        .filter(|candidate| candidate_feedback_hard_suppressed(candidate))
+        .count();
+    let feedback_score_capped_candidate_count = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.feedback_suppression_state == FeedbackSuppressionState::ScoreCapped.as_str()
+                || candidate.feedback_score_cap.is_some()
+        })
+        .count();
+    let model_candidate_count_before_feedback_filter = audit_inference_events
+        .last()
+        .map(|event| event.model_candidate_count_before_feedback_filter)
+        .unwrap_or(candidates.len());
+    let model_candidate_count_after_feedback_filter = audit_inference_events
+        .last()
+        .map(|event| event.model_candidate_count_after_feedback_filter)
+        .unwrap_or(primary_eligible_candidates_after_feedback_gate);
     let p0_quality_signals = p0_quality_signals_for_decision(
         active_current_work_unresolved.as_ref(),
         &stale_target_suppression,
@@ -4073,6 +4440,7 @@ pub fn get_continue_decision(
         decision_id,
         mode: effective_mode.to_string(),
         cache_hit: cached_meta.is_some(),
+        cache_bypass_reasons,
         source,
         model,
         response_id,
@@ -4086,6 +4454,7 @@ pub fn get_continue_decision(
             current_focus.as_ref(),
         ),
         selected_workstream: selected_workstream.as_ref().map(workstream_summary),
+        selected_candidate_id: selected.as_ref().map(|candidate| candidate.id.clone()),
         return_target: public_return_candidate.map(|candidate| {
             return_target_summary(
                 candidate.target_artifact.as_ref(),
@@ -4122,6 +4491,15 @@ pub fn get_continue_decision(
         alternatives,
         generated_candidates: candidates.len() as i64,
         validation_status,
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+        feedback_watermark_ms,
+        open_watermark_ms,
+        feedback_suppressed_candidate_count,
+        feedback_score_capped_candidate_count,
+        eligible_candidate_count_after_feedback_gate:
+            primary_eligible_candidates_after_feedback_gate,
+        model_candidate_count_before_feedback_filter,
+        model_candidate_count_after_feedback_filter,
         continue_output_mode: continue_output_mode.as_str().to_string(),
         evidence_watermark_hash: cached_meta
             .as_ref()
@@ -6627,6 +7005,128 @@ fn privacy_status_is_limited(status: &str) -> bool {
     )
 }
 
+fn continue_cache_bypass_reasons(
+    conn: &Connection,
+    session_id: Option<&str>,
+    current_watermark: &ContinueEvidenceWatermark,
+    micro_inference_requested: bool,
+) -> Result<Vec<String>, String> {
+    if !table_exists(conn, "continue_decisions")? {
+        return Ok(Vec::new());
+    }
+    let candidate = conn
+        .query_row(
+            "SELECT d.id, d.requested_at_ms
+             FROM continue_decisions d
+             LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
+             WHERE d.evidence_watermark_hash = ?1
+               AND (?2 IS NULL OR f.session_id = ?2 OR d.current_focus_frame_id IS NULL)
+               AND COALESCE(d.latest_boundary_revision, 0) = ?3
+               AND COALESCE(d.micro_inference_requested, 0) = ?4
+             ORDER BY d.requested_at_ms DESC
+             LIMIT 1",
+            params![
+                current_watermark.hash,
+                session_id,
+                current_watermark.latest_boundary_revision.unwrap_or(0),
+                if micro_inference_requested {
+                    1_i64
+                } else {
+                    0_i64
+                }
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((decision_id, requested_at_ms)) = candidate else {
+        return Ok(Vec::new());
+    };
+
+    let mut reasons = Vec::new();
+    let latest_feedback_ms = latest_continue_feedback_watermark_ms(conn)?;
+    if latest_feedback_ms.is_some_and(|timestamp| timestamp > requested_at_ms) {
+        reasons.push("feedback_newer_than_cached_decision".to_string());
+    }
+
+    if pending_open_feedback_exists_for_decision(conn, &decision_id, requested_at_ms)? {
+        reasons.push("continue_open_pending_feedback".to_string());
+    }
+
+    let latest_boundary_revision = current_watermark.latest_boundary_revision.unwrap_or(0);
+    let newer_boundary = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM continue_boundary_revisions
+               WHERE revision > ?1
+             )",
+            params![latest_boundary_revision],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .unwrap_or(0)
+        != 0;
+    if newer_boundary {
+        reasons.push("feedback_policy_version_changed".to_string());
+    }
+
+    Ok(reasons)
+}
+
+pub fn latest_continue_feedback_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
+    max_i64_if_present(conn, "continue_feedback_events", "timestamp_ms")
+}
+
+pub fn latest_continue_open_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
+    max_i64_if_present(conn, "continue_decision_open_events", "opened_at_ms")
+}
+
+pub fn latest_feedback_or_open_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
+    Ok(
+        match (
+            latest_continue_feedback_watermark_ms(conn)?,
+            latest_continue_open_watermark_ms(conn)?,
+        ) {
+            (Some(feedback), Some(open)) => Some(feedback.max(open)),
+            (Some(feedback), None) => Some(feedback),
+            (None, Some(open)) => Some(open),
+            (None, None) => None,
+        },
+    )
+}
+
+fn pending_open_feedback_exists_for_decision(
+    conn: &Connection,
+    decision_id: &str,
+    requested_at_ms: i64,
+) -> Result<bool, String> {
+    if !table_exists(conn, "continue_decision_open_events")? {
+        return Ok(false);
+    }
+    let now_ms = current_time_millis();
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM continue_decision_open_events oe
+           WHERE oe.decision_id = ?1
+             AND oe.opened_at_ms > ?2
+             AND oe.opened_at_ms <= ?3
+             AND NOT EXISTS (
+               SELECT 1 FROM continue_feedback_events fe WHERE fe.decision_id = oe.decision_id
+             )
+         )",
+        params![
+            decision_id,
+            requested_at_ms,
+            now_ms.saturating_sub(FEEDBACK_INFERENCE_MIN_AGE_MS),
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(to_string)
+}
+
 fn fresh_cached_continue_decision(
     conn: &Connection,
     session_id: Option<&str>,
@@ -6650,6 +7150,7 @@ fn fresh_cached_continue_decision(
                     d.evidence_watermark_hash, d.latest_boundary_revision,
                     d.micro_inference_requested, d.micro_inference_attempted
              FROM continue_decisions d
+             LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
              LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
              WHERE d.evidence_watermark_hash = ?1
                AND (?2 IS NULL OR f.session_id = ?2 OR d.current_focus_frame_id IS NULL)
@@ -6677,8 +7178,43 @@ fn fresh_cached_continue_decision(
                AND NOT EXISTS (
                  SELECT 1
                  FROM continue_feedback_events fe
-                 WHERE fe.decision_id = d.id
-                   AND fe.timestamp_ms > d.requested_at_ms
+                 WHERE fe.timestamp_ms > d.requested_at_ms
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM continue_feedback_events fe
+                 WHERE fe.timestamp_ms > d.requested_at_ms
+                   AND COALESCE(
+                     fe.is_negative_signal,
+                     CASE
+                       WHEN fe.event_kind IN ('rejected', 'ignored', 'corrected', 'ignored_workstream', 'artifact_only_evidence')
+                       THEN 1 ELSE 0
+                     END
+                   ) = 1
+                   AND (
+                     (d.selected_candidate_id IS NOT NULL AND fe.selected_candidate_id = d.selected_candidate_id)
+                     OR (d.selected_workstream_id IS NOT NULL AND fe.workstream_id = d.selected_workstream_id)
+                     OR (d.return_target_artifact_id IS NOT NULL AND (
+                       fe.target_artifact_id = d.return_target_artifact_id
+                       OR fe.resume_work_target_artifact_id = d.return_target_artifact_id
+                     ))
+                     OR (c.target_artifact_id IS NOT NULL AND (
+                       fe.target_artifact_id = c.target_artifact_id
+                       OR fe.resume_work_target_artifact_id = c.target_artifact_id
+                     ))
+                   )
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM continue_decision_open_events oe
+                 WHERE oe.decision_id = d.id
+                   AND oe.opened_at_ms > d.requested_at_ms
+                   AND oe.opened_at_ms <= ?5
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM continue_feedback_events fe
+                     WHERE fe.decision_id = d.id
+                   )
                )
                AND NOT EXISTS (
                  SELECT 1
@@ -6699,7 +7235,8 @@ fn fresh_cached_continue_decision(
                 1_i64
             } else {
                 0_i64
-            }
+            },
+            current_time_millis().saturating_sub(FEEDBACK_INFERENCE_MIN_AGE_MS),
         ],
         |row| {
             let warnings: Option<String> = row.get(6)?;
@@ -7464,6 +8001,422 @@ pub fn add_continue_breadcrumb(
     })
 }
 
+pub fn record_continue_decision_open_event(
+    conn: &Connection,
+    request: ContinueDecisionOpenEventRequest,
+) -> Result<ContinueDecisionOpenEventResult, String> {
+    ensure_continue_schema(conn)?;
+    let opened_at_ms = request.opened_at_ms.unwrap_or_else(current_time_millis);
+    let context = conn
+        .query_row(
+            "SELECT d.selected_candidate_id, d.selected_workstream_id, d.return_target_artifact_id,
+                    c.workstream_id, c.target_artifact_id
+             FROM continue_decisions d
+             LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
+             WHERE d.id = ?1",
+            params![request.decision_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((
+        decision_selected_candidate_id,
+        decision_workstream_id,
+        decision_return_target_artifact_id,
+        candidate_workstream_id,
+        candidate_target_artifact_id,
+    )) = context
+    else {
+        return Err(format!(
+            "unknown continue decision for open telemetry: {}",
+            request.decision_id
+        ));
+    };
+    let selected_candidate_id = request
+        .selected_candidate_id
+        .or(decision_selected_candidate_id);
+    let workstream_id = request
+        .workstream_id
+        .or(candidate_workstream_id)
+        .or(decision_workstream_id);
+    let target_artifact_id = request
+        .target_artifact_id
+        .or(candidate_target_artifact_id)
+        .or(decision_return_target_artifact_id);
+    let strategy = non_empty(request.strategy).unwrap_or_else(|| "unknown".to_string());
+    let id = format!(
+        "continue-open-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                request.decision_id,
+                opened_at_ms,
+                strategy,
+                request.opened_url as i64,
+                request.opened_path as i64,
+                request.opened_frame_fallback as i64
+            )
+            .as_bytes()
+        )
+    );
+    let warnings_json = serde_json::to_string(&request.warnings).map_err(to_string)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO continue_decision_open_events (
+            id, decision_id, selected_candidate_id, workstream_id, target_artifact_id,
+            opened_at_ms, strategy, opened_url, opened_path, opened_frame_fallback,
+            warnings_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            request.decision_id,
+            selected_candidate_id,
+            workstream_id,
+            target_artifact_id,
+            opened_at_ms,
+            strategy,
+            request.opened_url as i64,
+            request.opened_path as i64,
+            request.opened_frame_fallback as i64,
+            warnings_json,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(ContinueDecisionOpenEventResult {
+        id,
+        decision_id: request.decision_id,
+        selected_candidate_id,
+        workstream_id,
+        target_artifact_id,
+        opened_at_ms,
+        strategy,
+        opened_url: request.opened_url,
+        opened_path: request.opened_path,
+        opened_frame_fallback: request.opened_frame_fallback,
+    })
+}
+
+fn feedback_targets_for_candidate(
+    candidate: &ContinueCandidate,
+    artifacts_by_id: &HashMap<String, ContinueArtifact>,
+) -> Vec<FeedbackTargetKey> {
+    feedback_targets_from_parts(
+        Some(candidate.id.as_str()),
+        Some(candidate.workstream_id.as_str()),
+        candidate.target_artifact_id.as_deref(),
+        None,
+        artifacts_by_id,
+    )
+}
+
+fn feedback_targets_for_scored_candidate(
+    candidate: &ScoredContinueCandidate,
+    artifacts_by_id: &HashMap<String, ContinueArtifact>,
+) -> Vec<FeedbackTargetKey> {
+    feedback_targets_from_parts(
+        Some(candidate.id.as_str()),
+        Some(candidate.workstream_id.as_str()),
+        candidate
+            .target_artifact
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+        candidate
+            .resume_work_target
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+        artifacts_by_id,
+    )
+}
+
+fn feedback_targets_for_decision(
+    decision: &ContinueDecisionResult,
+    selected_candidate: Option<&ContinueCandidate>,
+    artifacts_by_id: &HashMap<String, ContinueArtifact>,
+) -> Vec<FeedbackTargetKey> {
+    let candidate_id = selected_candidate
+        .map(|candidate| candidate.id.as_str())
+        .or_else(|| {
+            let return_target_artifact_id = decision
+                .return_target
+                .as_ref()
+                .and_then(|target| target.artifact_id.as_deref());
+            decision
+                .alternatives
+                .iter()
+                .find(|candidate| {
+                    candidate.target_artifact_id.as_deref() == return_target_artifact_id
+                })
+                .map(|candidate| candidate.candidate_id.as_str())
+        });
+    let workstream_id = selected_candidate
+        .map(|candidate| candidate.workstream_id.as_str())
+        .or_else(|| {
+            decision
+                .selected_workstream
+                .as_ref()
+                .map(|workstream| workstream.workstream_id.as_str())
+        });
+    let target_artifact_id = selected_candidate
+        .and_then(|candidate| candidate.target_artifact_id.as_deref())
+        .or_else(|| {
+            decision
+                .return_target
+                .as_ref()
+                .and_then(|target| target.artifact_id.as_deref())
+        });
+    let resume_work_target_artifact_id = decision
+        .resume_work_target
+        .as_ref()
+        .and_then(|target| target.artifact_id.as_deref());
+
+    feedback_targets_from_parts(
+        candidate_id,
+        workstream_id,
+        target_artifact_id,
+        resume_work_target_artifact_id,
+        artifacts_by_id,
+    )
+}
+
+fn feedback_targets_for_feedback_event(row: &FeedbackEventRow) -> FeedbackEventTargets {
+    let selected_targets = feedback_targets_from_row(row);
+    let chosen_targets = feedback_targets_from_parts(
+        None,
+        None,
+        row.chosen_artifact_id.as_deref(),
+        None,
+        &HashMap::new(),
+    );
+    match row.event_kind.as_str() {
+        "accepted" | "auto_resumed" => FeedbackEventTargets {
+            positive_targets: if chosen_targets.is_empty() {
+                selected_targets
+            } else {
+                chosen_targets
+            },
+            ..FeedbackEventTargets::default()
+        },
+        "rejected" | "ignored" | "ignored_workstream" | "artifact_only_evidence" => {
+            FeedbackEventTargets {
+                negative_targets: selected_targets,
+                ..FeedbackEventTargets::default()
+            }
+        }
+        "corrected" => FeedbackEventTargets {
+            negative_targets: selected_targets,
+            positive_targets: chosen_targets,
+            ..FeedbackEventTargets::default()
+        },
+        "user_next_step_note" => FeedbackEventTargets {
+            neutral_targets: selected_targets,
+            ..FeedbackEventTargets::default()
+        },
+        _ => FeedbackEventTargets {
+            neutral_targets: selected_targets,
+            ..FeedbackEventTargets::default()
+        },
+    }
+}
+
+fn feedback_targets_from_row(row: &FeedbackEventRow) -> Vec<FeedbackTargetKey> {
+    let mut targets = Vec::new();
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::Candidate,
+        row.selected_candidate_id.as_deref(),
+    );
+    if row.event_kind == "ignored_workstream" {
+        push_feedback_target(
+            &mut targets,
+            FeedbackTargetScope::Workstream,
+            row.workstream_id.as_deref(),
+        );
+        return targets;
+    }
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::TargetArtifact,
+        row.target_artifact_id.as_deref(),
+    );
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::ResumeWorkTargetArtifact,
+        row.resume_work_target_artifact_id.as_deref(),
+    );
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::Workstream,
+        row.workstream_id.as_deref(),
+    );
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::ArtifactStableKey,
+        row.target_artifact_stable_key.as_deref(),
+    );
+    targets
+}
+
+fn feedback_targets_from_parts(
+    candidate_id: Option<&str>,
+    workstream_id: Option<&str>,
+    target_artifact_id: Option<&str>,
+    resume_work_target_artifact_id: Option<&str>,
+    artifacts_by_id: &HashMap<String, ContinueArtifact>,
+) -> Vec<FeedbackTargetKey> {
+    let mut targets = Vec::new();
+    push_feedback_target(&mut targets, FeedbackTargetScope::Candidate, candidate_id);
+    push_feedback_target(
+        &mut targets,
+        FeedbackTargetScope::TargetArtifact,
+        target_artifact_id,
+    );
+    if resume_work_target_artifact_id != target_artifact_id {
+        push_feedback_target(
+            &mut targets,
+            FeedbackTargetScope::ResumeWorkTargetArtifact,
+            resume_work_target_artifact_id,
+        );
+    }
+    push_feedback_target(&mut targets, FeedbackTargetScope::Workstream, workstream_id);
+    for artifact_id in [target_artifact_id, resume_work_target_artifact_id]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(artifact) = artifacts_by_id.get(artifact_id) {
+            push_feedback_target(
+                &mut targets,
+                FeedbackTargetScope::ArtifactStableKey,
+                Some(artifact.stable_key.as_str()),
+            );
+        }
+    }
+    targets
+}
+
+fn push_feedback_target(
+    targets: &mut Vec<FeedbackTargetKey>,
+    scope: FeedbackTargetScope,
+    id_or_key: Option<&str>,
+) {
+    let Some(id_or_key) = id_or_key.and_then(|value| non_empty(value.to_string())) else {
+        return;
+    };
+    let key = FeedbackTargetKey { scope, id_or_key };
+    if !targets.contains(&key) {
+        targets.push(key);
+    }
+}
+
+fn feedback_event_is_negative_signal(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        "rejected" | "ignored" | "corrected" | "ignored_workstream" | "artifact_only_evidence"
+    )
+}
+
+fn feedback_event_is_positive_reconfirmation(event_kind: &str) -> bool {
+    matches!(event_kind, "accepted" | "auto_resumed" | "corrected")
+}
+
+fn feedback_event_target_keys_json(row: &FeedbackEventRow) -> Result<String, String> {
+    let mapped = feedback_targets_for_feedback_event(row);
+    let mut keys = Vec::new();
+    for key in mapped
+        .negative_targets
+        .iter()
+        .chain(mapped.positive_targets.iter())
+        .chain(mapped.neutral_targets.iter())
+    {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    serde_json::to_string(&keys).map_err(to_string)
+}
+
+fn load_artifact_stable_key(
+    conn: &Connection,
+    artifact_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT stable_key FROM continue_artifacts WHERE id = ?1",
+        params![artifact_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+#[derive(Debug, Clone, Default)]
+struct FeedbackDecisionTargetContext {
+    selected_candidate_id: Option<String>,
+    workstream_id: Option<String>,
+    selected_target_artifact_id: Option<String>,
+    return_target_artifact_id: Option<String>,
+}
+
+fn load_feedback_decision_target_context(
+    conn: &Connection,
+    decision_id: Option<&str>,
+) -> Result<FeedbackDecisionTargetContext, String> {
+    let Some(decision_id) = decision_id else {
+        return Ok(FeedbackDecisionTargetContext::default());
+    };
+    conn.query_row(
+        "SELECT d.selected_candidate_id, d.selected_workstream_id,
+                c.target_artifact_id, d.return_target_artifact_id
+         FROM continue_decisions d
+         LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
+         WHERE d.id = ?1",
+        params![decision_id],
+        |row| {
+            Ok(FeedbackDecisionTargetContext {
+                selected_candidate_id: row.get(0)?,
+                workstream_id: row.get(1)?,
+                selected_target_artifact_id: row.get(2)?,
+                return_target_artifact_id: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map(|row| row.unwrap_or_default())
+    .map_err(to_string)
+}
+
+fn load_candidate_feedback_target(
+    conn: &Connection,
+    candidate_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(candidate_id) = candidate_id else {
+        return Ok((None, None));
+    };
+    conn.query_row(
+        "SELECT target_artifact_id, workstream_id
+         FROM continue_candidates
+         WHERE id = ?1",
+        params![candidate_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )
+    .optional()
+    .map(|row| row.unwrap_or((None, None)))
+    .map_err(to_string)
+}
+
 pub fn infer_continue_feedback(
     conn: &Connection,
     request: ContinueFeedbackRequest,
@@ -7546,6 +8499,27 @@ pub fn record_continue_feedback(
         .source
         .and_then(non_empty)
         .unwrap_or_else(|| "desktop_ui".to_string());
+    let decision_context =
+        load_feedback_decision_target_context(conn, request.decision_id.as_deref())?;
+    let selected_candidate_id = request
+        .selected_candidate_id
+        .clone()
+        .or(decision_context.selected_candidate_id.clone());
+    let (candidate_target_artifact_id, candidate_workstream_id) =
+        load_candidate_feedback_target(conn, selected_candidate_id.as_deref())?;
+    let workstream_id = request
+        .workstream_id
+        .clone()
+        .or(candidate_workstream_id)
+        .or(decision_context.workstream_id.clone());
+    let target_artifact_id = request
+        .target_artifact_id
+        .clone()
+        .or(candidate_target_artifact_id)
+        .or(decision_context.selected_target_artifact_id.clone())
+        .or(decision_context.return_target_artifact_id.clone());
+    let target_artifact_stable_key = load_artifact_stable_key(conn, target_artifact_id.as_deref())?;
+    let resume_work_target_artifact_id = None::<String>;
     let timestamp_ms = current_time_millis();
     let reason = match feedback_kind {
         "accepted" => "user marked the Continue target useful",
@@ -7562,9 +8536,9 @@ pub fn record_continue_feedback(
             format!(
                 "{}:{}:{}:{}:{}:{}:{}",
                 request.decision_id.as_deref().unwrap_or("none"),
-                request.workstream_id.as_deref().unwrap_or("none"),
+                workstream_id.as_deref().unwrap_or("none"),
                 feedback_kind,
-                request.target_artifact_id.as_deref().unwrap_or("none"),
+                target_artifact_id.as_deref().unwrap_or("none"),
                 request.corrected_artifact_id.as_deref().unwrap_or("none"),
                 note.as_deref().unwrap_or("none"),
                 source
@@ -7572,33 +8546,60 @@ pub fn record_continue_feedback(
             .as_bytes(),
         )
     );
+    let row = FeedbackEventRow {
+        id: id.clone(),
+        decision_id: request.decision_id.clone(),
+        selected_candidate_id: selected_candidate_id.clone(),
+        workstream_id: workstream_id.clone(),
+        event_kind: feedback_kind.to_string(),
+        observed_frame_id: None,
+        target_artifact_id: target_artifact_id.clone(),
+        chosen_artifact_id: request.corrected_artifact_id.clone(),
+        target_artifact_stable_key: target_artifact_stable_key.clone(),
+        resume_work_target_artifact_id: resume_work_target_artifact_id.clone(),
+        timestamp_ms,
+        confidence: 1.0,
+        reason: Some(reason.to_string()),
+        note: note.clone(),
+        source: Some(source.clone()),
+    };
+    let feedback_target_keys_json = feedback_event_target_keys_json(&row)?;
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO continue_feedback_events (
             id, decision_id, event_kind, observed_frame_id, target_artifact_id,
             chosen_artifact_id, timestamp_ms, confidence, reason,
-            selected_candidate_id, workstream_id, note, source
-         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            selected_candidate_id, workstream_id, note, source,
+            target_artifact_stable_key, resume_work_target_artifact_id,
+            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   ?13, ?14, ?15, ?16, ?17)",
             params![
                 id,
                 request.decision_id,
                 feedback_kind,
-                request.target_artifact_id,
+                target_artifact_id,
                 request.corrected_artifact_id,
                 timestamp_ms,
                 1.0_f64,
                 reason,
-                request.selected_candidate_id,
-                request.workstream_id,
+                selected_candidate_id,
+                workstream_id,
                 note,
                 source,
+                target_artifact_stable_key,
+                resume_work_target_artifact_id,
+                feedback_target_keys_json,
+                feedback_event_is_positive_reconfirmation(feedback_kind) as i64,
+                feedback_event_is_negative_signal(feedback_kind) as i64,
             ],
         )
         .map_err(to_string)?;
-    let affected_workstream = request.workstream_id.clone();
+    let affected_workstream = row.workstream_id.clone();
     if matches!(
         feedback_kind,
         "rejected"
+            | "ignored"
             | "corrected"
             | "artifact_only_evidence"
             | "ignored_workstream"
@@ -7616,19 +8617,19 @@ pub fn record_continue_feedback(
         )?;
     }
     let result = ContinueFeedbackEventResult {
-        id,
-        decision_id: request.decision_id,
-        selected_candidate_id: request.selected_candidate_id,
-        workstream_id: request.workstream_id,
+        id: row.id,
+        decision_id: row.decision_id,
+        selected_candidate_id: row.selected_candidate_id,
+        workstream_id: row.workstream_id,
         event_kind: feedback_kind.to_string(),
         observed_frame_id: None,
-        target_artifact_id: request.target_artifact_id,
-        chosen_artifact_id: request.corrected_artifact_id,
+        target_artifact_id: row.target_artifact_id,
+        chosen_artifact_id: row.chosen_artifact_id,
         timestamp_ms,
         confidence: 1.0,
         reason: Some(reason.to_string()),
-        note,
-        source: Some(source),
+        note: row.note,
+        source: row.source,
     };
     if inserted > 0 {
         update_continue_ranking_priors_from_feedback(conn, &result)?;
@@ -8679,6 +9680,7 @@ fn load_continue_feedback_events(
         .prepare(
             "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
                     observed_frame_id, target_artifact_id, chosen_artifact_id,
+                    target_artifact_stable_key, resume_work_target_artifact_id,
                     timestamp_ms, confidence, reason, note, source
              FROM continue_feedback_events
              WHERE (?1 IS NOT NULL AND decision_id = ?1)
@@ -8689,7 +9691,7 @@ fn load_continue_feedback_events(
         .map_err(to_string)?;
     let rows = stmt
         .query_map(params![decision_id, workstream_id], |row| {
-            Ok(ContinueFeedbackEventResult {
+            let feedback_row = FeedbackEventRow {
                 id: row.get(0)?,
                 decision_id: row.get(1)?,
                 selected_candidate_id: row.get(2)?,
@@ -8698,15 +9700,963 @@ fn load_continue_feedback_events(
                 observed_frame_id: row.get(5)?,
                 target_artifact_id: row.get(6)?,
                 chosen_artifact_id: row.get(7)?,
-                timestamp_ms: row.get(8)?,
-                confidence: round_score(row.get(9)?),
-                reason: row.get(10)?,
-                note: row.get(11)?,
-                source: row.get(12)?,
-            })
+                target_artifact_stable_key: row.get(8)?,
+                resume_work_target_artifact_id: row.get(9)?,
+                timestamp_ms: row.get(10)?,
+                confidence: row.get(11)?,
+                reason: row.get(12)?,
+                note: row.get(13)?,
+                source: row.get(14)?,
+            };
+            Ok(feedback_event_result_from_row(feedback_row))
         })
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_continue_feedback_events_for_target_keys(
+    conn: &Connection,
+    target_keys: &[FeedbackTargetKey],
+    limit: i64,
+) -> Result<Vec<ContinueFeedbackEventResult>, String> {
+    Ok(
+        load_continue_feedback_event_rows_for_target_keys(conn, target_keys, limit)?
+            .into_iter()
+            .map(feedback_event_result_from_row)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn load_continue_feedback_event_rows_for_target_keys(
+    conn: &Connection,
+    target_keys: &[FeedbackTargetKey],
+    limit: i64,
+) -> Result<Vec<FeedbackEventRow>, String> {
+    if target_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
+                    observed_frame_id, target_artifact_id, chosen_artifact_id,
+                    target_artifact_stable_key, resume_work_target_artifact_id,
+                    timestamp_ms, confidence, reason, note, source
+             FROM continue_feedback_events
+             ORDER BY timestamp_ms DESC
+             LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit.max(1)], |row| {
+            Ok(FeedbackEventRow {
+                id: row.get(0)?,
+                decision_id: row.get(1)?,
+                selected_candidate_id: row.get(2)?,
+                workstream_id: row.get(3)?,
+                event_kind: row.get(4)?,
+                observed_frame_id: row.get(5)?,
+                target_artifact_id: row.get(6)?,
+                chosen_artifact_id: row.get(7)?,
+                target_artifact_stable_key: row.get(8)?,
+                resume_work_target_artifact_id: row.get(9)?,
+                timestamp_ms: row.get(10)?,
+                confidence: row.get(11)?,
+                reason: row.get(12)?,
+                note: row.get(13)?,
+                source: row.get(14)?,
+            })
+        })
+        .map_err(to_string)?;
+    let target_key_set = target_keys.iter().collect::<HashSet<_>>();
+    let mut matched = Vec::new();
+    for row in rows {
+        let row = row.map_err(to_string)?;
+        let mapped = feedback_targets_for_feedback_event(&row);
+        let row_targets = mapped
+            .negative_targets
+            .iter()
+            .chain(mapped.positive_targets.iter())
+            .chain(mapped.neutral_targets.iter());
+        if row_targets
+            .into_iter()
+            .any(|key| target_key_set.contains(key))
+        {
+            matched.push(row);
+        }
+    }
+    Ok(matched)
+}
+
+fn feedback_event_result_from_row(row: FeedbackEventRow) -> ContinueFeedbackEventResult {
+    ContinueFeedbackEventResult {
+        id: row.id,
+        decision_id: row.decision_id,
+        selected_candidate_id: row.selected_candidate_id,
+        workstream_id: row.workstream_id,
+        event_kind: row.event_kind,
+        observed_frame_id: row.observed_frame_id,
+        target_artifact_id: row.target_artifact_id,
+        chosen_artifact_id: row.chosen_artifact_id,
+        timestamp_ms: row.timestamp_ms,
+        confidence: round_score(row.confidence),
+        reason: row.reason,
+        note: row.note,
+        source: row.source,
+    }
+}
+
+fn feedback_targets_for_scored_candidate_from_db(
+    conn: &Connection,
+    candidate: &ScoredContinueCandidate,
+) -> Result<Vec<FeedbackTargetKey>, String> {
+    let mut artifacts_by_id = HashMap::new();
+    for artifact_id in [
+        candidate
+            .target_artifact
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+        candidate
+            .resume_work_target
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(stable_key) = load_artifact_stable_key(conn, Some(artifact_id))? {
+            artifacts_by_id.insert(
+                artifact_id.to_string(),
+                ContinueArtifact {
+                    id: artifact_id.to_string(),
+                    artifact_kind: ContinueArtifactKind::Unknown,
+                    stable_key,
+                    app_name: None,
+                    bundle_id: None,
+                    window_title: None,
+                    browser_url: None,
+                    document_path: None,
+                    display_title: None,
+                    first_seen_frame_id: None,
+                    last_seen_frame_id: None,
+                    first_seen_timestamp: 0,
+                    last_seen_timestamp: 0,
+                    identity_confidence: 0.0,
+                    evidence_quality: ContinueEvidenceQuality::Unknown,
+                    privacy_status: None,
+                    openability: ContinueOpenability::Unknown,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            );
+        }
+    }
+    Ok(feedback_targets_for_scored_candidate(
+        candidate,
+        &artifacts_by_id,
+    ))
+}
+
+fn apply_feedback_obedience_to_candidates(
+    conn: &Connection,
+    candidates: &mut [ScoredContinueCandidate],
+) -> Result<(), String> {
+    let now_ms = current_time_millis();
+    for candidate in candidates {
+        let aggregate = feedback_aggregate_for_scored_candidate_at(conn, candidate, now_ms)?;
+        let target_keys = feedback_targets_for_scored_candidate_from_db(conn, candidate)?;
+        let reconfirming_evidence = if let Some(last_negative_ms) = aggregate.last_negative_ms {
+            find_reconfirming_evidence_after(conn, candidate, &target_keys, last_negative_ms)?
+        } else {
+            None
+        };
+        let decision =
+            compute_feedback_decision(&aggregate, reconfirming_evidence.as_ref(), now_ms);
+        candidate.feedback_suppression_state = decision.state_label().to_string();
+        candidate.feedback_negative_weight = decision.negative_weight_since_reconfirmation;
+        candidate.feedback_positive_weight_after_last_negative =
+            decision.positive_weight_after_last_negative;
+        candidate.feedback_last_negative_ms = decision.last_negative_ms;
+        candidate.feedback_last_positive_ms = decision.last_positive_ms;
+        candidate.feedback_last_reconfirming_evidence_ms = decision.last_reconfirming_evidence_ms;
+        candidate.feedback_score_cap = decision.score_cap;
+        candidate.feedback_reason_codes = decision.reason_codes.clone();
+        if aggregate.negative_count > 0 {
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("feedback_negative_count:{}", aggregate.negative_count),
+            );
+        }
+        if aggregate.positive_count > 0 {
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("feedback_positive_count:{}", aggregate.positive_count),
+            );
+        }
+        if let Some(last_negative_at_ms) = aggregate.last_negative_ms {
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("feedback_last_negative_at_ms:{}", last_negative_at_ms),
+            );
+        }
+        for reason_code in &decision.reason_codes {
+            push_string_once(&mut candidate.warnings, reason_code);
+        }
+        if let Some(score_cap) = decision.score_cap {
+            candidate.score = round_score(f64::min(candidate.score, score_cap));
+            push_string_once(
+                &mut candidate.score_caps_applied,
+                &format!("score_capped:{}", decision.state_label()),
+            );
+        }
+        if decision.suppress_primary {
+            let reason = decision
+                .reason_codes
+                .first()
+                .map(|value| value.trim_start_matches("feedback:"))
+                .unwrap_or("negative_feedback_without_reconfirmation");
+            candidate.score = round_score(f64::min(candidate.score, 0.18));
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason =
+                Some("repeated negative feedback without fresh reconfirmation".to_string());
+            push_string_once(&mut candidate.risk_flags, "feedback_hard_suppressed");
+            push_string_once(&mut candidate.risk_flags, reason);
+            push_string_once(
+                &mut candidate.score_caps_applied,
+                "score_capped:feedback_hard_suppressed",
+            );
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("feedback_hard_suppressed:{}", reason),
+            );
+            candidate.continuation_role = Some("suppressed".to_string());
+        }
+        candidate.risk_flags.sort();
+        candidate.risk_flags.dedup();
+        candidate.score_caps_applied.sort();
+        candidate.score_caps_applied.dedup();
+        candidate.warnings.sort();
+        candidate.warnings.dedup();
+    }
+    Ok(())
+}
+
+fn feedback_aggregate_for_scored_candidate(
+    conn: &Connection,
+    candidate: &ScoredContinueCandidate,
+) -> Result<FeedbackAggregate, String> {
+    feedback_aggregate_for_scored_candidate_at(conn, candidate, current_time_millis())
+}
+
+fn feedback_aggregate_for_scored_candidate_at(
+    conn: &Connection,
+    candidate: &ScoredContinueCandidate,
+    now_ms: i64,
+) -> Result<FeedbackAggregate, String> {
+    let keys = feedback_targets_for_scored_candidate_from_db(conn, candidate)?;
+    feedback_aggregate_for_target_keys_at(conn, &keys, now_ms)
+}
+
+pub fn continue_feedback_suppression_for_target(
+    conn: &Connection,
+    selected_candidate_id: Option<&str>,
+    workstream_id: Option<&str>,
+    target_artifact_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    ensure_continue_schema(conn)?;
+    let mut keys = Vec::new();
+    push_feedback_target(
+        &mut keys,
+        FeedbackTargetScope::Candidate,
+        selected_candidate_id,
+    );
+    push_feedback_target(
+        &mut keys,
+        FeedbackTargetScope::TargetArtifact,
+        target_artifact_id,
+    );
+    push_feedback_target(&mut keys, FeedbackTargetScope::Workstream, workstream_id);
+    if let Some(stable_key) = load_artifact_stable_key(conn, target_artifact_id)? {
+        push_feedback_target(
+            &mut keys,
+            FeedbackTargetScope::ArtifactStableKey,
+            Some(stable_key.as_str()),
+        );
+    }
+    let now_ms = current_time_millis();
+    let aggregate = feedback_aggregate_for_target_keys_at(conn, &keys, now_ms)?;
+    let reconfirming_evidence = if let Some(last_negative_ms) = aggregate.last_negative_ms {
+        find_reconfirming_evidence_for_target_after(conn, target_artifact_id, last_negative_ms)?
+    } else {
+        None
+    };
+    let decision = compute_feedback_decision(&aggregate, reconfirming_evidence.as_ref(), now_ms);
+    if decision.suppress_primary {
+        Ok(Some(decision.reason_codes.first().cloned().unwrap_or_else(
+            || "feedback:negative_feedback_without_reconfirmation".to_string(),
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn find_reconfirming_evidence_for_target_after(
+    conn: &Connection,
+    target_artifact_id: Option<&str>,
+    after_ms: i64,
+) -> Result<Option<ReconfirmingEvidence>, String> {
+    let Some(target_artifact_id) = target_artifact_id else {
+        return Ok(None);
+    };
+    let mut best = None;
+    if let Some(evidence) =
+        latest_direct_artifact_reconfirmation_after(conn, target_artifact_id, after_ms)?
+    {
+        set_newer_reconfirming_evidence(&mut best, evidence);
+    }
+    if let Some(evidence) =
+        latest_meaningful_action_reconfirmation_after(conn, target_artifact_id, after_ms)?
+    {
+        set_newer_reconfirming_evidence(&mut best, evidence);
+    }
+    Ok(best)
+}
+
+fn feedback_aggregate_for_target_keys(
+    conn: &Connection,
+    target_keys: &[FeedbackTargetKey],
+) -> Result<FeedbackAggregate, String> {
+    feedback_aggregate_for_target_keys_at(conn, target_keys, current_time_millis())
+}
+
+fn feedback_aggregate_for_target_keys_at(
+    conn: &Connection,
+    target_keys: &[FeedbackTargetKey],
+    now_ms: i64,
+) -> Result<FeedbackAggregate, String> {
+    let mut aggregate = FeedbackAggregate::default();
+    let target_key_set = target_keys.iter().collect::<HashSet<_>>();
+    let lookback_start_ms = now_ms.saturating_sub(FEEDBACK_NEGATIVE_LOOKBACK_MS);
+    let mut rows = load_continue_feedback_event_rows_for_target_keys(conn, target_keys, 500)?;
+    rows.sort_by_key(|row| row.timestamp_ms);
+    for row in rows {
+        let targets = feedback_targets_for_feedback_event(&row);
+        if row.timestamp_ms < lookback_start_ms
+            && feedback_event_is_negative_signal(&row.event_kind)
+        {
+            continue;
+        }
+        let positive_applies = feedback_positive_applies_to_candidate(&targets, &target_key_set);
+        if positive_applies {
+            let weight =
+                feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+            if weight > 0 {
+                aggregate.positive_count += 1;
+                aggregate.last_positive_ms = Some(
+                    aggregate
+                        .last_positive_ms
+                        .unwrap_or_default()
+                        .max(row.timestamp_ms),
+                );
+                if aggregate
+                    .last_negative_ms
+                    .is_some_and(|last_negative_ms| row.timestamp_ms > last_negative_ms)
+                {
+                    aggregate.positive_weight_after_last_negative += weight;
+                    aggregate.last_reconfirming_evidence_ms = Some(
+                        aggregate
+                            .last_reconfirming_evidence_ms
+                            .unwrap_or_default()
+                            .max(row.timestamp_ms),
+                    );
+                    push_string_once(
+                        &mut aggregate.reason_codes,
+                        "feedback:reconfirmed_by_positive_feedback_after_negative",
+                    );
+                }
+            }
+        }
+        if feedback_negative_applies_to_candidate(&row, &targets, &target_key_set) {
+            let reconfirmed_after_row = aggregate
+                .last_reconfirming_evidence_ms
+                .is_some_and(|last_reconfirming_ms| last_reconfirming_ms > row.timestamp_ms);
+            let weight =
+                feedback_negative_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+            if weight <= 0 || reconfirmed_after_row {
+                continue;
+            }
+            aggregate.negative_count += 1;
+            aggregate.negative_weight_since_reconfirmation += weight;
+            aggregate.last_negative_ms = Some(
+                aggregate
+                    .last_negative_ms
+                    .unwrap_or_default()
+                    .max(row.timestamp_ms),
+            );
+            aggregate.last_negative_kind = Some(row.event_kind.clone());
+            if row.timestamp_ms >= now_ms.saturating_sub(FEEDBACK_HARD_NEGATIVE_RECENT_MS) {
+                aggregate.hard_negative_recent = true;
+            }
+            if row.event_kind == "ignored" {
+                aggregate.ignored_count_since_reconfirmation += 1;
+            }
+            match row.event_kind.as_str() {
+                "rejected" | "corrected" => {
+                    aggregate.hard_negative_after_reconfirmation = true;
+                    push_string_once(
+                        &mut aggregate.reason_codes,
+                        "feedback:explicit_rejected_after_last_positive",
+                    );
+                }
+                "ignored_workstream" => {
+                    aggregate.ignored_workstream_after_reconfirmation = true;
+                    aggregate.hard_negative_after_reconfirmation = true;
+                    push_string_once(&mut aggregate.reason_codes, "feedback:ignored_workstream");
+                }
+                "artifact_only_evidence" => {
+                    aggregate.artifact_only_evidence_after_reconfirmation = true;
+                    aggregate.hard_negative_after_reconfirmation = true;
+                    push_string_once(
+                        &mut aggregate.reason_codes,
+                        "feedback:artifact_only_evidence_not_primary",
+                    );
+                }
+                "ignored" if aggregate.ignored_count_since_reconfirmation >= 2 => {
+                    push_string_once(
+                        &mut aggregate.reason_codes,
+                        "feedback:repeated_ignored_without_reconfirmation",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(aggregate)
+}
+
+fn feedback_source_is_explicit(source: &str) -> bool {
+    !matches!(source.trim(), "" | "inferred" | "auto" | "system")
+}
+
+fn feedback_negative_weight(kind: &str, source: &str) -> i32 {
+    let explicit = feedback_source_is_explicit(source);
+    match kind {
+        "rejected" | "corrected" | "artifact_only_evidence" => {
+            if explicit {
+                3
+            } else {
+                2
+            }
+        }
+        "ignored" => {
+            if explicit {
+                2
+            } else {
+                1
+            }
+        }
+        "ignored_workstream" => {
+            if explicit {
+                4
+            } else {
+                3
+            }
+        }
+        "accepted" | "auto_resumed" | "user_next_step_note" => 0,
+        _ => 0,
+    }
+}
+
+fn feedback_positive_weight(kind: &str, source: &str) -> i32 {
+    let explicit = feedback_source_is_explicit(source);
+    match kind {
+        "accepted" | "corrected" => {
+            if explicit {
+                3
+            } else {
+                2
+            }
+        }
+        "auto_resumed" => {
+            if explicit {
+                1
+            } else {
+                2
+            }
+        }
+        "user_next_step_note" => 0,
+        _ => 0,
+    }
+}
+
+fn scored_candidate_feedback_artifact_ids(candidate: &ScoredContinueCandidate) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(id) = candidate
+        .target_artifact
+        .as_ref()
+        .map(|artifact| artifact.id.clone())
+    {
+        push_string_once(&mut ids, &id);
+    }
+    if let Some(id) = candidate
+        .resume_work_target
+        .as_ref()
+        .map(|artifact| artifact.id.clone())
+    {
+        push_string_once(&mut ids, &id);
+    }
+    ids
+}
+
+fn find_reconfirming_evidence_after(
+    conn: &Connection,
+    candidate: &ScoredContinueCandidate,
+    target_keys: &[FeedbackTargetKey],
+    after_ms: i64,
+) -> Result<Option<ReconfirmingEvidence>, String> {
+    let target_key_set = target_keys.iter().collect::<HashSet<_>>();
+    let mut best: Option<ReconfirmingEvidence> = None;
+
+    for row in load_continue_feedback_event_rows_for_target_keys(conn, target_keys, 500)? {
+        if row.timestamp_ms <= after_ms {
+            continue;
+        }
+        let targets = feedback_targets_for_feedback_event(&row);
+        if !feedback_positive_applies_to_candidate(&targets, &target_key_set) {
+            continue;
+        }
+        let weight = feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+        if weight <= 0 {
+            continue;
+        }
+        set_newer_reconfirming_evidence(
+            &mut best,
+            ReconfirmingEvidence {
+                evidence_kind: row.event_kind.clone(),
+                evidence_id: row.id.clone(),
+                timestamp_ms: row.timestamp_ms,
+                weight,
+                reason_code: if row.event_kind == "corrected" {
+                    "feedback:reconfirmed_by_corrected_target_after_negative".to_string()
+                } else {
+                    "feedback:reconfirmed_by_positive_feedback_after_negative".to_string()
+                },
+            },
+        );
+    }
+
+    for artifact_id in scored_candidate_feedback_artifact_ids(candidate) {
+        if let Some(evidence) =
+            latest_direct_artifact_reconfirmation_after(conn, &artifact_id, after_ms)?
+        {
+            set_newer_reconfirming_evidence(&mut best, evidence);
+        }
+        if let Some(evidence) =
+            latest_meaningful_action_reconfirmation_after(conn, &artifact_id, after_ms)?
+        {
+            set_newer_reconfirming_evidence(&mut best, evidence);
+        }
+    }
+
+    if let Some(action) = candidate
+        .last_meaningful_action
+        .as_ref()
+        .filter(|action| action.created_at_ms > after_ms)
+        .filter(|action| {
+            action.artifact_id.as_deref().is_some_and(|artifact_id| {
+                scored_candidate_feedback_artifact_ids(candidate)
+                    .iter()
+                    .any(|target_id| target_id == artifact_id)
+            })
+        })
+        .filter(|action| action_kind_is_reconfirming(&action.action_kind, action.collapse_count))
+        .filter(|action| matches!(action.action_role.as_str(), "primary" | "return"))
+    {
+        set_newer_reconfirming_evidence(
+            &mut best,
+            ReconfirmingEvidence {
+                evidence_kind: "task_action".to_string(),
+                evidence_id: action.id.clone(),
+                timestamp_ms: action.created_at_ms,
+                weight: 3,
+                reason_code: "feedback:reconfirmed_by_direct_action_after_negative".to_string(),
+            },
+        );
+    }
+
+    Ok(best)
+}
+
+fn set_newer_reconfirming_evidence(
+    best: &mut Option<ReconfirmingEvidence>,
+    candidate: ReconfirmingEvidence,
+) {
+    if best
+        .as_ref()
+        .is_none_or(|current| candidate.timestamp_ms > current.timestamp_ms)
+    {
+        *best = Some(candidate);
+    }
+}
+
+fn latest_direct_artifact_reconfirmation_after(
+    conn: &Connection,
+    artifact_id: &str,
+    after_ms: i64,
+) -> Result<Option<ReconfirmingEvidence>, String> {
+    if !table_exists(conn, "continue_artifact_observations")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, timestamp_ms
+         FROM continue_artifact_observations
+         WHERE artifact_id = ?1
+           AND timestamp_ms > ?2
+         ORDER BY timestamp_ms DESC
+         LIMIT 1",
+        params![artifact_id, after_ms],
+        |row| {
+            Ok(ReconfirmingEvidence {
+                evidence_kind: "artifact_observation".to_string(),
+                evidence_id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                weight: 2,
+                reason_code: "feedback:reconfirmed_by_direct_artifact_observation_after_negative"
+                    .to_string(),
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn latest_meaningful_action_reconfirmation_after(
+    conn: &Connection,
+    artifact_id: &str,
+    after_ms: i64,
+) -> Result<Option<ReconfirmingEvidence>, String> {
+    if !table_exists(conn, "continue_task_actions")? {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, action_kind, action_role, created_at_ms, collapse_count
+             FROM continue_task_actions
+             WHERE artifact_id = ?1
+               AND created_at_ms > ?2
+             ORDER BY created_at_ms DESC
+             LIMIT 20",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![artifact_id, after_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(to_string)?;
+    for row in rows {
+        let (id, action_kind, action_role, created_at_ms, collapse_count) =
+            row.map_err(to_string)?;
+        if !matches!(action_role.as_str(), "primary" | "return") {
+            continue;
+        }
+        if !action_kind_is_reconfirming(&action_kind, collapse_count) {
+            continue;
+        }
+        return Ok(Some(ReconfirmingEvidence {
+            evidence_kind: "task_action".to_string(),
+            evidence_id: id,
+            timestamp_ms: created_at_ms,
+            weight: 3,
+            reason_code: "feedback:reconfirmed_by_direct_action_after_negative".to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+fn action_kind_is_reconfirming(action_kind: &str, collapse_count: i64) -> bool {
+    matches!(
+        action_kind,
+        "editing"
+            | "composing"
+            | "running_command"
+            | "observing_command_output"
+            | "encountering_error"
+            | "reviewing_output"
+            | "copying_evidence"
+            | "returning_to_origin"
+    ) || (action_kind == "reading" && collapse_count >= 2)
+}
+
+fn compute_feedback_decision(
+    aggregate: &FeedbackAggregate,
+    reconfirming_evidence: Option<&ReconfirmingEvidence>,
+    now_ms: i64,
+) -> FeedbackDecision {
+    let mut reason_codes = aggregate.reason_codes.clone();
+    push_string_once(&mut reason_codes, FEEDBACK_POLICY_VERSION);
+    let last_reconfirming_evidence_ms = [
+        aggregate.last_reconfirming_evidence_ms,
+        reconfirming_evidence.map(|evidence| evidence.timestamp_ms),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let reconfirmed_after_negative = aggregate
+        .last_negative_ms
+        .zip(last_reconfirming_evidence_ms)
+        .is_some_and(|(last_negative_ms, reconfirming_ms)| reconfirming_ms > last_negative_ms);
+    if let Some(evidence) = reconfirming_evidence {
+        push_string_once(&mut reason_codes, &evidence.reason_code);
+    }
+
+    if aggregate.last_negative_ms.is_none_or(|last_negative_ms| {
+        last_negative_ms < now_ms.saturating_sub(FEEDBACK_NEGATIVE_LOOKBACK_MS)
+    }) {
+        return FeedbackDecision {
+            state: FeedbackSuppressionState::None,
+            negative_weight_since_reconfirmation: 0,
+            positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+            last_negative_ms: aggregate.last_negative_ms,
+            last_positive_ms: aggregate.last_positive_ms,
+            last_reconfirming_evidence_ms,
+            suppress_primary: false,
+            score_cap: None,
+            reason_codes,
+        };
+    }
+
+    if reconfirmed_after_negative {
+        if reconfirming_evidence.is_some_and(|evidence| evidence.weight >= 3)
+            || aggregate.positive_weight_after_last_negative >= 3
+        {
+            push_string_once(
+                &mut reason_codes,
+                "feedback:strong_reconfirmation_after_negative",
+            );
+            return FeedbackDecision {
+                state: FeedbackSuppressionState::None,
+                negative_weight_since_reconfirmation: 0,
+                positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+                last_negative_ms: aggregate.last_negative_ms,
+                last_positive_ms: aggregate.last_positive_ms,
+                last_reconfirming_evidence_ms,
+                suppress_primary: false,
+                score_cap: None,
+                reason_codes,
+            };
+        }
+        push_string_once(
+            &mut reason_codes,
+            "feedback:weak_reconfirmation_after_negative",
+        );
+        return FeedbackDecision {
+            state: FeedbackSuppressionState::SoftPenalty,
+            negative_weight_since_reconfirmation: 0,
+            positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+            last_negative_ms: aggregate.last_negative_ms,
+            last_positive_ms: aggregate.last_positive_ms,
+            last_reconfirming_evidence_ms,
+            suppress_primary: false,
+            score_cap: None,
+            reason_codes,
+        };
+    }
+
+    let hard_suppressed = aggregate.hard_negative_after_reconfirmation
+        || aggregate.negative_weight_since_reconfirmation >= 3
+        || aggregate.ignored_count_since_reconfirmation >= 2;
+    if hard_suppressed {
+        if aggregate.negative_weight_since_reconfirmation >= 3 {
+            push_string_once(
+                &mut reason_codes,
+                "feedback:negative_weight_without_reconfirmation",
+            );
+        }
+        return FeedbackDecision {
+            state: FeedbackSuppressionState::HardSuppressed,
+            negative_weight_since_reconfirmation: aggregate.negative_weight_since_reconfirmation,
+            positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+            last_negative_ms: aggregate.last_negative_ms,
+            last_positive_ms: aggregate.last_positive_ms,
+            last_reconfirming_evidence_ms,
+            suppress_primary: true,
+            score_cap: Some(0.18),
+            reason_codes,
+        };
+    }
+
+    if aggregate.negative_weight_since_reconfirmation >= 2 {
+        push_string_once(
+            &mut reason_codes,
+            "feedback:soft_negative_without_reconfirmation",
+        );
+        return FeedbackDecision {
+            state: FeedbackSuppressionState::ScoreCapped,
+            negative_weight_since_reconfirmation: aggregate.negative_weight_since_reconfirmation,
+            positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+            last_negative_ms: aggregate.last_negative_ms,
+            last_positive_ms: aggregate.last_positive_ms,
+            last_reconfirming_evidence_ms,
+            suppress_primary: false,
+            score_cap: Some(FEEDBACK_SCORE_CAP_AFTER_SOFT_NEGATIVE),
+            reason_codes,
+        };
+    }
+
+    if aggregate.negative_weight_since_reconfirmation == 1 {
+        push_string_once(
+            &mut reason_codes,
+            "feedback:single_soft_negative_without_reconfirmation",
+        );
+        return FeedbackDecision {
+            state: FeedbackSuppressionState::SoftPenalty,
+            negative_weight_since_reconfirmation: aggregate.negative_weight_since_reconfirmation,
+            positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+            last_negative_ms: aggregate.last_negative_ms,
+            last_positive_ms: aggregate.last_positive_ms,
+            last_reconfirming_evidence_ms,
+            suppress_primary: false,
+            score_cap: None,
+            reason_codes,
+        };
+    }
+
+    FeedbackDecision {
+        state: FeedbackSuppressionState::None,
+        negative_weight_since_reconfirmation: 0,
+        positive_weight_after_last_negative: aggregate.positive_weight_after_last_negative,
+        last_negative_ms: aggregate.last_negative_ms,
+        last_positive_ms: aggregate.last_positive_ms,
+        last_reconfirming_evidence_ms,
+        suppress_primary: false,
+        score_cap: None,
+        reason_codes,
+    }
+}
+
+fn feedback_negative_applies_to_candidate(
+    row: &FeedbackEventRow,
+    targets: &FeedbackEventTargets,
+    target_key_set: &HashSet<&FeedbackTargetKey>,
+) -> bool {
+    targets.negative_targets.iter().any(|key| {
+        target_key_set.contains(key)
+            && (row.event_kind == "ignored_workstream"
+                || key.scope != FeedbackTargetScope::Workstream)
+    })
+}
+
+fn feedback_positive_applies_to_candidate(
+    targets: &FeedbackEventTargets,
+    target_key_set: &HashSet<&FeedbackTargetKey>,
+) -> bool {
+    targets
+        .positive_targets
+        .iter()
+        .any(|key| target_key_set.contains(key))
+}
+
+fn feedback_candidate_has_fresh_reconfirmation(
+    candidate: &ScoredContinueCandidate,
+    last_negative_at_ms: Option<i64>,
+) -> bool {
+    let Some(last_negative_at_ms) = last_negative_at_ms else {
+        return false;
+    };
+    let target_ids = [
+        candidate
+            .target_artifact
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+        candidate
+            .resume_work_target
+            .as_ref()
+            .map(|artifact| artifact.id.as_str()),
+    ];
+    let target_seen_after_negative = [
+        candidate.target_artifact.as_ref(),
+        candidate.resume_work_target.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|artifact| artifact.last_seen_timestamp > last_negative_at_ms);
+    let action_after_negative = candidate
+        .last_meaningful_action
+        .as_ref()
+        .is_some_and(|action| {
+            action.created_at_ms > last_negative_at_ms
+                && target_ids
+                    .iter()
+                    .flatten()
+                    .any(|target_id| action.artifact_id.as_deref() == Some(*target_id))
+        });
+    target_seen_after_negative || action_after_negative
+}
+
+fn candidate_feedback_hard_suppressed(candidate: &ScoredContinueCandidate) -> bool {
+    candidate.feedback_suppression_state == FeedbackSuppressionState::HardSuppressed.as_str()
+        || candidate
+            .risk_flags
+            .iter()
+            .any(|flag| flag == "feedback_hard_suppressed")
+}
+
+fn candidate_feedback_reconfirmed_after_negative(candidate: &ScoredContinueCandidate) -> bool {
+    match (
+        candidate.feedback_last_negative_ms,
+        candidate.feedback_last_reconfirming_evidence_ms,
+    ) {
+        (Some(last_negative_ms), Some(last_reconfirming_ms)) => {
+            last_reconfirming_ms > last_negative_ms
+        }
+        _ => false,
+    }
+}
+
+fn candidate_feedback_state_for_model(candidate: &ScoredContinueCandidate) -> String {
+    match candidate.feedback_suppression_state.as_str() {
+        "score_capped" => "score_capped",
+        "soft_penalty" => "soft_penalty",
+        "hard_suppressed" => "hard_suppressed",
+        _ if candidate.feedback_negative_weight > 0 => "soft_penalty",
+        _ => "none",
+    }
+    .to_string()
+}
+
+fn candidate_feedback_unreconfirmed_ignored_workstream(
+    candidate: &ScoredContinueCandidate,
+) -> bool {
+    candidate
+        .feedback_reason_codes
+        .iter()
+        .any(|code| code == "feedback:ignored_workstream")
+        && !candidate_feedback_reconfirmed_after_negative(candidate)
+}
+
+fn candidate_primary_eligible_after_feedback_gate(candidate: &ScoredContinueCandidate) -> bool {
+    candidate.eligible_for_primary_selection
+        && !candidate_feedback_hard_suppressed(candidate)
+        && !candidate_feedback_unreconfirmed_ignored_workstream(candidate)
+        && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+}
+
+fn candidate_available_after_feedback_gate(candidate: &ScoredContinueCandidate) -> bool {
+    !candidate_feedback_hard_suppressed(candidate)
+        && !candidate_feedback_unreconfirmed_ignored_workstream(candidate)
+}
+
+fn feedback_gate_suppressed_candidate_ids(candidates: &[ScoredContinueCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| !candidate_primary_eligible_after_feedback_gate(candidate))
+        .map(|candidate| candidate.id.clone())
+        .collect()
 }
 
 fn load_continue_breadcrumbs(
@@ -12425,10 +14375,10 @@ fn select_local_candidate_after_activity(
     candidates: &[ScoredContinueCandidate],
     app_activity: &ContinueAppActivityIntelligence,
 ) -> Option<ScoredContinueCandidate> {
-    if let Some(candidate) = candidates.iter().find(|candidate| {
-        candidate.eligible_for_primary_selection
-            && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
-    }) {
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+    {
         return Some(candidate.clone());
     }
     let has_high_value_needs_capture = app_activity.classifications.iter().any(|classification| {
@@ -12439,20 +14389,26 @@ fn select_local_candidate_after_activity(
         && candidates.iter().all(|candidate| {
             activity_role_is_suppressed(candidate.continuation_role.as_deref())
                 || candidate.candidate_kind == "evidence_only"
-                || !candidate.eligible_for_primary_selection
+                || !candidate_primary_eligible_after_feedback_gate(candidate)
         });
     if has_high_value_needs_capture && only_suppressed_candidates {
         return None;
     }
     candidates
         .iter()
-        .find(|candidate| !activity_role_is_suppressed(candidate.continuation_role.as_deref()))
+        .find(|candidate| {
+            !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+                && candidate_available_after_feedback_gate(candidate)
+        })
         .cloned()
         .or_else(|| {
-            if has_high_value_needs_capture {
+            if has_high_value_needs_capture || only_suppressed_candidates {
                 None
             } else {
-                candidates.first().cloned()
+                candidates
+                    .iter()
+                    .find(|candidate| candidate_available_after_feedback_gate(candidate))
+                    .cloned()
             }
         })
 }
@@ -12602,6 +14558,14 @@ fn build_scored_candidate(
         warnings: Vec::new(),
         risk_flags: Vec::new(),
         score_caps_applied: Vec::new(),
+        feedback_suppression_state: FeedbackSuppressionState::None.as_str().to_string(),
+        feedback_negative_weight: 0,
+        feedback_positive_weight_after_last_negative: 0,
+        feedback_last_negative_ms: None,
+        feedback_last_positive_ms: None,
+        feedback_last_reconfirming_evidence_ms: None,
+        feedback_score_cap: None,
+        feedback_reason_codes: Vec::new(),
         eligible_for_primary_selection: true,
         selection_demotion_reason: None,
         resume_work_target,
@@ -13656,7 +15620,7 @@ fn select_safer_local_fallback_candidate(
     candidates
         .iter()
         .filter(|candidate| Some(candidate.id.as_str()) != selected_id)
-        .filter(|candidate| candidate.eligible_for_primary_selection)
+        .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
         .filter(|candidate| !candidate_has_high_risk_selection(candidate))
         .filter(|candidate| {
             target_matches_current_focus(candidate, current_focus)
@@ -14643,8 +16607,7 @@ fn build_candidate_evidence_pack_v2(
                 reason: open_loop.local_reason.as_deref().map(safe_model_label),
             }),
         artifact_identity_audit,
-        local_score_components: serde_json::to_value(candidate_summary(candidate).components)
-            .unwrap_or_else(|_| serde_json::json!({})),
+        local_score_components: candidate_local_score_components_json(candidate),
         local_reasons: local_reasons_for_candidate(candidate),
         missing_evidence: candidate
             .missing_evidence
@@ -14664,7 +16627,49 @@ fn build_candidate_evidence_pack_v2(
         evidence_sufficiency_score: round_score(candidate.evidence_sufficiency_score),
         work_value_reason: candidate.work_value_reason.clone(),
         why_not_primary: candidate.why_not_primary.clone(),
+        feedback_state: candidate_feedback_state_for_model(candidate),
+        feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+        feedback_negative_weight: candidate.feedback_negative_weight,
+        feedback_reconfirmed_after_negative: candidate_feedback_reconfirmed_after_negative(
+            candidate,
+        ),
+        feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+        feedback_last_reconfirming_evidence_ms: candidate.feedback_last_reconfirming_evidence_ms,
+        feedback_reason_codes: candidate.feedback_reason_codes.clone(),
     }
+}
+
+fn candidate_local_score_components_json(candidate: &ScoredContinueCandidate) -> Value {
+    let components = candidate_summary(candidate).components;
+    serde_json::json!({
+        "actionability_score": components.actionability,
+        "primary_target_score": components.primary_target,
+        "unresolved_score": components.unresolved_state,
+        "branch_origin_score": components.branch_origin,
+        "evidence_quality_score": components.evidence_quality,
+        "recency_score": components.recency,
+        "fresh_current_work_score": components.fresh_current_work,
+        "openability_score": components.openability,
+        "privacy_safety_score": components.privacy_safety,
+        "memory_support_score": components.memory_support,
+        "memory_contradiction_score": components.memory_contradiction,
+        "feedback_prior_score": components.feedback_prior,
+        "feedback_suppression_state": candidate.feedback_suppression_state.clone(),
+        "feedback_negative_weight": candidate.feedback_negative_weight,
+        "feedback_positive_weight_after_last_negative": candidate.feedback_positive_weight_after_last_negative,
+        "feedback_last_negative_ms": candidate.feedback_last_negative_ms,
+        "feedback_last_reconfirming_evidence_ms": candidate.feedback_last_reconfirming_evidence_ms,
+        "feedback_score_cap": candidate.feedback_score_cap.map(round_score),
+        "feedback_reason_codes": candidate.feedback_reason_codes.clone(),
+        "retrieval_confidence_score": components.retrieval_confidence,
+        "work_value_score": components.work_value,
+        "resume_likelihood_score": components.resume_likelihood,
+        "divergence_score": components.divergence,
+        "diagnostic_score": components.diagnostic,
+        "objective_relation_score": components.objective_relation,
+        "interaction_depth_score": components.interaction_depth,
+        "evidence_sufficiency_score": components.evidence_sufficiency,
+    })
 }
 
 fn push_safe_content_cue(
@@ -14759,8 +16764,18 @@ fn build_micro_inference_pack(
     active_current_work_unresolved: Option<&ActiveCurrentWorkUnresolved>,
     continue_dossier: Option<&ContinueDossierV1>,
 ) -> Result<ContinueMicroInferencePack, String> {
-    let selected_candidates =
-        select_recall_first_candidates(current_focus, workstreams, candidates, candidate_limit);
+    let feedback_eligible_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    let suppressed_candidate_ids_not_sent = feedback_gate_suppressed_candidate_ids(candidates);
+    let selected_candidates = select_recall_first_candidates(
+        current_focus,
+        workstreams,
+        &feedback_eligible_candidates,
+        candidate_limit,
+    );
     let selected_workstream_ids = selected_candidates
         .iter()
         .map(|candidate| candidate.workstream_id.clone())
@@ -14878,6 +16893,16 @@ fn build_micro_inference_pack(
                 why_not_primary: candidate.why_not_primary.clone(),
                 memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
                 memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
+                feedback_state: candidate_feedback_state_for_model(candidate),
+                feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+                feedback_negative_weight: candidate.feedback_negative_weight,
+                feedback_reconfirmed_after_negative: candidate_feedback_reconfirmed_after_negative(
+                    candidate,
+                ),
+                feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+                feedback_last_reconfirming_evidence_ms: candidate
+                    .feedback_last_reconfirming_evidence_ms,
+                feedback_reason_codes: candidate.feedback_reason_codes.clone(),
                 local_reason: candidate
                     .open_loop
                     .as_ref()
@@ -14900,7 +16925,11 @@ fn build_micro_inference_pack(
 
     Ok(ContinueMicroInferencePack {
         schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
-        instructions: "Candidate IDs provided are the only valid choices. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Never select a candidate whose continuation_role is divergence, diagnostic_only, interruption, background_consumption, support_context, current_focus_only, suppressed, or needs_fresh_capture. active_current_work_unresolved is factual evidence that fresh current work exists; by itself it is not a return target, but a supplied continue_current_work candidate is valid as a thin current-work answer when the facts support inspect/capture rather than opening a URL or path. Reject high confidence when evidence_sufficiency_score is below 0.50. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
+        instructions: "Candidate IDs provided are the only valid choices. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Never select a candidate whose continuation_role is divergence, diagnostic_only, interruption, background_consumption, support_context, current_focus_only, suppressed, or needs_fresh_capture. feedback_state is authoritative local policy context: do not treat soft_penalty or score_capped candidates as clean high-confidence choices, and never assume a rejected target is valid without fresh reconfirmation. active_current_work_unresolved is factual evidence that fresh current work exists; by itself it is not a return target, but a supplied continue_current_work candidate is valid as a thin current-work answer when the facts support inspect/capture rather than opening a URL or path. Reject high confidence when evidence_sufficiency_score is below 0.50. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+        model_candidate_count_before_feedback_filter: candidates.len(),
+        model_candidate_count_after_feedback_filter: selected_candidates.len(),
+        suppressed_candidate_ids_not_sent,
         current_focus: model_safe_current_focus(current_focus),
         active_current_work_unresolved: active_current_work_unresolved
             .map(|fact| active_current_work_for_model(fact, now_ms)),
@@ -14932,7 +16961,8 @@ fn select_recall_first_candidates(
         candidates
             .iter()
             .filter(|candidate| {
-                target_matches_current_focus(candidate, current_focus)
+                candidate_primary_eligible_after_feedback_gate(candidate)
+                    && target_matches_current_focus(candidate, current_focus)
                     && candidate
                         .target_artifact
                         .as_ref()
@@ -14947,48 +16977,13 @@ fn select_recall_first_candidates(
         candidates
             .iter()
             .filter(|candidate| {
-                candidate.target_artifact.as_ref().is_some_and(|target| {
-                    matches!(
-                        target.artifact_kind.as_str(),
-                        "browser_tab" | "chat_conversation" | "messaging"
-                    )
-                })
-            })
-            .max_by(candidate_recency_then_score),
-        candidate_limit,
-    );
-    push_best_recall_candidate(
-        &mut selected,
-        &mut seen,
-        candidates
-            .iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.candidate_kind.as_str(),
-                    "continue_edit"
-                        | "continue_reply"
-                        | "review_completed_changes"
-                        | "commit_completed_changes"
-                        | "manual_verify_app_behavior"
-                        | "rerun_command"
-                        | "verify_output"
-                ) || candidate
-                    .last_meaningful_action
-                    .as_ref()
-                    .is_some_and(|action| {
+                candidate_primary_eligible_after_feedback_gate(candidate)
+                    && candidate.target_artifact.as_ref().is_some_and(|target| {
                         matches!(
-                            action.action_kind.as_str(),
-                            "editing"
-                                | "composing"
-                                | "running_command"
-                                | "observing_command_output"
-                                | "reviewing_output"
+                            target.artifact_kind.as_str(),
+                            "browser_tab" | "chat_conversation" | "messaging"
                         )
                     })
-                    || candidate
-                        .target_artifact
-                        .as_ref()
-                        .is_some_and(|target| target.artifact_kind == "code_editor")
             })
             .max_by(candidate_recency_then_score),
         candidate_limit,
@@ -14999,12 +16994,50 @@ fn select_recall_first_candidates(
         candidates
             .iter()
             .filter(|candidate| {
-                candidate.open_loop.is_some()
-                    || candidate.unresolved_score >= 0.80
-                    || workstreams
-                        .iter()
-                        .find(|workstream| workstream.id == candidate.workstream_id)
-                        .is_some_and(|workstream| workstream.unresolved_signal.is_some())
+                candidate_primary_eligible_after_feedback_gate(candidate)
+                    && (matches!(
+                        candidate.candidate_kind.as_str(),
+                        "continue_edit"
+                            | "continue_reply"
+                            | "review_completed_changes"
+                            | "commit_completed_changes"
+                            | "manual_verify_app_behavior"
+                            | "rerun_command"
+                            | "verify_output"
+                    ) || candidate
+                        .last_meaningful_action
+                        .as_ref()
+                        .is_some_and(|action| {
+                            matches!(
+                                action.action_kind.as_str(),
+                                "editing"
+                                    | "composing"
+                                    | "running_command"
+                                    | "observing_command_output"
+                                    | "reviewing_output"
+                            )
+                        })
+                        || candidate
+                            .target_artifact
+                            .as_ref()
+                            .is_some_and(|target| target.artifact_kind == "code_editor"))
+            })
+            .max_by(candidate_recency_then_score),
+        candidate_limit,
+    );
+    push_best_recall_candidate(
+        &mut selected,
+        &mut seen,
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate_primary_eligible_after_feedback_gate(candidate)
+                    && (candidate.open_loop.is_some()
+                        || candidate.unresolved_score >= 0.80
+                        || workstreams
+                            .iter()
+                            .find(|workstream| workstream.id == candidate.workstream_id)
+                            .is_some_and(|workstream| workstream.unresolved_signal.is_some()))
             })
             .max_by(candidate_score_then_recency),
         candidate_limit,
@@ -15015,13 +17048,14 @@ fn select_recall_first_candidates(
         candidates
             .iter()
             .filter(|candidate| {
-                candidate.candidate_kind == "return_to_primary_artifact"
-                    || workstreams
-                        .iter()
-                        .find(|workstream| workstream.id == candidate.workstream_id)
-                        .is_some_and(|workstream| {
-                            has_explicit_current_focus_return_evidence(candidate, workstream)
-                        })
+                candidate_primary_eligible_after_feedback_gate(candidate)
+                    && (candidate.candidate_kind == "return_to_primary_artifact"
+                        || workstreams
+                            .iter()
+                            .find(|workstream| workstream.id == candidate.workstream_id)
+                            .is_some_and(|workstream| {
+                                has_explicit_current_focus_return_evidence(candidate, workstream)
+                            }))
             })
             .max_by(candidate_score_then_recency),
         candidate_limit,
@@ -15030,6 +17064,9 @@ fn select_recall_first_candidates(
     for candidate in candidates {
         if selected.len() >= candidate_limit {
             break;
+        }
+        if !candidate_primary_eligible_after_feedback_gate(candidate) {
+            continue;
         }
         if seen.insert(candidate.id.clone()) {
             selected.push(candidate.clone());
@@ -15353,7 +17390,11 @@ fn classify_micro_inference_validation_failure(
         | "handoff_why_this_empty"
         | "high_confidence_with_thin_local_evidence"
         | "high_confidence_with_low_p8_evidence_sufficiency"
-        | "high_confidence_with_quality_gate_risks" => MicroInferenceValidationSeverity::Soft,
+        | "high_confidence_with_quality_gate_risks"
+        | "model_high_confidence_for_feedback_score_capped_candidate"
+        | "model_high_confidence_for_feedback_contradicted_candidate" => {
+            MicroInferenceValidationSeverity::Soft
+        }
         "next_action_incompatible_with_candidate" => {
             if model_next_action_can_be_locally_replaced(output, candidate) {
                 MicroInferenceValidationSeverity::Soft
@@ -15365,6 +17406,8 @@ fn classify_micro_inference_validation_failure(
         | "selected_workstream_id_missing"
         | "selected_workstream_id_mismatch"
         | "selected_candidate_not_sent_to_model"
+        | "model_selected_candidate_not_primary_eligible"
+        | "model_selected_feedback_suppressed_candidate"
         | "model_output_contains_unsupported_url_or_path"
         | "escape_hatch_cannot_claim_high_confidence"
         | "need_more_evidence_requires_capture_recommendation"
@@ -15456,6 +17499,13 @@ fn classify_micro_inference_validation_failures(
         }
         if !candidate.eligible_for_primary_selection {
             hard_failures.push("selected_candidate_blocked_by_local_gates".to_string());
+        }
+        if candidate_feedback_hard_suppressed(candidate) {
+            hard_failures.push("selected_candidate_suppressed_by_feedback".to_string());
+            hard_failures.push("model_selected_feedback_suppressed_candidate".to_string());
+        }
+        if !candidate_primary_eligible_after_feedback_gate(candidate) {
+            hard_failures.push("model_selected_candidate_not_primary_eligible".to_string());
         }
         if !candidate_has_human_return_target(candidate) {
             hard_failures.push("selected_candidate_without_human_return_target".to_string());
@@ -15620,6 +17670,13 @@ fn validate_micro_inference_output(
         .any(|pack_candidate| pack_candidate.id == selected_candidate_id)
     {
         failures.push("selected_candidate_not_sent_to_model".to_string());
+        failures.push("model_selected_candidate_not_primary_eligible".to_string());
+    }
+    if candidate_feedback_hard_suppressed(&candidate) {
+        failures.push("model_selected_feedback_suppressed_candidate".to_string());
+    }
+    if !candidate_primary_eligible_after_feedback_gate(&candidate) {
+        failures.push("model_selected_candidate_not_primary_eligible".to_string());
     }
     if output.next_action.as_ref().is_some_and(|action| {
         action.trim().is_empty()
@@ -15657,6 +17714,18 @@ fn validate_micro_inference_output(
         && candidate.evidence_sufficiency_score < 0.50
     {
         failures.push("high_confidence_with_low_p8_evidence_sufficiency".to_string());
+    }
+    if output.confidence == "high" {
+        if candidate.feedback_suppression_state == FeedbackSuppressionState::ScoreCapped.as_str()
+            || candidate.feedback_score_cap.is_some()
+        {
+            failures.push("model_high_confidence_for_feedback_score_capped_candidate".to_string());
+        } else if candidate.feedback_negative_weight > 0
+            || candidate.feedback_suppression_state
+                == FeedbackSuppressionState::SoftPenalty.as_str()
+        {
+            failures.push("model_high_confidence_for_feedback_contradicted_candidate".to_string());
+        }
     }
     if activity_role_is_suppressed(candidate.continuation_role.as_deref()) {
         failures.push("p8_suppressed_candidate_role".to_string());
@@ -15950,6 +18019,43 @@ fn infer_pending_continue_feedback(
     Ok(events)
 }
 
+#[derive(Debug, Clone)]
+struct ContinueDecisionOpenEventRow {
+    opened_at_ms: i64,
+    target_artifact_id: Option<String>,
+    opened_url: bool,
+    opened_path: bool,
+    opened_frame_fallback: bool,
+}
+
+fn latest_open_event_for_decision(
+    conn: &Connection,
+    decision_id: &str,
+) -> Result<Option<ContinueDecisionOpenEventRow>, String> {
+    if !table_exists(conn, "continue_decision_open_events")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT opened_at_ms, target_artifact_id, opened_url, opened_path, opened_frame_fallback
+         FROM continue_decision_open_events
+         WHERE decision_id = ?1
+         ORDER BY opened_at_ms DESC
+         LIMIT 1",
+        params![decision_id],
+        |row| {
+            Ok(ContinueDecisionOpenEventRow {
+                opened_at_ms: row.get(0)?,
+                target_artifact_id: row.get(1)?,
+                opened_url: row.get::<_, i64>(2)? != 0,
+                opened_path: row.get::<_, i64>(3)? != 0,
+                opened_frame_fallback: row.get::<_, i64>(4)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
 fn infer_feedback_for_decision(
     conn: &Connection,
     decision_id: &str,
@@ -15975,6 +18081,14 @@ fn infer_feedback_for_decision(
         return Ok(None);
     };
     let cutoff_ms = requested_at_ms + window_ms.max(60_000);
+    if current_time_millis() < cutoff_ms {
+        return Ok(None);
+    }
+    let open_event = latest_open_event_for_decision(conn, decision_id)?;
+    let opened_target_artifact_id = open_event
+        .as_ref()
+        .and_then(|event| event.target_artifact_id.clone())
+        .or_else(|| target_artifact_id.clone());
     let mut stmt = conn
         .prepare(
             "SELECT o.frame_id, o.artifact_id, o.timestamp_ms
@@ -15999,6 +18113,23 @@ fn infer_feedback_for_decision(
     let Some((first_frame_id, first_artifact_id, first_timestamp_ms)) =
         observations.first().cloned()
     else {
+        if let Some(open_event) = open_event
+            .as_ref()
+            .filter(|event| event.opened_url || event.opened_path || event.opened_frame_fallback)
+        {
+            return insert_feedback_event(
+                conn,
+                decision_id,
+                "rejected",
+                None,
+                opened_target_artifact_id.as_deref(),
+                None,
+                open_event.opened_at_ms,
+                0.66,
+                "Continue target was opened but no post-open target activity was observed",
+            )
+            .map(Some);
+        }
         return insert_feedback_event(
             conn,
             decision_id,
@@ -16013,13 +18144,13 @@ fn infer_feedback_for_decision(
         .map(Some);
     };
 
-    let target_seen = target_artifact_id.as_ref().and_then(|target| {
+    let target_seen = opened_target_artifact_id.as_ref().and_then(|target| {
         observations
             .iter()
             .find(|(_, artifact_id, _)| artifact_id == target)
             .cloned()
     });
-    let meaningful_target_action = if let Some(target) = target_artifact_id.as_deref() {
+    let meaningful_target_action = if let Some(target) = opened_target_artifact_id.as_deref() {
         conn.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM continue_task_actions
@@ -16038,12 +18169,19 @@ fn infer_feedback_for_decision(
     };
 
     if let (Some(target), Some((frame_id, artifact_id, timestamp_ms))) =
-        (target_artifact_id.as_ref(), target_seen)
+        (opened_target_artifact_id.as_ref(), target_seen)
     {
         let later_other = observations.iter().any(|(_, next_artifact_id, next_ts)| {
             next_ts > &timestamp_ms && next_artifact_id != target
         });
-        if meaningful_target_action || !later_other {
+        let dwell_ms = observations
+            .iter()
+            .find(|(_, next_artifact_id, next_ts)| {
+                next_ts > &timestamp_ms && next_artifact_id != target
+            })
+            .map(|(_, _, next_ts)| next_ts.saturating_sub(timestamp_ms))
+            .unwrap_or_else(|| cutoff_ms.saturating_sub(timestamp_ms));
+        if meaningful_target_action || dwell_ms >= FEEDBACK_ACCEPTED_MIN_DWELL_MS {
             return insert_feedback_event(
                 conn,
                 decision_id,
@@ -16057,6 +18195,11 @@ fn infer_feedback_for_decision(
             )
             .map(Some);
         }
+        let rejection_reason = if dwell_ms <= FEEDBACK_REJECTED_MAX_DWELL_MS || later_other {
+            "target artifact was opened then quickly left without meaningful action"
+        } else {
+            "target artifact was opened without meaningful action"
+        };
         return insert_feedback_event(
             conn,
             decision_id,
@@ -16066,7 +18209,7 @@ fn infer_feedback_for_decision(
             Some(&artifact_id),
             timestamp_ms,
             0.68,
-            "target artifact was opened then quickly left without meaningful action",
+            rejection_reason,
         )
         .map(Some);
     }
@@ -16117,39 +18260,78 @@ fn insert_feedback_event(
         "continue-feedback-{}",
         stable_hash(format!("{}:{}:{}", decision_id, event_kind, timestamp_ms).as_bytes())
     );
+    let decision_context = load_feedback_decision_target_context(conn, Some(decision_id))?;
+    let selected_candidate_id = decision_context.selected_candidate_id.clone();
+    let (candidate_target_artifact_id, candidate_workstream_id) =
+        load_candidate_feedback_target(conn, selected_candidate_id.as_deref())?;
+    let resolved_target_artifact_id = target_artifact_id
+        .map(str::to_string)
+        .or(candidate_target_artifact_id)
+        .or(decision_context.selected_target_artifact_id.clone())
+        .or(decision_context.return_target_artifact_id.clone());
+    let workstream_id = candidate_workstream_id.or(decision_context.workstream_id.clone());
+    let target_artifact_stable_key =
+        load_artifact_stable_key(conn, resolved_target_artifact_id.as_deref())?;
+    let resume_work_target_artifact_id = None::<String>;
+    let row = FeedbackEventRow {
+        id: id.clone(),
+        decision_id: Some(decision_id.to_string()),
+        selected_candidate_id: selected_candidate_id.clone(),
+        workstream_id: workstream_id.clone(),
+        event_kind: event_kind.to_string(),
+        observed_frame_id: observed_frame_id.map(str::to_string),
+        target_artifact_id: resolved_target_artifact_id.clone(),
+        chosen_artifact_id: chosen_artifact_id.map(str::to_string),
+        target_artifact_stable_key: target_artifact_stable_key.clone(),
+        resume_work_target_artifact_id: resume_work_target_artifact_id.clone(),
+        timestamp_ms,
+        confidence: round_score(confidence),
+        reason: Some(reason.to_string()),
+        note: None,
+        source: Some("inferred".to_string()),
+    };
+    let feedback_target_keys_json = feedback_event_target_keys_json(&row)?;
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO continue_feedback_events (
             id, decision_id, event_kind, observed_frame_id, target_artifact_id,
             chosen_artifact_id, timestamp_ms, confidence, reason,
-            selected_candidate_id, workstream_id, note, source
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            selected_candidate_id, workstream_id, note, source,
+            target_artifact_stable_key, resume_work_target_artifact_id,
+            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18)",
             params![
                 id,
                 decision_id,
                 event_kind,
                 observed_frame_id,
-                target_artifact_id,
+                resolved_target_artifact_id,
                 chosen_artifact_id,
                 timestamp_ms,
                 confidence,
                 reason,
-                Option::<String>::None,
-                Option::<String>::None,
+                selected_candidate_id,
+                workstream_id,
                 Option::<String>::None,
                 "inferred",
+                target_artifact_stable_key,
+                resume_work_target_artifact_id,
+                feedback_target_keys_json,
+                feedback_event_is_positive_reconfirmation(event_kind) as i64,
+                feedback_event_is_negative_signal(event_kind) as i64,
             ],
         )
         .map_err(to_string)?;
     let result = ContinueFeedbackEventResult {
-        id,
-        decision_id: Some(decision_id.to_string()),
-        selected_candidate_id: None,
-        workstream_id: None,
+        id: row.id,
+        decision_id: row.decision_id,
+        selected_candidate_id: row.selected_candidate_id,
+        workstream_id: row.workstream_id,
         event_kind: event_kind.to_string(),
-        observed_frame_id: observed_frame_id.map(|value| value.to_string()),
-        target_artifact_id: target_artifact_id.map(|value| value.to_string()),
-        chosen_artifact_id: chosen_artifact_id.map(|value| value.to_string()),
+        observed_frame_id: row.observed_frame_id,
+        target_artifact_id: row.target_artifact_id,
+        chosen_artifact_id: row.chosen_artifact_id,
         timestamp_ms,
         confidence: round_score(confidence),
         reason: Some(reason.to_string()),
@@ -16852,7 +19034,7 @@ fn build_feedback_eval_input_snapshot(
 }
 
 fn default_continue_eval_fixture() -> ContinueEvalFixture {
-    let cases = vec![
+    let mut cases = vec![
         eval_case(
             "edit_docs_branch_idle",
             "Edit -> docs/search branch -> idle",
@@ -17141,6 +19323,8 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 is_support_branch: None,
                 stale_target_suppressed: None,
                 suppressed_target_open_attempted: None,
+                feedback_suppression_state: None,
+                feedback_score_capped: None,
             }],
         ),
         eval_case(
@@ -17166,6 +19350,8 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 is_support_branch: None,
                 stale_target_suppressed: None,
                 suppressed_target_open_attempted: None,
+                feedback_suppression_state: None,
+                feedback_score_capped: None,
             }],
         ),
         eval_case_with_model_output(
@@ -17433,7 +19619,291 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             ],
         ),
     ];
+    cases.extend(p1_feedback_eval_cases());
     ContinueEvalFixture { cases, k: Some(3) }
+}
+
+fn p1_feedback_eval_cases() -> Vec<ContinueEvalCaseFixture> {
+    let mut repeated_ignored = eval_case(
+        "p1_feedback_repeated_ignored_stale_chat",
+        "Repeated ignored feedback suppresses stale chat target",
+        "unknown",
+        Some("chat-old"),
+        vec![
+            feedback_eval_candidate(
+                "c-current-unknown",
+                "w-current",
+                Some("unknown"),
+                0.42,
+                "thin",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-chat-old",
+                "w-chat",
+                Some("chat-old"),
+                0.18,
+                "medium",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    repeated_ignored.negative_feedback = vec![
+        ContinueEvalFeedbackFixture {
+            target_artifact_id: Some("chat-old".to_string()),
+            kind: "ignored".to_string(),
+            source: Some("inferred".to_string()),
+            at_ms: Some(1_000),
+        },
+        ContinueEvalFeedbackFixture {
+            target_artifact_id: Some("chat-old".to_string()),
+            kind: "ignored".to_string(),
+            source: Some("inferred".to_string()),
+            at_ms: Some(2_000),
+        },
+    ];
+    repeated_ignored.expected_suppressed_artifact_ids = vec!["chat-old".to_string()];
+    repeated_ignored.expected_not_return_target_artifact_ids = vec!["chat-old".to_string()];
+    repeated_ignored.expected_validation_status = Some("thin_evidence".to_string());
+
+    let mut rejected_beats_openability = eval_case(
+        "p1_feedback_rejected_beats_old_openability",
+        "Explicit rejected feedback beats old openability",
+        "active-doc",
+        Some("old-tab"),
+        vec![
+            feedback_eval_candidate(
+                "c-active-doc",
+                "w-active",
+                Some("active-doc"),
+                0.64,
+                "medium",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-old-tab",
+                "w-old",
+                Some("old-tab"),
+                0.18,
+                "strong",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    rejected_beats_openability.negative_feedback = vec![ContinueEvalFeedbackFixture {
+        target_artifact_id: Some("old-tab".to_string()),
+        kind: "rejected".to_string(),
+        source: Some("explicit".to_string()),
+        at_ms: Some(3_000),
+    }];
+    rejected_beats_openability.expected_suppressed_artifact_ids = vec!["old-tab".to_string()];
+    rejected_beats_openability.expected_not_return_target_artifact_ids =
+        vec!["old-tab".to_string()];
+
+    let mut corrected_preferred = eval_case(
+        "p1_feedback_corrected_artifact_preferred",
+        "Corrected artifact becomes preferred",
+        "artifact-b",
+        Some("artifact-a"),
+        vec![
+            feedback_eval_candidate(
+                "c-artifact-b",
+                "w-corrected",
+                Some("artifact-b"),
+                0.82,
+                "strong",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-artifact-a",
+                "w-corrected",
+                Some("artifact-a"),
+                0.2,
+                "medium",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    corrected_preferred.negative_feedback = vec![ContinueEvalFeedbackFixture {
+        target_artifact_id: Some("artifact-a".to_string()),
+        kind: "corrected".to_string(),
+        source: Some("explicit".to_string()),
+        at_ms: Some(4_000),
+    }];
+    corrected_preferred.corrected_artifact_id = Some("artifact-b".to_string());
+    corrected_preferred.expected_suppressed_artifact_ids = vec!["artifact-a".to_string()];
+    corrected_preferred.expected_not_return_target_artifact_ids = vec!["artifact-a".to_string()];
+
+    let mut accepted_reconfirms = eval_case(
+        "p1_feedback_accepted_clears_prior_negative",
+        "Accepted feedback clears prior negative feedback",
+        "artifact-reconfirmed",
+        Some("artifact-reconfirmed"),
+        vec![feedback_eval_candidate(
+            "c-reconfirmed",
+            "w-reconfirmed",
+            Some("artifact-reconfirmed"),
+            0.8,
+            "strong",
+            "none",
+            false,
+        )],
+    );
+    accepted_reconfirms.negative_feedback = vec![ContinueEvalFeedbackFixture {
+        target_artifact_id: Some("artifact-reconfirmed".to_string()),
+        kind: "accepted_after_rejected".to_string(),
+        source: Some("explicit".to_string()),
+        at_ms: Some(5_000),
+    }];
+
+    let mut direct_action_reconfirms = eval_case(
+        "p1_feedback_direct_post_negative_action_reconfirms",
+        "Direct post-negative action clears suppression",
+        "artifact-edited",
+        Some("artifact-edited"),
+        vec![feedback_eval_candidate(
+            "c-edited",
+            "w-edited",
+            Some("artifact-edited"),
+            0.78,
+            "strong",
+            "none",
+            false,
+        )],
+    );
+    direct_action_reconfirms.negative_feedback = vec![ContinueEvalFeedbackFixture {
+        target_artifact_id: Some("artifact-edited".to_string()),
+        kind: "rejected_then_direct_editing".to_string(),
+        source: Some("explicit".to_string()),
+        at_ms: Some(6_000),
+    }];
+
+    let mut cache_feedback_bypass = eval_case(
+        "p1_feedback_cache_cannot_hide_rejection",
+        "Feedback newer than cached decision bypasses stale cache",
+        "artifact-new",
+        Some("artifact-old-cache"),
+        vec![
+            feedback_eval_candidate(
+                "c-artifact-new",
+                "w-new",
+                Some("artifact-new"),
+                0.7,
+                "medium",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-artifact-old-cache",
+                "w-old-cache",
+                Some("artifact-old-cache"),
+                0.18,
+                "strong",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    cache_feedback_bypass.negative_feedback = vec![ContinueEvalFeedbackFixture {
+        target_artifact_id: Some("artifact-old-cache".to_string()),
+        kind: "rejected".to_string(),
+        source: Some("explicit".to_string()),
+        at_ms: Some(7_000),
+    }];
+    cache_feedback_bypass.expected_suppressed_artifact_ids = vec!["artifact-old-cache".to_string()];
+    cache_feedback_bypass.expected_not_return_target_artifact_ids =
+        vec!["artifact-old-cache".to_string()];
+    cache_feedback_bypass.cached_decision_target_artifact_id =
+        Some("artifact-old-cache".to_string());
+    cache_feedback_bypass.cache_feedback_newer_than_cached_decision = Some(true);
+
+    let mut model_cannot_revive = eval_case_with_model_output(
+        "p1_feedback_model_cannot_revive_suppressed_target",
+        "Model cannot revive a hard-suppressed target",
+        "artifact-safe",
+        Some("artifact-suppressed"),
+        vec![
+            feedback_eval_candidate(
+                "c-artifact-safe",
+                "w-safe",
+                Some("artifact-safe"),
+                0.68,
+                "medium",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-artifact-suppressed",
+                "w-suppressed",
+                Some("artifact-suppressed"),
+                0.18,
+                "strong",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+        ContinueMicroInferenceOutput {
+            result: "selected_candidate".to_string(),
+            selected_candidate_id: Some("c-artifact-suppressed".to_string()),
+            selected_workstream_id: Some("w-suppressed".to_string()),
+            intent_label: "Suppressed".to_string(),
+            headline: "Continue suppressed target".to_string(),
+            return_line: "Continue the suppressed target".to_string(),
+            current_focus_line: "Current focus is suppressed target".to_string(),
+            last_state_line: "Old state".to_string(),
+            next_action: Some("Open old target".to_string()),
+            why_this: vec!["Model selected a suppressed target".to_string()],
+            missing_evidence_line: None,
+            reason: "Suppressed target selected".to_string(),
+            confidence: "high".to_string(),
+            user_visible_uncertainty: None,
+            uncertainty_notes: None,
+            missing_evidence: Vec::new(),
+            recommended_local_capture: None,
+        },
+    );
+    model_cannot_revive.expected_suppressed_artifact_ids = vec!["artifact-suppressed".to_string()];
+    model_cannot_revive.expected_not_return_target_artifact_ids =
+        vec!["artifact-suppressed".to_string()];
+    model_cannot_revive.model_feedback_validation_failure_expected = Some(true);
+
+    vec![
+        repeated_ignored,
+        rejected_beats_openability,
+        corrected_preferred,
+        accepted_reconfirms,
+        direct_action_reconfirms,
+        cache_feedback_bypass,
+        model_cannot_revive,
+    ]
+}
+
+fn feedback_eval_candidate(
+    id: &str,
+    workstream_id: &str,
+    target_artifact_id: Option<&str>,
+    score: f64,
+    evidence_quality: &str,
+    feedback_suppression_state: &str,
+    feedback_score_capped: bool,
+) -> ContinueEvalCandidateFixture {
+    let mut candidate = eval_candidate(
+        id,
+        workstream_id,
+        target_artifact_id,
+        score,
+        evidence_quality,
+    );
+    candidate.feedback_suppression_state = Some(feedback_suppression_state.to_string());
+    candidate.feedback_score_capped = Some(feedback_score_capped);
+    candidate.stale_target_suppressed = Some(feedback_suppression_state == "hard_suppressed");
+    candidate
 }
 
 fn eval_case(
@@ -17451,6 +19921,15 @@ fn eval_case(
         candidates,
         model_output: None,
         expected_feedback_obedience_placeholder: None,
+        negative_feedback: Vec::new(),
+        expected_suppressed_artifact_ids: Vec::new(),
+        expected_not_return_target_artifact_ids: Vec::new(),
+        expected_feedback_return_target_artifact_id: None,
+        expected_validation_status: None,
+        corrected_artifact_id: None,
+        cached_decision_target_artifact_id: None,
+        cache_feedback_newer_than_cached_decision: None,
+        model_feedback_validation_failure_expected: None,
     }
 }
 
@@ -17470,6 +19949,15 @@ fn eval_case_with_model_output(
         candidates,
         model_output: Some(model_output),
         expected_feedback_obedience_placeholder: None,
+        negative_feedback: Vec::new(),
+        expected_suppressed_artifact_ids: Vec::new(),
+        expected_not_return_target_artifact_ids: Vec::new(),
+        expected_feedback_return_target_artifact_id: None,
+        expected_validation_status: None,
+        corrected_artifact_id: None,
+        cached_decision_target_artifact_id: None,
+        cache_feedback_newer_than_cached_decision: None,
+        model_feedback_validation_failure_expected: None,
     }
 }
 
@@ -17521,6 +20009,8 @@ fn eval_candidate_with_missing(
         is_support_branch: None,
         stale_target_suppressed: None,
         suppressed_target_open_attempted: None,
+        feedback_suppression_state: None,
+        feedback_score_capped: None,
     }
 }
 
@@ -17566,6 +20056,8 @@ fn p0_eval_candidate(
         is_support_branch: Some(flags.support_branch),
         stale_target_suppressed: Some(flags.stale_target_suppressed),
         suppressed_target_open_attempted: Some(flags.suppressed_target_open_attempted),
+        feedback_suppression_state: None,
+        feedback_score_capped: None,
     }
 }
 
@@ -17593,6 +20085,26 @@ fn summarize_continue_eval_fixture(
     let current_focus_false_positive_count = reports
         .iter()
         .filter(|case| case.current_focus_false_positive)
+        .count() as i64;
+    let feedback_obedience_case_count = reports
+        .iter()
+        .filter(|case| case.feedback_obedience_case)
+        .count() as i64;
+    let feedback_suppressed_target_exposed_count = reports
+        .iter()
+        .filter(|case| case.feedback_suppressed_target_exposed)
+        .count() as i64;
+    let corrected_artifact_preferred_count = reports
+        .iter()
+        .filter(|case| case.corrected_artifact_preferred)
+        .count() as i64;
+    let feedback_cache_stale_hit_count = reports
+        .iter()
+        .filter(|case| case.feedback_cache_stale_hit)
+        .count() as i64;
+    let model_feedback_validation_failure_count = reports
+        .iter()
+        .filter(|case| case.model_feedback_validation_failure)
         .count() as i64;
     let denom = if case_count == 0 {
         1.0
@@ -17638,6 +20150,19 @@ fn summarize_continue_eval_fixture(
             case.support_branch_false_promotion
         }),
         truthful_thin_mode_rate: metric_ratio(&reports, |case| case.truthful_thin_mode),
+        feedback_obedience_case_count,
+        feedback_suppressed_target_exposed_count,
+        feedback_suppressed_target_exposed_rate: round_score(
+            feedback_suppressed_target_exposed_count as f64
+                / if feedback_obedience_case_count == 0 {
+                    1.0
+                } else {
+                    feedback_obedience_case_count as f64
+                },
+        ),
+        corrected_artifact_preferred_count,
+        feedback_cache_stale_hit_count,
+        model_feedback_validation_failure_count,
         feedback_obedience_placeholder_rate: metric_ratio(&reports, |case| {
             case.feedback_obedience_placeholder
         }),
@@ -17942,7 +20467,7 @@ fn evaluate_continue_fixture_case(
         .iter()
         .position(|candidate| candidate.target_artifact_id.as_deref() == Some(expected.as_str()))
         .map(|index| index as i64 + 1);
-    let selected = if let Some(output) = case.model_output.as_ref() {
+    let mut selected = if let Some(output) = case.model_output.as_ref() {
         output
             .selected_candidate_id
             .as_deref()
@@ -17961,11 +20486,61 @@ fn evaluate_continue_fixture_case(
     } else {
         0
     };
+    let feedback_obedience_case = !case.negative_feedback.is_empty()
+        || !case.expected_suppressed_artifact_ids.is_empty()
+        || !case.expected_not_return_target_artifact_ids.is_empty()
+        || case.corrected_artifact_id.is_some()
+        || case
+            .cache_feedback_newer_than_cached_decision
+            .unwrap_or(false)
+        || case
+            .model_feedback_validation_failure_expected
+            .unwrap_or(false);
+    if let Some(output) = case.model_output.as_ref() {
+        if let Some(selected_id) = output.selected_candidate_id.as_deref() {
+            if let Some(model_selected) = case
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == selected_id)
+            {
+                let model_selected_suppressed = model_selected
+                    .target_artifact_id
+                    .as_ref()
+                    .is_some_and(|artifact_id| {
+                        case.expected_suppressed_artifact_ids.contains(artifact_id)
+                            || case
+                                .expected_not_return_target_artifact_ids
+                                .contains(artifact_id)
+                    })
+                    || model_selected
+                        .feedback_suppression_state
+                        .as_deref()
+                        .is_some_and(|state| state == "hard_suppressed");
+                let model_high_confidence_score_capped = output.confidence == "high"
+                    && (model_selected.feedback_score_capped.unwrap_or(false)
+                        || model_selected
+                            .feedback_suppression_state
+                            .as_deref()
+                            .is_some_and(|state| state == "score_capped"));
+                if model_selected_suppressed || model_high_confidence_score_capped {
+                    push_string_once(
+                        &mut validation_failures,
+                        "model_feedback_validation_failure",
+                    );
+                }
+            }
+        }
+    }
     let validation_status = if validation_failures.is_empty() {
-        "valid".to_string()
+        case.expected_validation_status
+            .clone()
+            .unwrap_or_else(|| "valid".to_string())
     } else {
         "fallback".to_string()
     };
+    if !validation_failures.is_empty() {
+        selected = case.candidates.first();
+    }
     let selected_target = selected.and_then(|candidate| candidate.target_artifact_id.clone());
     let target_correct = selected_target.as_deref() == Some(expected.as_str());
     let selected_evidence_quality =
@@ -18040,6 +20615,29 @@ fn evaluate_continue_fixture_case(
         .candidates
         .iter()
         .any(|candidate| candidate.suppressed_target_open_attempted.unwrap_or(false));
+    let feedback_suppressed_target_exposed = selected_target.as_ref().is_some_and(|target| {
+        case.expected_suppressed_artifact_ids.contains(target)
+            || case
+                .expected_not_return_target_artifact_ids
+                .contains(target)
+    });
+    let corrected_artifact_preferred = case
+        .corrected_artifact_id
+        .as_ref()
+        .is_some_and(|artifact_id| selected_target.as_ref() == Some(artifact_id));
+    let feedback_cache_stale_hit = case
+        .cache_feedback_newer_than_cached_decision
+        .unwrap_or(false)
+        && case
+            .cached_decision_target_artifact_id
+            .as_ref()
+            .is_some_and(|artifact_id| selected_target.as_ref() == Some(artifact_id));
+    let model_feedback_validation_failure = case
+        .model_feedback_validation_failure_expected
+        .unwrap_or(false)
+        || validation_failures
+            .iter()
+            .any(|failure| failure.contains("feedback"));
     let feedback_obedience_placeholder =
         case.expected_feedback_obedience_placeholder.unwrap_or(true);
     let selected_return_target_openable =
@@ -18121,6 +20719,11 @@ fn evaluate_continue_fixture_case(
         stale_target_suppressed,
         support_branch_false_promotion,
         truthful_thin_mode,
+        feedback_obedience_case,
+        feedback_suppressed_target_exposed,
+        corrected_artifact_preferred,
+        feedback_cache_stale_hit,
+        model_feedback_validation_failure,
         feedback_obedience_placeholder,
         suppressed_target_open_attempted,
     })
@@ -18869,7 +21472,18 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
         risk_flags: candidate.risk_flags.clone(),
         score_caps_applied: candidate.score_caps_applied.clone(),
         eligible_for_primary_selection: candidate.eligible_for_primary_selection,
+        public_alternative_eligible_after_feedback: candidate_available_after_feedback_gate(
+            candidate,
+        ),
         selection_demotion_reason: candidate.selection_demotion_reason.clone(),
+        feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+        feedback_negative_weight: candidate.feedback_negative_weight,
+        feedback_positive_weight_after_last_negative: candidate
+            .feedback_positive_weight_after_last_negative,
+        feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+        feedback_last_reconfirming_evidence_ms: candidate.feedback_last_reconfirming_evidence_ms,
+        feedback_score_cap: candidate.feedback_score_cap.map(round_score),
+        feedback_reason_codes: candidate.feedback_reason_codes.clone(),
         evidence_frame_id: candidate.evidence_frame_id.clone(),
         supporting_episode_id: candidate.supporting_episode_id.clone(),
         last_meaningful_action_id: candidate
@@ -18921,6 +21535,11 @@ fn candidate_score_trace(candidate: &ScoredContinueCandidate) -> ContinueCandida
         openability_score: round_score(candidate.openability_score),
         recency_score: round_score(candidate.recency_score),
         evidence_quality_score: round_score(candidate.evidence_quality_score),
+        feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+        feedback_negative_weight: candidate.feedback_negative_weight,
+        feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+        feedback_last_reconfirming_evidence_ms: candidate.feedback_last_reconfirming_evidence_ms,
+        feedback_reason_codes: candidate.feedback_reason_codes.clone(),
     }
 }
 
@@ -26047,11 +28666,15 @@ fn insert_continue_candidate(
             app_activity_classification_id, app_family, surface_type, activity_intent,
             task_phase, continuation_role, work_value_reason, why_not_primary,
             retrieved_memory_cell_ids_json, memory_warning_json, reason, missing_evidence,
-            created_at_ms
+            feedback_suppression_state, feedback_negative_weight,
+            feedback_positive_weight_after_last_negative, feedback_last_negative_ms,
+            feedback_last_positive_ms, feedback_last_reconfirming_evidence_ms,
+            feedback_score_cap, feedback_reason_codes_json, created_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
                    ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                   ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+                   ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42,
+                   ?43, ?44, ?45, ?46, ?47, ?48, ?49)",
         params![
             candidate.id,
             candidate.workstream_id,
@@ -26103,6 +28726,14 @@ fn insert_continue_candidate(
             } else {
                 Some(candidate.missing_evidence.join(";"))
             },
+            candidate.feedback_suppression_state,
+            candidate.feedback_negative_weight,
+            candidate.feedback_positive_weight_after_last_negative,
+            candidate.feedback_last_negative_ms,
+            candidate.feedback_last_positive_ms,
+            candidate.feedback_last_reconfirming_evidence_ms,
+            candidate.feedback_score_cap,
+            serde_json::to_string(&candidate.feedback_reason_codes).map_err(to_string)?,
             created_at_ms,
         ],
     )
@@ -28036,6 +30667,14 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           memory_warning_json TEXT NOT NULL DEFAULT '[]',
           reason TEXT,
           missing_evidence TEXT,
+          feedback_suppression_state TEXT NOT NULL DEFAULT 'none',
+          feedback_negative_weight INTEGER NOT NULL DEFAULT 0,
+          feedback_positive_weight_after_last_negative INTEGER NOT NULL DEFAULT 0,
+          feedback_last_negative_ms INTEGER,
+          feedback_last_positive_ms INTEGER,
+          feedback_last_reconfirming_evidence_ms INTEGER,
+          feedback_score_cap REAL,
+          feedback_reason_codes_json TEXT NOT NULL DEFAULT '[]',
           created_at_ms INTEGER NOT NULL,
           FOREIGN KEY(workstream_id) REFERENCES continue_workstreams(id) ON DELETE CASCADE,
           FOREIGN KEY(target_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
@@ -28180,6 +30819,28 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           ON continue_decisions(requested_at_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_continue_decisions_candidate
           ON continue_decisions(selected_candidate_id);
+
+        CREATE TABLE IF NOT EXISTS continue_decision_open_events (
+          id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL,
+          selected_candidate_id TEXT,
+          workstream_id TEXT,
+          target_artifact_id TEXT,
+          opened_at_ms INTEGER NOT NULL,
+          strategy TEXT,
+          opened_url INTEGER NOT NULL DEFAULT 0,
+          opened_path INTEGER NOT NULL DEFAULT 0,
+          opened_frame_fallback INTEGER NOT NULL DEFAULT 0,
+          warnings_json TEXT NOT NULL DEFAULT '[]',
+          FOREIGN KEY(decision_id) REFERENCES continue_decisions(id) ON DELETE CASCADE,
+          FOREIGN KEY(selected_candidate_id) REFERENCES continue_candidates(id) ON DELETE SET NULL,
+          FOREIGN KEY(workstream_id) REFERENCES continue_workstreams(id) ON DELETE SET NULL,
+          FOREIGN KEY(target_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_decision_open_events_decision
+          ON continue_decision_open_events(decision_id, opened_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_continue_decision_open_events_opened
+          ON continue_decision_open_events(opened_at_ms DESC);
 
         CREATE TABLE IF NOT EXISTS continue_feedback_events (
           id TEXT PRIMARY KEY,
@@ -28390,6 +31051,49 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     ensure_column_exists(conn, "continue_candidates", "continuation_role", "TEXT")?;
     ensure_column_exists(conn, "continue_candidates", "work_value_reason", "TEXT")?;
     ensure_column_exists(conn, "continue_candidates", "why_not_primary", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_suppression_state",
+        "TEXT NOT NULL DEFAULT 'none'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_negative_weight",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_positive_weight_after_last_negative",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_last_negative_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_last_positive_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_last_reconfirming_evidence_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(conn, "continue_candidates", "feedback_score_cap", "REAL")?;
+    ensure_column_exists(
+        conn,
+        "continue_candidates",
+        "feedback_reason_codes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     ensure_column_exists(conn, "continue_decisions", "response_id", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "model", "TEXT")?;
     ensure_column_exists(conn, "continue_decisions", "validation_notes", "TEXT")?;
@@ -28501,6 +31205,36 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "continue_feedback_events",
         "source",
         "TEXT NOT NULL DEFAULT 'inferred'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "target_artifact_stable_key",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "resume_work_target_artifact_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "feedback_target_keys_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "is_positive_reconfirmation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "is_negative_signal",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     Ok(())
 }
@@ -29151,6 +31885,1265 @@ mod tests {
         assert!(wrong.score <= 0.42);
     }
 
+    #[test]
+    fn p1_corrected_feedback_maps_selected_negative_and_corrected_positive_targets() {
+        let row = p1_feedback_row(
+            "corrected",
+            Some("candidate-wrong"),
+            Some("workstream-p1"),
+            Some("artifact-wrong"),
+            Some("artifact-right"),
+            Some("stable-wrong"),
+        );
+
+        let targets = feedback_targets_for_feedback_event(&row);
+
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::Candidate,
+            "candidate-wrong",
+        );
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-wrong",
+        );
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::Workstream,
+            "workstream-p1",
+        );
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::ArtifactStableKey,
+            "stable-wrong",
+        );
+        assert_has_feedback_key(
+            &targets.positive_targets,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-right",
+        );
+        assert!(targets.neutral_targets.is_empty());
+    }
+
+    #[test]
+    fn p1_ignored_workstream_maps_only_workstream_negative_without_artifact() {
+        let row = p1_feedback_row(
+            "ignored_workstream",
+            None,
+            Some("workstream-p1"),
+            Some("artifact-wrong"),
+            None,
+            Some("stable-wrong"),
+        );
+
+        let targets = feedback_targets_for_feedback_event(&row);
+
+        assert_eq!(targets.negative_targets.len(), 1);
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::Workstream,
+            "workstream-p1",
+        );
+        assert!(targets.positive_targets.is_empty());
+        assert!(targets.neutral_targets.is_empty());
+    }
+
+    #[test]
+    fn p1_artifact_only_evidence_maps_selected_artifact_negative_for_primary_target() {
+        let row = p1_feedback_row(
+            "artifact_only_evidence",
+            Some("candidate-support"),
+            Some("workstream-p1"),
+            Some("artifact-support"),
+            None,
+            Some("stable-support"),
+        );
+
+        let targets = feedback_targets_for_feedback_event(&row);
+
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-support",
+        );
+        assert_has_feedback_key(
+            &targets.negative_targets,
+            FeedbackTargetScope::ArtifactStableKey,
+            "stable-support",
+        );
+        assert!(targets.positive_targets.is_empty());
+    }
+
+    #[test]
+    fn p1_candidate_id_is_not_only_feedback_key_when_target_artifact_exists() {
+        let artifact = p1_public_artifact("artifact-target", "stable-target");
+        let candidate = p1_public_candidate("candidate-target", Some("artifact-target"));
+        let artifacts_by_id = HashMap::from([(artifact.id.clone(), artifact)]);
+
+        let targets = feedback_targets_for_candidate(&candidate, &artifacts_by_id);
+
+        assert_has_feedback_key(&targets, FeedbackTargetScope::Candidate, "candidate-target");
+        assert_has_feedback_key(
+            &targets,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-target",
+        );
+        assert_has_feedback_key(
+            &targets,
+            FeedbackTargetScope::ArtifactStableKey,
+            "stable-target",
+        );
+        assert!(targets.len() > 1);
+    }
+
+    #[test]
+    fn p1_missing_artifact_rows_do_not_panic_and_keep_best_effort_keys() {
+        let candidate = p1_public_candidate("candidate-missing", Some("artifact-missing"));
+        let artifacts_by_id = HashMap::new();
+
+        let targets = feedback_targets_for_candidate(&candidate, &artifacts_by_id);
+
+        assert_has_feedback_key(
+            &targets,
+            FeedbackTargetScope::Candidate,
+            "candidate-missing",
+        );
+        assert_has_feedback_key(
+            &targets,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-missing",
+        );
+        assert!(!targets
+            .iter()
+            .any(|target| target.scope == FeedbackTargetScope::ArtifactStableKey));
+    }
+
+    #[test]
+    fn p1_record_feedback_backfills_target_context_and_persists_target_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+
+        let feedback = record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: None,
+                target_artifact_id: None,
+                corrected_artifact_id: Some("artifact-right".to_string()),
+                feedback_kind: "corrected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            feedback.target_artifact_id.as_deref(),
+            Some("artifact-wrong")
+        );
+        assert_eq!(feedback.workstream_id.as_deref(), Some("workstream-p4"));
+
+        let (target_stable_key, target_keys_json, is_positive, is_negative): (
+            Option<String>,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT target_artifact_stable_key, feedback_target_keys_json,
+                        is_positive_reconfirmation, is_negative_signal
+                 FROM continue_feedback_events
+                 WHERE id = ?1",
+                params![feedback.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(target_stable_key.as_deref(), Some("artifact-wrong"));
+        assert_eq!(is_positive, 1);
+        assert_eq!(is_negative, 1);
+        let target_keys: Vec<FeedbackTargetKey> = serde_json::from_str(&target_keys_json).unwrap();
+        assert_has_feedback_key(
+            &target_keys,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-wrong",
+        );
+        assert_has_feedback_key(
+            &target_keys,
+            FeedbackTargetScope::TargetArtifact,
+            "artifact-right",
+        );
+    }
+
+    #[test]
+    fn p1_repeated_ignored_feedback_hard_suppresses_bad_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        record_ignored_feedback_for_candidate(&conn, "first ignored");
+        record_ignored_feedback_for_candidate(&conn, "second ignored");
+        let mut workstream = p1_feedback_workstream();
+        let wrong = test_artifact("artifact-wrong", "browser_tab", "Search");
+        let right = test_artifact("artifact-right", "code_editor", "lib.rs");
+        workstream.primary_artifact_id = Some("artifact-right".to_string());
+        workstream.artifacts = vec![
+            ScorerWorkstreamArtifact {
+                artifact: wrong.clone(),
+                durable_role: "primary_target".to_string(),
+                importance_score: 1.0,
+                first_seen_frame_id: Some("1".to_string()),
+                last_seen_frame_id: Some("1".to_string()),
+            },
+            ScorerWorkstreamArtifact {
+                artifact: right.clone(),
+                durable_role: "primary_target".to_string(),
+                importance_score: 0.9,
+                first_seen_frame_id: Some("1".to_string()),
+                last_seen_frame_id: Some("1".to_string()),
+            },
+        ];
+        let mut candidates = vec![
+            test_candidate(
+                "return_to_primary_artifact",
+                Some(wrong),
+                Some(test_action("artifact-wrong", "editing")),
+                None,
+            ),
+            test_candidate(
+                "continue_edit",
+                Some(right),
+                Some(test_action("artifact-right", "editing")),
+                None,
+            ),
+        ];
+        candidates[0].id = "candidate-wrong".to_string();
+        candidates[0].workstream_id = "workstream-p4".to_string();
+        candidates[1].id = "candidate-right".to_string();
+        candidates[1].workstream_id = "workstream-p4".to_string();
+
+        score_continue_candidates(&mut candidates, &[workstream.clone()], None, None);
+        apply_feedback_obedience_to_candidates(&conn, &mut candidates).unwrap();
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let wrong = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-wrong")
+            .unwrap();
+        assert!(candidate_feedback_hard_suppressed(wrong));
+        assert!(!wrong.eligible_for_primary_selection);
+        assert!(wrong.score <= 0.18);
+        assert!(wrong
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("feedback_hard_suppressed:")));
+
+        let selected = select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, "candidate-right");
+
+        let public_alternatives = candidates
+            .iter()
+            .filter(|candidate| !candidate_feedback_hard_suppressed(candidate))
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        assert!(!public_alternatives.contains(&"candidate-wrong".to_string()));
+    }
+
+    #[test]
+    fn p1_fresh_target_evidence_newer_than_negative_feedback_reconfirms_candidate() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_ignored_feedback_row(&conn, "ignored-1", 1_000);
+        insert_ignored_feedback_row(&conn, "ignored-2", 1_100);
+        let mut target = test_artifact("artifact-wrong", "browser_tab", "Search");
+        target.last_seen_timestamp = 2_000;
+        let mut action = test_action("artifact-wrong", "editing");
+        action.created_at_ms = 2_000;
+        let mut candidate = test_candidate(
+            "return_to_primary_artifact",
+            Some(target),
+            Some(action),
+            None,
+        );
+        candidate.id = "candidate-wrong".to_string();
+        candidate.workstream_id = "workstream-p4".to_string();
+        let mut candidates = vec![candidate];
+        let workstream = p1_feedback_workstream();
+
+        score_continue_candidates(&mut candidates, &[workstream], None, None);
+        apply_feedback_obedience_to_candidates(&conn, &mut candidates).unwrap();
+
+        assert!(!candidate_feedback_hard_suppressed(&candidates[0]));
+        assert!(candidates[0].eligible_for_primary_selection);
+    }
+
+    #[test]
+    fn p1_04_all_hard_suppressed_candidates_leave_no_public_selection() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "rejected-only-target",
+            "rejected",
+            "desktop_ui",
+            current_time_millis().saturating_sub(1_000),
+            Some("artifact-wrong"),
+            None,
+            None,
+        );
+        let workstream = p1_feedback_workstream();
+        let mut candidates = vec![p1_policy_candidate(None)];
+        candidates[0].supporting_episode_id = None;
+
+        score_continue_candidates(&mut candidates, &[workstream], None, None);
+        apply_feedback_obedience_to_candidates(&conn, &mut candidates).unwrap();
+
+        assert!(candidate_feedback_hard_suppressed(&candidates[0]));
+        assert!(select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default()
+        )
+        .is_none());
+
+        let public_alternatives = candidates
+            .iter()
+            .filter(|candidate| !candidate_feedback_hard_suppressed(candidate))
+            .map(candidate_summary)
+            .collect::<Vec<_>>();
+        assert!(public_alternatives.is_empty());
+
+        let diagnostic = candidate_summary(&candidates[0]);
+        assert_eq!(diagnostic.feedback_suppression_state, "hard_suppressed");
+        assert!(diagnostic
+            .feedback_reason_codes
+            .contains(&"feedback:explicit_rejected_after_last_positive".to_string()));
+
+        insert_continue_candidate(&conn, &candidates[0], 2_000).unwrap();
+        let (state, negative_weight, reason_codes_json): (String, i32, String) = conn
+            .query_row(
+                "SELECT feedback_suppression_state, feedback_negative_weight,
+                        feedback_reason_codes_json
+                 FROM continue_candidates
+                 WHERE id = ?1",
+                params![candidates[0].id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "hard_suppressed");
+        assert!(negative_weight >= 3);
+        assert!(reason_codes_json.contains("feedback:explicit_rejected_after_last_positive"));
+    }
+
+    #[test]
+    fn p1_04_score_capped_candidate_stays_below_unsuppressed_fresh_candidate() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "soft-ignored-target",
+            "ignored",
+            "desktop_ui",
+            current_time_millis().saturating_sub(1_000),
+            Some("artifact-wrong"),
+            None,
+            None,
+        );
+        let wrong = test_artifact("artifact-wrong", "browser_tab", "Search");
+        let right = test_artifact("artifact-right", "code_editor", "lib.rs");
+        let mut candidates = vec![
+            test_candidate(
+                "return_to_primary_artifact",
+                Some(wrong),
+                Some(test_action("artifact-wrong", "editing")),
+                None,
+            ),
+            test_candidate(
+                "continue_edit",
+                Some(right),
+                Some(test_action("artifact-right", "editing")),
+                None,
+            ),
+        ];
+        candidates[0].id = "candidate-wrong".to_string();
+        candidates[0].workstream_id = "workstream-p4".to_string();
+        candidates[0].score = 0.92;
+        candidates[1].id = "candidate-right".to_string();
+        candidates[1].workstream_id = "workstream-p4".to_string();
+        candidates[1].score = 0.50;
+
+        apply_feedback_obedience_to_candidates(&conn, &mut candidates).unwrap();
+
+        let capped = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-wrong")
+            .unwrap();
+        assert_eq!(capped.feedback_suppression_state, "score_capped");
+        assert!(capped.eligible_for_primary_selection);
+        assert!(capped.score <= FEEDBACK_SCORE_CAP_AFTER_SOFT_NEGATIVE);
+        assert!(capped.score < candidates[1].score);
+
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let selected = select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, "candidate-right");
+    }
+
+    #[test]
+    fn p1_03_single_inferred_ignored_is_soft_not_hard_suppression() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "ignored-inferred-1",
+            "ignored",
+            "inferred",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::SoftPenalty);
+        assert_eq!(decision.negative_weight_since_reconfirmation, 1);
+        assert!(!decision.suppress_primary);
+    }
+
+    #[test]
+    fn p1_03_two_inferred_ignored_events_hard_suppress_without_reconfirmation() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "ignored-inferred-1",
+            "ignored",
+            "inferred",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        insert_policy_feedback_row(
+            &conn,
+            "ignored-inferred-2",
+            "ignored",
+            "inferred",
+            1_100,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::HardSuppressed);
+        assert!(decision.suppress_primary);
+        assert!(decision
+            .reason_codes
+            .contains(&"feedback:repeated_ignored_without_reconfirmation".to_string()));
+    }
+
+    #[test]
+    fn p1_03_explicit_rejected_after_last_positive_hard_suppresses() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "accepted-before-reject",
+            "accepted",
+            "desktop_ui",
+            900,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        insert_policy_feedback_row(
+            &conn,
+            "rejected-after-positive",
+            "rejected",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::HardSuppressed);
+        assert!(decision
+            .reason_codes
+            .contains(&"feedback:explicit_rejected_after_last_positive".to_string()));
+    }
+
+    #[test]
+    fn p1_03_accepted_newer_than_rejected_clears_hard_suppression() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "rejected-before-accepted",
+            "rejected",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        insert_policy_feedback_row(
+            &conn,
+            "accepted-after-reject",
+            "accepted",
+            "desktop_ui",
+            1_200,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::None);
+        assert!(!decision.suppress_primary);
+        assert_eq!(decision.last_reconfirming_evidence_ms, Some(1_200));
+    }
+
+    #[test]
+    fn p1_03_direct_primary_editing_after_rejected_clears_hard_suppression() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "rejected-before-edit",
+            "rejected",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let mut action = test_action("artifact-wrong", "editing");
+        action.created_at_ms = 1_300;
+        let candidate = p1_policy_candidate(Some(action));
+        let keys = feedback_targets_for_scored_candidate_from_db(&conn, &candidate).unwrap();
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let reconfirming =
+            find_reconfirming_evidence_after(&conn, &candidate, &keys, 1_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, reconfirming.as_ref(), 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::None);
+        assert_eq!(decision.last_reconfirming_evidence_ms, Some(1_300));
+        assert!(decision
+            .reason_codes
+            .contains(&"feedback:reconfirmed_by_direct_action_after_negative".to_string()));
+    }
+
+    #[test]
+    fn p1_03_old_unresolved_state_does_not_reconfirm_after_negative_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "rejected-after-old-state",
+            "rejected",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let mut old_target = test_artifact("artifact-wrong", "browser_tab", "Search");
+        old_target.last_seen_timestamp = 900;
+        let candidate = test_candidate("return_to_primary_artifact", Some(old_target), None, None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::HardSuppressed);
+        assert!(decision.suppress_primary);
+    }
+
+    #[test]
+    fn p1_03_ignored_workstream_suppresses_workstream_candidates() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "ignored-workstream-1",
+            "ignored_workstream",
+            "desktop_ui",
+            1_000,
+            None,
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::HardSuppressed);
+        assert!(decision
+            .reason_codes
+            .contains(&"feedback:ignored_workstream".to_string()));
+    }
+
+    #[test]
+    fn p1_03_artifact_only_evidence_suppresses_primary_without_dropping_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "artifact-only-evidence-1",
+            "artifact_only_evidence",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let candidate = p1_policy_candidate(None);
+        let aggregate =
+            feedback_aggregate_for_scored_candidate_at(&conn, &candidate, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::HardSuppressed);
+        assert!(decision.suppress_primary);
+        assert!(candidate.target_artifact.is_some());
+        assert!(decision
+            .reason_codes
+            .contains(&"feedback:artifact_only_evidence_not_primary".to_string()));
+    }
+
+    #[test]
+    fn p1_hard_suppressed_candidates_are_not_sent_to_micro_inference() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        record_ignored_feedback_for_candidate(&conn, "first ignored");
+        record_ignored_feedback_for_candidate(&conn, "second ignored");
+        let workstream = p1_feedback_workstream();
+        let wrong = test_artifact("artifact-wrong", "browser_tab", "Search");
+        let right = test_artifact("artifact-right", "code_editor", "lib.rs");
+        let mut candidates = vec![
+            test_candidate(
+                "return_to_primary_artifact",
+                Some(wrong),
+                Some(test_action("artifact-wrong", "editing")),
+                None,
+            ),
+            test_candidate(
+                "continue_edit",
+                Some(right),
+                Some(test_action("artifact-right", "editing")),
+                None,
+            ),
+        ];
+        candidates[0].id = "candidate-wrong".to_string();
+        candidates[0].workstream_id = "workstream-p4".to_string();
+        candidates[1].id = "candidate-right".to_string();
+        candidates[1].workstream_id = "workstream-p4".to_string();
+
+        score_continue_candidates(
+            &mut candidates,
+            std::slice::from_ref(&workstream),
+            None,
+            None,
+        );
+        apply_feedback_obedience_to_candidates(&conn, &mut candidates).unwrap();
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            3_000,
+            &[workstream],
+            &candidates,
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!pack
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == "candidate-wrong"));
+        assert!(pack
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == "candidate-right"));
+    }
+
+    #[test]
+    fn p1_related_negative_feedback_invalidates_cached_decision_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE frames (id INTEGER PRIMARY KEY, session_id TEXT)",
+            [],
+        )
+        .unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET evidence_watermark_hash = 'p1-cache-watermark',
+                 micro_inference_requested = 0,
+                 latest_boundary_revision = NULL
+             WHERE id = 'decision-p4'",
+            [],
+        )
+        .unwrap();
+        let watermark = p1_cache_watermark();
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_some()
+        );
+
+        insert_related_negative_feedback_row(&conn);
+
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn p1_cached_decision_reuses_when_no_new_feedback_or_open_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE frames (id INTEGER PRIMARY KEY, session_id TEXT)",
+            [],
+        )
+        .unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET evidence_watermark_hash = 'p1-cache-watermark',
+                 micro_inference_requested = 0,
+                 latest_boundary_revision = NULL
+             WHERE id = 'decision-p4'",
+            [],
+        )
+        .unwrap();
+        let watermark = p1_cache_watermark();
+
+        let cached = fresh_cached_continue_decision(&conn, None, &watermark, false).unwrap();
+        let reasons = continue_cache_bypass_reasons(&conn, None, &watermark, false).unwrap();
+
+        assert!(cached.is_some());
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn p1_explicit_rejected_feedback_bypasses_cached_decision_with_reason() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE frames (id INTEGER PRIMARY KEY, session_id TEXT)",
+            [],
+        )
+        .unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET evidence_watermark_hash = 'p1-cache-watermark',
+                 micro_inference_requested = 0,
+                 latest_boundary_revision = NULL
+             WHERE id = 'decision-p4'",
+            [],
+        )
+        .unwrap();
+        record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: Some("workstream-p4".to_string()),
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                corrected_artifact_id: None,
+                feedback_kind: "rejected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let watermark = p1_cache_watermark();
+
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            continue_cache_bypass_reasons(&conn, None, &watermark, false)
+                .unwrap()
+                .contains(&"feedback_newer_than_cached_decision".to_string())
+        );
+    }
+
+    #[test]
+    fn p1_matured_open_event_bypasses_cached_decision_until_feedback_is_inferred() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE frames (id INTEGER PRIMARY KEY, session_id TEXT)",
+            [],
+        )
+        .unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET evidence_watermark_hash = 'p1-cache-watermark',
+                 micro_inference_requested = 0,
+                 latest_boundary_revision = NULL
+             WHERE id = 'decision-p4'",
+            [],
+        )
+        .unwrap();
+        let watermark = p1_cache_watermark();
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_some()
+        );
+
+        record_continue_decision_open_event(
+            &conn,
+            ContinueDecisionOpenEventRequest {
+                decision_id: "decision-p4".to_string(),
+                selected_candidate_id: None,
+                workstream_id: None,
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                opened_at_ms: Some(current_time_millis() - FEEDBACK_INFERENCE_MIN_AGE_MS - 1_000),
+                strategy: "browser_url".to_string(),
+                opened_url: true,
+                opened_path: false,
+                opened_frame_fallback: false,
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            continue_cache_bypass_reasons(&conn, None, &watermark, false)
+                .unwrap()
+                .contains(&"continue_open_pending_feedback".to_string())
+        );
+    }
+
+    #[test]
+    fn p1_infer_continue_feedback_writes_ignored_without_open_or_activity() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET requested_at_ms = ?1
+             WHERE id = 'decision-p4'",
+            params![current_time_millis() - 120_000],
+        )
+        .unwrap();
+
+        let events = infer_continue_feedback(
+            &conn,
+            ContinueFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                observation_window_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, "ignored");
+        assert_eq!(
+            events[0].target_artifact_id.as_deref(),
+            Some("artifact-wrong")
+        );
+    }
+
+    #[test]
+    fn p1_infer_continue_feedback_writes_rejected_for_opened_then_left_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        let requested_at_ms = current_time_millis() - 120_000;
+        conn.execute(
+            "UPDATE continue_decisions
+             SET requested_at_ms = ?1
+             WHERE id = 'decision-p4'",
+            params![requested_at_ms],
+        )
+        .unwrap();
+        for (id, artifact_id, timestamp_ms) in [
+            ("obs-wrong", "artifact-wrong", requested_at_ms + 10_000),
+            ("obs-right", "artifact-right", requested_at_ms + 20_000),
+        ] {
+            conn.execute(
+                "INSERT INTO continue_artifact_observations (
+                    id, artifact_id, frame_id, text_source, observation_confidence,
+                    reason, timestamp_ms
+                 ) VALUES (?1, ?2, ?3, 'test', 0.9, 'test observation', ?4)",
+                params![id, artifact_id, id, timestamp_ms],
+            )
+            .unwrap();
+        }
+        record_continue_decision_open_event(
+            &conn,
+            ContinueDecisionOpenEventRequest {
+                decision_id: "decision-p4".to_string(),
+                selected_candidate_id: None,
+                workstream_id: None,
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                opened_at_ms: Some(requested_at_ms + 9_000),
+                strategy: "browser_url".to_string(),
+                opened_url: true,
+                opened_path: false,
+                opened_frame_fallback: false,
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let events = infer_continue_feedback(
+            &conn,
+            ContinueFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                observation_window_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, "rejected");
+        assert_eq!(
+            events[0].target_artifact_id.as_deref(),
+            Some("artifact-wrong")
+        );
+    }
+
+    fn p1_feedback_row(
+        event_kind: &str,
+        selected_candidate_id: Option<&str>,
+        workstream_id: Option<&str>,
+        target_artifact_id: Option<&str>,
+        chosen_artifact_id: Option<&str>,
+        target_artifact_stable_key: Option<&str>,
+    ) -> FeedbackEventRow {
+        FeedbackEventRow {
+            id: "feedback-p1".to_string(),
+            decision_id: Some("decision-p1".to_string()),
+            selected_candidate_id: selected_candidate_id.map(str::to_string),
+            workstream_id: workstream_id.map(str::to_string),
+            event_kind: event_kind.to_string(),
+            observed_frame_id: None,
+            target_artifact_id: target_artifact_id.map(str::to_string),
+            chosen_artifact_id: chosen_artifact_id.map(str::to_string),
+            target_artifact_stable_key: target_artifact_stable_key.map(str::to_string),
+            resume_work_target_artifact_id: None,
+            timestamp_ms: 1_000,
+            confidence: 1.0,
+            reason: Some("test feedback".to_string()),
+            note: None,
+            source: Some("test".to_string()),
+        }
+    }
+
+    fn p1_public_candidate(id: &str, target_artifact_id: Option<&str>) -> ContinueCandidate {
+        ContinueCandidate {
+            id: id.to_string(),
+            workstream_id: "workstream-p1".to_string(),
+            target_artifact_id: target_artifact_id.map(str::to_string),
+            candidate_kind: ContinueCandidateKind::ContinueEdit,
+            last_meaningful_action_id: None,
+            evidence_frame_id: Some("1".to_string()),
+            supporting_episode_id: None,
+            score: 0.7,
+            actionability_score: 0.7,
+            primary_target_score: 0.7,
+            unresolved_score: 0.7,
+            branch_origin_score: 0.0,
+            evidence_quality_score: 0.7,
+            recency_score: 0.7,
+            openability_score: 0.7,
+            privacy_safety_score: 1.0,
+            reason: Some("test".to_string()),
+            missing_evidence: None,
+            created_at_ms: 1_000,
+        }
+    }
+
+    fn p1_public_artifact(id: &str, stable_key: &str) -> ContinueArtifact {
+        ContinueArtifact {
+            id: id.to_string(),
+            artifact_kind: ContinueArtifactKind::CodeEditor,
+            stable_key: stable_key.to_string(),
+            app_name: Some("VS Code".to_string()),
+            bundle_id: None,
+            window_title: Some("lib.rs".to_string()),
+            browser_url: None,
+            document_path: None,
+            display_title: Some("lib.rs".to_string()),
+            first_seen_frame_id: Some("1".to_string()),
+            last_seen_frame_id: Some("1".to_string()),
+            first_seen_timestamp: 1_000,
+            last_seen_timestamp: 1_000,
+            identity_confidence: 0.9,
+            evidence_quality: ContinueEvidenceQuality::Strong,
+            privacy_status: None,
+            openability: ContinueOpenability::Openable,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    fn assert_has_feedback_key(
+        keys: &[FeedbackTargetKey],
+        scope: FeedbackTargetScope,
+        id_or_key: &str,
+    ) {
+        assert!(
+            keys.iter()
+                .any(|key| key.scope == scope && key.id_or_key == id_or_key),
+            "missing feedback key {:?}:{} in {:?}",
+            scope,
+            id_or_key,
+            keys
+        );
+    }
+
+    fn record_ignored_feedback_for_candidate(conn: &Connection, note: &str) {
+        record_continue_feedback(
+            conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: Some("workstream-p4".to_string()),
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                corrected_artifact_id: None,
+                feedback_kind: "ignored".to_string(),
+                note: Some(note.to_string()),
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn insert_ignored_feedback_row(conn: &Connection, id: &str, timestamp_ms: i64) {
+        let row = p1_feedback_row(
+            "ignored",
+            Some("candidate-wrong"),
+            Some("workstream-p4"),
+            Some("artifact-wrong"),
+            None,
+            Some("artifact-wrong"),
+        );
+        let target_keys_json = feedback_event_target_keys_json(&row).unwrap();
+        conn.execute(
+            "INSERT INTO continue_feedback_events (
+                id, decision_id, event_kind, observed_frame_id, target_artifact_id,
+                chosen_artifact_id, timestamp_ms, confidence, reason,
+                selected_candidate_id, workstream_id, note, source,
+                target_artifact_stable_key, feedback_target_keys_json,
+                is_positive_reconfirmation, is_negative_signal
+             ) VALUES (
+                ?1, 'decision-p4', 'ignored', NULL, 'artifact-wrong',
+                NULL, ?2, 1.0, 'test ignored',
+                'candidate-wrong', 'workstream-p4', NULL, 'test',
+                'artifact-wrong', ?3, 0, 1
+             )",
+            params![id, timestamp_ms, target_keys_json],
+        )
+        .unwrap();
+    }
+
+    fn insert_related_negative_feedback_row(conn: &Connection) {
+        let row = p1_feedback_row(
+            "rejected",
+            None,
+            Some("workstream-p4"),
+            Some("artifact-wrong"),
+            None,
+            Some("artifact-wrong"),
+        );
+        let target_keys_json = feedback_event_target_keys_json(&row).unwrap();
+        conn.execute(
+            "INSERT INTO continue_feedback_events (
+                id, decision_id, event_kind, observed_frame_id, target_artifact_id,
+                chosen_artifact_id, timestamp_ms, confidence, reason,
+                selected_candidate_id, workstream_id, note, source,
+                target_artifact_stable_key, feedback_target_keys_json,
+                is_positive_reconfirmation, is_negative_signal
+             ) VALUES (
+                'feedback-related-negative', NULL, 'rejected', NULL, 'artifact-wrong',
+                NULL, 2000, 1.0, 'related target rejected',
+                NULL, 'workstream-p4', NULL, 'test',
+                'artifact-wrong', ?1, 0, 1
+             )",
+            params![target_keys_json],
+        )
+        .unwrap();
+    }
+
+    fn insert_policy_feedback_row(
+        conn: &Connection,
+        id: &str,
+        event_kind: &str,
+        source: &str,
+        timestamp_ms: i64,
+        target_artifact_id: Option<&str>,
+        chosen_artifact_id: Option<&str>,
+        workstream_id: Option<&str>,
+    ) {
+        let mut row = p1_feedback_row(
+            event_kind,
+            Some("candidate-wrong"),
+            workstream_id,
+            target_artifact_id,
+            chosen_artifact_id,
+            target_artifact_id,
+        );
+        row.id = id.to_string();
+        row.timestamp_ms = timestamp_ms;
+        row.source = Some(source.to_string());
+        let target_keys_json = feedback_event_target_keys_json(&row).unwrap();
+        conn.execute(
+            "INSERT INTO continue_feedback_events (
+                id, decision_id, event_kind, observed_frame_id, target_artifact_id,
+                chosen_artifact_id, timestamp_ms, confidence, reason,
+                selected_candidate_id, workstream_id, note, source,
+                target_artifact_stable_key, feedback_target_keys_json,
+                is_positive_reconfirmation, is_negative_signal
+             ) VALUES (
+                ?1, 'decision-p4', ?2, NULL, ?3,
+                ?4, ?5, 1.0, 'test feedback policy',
+                'candidate-wrong', ?6, NULL, ?7,
+                ?8, ?9, ?10, ?11
+             )",
+            params![
+                id,
+                event_kind,
+                target_artifact_id,
+                chosen_artifact_id,
+                timestamp_ms,
+                workstream_id,
+                source,
+                target_artifact_id,
+                target_keys_json,
+                feedback_event_is_positive_reconfirmation(event_kind) as i64,
+                feedback_event_is_negative_signal(event_kind) as i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn p1_policy_candidate(action: Option<ScorerAction>) -> ScoredContinueCandidate {
+        let mut candidate = test_candidate(
+            "return_to_primary_artifact",
+            Some(test_artifact("artifact-wrong", "browser_tab", "Search")),
+            action,
+            None,
+        );
+        candidate.id = "candidate-wrong".to_string();
+        candidate.workstream_id = "workstream-p4".to_string();
+        candidate
+    }
+
+    fn p1_cache_watermark() -> ContinueEvidenceWatermark {
+        ContinueEvidenceWatermark {
+            latest_frame_id: None,
+            latest_frame_at_ms: None,
+            latest_ui_event_id: None,
+            latest_ui_event_at_ms: None,
+            latest_artifact_observation_id: None,
+            latest_artifact_observation_at_ms: None,
+            latest_typing_burst_id: None,
+            latest_typing_burst_at_ms: None,
+            latest_window_snapshot_id: None,
+            latest_window_snapshot_at_ms: None,
+            latest_app_context_id: None,
+            latest_app_context_at_ms: None,
+            latest_semantic_moment_id: None,
+            latest_semantic_moment_at_ms: None,
+            latest_task_action_id: None,
+            latest_task_action_at_ms: None,
+            latest_workstream_revision: None,
+            latest_open_loop_revision: None,
+            latest_boundary_revision: None,
+            latest_memory_cell_at_ms: None,
+            latest_memory_edge_at_ms: None,
+            latest_evidence_probe_id: None,
+            latest_evidence_probe_at_ms: None,
+            latest_app_activity_segment_id: None,
+            latest_app_activity_segment_at_ms: None,
+            latest_activity_classification_id: None,
+            latest_activity_classification_at_ms: None,
+            hash: "p1-cache-watermark".to_string(),
+        }
+    }
+
+    fn p1_feedback_workstream() -> ScorerWorkstream {
+        ScorerWorkstream {
+            id: "workstream-p4".to_string(),
+            state: "active".to_string(),
+            title_candidate: Some("P1 feedback".to_string()),
+            primary_artifact_id: Some("artifact-wrong".to_string()),
+            last_active_timestamp_ms: 1_000,
+            confidence: 0.9,
+            unresolved_signal: Some("branch_without_return".to_string()),
+            episodes: Vec::new(),
+            artifacts: Vec::new(),
+            last_meaningful_action: Some(test_action("artifact-wrong", "editing")),
+            open_loops: Vec::new(),
+        }
+    }
+
     fn insert_p4_learning_rows(conn: &Connection) {
         for (id, kind, title, path) in [
             (
@@ -29331,6 +33324,14 @@ mod tests {
             warnings: Vec::new(),
             risk_flags: Vec::new(),
             score_caps_applied: Vec::new(),
+            feedback_suppression_state: "none".to_string(),
+            feedback_negative_weight: 0,
+            feedback_positive_weight_after_last_negative: 0,
+            feedback_last_negative_ms: None,
+            feedback_last_positive_ms: None,
+            feedback_last_reconfirming_evidence_ms: None,
+            feedback_score_cap: None,
+            feedback_reason_codes: Vec::new(),
             eligible_for_primary_selection: true,
             selection_demotion_reason: None,
             resume_work_target: Some(unknown),
@@ -29545,6 +33546,14 @@ mod tests {
             warnings: Vec::new(),
             risk_flags: Vec::new(),
             score_caps_applied: Vec::new(),
+            feedback_suppression_state: "none".to_string(),
+            feedback_negative_weight: 0,
+            feedback_positive_weight_after_last_negative: 0,
+            feedback_last_negative_ms: None,
+            feedback_last_positive_ms: None,
+            feedback_last_reconfirming_evidence_ms: None,
+            feedback_score_cap: None,
+            feedback_reason_codes: Vec::new(),
             eligible_for_primary_selection: true,
             selection_demotion_reason: None,
             resume_work_target: target,
@@ -30327,6 +34336,16 @@ mod tests {
             why_not_primary: candidate.why_not_primary.clone(),
             memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
             memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
+            feedback_state: candidate_feedback_state_for_model(candidate),
+            feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+            feedback_negative_weight: candidate.feedback_negative_weight,
+            feedback_reconfirmed_after_negative: candidate_feedback_reconfirmed_after_negative(
+                candidate,
+            ),
+            feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+            feedback_last_reconfirming_evidence_ms: candidate
+                .feedback_last_reconfirming_evidence_ms,
+            feedback_reason_codes: candidate.feedback_reason_codes.clone(),
             local_reason: candidate.reason.clone(),
         }
     }
@@ -30337,6 +34356,10 @@ mod tests {
         ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            model_candidate_count_before_feedback_filter: candidates.len(),
+            model_candidate_count_after_feedback_filter: candidates.len(),
+            suppressed_candidate_ids_not_sent: Vec::new(),
             current_focus: None,
             active_current_work_unresolved: None,
             current_surface: None,
@@ -30361,6 +34384,7 @@ mod tests {
             decision_id: "decision-p5-thin".to_string(),
             mode: "normal".to_string(),
             cache_hit: false,
+            cache_bypass_reasons: Vec::new(),
             source: "local_scorer".to_string(),
             model: None,
             response_id: None,
@@ -30386,6 +34410,7 @@ mod tests {
                 last_active_timestamp_ms: current_time_millis().saturating_sub(20 * 60 * 1000),
                 unresolved_signal: Some("visible_error_or_failure".to_string()),
             }),
+            selected_candidate_id: Some("candidate-old".to_string()),
             return_target: Some(ContinueReturnTarget {
                 artifact_id: Some("artifact-old".to_string()),
                 artifact_kind: Some("finder".to_string()),
@@ -30426,6 +34451,14 @@ mod tests {
             ],
             generated_candidates: 2,
             validation_status: "thin_evidence".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            feedback_watermark_ms: None,
+            open_watermark_ms: None,
+            feedback_suppressed_candidate_count: 0,
+            feedback_score_capped_candidate_count: 0,
+            eligible_candidate_count_after_feedback_gate: 2,
+            model_candidate_count_before_feedback_filter: 2,
+            model_candidate_count_after_feedback_filter: 2,
             continue_output_mode: "thin_continue".to_string(),
             evidence_watermark_hash: "watermark-p5-thin".to_string(),
             latest_boundary_revision: None,
@@ -30487,7 +34520,15 @@ mod tests {
             risk_flags: Vec::new(),
             score_caps_applied: Vec::new(),
             eligible_for_primary_selection: true,
+            public_alternative_eligible_after_feedback: true,
             selection_demotion_reason: None,
+            feedback_suppression_state: "none".to_string(),
+            feedback_negative_weight: 0,
+            feedback_positive_weight_after_last_negative: 0,
+            feedback_last_negative_ms: None,
+            feedback_last_reconfirming_evidence_ms: None,
+            feedback_score_cap: None,
+            feedback_reason_codes: Vec::new(),
             evidence_frame_id: Some("12".to_string()),
             supporting_episode_id: None,
             last_meaningful_action_id: None,
@@ -30528,6 +34569,11 @@ mod tests {
                 openability_score: 0.2,
                 recency_score: 0.3,
                 evidence_quality_score: 0.3,
+                feedback_suppression_state: "none".to_string(),
+                feedback_negative_weight: 0,
+                feedback_last_negative_ms: None,
+                feedback_last_reconfirming_evidence_ms: None,
+                feedback_reason_codes: Vec::new(),
             },
         }
     }
@@ -30900,6 +34946,14 @@ mod tests {
                 warnings: Vec::new(),
                 risk_flags: Vec::new(),
                 score_caps_applied: Vec::new(),
+                feedback_suppression_state: "none".to_string(),
+                feedback_negative_weight: 0,
+                feedback_positive_weight_after_last_negative: 0,
+                feedback_last_negative_ms: None,
+                feedback_last_positive_ms: None,
+                feedback_last_reconfirming_evidence_ms: None,
+                feedback_score_cap: None,
+                feedback_reason_codes: Vec::new(),
                 eligible_for_primary_selection: true,
                 selection_demotion_reason: None,
                 resume_work_target: None,
@@ -30951,6 +35005,14 @@ mod tests {
                 warnings: Vec::new(),
                 risk_flags: Vec::new(),
                 score_caps_applied: Vec::new(),
+                feedback_suppression_state: "none".to_string(),
+                feedback_negative_weight: 0,
+                feedback_positive_weight_after_last_negative: 0,
+                feedback_last_negative_ms: None,
+                feedback_last_positive_ms: None,
+                feedback_last_reconfirming_evidence_ms: None,
+                feedback_score_cap: None,
+                feedback_reason_codes: Vec::new(),
                 eligible_for_primary_selection: true,
                 selection_demotion_reason: None,
                 resume_work_target: None,
@@ -31658,6 +35720,220 @@ mod tests {
     }
 
     #[test]
+    fn micro_pack_excludes_hard_suppressed_candidate_and_records_feedback_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let mut suppressed = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-rejected", "code_editor", "old.rs")),
+            None,
+            None,
+        );
+        suppressed.id = "continue-candidate-rejected".to_string();
+        suppressed.score = 0.95;
+        suppressed.feedback_suppression_state = "hard_suppressed".to_string();
+        suppressed.feedback_negative_weight = 3;
+        suppressed.feedback_reason_codes =
+            vec!["feedback:explicit_rejected_after_last_positive".to_string()];
+        suppressed.eligible_for_primary_selection = false;
+        suppressed.risk_flags = vec!["feedback_hard_suppressed".to_string()];
+
+        let mut eligible = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-current", "code_editor", "main.rs")),
+            None,
+            None,
+        );
+        eligible.id = "continue-candidate-current".to_string();
+        eligible.score = 0.62;
+
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            current_time_millis(),
+            &[],
+            &[suppressed.clone(), eligible.clone()],
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(pack.model_candidate_count_before_feedback_filter, 2);
+        assert_eq!(pack.model_candidate_count_after_feedback_filter, 1);
+        assert_eq!(
+            pack.suppressed_candidate_ids_not_sent,
+            vec!["continue-candidate-rejected".to_string()]
+        );
+        assert_eq!(pack.candidates.len(), 1);
+        assert_eq!(pack.candidates[0].id, "continue-candidate-current");
+        assert_eq!(pack.candidates[0].feedback_state, "none");
+    }
+
+    #[test]
+    fn model_selected_feedback_suppressed_candidate_is_hard_rejected() {
+        let mut candidate = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-rejected", "code_editor", "old.rs")),
+            None,
+            None,
+        );
+        candidate.id = "continue-candidate-rejected".to_string();
+        candidate.score = 0.82;
+        candidate.feedback_suppression_state = "hard_suppressed".to_string();
+        candidate.feedback_negative_weight = 3;
+        candidate.feedback_reason_codes =
+            vec!["feedback:explicit_rejected_after_last_positive".to_string()];
+        candidate.eligible_for_primary_selection = false;
+        candidate.risk_flags = vec!["feedback_hard_suppressed".to_string()];
+        let pack = micro_pack_for_candidate(&candidate);
+        let output = selected_candidate_model_output(&candidate);
+
+        let failures = validate_micro_inference_output(&output, &[candidate.clone()], &pack)
+            .expect_err("hard-suppressed candidate must be rejected");
+        let classification =
+            classify_micro_inference_validation_failures(&output, &[candidate], &pack, &failures);
+
+        assert!(failures.contains(&"model_selected_feedback_suppressed_candidate".to_string()));
+        assert!(failures.contains(&"model_selected_candidate_not_primary_eligible".to_string()));
+        assert!(!classification.recoverable);
+        assert!(classification
+            .hard_failures
+            .contains(&"model_selected_feedback_suppressed_candidate".to_string()));
+    }
+
+    #[test]
+    fn high_confidence_for_feedback_score_capped_candidate_is_soft_recovered() {
+        let mut candidate = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-soft", "code_editor", "soft.rs")),
+            None,
+            None,
+        );
+        candidate.id = "continue-candidate-soft".to_string();
+        candidate.score = 0.58;
+        candidate.feedback_suppression_state = "score_capped".to_string();
+        candidate.feedback_negative_weight = 1;
+        candidate.feedback_score_cap = Some(0.58);
+        candidate.feedback_reason_codes = vec!["feedback:single_ignored".to_string()];
+        let pack = micro_pack_for_candidate(&candidate);
+        let mut output = selected_candidate_model_output(&candidate);
+        output.confidence = "high".to_string();
+
+        let failures = validate_micro_inference_output(&output, &[candidate.clone()], &pack)
+            .expect_err("high confidence on score-capped feedback candidate should fail");
+        let classification = classify_micro_inference_validation_failures(
+            &output,
+            &[candidate.clone()],
+            &pack,
+            &failures,
+        );
+
+        assert!(failures
+            .contains(&"model_high_confidence_for_feedback_score_capped_candidate".to_string()));
+        assert!(classification.recoverable);
+        assert!(classification
+            .soft_failures
+            .contains(&"model_high_confidence_for_feedback_score_capped_candidate".to_string()));
+        let gate = quality_gate_for_test(&candidate, None);
+        let recovered_confidence = confidence_for_soft_recovered_micro_inference(
+            &output.confidence,
+            &candidate,
+            &gate,
+            &classification.soft_failures,
+        );
+        assert!(recovered_confidence <= 0.58);
+    }
+
+    #[test]
+    fn local_fallback_uses_feedback_eligible_candidate_not_suppressed_top() {
+        let mut suppressed = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-rejected", "code_editor", "old.rs")),
+            None,
+            None,
+        );
+        suppressed.id = "continue-candidate-rejected".to_string();
+        suppressed.score = 0.92;
+        suppressed.feedback_suppression_state = "hard_suppressed".to_string();
+        suppressed.feedback_negative_weight = 3;
+        suppressed.eligible_for_primary_selection = false;
+        suppressed.risk_flags = vec!["feedback_hard_suppressed".to_string()];
+
+        let mut eligible = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-eligible", "code_editor", "main.rs")),
+            None,
+            None,
+        );
+        eligible.id = "continue-candidate-eligible".to_string();
+        eligible.score = 0.76;
+
+        let fallback = select_safer_local_fallback_candidate(
+            &[suppressed.clone(), eligible.clone()],
+            Some(&suppressed),
+            None,
+        )
+        .expect("eligible fallback candidate");
+
+        assert_eq!(fallback.id, "continue-candidate-eligible");
+    }
+
+    #[test]
+    fn all_feedback_suppressed_candidates_produce_empty_model_pack_and_no_local_selection() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let mut first = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-first", "code_editor", "first.rs")),
+            None,
+            None,
+        );
+        first.id = "continue-candidate-first".to_string();
+        first.feedback_suppression_state = "hard_suppressed".to_string();
+        first.feedback_negative_weight = 3;
+        first.eligible_for_primary_selection = false;
+        first.risk_flags = vec!["feedback_hard_suppressed".to_string()];
+
+        let mut second = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-second", "code_editor", "second.rs")),
+            None,
+            None,
+        );
+        second.id = "continue-candidate-second".to_string();
+        second.feedback_suppression_state = "hard_suppressed".to_string();
+        second.feedback_negative_weight = 3;
+        second.eligible_for_primary_selection = false;
+        second.risk_flags = vec!["feedback_hard_suppressed".to_string()];
+
+        let candidates = vec![first, second];
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            current_time_millis(),
+            &[],
+            &candidates,
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+        let selected = select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default(),
+        );
+
+        assert!(pack.candidates.is_empty());
+        assert_eq!(pack.model_candidate_count_before_feedback_filter, 2);
+        assert_eq!(pack.model_candidate_count_after_feedback_filter, 0);
+        assert_eq!(pack.suppressed_candidate_ids_not_sent.len(), 2);
+        assert!(selected.is_none());
+    }
+
+    #[test]
     fn soft_micro_inference_validation_preserves_valid_candidate_choice() {
         let target = test_artifact("artifact-smalltalk", "code_editor", "smalltalk");
         let action = test_action(&target.id, "encountering_error");
@@ -31784,6 +36060,10 @@ mod tests {
         let pack = ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            model_candidate_count_before_feedback_filter: 1,
+            model_candidate_count_after_feedback_filter: 0,
+            suppressed_candidate_ids_not_sent: vec![candidate.id.clone()],
             current_focus: None,
             active_current_work_unresolved: None,
             current_surface: None,
@@ -31876,6 +36156,10 @@ mod tests {
         let pack = ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            model_candidate_count_before_feedback_filter: 1,
+            model_candidate_count_after_feedback_filter: 1,
+            suppressed_candidate_ids_not_sent: Vec::new(),
             current_focus: None,
             active_current_work_unresolved: None,
             current_surface: None,
@@ -31927,6 +36211,16 @@ mod tests {
                 why_not_primary: candidate.why_not_primary.clone(),
                 memory_supporting_cell_ids: candidate.supporting_memory_ids.clone(),
                 memory_contradicting_cell_ids: candidate.contradicting_memory_ids.clone(),
+                feedback_state: candidate_feedback_state_for_model(&candidate),
+                feedback_suppression_state: candidate.feedback_suppression_state.clone(),
+                feedback_negative_weight: candidate.feedback_negative_weight,
+                feedback_reconfirmed_after_negative: candidate_feedback_reconfirmed_after_negative(
+                    &candidate,
+                ),
+                feedback_last_negative_ms: candidate.feedback_last_negative_ms,
+                feedback_last_reconfirming_evidence_ms: candidate
+                    .feedback_last_reconfirming_evidence_ms,
+                feedback_reason_codes: candidate.feedback_reason_codes.clone(),
                 local_reason: candidate.reason.clone(),
             }],
             evidence_packs_v2: vec![build_candidate_evidence_pack_v2(&candidate, None, None)],
@@ -31984,6 +36278,10 @@ mod tests {
         let pack = ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            model_candidate_count_before_feedback_filter: 0,
+            model_candidate_count_after_feedback_filter: 0,
+            suppressed_candidate_ids_not_sent: Vec::new(),
             current_focus: None,
             active_current_work_unresolved: None,
             current_surface: None,
@@ -32024,6 +36322,10 @@ mod tests {
         let pack = ContinueMicroInferencePack {
             schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
             instructions: "test".to_string(),
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            model_candidate_count_before_feedback_filter: 0,
+            model_candidate_count_after_feedback_filter: 0,
+            suppressed_candidate_ids_not_sent: Vec::new(),
             current_focus: None,
             active_current_work_unresolved: None,
             current_surface: None,
@@ -36274,16 +40576,22 @@ mod tests {
         let report = run_continue_eval(None).unwrap();
 
         assert_eq!(report.schema, "smalltalk.continue_eval.v1");
-        assert_eq!(report.case_count, 30);
-        assert_eq!(report.target_artifact_correct, 30);
+        assert_eq!(report.case_count, 37);
+        assert_eq!(report.target_artifact_correct, 37);
         assert_eq!(report.recall_at_k, 1.0);
         assert_eq!(report.mrr, 1.0);
         assert_eq!(report.hallucinated_artifact_count, 1);
-        assert_eq!(report.model_validation_fallback_rate, 0.03);
+        assert_eq!(report.model_validation_fallback_rate, 0.05);
         assert_eq!(report.fresh_surface_retention_rate, 1.0);
         assert_eq!(report.stale_target_suppression_rate, 1.0);
         assert_eq!(report.support_branch_false_promotion_rate, 0.0);
         assert_eq!(report.truthful_thin_mode_rate, 1.0);
+        assert_eq!(report.feedback_obedience_case_count, 7);
+        assert_eq!(report.feedback_suppressed_target_exposed_count, 0);
+        assert_eq!(report.feedback_suppressed_target_exposed_rate, 0.0);
+        assert_eq!(report.corrected_artifact_preferred_count, 1);
+        assert_eq!(report.feedback_cache_stale_hit_count, 0);
+        assert_eq!(report.model_feedback_validation_failure_count, 1);
         assert_eq!(report.feedback_obedience_placeholder_rate, 1.0);
         assert_eq!(report.suppressed_target_open_attempt_count, 0);
         assert!(report.last_state_specificity > 0.0);
@@ -36342,6 +40650,15 @@ mod tests {
                     recommended_local_capture: None,
                 }),
                 expected_feedback_obedience_placeholder: None,
+                negative_feedback: Vec::new(),
+                expected_suppressed_artifact_ids: Vec::new(),
+                expected_not_return_target_artifact_ids: Vec::new(),
+                expected_feedback_return_target_artifact_id: None,
+                expected_validation_status: None,
+                corrected_artifact_id: None,
+                cached_decision_target_artifact_id: None,
+                cache_feedback_newer_than_cached_decision: None,
+                model_feedback_validation_failure_expected: None,
             }],
         };
 
@@ -36390,6 +40707,15 @@ mod tests {
                     recommended_local_capture: None,
                 }),
                 expected_feedback_obedience_placeholder: None,
+                negative_feedback: Vec::new(),
+                expected_suppressed_artifact_ids: Vec::new(),
+                expected_not_return_target_artifact_ids: Vec::new(),
+                expected_feedback_return_target_artifact_id: None,
+                expected_validation_status: None,
+                corrected_artifact_id: None,
+                cached_decision_target_artifact_id: None,
+                cache_feedback_newer_than_cached_decision: None,
+                model_feedback_validation_failure_expected: None,
             }],
         };
 
