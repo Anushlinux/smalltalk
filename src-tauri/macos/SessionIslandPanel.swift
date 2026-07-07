@@ -14,6 +14,9 @@ private struct IslandSnapshot: Decodable {
     var trailMomentCount: Int64?
     var trailLabels: [String]?
     var lastFrameId: Int64?
+    var currentApp: String?
+    var currentWindow: String?
+    var currentSurfaceKind: String?
     var lastTrigger: String?
     var lastCaptureAtMs: Int64?
     var capturePulseNonce: UInt64?
@@ -24,7 +27,10 @@ private struct IslandSnapshot: Decodable {
     var resumeSource: String?
     var resumeModel: String?
     var resumeResponseId: String?
+    var continueDecisionId: String?
     var resumeWarning: String?
+    var privacyLabel: String?
+    var isSensitive: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -34,6 +40,9 @@ private struct IslandSnapshot: Decodable {
         case trailMomentCount = "trail_moment_count"
         case trailLabels = "trail_labels"
         case lastFrameId = "last_frame_id"
+        case currentApp = "current_app"
+        case currentWindow = "current_window"
+        case currentSurfaceKind = "current_surface_kind"
         case lastTrigger = "last_trigger"
         case lastCaptureAtMs = "last_capture_at_ms"
         case capturePulseNonce = "capture_pulse_nonce"
@@ -44,7 +53,10 @@ private struct IslandSnapshot: Decodable {
         case resumeSource = "resume_source"
         case resumeModel = "resume_model"
         case resumeResponseId = "resume_response_id"
+        case continueDecisionId = "continue_decision_id"
         case resumeWarning = "resume_warning"
+        case privacyLabel = "privacy_label"
+        case isSensitive = "is_sensitive"
     }
 }
 
@@ -175,13 +187,14 @@ private final class AnimationTick: ObservableObject {
 }
 
 @available(macOS 13.0, *)
-private struct EvidenceTapeView: View {
+private struct MemorySignalView: View {
     let active: Bool
     let processing: Bool
     let error: Bool
-    let frameCount: Int64
+    let privateMode: Bool
+    let thinEvidence: Bool
+    let ready: Bool
     let pulseNonce: UInt64?
-    let density: Double
     let scale: CGFloat
     let width: CGFloat
     let height: CGFloat
@@ -195,12 +208,12 @@ private struct EvidenceTapeView: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius * scale, style: .continuous)
         let pulseAge = pulseStartedAt.map { max(0, anim.value - $0) } ?? 999
-        let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.46)
+        let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.62)
         let pulseStrength = max(0, 1 - pulseProgress)
-        let heat = active ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
+        let breath = active && !reduceMotion ? 0.5 + 0.5 * sin(anim.value * 1.85) : 0.0
 
         Canvas { context, size in
-            drawTape(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
+            drawSignal(context: &context, size: size, pulseStrength: pulseStrength, breath: breath)
         }
         .frame(width: width * scale, height: height * scale)
         .background(
@@ -208,7 +221,8 @@ private struct EvidenceTapeView: View {
                 LinearGradient(
                     colors: [
                         Color(red: 0.018, green: 0.020, blue: 0.024).opacity(0.96),
-                        Color(red: 0.045, green: 0.048, blue: 0.056).opacity(0.94),
+                        signalColor.opacity(active || ready ? 0.16 : 0.04),
+                        Color(red: 0.042, green: 0.047, blue: 0.052).opacity(0.95),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -217,32 +231,23 @@ private struct EvidenceTapeView: View {
         )
         .overlay(
             shape.stroke(
-                error
-                    ? Color(red: 1.0, green: 0.62, blue: 0.24).opacity(0.40)
-                    : active
-                        ? Color(red: 1.0, green: 0.28, blue: 0.22).opacity(0.18 + 0.08 * heat)
-                        : Color.white.opacity(0.10),
+                signalColor.opacity(active || processing || error || thinEvidence || ready || privateMode ? 0.34 + 0.12 * breath : 0.12),
                 lineWidth: 0.7
             )
         )
         .overlay(alignment: .top) {
             shape
-                .stroke(Color.white.opacity(active ? 0.08 : 0.055), lineWidth: 1)
+                .stroke(Color.white.opacity(active || ready ? 0.11 : 0.055), lineWidth: 1)
                 .blur(radius: 0.25)
                 .offset(y: -0.5 * scale)
         }
         .overlay(
             shape.fill(
-                Color(red: 1, green: 0.22, blue: 0.16)
-                    .opacity(pulseStrength * (compact ? 0.13 : 0.11))
+                signalColor.opacity(pulseStrength * (compact ? 0.16 : 0.12))
             )
         )
         .shadow(
-            color: error
-                ? Color(red: 1.0, green: 0.56, blue: 0.18).opacity(0.14)
-                : active
-                    ? Color(red: 1.0, green: 0.18, blue: 0.14).opacity(0.10 + 0.06 * heat)
-                    : Color.clear,
+            color: signalColor.opacity(active || ready || pulseStrength > 0 ? 0.12 + 0.08 * breath : 0),
             radius: 9 * scale,
             x: 0,
             y: 0
@@ -263,64 +268,69 @@ private struct EvidenceTapeView: View {
         .animation(IslandMotion.settle(reduceMotion), value: active)
         .animation(IslandMotion.settle(reduceMotion), value: processing)
         .animation(IslandMotion.settle(reduceMotion), value: error)
+        .animation(IslandMotion.settle(reduceMotion), value: privateMode)
+        .animation(IslandMotion.settle(reduceMotion), value: thinEvidence)
+        .animation(IslandMotion.settle(reduceMotion), value: ready)
     }
 
-    private func drawTape(
+    private var signalColor: Color {
+        if error {
+            return Color(red: 1.0, green: 0.36, blue: 0.28)
+        }
+        if thinEvidence || processing {
+            return Color(red: 1.0, green: 0.68, blue: 0.28)
+        }
+        if privateMode {
+            return Color.white.opacity(0.62)
+        }
+        if active || ready {
+            return Color(red: 0.36, green: 0.84, blue: 0.68)
+        }
+        return Color.white.opacity(0.42)
+    }
+
+    private func drawSignal(
         context: inout GraphicsContext,
         size: CGSize,
         pulseStrength: Double,
-        heat: Double
+        breath: Double
     ) {
         let tick = anim.value
-        let tapeRect = CGRect(origin: .zero, size: size)
-
-        context.fill(Path(tapeRect), with: .color(.black.opacity(0.18)))
-
-        let phase = scanPhase(tick)
-        let scanX = round(phase * size.width)
-        let red = Color(red: 1.0, green: 0.22, blue: 0.16)
-        let amber = Color(red: 1.0, green: 0.62, blue: 0.24)
-
-        let rows = max(3, Int(round(density)))
-        for index in 1..<rows {
-            let offset = index % 2 == 0 ? 0.18 : -0.08
-            let y = round((Double(index) + offset) * size.height / Double(rows))
-            context.fill(
-                Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                with: .color(.white.opacity(active ? 0.040 : 0.028))
-            )
+        let baseY = size.height * 0.55
+        let amp = max(1.5 * scale, size.height * (active ? 0.18 + 0.06 * breath : 0.08))
+        let steps = 24
+        var path = Path()
+        for index in 0...steps {
+            let x = size.width * CGFloat(index) / CGFloat(steps)
+            let phase = Double(index) / Double(steps)
+            let wave = sin((phase * 2.0 + tick * (active && !reduceMotion ? 0.18 : 0.03)) * .pi * 2.0)
+            let taper = sin(phase * .pi)
+            let y = baseY - CGFloat(wave) * amp * CGFloat(taper)
+            if index == 0 {
+                path.move(to: CGPoint(x: x, y: y))
+            } else {
+                path.addLine(to: CGPoint(x: x, y: y))
+            }
         }
+        context.stroke(path, with: .color(signalColor.opacity(active || ready ? 0.74 : 0.36)), lineWidth: max(1.2, 1.4 * scale))
 
-        let columns = max(4, Int(round(density + 2)))
-        for index in 1..<columns {
-            let skew = (index % 3 == 0 ? 0.30 : index % 2 == 0 ? -0.16 : 0.06)
-            let x = round((Double(index) + skew) * size.width / Double(columns))
-            context.fill(
-                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
-                with: .color(.white.opacity(active ? 0.028 : 0.017))
-            )
-        }
+        let dotRadius = max(2.2 * scale, min(size.height, 6 * scale))
+        let dotX = ready ? size.width * 0.84 : size.width * (active ? 0.18 + 0.06 * CGFloat(breath) : 0.16)
+        let dotRect = CGRect(
+            x: dotX - dotRadius / 2,
+            y: baseY - dotRadius / 2,
+            width: dotRadius,
+            height: dotRadius
+        )
+        context.fill(Path(ellipseIn: dotRect), with: .color(signalColor.opacity(active || ready ? 0.92 : 0.58)))
 
-        if active || pulseStrength > 0 {
-            let filledWidth = max(0, min(size.width, scanX))
-            context.fill(
-                Path(CGRect(x: 0, y: 0, width: filledWidth, height: size.height)),
-                with: .color(red.opacity(active ? 0.035 + 0.025 * heat : 0.018 * pulseStrength))
-            )
-        }
-
-        drawFrameTicks(context: &context, size: size, red: red, pulseStrength: pulseStrength)
-
-        if active || pulseStrength > 0 || processing {
-            let width = processing ? max(2, 2 * scale) : max(1, 1.2 * scale)
-            context.fill(
-                Path(CGRect(x: scanX, y: 1 * scale, width: width, height: max(1, size.height - 2 * scale))),
-                with: .color((processing ? Color.white : red).opacity(processing ? 0.30 : 0.48 + 0.20 * heat))
-            )
+        if ready {
+            let ringRect = dotRect.insetBy(dx: -3.5 * scale, dy: -3.5 * scale)
+            context.stroke(Path(ellipseIn: ringRect), with: .color(signalColor.opacity(0.28 + 0.12 * breath)), lineWidth: max(1, 1 * scale))
         }
 
         if pulseStrength > 0 {
-            let bloomX = max(0, min(size.width - 2 * scale, scanX - 1 * scale))
+            let bloomX = size.width * 0.56
             let bloomRect = CGRect(
                 x: max(0, bloomX - size.width * 0.22),
                 y: 0,
@@ -331,7 +341,7 @@ private struct EvidenceTapeView: View {
                 Gradient(stops: [
                     .init(color: .white.opacity(0), location: 0.0),
                     .init(color: .white.opacity(0.24 * pulseStrength), location: 0.42),
-                    .init(color: red.opacity(0.24 * pulseStrength), location: 0.58),
+                    .init(color: signalColor.opacity(0.32 * pulseStrength), location: 0.58),
                     .init(color: .white.opacity(0), location: 1.0),
                 ]),
                 startPoint: CGPoint(x: bloomRect.minX, y: bloomRect.midY),
@@ -360,60 +370,17 @@ private struct EvidenceTapeView: View {
             context.fill(Path(shimmerRect), with: shimmer)
         }
 
-        if error {
+        if error || privateMode {
             let y = round(size.height * 0.63)
             context.fill(
                 Path(CGRect(x: size.width * 0.12, y: y, width: size.width * 0.76, height: max(1, 1 * scale))),
-                with: .color(amber.opacity(0.50))
+                with: .color(signalColor.opacity(0.50))
             )
             context.fill(
                 Path(CGRect(x: size.width * 0.58, y: max(0, y - 3 * scale), width: max(1, 1 * scale), height: min(size.height, 6 * scale))),
-                with: .color(amber.opacity(0.72))
+                with: .color(signalColor.opacity(0.72))
             )
         }
-    }
-
-    private func drawFrameTicks(
-        context: inout GraphicsContext,
-        size: CGSize,
-        red: Color,
-        pulseStrength: Double
-    ) {
-        let count = max(0, frameCount)
-        guard count > 0 else { return }
-        let tickCount = Int(min(count, compact ? 9 : 18))
-        let first = count - Int64(tickCount) + 1
-
-        for offset in 0..<tickCount {
-            let frameOrdinal = first + Int64(offset)
-            let fraction = tickFraction(frameOrdinal)
-            let tickHeight = size.height * (0.34 + 0.10 * Double((frameOrdinal % 3 + 3) % 3))
-            let x = round(max(1, min(size.width - 2, fraction * size.width)))
-            let y = round((size.height - tickHeight) / 2.0)
-            let isNewest = offset == tickCount - 1
-            let alpha = isNewest ? 0.55 + 0.32 * pulseStrength : 0.20 + 0.07 * Double(offset % 3)
-            let color = isNewest && (active || pulseStrength > 0) ? red.opacity(alpha) : Color.white.opacity(alpha)
-            context.fill(
-                Path(CGRect(x: x, y: y, width: max(1, 1 * scale), height: tickHeight)),
-                with: .color(color)
-            )
-        }
-    }
-
-    private func scanPhase(_ tick: Double) -> Double {
-        if processing {
-            return 0.78
-        }
-        if reduceMotion {
-            return active ? 0.62 : 0.38
-        }
-        let speed = active ? 0.18 : 0.030
-        return fmod(tick * speed + (active ? 0.12 : 0.04), 1.0)
-    }
-
-    private func tickFraction(_ value: Int64) -> Double {
-        let raw = fmod(Double(value) * 0.61803398875 + Double((value % 7 + 7) % 7) * 0.031, 1.0)
-        return 0.08 + raw * 0.84
     }
 }
 
@@ -435,6 +402,18 @@ private enum IslandPresentation: Equatable {
     case expanded
 }
 
+private enum IslandProductState: Equatable {
+    case memoryOff
+    case memoryStarting
+    case memoryOn
+    case continueUpdating
+    case continueReady
+    case thinEvidence
+    case pausedWithEvidence
+    case privateOrExcluded
+    case needsAttention
+}
+
 @available(macOS 13.0, *)
 private struct SessionIslandView: View {
     let snapshot: IslandSnapshot
@@ -448,12 +427,46 @@ private struct SessionIslandView: View {
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
-    private var captureActive: Bool {
-        metrics.meetingActive
+    private var productState: IslandProductState {
+        if hasError {
+            return .needsAttention
+        }
+        if isPrivateOrExcluded {
+            return .privateOrExcluded
+        }
+        switch snapshot.state {
+        case "starting":
+            return .memoryStarting
+        case "recording_compact", "recording_expanded":
+            return .memoryOn
+        case "processing":
+            return .memoryOn
+        case "trail_reconstructing":
+            return .continueUpdating
+        case "resume_ready":
+            return resumeReadyIsThin ? .thinEvidence : .continueReady
+        default:
+            return hasMoments ? .pausedWithEvidence : .memoryOff
+        }
     }
 
-    private var isRecording: Bool {
-        snapshot.state == "recording_compact" || snapshot.state == "recording_expanded"
+    private var captureActive: Bool {
+        productState == .memoryStarting ||
+            productState == .memoryOn ||
+            productState == .continueUpdating ||
+            productState == .continueReady
+    }
+
+    private var signalReady: Bool {
+        productState == .continueReady
+    }
+
+    private var signalThin: Bool {
+        productState == .thinEvidence
+    }
+
+    private var signalPrivate: Bool {
+        productState == .privateOrExcluded
     }
 
     private var isBusy: Bool {
@@ -461,113 +474,158 @@ private struct SessionIslandView: View {
     }
 
     private var isProcessing: Bool {
-        snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
+        snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
     }
 
     private var hasError: Bool {
         snapshot.lastError != nil || snapshot.state == "error"
     }
 
+    private var isPrivateOrExcluded: Bool {
+        snapshot.isSensitive || isPrivatePrivacyLabel(snapshot.privacyLabel)
+    }
+
     private var primaryDisplayText: String {
-        if hasError {
+        switch productState {
+        case .needsAttention:
             return "Needs attention"
-        }
-        switch snapshot.state {
-        case "starting":
+        case .privateOrExcluded:
+            return "Not observing this app"
+        case .memoryStarting:
             return "Starting memory"
-        case "recording_compact", "recording_expanded":
-            return "Following work"
-        case "processing":
-            return "Saving memory"
-        case "stopped_toast":
-            return "Continue"
-        case "trail_reconstructing":
+        case .memoryOn:
+            return snapshot.state == "processing" ? "Pausing memory" : "Memory on"
+        case .continueUpdating:
             return "Finding continuation"
-        case "resume_ready":
+        case .continueReady:
             return resumeReadyTitle
-        default:
-            return hasMoments ? "Continue" : "Ready to follow"
+        case .thinEvidence:
+            return "Evidence is thin"
+        case .pausedWithEvidence:
+            return "Continue ready"
+        case .memoryOff:
+            return "Memory off"
         }
     }
 
     private var secondaryDisplayText: String {
-        if hasError {
-            return "Capture needs attention"
-        }
-        switch snapshot.state {
-        case "recording_compact", "recording_expanded":
-            return trailSummary
-        case "starting":
-            return "Start local memory"
-        case "processing":
-            return trailSummary
-        case "trail_reconstructing":
-            return "Checking local evidence"
-        case "resume_ready":
+        switch productState {
+        case .needsAttention:
+            return productizedErrorLine
+        case .privateOrExcluded:
+            return "Privacy boundary active"
+        case .memoryStarting:
+            return "Preparing local memory"
+        case .memoryOn:
+            return snapshot.state == "processing" ? "Keeping the last answer available" : "Maintaining context quietly"
+        case .continueUpdating:
+            return "Looking for your return point"
+        case .continueReady, .thinEvidence:
             return resumePointLine
-        default:
-            return hasMoments ? "Ready to continue" : "Start local memory"
+        case .pausedWithEvidence:
+            return "Ask Continue from stored evidence"
+        case .memoryOff:
+            return "Turn on local memory"
         }
     }
 
     private var primaryActionLabel: String {
-        if snapshot.state == "starting" {
+        switch productState {
+        case .memoryOff:
+            return "Turn on memory"
+        case .memoryStarting:
             return "Starting"
-        }
-        if snapshot.state == "processing" || snapshot.state == "trail_reconstructing" {
-            return snapshot.state == "trail_reconstructing" ? "Finding" : "Saving"
-        }
-        if snapshot.state == "resume_ready" {
+        case .memoryOn:
+            return snapshot.state == "processing" ? "Pausing" : "Find continuation"
+        case .continueUpdating:
+            return "Finding"
+        case .continueReady:
             return "Continue here"
-        }
-        if isRecording {
-            return "Mark memory"
-        }
-        if hasMoments {
+        case .thinEvidence:
+            return "Why this?"
+        case .pausedWithEvidence:
             return "Continue"
+        case .privateOrExcluded:
+            return "Privacy"
+        case .needsAttention:
+            return "Fix in Smalltalk"
         }
-        return "Start memory"
+    }
+
+    private var compactActionLabel: String {
+        switch productState {
+        case .continueReady:
+            return "Open"
+        case .thinEvidence:
+            return "Why"
+        case .memoryOff:
+            return "On"
+        case .memoryStarting:
+            return "..."
+        case .memoryOn, .pausedWithEvidence:
+            return "Ask"
+        case .continueUpdating:
+            return "..."
+        case .privateOrExcluded:
+            return "Privacy"
+        case .needsAttention:
+            return "Fix"
+        }
     }
 
     private var secondaryActionLabel: String {
-        if snapshot.state == "resume_ready" {
-            return "Open app"
+        switch productState {
+        case .memoryOn:
+            return snapshot.state == "processing" ? "Open Smalltalk" : "Pause memory"
+        case .continueReady:
+            return "Why this?"
+        case .thinEvidence:
+            return "Open Smalltalk"
+        case .pausedWithEvidence, .memoryOff, .privateOrExcluded, .needsAttention:
+            return "Open Smalltalk"
+        case .memoryStarting, .continueUpdating:
+            return "Open Smalltalk"
         }
-        if isRecording {
-            return "Pause"
-        }
-        return "Open app"
     }
 
     private var primaryActionDisabled: Bool {
-        isBusy || (hasError && !isRecording)
+        productState == .memoryStarting ||
+            productState == .continueUpdating ||
+            (productState == .memoryOn && snapshot.state == "processing")
     }
 
     private var secondaryActionDisabled: Bool {
-        isBusy || (!hasMoments && !isRecording && snapshot.state != "resume_ready")
+        productState == .memoryStarting || productState == .continueUpdating
     }
 
     private var primaryButtonAction: String {
-        if snapshot.state == "resume_ready" {
-            return "open_resume_point"
-        }
-        if isRecording {
-            return "capture_once"
-        }
-        if hasMoments {
+        switch productState {
+        case .memoryOff:
+            return "start_memory"
+        case .memoryOn, .pausedWithEvidence:
             return "continue"
+        case .continueReady:
+            return "open_resume_point"
+        case .thinEvidence:
+            return "show_trail"
+        case .privateOrExcluded, .needsAttention:
+            return "open_main_window"
+        case .memoryStarting, .continueUpdating:
+            return "open_main_window"
         }
-        return "toggle_meeting"
     }
 
     private var secondaryButtonAction: String {
-        if snapshot.state == "resume_ready" {
+        switch productState {
+        case .memoryOn:
+            return snapshot.state == "processing" ? "open_main_window" : "pause_memory"
+        case .continueReady:
             return "show_trail"
+        case .thinEvidence:
+            return "open_main_window"
+        default:
+            return "open_main_window"
         }
-        if isRecording {
-            return "toggle_meeting"
-        }
-        return "show_trail"
     }
 
     private var hasMoments: Bool {
@@ -582,16 +640,6 @@ private struct SessionIslandView: View {
         max(0, snapshot.trailAppCount ?? Int64(snapshot.trailLabels?.count ?? 0))
     }
 
-    private var trailSummary: String {
-        if trailAppCount > 0 && trailMomentCount > 0 {
-            return "\(trailAppCount) \(trailAppCount == 1 ? "app" : "apps") · \(momentLabel)"
-        }
-        if trailMomentCount > 0 {
-            return momentLabel
-        }
-        return "Building local memory"
-    }
-
     private var momentLabel: String {
         "\(trailMomentCount) \(trailMomentCount == 1 ? "signal" : "signals")"
     }
@@ -604,21 +652,25 @@ private struct SessionIslandView: View {
 
     private var resumeReadyTitle: String {
         if trimmed(snapshot.resumeSource) == "continue" {
-            let warning = trimmed(snapshot.resumeWarning).lowercased()
-            if warning.contains("thin") || warning.contains("missing") || warning.contains("no_") {
+            if resumeReadyIsThin {
                 return "Evidence is thin"
             }
             let headline = trimmed(snapshot.resumeHeadline)
-            return headline.isEmpty ? "Ready to continue" : headline
+            return headline.isEmpty ? "Continue ready" : headline
         }
         if trimmed(snapshot.resumeSource) == "cloud" {
-            return "OpenAI answered"
+            return "Continue ready"
         }
         let warning = trimmed(snapshot.resumeWarning).lowercased()
         if warning.contains("openai_api_key") || warning.contains("key") {
             return "OpenAI key missing"
         }
         return "OpenAI unavailable"
+    }
+
+    private var resumeReadyIsThin: Bool {
+        let warning = trimmed(snapshot.resumeWarning).lowercased()
+        return warning.contains("thin") || warning.contains("missing") || warning.contains("no_")
     }
 
     private var resumeDetailLine: String {
@@ -633,22 +685,41 @@ private struct SessionIslandView: View {
     private var resumeProvenanceLine: String {
         if trimmed(snapshot.resumeSource) == "continue" {
             let warning = trimmed(snapshot.resumeWarning)
-            return warning.isEmpty ? "Local Continue" : warning
+            return warning.isEmpty ? "Evidence-backed Continue" : productizedWarningLine(warning)
         }
         if trimmed(snapshot.resumeSource) == "cloud" {
             let model = trimmed(snapshot.resumeModel)
-            let response = trimmed(snapshot.resumeResponseId)
-            if !model.isEmpty && !response.isEmpty {
-                return "\(model) · \(response)"
-            }
-            return model.isEmpty ? "Cloud resume" : model
+            return model.isEmpty ? "AI-assisted Continue" : model
         }
         let warning = trimmed(snapshot.resumeWarning)
-        return warning.isEmpty ? "Local evidence" : warning
+        return warning.isEmpty ? "Local evidence" : productizedWarningLine(warning)
+    }
+
+    private var productizedErrorLine: String {
+        let error = trimmed(snapshot.lastError)
+        if error.isEmpty {
+            return "Open Smalltalk to fix local memory"
+        }
+        return error.replacingOccurrences(of: "Capture", with: "Memory")
+            .replacingOccurrences(of: "capture", with: "memory")
+    }
+
+    private func productizedWarningLine(_ value: String) -> String {
+        let warning = value.lowercased()
+        if warning.contains("thin") || warning.contains("missing") || warning.contains("no_") {
+            return "Evidence is thin"
+        }
+        return value.replacingOccurrences(of: "_", with: " ")
     }
 
     private func trimmed(_ value: String?) -> String {
         value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func isPrivatePrivacyLabel(_ value: String?) -> Bool {
+        let label = trimmed(value).lowercased()
+        guard !label.isEmpty else { return false }
+        return !["normal", "ok", "allowed"].contains(label)
     }
 
     private var displayTrailLabels: [String] {
@@ -660,7 +731,22 @@ private struct SessionIslandView: View {
 
     private var activeBreath: Double {
         guard captureActive && !reduceMotion else { return 0 }
-        return 0.5 + 0.5 * sin(anim.value * 3.8)
+        return 0.5 + 0.5 * sin(anim.value * 1.85)
+    }
+
+    private var signalColor: Color {
+        switch productState {
+        case .needsAttention:
+            return Color(red: 1.0, green: 0.36, blue: 0.28)
+        case .thinEvidence, .continueUpdating:
+            return Color(red: 1.0, green: 0.68, blue: 0.28)
+        case .privateOrExcluded:
+            return Color.white.opacity(0.64)
+        case .memoryOn, .memoryStarting, .continueReady:
+            return Color(red: 0.36, green: 0.84, blue: 0.68)
+        case .pausedWithEvidence, .memoryOff:
+            return Color.white.opacity(0.42)
+        }
     }
 
     var body: some View {
@@ -679,7 +765,7 @@ private struct SessionIslandView: View {
         }
         .fixedSize()
         .background(Color.clear)
-        .accessibilityHidden(true)
+        .accessibilityLabel(accessibilityLabel)
         .animation(IslandMotion.reveal(reduceMotion), value: presentation)
         .animation(IslandMotion.settle(reduceMotion), value: primaryDisplayText)
         .animation(IslandMotion.settle(reduceMotion), value: captureActive)
@@ -687,29 +773,54 @@ private struct SessionIslandView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
+    private var accessibilityLabel: String {
+        switch productState {
+        case .memoryOn:
+            return "Smalltalk local memory is on"
+        case .continueReady:
+            return "Smalltalk Continue is ready"
+        case .thinEvidence:
+            return "Smalltalk evidence is thin"
+        case .privateOrExcluded:
+            return "Smalltalk is not observing this app"
+        case .needsAttention:
+            return "Smalltalk needs attention"
+        case .memoryStarting:
+            return "Smalltalk local memory is starting"
+        case .continueUpdating:
+            return "Smalltalk is finding a continuation"
+        case .pausedWithEvidence:
+            return "Smalltalk has local evidence ready"
+        case .memoryOff:
+            return "Smalltalk local memory is off"
+        }
+    }
+
     private var microView: some View {
         Button {
             presentation = .compact
             onAction("reveal_compact")
         } label: {
-            Capsule()
-                .fill(Color.white.opacity(0.025))
-                .frame(width: kBaseMicroVisualW * scale, height: kBaseMicroVisualH * scale)
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.66), lineWidth: max(1, 1 * scale))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.black.opacity(0.34), lineWidth: max(1, 1 * scale))
-                        .blur(radius: 0.3)
-                        .offset(y: 0.5 * scale)
-                )
+            MemorySignalView(
+                active: captureActive,
+                processing: isProcessing,
+                error: hasError,
+                privateMode: signalPrivate,
+                thinEvidence: signalThin,
+                ready: signalReady,
+                pulseNonce: snapshot.capturePulseNonce,
+                scale: scale,
+                width: kBaseMicroVisualW,
+                height: kBaseMicroVisualH,
+                cornerRadius: 999,
+                compact: true
+            )
                 .shadow(color: .black.opacity(0.26), radius: s(4), x: 0, y: s(2))
                 .frame(width: kBaseMicroHitW * scale, height: kBaseMicroHitH * scale)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
         .onHover { hovering in
             if hovering {
                 presentation = .compact
@@ -720,13 +831,21 @@ private struct SessionIslandView: View {
 
     private var collapsedView: some View {
         HStack(spacing: s(7)) {
-            PlayPauseButton(
-                isActive: isRecording,
+            MemorySignalView(
+                active: captureActive,
+                processing: isProcessing,
+                error: hasError,
+                privateMode: signalPrivate,
+                thinEvidence: signalThin,
+                ready: signalReady,
+                pulseNonce: snapshot.capturePulseNonce,
                 scale: scale,
-                disabled: isBusy
-            ) {
-                onAction("toggle_meeting")
-            }
+                width: 34,
+                height: 24,
+                cornerRadius: 8,
+                compact: true
+            )
+            .frame(width: s(38), height: s(30))
 
             VStack(alignment: .leading, spacing: s(1)) {
                 Text(primaryDisplayText)
@@ -745,39 +864,33 @@ private struct SessionIslandView: View {
                     .id("compact-secondary-\(secondaryDisplayText)")
                     .transition(.opacity)
             }
-            .frame(width: s(96), alignment: .leading)
+            .frame(width: s(106), alignment: .leading)
 
             Spacer(minLength: s(2))
 
             Button {
-                onAction("open_expanded")
+                onAction(primaryButtonAction)
             } label: {
-                EvidenceTapeView(
-                    active: isRecording,
-                    processing: isProcessing,
-                    error: hasError,
-                    frameCount: snapshot.frameCount,
-                    pulseNonce: snapshot.capturePulseNonce,
-                    density: 4,
-                    scale: scale,
-                    width: 60,
-                    height: 18,
-                    cornerRadius: 6,
-                    compact: true
-                )
-                .scaleEffect(signalHovered ? 1.035 : 1)
-                .shadow(
-                    color: isRecording
-                        ? Color(red: 1, green: 0.20, blue: 0.16).opacity(signalHovered ? 0.22 : 0.12)
-                        : Color.white.opacity(signalHovered ? 0.08 : 0),
-                    radius: s(signalHovered ? 10 : 7),
-                    x: 0,
-                    y: 0
-                )
+                Text(compactActionLabel)
+                    .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
+                    .foregroundColor(.white.opacity(primaryActionDisabled ? 0.36 : signalHovered ? 0.96 : 0.78))
+                    .lineLimit(1)
+                    .frame(width: s(48), height: s(26))
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(primaryActionDisabled ? 0.035 : signalHovered ? 0.14 : 0.075))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(primaryActionDisabled ? 0.05 : signalHovered ? 0.18 : 0.09), lineWidth: 0.6)
+                    )
+                    .scaleEffect(signalHovered && !primaryActionDisabled && !reduceMotion ? 1.035 : 1)
             }
             .buttonStyle(.plain)
-            .frame(width: s(64), height: s(30))
+            .disabled(primaryActionDisabled)
+            .frame(width: s(52), height: s(30))
             .contentShape(Rectangle())
+            .accessibilityLabel(primaryActionLabel)
             .onHover { hovering in
                 withAnimation(IslandMotion.quick(reduceMotion)) {
                     signalHovered = hovering
@@ -803,7 +916,7 @@ private struct SessionIslandView: View {
                     LinearGradient(
                         colors: [
                             Color.clear,
-                            Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.08 + 0.04 * activeBreath : 0),
+                            signalColor.opacity(captureActive ? 0.08 + 0.04 * activeBreath : 0),
                             Color.clear,
                         ],
                         startPoint: .leading,
@@ -817,7 +930,7 @@ private struct SessionIslandView: View {
         }
         .clipShape(Capsule())
         .shadow(color: .black.opacity(0.24), radius: s(13), x: 0, y: s(7))
-        .shadow(color: Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.06 + 0.025 * activeBreath : 0), radius: s(10), x: 0, y: 0)
+        .shadow(color: signalColor.opacity(captureActive ? 0.08 + 0.025 * activeBreath : 0), radius: s(10), x: 0, y: 0)
         .onHover { hovering in
             if hovering {
                 onAction("keep_compact")
@@ -828,13 +941,21 @@ private struct SessionIslandView: View {
     private var expandedView: some View {
         VStack(alignment: .leading, spacing: s(13)) {
             HStack(alignment: .center, spacing: s(11)) {
-                PlayPauseButton(
-                    isActive: isRecording,
+                MemorySignalView(
+                    active: captureActive,
+                    processing: isProcessing,
+                    error: hasError,
+                    privateMode: signalPrivate,
+                    thinEvidence: signalThin,
+                    ready: signalReady,
+                    pulseNonce: snapshot.capturePulseNonce,
                     scale: scale,
-                    disabled: isBusy
-                ) {
-                    onAction("toggle_meeting")
-                }
+                    width: 46,
+                    height: 32,
+                    cornerRadius: 10,
+                    compact: false
+                )
+                .frame(width: s(48), height: s(34))
 
                 VStack(alignment: .leading, spacing: s(3)) {
                     Text(primaryDisplayText)
@@ -858,29 +979,29 @@ private struct SessionIslandView: View {
 
                 Spacer(minLength: s(8))
 
-                EvidenceTapeView(
-                    active: isRecording,
+                MemorySignalView(
+                    active: captureActive,
                     processing: isProcessing,
                     error: hasError,
-                    frameCount: snapshot.frameCount,
+                    privateMode: signalPrivate,
+                    thinEvidence: signalThin,
+                    ready: signalReady,
                     pulseNonce: snapshot.capturePulseNonce,
-                    density: 5,
                     scale: scale,
-                    width: 112,
+                    width: 104,
                     height: 30,
                     cornerRadius: 7,
                     compact: false
                 )
-                .frame(width: s(112), alignment: .trailing)
+                .frame(width: s(104), alignment: .trailing)
             }
 
-            if snapshot.state != "resume_ready", !displayTrailLabels.isEmpty {
-                TrailRouteView(labels: displayTrailLabels, scale: scale)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            if snapshot.state == "resume_ready" {
+            if snapshot.state == "resume_ready" && productState != .privateOrExcluded {
                 VStack(alignment: .leading, spacing: s(7)) {
+                    Text("Continue at")
+                        .font(Brand.swiftUIMonoFont(size: s(9), weight: .semibold))
+                        .foregroundColor(.white.opacity(0.50))
+                        .lineLimit(1)
                     Text(resumeDetailLine)
                         .font(Brand.swiftUIFont(size: s(12), weight: .medium))
                         .foregroundColor(.white.opacity(0.74))
@@ -948,15 +1069,15 @@ private struct SessionIslandView: View {
         .overlay(expandedGlassStroke(active: captureActive))
         .clipShape(RoundedRectangle(cornerRadius: s(18), style: .continuous))
         .shadow(color: .black.opacity(0.34), radius: s(22), x: 0, y: s(12))
-        .shadow(color: Color(red: 1, green: 0.20, blue: 0.16).opacity(captureActive ? 0.08 + 0.035 * activeBreath : 0), radius: s(22), x: 0, y: 0)
+        .shadow(color: signalColor.opacity(captureActive ? 0.10 + 0.035 * activeBreath : 0), radius: s(22), x: 0, y: 0)
     }
 
     private func capsuleFill(active: Bool) -> some ShapeStyle {
         LinearGradient(
             colors: active
                 ? [
-                    Color(red: 0.18, green: 0.15, blue: 0.15).opacity(0.98),
-                    Color(red: 0.09, green: 0.095, blue: 0.105).opacity(0.98),
+                    Color(red: 0.06, green: 0.15, blue: 0.13).opacity(0.98),
+                    Color(red: 0.055, green: 0.078, blue: 0.080).opacity(0.98),
                 ]
                 : [
                     Color(red: 0.12, green: 0.125, blue: 0.135).opacity(0.98),
@@ -970,7 +1091,7 @@ private struct SessionIslandView: View {
     private func capsuleStroke(active: Bool) -> some View {
         Capsule()
             .stroke(
-                active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.34) : Color.white.opacity(0.16),
+                active ? signalColor.opacity(0.34) : Color.white.opacity(0.16),
                 lineWidth: 0.7
             )
             .overlay(
@@ -985,8 +1106,8 @@ private struct SessionIslandView: View {
         LinearGradient(
             colors: active
                 ? [
-                    Color(red: 0.15, green: 0.13, blue: 0.13).opacity(0.99),
-                    Color(red: 0.075, green: 0.08, blue: 0.09).opacity(0.99),
+                    Color(red: 0.055, green: 0.135, blue: 0.12).opacity(0.99),
+                    Color(red: 0.060, green: 0.072, blue: 0.080).opacity(0.99),
                 ]
                 : [
                     Color(red: 0.115, green: 0.12, blue: 0.13).opacity(0.99),
@@ -1000,7 +1121,7 @@ private struct SessionIslandView: View {
     private func expandedGlassStroke(active: Bool) -> some View {
         let shape = RoundedRectangle(cornerRadius: s(18), style: .continuous)
         return shape
-            .stroke(active ? Color(red: 1, green: 0.32, blue: 0.28).opacity(0.32) : Color.white.opacity(0.14), lineWidth: 0.8)
+            .stroke(active ? signalColor.opacity(0.32) : Color.white.opacity(0.14), lineWidth: 0.8)
             .overlay(
                 shape
                     .stroke(Color.black.opacity(0.48), lineWidth: 1)
@@ -1387,7 +1508,13 @@ private final class SessionIslandController: NSObject {
     }
 
     private var canUseMicro: Bool {
-        snapshot.state == "ready" && snapshot.lastError == nil
+        snapshot.lastError == nil &&
+            (
+                snapshot.state == "ready" ||
+                    snapshot.state == "recording_compact" ||
+                    snapshot.state == "recording_expanded" ||
+                    snapshot.state == "resume_ready"
+            )
     }
 
     private func setPresentation(
@@ -1629,6 +1756,12 @@ private final class SessionIslandController: NSObject {
         case "continue":
             setPresentation(.expanded, resetIdleTimer: false)
             sendAction("continue")
+        case "start_memory":
+            revealCompact()
+            sendAction("start_capture")
+        case "pause_memory":
+            revealCompact()
+            sendAction("stop_capture")
         case "reconstruct_trail":
             setPresentation(.expanded, resetIdleTimer: false)
             sendAction("continue")
@@ -1636,6 +1769,8 @@ private final class SessionIslandController: NSObject {
             sendAction("show_trail")
         case "open_resume_point":
             sendAction("open_resume_point")
+        case "open_main_window":
+            sendAction("open_main_window")
         case "open_expanded":
             openExpandedFromCompact()
         case "toggle_meeting":

@@ -1593,6 +1593,9 @@ pub struct OpenResumePointInput {
     pub output_path: Option<String>,
     pub session_id: Option<String>,
     pub continue_decision_id: Option<String>,
+    pub target_artifact_id: Option<String>,
+    #[serde(default)]
+    pub strict_continue_target: bool,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub current_frame_id: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
@@ -2488,33 +2491,44 @@ pub fn list_exclusion_rules(app: AppHandle) -> Result<Vec<ExclusionRule>, String
 }
 
 #[tauri::command]
-pub fn delete_recent_captures(app: AppHandle, range_ms: i64) -> Result<i64, String> {
+pub fn delete_recent_captures(
+    app: AppHandle,
+    state: State<CaptureState>,
+    range_ms: i64,
+) -> Result<i64, String> {
     let conn = open_db(&app)?;
     let cutoff = now_millis() - range_ms.max(1_000);
-    let mut stmt = conn
-        .prepare(
-            "SELECT snapshot_path, active_window_crop_path FROM frames WHERE captured_at >= ?1",
-        )
-        .map_err(to_string)?;
-    let paths = stmt
-        .query_map(params![cutoff], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .map_err(to_string)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(to_string)?;
-    for (snapshot, crop) in paths {
-        let _ = fs::remove_file(snapshot);
-        if let Some(crop) = crop {
-            let _ = fs::remove_file(crop);
+    let frame_ids = query_i64_rows(
+        &conn,
+        "SELECT id FROM frames WHERE captured_at >= ?1 ORDER BY id ASC",
+        &[&cutoff as &dyn ToSql],
+    )?;
+
+    let mut deleted = 0_i64;
+    for frame_id in frame_ids {
+        for path in frame_asset_paths(&conn, frame_id)? {
+            let _ = fs::remove_file(path);
         }
+        delete_frame_dependents(&conn, frame_id)?;
+        conn.execute("DELETE FROM frames WHERE id = ?1", params![frame_id])
+            .map_err(to_string)?;
+        deleted += 1;
     }
-    let deleted = conn
-        .execute(
-            "DELETE FROM frames WHERE captured_at >= ?1",
-            params![cutoff],
-        )
-        .map_err(to_string)? as i64;
+
+    prune_continue_refresh_rows(&conn)?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    drop(conn);
+
+    let status = capture_status_snapshot(&app, &state)?;
+    let _ = app.emit("capture-status", status.clone());
+    crate::session_island::update_session_island_from_status(
+        &status,
+        if status.running {
+            crate::session_island::SessionIslandState::RecordingCompact
+        } else {
+            crate::session_island::SessionIslandState::Ready
+        },
+    );
     Ok(deleted)
 }
 
@@ -5730,6 +5744,27 @@ struct ResolvedOpenResumePoint {
 }
 
 #[derive(Debug, Clone)]
+struct ContinueOpenDecisionRow {
+    return_target_artifact_id: Option<String>,
+    confidence: f64,
+    selected_workstream_id: Option<String>,
+    candidate_target_artifact_id: Option<String>,
+    candidate_evidence_frame_id: Option<String>,
+    candidate_workstream_id: Option<String>,
+    return_target_last_seen_frame_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ContinueOpenArtifactRow {
+    id: String,
+    browser_url: Option<String>,
+    document_path: Option<String>,
+    display_title: Option<String>,
+    last_seen_frame_id: Option<String>,
+    openability: String,
+}
+
+#[derive(Debug, Clone)]
 struct BrowserOpenOutcome {
     strategy: String,
     warnings: Vec<String>,
@@ -6019,9 +6054,26 @@ fn resolve_open_resume_point(
     }
 
     if let Some(decision_id) = input.continue_decision_id.as_deref() {
-        if let Some(point) = resolve_continue_decision_for_open(conn, decision_id, warnings)? {
+        if let Some(point) = resolve_continue_decision_for_open(
+            conn,
+            decision_id,
+            input.target_artifact_id.as_deref(),
+            input.strict_continue_target,
+            warnings,
+        )? {
             return Ok(Some(point));
         }
+        if input.strict_continue_target {
+            return Ok(None);
+        }
+    }
+
+    if input.strict_continue_target {
+        warnings.push(
+            "Strict Continue open requested without a Continue decision; staying in Smalltalk instead of using a fallback target."
+                .to_string(),
+        );
+        return Ok(None);
     }
 
     if let Some(file) = cloud_file {
@@ -6048,35 +6100,78 @@ fn resolve_open_resume_point(
 fn resolve_continue_decision_for_open(
     conn: &Connection,
     decision_id: &str,
+    requested_artifact_id: Option<&str>,
+    strict_continue_target: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Option<ResolvedOpenResumePoint>, String> {
     let row = conn
         .query_row(
-            "SELECT d.return_target_artifact_id, d.confidence, c.evidence_frame_id,
-                    a.last_seen_frame_id, a.browser_url
+            "SELECT d.return_target_artifact_id, d.confidence,
+                    d.selected_workstream_id,
+                    c.target_artifact_id, c.evidence_frame_id, c.workstream_id,
+                    a.last_seen_frame_id
              FROM continue_decisions d
              LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
              LEFT JOIN continue_artifacts a ON a.id = d.return_target_artifact_id
              WHERE d.id = ?1",
             params![decision_id],
             |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
+                Ok(ContinueOpenDecisionRow {
+                    return_target_artifact_id: row.get(0)?,
+                    confidence: row.get(1)?,
+                    selected_workstream_id: row.get(2)?,
+                    candidate_target_artifact_id: row.get(3)?,
+                    candidate_evidence_frame_id: row.get(4)?,
+                    candidate_workstream_id: row.get(5)?,
+                    return_target_last_seen_frame_id: row.get(6)?,
+                })
             },
         )
         .optional()
         .map_err(to_string)?;
-    let Some((target_artifact_id, confidence, evidence_frame_id, last_seen_frame_id, _url)) = row
-    else {
+    let Some(row) = row else {
         warnings.push(format!("Continue decision {} was not found.", decision_id));
         return Ok(None);
     };
-    let frame_id = evidence_frame_id.or(last_seen_frame_id);
+
+    if strict_continue_target {
+        let target_artifact_id = requested_artifact_id
+            .and_then(|value| non_empty(value.to_string()))
+            .or_else(|| row.candidate_target_artifact_id.clone())
+            .or_else(|| row.return_target_artifact_id.clone());
+        let Some(target_artifact_id) = target_artifact_id else {
+            warnings.push(format!(
+                "Strict Continue decision {} has no displayed target artifact; staying in Smalltalk instead of using a fallback target.",
+                decision_id
+            ));
+            return Ok(None);
+        };
+        if !continue_decision_context_contains_artifact(conn, &row, &target_artifact_id)? {
+            warnings.push(format!(
+                "Strict Continue target {} is not part of decision {}; staying in Smalltalk instead of using a fallback target.",
+                target_artifact_id, decision_id
+            ));
+            return Ok(None);
+        }
+        let Some(artifact) = continue_open_artifact_by_id(conn, &target_artifact_id)? else {
+            warnings.push(format!(
+                "Strict Continue target {} is missing locally; staying in Smalltalk instead of using a fallback target.",
+                target_artifact_id
+            ));
+            return Ok(None);
+        };
+        return resolve_strict_continue_artifact_for_open(
+            conn,
+            decision_id,
+            &artifact,
+            row.confidence,
+            warnings,
+        );
+    }
+
+    let frame_id = row
+        .candidate_evidence_frame_id
+        .or(row.return_target_last_seen_frame_id);
     let Some(frame_id) = frame_id.and_then(|value| value.parse::<i64>().ok()) else {
         warnings.push(format!(
             "Continue decision {} has no openable target frame.",
@@ -6093,12 +6188,176 @@ fn resolve_continue_decision_for_open(
     };
     warnings.push(format!(
         "Opening native Continue decision target{}.",
-        target_artifact_id
+        row.return_target_artifact_id
             .as_deref()
             .map(|id| format!(" {}", id))
             .unwrap_or_default()
     ));
-    resolved_open_resume_point_from_frame(conn, frame, None, confidence).map(Some)
+    resolved_open_resume_point_from_frame(conn, frame, None, row.confidence).map(Some)
+}
+
+fn continue_decision_context_contains_artifact(
+    conn: &Connection,
+    row: &ContinueOpenDecisionRow,
+    artifact_id: &str,
+) -> Result<bool, String> {
+    if row
+        .return_target_artifact_id
+        .as_deref()
+        .is_some_and(|id| id == artifact_id)
+        || row
+            .candidate_target_artifact_id
+            .as_deref()
+            .is_some_and(|id| id == artifact_id)
+    {
+        return Ok(true);
+    }
+
+    let mut workstream_ids = Vec::new();
+    push_string_once_option(&mut workstream_ids, row.selected_workstream_id.as_deref());
+    push_string_once_option(&mut workstream_ids, row.candidate_workstream_id.as_deref());
+    for workstream_id in workstream_ids {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM continue_workstream_artifacts
+                 WHERE workstream_id = ?1 AND artifact_id = ?2
+                 LIMIT 1",
+                params![workstream_id, artifact_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(to_string)?
+            .is_some();
+        if exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn push_string_once_option(values: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = value.and_then(|value| non_empty(value.to_string())) else {
+        return;
+    };
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn continue_open_artifact_by_id(
+    conn: &Connection,
+    artifact_id: &str,
+) -> Result<Option<ContinueOpenArtifactRow>, String> {
+    conn.query_row(
+        "SELECT id, browser_url, document_path, display_title, last_seen_frame_id, openability
+         FROM continue_artifacts
+         WHERE id = ?1",
+        params![artifact_id],
+        |row| {
+            Ok(ContinueOpenArtifactRow {
+                id: row.get(0)?,
+                browser_url: row.get(1)?,
+                document_path: row.get(2)?,
+                display_title: row.get(3)?,
+                last_seen_frame_id: row.get(4)?,
+                openability: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn resolve_strict_continue_artifact_for_open(
+    conn: &Connection,
+    decision_id: &str,
+    artifact: &ContinueOpenArtifactRow,
+    confidence: f64,
+    warnings: &mut Vec<String>,
+) -> Result<Option<ResolvedOpenResumePoint>, String> {
+    let has_direct_locator = artifact.browser_url.is_some() || artifact.document_path.is_some();
+    if !has_direct_locator {
+        let label = artifact
+            .display_title
+            .as_deref()
+            .unwrap_or(artifact.id.as_str());
+        warnings.push(format!(
+            "Strict Continue target {} ({}) is not directly openable; openability={} and no URL or document path was captured. Staying in Smalltalk instead of using a fallback target.",
+            artifact.id, label, artifact.openability
+        ));
+        return Ok(None);
+    }
+
+    let frame = strict_continue_artifact_frame(conn, artifact)?;
+    let Some(frame) = frame else {
+        warnings.push(format!(
+            "Strict Continue target {} has no local frame for its captured URL or document path. Staying in Smalltalk instead of using a fallback target.",
+            artifact.id
+        ));
+        return Ok(None);
+    };
+
+    let resolved = resolved_open_resume_point_from_frame(conn, frame, None, confidence)?;
+    if resolved.url.is_none() {
+        warnings.push(format!(
+            "Strict Continue target {} resolved only to local evidence after identity checks; staying in Smalltalk instead of using a fallback target.",
+            artifact.id
+        ));
+        return Ok(Some(resolved));
+    }
+    warnings.push(format!(
+        "Opening strict Continue decision {} target {}.",
+        decision_id, artifact.id
+    ));
+    Ok(Some(resolved))
+}
+
+fn strict_continue_artifact_frame(
+    conn: &Connection,
+    artifact: &ContinueOpenArtifactRow,
+) -> Result<Option<CaptureFrame>, String> {
+    if let Some(frame_id) = artifact
+        .last_seen_frame_id
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        if let Some(frame) = frame_by_id(conn, frame_id)? {
+            if strict_frame_matches_artifact(&frame, artifact) {
+                return Ok(Some(frame));
+            }
+        }
+    }
+
+    let Some(locator) = artifact
+        .browser_url
+        .as_deref()
+        .or(artifact.document_path.as_deref())
+    else {
+        return Ok(None);
+    };
+    let frame_id = conn
+        .query_row(
+            "SELECT id FROM frames
+             WHERE COALESCE(browser_url, document_path, '') = ?1
+             ORDER BY captured_at DESC
+             LIMIT 1",
+            params![locator],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    frame_id.map_or(Ok(None), |frame_id| frame_by_id(conn, frame_id))
+}
+
+fn strict_frame_matches_artifact(frame: &CaptureFrame, artifact: &ContinueOpenArtifactRow) -> bool {
+    artifact
+        .browser_url
+        .as_deref()
+        .is_some_and(|url| frame.browser_url.as_deref() == Some(url))
+        || artifact
+            .document_path
+            .as_deref()
+            .is_some_and(|path| frame.document_path.as_deref() == Some(path))
 }
 
 fn resolve_cloud_resume_target_for_open(
@@ -6276,6 +6535,9 @@ fn resolved_open_resume_point_from_frame(
     let app_context_url = app_contexts
         .iter()
         .find_map(|context| context.url.clone().and_then(non_empty));
+    let app_context_file_path = app_contexts
+        .iter()
+        .find_map(|context| context.file_path.clone().and_then(non_empty));
     let fallback_anchor = content_units
         .iter()
         .filter(|unit| content_unit_summary_is_active_evidence(unit))
@@ -6296,13 +6558,21 @@ fn resolved_open_resume_point_from_frame(
 
     let mut warnings = Vec::new();
     let url = if route_eligibility.url_allowed {
-        frame.browser_url.clone().or(app_context_url)
+        frame
+            .browser_url
+            .clone()
+            .or(app_context_url)
+            .or(frame.document_path.clone())
+            .or(app_context_file_path)
     } else {
-        if (frame.browser_url.is_some() || app_context_url.is_some())
+        if (frame.browser_url.is_some()
+            || app_context_url.is_some()
+            || frame.document_path.is_some()
+            || app_context_file_path.is_some())
             && route_eligibility.reason != "captured URL blocked because visible app identity repaired to a non-browser surface"
         {
             warnings.push(format!(
-                "Frame {} has a captured URL, but Smalltalk kept this as local evidence because the visible app identity did not match a trusted browser surface.",
+                "Frame {} has a captured URL or document path, but Smalltalk kept this as local evidence because the visible app identity did not match a trusted browser surface.",
                 frame_id
             ));
         }
@@ -25357,6 +25627,124 @@ mod tests {
         frame_id
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn insert_continue_open_artifact(
+        conn: &Connection,
+        artifact_id: &str,
+        artifact_kind: &str,
+        browser_url: Option<&str>,
+        document_path: Option<&str>,
+        last_seen_frame_id: Option<String>,
+        openability: &str,
+        display_title: &str,
+        observed_at_ms: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO continue_artifacts (
+                id, artifact_kind, stable_key, app_name, bundle_id, window_title,
+                browser_url, document_path, display_title, first_seen_frame_id,
+                last_seen_frame_id, first_seen_timestamp, last_seen_timestamp,
+                identity_confidence, evidence_quality, privacy_status, openability,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, 'Helium', 'co.madcow.Helium', ?8,
+                ?4, ?5, ?8, ?6,
+                ?6, ?7, ?7,
+                0.9, 'medium', 'normal', ?9,
+                ?7, ?7
+             )",
+            params![
+                artifact_id,
+                artifact_kind,
+                format!("test-stable-{}", artifact_id),
+                browser_url,
+                document_path,
+                last_seen_frame_id,
+                observed_at_ms,
+                display_title,
+                openability,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_continue_open_decision(
+        conn: &Connection,
+        decision_id: &str,
+        workstream_id: &str,
+        candidate_id: &str,
+        target_artifact_id: &str,
+        evidence_frame_id: &str,
+        requested_at_ms: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO continue_workstreams (
+                id, state, title_candidate, inferred_intent, primary_artifact_id,
+                created_at_ms, last_active_timestamp_ms, suspended_timestamp_ms,
+                confidence, unresolved_signal, source
+             ) VALUES (
+                ?1, 'suspended', 'Open target test', NULL, ?2,
+                ?3, ?3, ?3, 0.8, 'test unresolved', 'test'
+             )",
+            params![workstream_id, target_artifact_id, requested_at_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_workstream_artifacts (
+                workstream_id, artifact_id, durable_role, importance_score,
+                first_seen_frame_id, last_seen_frame_id, reason
+             ) VALUES (?1, ?2, 'primary_target', 0.9, ?3, ?3, 'test target')",
+            params![workstream_id, target_artifact_id, evidence_frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_candidates (
+                id, workstream_id, target_artifact_id, candidate_kind,
+                last_meaningful_action_id, evidence_frame_id, supporting_episode_id,
+                score, actionability_score, primary_target_score, unresolved_score,
+                branch_origin_score, evidence_quality_score, recency_score,
+                openability_score, privacy_safety_score, reason, missing_evidence,
+                created_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, 'return_to_primary_artifact',
+                NULL, ?4, NULL,
+                0.8, 0.7, 0.9, 0.8,
+                0.0, 0.8, 1.0,
+                0.8, 1.0, 'test candidate', NULL,
+                ?5
+             )",
+            params![
+                candidate_id,
+                workstream_id,
+                target_artifact_id,
+                evidence_frame_id,
+                requested_at_ms,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_decisions (
+                id, requested_at_ms, source, current_focus_frame_id,
+                current_focus_artifact_id, selected_workstream_id, selected_candidate_id,
+                return_target_artifact_id, confidence, decision_reason, next_action,
+                warnings, validation_status, continue_output_mode
+             ) VALUES (
+                ?1, ?2, 'local', NULL,
+                NULL, ?3, ?4,
+                ?5, 0.8, 'test decision', 'open target',
+                '', 'strong_continue', 'strong_continue'
+             )",
+            params![
+                decision_id,
+                requested_at_ms,
+                workstream_id,
+                candidate_id,
+                target_artifact_id,
+            ],
+        )
+        .unwrap();
+    }
+
     fn replace_resume_test_content_units(
         conn: &Connection,
         frame_id: i64,
@@ -30473,6 +30861,258 @@ mod tests {
 
         assert_eq!(resolved.frame_id, frame_id.to_string());
         assert_eq!(resolved.anchor_text.as_deref(), Some("Resume from"));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("local resume query candidate")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_continue_decision_does_not_open_stale_chatgpt_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let chatgpt_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/stale-chatgpt.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "ChatGPT - smalltalk",
+            "https://chatgpt.com/c/stale",
+            "chat_conversation",
+            "Older ChatGPT support branch.",
+            "phash-chatgpt-stale",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-chatgpt-stale",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/stale"),
+            None,
+            Some(chatgpt_frame.to_string()),
+            "openable",
+            "ChatGPT - smalltalk - Helium",
+            10,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-x-frame-fallback",
+            "unknown",
+            None,
+            None,
+            Some("event-4311492174e5ec10".to_string()),
+            "frame_fallback",
+            "Home / X - Helium",
+            20,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-strict-x",
+            "workstream-x",
+            "continue-candidate-x",
+            "artifact-x-frame-fallback",
+            "event-4311492174e5ec10",
+            30,
+        );
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-strict-x",
+            Some("artifact-x-frame-fallback"),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("Strict Continue target artifact-x-frame-fallback")
+                && warning.contains("Staying in Smalltalk")
+        }));
+        assert!(!warnings.iter().any(|warning| warning.contains("chatgpt")));
+    }
+
+    #[test]
+    fn strict_continue_decision_opens_exact_displayed_openable_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let x_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/x-openable.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Home / X",
+            "https://x.com/home",
+            "browser_tab",
+            "Home / X active work target.",
+            "phash-x-openable",
+            None,
+        );
+        let chatgpt_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/chatgpt-openable.jpg",
+            20,
+            "Helium",
+            "co.madcow.Helium",
+            "ChatGPT",
+            "https://chatgpt.com/c/other",
+            "chat_conversation",
+            "Other older branch.",
+            "phash-chatgpt-other",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-x-openable",
+            "browser_tab",
+            Some("https://x.com/home"),
+            None,
+            Some(x_frame.to_string()),
+            "openable",
+            "Home / X - Helium",
+            10,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-chatgpt-other",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/other"),
+            None,
+            Some(chatgpt_frame.to_string()),
+            "openable",
+            "ChatGPT - Helium",
+            20,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-strict-openable",
+            "workstream-x-openable",
+            "continue-candidate-x-openable",
+            "artifact-x-openable",
+            &x_frame.to_string(),
+            30,
+        );
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-strict-openable",
+            Some("artifact-x-openable"),
+            true,
+            &mut warnings,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.frame_id, x_frame.to_string());
+        assert_eq!(resolved.url.as_deref(), Some("https://x.com/home"));
+        assert!(!resolved
+            .url
+            .as_deref()
+            .is_some_and(|url| url.contains("chatgpt.com")));
+        assert!(warnings.iter().any(|warning| warning.contains(
+            "Opening strict Continue decision continue-decision-strict-openable target artifact-x-openable"
+        )));
+    }
+
+    #[test]
+    fn non_strict_continue_decision_can_still_use_legacy_query_bundle_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let fallback_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/legacy-chatgpt-fallback.jpg",
+            10,
+            "Arc",
+            "company.thebrowser.Browser",
+            "ChatGPT",
+            "https://chatgpt.com/c/legacy-fallback",
+            "chat_conversation",
+            "Legacy query bundle fallback target.",
+            "phash-legacy-fallback",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-non-strict-thin",
+            "unknown",
+            None,
+            None,
+            Some("event-thin".to_string()),
+            "frame_fallback",
+            "Thin event target",
+            20,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-non-strict",
+            "workstream-non-strict",
+            "continue-candidate-non-strict",
+            "artifact-non-strict-thin",
+            "event-thin",
+            30,
+        );
+        let root = std::env::temp_dir().join(format!(
+            "smalltalk-non-strict-open-fallback-{}",
+            now_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut bundle = resume_query_result_for_test().bundle;
+        bundle.session.id = session.id;
+        bundle.resume_candidate.frame_id = fallback_frame.to_string();
+        bundle.resume_candidate.exact_words = "Legacy query bundle".to_string();
+        bundle.resume_candidate.confidence = 0.67;
+        let bundle_path = root.join("resume-query-bundle.json");
+        write_json_pretty(&bundle_path, &serde_json::to_value(&bundle).unwrap()).unwrap();
+        let file = OpenResumeCloudFile {
+            generated_at_ms: 20,
+            source: "cloud".to_string(),
+            response_id: Some("resp_non_strict".to_string()),
+            request: None,
+            resume_target: serde_json::json!({"frame_id": "999", "exact_words": null}),
+            current_focus: serde_json::json!({}),
+            resume_work_target: serde_json::json!({}),
+            resume_target_if_returning: serde_json::json!({}),
+            return_target: serde_json::json!({}),
+            confidence: 0.1,
+            warnings: Vec::new(),
+            query_bundle_path: Some(bundle_path),
+            output_path: root.join("cloud-resume-result.json"),
+        };
+        let mut warnings = Vec::new();
+        assert!(resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-non-strict",
+            None,
+            false,
+            &mut warnings,
+        )
+        .unwrap()
+        .is_none());
+
+        let resolved = resolve_query_bundle_candidate_for_open(&conn, &file, &mut warnings)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.frame_id, fallback_frame.to_string());
+        assert_eq!(
+            resolved.url.as_deref(),
+            Some("https://chatgpt.com/c/legacy-fallback")
+        );
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("local resume query candidate")));

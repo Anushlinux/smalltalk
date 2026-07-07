@@ -14,6 +14,7 @@ static EXPANDED: AtomicBool = AtomicBool::new(false);
 #[allow(dead_code)]
 static LAST_CLOUD_RESUME_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CONTINUE_DECISION_ID: Mutex<Option<String>> = Mutex::new(None);
+static LAST_CONTINUE_TARGET_ARTIFACT_ID: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionIslandSnapshot {
@@ -408,7 +409,7 @@ fn continue_from_island() {
             }),
         ) {
             Ok(decision) => {
-                remember_continue_decision_id(&decision.decision_id);
+                remember_continue_decision(&decision);
                 let state = app.state::<crate::capture::CaptureState>();
                 let next_status = crate::capture::capture_status(app.clone(), state)
                     .unwrap_or_else(|_| crate::capture::CaptureStatus {
@@ -609,8 +610,8 @@ fn open_resume_point_from_island() {
         return;
     };
     thread::spawn(move || {
-        let continue_decision_id = match remembered_continue_decision_id() {
-            Some(id) => Some(id),
+        let (continue_decision_id, target_artifact_id) = match remembered_continue_decision_id() {
+            Some(id) => (Some(id), remembered_continue_target_artifact_id()),
             None => match crate::capture::get_continue_decision(
                 app.clone(),
                 Some(crate::continuation::ContinueDecisionRequest {
@@ -622,21 +623,34 @@ fn open_resume_point_from_island() {
                 }),
             ) {
                 Ok(decision) => {
-                    remember_continue_decision_id(&decision.decision_id);
-                    Some(decision.decision_id)
+                    let target_artifact_id = continue_decision_target_artifact_id(&decision);
+                    remember_continue_decision(&decision);
+                    (Some(decision.decision_id), target_artifact_id)
                 }
                 Err(error) => {
                     eprintln!("[session_island] get_continue_decision failed: {}", error);
-                    None
+                    update_session_island(SessionIslandSnapshot::error(
+                        "Continue is not ready yet. Open Smalltalk to inspect local evidence."
+                            .to_string(),
+                    ));
+                    open_main_window();
+                    return;
                 }
             },
         };
+        if continue_decision_id.is_none() {
+            eprintln!("[session_island] strict Continue open skipped because no decision id was available");
+            open_main_window();
+            return;
+        }
         match crate::capture::open_resume_point(
             app.clone(),
             Some(OpenResumePointInput {
                 output_path: None,
                 session_id: None,
                 continue_decision_id,
+                target_artifact_id,
+                strict_continue_target: true,
                 current_frame_id: None,
                 target_frame_id: None,
             }),
@@ -660,6 +674,25 @@ fn open_resume_point_from_island() {
     });
 }
 
+fn remember_continue_decision(decision: &crate::continuation::ContinueDecisionResult) {
+    remember_continue_decision_id(&decision.decision_id);
+    if let Ok(mut slot) = LAST_CONTINUE_TARGET_ARTIFACT_ID.lock() {
+        *slot = continue_decision_target_artifact_id(decision);
+    }
+}
+
+fn continue_decision_target_artifact_id(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> Option<String> {
+    decision
+        .resume_work_target
+        .as_ref()
+        .or(decision.return_target.as_ref())
+        .and_then(|target| target.artifact_id.as_ref())
+        .map(|artifact_id| artifact_id.trim().to_string())
+        .filter(|artifact_id| !artifact_id.is_empty())
+}
+
 fn remember_continue_decision_id(decision_id: &str) {
     if let Ok(mut slot) = LAST_CONTINUE_DECISION_ID.lock() {
         *slot = Some(decision_id.to_string());
@@ -668,6 +701,13 @@ fn remember_continue_decision_id(decision_id: &str) {
 
 fn remembered_continue_decision_id() -> Option<String> {
     LAST_CONTINUE_DECISION_ID
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn remembered_continue_target_artifact_id() -> Option<String> {
+    LAST_CONTINUE_TARGET_ARTIFACT_ID
         .lock()
         .ok()
         .and_then(|slot| slot.clone())

@@ -205,6 +205,22 @@ type CleanupLocalMemoryResult = {
   summary: string;
 };
 
+type ExclusionRule = {
+  id: string;
+  rule_type: string;
+  pattern: string;
+  action: string;
+  enabled: boolean;
+  created_at_ms: number;
+};
+
+type ExclusionRuleInput = {
+  rule_type: string;
+  pattern: string;
+  action: string;
+  enabled?: boolean;
+};
+
 type SearchResult = {
   frame: CaptureFrame;
   snippet: string;
@@ -693,6 +709,53 @@ type ContinueWorkstreamDetailResult = {
 type ViewMode = "continue" | "developer";
 type OverlayMode = "units" | "ocr" | "ax" | "privacy";
 type EvidenceTab = "text" | "events" | "context" | "paths";
+type MemoryProductStatus =
+  | "off"
+  | "starting"
+  | "on"
+  | "paused_with_evidence"
+  | "private_or_excluded"
+  | "needs_permission"
+  | "needs_attention"
+  | "deleting";
+type DangerousAction = "delete_all" | "delete_recent" | "dev_reset";
+
+const RECENT_MEMORY_DELETE_RANGE_MS = 60 * 60 * 1000;
+
+const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: string }> = {
+  off: {
+    label: "Memory off",
+    detail: "Turn it on once, keep working, then ask Continue when needed.",
+  },
+  starting: {
+    label: "Starting memory",
+    detail: "Preparing local memory.",
+  },
+  on: {
+    label: "Memory on",
+    detail: "Smalltalk is maintaining context quietly in the background.",
+  },
+  paused_with_evidence: {
+    label: "Memory paused",
+    detail: "Continue can still answer from evidence already stored locally.",
+  },
+  private_or_excluded: {
+    label: "Not observing this app",
+    detail: "Smalltalk is respecting your privacy boundary here.",
+  },
+  needs_permission: {
+    label: "Permission needed",
+    detail: "Smalltalk needs permission before local memory can work.",
+  },
+  needs_attention: {
+    label: "Memory needs attention",
+    detail: "Open Details for the technical cause.",
+  },
+  deleting: {
+    label: "Deleting local memory",
+    detail: "Clearing local evidence.",
+  },
+};
 
 const emptyRuntimeDiagnostics: RuntimeDiagnostics = {
   heavy_captures_stored: 0,
@@ -769,11 +832,15 @@ function App() {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("continue");
   const [memoryMenuOpen, setMemoryMenuOpen] = useState(false);
+  const [privacyPanelOpen, setPrivacyPanelOpen] = useState(false);
+  const [exclusionRules, setExclusionRules] = useState<ExclusionRule[]>([]);
+  const [privacyActionStatus, setPrivacyActionStatus] = useState<string | null>(null);
+  const [pendingDangerAction, setPendingDangerAction] = useState<DangerousAction | null>(null);
   const [error, setError] = useState<string | null>(null);
   const storeGenerationRef = useRef(0);
   const autoContinueRef = useRef(false);
   const captureMenuRef = useRef<HTMLDetailsElement | null>(null);
-  const isDeleting = busyAction === "delete_all_frames";
+  const isDeleting = busyAction === "delete_all_frames" || busyAction === "delete_recent_captures";
   const diagnosticsOpen = viewMode === "developer";
   const currentSession = status.active_session || status.latest_session || null;
   const currentSessionId = currentSession?.id || null;
@@ -808,6 +875,15 @@ function App() {
       setMemoryDiagnostics(diagnostics);
     } catch (err) {
       setContinueError(`Memory diagnostics failed: ${String(err)}`);
+    }
+  }, []);
+
+  const refreshExclusionRules = useCallback(async () => {
+    try {
+      const rules = await invoke<ExclusionRule[]>("list_exclusion_rules");
+      setExclusionRules(rules);
+    } catch (err) {
+      setPrivacyActionStatus(`Could not load privacy exclusions: ${String(err)}`);
     }
   }, []);
 
@@ -967,6 +1043,7 @@ function App() {
 
   const openContinueTarget = useCallback(async () => {
     if (!continueDecision) return;
+    const resumeTarget = continueDecision.resume_work_target || continueDecision.return_target || null;
     setBusyAction("open_continue_target");
     setContinueOpenResult(null);
     setContinueError(null);
@@ -974,6 +1051,8 @@ function App() {
       const result = await invoke<OpenResumePointResult>("open_resume_point", {
         input: {
           continue_decision_id: continueDecision.decision_id,
+          target_artifact_id: resumeTarget?.artifact_id || null,
+          strict_continue_target: true,
         },
       });
       setContinueOpenResult(result);
@@ -1053,7 +1132,7 @@ function App() {
       setContinueError(null);
       setFeedbackStatus(null);
       try {
-        const feedback = await invoke<ContinueFeedbackEventResult>(
+        await invoke<ContinueFeedbackEventResult>(
           "record_continue_feedback",
           {
             input: {
@@ -1076,7 +1155,7 @@ function App() {
             },
           },
         );
-        setFeedbackStatus(`${sentenceCase(feedback.event_kind)} feedback saved.`);
+        setFeedbackStatus("Got it. Smalltalk will use that correction next time.");
         await loadWorkstreamDetail(workstreamId);
       } catch (err) {
         setContinueError(`Feedback failed: ${String(err)}`);
@@ -1157,13 +1236,10 @@ function App() {
     }
   }, [refreshContinueMemory, refreshStatus]);
 
-  const runDevReset = useCallback(async () => {
-    const confirmed = window.confirm(
-      "Reset local memory for developer testing? This clears frames, events, derived Continue rows, snapshots, and generated debug exports.",
-    );
-    if (!confirmed) return;
+  const performDevReset = useCallback(async () => {
     setBusyAction("dev_reset_local_memory");
     setError(null);
+    setPrivacyActionStatus(null);
     storeGenerationRef.current += 1;
     try {
       const nextStatus = await invoke<CaptureStatus>("dev_reset_local_memory", {
@@ -1187,12 +1263,18 @@ function App() {
       setStatus(nextStatus);
       await refreshContinueMemory();
       await refreshMemoryDiagnostics();
+      await refreshExclusionRules();
+      setPrivacyActionStatus("Developer reset completed.");
     } catch (err) {
       setError(`Developer reset failed: ${String(err)}`);
     } finally {
       setBusyAction(null);
     }
-  }, [refreshContinueMemory, refreshMemoryDiagnostics]);
+  }, [refreshContinueMemory, refreshExclusionRules, refreshMemoryDiagnostics]);
+
+  const requestDevReset = useCallback(() => {
+    setPendingDangerAction("dev_reset");
+  }, []);
 
   const runAction = useCallback(
     async (action: "start_capture" | "stop_capture" | "capture_once") => {
@@ -1249,14 +1331,10 @@ function App() {
     [currentSessionId, diagnosticsOpen, query, refreshStatus, refreshTimeline, runSearch, selectFrame],
   );
 
-  const deleteAllFrames = useCallback(async () => {
-    const confirmed = window.confirm(
-      "Delete all stored frames and screenshots? This creates a clean slate.",
-    );
-    if (!confirmed) return;
-
+  const performDeleteAllMemory = useCallback(async () => {
     setBusyAction("delete_all_frames");
     setError(null);
+    setPrivacyActionStatus(null);
     storeGenerationRef.current += 1;
     try {
       const nextStatus = await invoke<CaptureStatus>("delete_all_frames");
@@ -1290,17 +1368,87 @@ function App() {
         last_skipped_at: null,
         last_error: null,
       });
+      await refreshContinueMemory();
+      await refreshMemoryDiagnostics();
+      await refreshExclusionRules();
+      setPrivacyActionStatus("Local memory deleted.");
     } catch (err) {
       setError(`Delete all failed: ${String(err)}`);
     } finally {
       setBusyAction(null);
     }
+  }, [refreshContinueMemory, refreshExclusionRules, refreshMemoryDiagnostics]);
+
+  const deleteAllFrames = useCallback(() => {
+    setPendingDangerAction("delete_all");
   }, []);
+
+  const deleteRecentMemory = useCallback(() => {
+    setPendingDangerAction("delete_recent");
+  }, []);
+
+  const performDeleteRecentMemory = useCallback(async () => {
+    setBusyAction("delete_recent_captures");
+    setError(null);
+    setPrivacyActionStatus(null);
+    storeGenerationRef.current += 1;
+    try {
+      const deletedCount = await invoke<number>("delete_recent_captures", {
+        rangeMs: RECENT_MEMORY_DELETE_RANGE_MS,
+      });
+      storeGenerationRef.current += 1;
+      setResults([]);
+      setSelectedFrame(null);
+      setImageData(null);
+      setFrameDetail(null);
+      setTimeline(emptyTimeline);
+      setContinueDecision(null);
+      setContinueDecisionFrameCount(null);
+      setWorkstreams([]);
+      setSelectedWorkstreamId(null);
+      setWorkstreamDetail(null);
+      setFeedbackStatus(null);
+      setEvalReport(null);
+      const nextStatus = await invoke<CaptureStatus>("capture_status");
+      setStatus(nextStatus);
+      await refreshContinueMemory();
+      await refreshMemoryDiagnostics();
+      setPrivacyActionStatus(
+        deletedCount > 0
+          ? `Deleted ${deletedCount} recent evidence ${deletedCount === 1 ? "item" : "items"}.`
+          : "No recent local evidence needed deletion.",
+      );
+    } catch (err) {
+      setError(`Delete recent memory failed: ${String(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }, [refreshContinueMemory, refreshMemoryDiagnostics]);
+
+  const confirmDangerAction = useCallback(async () => {
+    const action = pendingDangerAction;
+    if (!action) return;
+    setPendingDangerAction(null);
+    if (action === "delete_all") {
+      await performDeleteAllMemory();
+    } else if (action === "delete_recent") {
+      await performDeleteRecentMemory();
+    } else {
+      await performDevReset();
+    }
+  }, [pendingDangerAction, performDeleteAllMemory, performDeleteRecentMemory, performDevReset]);
 
   useEffect(() => {
     void refreshStatus();
     void refreshContinueMemory();
-  }, []);
+    void refreshExclusionRules();
+  }, [refreshContinueMemory, refreshExclusionRules, refreshStatus]);
+
+  useEffect(() => {
+    if (privacyPanelOpen) {
+      void refreshExclusionRules();
+    }
+  }, [privacyPanelOpen, refreshExclusionRules]);
 
   useEffect(() => {
     if (!memoryMenuOpen) return;
@@ -1453,22 +1601,30 @@ function App() {
       : continueDecision
         ? "Current"
         : "Ready";
-  const continueStatusLabel = isDeleting
-    ? "Deleting local memory"
-    : status.last_error
-      ? "Permission issue"
-      : status.running
-        ? "Active"
-        : continueHasEvidence
-          ? "Paused"
-          : "No evidence";
-  const continuePrimaryMessage = !continueHasEvidence
-    ? "Start local memory to make Continue useful."
-    : status.running && !continueDecision
-      ? "Smalltalk is watching locally. Continue when there is enough evidence."
-      : continueDecision
-        ? continueWorkstreamTitle
-        : "Ready to find where to continue.";
+  const latestEvidenceFrame = status.latest_frame;
+  const memorySurfacePrivate = isPrivateMemorySurface(status);
+  const memoryProductStatus = deriveMemoryProductStatus(
+    status,
+    continueHasEvidence,
+    busyAction,
+    memorySurfacePrivate,
+  );
+  const memoryProduct = getMemoryProductCopy(memoryProductStatus, status.last_error);
+  const continueStatusLabel = memoryProduct.label;
+  const memoryCueLabel = status.last_error
+    ? memoryProduct.label
+    : continueIsStale
+      ? "New evidence since this answer"
+      : memoryProduct.label;
+  const continuePrimaryMessage = status.running && !continueDecision && !continueHasEvidence
+    ? "Local memory is on."
+    : !continueHasEvidence
+      ? "Turn on local memory once."
+      : status.running && !continueDecision
+        ? "Local memory is on."
+        : continueDecision
+          ? continueWorkstreamTitle
+          : "Ready to find your continuation.";
   const captureStateLabel = isDeleting
     ? "Deleting"
     : status.running
@@ -1476,18 +1632,130 @@ function App() {
       : "Ready";
   const hasFrames = status.frame_count > 0;
   const hasQuery = query.trim().length > 0;
-  const latestFrameLabel = status.latest_frame
-    ? formatTime(status.latest_frame.captured_at)
+  const latestFrameLabel = latestEvidenceFrame
+    ? formatTime(latestEvidenceFrame.captured_at)
     : "None yet";
-  const latestEvidenceAgeLabel = status.latest_frame
-    ? formatRelativeAge(status.latest_frame.captured_at)
+  const latestEvidenceAgeLabel = latestEvidenceFrame
+    ? formatRelativeAge(latestEvidenceFrame.captured_at)
     : "No evidence yet";
   const sessionLabel = currentSession
     ? `${currentSession.status} capture-${String(currentSession.sequence).padStart(3, "0")}`
     : "No capture";
+  const currentAppPattern = latestEvidenceFrame?.app_bundle_id || latestEvidenceFrame?.app_name || "";
+  const currentAppLabel = latestEvidenceFrame?.app_name || latestEvidenceFrame?.app_bundle_id || "";
+  const currentWebsitePattern = sitePatternFromUrl(latestEvidenceFrame?.browser_url);
+  const currentWebsiteLabel = siteLabelFromUrl(latestEvidenceFrame?.browser_url);
+  const currentAppExcluded = currentAppPattern
+    ? hasEnabledExclusion(exclusionRules, "app_bundle", currentAppPattern)
+    : false;
+  const currentWebsiteExcluded = currentWebsitePattern
+    ? hasEnabledExclusion(exclusionRules, "url_regex", currentWebsitePattern)
+    : false;
   const activeContext = frameDetail?.app_contexts[0];
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No frame selected";
+  const showInspectEntry = import.meta.env.DEV;
+  const openDeveloperMode = useCallback(() => {
+    setMemoryMenuOpen(false);
+    setViewMode("developer");
+    void refreshWorkstreams();
+    void runSearch("");
+    void refreshTimeline();
+    void refreshMemoryDiagnostics();
+    void loadWorkstreamDetail(selectedWorkstreamId);
+  }, [
+    loadWorkstreamDetail,
+    refreshMemoryDiagnostics,
+    refreshTimeline,
+    refreshWorkstreams,
+    runSearch,
+    selectedWorkstreamId,
+  ]);
+
+  const openPrivacyPanel = useCallback(() => {
+    setMemoryMenuOpen(false);
+    setPrivacyPanelOpen(true);
+    setPrivacyActionStatus(null);
+    void refreshExclusionRules();
+  }, [refreshExclusionRules]);
+
+  const addPrivacyExclusion = useCallback(
+    async (rule: ExclusionRuleInput, successMessage: string) => {
+      setBusyAction("add_exclusion_rule");
+      setError(null);
+      setPrivacyActionStatus(null);
+      try {
+        await invoke<ExclusionRule>("add_exclusion_rule", { rule });
+        await refreshExclusionRules();
+        await refreshStatus();
+        setPrivacyActionStatus(successMessage);
+      } catch (err) {
+        setPrivacyActionStatus(`Could not add privacy exclusion: ${String(err)}`);
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [refreshExclusionRules, refreshStatus],
+  );
+
+  const excludeCurrentApp = useCallback(async () => {
+    if (!currentAppPattern) {
+      setPrivacyActionStatus("No current app is available to exclude yet.");
+      return;
+    }
+    if (currentAppExcluded) {
+      setPrivacyActionStatus(`${currentAppLabel || "This app"} is already excluded.`);
+      return;
+    }
+    await addPrivacyExclusion(
+      {
+        rule_type: "app_bundle",
+        pattern: currentAppPattern,
+        action: "skip_capture",
+        enabled: true,
+      },
+      `${currentAppLabel || "This app"} will be skipped by local memory.`,
+    );
+  }, [addPrivacyExclusion, currentAppExcluded, currentAppLabel, currentAppPattern]);
+
+  const excludeCurrentWebsite = useCallback(async () => {
+    if (!currentWebsitePattern) {
+      setPrivacyActionStatus("No current website is available to exclude yet.");
+      return;
+    }
+    if (currentWebsiteExcluded) {
+      setPrivacyActionStatus(`${currentWebsiteLabel || "This website"} is already excluded.`);
+      return;
+    }
+    await addPrivacyExclusion(
+      {
+        rule_type: "url_regex",
+        pattern: currentWebsitePattern,
+        action: "skip_capture",
+        enabled: true,
+      },
+      `${currentWebsiteLabel || "This website"} will be skipped by local memory.`,
+    );
+  }, [addPrivacyExclusion, currentWebsiteExcluded, currentWebsiteLabel, currentWebsitePattern]);
+
+  const removeExclusionRule = useCallback(
+    async (ruleId: string) => {
+      setBusyAction("remove_exclusion_rule");
+      setError(null);
+      setPrivacyActionStatus(null);
+      try {
+        await invoke<boolean>("remove_exclusion_rule", { ruleId });
+        await refreshExclusionRules();
+        setPrivacyActionStatus("Privacy exclusion removed.");
+      } catch (err) {
+        setPrivacyActionStatus(`Could not remove privacy exclusion: ${String(err)}`);
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [refreshExclusionRules],
+  );
+
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
@@ -1530,38 +1798,30 @@ function App() {
           <div className="brand-mark" aria-hidden="true">S</div>
           <div>
             <p className="product-kicker">Smalltalk</p>
-            <h1>{viewMode === "developer" ? "Developer mode" : "Continue"}</h1>
+            <h1>{viewMode === "developer" ? "Evidence inspection" : "Continue"}</h1>
           </div>
         </div>
 
-        <div className="view-switch" aria-label="App view">
-          <button
-            className={viewMode === "continue" ? "active" : ""}
-            type="button"
-            onClick={() => {
-              setViewMode("continue");
-              setEvidenceOpen(false);
-            }}
-          >
-            Continue
-          </button>
-          <button
-            className={viewMode === "developer" ? "active" : ""}
-            type="button"
-            onClick={() => {
-              setViewMode("developer");
-              void refreshWorkstreams();
-              void runSearch("");
-              void refreshTimeline();
-              void refreshMemoryDiagnostics();
-              void loadWorkstreamDetail(selectedWorkstreamId);
-            }}
-          >
-            Developer
-          </button>
+        <div className="topbar-status" aria-label="Local memory status">
+          {viewMode === "developer" ? (
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => {
+                setViewMode("continue");
+                setEvidenceOpen(false);
+              }}
+            >
+              Back to Continue
+            </button>
+          ) : (
+	            <span className={`memory-dot ${memoryProductStatus}`}>
+	              {memoryCueLabel}
+	            </span>
+          )}
         </div>
 
-        <div className="topbar-meta" aria-label="Local memory status">
+        <div className="topbar-meta" aria-label={viewMode === "developer" ? "Developer status" : "Continue controls"}>
           {viewMode === "developer" ? (
             <>
               <StatusPill label="Local memory" value={continueStatusLabel} tone={status.running ? "good" : status.last_error ? "bad" : "quiet"} />
@@ -1569,9 +1829,110 @@ function App() {
               <StatusPill label="Continue" value={continueFreshnessLabel} tone={continueIsStale ? "good" : "quiet"} />
             </>
           ) : (
-            <span className={`memory-dot ${status.running ? "active" : ""}`}>
-              {status.running ? "Local memory active" : continueHasEvidence ? "Local memory paused" : "No local memory yet"}
-            </span>
+            <div className="topbar-actions">
+              <button
+                className="primary-button topbar-continue-button"
+                type="button"
+                disabled={!continueHasEvidence || busyAction !== null}
+                aria-busy={busyAction === "get_continue_decision"}
+                onClick={() => void runContinueDecision({ writeAudit: true })}
+              >
+                {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
+              </button>
+              <details
+                className="capture-menu topbar-memory-menu"
+                open={memoryMenuOpen}
+                ref={captureMenuRef}
+                onToggle={(event) => setMemoryMenuOpen(event.currentTarget.open)}
+              >
+                <summary>Memory</summary>
+                <div>
+                  {status.running ? (
+                    <button
+                      className="secondary-button"
+                      disabled={busyAction !== null}
+                      aria-busy={busyAction === "stop_capture"}
+                      onClick={() => {
+                        setMemoryMenuOpen(false);
+                        void runAction("stop_capture");
+                      }}
+                      type="button"
+                    >
+	                      {busyAction === "stop_capture" ? "Pausing" : "Pause memory"}
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary-button"
+                      disabled={busyAction !== null}
+                      aria-busy={busyAction === "start_capture"}
+                      onClick={() => {
+                        setMemoryMenuOpen(false);
+                        void runAction("start_capture");
+                      }}
+                      type="button"
+                    >
+                      {busyAction === "start_capture" ? "Starting" : "Turn on local memory"}
+                    </button>
+	                  )}
+	                  <button
+	                    className="secondary-button"
+	                    disabled={busyAction !== null}
+	                    onClick={openPrivacyPanel}
+	                    type="button"
+	                  >
+	                    Privacy
+	                  </button>
+	                  <button
+	                    className="secondary-button"
+	                    disabled={!status.running || busyAction !== null}
+                    aria-busy={busyAction === "capture_once"}
+                    onClick={() => {
+                      setMemoryMenuOpen(false);
+                      void runAction("capture_once");
+                    }}
+                    type="button"
+                  >
+                    {busyAction === "capture_once" ? "Updating" : "Update memory now"}
+                  </button>
+                  <button
+                    className="secondary-button"
+                    disabled={!continueHasEvidence || busyAction !== null}
+                    aria-busy={busyAction === "get_continue_decision"}
+                    onClick={() => {
+                      setMemoryMenuOpen(false);
+                      void runContinueDecision({ writeAudit: true });
+                    }}
+                    type="button"
+	                  >
+	                    {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh Continue"}
+	                  </button>
+	                  <button
+	                    className="danger-button"
+	                    disabled={!continueHasEvidence || busyAction !== null}
+	                    aria-busy={isDeleting}
+	                    onClick={() => {
+	                      setMemoryMenuOpen(false);
+	                      deleteAllFrames();
+	                    }}
+	                    type="button"
+	                  >
+	                    {isDeleting ? "Deleting" : "Delete local memory"}
+	                  </button>
+	                  {showInspectEntry ? (
+	                    <>
+	                      <span className="menu-section-label">Advanced</span>
+                      <button
+                        className="text-button"
+                        onClick={openDeveloperMode}
+                        type="button"
+                      >
+                        Inspect local evidence
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              </details>
+            </div>
           )}
         </div>
       </header>
@@ -1583,31 +1944,81 @@ function App() {
         }}
       >
       <section className="continue-home" aria-label="Continue">
-        <ContinuationAnswer
-          decision={continueDecision}
-          primaryMessage={continuePrimaryMessage}
-          hasEvidence={continueHasEvidence}
-          running={status.running}
-          busyAction={busyAction}
-          openResult={continueOpenResult}
-          stale={continueIsStale}
-          onStartMemory={() => void runAction("start_capture")}
-          onContinue={() => void runContinueDecision({ writeAudit: true })}
-          onOpenTarget={() => void openContinueTarget()}
-          onRecordFeedback={(kind) => void recordContinueFeedback(kind)}
-          onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
-        />
-      </section>
+        <div className="continue-stage">
+          <ContinuationAnswer
+            decision={continueDecision}
+            primaryMessage={continuePrimaryMessage}
+            hasEvidence={continueHasEvidence}
+            running={status.running}
+            busyAction={busyAction}
+            openResult={continueOpenResult}
+            stale={continueIsStale}
+            onStartMemory={() => void runAction("start_capture")}
+            onContinue={() => void runContinueDecision({ writeAudit: true })}
+            onOpenTarget={() => void openContinueTarget()}
+            onInspectEvidence={() => {
+              const firstEvidenceFrame = continueDecision?.evidence_anchors.frame_ids[0] || null;
+              void revealContinueFrame(firstEvidenceFrame);
+            }}
+            feedbackStatus={feedbackStatus}
+            onRecordFeedback={(kind) => void recordContinueFeedback(kind)}
+            onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
+          />
+          <ContinueCompanionPanel
+            status={status}
+            hasEvidence={continueHasEvidence}
+            decision={continueDecision}
+            busyAction={busyAction}
+            statusLabel={continueStatusLabel}
+            freshnessLabel={continueFreshnessLabel}
+	            evidenceAgeLabel={latestEvidenceAgeLabel}
+	            memoryProductStatus={memoryProductStatus}
+	            memoryProduct={memoryProduct}
+	            privacyActionStatus={privacyActionStatus}
+	            onStartMemory={() => void runAction("start_capture")}
+	            onPauseMemory={() => void runAction("stop_capture")}
+	            onCaptureEvidence={() => void runAction("capture_once")}
+	            onRefreshContinue={() => void runContinueDecision({ writeAudit: true })}
+	            onOpenPrivacy={openPrivacyPanel}
+	            onDeleteLocalMemory={deleteAllFrames}
+	          />
+	        </div>
+	      </section>
 
-      {continueError ? (
-        <div className="error-box" role="alert">{continueError}</div>
-      ) : null}
+	      {privacyPanelOpen ? (
+	        <PrivacyPanel
+	          status={status}
+	          memoryProductStatus={memoryProductStatus}
+	          memoryProduct={memoryProduct}
+	          exclusionRules={exclusionRules}
+	          currentAppLabel={currentAppLabel}
+	          currentWebsiteLabel={currentWebsiteLabel}
+	          currentAppExcluded={currentAppExcluded}
+	          currentWebsiteExcluded={currentWebsiteExcluded}
+	          hasCurrentApp={Boolean(currentAppPattern)}
+	          hasCurrentWebsite={Boolean(currentWebsitePattern)}
+	          busyAction={busyAction}
+	          privacyActionStatus={privacyActionStatus}
+	          onClose={() => setPrivacyPanelOpen(false)}
+	          onStartMemory={() => void runAction("start_capture")}
+	          onPauseMemory={() => void runAction("stop_capture")}
+	          onExcludeCurrentApp={() => void excludeCurrentApp()}
+	          onExcludeCurrentWebsite={() => void excludeCurrentWebsite()}
+	          onRemoveExclusion={(ruleId) => void removeExclusionRule(ruleId)}
+	          onDeleteRecentMemory={deleteRecentMemory}
+	          onDeleteAllMemory={deleteAllFrames}
+	        />
+	      ) : null}
 
-      {error || status.last_error ? (
-        <div className="error-box" role="alert">{error || status.last_error}</div>
-      ) : null}
+	      {continueError ? (
+	        <MemoryErrorBox message={continueError} />
+	      ) : null}
 
-      {viewMode === "developer" && evidenceOpen ? (
+	      {error || status.last_error ? (
+	        <MemoryErrorBox message={error || status.last_error || ""} />
+	      ) : null}
+
+      {evidenceOpen ? (
         <ContinueEvidencePanel
           decision={continueDecision}
           selectedFrame={selectedFrame}
@@ -1623,7 +2034,7 @@ function App() {
             <span>Developer diagnostics</span>
             <strong>Frame inspector, search, raw events, and local evidence substrate</strong>
           </div>
-          <div className="control-strip" aria-label="Capture controls">
+	          <div className="control-strip" aria-label="Local memory controls">
             <button
               className="primary-button"
               disabled={busyAction !== null}
@@ -1650,7 +2061,7 @@ function App() {
                   }}
                   type="button"
                 >
-                  {busyAction === "start_capture" ? "Starting" : "Start local memory"}
+                  {busyAction === "start_capture" ? "Starting" : "Turn on local memory"}
                 </button>
                 <button
                   className="secondary-button"
@@ -1662,7 +2073,7 @@ function App() {
                   }}
                   type="button"
                 >
-                  {busyAction === "stop_capture" ? "Pausing" : "Pause local memory"}
+	                  {busyAction === "stop_capture" ? "Pausing" : "Pause memory"}
                 </button>
                 <button
                   className="secondary-button"
@@ -1674,7 +2085,7 @@ function App() {
                   }}
                   type="button"
                 >
-                  {busyAction === "capture_once" ? "Capturing" : "Capture evidence now"}
+	                  {busyAction === "capture_once" ? "Adding" : "Add evidence"}
                 </button>
                 <button
                   className="danger-button"
@@ -1798,7 +2209,7 @@ function App() {
                 type="button"
                 disabled={busyAction !== null}
                 aria-busy={busyAction === "dev_reset_local_memory"}
-                onClick={() => void runDevReset()}
+                onClick={requestDevReset}
               >
                 {busyAction === "dev_reset_local_memory" ? "Resetting" : "Dev reset"}
               </button>
@@ -2145,8 +2556,409 @@ function App() {
       </section>
       </section>
       ) : null}
+	      </div>
+	      {pendingDangerAction ? (
+	        <DangerConfirmDialog
+	          action={pendingDangerAction}
+	          busyAction={busyAction}
+	          onCancel={() => setPendingDangerAction(null)}
+	          onConfirm={() => void confirmDangerAction()}
+	        />
+	      ) : null}
+	    </main>
+	  );
+	}
+
+function ContinueCompanionPanel({
+  status,
+  hasEvidence,
+  decision,
+  busyAction,
+  statusLabel,
+  freshnessLabel,
+  evidenceAgeLabel,
+  memoryProductStatus,
+  memoryProduct,
+  privacyActionStatus,
+  onStartMemory,
+  onPauseMemory,
+  onCaptureEvidence,
+  onRefreshContinue,
+  onOpenPrivacy,
+  onDeleteLocalMemory,
+}: {
+  status: CaptureStatus;
+  hasEvidence: boolean;
+  decision: ContinueDecisionResult | null;
+  busyAction: string | null;
+  statusLabel: string;
+  freshnessLabel: string;
+  evidenceAgeLabel: string;
+  memoryProductStatus: MemoryProductStatus;
+  memoryProduct: { label: string; detail: string };
+  privacyActionStatus: string | null;
+  onStartMemory: () => void;
+  onPauseMemory: () => void;
+  onCaptureEvidence: () => void;
+  onRefreshContinue: () => void;
+  onOpenPrivacy: () => void;
+  onDeleteLocalMemory: () => void;
+}) {
+  const memoryTone = companionToneForStatus(memoryProductStatus);
+
+  return (
+    <aside className="continue-companion" aria-label="Local memory and trust status">
+      <div className={`companion-orb ${memoryTone}`} aria-hidden="true">
+        <span />
       </div>
-    </main>
+      <div className="companion-copy">
+        <span>{statusLabel}</span>
+        <strong>{memoryProduct.label}</strong>
+        <p>{memoryProduct.detail}</p>
+      </div>
+
+      <div className="companion-facts" aria-label="Continue readiness">
+        <div>
+          <span>Continue</span>
+          <strong>{busyAction === "get_continue_decision" ? "Updating" : decision ? freshnessLabel : hasEvidence ? "Ready" : "Waiting"}</strong>
+        </div>
+        <div>
+          <span>Evidence</span>
+          <strong>{evidenceAgeLabel}</strong>
+        </div>
+      </div>
+
+      <div className="privacy-note">
+        <span>Privacy boundary</span>
+        <p>Local memory is private to this device. Raw typed characters and full clipboard contents are not stored.</p>
+      </div>
+
+      <details className="companion-controls">
+        <summary>Memory controls</summary>
+        <div className="companion-actions" aria-label="Local memory controls">
+          {status.running ? (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null}
+              aria-busy={busyAction === "stop_capture"}
+              onClick={onPauseMemory}
+            >
+              {busyAction === "stop_capture" ? "Pausing" : "Pause memory"}
+            </button>
+          ) : (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null}
+              aria-busy={busyAction === "start_capture"}
+              onClick={onStartMemory}
+            >
+              {busyAction === "start_capture" ? "Starting" : "Turn on memory"}
+            </button>
+          )}
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={!status.running || busyAction !== null}
+            aria-busy={busyAction === "capture_once"}
+            onClick={onCaptureEvidence}
+          >
+            Update memory
+          </button>
+          <button
+            className="text-button"
+            type="button"
+            disabled={!hasEvidence || busyAction !== null}
+            onClick={onRefreshContinue}
+          >
+            Refresh Continue
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            onClick={onOpenPrivacy}
+          >
+            Privacy
+          </button>
+          <button
+            className="danger-button"
+            type="button"
+            disabled={!hasEvidence || busyAction !== null}
+            aria-busy={busyAction === "delete_all_frames"}
+            onClick={onDeleteLocalMemory}
+          >
+            Delete local memory
+          </button>
+          {privacyActionStatus ? (
+            <p className="privacy-action-status" role="status">{privacyActionStatus}</p>
+          ) : null}
+        </div>
+      </details>
+    </aside>
+  );
+}
+
+function PrivacyPanel({
+  status,
+  memoryProductStatus,
+  memoryProduct,
+  exclusionRules,
+  currentAppLabel,
+  currentWebsiteLabel,
+  currentAppExcluded,
+  currentWebsiteExcluded,
+  hasCurrentApp,
+  hasCurrentWebsite,
+  busyAction,
+  privacyActionStatus,
+  onClose,
+  onStartMemory,
+  onPauseMemory,
+  onExcludeCurrentApp,
+  onExcludeCurrentWebsite,
+  onRemoveExclusion,
+  onDeleteRecentMemory,
+  onDeleteAllMemory,
+}: {
+  status: CaptureStatus;
+  memoryProductStatus: MemoryProductStatus;
+  memoryProduct: { label: string; detail: string };
+  exclusionRules: ExclusionRule[];
+  currentAppLabel: string;
+  currentWebsiteLabel: string;
+  currentAppExcluded: boolean;
+  currentWebsiteExcluded: boolean;
+  hasCurrentApp: boolean;
+  hasCurrentWebsite: boolean;
+  busyAction: string | null;
+  privacyActionStatus: string | null;
+  onClose: () => void;
+  onStartMemory: () => void;
+  onPauseMemory: () => void;
+  onExcludeCurrentApp: () => void;
+  onExcludeCurrentWebsite: () => void;
+  onRemoveExclusion: (ruleId: string) => void;
+  onDeleteRecentMemory: () => void;
+  onDeleteAllMemory: () => void;
+}) {
+  const activeRules = exclusionRules.filter((rule) => rule.enabled);
+  const memoryBusy = busyAction === "start_capture" || busyAction === "stop_capture";
+  const exclusionBusy = busyAction === "add_exclusion_rule" || busyAction === "remove_exclusion_rule";
+  const deleting = busyAction === "delete_all_frames" || busyAction === "delete_recent_captures";
+  const startMemoryLabel = memoryProductStatus === "paused_with_evidence" ? "Resume memory" : "Turn on memory";
+
+  return (
+    <section className="privacy-panel" aria-label="Privacy">
+      <div className="privacy-panel-head">
+        <div>
+          <p className="product-kicker">Privacy</p>
+          <h2>Local memory boundaries</h2>
+        </div>
+        <button className="secondary-button" type="button" onClick={onClose}>
+          Close
+        </button>
+      </div>
+
+      <div className={`privacy-status-card ${memoryProductStatus}`}>
+        <span>Local memory</span>
+        <strong>{memoryProduct.label}</strong>
+        <p>{memoryProduct.detail}</p>
+      </div>
+
+      <div className="privacy-grid">
+        <section aria-label="What Smalltalk may use">
+          <h3>What Smalltalk may use</h3>
+          <ul>
+            <li>App and window context</li>
+            <li>Visible text when available</li>
+            <li>Lightweight activity signals</li>
+            <li>Derived workstream metadata</li>
+          </ul>
+        </section>
+
+        <section aria-label="What Smalltalk excludes">
+          <h3>What Smalltalk excludes</h3>
+          <ul>
+            <li>Raw typed characters</li>
+            <li>Full clipboard contents</li>
+            <li>Apps and websites you exclude</li>
+            <li>Frames marked never-send-to-AI</li>
+          </ul>
+        </section>
+      </div>
+
+      <div className="privacy-expanded-detail">
+        Smalltalk stores local work context such as app/window signals, visible text when available, evidence quality, and derived workstream metadata. It does not store raw typed characters or full clipboard contents.
+      </div>
+
+      <div className="privacy-controls-grid" aria-label="Privacy controls">
+        {status.running ? (
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            aria-busy={busyAction === "stop_capture"}
+            onClick={onPauseMemory}
+          >
+            {busyAction === "stop_capture" ? "Pausing" : "Pause memory"}
+          </button>
+        ) : (
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            aria-busy={busyAction === "start_capture"}
+            onClick={onStartMemory}
+          >
+            {busyAction === "start_capture" ? "Starting" : startMemoryLabel}
+          </button>
+        )}
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={!hasCurrentApp || currentAppExcluded || exclusionBusy || memoryBusy || deleting}
+          aria-busy={busyAction === "add_exclusion_rule"}
+          onClick={onExcludeCurrentApp}
+        >
+          {currentAppExcluded ? "Current app excluded" : "Exclude this app"}
+        </button>
+        {hasCurrentWebsite ? (
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={currentWebsiteExcluded || exclusionBusy || memoryBusy || deleting}
+            aria-busy={busyAction === "add_exclusion_rule"}
+            onClick={onExcludeCurrentWebsite}
+          >
+            {currentWebsiteExcluded ? "Current website excluded" : "Exclude this website"}
+          </button>
+        ) : null}
+        <button
+          className="danger-button"
+          type="button"
+          disabled={busyAction !== null}
+          aria-busy={busyAction === "delete_recent_captures"}
+          onClick={onDeleteRecentMemory}
+        >
+          Delete recent memory
+        </button>
+        <button
+          className="danger-button"
+          type="button"
+          disabled={busyAction !== null}
+          aria-busy={busyAction === "delete_all_frames"}
+          onClick={onDeleteAllMemory}
+        >
+          Delete local memory
+        </button>
+      </div>
+
+      <div className="current-surface-note">
+        <span>Current surface</span>
+        <p>
+          {hasCurrentApp
+            ? `${currentAppLabel || "This app"} can be excluded from future local memory.`
+            : "Smalltalk has not observed an app that can be excluded yet."}
+          {hasCurrentWebsite ? ` ${currentWebsiteLabel || "This website"} can also be excluded.` : ""}
+        </p>
+      </div>
+
+      <section className="exclusion-list" aria-label="Current exclusions">
+        <div className="exclusion-list-head">
+          <h3>Current exclusions</h3>
+          <span>{activeRules.length}</span>
+        </div>
+        {activeRules.length > 0 ? (
+          <ul>
+            {activeRules.map((rule) => (
+              <li key={rule.id}>
+                <div>
+                  <strong>{formatExclusionRule(rule)}</strong>
+                  <span>{formatExclusionAction(rule.action)}</span>
+                </div>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() => onRemoveExclusion(rule.id)}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>No user-visible exclusions are configured yet.</p>
+        )}
+      </section>
+
+      {privacyActionStatus ? (
+        <p className="privacy-action-status" role="status">{privacyActionStatus}</p>
+      ) : null}
+    </section>
+  );
+}
+
+function MemoryErrorBox({ message }: { message: string }) {
+  const productCopy = productizeMemoryError(message);
+  return (
+    <div className="error-box" role="alert">
+      <strong>{productCopy}</strong>
+      {message && productCopy !== message ? (
+        <details>
+          <summary>Details</summary>
+          <span>{message}</span>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function DangerConfirmDialog({
+  action,
+  busyAction,
+  onCancel,
+  onConfirm,
+}: {
+  action: DangerousAction;
+  busyAction: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const copy = dangerousActionCopy(action);
+  const busy = busyAction === "delete_all_frames" ||
+    busyAction === "delete_recent_captures" ||
+    busyAction === "dev_reset_local_memory";
+  return (
+    <div className="confirm-backdrop" role="presentation">
+      <section className="confirm-dialog" role="dialog" aria-modal="true" aria-label={copy.title}>
+        <div>
+          <h2>{copy.title}</h2>
+          <p>{copy.body}</p>
+        </div>
+        <div className="confirm-actions">
+          <button
+            className="danger-button"
+            type="button"
+            disabled={busy || busyAction !== null}
+            aria-busy={busy}
+            onClick={onConfirm}
+          >
+            {copy.confirmLabel}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -2158,9 +2970,11 @@ function ContinuationAnswer({
   busyAction,
   openResult,
   stale,
+  feedbackStatus,
   onStartMemory,
   onContinue,
   onOpenTarget,
+  onInspectEvidence,
   onRecordFeedback,
   onUseAlternative,
 }: {
@@ -2171,13 +2985,16 @@ function ContinuationAnswer({
   busyAction: string | null;
   openResult: OpenResumePointResult | null;
   stale: boolean;
+  feedbackStatus: string | null;
   onStartMemory: () => void;
   onContinue: () => void;
   onOpenTarget: () => void;
+  onInspectEvidence: () => void;
   onRecordFeedback: (feedbackKind: string) => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
   const resumeTarget = decision?.resume_work_target || decision?.return_target || null;
+  const canOpenResumeTarget = isDirectResumeTargetOpenable(resumeTarget);
   const lowConfidence = decision ? decision.confidence < 0.55 : false;
   const handoff = decision?.handoff || null;
   const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
@@ -2217,9 +3034,17 @@ function ContinuationAnswer({
   );
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
   const provenanceTone = decision ? continueProvenanceTone(decision) : "local";
+  const whyLines = (
+    handoff?.why_this?.map((line) => cleanHumanText(line)).filter(Boolean) ||
+    (presentation?.decisionReason ? [presentation.decisionReason] : [])
+  ).slice(0, 3);
+  const openButtonLabel =
+    busyAction === "open_continue_target"
+      ? "Opening"
+      : "Continue here";
   const uncertaintyLine =
     targetLooksInternal
-      ? "I saw the current screen, but I don't have a reliable return target yet."
+      ? "I saw the current focus, but I don't have a reliable return target yet."
       : safeProductLine(
           handoff?.user_visible_uncertainty ||
             handoff?.missing_evidence_line ||
@@ -2229,7 +3054,7 @@ function ContinuationAnswer({
         );
   const showCurrentFocus =
     Boolean(currentFocusLine) &&
-    currentFocusLine !== "No current screen returned." &&
+    currentFocusLine !== "No current focus returned." &&
     currentFocusLine !== targetLine &&
     (
       decision?.warnings.includes("current_focus_differs_from_return_target") ||
@@ -2246,43 +3071,44 @@ function ContinuationAnswer({
     onRecordFeedback(feedbackKind);
     setCorrectionOpen(false);
   };
+  const emptyPrimaryStartsMemory = !hasEvidence && !running;
+  const emptyPrimaryBusy = emptyPrimaryStartsMemory
+    ? busyAction === "start_capture"
+    : busyAction === "get_continue_decision";
+  const emptyPrimaryLabel = emptyPrimaryStartsMemory
+    ? emptyPrimaryBusy ? "Starting" : "Turn on local memory"
+    : busyAction === "get_continue_decision"
+      ? running && !hasEvidence ? "Finding best available answer" : "Finding where to continue"
+      : running && !hasEvidence ? "Find best available answer" : "Find where to continue";
+  const emptySubcopy = emptyPrimaryStartsMemory
+    ? "Smalltalk will quietly keep enough context to help you continue later."
+    : running && !hasEvidence
+      ? "Keep working. Smalltalk will surface a continuation when there is enough evidence."
+      : "Smalltalk can answer from local evidence without stopping memory first.";
 
   if (!decision) {
     return (
       <section className="continue-card continuation-answer empty" aria-label="Continue decision">
-        <div className="answer-eyebrow">
-          <span>{running ? "Local memory active" : hasEvidence ? "Local memory ready" : "No local memory yet"}</span>
-        </div>
-        <div className="answer-hero">
-          <p>{hasEvidence ? "Ready to answer" : "Start local memory"}</p>
-          <h2>{primaryMessage}</h2>
-          <span>
-            {hasEvidence
-              ? "Continue uses bounded AI over local candidates when available, with local validation and fallback. You do not need to stop anything first."
-              : "Smalltalk needs local evidence before it can say what you were doing and where to continue."}
-          </span>
-        </div>
-        <div className="answer-actions">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busyAction !== null}
-            aria-busy={busyAction === "get_continue_decision"}
-            onClick={onContinue}
-          >
-            {busyAction === "get_continue_decision" ? "Finding where to continue" : "Find where to continue"}
-          </button>
-          {!hasEvidence ? (
+        <div className="answer-shell">
+          <div className="answer-eyebrow">
+            <span>{running ? "Memory on" : hasEvidence ? "Evidence ready" : "No local memory yet"}</span>
+          </div>
+          <div className="answer-hero">
+            <p>{hasEvidence ? "Ready to find your continuation" : running ? "Local memory is on" : "Turn on local memory once"}</p>
+            <h2>{primaryMessage}</h2>
+            <span>{emptySubcopy}</span>
+          </div>
+          <div className="answer-actions">
             <button
-              className="secondary-button"
+              className="primary-button"
               type="button"
-              disabled={running || busyAction !== null}
-              aria-busy={busyAction === "start_capture"}
-              onClick={onStartMemory}
+              disabled={busyAction !== null}
+              aria-busy={emptyPrimaryBusy}
+              onClick={emptyPrimaryStartsMemory ? onStartMemory : onContinue}
             >
-              {busyAction === "start_capture" ? "Starting" : "Start local memory"}
+              {emptyPrimaryLabel}
             </button>
-          ) : null}
+          </div>
         </div>
       </section>
     );
@@ -2290,144 +3116,167 @@ function ContinuationAnswer({
 
   return (
     <section className={`continue-card continuation-answer ${lowConfidence || targetLooksInternal ? "low-confidence" : ""}`} aria-label="Continue decision">
-      <div className="answer-eyebrow answer-provenance">
-        <span>{stale ? "New local evidence since this answer" : lowConfidence || targetLooksInternal ? "Best available answer" : "Continue answer"}</span>
-        <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
-      </div>
-
-      <div className="answer-hero">
-        <p>You were working on</p>
-        <h2>{workstreamLine}</h2>
-      </div>
-
-      <div className="answer-target">
-        <div>
-          <span>{lowConfidence ? "Best available place to continue" : "Continue at"}</span>
-          <strong>{targetLine}</strong>
-          <small>{targetMeta}</small>
+      <div className="answer-shell">
+        <div className="answer-eyebrow answer-provenance">
+          <span>{stale ? "New local evidence since this answer" : lowConfidence || targetLooksInternal ? "Best available answer" : "Continue answer"}</span>
+          <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
         </div>
-      </div>
 
-      <div className="answer-state">
-        <div>
-          <span>Last meaningful state</span>
-          <strong>{lastStateLine}</strong>
+        <div className="answer-hero">
+          <p>You were working on</p>
+          <h2>{workstreamLine}</h2>
         </div>
-        <div>
-          <span>Next action</span>
-          <strong>{nextActionLine}</strong>
+
+        <div className="answer-target">
+          <div>
+            <span>{lowConfidence ? "Best available place to continue" : "Continue at"}</span>
+            <strong>{targetLine}</strong>
+            <small>{targetMeta}</small>
+          </div>
         </div>
-      </div>
 
-      {showCurrentFocus ? (
-        <p className="answer-context">
-          Current focus: <strong>{currentFocusLine}</strong>
-        </p>
-      ) : null}
+        <div className="answer-state">
+          <div>
+            <span>Last meaningful state</span>
+            <strong>{lastStateLine}</strong>
+          </div>
+          <div>
+            <span>Next action</span>
+            <strong>{nextActionLine}</strong>
+          </div>
+        </div>
 
-      {lowConfidence || uncertaintyLine ? (
-        <p className="answer-uncertainty">
-          {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
-        </p>
-      ) : null}
-
-      <div className="answer-actions">
-        <button
-          className="primary-button"
-          type="button"
-          disabled={busyAction !== null || !resumeTarget}
-          aria-busy={busyAction === "open_continue_target"}
-          onClick={onOpenTarget}
-        >
-          {busyAction === "open_continue_target" ? "Opening" : "Continue here"}
-        </button>
-        <button
-          className="secondary-button"
-          type="button"
-          disabled={busyAction !== null}
-          aria-busy={busyAction === "get_continue_decision"}
-          onClick={onContinue}
-        >
-          {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh Continue"}
-        </button>
-      </div>
-
-      <div className="continue-correction">
-        <button
-          className="text-button"
-          type="button"
-          disabled={busyAction !== null}
-          onClick={() => setCorrectionOpen((open) => !open)}
-        >
-          Not right
-        </button>
-        {correctionOpen ? (
-          <div className="continue-correction-panel" aria-label="Correction controls">
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("rejected")}
-            >
-              Mark wrong target
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null || alternatives.length === 0}
-              onClick={() => {
-                setAlternativesOpen((open) => !open);
-              }}
-            >
-              {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("artifact_only_evidence")}
-            >
-              This was only evidence
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => recordAndClose("ignored_workstream")}
-            >
-              Ignore this workstream
-            </button>
+        {whyLines.length ? (
+          <div className="answer-why-strip" aria-label="Why this continuation">
+            {whyLines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
           </div>
         ) : null}
-      </div>
 
-      {visibleAlternatives.length > 0 ? (
-        <div className="alternative-list" aria-label="Alternative continuations">
-          {visibleAlternatives.map((candidate) => (
-            <div className="alternative-row" key={candidate.candidate_id}>
-              <div>
-                <strong>{presentAlternativeCandidate(candidate)}</strong>
-                <span>{productizeInternalLabel(candidate.reason) || candidate.confidence_label || "Possible continuation"}</span>
-              </div>
+        {showCurrentFocus ? (
+          <p className="answer-context">
+            Current focus: <strong>{currentFocusLine}</strong>
+          </p>
+        ) : null}
+
+        {lowConfidence || uncertaintyLine ? (
+          <p className="answer-uncertainty">
+            {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
+          </p>
+        ) : null}
+
+        <div className="answer-actions">
+          {canOpenResumeTarget ? (
+            <button
+              className="primary-button"
+              type="button"
+              disabled={busyAction !== null}
+              aria-busy={busyAction === "open_continue_target"}
+              onClick={onOpenTarget}
+            >
+              {openButtonLabel}
+            </button>
+          ) : null}
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            onClick={onInspectEvidence}
+          >
+            Why this?
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            aria-busy={busyAction === "get_continue_decision"}
+            onClick={onContinue}
+          >
+            {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh"}
+          </button>
+        </div>
+
+        <div className="continue-correction">
+          <button
+            className="text-button"
+            type="button"
+            disabled={busyAction !== null}
+            onClick={() => setCorrectionOpen((open) => !open)}
+          >
+            Wrong target?
+          </button>
+          {correctionOpen ? (
+            <div className="continue-correction-panel" aria-label="Correction controls">
               <button
                 className="secondary-button"
                 type="button"
                 disabled={busyAction !== null}
-                onClick={() => onUseAlternative(candidate)}
+                onClick={() => recordAndClose("rejected")}
               >
-                Use this instead
+                Not this
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null || alternatives.length === 0}
+                onClick={() => {
+                  setAlternativesOpen((open) => !open);
+                }}
+              >
+                {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null}
+                onClick={() => recordAndClose("artifact_only_evidence")}
+              >
+                This was only evidence
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null}
+                onClick={() => recordAndClose("ignored_workstream")}
+              >
+                Ignore this workstream
               </button>
             </div>
-          ))}
+          ) : null}
+          {feedbackStatus ? (
+            <p className="correction-feedback" role="status">{feedbackStatus}</p>
+          ) : null}
         </div>
-      ) : null}
 
-      {openResult ? (
-        <div className="continue-open-result">
-          <strong>Open target</strong>
-          <span>{presentOpenResult(openResult)}</span>
-        </div>
-      ) : null}
+        {visibleAlternatives.length > 0 ? (
+          <div className="alternative-list" aria-label="Alternative continuations">
+            {visibleAlternatives.map((candidate) => (
+              <div className="alternative-row" key={candidate.candidate_id}>
+                <div>
+                  <strong>{presentAlternativeCandidate(candidate)}</strong>
+                  <span>{productizeInternalLabel(candidate.reason) || candidate.confidence_label || "Possible continuation"}</span>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() => onUseAlternative(candidate)}
+                >
+                  Use this
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {openResult ? (
+          <div className="continue-open-result">
+            <strong>Open target</strong>
+            <span>{presentOpenResult(openResult)}</span>
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -2454,10 +3303,10 @@ function ContinueEvidencePanel({
 
   if (!decision) {
     return (
-      <section className="continue-evidence-panel empty" aria-label="Continue evidence">
+      <section className="continue-evidence-panel empty" aria-label="Why this continuation">
         <div className="continue-evidence-head">
           <div>
-            <p className="product-kicker">Continue evidence</p>
+            <p className="product-kicker">Why this continuation?</p>
             <h2>Run Continue after local memory has evidence.</h2>
           </div>
           <button className="secondary-button" type="button" onClick={onClose}>
@@ -2469,10 +3318,10 @@ function ContinueEvidencePanel({
   }
 
   return (
-    <section className="continue-evidence-panel" aria-label="Continue evidence">
+    <section className="continue-evidence-panel" aria-label="Why this continuation">
       <div className="continue-evidence-head">
         <div>
-          <p className="product-kicker">Continue evidence</p>
+          <p className="product-kicker">Why this continuation?</p>
           <h2>{presentation?.workstreamTitle || continueTargetLabel(target) || "Selected workstream"}</h2>
         </div>
         <button className="secondary-button" type="button" onClick={onClose}>
@@ -2491,23 +3340,23 @@ function ContinueEvidencePanel({
             <dd>{presentation?.returnTarget || "No return target returned."}</dd>
           </div>
           <div>
-            <dt>Current screen</dt>
-            <dd>{presentation?.currentFocus || "No current screen returned."}</dd>
+            <dt>Current focus</dt>
+            <dd>{presentation?.currentFocus || "No current focus returned."}</dd>
           </div>
           <div>
             <dt>Last meaningful action</dt>
             <dd>{presentation?.lastState || "No action returned."}</dd>
           </div>
           <div>
-            <dt>Unresolved state</dt>
+            <dt>What is unresolved</dt>
             <dd>{presentation?.unresolvedState || "No unresolved state returned."}</dd>
           </div>
           <div>
-            <dt>Evidence</dt>
+            <dt>Missing evidence</dt>
             <dd>{presentation?.missingEvidenceSummary || "No missing evidence called out."}</dd>
           </div>
           <div>
-            <dt>Inference</dt>
+            <dt>How this was chosen</dt>
             <dd>{provenanceLabel}</dd>
           </div>
         </dl>
@@ -2515,7 +3364,7 @@ function ContinueEvidencePanel({
         <div className="anchor-preview">
           <div className="anchor-preview-head">
             <strong>Evidence anchor</strong>
-            <span>{selectedFrame ? frameTitle(selectedFrame) : "No evidence selected"}</span>
+            <span>{evidenceAnchorLabel(selectedFrame)}</span>
           </div>
           {selectedFrame && imageData ? (
             <div className="anchor-image" style={stageStyle(selectedFrame)}>
@@ -2524,7 +3373,7 @@ function ContinueEvidencePanel({
           ) : (
             <div className="anchor-empty">
               <strong>No preview loaded</strong>
-              <span>{selectedFrame ? frameTitle(selectedFrame) : "No evidence preview is selected."}</span>
+              <span>{selectedFrame ? evidenceAnchorLabel(selectedFrame) : "No evidence preview is selected."}</span>
             </div>
           )}
         </div>
@@ -3074,11 +3923,11 @@ function EmptyCaptureState({
 }) {
   return (
     <div className="empty-state">
-      <strong>{hasFrames && hasQuery ? "No matching evidence" : "No captured frames yet"}</strong>
+      <strong>{hasFrames && hasQuery ? "No matching evidence" : "No evidence yet"}</strong>
       <span>
         {hasFrames && hasQuery
-          ? "Clear the search or use a broader term to inspect existing captures."
-          : "Start a session to collect screenshots, events, text sources, and missing-signal checks."}
+          ? "Clear the search or use a broader term to inspect existing evidence."
+          : "Turn on local memory to collect inspectable evidence, text sources, and missing-signal checks."}
       </span>
     </div>
   );
@@ -3225,6 +4074,181 @@ function EvidencePanel({
   );
 }
 
+function deriveMemoryProductStatus(
+  status: CaptureStatus,
+  hasEvidence: boolean,
+  busyAction: string | null,
+  privateOrExcluded: boolean,
+): MemoryProductStatus {
+  if (
+    busyAction === "delete_all_frames" ||
+    busyAction === "delete_recent_captures" ||
+    busyAction === "dev_reset_local_memory"
+  ) {
+    return "deleting";
+  }
+  if (busyAction === "start_capture") {
+    return "starting";
+  }
+  if (status.last_error) {
+    return isPermissionMemoryError(status.last_error) ? "needs_permission" : "needs_attention";
+  }
+  if (privateOrExcluded) {
+    return "private_or_excluded";
+  }
+  if (status.running) {
+    return "on";
+  }
+  if (hasEvidence) {
+    return "paused_with_evidence";
+  }
+  return "off";
+}
+
+function getMemoryProductCopy(
+  status: MemoryProductStatus,
+  errorMessage?: string | null,
+): { label: string; detail: string } {
+  if (!errorMessage) return memoryProductCopy[status];
+  return {
+    label: memoryProductCopy[status].label,
+    detail: productizeMemoryError(errorMessage),
+  };
+}
+
+function companionToneForStatus(status: MemoryProductStatus) {
+  if (status === "on" || status === "starting") return "active";
+  if (status === "paused_with_evidence") return "paused";
+  if (status === "private_or_excluded") return "private";
+  if (status === "needs_attention" || status === "needs_permission") return "attention";
+  return "quiet";
+}
+
+function isPrivateMemorySurface(status: CaptureStatus) {
+  const latestFrameAt = status.latest_frame?.captured_at || 0;
+  const latestPrivacy = status.latest_frame?.privacy_status || "";
+  if (isPrivatePrivacyLabel(latestPrivacy)) return true;
+  return Boolean(
+    status.running &&
+      status.last_skipped_at &&
+      status.last_skipped_at >= latestFrameAt &&
+      status.runtime_diagnostics.heavy_captures_skipped_privacy > 0,
+  );
+}
+
+function isPrivatePrivacyLabel(value?: string | null) {
+  const label = normalizeToken(value);
+  return Boolean(label && !["normal", "ok", "allowed", "manual_evidence", "high_value", "decision_anchor"].includes(label));
+}
+
+function isPermissionMemoryError(value: string) {
+  const error = value.toLowerCase();
+  return error.includes("permission") ||
+    error.includes("screen access") ||
+    error.includes("accessibility") ||
+    error.includes("not authorized") ||
+    error.includes("denied");
+}
+
+function productizeMemoryError(value: string) {
+  const error = value.toLowerCase();
+  if (error.includes("screen") && (error.includes("permission") || error.includes("access"))) {
+    return "Screen access is needed for local memory.";
+  }
+  if (error.includes("accessibility") || error.includes("ax")) {
+    return "Accessibility access is needed to understand app context.";
+  }
+  if (error.includes("ocr") || error.includes("vision")) {
+    return "Some visible text could not be read.";
+  }
+  if (error.includes("database") && (error.includes("locked") || error.includes("busy"))) {
+    return "Local memory is temporarily unavailable.";
+  }
+  if (error.includes("no space") || error.includes("storage") || error.includes("disk")) {
+    return "Local memory needs cleanup.";
+  }
+  if (error.includes("privacy") || error.includes("excluded") || error.includes("never_send_to_ai")) {
+    return "This surface was skipped for privacy.";
+  }
+  if (error.includes("capture")) {
+    return value
+      .replace(/Capture/g, "Memory")
+      .replace(/capture/g, "memory");
+  }
+  return value || "Local memory needs attention.";
+}
+
+function sitePatternFromUrl(value?: string | null) {
+  if (!value) return "";
+  try {
+    const host = new URL(value).hostname.replace(/^www\./, "");
+    return host.trim();
+  } catch {
+    return "";
+  }
+}
+
+function siteLabelFromUrl(value?: string | null) {
+  const pattern = sitePatternFromUrl(value);
+  return pattern ? pattern : "";
+}
+
+function hasEnabledExclusion(rules: ExclusionRule[], ruleType: string, pattern: string) {
+  const normalizedPattern = pattern.trim().toLowerCase();
+  return rules.some((rule) => {
+    if (!rule.enabled || rule.rule_type !== ruleType) return false;
+    const candidates = rule.pattern
+      .split("|")
+      .map((part) => part.trim().toLowerCase())
+      .filter(Boolean);
+    return candidates.some((candidate) =>
+      normalizedPattern.includes(candidate) || candidate.includes(normalizedPattern),
+    );
+  });
+}
+
+function formatExclusionRule(rule: ExclusionRule) {
+  const typeLabels: Record<string, string> = {
+    app_bundle: "App",
+    url_regex: "Website",
+    window_title_regex: "Window title",
+    content_regex: "Content",
+  };
+  const type = typeLabels[rule.rule_type] || sentenceCase(rule.rule_type);
+  return `${type}: ${rule.pattern}`;
+}
+
+function formatExclusionAction(action: string) {
+  const labels: Record<string, string> = {
+    skip_capture: "Not observed",
+    store_redacted: "Stored with redaction",
+    never_send_to_ai: "Never sent to AI",
+  };
+  return labels[action] || sentenceCase(action);
+}
+
+function dangerousActionCopy(action: DangerousAction) {
+  if (action === "delete_recent") {
+    return {
+      title: "Delete recent memory?",
+      body: "This removes local evidence stored in the last hour from this device. Older local evidence may remain.",
+      confirmLabel: "Delete recent memory",
+    };
+  }
+  if (action === "dev_reset") {
+    return {
+      title: "Developer reset?",
+      body: "This clears local evidence, derived Continue rows, snapshots, generated debug exports, and diagnostics.",
+      confirmLabel: "Reset for development",
+    };
+  }
+  return {
+    title: "Delete local memory?",
+    body: "This removes stored evidence and Continue history from this device. It cannot be undone.",
+    confirmLabel: "Delete local memory",
+  };
+}
+
 type ContinuePresentation = {
   workstreamTitle: string;
   currentFocus: string;
@@ -3321,11 +4345,19 @@ function humanTargetMeta(target?: ContinueReturnTarget | null) {
   return parts.join(" / ") || "I don't have a reliable app or page target for this yet.";
 }
 
+function isDirectResumeTargetOpenable(target?: ContinueReturnTarget | null) {
+  return Boolean(
+    target &&
+      normalizeToken(target.openability) === "openable" &&
+      (target.browser_url || target.document_path),
+  );
+}
+
 function humanFocusLabel(focus?: ContinueFocusSummary | null) {
-  if (!focus) return "No current screen returned.";
+  if (!focus) return "No current focus returned.";
   return cleanHumanText(focus.title || focus.window_title || focus.app_name)
     || productizeArtifactKind(focus.artifact_kind)
-    || "Current screen";
+    || "Current focus";
 }
 
 function productizeAction(action?: ContinueActionSummary | null) {
@@ -3353,7 +4385,7 @@ function productizeActionKind(value?: string | null) {
     idle_after_progress: "Work paused after meaningful progress.",
     messaging_interrupt: "Messaging interrupted the workstream.",
     verification_branch: "A verification branch was open.",
-    possible_distraction: "The current screen looks like a possible distraction.",
+    possible_distraction: "The current focus looks like a possible distraction.",
   };
   return labels[key] || (key ? sentenceCase(key) : "");
 }
@@ -3389,7 +4421,7 @@ function productizeUnresolvedState(value?: string | null) {
     verification_without_return: "Verification branch has not been applied back to the target.",
     branch_without_return: "Search branch has not been applied back to the target.",
   };
-  return labels[kind] || sentenceCase(kind) || "Unresolved state still present.";
+  return labels[kind] || sentenceCase(kind) || "Something remains unresolved.";
 }
 
 function unresolvedKind(value: string) {
@@ -3417,16 +4449,16 @@ function productizeInternalLabel(value?: string | null) {
     primary_artifact_fallback: "This looks like the main place to continue.",
     last_meaningful_error: "The last meaningful state was an error/blocker.",
     secondary_artifact_for_searching: "Search was treated as supporting evidence.",
-    current_focus_differs_from_return_target: "Current screen is not the return target.",
+    current_focus_differs_from_return_target: "Current focus is not the return target.",
     thin_evidence: "Evidence is thin.",
     no_last_meaningful_action: "No clear last action was captured.",
     no_openable_target: "No directly openable target was found.",
     no_candidate_generated: "No continuation candidate could be generated yet.",
-    micro_inference_missing_openai_api_key: "Model ranking is unavailable; using local scoring.",
+    micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local scoring.",
     smalltalk_self_observation_downranked: "Smalltalk's own UI was treated as low-value diagnostic evidence.",
     branch_surface_is_evidence_not_default_return_target: "Branch surface is evidence, not the default return target.",
     privacy_sensitive_or_redacted_target_local_only: "Target contains sensitive or redacted evidence and stays local.",
-    current_focus_mismatch: "Current screen is not the return target.",
+    current_focus_mismatch: "Current focus is not the return target.",
   };
   if (labels[key]) return labels[key];
   if (raw.includes(":")) {
@@ -3552,9 +4584,9 @@ function continueTargetLabel(target?: ContinueReturnTarget | null) {
 }
 
 function continueFocusLabel(focus?: ContinueFocusSummary | null) {
-  if (!focus) return "No current screen returned.";
+  if (!focus) return "No current focus returned.";
   return [
-    focus.title || focus.window_title || focus.app_name || "Current screen",
+    focus.title || focus.window_title || focus.app_name || "Current focus",
     focus.artifact_kind,
     `frame ${focus.frame_id}`,
   ]
@@ -3625,6 +4657,11 @@ function sentenceCase(value?: string | null) {
 
 function frameTitle(frame: CaptureFrame) {
   return frame.window_name || frame.app_name || `Frame ${frame.id}`;
+}
+
+function evidenceAnchorLabel(frame?: CaptureFrame | null) {
+  if (!frame) return "No evidence selected";
+  return cleanHumanText(frame.window_name || frame.app_name || "") || "Selected evidence";
 }
 
 function formatTime(value?: number | null) {
