@@ -3764,6 +3764,10 @@ pub fn get_continue_decision(
         );
     }
 
+    let public_return_candidate = selected.as_ref().filter(|candidate| {
+        candidate_exposes_public_return_target(candidate, &continue_output_mode)
+    });
+
     if cached_meta.is_none() {
         insert_continue_decision(
             conn,
@@ -3772,6 +3776,7 @@ pub fn get_continue_decision(
             current_focus.as_ref(),
             selected_workstream.as_ref(),
             selected.as_ref(),
+            public_return_candidate,
             next_action.as_deref(),
             &warnings,
             &validation_status,
@@ -3820,13 +3825,13 @@ pub fn get_continue_decision(
             current_focus.as_ref(),
         ),
         selected_workstream: selected_workstream.as_ref().map(workstream_summary),
-        return_target: selected.as_ref().map(|candidate| {
+        return_target: public_return_candidate.map(|candidate| {
             return_target_summary(
                 candidate.target_artifact.as_ref(),
                 candidate.evidence_frame_id.clone(),
             )
         }),
-        resume_work_target: selected.as_ref().map(|candidate| {
+        resume_work_target: public_return_candidate.map(|candidate| {
             return_target_summary(
                 candidate
                     .resume_work_target
@@ -17089,6 +17094,18 @@ fn candidate_has_human_return_target(candidate: &ScoredContinueCandidate) -> boo
     human_return_target_label(candidate).is_some()
 }
 
+fn candidate_exposes_public_return_target(
+    candidate: &ScoredContinueCandidate,
+    output_mode: &ContinueOutputMode,
+) -> bool {
+    matches!(
+        output_mode,
+        ContinueOutputMode::StrongContinue | ContinueOutputMode::ThinContinue
+    ) && candidate.eligible_for_primary_selection
+        && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+        && candidate_has_human_return_target(candidate)
+}
+
 fn human_return_target_label(candidate: &ScoredContinueCandidate) -> Option<String> {
     candidate
         .resume_work_target
@@ -23499,6 +23516,7 @@ fn insert_continue_decision(
     current_focus: Option<&ContinueFocusSummary>,
     selected_workstream: Option<&ScorerWorkstream>,
     selected: Option<&ScoredContinueCandidate>,
+    public_return_candidate: Option<&ScoredContinueCandidate>,
     next_action: Option<&str>,
     warnings: &[String],
     validation_status: &str,
@@ -23560,7 +23578,7 @@ fn insert_continue_decision(
             current_focus.and_then(|focus| focus.artifact_id.clone()),
             selected_workstream.map(|workstream| workstream.id.clone()),
             selected.map(|candidate| candidate.id.clone()),
-            selected.and_then(|candidate| {
+            public_return_candidate.and_then(|candidate| {
                 candidate
                     .target_artifact
                     .as_ref()
@@ -26943,6 +26961,36 @@ mod tests {
             audit.as_ref(),
             &pack,
         )
+    }
+
+    #[test]
+    fn public_return_target_is_suppressed_for_no_clear_or_diagnostic_candidate() {
+        let target = test_artifact("artifact-code", "code_editor", "continuation.rs");
+        let mut candidate = test_candidate(
+            "continue_edit",
+            Some(target),
+            Some(test_action("artifact-code", "editing")),
+            None,
+        );
+        candidate.score = 0.82;
+        candidate.eligible_for_primary_selection = true;
+
+        assert!(candidate_exposes_public_return_target(
+            &candidate,
+            &ContinueOutputMode::StrongContinue
+        ));
+        assert!(!candidate_exposes_public_return_target(
+            &candidate,
+            &ContinueOutputMode::NoClearContinuation
+        ));
+
+        candidate.continuation_role = Some("diagnostic_only".to_string());
+        candidate.eligible_for_primary_selection = false;
+
+        assert!(!candidate_exposes_public_return_target(
+            &candidate,
+            &ContinueOutputMode::ThinContinue
+        ));
     }
 
     fn pack_candidate_for_test(candidate: &ScoredContinueCandidate) -> ContinuePackCandidate {

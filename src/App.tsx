@@ -719,8 +719,42 @@ type MemoryProductStatus =
   | "needs_attention"
   | "deleting";
 type DangerousAction = "delete_all" | "delete_recent" | "dev_reset";
+type ContinueFreshness =
+  | "waiting_for_evidence"
+  | "ready"
+  | "updating"
+  | "current"
+  | "new_evidence"
+  | "thin_evidence"
+  | "needs_attention";
+type ContinueRequestTrigger = "manual" | "startup" | "background";
+
+type ContinueEvidenceSnapshot = {
+  frameCount: number;
+  eventCount: number;
+  signalCount: number;
+  contentUnitCount: number;
+  artifactCount: number;
+  workstreamCount: number;
+  latestFrameAtMs?: number | null;
+  latestArtifactAtMs?: number | null;
+  latestWorkstreamAtMs?: number | null;
+};
+
+type ContinueFreshnessPresentation = {
+  state: ContinueFreshness;
+  label: string;
+  detail: string;
+  stale: boolean;
+  thin: boolean;
+  openable: boolean;
+  updatedAtLabel?: string;
+};
 
 const RECENT_MEMORY_DELETE_RANGE_MS = 60 * 60 * 1000;
+const BACKGROUND_CONTINUE_VISIBLE_DEBOUNCE_MS = 2200;
+const BACKGROUND_CONTINUE_IDLE_DEBOUNCE_MS = 14000;
+const BACKGROUND_CONTINUE_MIN_INTERVAL_MS = 12000;
 
 const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: string }> = {
   off: {
@@ -816,8 +850,13 @@ function App() {
   const [continueMemory, setContinueMemory] = useState<ContinueMemoryStatus | null>(null);
   const [continueDecision, setContinueDecision] = useState<ContinueDecisionResult | null>(null);
   const [continueDecisionFrameCount, setContinueDecisionFrameCount] = useState<number | null>(null);
+  const [continueDecisionEvidenceSnapshot, setContinueDecisionEvidenceSnapshot] =
+    useState<ContinueEvidenceSnapshot | null>(null);
   const [continueError, setContinueError] = useState<string | null>(null);
+  const [backgroundContinueError, setBackgroundContinueError] = useState<string | null>(null);
   const [continueOpenResult, setContinueOpenResult] = useState<OpenResumePointResult | null>(null);
+  const [quietContinueRefreshing, setQuietContinueRefreshing] = useState(false);
+  const [continueUpdatedAtMs, setContinueUpdatedAtMs] = useState<number | null>(null);
   const [workstreams, setWorkstreams] = useState<RecentContinueWorkstream[]>([]);
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState<string | null>(null);
   const [workstreamDetail, setWorkstreamDetail] = useState<ContinueWorkstreamDetailResult | null>(null);
@@ -837,35 +876,43 @@ function App() {
   const [privacyActionStatus, setPrivacyActionStatus] = useState<string | null>(null);
   const [pendingDangerAction, setPendingDangerAction] = useState<DangerousAction | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [appVisible, setAppVisible] = useState(() => document.visibilityState === "visible");
   const storeGenerationRef = useRef(0);
   const autoContinueRef = useRef(false);
+  const continueRequestInFlightRef = useRef(false);
+  const lastBackgroundContinueAttemptRef = useRef(0);
+  const failedBackgroundContinueSignatureRef = useRef<string | null>(null);
   const captureMenuRef = useRef<HTMLDetailsElement | null>(null);
   const isDeleting = busyAction === "delete_all_frames" || busyAction === "delete_recent_captures";
   const diagnosticsOpen = viewMode === "developer";
   const currentSession = status.active_session || status.latest_session || null;
   const currentSessionId = currentSession?.id || null;
 
-  const refreshStatus = useCallback(async () => {
+  const refreshStatus = useCallback(async (): Promise<CaptureStatus | null> => {
     const requestGeneration = storeGenerationRef.current;
     try {
       const nextStatus = await invoke<CaptureStatus>("capture_status");
-      if (requestGeneration !== storeGenerationRef.current) return;
+      if (requestGeneration !== storeGenerationRef.current) return null;
       setStatus(nextStatus);
       setError(null);
       if (!selectedFrame && nextStatus.latest_frame) {
         setSelectedFrame(nextStatus.latest_frame);
       }
+      return nextStatus;
     } catch (err) {
       setError(String(err));
+      return null;
     }
   }, [selectedFrame]);
 
-  const refreshContinueMemory = useCallback(async () => {
+  const refreshContinueMemory = useCallback(async (): Promise<ContinueMemoryStatus | null> => {
     try {
       const nextMemory = await invoke<ContinueMemoryStatus>("get_continue_memory_status");
       setContinueMemory(nextMemory);
+      return nextMemory;
     } catch (err) {
       setContinueError(`Continue memory status failed: ${String(err)}`);
+      return null;
     }
   }, []);
 
@@ -1007,11 +1054,47 @@ function App() {
     [selectFrame],
   );
 
-  const runContinueDecision = useCallback(async (options: { forceRebuild?: boolean; writeAudit?: boolean } = {}) => {
-    setBusyAction("get_continue_decision");
-    setContinueError(null);
-    setContinueOpenResult(null);
-    setBreadcrumbStatus(null);
+  const applyContinueDecision = useCallback(
+    async (decision: ContinueDecisionResult) => {
+      setContinueDecision(decision);
+      setSelectedWorkstreamId(decision.selected_workstream?.workstream_id || null);
+      setContinueUpdatedAtMs(Date.now());
+      setBackgroundContinueError(null);
+      failedBackgroundContinueSignatureRef.current = null;
+
+      const [nextStatus, nextMemory] = await Promise.all([
+        refreshStatus(),
+        refreshContinueMemory(),
+      ]);
+      const evidenceStatus = nextStatus || status;
+      const evidenceMemory = nextMemory || continueMemory;
+      setContinueDecisionFrameCount(evidenceStatus.frame_count);
+      setContinueDecisionEvidenceSnapshot(
+        buildContinueEvidenceSnapshot(evidenceStatus, evidenceMemory),
+      );
+    },
+    [continueMemory, refreshContinueMemory, refreshStatus, status],
+  );
+
+  const runContinueDecision = useCallback(async (options: {
+    forceRebuild?: boolean;
+    writeAudit?: boolean;
+    trigger?: ContinueRequestTrigger;
+  } = {}) => {
+    if (continueRequestInFlightRef.current) return;
+    const trigger = options.trigger || (options.writeAudit === true ? "manual" : "startup");
+    const background = trigger === "background";
+    continueRequestInFlightRef.current = true;
+    if (background) {
+      setQuietContinueRefreshing(true);
+      setBackgroundContinueError(null);
+      lastBackgroundContinueAttemptRef.current = Date.now();
+    } else {
+      setBusyAction("get_continue_decision");
+      setContinueError(null);
+      setContinueOpenResult(null);
+      setBreadcrumbStatus(null);
+    }
     try {
       const decision = await invoke<ContinueDecisionResult>("get_continue_decision", {
         input: {
@@ -1022,10 +1105,7 @@ function App() {
           audit_output_enabled: options.writeAudit === true,
         },
       });
-      setContinueDecision(decision);
-      setSelectedWorkstreamId(decision.selected_workstream?.workstream_id || null);
-      setContinueDecisionFrameCount(status.frame_count);
-      await refreshContinueMemory();
+      await applyContinueDecision(decision);
       if (diagnosticsOpen) {
         await refreshWorkstreams();
       }
@@ -1035,11 +1115,31 @@ function App() {
         setEvidenceOpen(false);
       }
     } catch (err) {
-      setContinueError(`Continue failed: ${String(err)}`);
+      if (background) {
+        failedBackgroundContinueSignatureRef.current = continueEvidenceSignature(
+          buildContinueEvidenceSnapshot(status, continueMemory),
+        );
+        setBackgroundContinueError("Could not refresh Continue quietly. Keeping the previous answer.");
+      } else {
+        setContinueError(`Continue failed: ${String(err)}`);
+      }
     } finally {
-      setBusyAction(null);
+      continueRequestInFlightRef.current = false;
+      if (background) {
+        setQuietContinueRefreshing(false);
+      } else {
+        setBusyAction(null);
+      }
     }
-  }, [diagnosticsOpen, refreshContinueMemory, refreshWorkstreams, revealContinueFrame, selectedFrame, status.frame_count]);
+  }, [
+    applyContinueDecision,
+    continueMemory,
+    diagnosticsOpen,
+    refreshWorkstreams,
+    revealContinueFrame,
+    selectedFrame,
+    status,
+  ]);
 
   const openContinueTarget = useCallback(async () => {
     if (!continueDecision) return;
@@ -1253,6 +1353,9 @@ function App() {
       setTimeline(emptyTimeline);
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
+      setContinueDecisionEvidenceSnapshot(null);
+      setContinueUpdatedAtMs(null);
+      setBackgroundContinueError(null);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1346,6 +1449,9 @@ function App() {
       setTimeline(emptyTimeline);
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
+      setContinueDecisionEvidenceSnapshot(null);
+      setContinueUpdatedAtMs(null);
+      setBackgroundContinueError(null);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1404,6 +1510,9 @@ function App() {
       setTimeline(emptyTimeline);
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
+      setContinueDecisionEvidenceSnapshot(null);
+      setContinueUpdatedAtMs(null);
+      setBackgroundContinueError(null);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1499,8 +1608,19 @@ function App() {
       return;
     }
     autoContinueRef.current = true;
-    void runContinueDecision({ writeAudit: false });
+    void runContinueDecision({ writeAudit: false, trigger: "startup" });
   }, [busyAction, continueDecision, runContinueDecision, status.frame_count]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      setAppVisible(document.visibilityState === "visible");
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
 
   useEffect(() => {
     if (diagnosticsOpen) {
@@ -1590,17 +1710,84 @@ function App() {
   const continueHasEvidence =
     status.frame_count > 0 ||
     Boolean(continueMemory && continueMemory.counts.artifacts > 0);
+  const currentContinueEvidenceSnapshot = useMemo(
+    () => buildContinueEvidenceSnapshot(status, continueMemory),
+    [
+      continueMemory,
+      status.content_unit_count,
+      status.event_count,
+      status.frame_count,
+      status.latest_frame?.captured_at,
+      status.signal_count,
+    ],
+  );
   const continueIsStale =
     Boolean(continueDecision) &&
-    continueDecisionFrameCount !== null &&
-    status.frame_count > continueDecisionFrameCount;
-  const continueFreshnessLabel = busyAction === "get_continue_decision"
-    ? "Updating"
-    : continueIsStale
-      ? "New evidence"
-      : continueDecision
-        ? "Current"
-        : "Ready";
+    (
+      (continueDecisionEvidenceSnapshot
+        ? continueEvidenceChanged(continueDecisionEvidenceSnapshot, currentContinueEvidenceSnapshot)
+        : continueDecisionFrameCount !== null && status.frame_count > continueDecisionFrameCount)
+    );
+  const continueIsThin = isThinContinueDecision(continueDecision);
+  const continueTargetOpenable = isDirectResumeTargetOpenable(continueResumeTarget);
+  const continueRefreshBusy = busyAction === "get_continue_decision" || quietContinueRefreshing;
+  const continueFreshness = deriveContinueFreshness({
+    hasEvidence: continueHasEvidence,
+    decision: continueDecision,
+    stale: continueIsStale,
+    updating: continueRefreshBusy,
+    thin: continueIsThin,
+    openable: continueTargetOpenable,
+    error: continueDecision ? backgroundContinueError : continueError,
+    updatedAtMs: continueUpdatedAtMs,
+  });
+  const continueFreshnessLabel = continueFreshness.label;
+  const currentEvidenceSignature = continueEvidenceSignature(currentContinueEvidenceSnapshot);
+
+  useEffect(() => {
+    if (
+      !appVisible ||
+      !status.running ||
+      !continueHasEvidence ||
+      !continueDecision ||
+      !continueIsStale ||
+      busyAction !== null ||
+      quietContinueRefreshing ||
+      failedBackgroundContinueSignatureRef.current === currentEvidenceSignature
+    ) {
+      return;
+    }
+
+    const requestedDelay = viewMode === "continue"
+      ? BACKGROUND_CONTINUE_VISIBLE_DEBOUNCE_MS
+      : BACKGROUND_CONTINUE_IDLE_DEBOUNCE_MS;
+    const sinceLastAttempt = Date.now() - lastBackgroundContinueAttemptRef.current;
+    const delay = Math.max(
+      requestedDelay,
+      BACKGROUND_CONTINUE_MIN_INTERVAL_MS - sinceLastAttempt,
+      0,
+    );
+    const id = window.setTimeout(() => {
+      void runContinueDecision({
+        writeAudit: false,
+        trigger: "background",
+      });
+    }, delay);
+
+    return () => window.clearTimeout(id);
+  }, [
+    appVisible,
+    busyAction,
+    continueDecision,
+    continueHasEvidence,
+    continueIsStale,
+    currentEvidenceSignature,
+    quietContinueRefreshing,
+    runContinueDecision,
+    status.running,
+    viewMode,
+  ]);
+
   const latestEvidenceFrame = status.latest_frame;
   const memorySurfacePrivate = isPrivateMemorySurface(status);
   const memoryProductStatus = deriveMemoryProductStatus(
@@ -1614,7 +1801,9 @@ function App() {
   const memoryCueLabel = status.last_error
     ? memoryProduct.label
     : continueIsStale
-      ? "New evidence since this answer"
+      ? "New evidence"
+      : continueFreshness.state === "updating"
+        ? "Updating"
       : memoryProduct.label;
   const continuePrimaryMessage = status.running && !continueDecision && !continueHasEvidence
     ? "Local memory is on."
@@ -1638,9 +1827,9 @@ function App() {
   const latestEvidenceAgeLabel = latestEvidenceFrame
     ? formatRelativeAge(latestEvidenceFrame.captured_at)
     : "No evidence yet";
-  const sessionLabel = currentSession
-    ? `${currentSession.status} capture-${String(currentSession.sequence).padStart(3, "0")}`
-    : "No capture";
+  const memoryWindowLabel = currentSession
+    ? `${sentenceCase(currentSession.status)} memory-${String(currentSession.sequence).padStart(3, "0")}`
+    : "No memory window";
   const currentAppPattern = latestEvidenceFrame?.app_bundle_id || latestEvidenceFrame?.app_name || "";
   const currentAppLabel = latestEvidenceFrame?.app_name || latestEvidenceFrame?.app_bundle_id || "";
   const currentWebsitePattern = sitePatternFromUrl(latestEvidenceFrame?.browser_url);
@@ -1653,7 +1842,7 @@ function App() {
     : false;
   const activeContext = frameDetail?.app_contexts[0];
   const activeTransition = frameDetail?.transitions[0];
-  const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No frame selected";
+  const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No evidence selected";
   const showInspectEntry = import.meta.env.DEV;
   const openDeveloperMode = useCallback(() => {
     setMemoryMenuOpen(false);
@@ -1779,11 +1968,52 @@ function App() {
       })
       .catch((err) => setError(String(err)));
 
+    listen<CaptureStatus>("capture-status", (event) => {
+      setStatus(event.payload);
+      void refreshContinueMemory();
+      if (diagnosticsOpen) {
+        void refreshWorkstreams();
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisteners.push(nextUnlisten);
+        }
+      })
+      .catch((err) => setError(String(err)));
+
+    listen<ContinueDecisionResult>("session-island-continue-ready", (event) => {
+      void applyContinueDecision(event.payload);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisteners.push(nextUnlisten);
+        }
+      })
+      .catch((err) => setError(String(err)));
+
+    listen<ContinueDecisionResult>("smalltalk-continue-updated", (event) => {
+      void applyContinueDecision(event.payload);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisteners.push(nextUnlisten);
+        }
+      })
+      .catch((err) => setError(String(err)));
+
     return () => {
       disposed = true;
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [
+    applyContinueDecision,
     refreshContinueMemory,
     refreshWorkstreams,
     refreshStatus,
@@ -1815,7 +2045,7 @@ function App() {
               Back to Continue
             </button>
           ) : (
-	            <span className={`memory-dot ${memoryProductStatus}`}>
+	            <span className={`memory-dot ${memoryProductStatus} freshness-${continueFreshness.state}`}>
 	              {memoryCueLabel}
 	            </span>
           )}
@@ -1826,18 +2056,18 @@ function App() {
             <>
               <StatusPill label="Local memory" value={continueStatusLabel} tone={status.running ? "good" : status.last_error ? "bad" : "quiet"} />
               <StatusPill label="Evidence age" value={latestEvidenceAgeLabel} />
-              <StatusPill label="Continue" value={continueFreshnessLabel} tone={continueIsStale ? "good" : "quiet"} />
+              <StatusPill label="Continue" value={continueFreshnessLabel} tone={continueFreshnessTone(continueFreshness.state)} />
             </>
           ) : (
             <div className="topbar-actions">
               <button
                 className="primary-button topbar-continue-button"
                 type="button"
-                disabled={!continueHasEvidence || busyAction !== null}
-                aria-busy={busyAction === "get_continue_decision"}
+                disabled={!continueHasEvidence || busyAction !== null || quietContinueRefreshing}
+                aria-busy={continueRefreshBusy}
                 onClick={() => void runContinueDecision({ writeAudit: true })}
               >
-                {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
+                {continueRefreshBusy ? "Finding" : "Continue"}
               </button>
               <details
                 className="capture-menu topbar-memory-menu"
@@ -1896,15 +2126,15 @@ function App() {
                   </button>
                   <button
                     className="secondary-button"
-                    disabled={!continueHasEvidence || busyAction !== null}
-                    aria-busy={busyAction === "get_continue_decision"}
+                    disabled={!continueHasEvidence || busyAction !== null || quietContinueRefreshing}
+                    aria-busy={continueRefreshBusy}
                     onClick={() => {
                       setMemoryMenuOpen(false);
                       void runContinueDecision({ writeAudit: true });
                     }}
                     type="button"
 	                  >
-	                    {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh Continue"}
+	                    {continueRefreshBusy ? "Refreshing" : "Refresh Continue"}
 	                  </button>
 	                  <button
 	                    className="danger-button"
@@ -1951,8 +2181,9 @@ function App() {
             hasEvidence={continueHasEvidence}
             running={status.running}
             busyAction={busyAction}
+            continueRefreshBusy={continueRefreshBusy}
             openResult={continueOpenResult}
-            stale={continueIsStale}
+            freshness={continueFreshness}
             onStartMemory={() => void runAction("start_capture")}
             onContinue={() => void runContinueDecision({ writeAudit: true })}
             onOpenTarget={() => void openContinueTarget()}
@@ -1969,9 +2200,9 @@ function App() {
             hasEvidence={continueHasEvidence}
             decision={continueDecision}
             busyAction={busyAction}
+            continueRefreshBusy={continueRefreshBusy}
             statusLabel={continueStatusLabel}
-            freshnessLabel={continueFreshnessLabel}
-	            evidenceAgeLabel={latestEvidenceAgeLabel}
+            freshness={continueFreshness}
 	            memoryProductStatus={memoryProductStatus}
 	            memoryProduct={memoryProduct}
 	            privacyActionStatus={privacyActionStatus}
@@ -2028,20 +2259,20 @@ function App() {
       ) : null}
 
       {viewMode === "developer" ? (
-      <section className="developer-panel diagnostics-panel" aria-label="Developer diagnostics">
+              <section className="developer-panel diagnostics-panel" aria-label="Inspect local evidence">
         <div className="developer-panel-head">
           <div>
-            <span>Developer diagnostics</span>
-            <strong>Frame inspector, search, raw events, and local evidence substrate</strong>
+            <span>Inspect local evidence</span>
+            <strong>Evidence inspector, search, raw event rows, and local memory substrate</strong>
           </div>
 	          <div className="control-strip" aria-label="Local memory controls">
             <button
               className="primary-button"
               disabled={busyAction !== null}
-              aria-busy={busyAction === "get_continue_decision"}
+              aria-busy={continueRefreshBusy}
               onClick={() => void runContinueDecision({ writeAudit: true })}
             >
-              {busyAction === "get_continue_decision" ? "Finding" : "Continue"}
+              {continueRefreshBusy ? "Finding" : "Continue"}
             </button>
             <details
               className="capture-menu"
@@ -2297,21 +2528,21 @@ function App() {
           <input
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Search captured evidence"
-            aria-label="Search captured evidence"
+            placeholder="Search evidence"
+            aria-label="Search evidence"
           />
           <button type="submit" disabled={busyAction !== null}>Search evidence</button>
         </form>
 
-      <section className="health-strip" aria-label="Capture health">
+      <section className="health-strip" aria-label="Local memory health">
         <StatusPill label="State" value={captureStateLabel} tone={status.running ? "good" : "quiet"} />
-        <StatusPill label="Session" value={sessionLabel} tone={status.running ? "good" : "quiet"} />
+        <StatusPill label="Memory window" value={memoryWindowLabel} tone={status.running ? "good" : "quiet"} />
         <StatusPill label="Signals" value={status.signal_count} />
-        <StatusPill label="Frames" value={status.frame_count} />
+        <StatusPill label="Anchors" value={status.frame_count} />
         <StatusPill label="Events" value={status.event_count} />
         <StatusPill label="Transitions" value={status.transition_count} />
         <StatusPill label="Units" value={status.content_unit_count} />
-        <StatusPill label="Total sessions" value={status.session_count} />
+        <StatusPill label="Memory windows" value={status.session_count} />
         <StatusPill label="Latest" value={latestFrameLabel} />
         <StatusPill label="Screen" value={status.screenshot_tool ? "ready" : "missing"} tone={status.screenshot_tool ? "good" : "bad"} />
         <StatusPill label="A11y" value={status.accessibility_tool ? "ready" : "missing"} tone={status.accessibility_tool ? "good" : "bad"} />
@@ -2351,11 +2582,11 @@ function App() {
       </section>
 
       <section className="inspector-grid">
-        <aside className="timeline-pane" aria-label="Captured frames">
+        <aside className="timeline-pane" aria-label="Evidence anchors">
           <div className="pane-heading">
             <div>
-              <h2>Evidence timeline</h2>
-              <p>{hasQuery ? "Filtered frames" : "Most recent local captures"}</p>
+              <h2>Evidence history</h2>
+              <p>{hasQuery ? "Filtered evidence" : "Most recent local evidence"}</p>
             </div>
             <span>{results.length}</span>
           </div>
@@ -2378,7 +2609,7 @@ function App() {
 
           <div className="event-feed">
             <div className="feed-heading">
-              <h3>Raw event stream</h3>
+              <h3>Raw event rows</h3>
               <span>{timeline.events.length}</span>
             </div>
             {timeline.events.slice(0, 8).map((event) => (
@@ -2389,15 +2620,15 @@ function App() {
               </div>
             ))}
             {timeline.events.length === 0 ? (
-              <p className="feed-empty">No raw events in the last 10 minutes.</p>
+              <p className="feed-empty">No raw event rows in the last 10 minutes.</p>
             ) : null}
           </div>
         </aside>
 
-        <section className="viewer-pane" aria-label="Frame inspector">
+        <section className="viewer-pane" aria-label="Evidence inspector">
           <div className="viewer-toolbar">
             <div>
-              <p className="product-kicker">{selectedFrame?.capture_trigger || "waiting"}</p>
+              <p className="product-kicker">{productizeEvidenceTrigger(selectedFrame?.capture_trigger) || "waiting"}</p>
               <h2>{selectedTitle}</h2>
             </div>
             <span className={`trust-badge ${selectedVerification?.trust_label || "unknown"}`}>
@@ -2436,8 +2667,8 @@ function App() {
               </div>
             ) : (
               <div className="viewer-empty">
-                <strong>No frame selected</strong>
-                <span>Choose a frame or capture now to inspect the screenshot, sources, and transitions.</span>
+                <strong>No evidence anchor selected</strong>
+                <span>Choose an evidence anchor or add evidence to inspect the screenshot, sources, and transitions.</span>
               </div>
             )}
           </div>
@@ -2471,7 +2702,7 @@ function App() {
           <section className="verification-card">
             <div className="pane-heading compact">
               <div>
-                <h2>Last capture</h2>
+                <h2>Last evidence update</h2>
                 <p>{selectedFrame ? formatTime(selectedFrame.captured_at) : "Nothing selected"}</p>
               </div>
               <span>{selectedFrame?.text_source || "visual"}</span>
@@ -2494,7 +2725,7 @@ function App() {
                 ))}
               </div>
             ) : (
-              <div className="complete-box">All core verification signals are present for this frame.</div>
+              <div className="complete-box">All core verification signals are present for this evidence anchor.</div>
             )}
           </section>
 
@@ -2574,9 +2805,9 @@ function ContinueCompanionPanel({
   hasEvidence,
   decision,
   busyAction,
+  continueRefreshBusy,
   statusLabel,
-  freshnessLabel,
-  evidenceAgeLabel,
+  freshness,
   memoryProductStatus,
   memoryProduct,
   privacyActionStatus,
@@ -2591,9 +2822,9 @@ function ContinueCompanionPanel({
   hasEvidence: boolean;
   decision: ContinueDecisionResult | null;
   busyAction: string | null;
+  continueRefreshBusy: boolean;
   statusLabel: string;
-  freshnessLabel: string;
-  evidenceAgeLabel: string;
+  freshness: ContinueFreshnessPresentation;
   memoryProductStatus: MemoryProductStatus;
   memoryProduct: { label: string; detail: string };
   privacyActionStatus: string | null;
@@ -2604,28 +2835,23 @@ function ContinueCompanionPanel({
   onOpenPrivacy: () => void;
   onDeleteLocalMemory: () => void;
 }) {
-  const memoryTone = companionToneForStatus(memoryProductStatus);
+  const memoryTone = companionToneForStatus(memoryProductStatus, freshness.state);
 
   return (
-    <aside className="continue-companion" aria-label="Local memory and trust status">
+    <aside className={`continue-companion freshness-${freshness.state}`} aria-label="Local memory and trust status">
       <div className={`companion-orb ${memoryTone}`} aria-hidden="true">
         <span />
       </div>
       <div className="companion-copy">
         <span>{statusLabel}</span>
-        <strong>{memoryProduct.label}</strong>
-        <p>{memoryProduct.detail}</p>
-      </div>
-
-      <div className="companion-facts" aria-label="Continue readiness">
-        <div>
-          <span>Continue</span>
-          <strong>{busyAction === "get_continue_decision" ? "Updating" : decision ? freshnessLabel : hasEvidence ? "Ready" : "Waiting"}</strong>
-        </div>
-        <div>
-          <span>Evidence</span>
-          <strong>{evidenceAgeLabel}</strong>
-        </div>
+        <strong>{freshness.state === "new_evidence" ? "New evidence" : memoryProduct.label}</strong>
+        <p>
+          {freshness.state === "new_evidence"
+            ? "Continue will refresh quietly."
+            : decision || hasEvidence
+              ? freshness.detail
+              : memoryProduct.detail}
+        </p>
       </div>
 
       <div className="privacy-note">
@@ -2654,7 +2880,7 @@ function ContinueCompanionPanel({
               aria-busy={busyAction === "start_capture"}
               onClick={onStartMemory}
             >
-              {busyAction === "start_capture" ? "Starting" : "Turn on memory"}
+              {busyAction === "start_capture" ? "Starting" : "Turn on local memory"}
             </button>
           )}
           <button
@@ -2669,10 +2895,11 @@ function ContinueCompanionPanel({
           <button
             className="text-button"
             type="button"
-            disabled={!hasEvidence || busyAction !== null}
+            disabled={!hasEvidence || busyAction !== null || continueRefreshBusy}
+            aria-busy={continueRefreshBusy}
             onClick={onRefreshContinue}
           >
-            Refresh Continue
+            {continueRefreshBusy ? "Refreshing" : "Refresh Continue"}
           </button>
           <button
             className="secondary-button"
@@ -2747,7 +2974,7 @@ function PrivacyPanel({
   const memoryBusy = busyAction === "start_capture" || busyAction === "stop_capture";
   const exclusionBusy = busyAction === "add_exclusion_rule" || busyAction === "remove_exclusion_rule";
   const deleting = busyAction === "delete_all_frames" || busyAction === "delete_recent_captures";
-  const startMemoryLabel = memoryProductStatus === "paused_with_evidence" ? "Resume memory" : "Turn on memory";
+  const startMemoryLabel = "Turn on local memory";
 
   return (
     <section className="privacy-panel" aria-label="Privacy">
@@ -2784,7 +3011,7 @@ function PrivacyPanel({
             <li>Raw typed characters</li>
             <li>Full clipboard contents</li>
             <li>Apps and websites you exclude</li>
-            <li>Frames marked never-send-to-AI</li>
+            <li>Evidence marked local-only</li>
           </ul>
         </section>
       </div>
@@ -2962,14 +3189,188 @@ function DangerConfirmDialog({
   );
 }
 
+function buildContinueEvidenceSnapshot(
+  status: CaptureStatus,
+  memory: ContinueMemoryStatus | null,
+): ContinueEvidenceSnapshot {
+  return {
+    frameCount: Math.max(0, status.frame_count),
+    eventCount: Math.max(0, status.event_count),
+    signalCount: Math.max(0, status.signal_count),
+    contentUnitCount: Math.max(0, status.content_unit_count),
+    artifactCount: Math.max(0, memory?.counts.artifacts || 0),
+    workstreamCount: Math.max(0, memory?.counts.workstreams || 0),
+    latestFrameAtMs: status.latest_frame?.captured_at || null,
+    latestArtifactAtMs: memory?.latest_artifact_timestamp || null,
+    latestWorkstreamAtMs: memory?.latest_workstream_timestamp || null,
+  };
+}
+
+function continueEvidenceChanged(
+  decisionSnapshot: ContinueEvidenceSnapshot,
+  currentSnapshot: ContinueEvidenceSnapshot,
+) {
+  return currentSnapshot.frameCount > decisionSnapshot.frameCount ||
+    currentSnapshot.eventCount > decisionSnapshot.eventCount ||
+    currentSnapshot.signalCount > decisionSnapshot.signalCount ||
+    currentSnapshot.contentUnitCount > decisionSnapshot.contentUnitCount ||
+    currentSnapshot.artifactCount > decisionSnapshot.artifactCount ||
+    currentSnapshot.workstreamCount > decisionSnapshot.workstreamCount ||
+    latestTimestamp(currentSnapshot) > latestTimestamp(decisionSnapshot);
+}
+
+function continueEvidenceSignature(snapshot: ContinueEvidenceSnapshot) {
+  return [
+    snapshot.frameCount,
+    snapshot.eventCount,
+    snapshot.signalCount,
+    snapshot.contentUnitCount,
+    snapshot.artifactCount,
+    snapshot.workstreamCount,
+    latestTimestamp(snapshot),
+  ].join(":");
+}
+
+function latestTimestamp(snapshot: ContinueEvidenceSnapshot) {
+  return Math.max(
+    snapshot.latestFrameAtMs || 0,
+    snapshot.latestArtifactAtMs || 0,
+    snapshot.latestWorkstreamAtMs || 0,
+  );
+}
+
+function isThinContinueDecision(decision: ContinueDecisionResult | null) {
+  if (!decision) return false;
+  const validation = normalizeToken(decision.validation_status);
+  const confidenceLabelValue = normalizeToken(decision.confidence_label);
+  return decision.confidence < 0.55 ||
+    validation.includes("thin") ||
+    validation.includes("no_clear") ||
+    confidenceLabelValue.includes("thin") ||
+    decision.missing_evidence.length > 0 ||
+    decision.validation_failures.length > 0;
+}
+
+function deriveContinueFreshness({
+  hasEvidence,
+  decision,
+  stale,
+  updating,
+  thin,
+  openable,
+  error,
+  updatedAtMs,
+}: {
+  hasEvidence: boolean;
+  decision: ContinueDecisionResult | null;
+  stale: boolean;
+  updating: boolean;
+  thin: boolean;
+  openable: boolean;
+  error?: string | null;
+  updatedAtMs?: number | null;
+}): ContinueFreshnessPresentation {
+  if (updating) {
+    return {
+      state: "updating",
+      label: "Updating",
+      detail: "Finding the latest continuation.",
+      stale,
+      thin,
+      openable,
+    };
+  }
+  if (!hasEvidence) {
+    return {
+      state: "waiting_for_evidence",
+      label: "Waiting for evidence",
+      detail: "Local memory has not collected enough evidence yet.",
+      stale: false,
+      thin: false,
+      openable: false,
+    };
+  }
+  if (!decision) {
+    return {
+      state: "ready",
+      label: "Ready",
+      detail: "Evidence exists and Continue can run.",
+      stale: false,
+      thin: false,
+      openable: false,
+    };
+  }
+  if (stale) {
+    return {
+      state: "new_evidence",
+      label: "New evidence",
+      detail: "The previous answer is still visible while Smalltalk refreshes quietly.",
+      stale: true,
+      thin,
+      openable,
+    };
+  }
+  if (error) {
+    return {
+      state: "needs_attention",
+      label: "Needs attention",
+      detail: productizeMemoryError(error),
+      stale,
+      thin,
+      openable,
+    };
+  }
+  if (thin || !openable) {
+    return {
+      state: "thin_evidence",
+      label: "Thin evidence",
+      detail: openable
+        ? "This is the best available answer from thin local evidence."
+        : "No reliable return target is grounded yet.",
+      stale: false,
+      thin: true,
+      openable,
+      updatedAtLabel: updatedAtMs ? `Updated ${formatRelativeAge(updatedAtMs)}` : undefined,
+    };
+  }
+  return {
+    state: "current",
+    label: "Ready to continue",
+    detail: "The current Continue answer matches the latest local evidence.",
+    stale: false,
+    thin: false,
+    openable: true,
+    updatedAtLabel: updatedAtMs ? `Updated ${formatRelativeAge(updatedAtMs)}` : undefined,
+  };
+}
+
+function continueFreshnessTone(state: ContinueFreshness): "quiet" | "good" | "warn" | "bad" {
+  if (state === "current") return "good";
+  if (state === "new_evidence" || state === "thin_evidence" || state === "updating") return "warn";
+  if (state === "needs_attention") return "bad";
+  return "quiet";
+}
+
+function freshnessBadgeLabel(
+  freshness: ContinueFreshnessPresentation,
+  bestAvailable: boolean,
+) {
+  if (freshness.state === "new_evidence") return "New evidence since this answer";
+  if (freshness.state === "updating") return "Updating";
+  if (bestAvailable || freshness.state === "thin_evidence") return "Best available answer";
+  if (freshness.openable) return "Ready to continue";
+  return freshness.label;
+}
+
 function ContinuationAnswer({
   decision,
   primaryMessage,
   hasEvidence,
   running,
   busyAction,
+  continueRefreshBusy,
   openResult,
-  stale,
+  freshness,
   feedbackStatus,
   onStartMemory,
   onContinue,
@@ -2983,8 +3384,9 @@ function ContinuationAnswer({
   hasEvidence: boolean;
   running: boolean;
   busyAction: string | null;
+  continueRefreshBusy: boolean;
   openResult: OpenResumePointResult | null;
-  stale: boolean;
+  freshness: ContinueFreshnessPresentation;
   feedbackStatus: string | null;
   onStartMemory: () => void;
   onContinue: () => void;
@@ -3035,13 +3437,20 @@ function ContinuationAnswer({
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
   const provenanceTone = decision ? continueProvenanceTone(decision) : "local";
   const whyLines = (
-    handoff?.why_this?.map((line) => cleanHumanText(line)).filter(Boolean) ||
+    handoff?.why_this
+      ?.map(productizeInternalLabel)
+      .filter((line) => line && !isInternalFacingText(line)) ||
     (presentation?.decisionReason ? [presentation.decisionReason] : [])
-  ).slice(0, 3);
+  )
+    .map((line) => safeProductLine(line, ""))
+    .filter(Boolean)
+    .slice(0, 3);
   const openButtonLabel =
     busyAction === "open_continue_target"
       ? "Opening"
-      : "Continue here";
+      : canOpenResumeTarget
+        ? "Continue here"
+        : "No direct target";
   const uncertaintyLine =
     targetLooksInternal
       ? "I saw the current focus, but I don't have a reliable return target yet."
@@ -3074,10 +3483,10 @@ function ContinuationAnswer({
   const emptyPrimaryStartsMemory = !hasEvidence && !running;
   const emptyPrimaryBusy = emptyPrimaryStartsMemory
     ? busyAction === "start_capture"
-    : busyAction === "get_continue_decision";
+    : continueRefreshBusy;
   const emptyPrimaryLabel = emptyPrimaryStartsMemory
     ? emptyPrimaryBusy ? "Starting" : "Turn on local memory"
-    : busyAction === "get_continue_decision"
+    : continueRefreshBusy
       ? running && !hasEvidence ? "Finding best available answer" : "Finding where to continue"
       : running && !hasEvidence ? "Find best available answer" : "Find where to continue";
   const emptySubcopy = emptyPrimaryStartsMemory
@@ -3091,7 +3500,7 @@ function ContinuationAnswer({
       <section className="continue-card continuation-answer empty" aria-label="Continue decision">
         <div className="answer-shell">
           <div className="answer-eyebrow">
-            <span>{running ? "Memory on" : hasEvidence ? "Evidence ready" : "No local memory yet"}</span>
+            <span>{freshness.label}</span>
           </div>
           <div className="answer-hero">
             <p>{hasEvidence ? "Ready to find your continuation" : running ? "Local memory is on" : "Turn on local memory once"}</p>
@@ -3102,7 +3511,7 @@ function ContinuationAnswer({
             <button
               className="primary-button"
               type="button"
-              disabled={busyAction !== null}
+              disabled={busyAction !== null || continueRefreshBusy}
               aria-busy={emptyPrimaryBusy}
               onClick={emptyPrimaryStartsMemory ? onStartMemory : onContinue}
             >
@@ -3118,7 +3527,10 @@ function ContinuationAnswer({
     <section className={`continue-card continuation-answer ${lowConfidence || targetLooksInternal ? "low-confidence" : ""}`} aria-label="Continue decision">
       <div className="answer-shell">
         <div className="answer-eyebrow answer-provenance">
-          <span>{stale ? "New local evidence since this answer" : lowConfidence || targetLooksInternal ? "Best available answer" : "Continue answer"}</span>
+          <span>{freshnessBadgeLabel(freshness, lowConfidence || targetLooksInternal)}</span>
+          {freshness.updatedAtLabel ? (
+            <span className="freshness-updated">{freshness.updatedAtLabel}</span>
+          ) : null}
           <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
         </div>
 
@@ -3167,17 +3579,15 @@ function ContinuationAnswer({
         ) : null}
 
         <div className="answer-actions">
-          {canOpenResumeTarget ? (
-            <button
-              className="primary-button"
-              type="button"
-              disabled={busyAction !== null}
-              aria-busy={busyAction === "open_continue_target"}
-              onClick={onOpenTarget}
-            >
-              {openButtonLabel}
-            </button>
-          ) : null}
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busyAction !== null || !canOpenResumeTarget}
+            aria-busy={busyAction === "open_continue_target"}
+            onClick={onOpenTarget}
+          >
+            {openButtonLabel}
+          </button>
           <button
             className="secondary-button"
             type="button"
@@ -3189,11 +3599,11 @@ function ContinuationAnswer({
           <button
             className="secondary-button"
             type="button"
-            disabled={busyAction !== null}
-            aria-busy={busyAction === "get_continue_decision"}
+            disabled={busyAction !== null || continueRefreshBusy}
+            aria-busy={continueRefreshBusy}
             onClick={onContinue}
           >
-            {busyAction === "get_continue_decision" ? "Refreshing" : "Refresh"}
+            {continueRefreshBusy ? "Refreshing" : freshness.stale ? "Refresh Continue" : "Refresh"}
           </button>
         </div>
 
@@ -3322,7 +3732,7 @@ function ContinueEvidencePanel({
       <div className="continue-evidence-head">
         <div>
           <p className="product-kicker">Why this continuation?</p>
-          <h2>{presentation?.workstreamTitle || continueTargetLabel(target) || "Selected workstream"}</h2>
+          <h2>{presentation?.workstreamTitle || humanTargetLabel(target) || "Selected workstream"}</h2>
         </div>
         <button className="secondary-button" type="button" onClick={onClose}>
           Close
@@ -3333,7 +3743,7 @@ function ContinueEvidencePanel({
         <dl className="continue-evidence-facts">
           <div>
             <dt>Why this workstream</dt>
-            <dd>{presentation?.decisionReason || "Selected by local continuation scoring."}</dd>
+            <dd>{presentation?.decisionReason || "Selected from local evidence."}</dd>
           </div>
           <div>
             <dt>Return target</dt>
@@ -3440,7 +3850,7 @@ function WorkstreamDetailPanel({
           <h2>Select a workstream to inspect where Continue would return.</h2>
         </div>
         <p className="continue-lede">
-          Workstream detail appears after local memory has enough evidence to build episodes, artifact roles, and candidates.
+          Workstream detail appears after local memory has enough evidence to build evidence anchors, artifact roles, and return targets.
         </p>
       </section>
     );
@@ -3489,14 +3899,14 @@ function WorkstreamDetailPanel({
             {primaryCandidate?.target_title ||
               primaryCandidate?.target_artifact_id ||
               continueTargetLabel(decision?.resume_work_target || decision?.return_target) ||
-              "No candidate target"}
+              "No return target"}
           </strong>
           <small>
             {[
               primaryCandidate ? sentenceCase(primaryCandidate.candidate_kind) : null,
               primaryCandidate?.target_openability,
               primaryCandidate ? confidenceLabel(primaryCandidate.score) : null,
-            ].filter(Boolean).join(" / ") || "Target metadata unavailable."}
+            ].filter(Boolean).join(" / ") || "Target details unavailable."}
           </small>
         </section>
         <section className="detail-block">
@@ -3642,8 +4052,8 @@ function WorkstreamDetailPanel({
           ))}
           {detail.candidates.length === 0 ? (
             <div className="workstream-empty">
-              <strong>No candidates yet</strong>
-              <span>Refresh Continue to generate continuation candidates.</span>
+              <strong>No return targets yet</strong>
+              <span>Refresh Continue to generate continuation targets.</span>
             </div>
           ) : null}
         </section>
@@ -3673,7 +4083,7 @@ function WorkstreamDetailPanel({
                   type="button"
                   onClick={() => onShowEvidence(episode.end_frame_id || episode.start_frame_id)}
                 >
-                  Inspect frame
+                  Inspect evidence
                 </button>
               </div>
               <div className="action-list">
@@ -3757,7 +4167,7 @@ function WorkstreamList({
       <div className="workstream-head">
         <div>
           <h2>Workstreams</h2>
-          <p>Recent continuation candidates, not sessions.</p>
+          <p>Recent return targets and supporting work.</p>
         </div>
         <button className="secondary-button" type="button" onClick={onRefresh}>
           Refresh
@@ -3816,7 +4226,7 @@ function StatusPill({
 }: {
   label: string;
   value: string | number;
-  tone?: "quiet" | "good" | "bad";
+  tone?: "quiet" | "good" | "warn" | "bad";
 }) {
   return (
     <div className={`status-pill ${tone}`}>
@@ -3848,13 +4258,13 @@ function FrameRow({
       <span className="frame-row-main">
         <span className="row-meta">
           <time>{formatTime(frame.captured_at)}</time>
-          <b>{frame.capture_trigger}</b>
+          <b>{productizeEvidenceTrigger(frame.capture_trigger)}</b>
         </span>
         <strong>{frameTitle(frame)}</strong>
         <small>{cleanSnippet(snippet || frame.full_text)}</small>
         <span className="badge-row">
           <EvidenceBadge label="screen" ok={Boolean(frame.snapshot_path)} />
-          <EvidenceBadge label={frame.capture_provider || "capture"} ok={frame.capture_provider === "screen_capture_kit"} />
+          <EvidenceBadge label={productizeCaptureProvider(frame.capture_provider)} ok={frame.capture_provider === "screen_capture_kit"} />
           <EvidenceBadge label={frame.text_source || "visual"} ok={Boolean(frame.text_source)} />
           <EvidenceBadge label={frame.privacy_status || "normal"} ok={frame.privacy_status !== "skipped_sensitive"} />
           <EvidenceBadge label="transition" ok={Boolean(frame.capture_trigger_id || frame.previous_frame_id)} />
@@ -3949,8 +4359,8 @@ function EvidencePanel({
   if (!frame) {
     return (
       <div className="drawer-empty">
-        <strong>No frame selected</strong>
-        <span>Select a frame to inspect stored evidence.</span>
+        <strong>No evidence anchor selected</strong>
+        <span>Select an evidence anchor to inspect stored evidence.</span>
       </div>
     );
   }
@@ -3968,8 +4378,8 @@ function EvidencePanel({
           ))
         ) : (
           <div className="drawer-empty">
-            <strong>No raw event linked</strong>
-            <span>Manual captures may not have event provenance.</span>
+            <strong>No raw event row linked</strong>
+            <span>Manual evidence updates may not have event provenance.</span>
           </div>
         )}
         {detail?.transitions.map((transition) => (
@@ -4023,19 +4433,19 @@ function EvidencePanel({
           <dd>{frame.active_window_crop_path || "None"}</dd>
         </div>
         <div>
-          <dt>Database</dt>
+          <dt>Evidence trigger</dt>
           <dd>{frame.capture_trigger_id || "No trigger id"}</dd>
         </div>
         <div>
-          <dt>Session</dt>
-          <dd>{frame.session_id || "No session id"}</dd>
+          <dt>Memory window</dt>
+          <dd>{frame.session_id || "No memory-window id"}</dd>
         </div>
         <div>
           <dt>App bundle</dt>
           <dd>{frame.app_bundle_id || "Unknown"}</dd>
         </div>
         <div>
-          <dt>Capture provider</dt>
+          <dt>Evidence provider</dt>
           <dd>{frame.capture_provider || "Unknown"}</dd>
         </div>
         <div>
@@ -4116,7 +4526,11 @@ function getMemoryProductCopy(
   };
 }
 
-function companionToneForStatus(status: MemoryProductStatus) {
+function companionToneForStatus(status: MemoryProductStatus, freshness?: ContinueFreshness) {
+  if (freshness === "updating") return "updating";
+  if (freshness === "new_evidence") return "noticed";
+  if (freshness === "current") return "ready";
+  if (freshness === "thin_evidence") return "thin";
   if (status === "on" || status === "starting") return "active";
   if (status === "paused_with_evidence") return "paused";
   if (status === "private_or_excluded") return "private";
@@ -4440,6 +4854,7 @@ function unresolvedKind(value: string) {
 function productizeInternalLabel(value?: string | null) {
   const raw = cleanHumanText(value);
   if (!raw) return "";
+  if (isInternalFacingText(raw)) return "";
   const key = normalizeToken(raw);
   const labels: Record<string, string> = {
     error_signal: "An error or failure was visible.",
@@ -4451,16 +4866,19 @@ function productizeInternalLabel(value?: string | null) {
     secondary_artifact_for_searching: "Search was treated as supporting evidence.",
     current_focus_differs_from_return_target: "Current focus is not the return target.",
     thin_evidence: "Evidence is thin.",
-    no_last_meaningful_action: "No clear last action was captured.",
+    no_last_meaningful_action: "No clear last action is grounded yet.",
     no_openable_target: "No directly openable target was found.",
-    no_candidate_generated: "No continuation candidate could be generated yet.",
-    micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local scoring.",
-    smalltalk_self_observation_downranked: "Smalltalk's own UI was treated as low-value diagnostic evidence.",
+    no_candidate_generated: "No continuation target could be grounded yet.",
+    micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local evidence.",
+    smalltalk_self_observation_downranked: "Smalltalk ignored its own UI as evidence.",
     branch_surface_is_evidence_not_default_return_target: "Branch surface is evidence, not the default return target.",
     privacy_sensitive_or_redacted_target_local_only: "Target contains sensitive or redacted evidence and stays local.",
     current_focus_mismatch: "Current focus is not the return target.",
   };
   if (labels[key]) return labels[key];
+  if (key.includes("scoring") || key.includes("score_component")) {
+    return "Selected from local evidence.";
+  }
   if (raw.includes(":")) {
     const prefix = normalizeToken(raw.split(":")[0]);
     if (labels[prefix]) return labels[prefix];
@@ -4507,6 +4925,34 @@ function productizeOpenability(value?: string | null) {
   return labels[key] || "";
 }
 
+function productizeEvidenceTrigger(value?: string | null) {
+  const key = normalizeToken(value);
+  const labels: Record<string, string> = {
+    manual_capture: "Manual evidence",
+    explicit_user_capture: "Manual evidence",
+    scheduled_capture: "Scheduled evidence",
+    event: "Event-backed",
+    app_switch: "App changed",
+    window_change: "Window changed",
+    content_change: "Content changed",
+    idle: "Idle evidence",
+    startup: "Initial evidence",
+  };
+  return labels[key] || productizeInternalLabel(value) || "Evidence";
+}
+
+function productizeCaptureProvider(value?: string | null) {
+  const key = normalizeToken(value);
+  const labels: Record<string, string> = {
+    screen_capture_kit: "ScreenCaptureKit",
+    screenshot_cli: "Screenshot",
+    accessibility: "Accessibility",
+    ocr: "OCR",
+    manual: "Manual",
+  };
+  return labels[key] || "Local evidence";
+}
+
 function safeProductLine(value: string, fallback: string) {
   const cleaned = cleanHumanText(value);
   if (!cleaned || isInternalFacingText(cleaned)) return fallback;
@@ -4522,21 +4968,28 @@ function isInternalFacingText(value?: string | null) {
   if (!lower) return false;
   if (
     lower.includes("continue-candidate-") ||
+    lower.includes("continue-decision-") ||
     lower.includes("workstream-") ||
     lower.includes("artifact-") ||
+    lower.includes("action-") ||
+    lower.includes("task-action-") ||
     lower.includes("frame-fallback") ||
     lower.includes("frame_fallback") ||
+    lower.includes("frame fallback") ||
     lower.includes("target metadata") ||
     lower.includes("selected candidate") ||
     lower.includes("candidate id") ||
+    lower.includes("action id") ||
     lower.includes("workstream id") ||
     lower.includes("artifact id") ||
+    lower.includes("episode id") ||
     lower.includes("frame_id") ||
     lower.includes("frame id")
   ) {
     return true;
   }
-  return /\bframe-\d+\b/.test(lower) || /\bframe\s+\d+\b/.test(lower);
+  return /\b(frame|action|artifact|episode|workstream)[-_]\d+\b/.test(lower) ||
+    /\b(frame|action|artifact|episode|workstream)\s+\d+\b/.test(lower);
 }
 
 function presentOpenResult(result: OpenResumePointResult) {
@@ -4568,17 +5021,16 @@ function cleanHumanText(value?: string | null) {
 
 function looksLikeInternalId(value: string) {
   const trimmed = value.trim();
-  return /^(frame|action|artifact|episode|workstream|continue-candidate|continue-decision|task-action)-?[a-z0-9_-]+$/i.test(trimmed)
+  return /^(frame|action|artifact|episode|workstream|continue-candidate|continue-decision|task-action)[-_]?[a-z0-9_-]+$/i.test(trimmed)
     || /^-?\d+$/.test(trimmed);
 }
 
 function continueTargetLabel(target?: ContinueReturnTarget | null) {
   if (!target) return "";
   return (
-    target.title ||
-    target.artifact_kind ||
+    cleanHumanText(target.title) ||
     pathBasename(target.document_path || target.browser_url) ||
-    target.artifact_id ||
+    productizeArtifactKind(target.artifact_kind) ||
     ""
   );
 }
@@ -4656,7 +5108,7 @@ function sentenceCase(value?: string | null) {
 }
 
 function frameTitle(frame: CaptureFrame) {
-  return frame.window_name || frame.app_name || `Frame ${frame.id}`;
+  return frame.window_name || frame.app_name || "Evidence anchor";
 }
 
 function evidenceAnchorLabel(frame?: CaptureFrame | null) {
@@ -4769,7 +5221,7 @@ function overlayCount(detail: FrameDetail | null, mode: OverlayMode) {
 }
 
 function confidenceLabel(value?: number | null) {
-  if (typeof value !== "number") return "unscored";
+  if (typeof value !== "number") return "unknown";
   return `${Math.round(value * 100)}%`;
 }
 

@@ -15,6 +15,23 @@ static EXPANDED: AtomicBool = AtomicBool::new(false);
 static LAST_CLOUD_RESUME_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CONTINUE_DECISION_ID: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CONTINUE_TARGET_ARTIFACT_ID: Mutex<Option<String>> = Mutex::new(None);
+static LAST_CONTINUE_ISLAND_STATE: Mutex<Option<RememberedContinueIslandState>> = Mutex::new(None);
+
+#[derive(Debug, Clone)]
+struct RememberedContinueIslandState {
+    decision_id: String,
+    resume_headline: Option<String>,
+    resume_detail: Option<String>,
+    resume_point: Option<String>,
+    resume_warning: Option<String>,
+    continue_freshness: String,
+    evidence_updated_at_ms: Option<i64>,
+    decision_updated_at_ms: Option<i64>,
+    continue_openable: bool,
+    frame_count: u64,
+    signal_count: u64,
+    event_count: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionIslandSnapshot {
@@ -22,6 +39,7 @@ pub struct SessionIslandSnapshot {
     pub session_id: Option<String>,
     pub elapsed_ms: u64,
     pub frame_count: u64,
+    pub event_count: u64,
     pub trail_app_count: u64,
     pub trail_moment_count: u64,
     pub trail_labels: Vec<String>,
@@ -40,6 +58,10 @@ pub struct SessionIslandSnapshot {
     pub resume_model: Option<String>,
     pub resume_response_id: Option<String>,
     pub continue_decision_id: Option<String>,
+    pub continue_freshness: Option<String>,
+    pub evidence_updated_at_ms: Option<i64>,
+    pub decision_updated_at_ms: Option<i64>,
+    pub continue_openable: Option<bool>,
     pub resume_warning: Option<String>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
@@ -89,6 +111,7 @@ impl SessionIslandSnapshot {
             session_id: None,
             elapsed_ms: 0,
             frame_count: 0,
+            event_count: 0,
             trail_app_count: 0,
             trail_moment_count: 0,
             trail_labels: Vec::new(),
@@ -107,6 +130,10 @@ impl SessionIslandSnapshot {
             resume_model: None,
             resume_response_id: None,
             continue_decision_id: None,
+            continue_freshness: None,
+            evidence_updated_at_ms: None,
+            decision_updated_at_ms: None,
+            continue_openable: None,
             resume_warning: None,
             privacy_label: None,
             is_sensitive: false,
@@ -288,11 +315,12 @@ fn snapshot_from_status(
         })
         .unwrap_or(0);
 
-    SessionIslandSnapshot {
+    let mut snapshot = SessionIslandSnapshot {
         state,
         session_id,
         elapsed_ms,
         frame_count: status.frame_count.max(0) as u64,
+        event_count: status.event_count.max(0) as u64,
         trail_app_count: status.recent_app_labels.len() as u64,
         trail_moment_count: status.signal_count.max(0) as u64,
         trail_labels: status.recent_app_labels.clone(),
@@ -327,10 +355,16 @@ fn snapshot_from_status(
         resume_model: None,
         resume_response_id: None,
         continue_decision_id: None,
+        continue_freshness: None,
+        evidence_updated_at_ms: frame.map(|frame| frame.captured_at),
+        decision_updated_at_ms: None,
+        continue_openable: None,
         resume_warning: None,
         privacy_label,
         is_sensitive,
-    }
+    };
+    apply_remembered_continue_to_status_snapshot(&mut snapshot, status);
+    snapshot
 }
 
 fn clean_one_line(value: Option<&str>) -> Option<String> {
@@ -341,6 +375,56 @@ fn clean_one_line(value: Option<&str>) -> Option<String> {
 
 fn is_sensitive_privacy_label(label: &str) -> bool {
     !matches!(label, "normal" | "ok" | "allowed")
+}
+
+fn apply_remembered_continue_to_status_snapshot(
+    snapshot: &mut SessionIslandSnapshot,
+    _status: &CaptureStatus,
+) {
+    if matches!(
+        snapshot.state,
+        SessionIslandState::Hidden
+            | SessionIslandState::Starting
+            | SessionIslandState::Processing
+            | SessionIslandState::TrailReconstructing
+            | SessionIslandState::StoppedToast
+            | SessionIslandState::Error
+    ) {
+        return;
+    }
+
+    let remembered = LAST_CONTINUE_ISLAND_STATE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(remembered) = remembered else {
+        return;
+    };
+
+    let latest_capture_at = snapshot.last_capture_at_ms.unwrap_or_default();
+    let remembered_evidence_at = remembered.evidence_updated_at_ms.unwrap_or_default();
+    let has_new_evidence = snapshot.frame_count > remembered.frame_count
+        || snapshot.trail_moment_count > remembered.signal_count
+        || snapshot.event_count > remembered.event_count
+        || latest_capture_at > remembered_evidence_at;
+
+    snapshot.continue_decision_id = Some(remembered.decision_id);
+    snapshot.continue_openable = Some(remembered.continue_openable);
+    snapshot.decision_updated_at_ms = remembered.decision_updated_at_ms;
+    snapshot.evidence_updated_at_ms = Some(latest_capture_at.max(remembered_evidence_at));
+    snapshot.resume_point = remembered.resume_point.clone();
+
+    if has_new_evidence {
+        snapshot.continue_freshness = Some("new_evidence".to_string());
+        snapshot.resume_headline = Some("New evidence".to_string());
+        snapshot.resume_detail = Some("Refresh Continue".to_string());
+        snapshot.resume_warning = None;
+    } else {
+        snapshot.continue_freshness = Some(remembered.continue_freshness);
+        snapshot.resume_headline = remembered.resume_headline;
+        snapshot.resume_detail = remembered.resume_detail;
+        snapshot.resume_warning = remembered.resume_warning;
+    }
 }
 
 fn now_millis() -> i64 {
@@ -440,6 +524,7 @@ fn continue_from_island() {
                     snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
                 apply_continue_decision_to_snapshot(&mut snapshot, &decision);
                 let _ = app.emit("session-island-continue-ready", decision.clone());
+                let _ = app.emit("smalltalk-continue-updated", decision.clone());
                 update_session_island(snapshot);
                 show_session_island();
             }
@@ -455,7 +540,35 @@ fn apply_continue_decision_to_snapshot(
     snapshot: &mut SessionIslandSnapshot,
     decision: &crate::continuation::ContinueDecisionResult,
 ) {
+    let target = decision
+        .resume_work_target
+        .as_ref()
+        .or(decision.return_target.as_ref());
+    let continue_openable = target.is_some_and(|target| {
+        target.openability == "openable"
+            && (target.browser_url.is_some() || target.document_path.is_some())
+    });
+    let thin = decision.confidence < 0.55
+        || decision.confidence_label.eq_ignore_ascii_case("thin")
+        || decision.validation_status.contains("thin")
+        || !decision.missing_evidence.is_empty()
+        || !decision.validation_failures.is_empty();
+    let continue_freshness = if thin {
+        "thin_evidence"
+    } else if continue_openable {
+        "current"
+    } else {
+        "needs_evidence"
+    }
+    .to_string();
+
     snapshot.continue_decision_id = Some(decision.decision_id.clone());
+    snapshot.continue_freshness = Some(continue_freshness.clone());
+    snapshot.decision_updated_at_ms = Some(now_millis());
+    snapshot.evidence_updated_at_ms = decision_evidence_updated_at_ms(decision)
+        .or(snapshot.last_capture_at_ms)
+        .or(snapshot.decision_updated_at_ms);
+    snapshot.continue_openable = Some(continue_openable);
     snapshot.resume_source = Some("continue".to_string());
     snapshot.resume_model = decision.model.clone();
     snapshot.resume_response_id = decision.response_id.clone();
@@ -465,17 +578,18 @@ fn apply_continue_decision_to_snapshot(
         _ => "Evidence is thin".to_string(),
     });
     snapshot.resume_detail = clean_one_line(
-        decision
-            .selected_workstream
-            .as_ref()
-            .and_then(|workstream| workstream.title_candidate.as_deref())
+        Some(decision.handoff.last_state_line.as_str())
+            .filter(|line| !line.trim().is_empty())
+            .or_else(|| {
+                decision
+                    .selected_workstream
+                    .as_ref()
+                    .and_then(|workstream| workstream.title_candidate.as_deref())
+            })
             .or(decision.next_action.as_deref()),
     );
     snapshot.resume_point = clean_one_line(
-        decision
-            .resume_work_target
-            .as_ref()
-            .or(decision.return_target.as_ref())
+        target
             .and_then(|target| {
                 target
                     .title
@@ -490,6 +604,21 @@ fn apply_continue_decision_to_snapshot(
         .first()
         .or_else(|| decision.warnings.first())
         .and_then(|warning| clean_one_line(Some(warning)));
+    remember_continue_decision_from_snapshot(decision, snapshot, continue_freshness, continue_openable);
+}
+
+fn decision_evidence_updated_at_ms(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> Option<i64> {
+    decision
+        .evidence_freshness_ledger
+        .as_ref()
+        .and_then(|ledger| {
+            ledger
+                .get("latest_any_evidence_ms")
+                .or_else(|| ledger.get("decision_watermark_ms"))
+                .and_then(|value| value.as_i64())
+        })
 }
 
 #[allow(dead_code)]
@@ -513,14 +642,14 @@ fn apply_cloud_resume_to_snapshot(
             && current_label != return_label
             && result.decision == "ambiguous_current_focus_vs_prior_task";
         snapshot.resume_headline = if split_targets {
-            Some("Trail split: current focus vs return target".to_string())
+            Some("Current focus differs from return target".to_string())
         } else {
             cloud_answer_text(result, "focus_now")
                 .or_else(|| clean_one_line(Some(&result.local_card.focus_now)))
         };
         snapshot.resume_detail = if split_targets {
             Some(format!(
-                "Current: {}. Return: {}.",
+                "Current focus: {}. Return target: {}.",
                 current_label
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
@@ -681,6 +810,31 @@ fn remember_continue_decision(decision: &crate::continuation::ContinueDecisionRe
     }
 }
 
+fn remember_continue_decision_from_snapshot(
+    decision: &crate::continuation::ContinueDecisionResult,
+    snapshot: &SessionIslandSnapshot,
+    continue_freshness: String,
+    continue_openable: bool,
+) {
+    remember_continue_decision(decision);
+    if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+        *slot = Some(RememberedContinueIslandState {
+            decision_id: decision.decision_id.clone(),
+            resume_headline: snapshot.resume_headline.clone(),
+            resume_detail: snapshot.resume_detail.clone(),
+            resume_point: snapshot.resume_point.clone(),
+            resume_warning: snapshot.resume_warning.clone(),
+            continue_freshness,
+            evidence_updated_at_ms: snapshot.evidence_updated_at_ms,
+            decision_updated_at_ms: snapshot.decision_updated_at_ms,
+            continue_openable,
+            frame_count: snapshot.frame_count,
+            signal_count: snapshot.trail_moment_count,
+            event_count: snapshot.event_count,
+        });
+    }
+}
+
 fn continue_decision_target_artifact_id(
     decision: &crate::continuation::ContinueDecisionResult,
 ) -> Option<String> {
@@ -835,9 +989,14 @@ fn toggle_expanded_from_native() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn snapshot_from_status_uses_event_backed_signal_count_for_trail_moments() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_remembered_continue_for_test();
         let status = CaptureStatus {
             running: true,
             frame_count: 1,
@@ -870,8 +1029,141 @@ mod tests {
         let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
 
         assert_eq!(snapshot.frame_count, 1);
+        assert_eq!(snapshot.event_count, 1370);
         assert_eq!(snapshot.trail_app_count, 3);
         assert_eq!(snapshot.trail_moment_count, 7);
+    }
+
+    #[test]
+    fn snapshot_from_status_preserves_current_remembered_continue_without_new_evidence() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        remember_continue_for_test(1, 7, 12, "current");
+        let status = status_for_island_freshness(1, 7, 12, 10_000);
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
+
+        assert_eq!(snapshot.continue_decision_id.as_deref(), Some("decision-test"));
+        assert_eq!(snapshot.continue_freshness.as_deref(), Some("current"));
+        assert_eq!(snapshot.resume_headline.as_deref(), Some("Ready to continue"));
+        assert_eq!(snapshot.resume_point.as_deref(), Some("PRODUCT.md"));
+    }
+
+    #[test]
+    fn snapshot_from_status_marks_remembered_continue_stale_on_event_only_evidence() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        remember_continue_for_test(1, 7, 12, "current");
+        let status = status_for_island_freshness(1, 7, 13, 10_000);
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
+
+        assert_eq!(snapshot.continue_decision_id.as_deref(), Some("decision-test"));
+        assert_eq!(snapshot.continue_freshness.as_deref(), Some("new_evidence"));
+        assert_eq!(snapshot.resume_headline.as_deref(), Some("New evidence"));
+        assert_eq!(snapshot.resume_detail.as_deref(), Some("Refresh Continue"));
+        assert_eq!(snapshot.resume_point.as_deref(), Some("PRODUCT.md"));
+    }
+
+    fn clear_remembered_continue_for_test() {
+        if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+            *slot = None;
+        }
+    }
+
+    fn remember_continue_for_test(
+        frame_count: u64,
+        signal_count: u64,
+        event_count: u64,
+        freshness: &str,
+    ) {
+        if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+            *slot = Some(RememberedContinueIslandState {
+                decision_id: "decision-test".to_string(),
+                resume_headline: Some("Ready to continue".to_string()),
+                resume_detail: Some("Editing was in progress.".to_string()),
+                resume_point: Some("PRODUCT.md".to_string()),
+                resume_warning: None,
+                continue_freshness: freshness.to_string(),
+                evidence_updated_at_ms: Some(10_000),
+                decision_updated_at_ms: Some(11_000),
+                continue_openable: true,
+                frame_count,
+                signal_count,
+                event_count,
+            });
+        }
+    }
+
+    fn status_for_island_freshness(
+        frame_count: i64,
+        signal_count: i64,
+        event_count: i64,
+        latest_capture_at_ms: i64,
+    ) -> CaptureStatus {
+        CaptureStatus {
+            running: true,
+            frame_count,
+            recent_app_labels: vec!["Codex".to_string()],
+            signal_count,
+            event_count,
+            transition_count: 0,
+            content_unit_count: 0,
+            session_count: 1,
+            active_session: None,
+            latest_session: None,
+            last_export: None,
+            started_at: Some(now_millis()),
+            last_error: None,
+            latest_frame: Some(crate::capture::CaptureFrame {
+                id: 1,
+                session_id: None,
+                captured_at: latest_capture_at_ms,
+                snapshot_path: String::new(),
+                app_name: Some("Codex".to_string()),
+                window_name: Some("PRODUCT.md".to_string()),
+                browser_url: None,
+                document_path: Some("/Users/me/smalltalk/PRODUCT.md".to_string()),
+                focused: true,
+                capture_trigger: "event".to_string(),
+                text_source: None,
+                accessibility_text: None,
+                accessibility_tree_json: None,
+                full_text: None,
+                content_hash: None,
+                image_hash: None,
+                capture_provider: None,
+                scope: None,
+                display_id: None,
+                window_id: None,
+                app_pid: None,
+                app_bundle_id: None,
+                screen_scale: None,
+                pixel_width: None,
+                pixel_height: None,
+                full_screenshot_path: None,
+                active_window_crop_path: None,
+                active_element_crop_path: None,
+                phash: None,
+                privacy_status: None,
+                capture_trigger_id: None,
+                previous_frame_id: None,
+                sck_display_id: None,
+                sck_window_id: None,
+                sck_owning_bundle_id: None,
+                sck_filter_summary_json: None,
+                sck_configuration_summary_json: None,
+                sck_frame_metadata_json: None,
+                sck_capture_mode: None,
+                sck_audio_policy: None,
+            }),
+            skipped_samples: 0,
+            last_skipped_at: None,
+            data_dir: String::new(),
+            database_path: String::new(),
+            screenshot_tool: true,
+            accessibility_tool: true,
+            ocr_tool: true,
+            runtime_diagnostics: crate::capture::RuntimeDiagnostics::default(),
+        }
     }
 }
 
