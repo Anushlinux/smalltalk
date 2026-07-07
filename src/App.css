@@ -1874,6 +1874,14 @@ h3 {
   min-width: 0;
 }
 
+.alternative-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
 .alternative-heading strong {
   color: var(--ink);
   font-size: 13px;

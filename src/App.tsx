@@ -443,6 +443,7 @@ type ContinueCandidateSummary = {
   continuation_role?: string | null;
   work_value_reason?: string | null;
   why_not_primary?: string | null;
+  candidate_score_components?: ContinueCandidateScoreTrace;
 };
 
 type ContinueScoreComponents = {
@@ -452,6 +453,7 @@ type ContinueScoreComponents = {
   branch_origin: number;
   evidence_quality: number;
   recency: number;
+  fresh_current_work?: number;
   openability: number;
   privacy_safety: number;
   memory_support?: number;
@@ -467,12 +469,41 @@ type ContinueScoreComponents = {
   evidence_sufficiency?: number;
 };
 
+type ContinueCandidateScoreTrace = {
+  fresh_current_work_score: number;
+  stale_mismatch_cap_applied: boolean;
+  openability_score: number;
+  recency_score: number;
+  evidence_quality_score: number;
+};
+
 type ContinueActivitySummary = {
   main_work?: string | null;
   support_context: string[];
   recent_divergence: string[];
   diagnostic_surfaces: string[];
   missing_for_current_focus: string[];
+};
+
+type ActiveCurrentWorkUnresolved = {
+  id: string;
+  observed_at_ms: number;
+  app_name?: string | null;
+  bundle_id?: string | null;
+  window_title?: string | null;
+  artifact_id?: string | null;
+  frame_id?: string | null;
+  event_ids: string[];
+  event_backed: boolean;
+  has_fresh_heavy_frame: boolean;
+  has_human_readable_title: boolean;
+  has_openable_target: boolean;
+  evidence_quality: string;
+  identity_confidence: number;
+  activity_hint?: string | null;
+  unresolved_reason: string;
+  missing_evidence: string[];
+  warnings: string[];
 };
 
 type ContinueDecisionResult = {
@@ -483,6 +514,7 @@ type ContinueDecisionResult = {
   model?: string | null;
   response_id?: string | null;
   current_focus?: ContinueFocusSummary | null;
+  active_current_work_unresolved?: ActiveCurrentWorkUnresolved | null;
   current_activity?: string | null;
   selected_workstream?: ContinueSelectedWorkstream | null;
   return_target?: ContinueReturnTarget | null;
@@ -517,6 +549,11 @@ type ContinueHandoff = {
   confidence_label: string;
   user_visible_uncertainty?: string | null;
 };
+
+type ContinueCardActionState =
+  | { kind: "openable_return_target"; label: "Continue here" }
+  | { kind: "thin_current_work"; label: "Inspect latest evidence" }
+  | { kind: "no_clear_continuation"; label: "Inspect evidence" };
 
 type RecentContinueWorkstream = {
   id: string;
@@ -3378,7 +3415,10 @@ function ContinuationAnswer({
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
   const resumeTarget = decision?.resume_work_target || decision?.return_target || null;
-  const canOpenResumeTarget = isDirectResumeTargetOpenable(resumeTarget);
+  const actionState = decision ? getContinueCardActionState(decision) : null;
+  const canOpenResumeTarget = actionState?.kind === "openable_return_target";
+  const isThinCurrentWork = actionState?.kind === "thin_current_work";
+  const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
   const lowConfidence = decision ? decision.confidence < 0.55 : false;
   const handoff = decision?.handoff || null;
   const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
@@ -3386,16 +3426,25 @@ function ContinuationAnswer({
   const [alternativesOpen, setAlternativesOpen] = useState(false);
   const alternatives = decision?.alternatives || [];
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
+  const evidenceLines = decision ? productEvidenceLines(decision).slice(0, 3) : [];
   const rawWorkstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
   const targetLooksInternal = isInternalFacingText(rawTargetLine);
-  const workstreamLine = targetLooksInternal
+  const workstreamLine = isThinCurrentWork
+    ? "Most recent work seen"
+    : targetLooksInternal
     ? "No reliable continuation target yet"
     : safeProductLine(rawWorkstreamLine, "Recent work");
-  const targetLine = targetLooksInternal
+  const targetLine = isInspectPrimary
+    ? "Exact return target missing"
+    : targetLooksInternal
     ? "No reliable return target is grounded yet."
     : safeProductLine(rawTargetLine, "No stable place to continue yet.");
-  const targetMeta = targetLooksInternal
+  const targetMeta = isThinCurrentWork
+    ? "Smalltalk saw recent activity here, but does not yet have enough evidence to reopen the exact task safely."
+    : isInspectPrimary
+    ? "Smalltalk does not yet have enough evidence to reopen an exact task safely."
+    : targetLooksInternal
     ? "I don't have a reliable app or page target for this yet."
     : presentation?.targetMeta || humanTargetMeta(resumeTarget);
   const lastStateLine = targetLooksInternal
@@ -3415,7 +3464,7 @@ function ContinuationAnswer({
         );
   const currentFocusLine = stripCurrentFocusPrefix(
     safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
-  );
+  ) || humanFocusLabel(decision?.current_focus);
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
   const provenanceTone = decision ? continueProvenanceTone(decision) : "local";
   const whyLines = (
@@ -3427,13 +3476,21 @@ function ContinuationAnswer({
     .map((line) => safeProductLine(line, ""))
     .filter(Boolean)
     .slice(0, 3);
+  const targetBlockLabel = isInspectPrimary
+    ? "No safe return target yet"
+    : lowConfidence
+      ? "Best available place to continue"
+      : "Continue at";
   const openButtonLabel =
-    busyAction === "open_continue_target"
+    busyAction === "open_continue_target" && canOpenResumeTarget
       ? "Opening"
-      : canOpenResumeTarget
-        ? "Continue here"
-        : "No direct target";
+      : actionState?.label || "Inspect evidence";
   const uncertaintyLine =
+    isThinCurrentWork
+      ? evidenceLines[0] || "Evidence is thin."
+      : isInspectPrimary
+      ? evidenceLines[0] || "No safe return target is grounded yet."
+      :
     targetLooksInternal
       ? "I saw the current focus, but I don't have a reliable return target yet."
       : safeProductLine(
@@ -3446,8 +3503,9 @@ function ContinuationAnswer({
   const showCurrentFocus =
     Boolean(currentFocusLine) &&
     currentFocusLine !== "No current focus returned." &&
-    currentFocusLine !== targetLine &&
+    (isThinCurrentWork || currentFocusLine !== targetLine) &&
     (
+      isThinCurrentWork ||
       decision?.warnings.includes("current_focus_differs_from_return_target") ||
       decision?.warnings.includes("current_focus_mismatch") ||
       decision?.current_focus?.artifact_id !== resumeTarget?.artifact_id
@@ -3517,13 +3575,13 @@ function ContinuationAnswer({
         </div>
 
         <div className="answer-hero">
-          <p>You were working on</p>
+          <p>{isThinCurrentWork ? "Current work detected" : "You were working on"}</p>
           <h2>{workstreamLine}</h2>
         </div>
 
         <div className="answer-target">
           <div>
-            <span>{lowConfidence ? "Best available place to continue" : "Continue at"}</span>
+            <span>{targetBlockLabel}</span>
             <strong>{targetLine}</strong>
             <small>{targetMeta}</small>
           </div>
@@ -3548,6 +3606,14 @@ function ContinuationAnswer({
           </div>
         ) : null}
 
+        {isInspectPrimary && evidenceLines.length ? (
+          <div className="answer-why-strip" aria-label="Missing evidence">
+            {evidenceLines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </div>
+        ) : null}
+
         {showCurrentFocus ? (
           <p className="answer-context">
             Current focus: <strong>{currentFocusLine}</strong>
@@ -3564,9 +3630,9 @@ function ContinuationAnswer({
           <button
             className="primary-button"
             type="button"
-            disabled={busyAction !== null || !canOpenResumeTarget}
+            disabled={busyAction !== null}
             aria-busy={busyAction === "open_continue_target"}
-            onClick={onOpenTarget}
+            onClick={canOpenResumeTarget ? onOpenTarget : onInspectEvidence}
           >
             {openButtonLabel}
           </button>
@@ -3643,11 +3709,20 @@ function ContinuationAnswer({
 
         {visibleAlternatives.length > 0 ? (
           <div className="alternative-list" aria-label="Alternative continuations">
+            <div className="alternative-heading">
+              <strong>{isThinCurrentWork ? "Older possible return points" : "Alternatives"}</strong>
+              <span>{visibleAlternatives.length}</span>
+            </div>
             {visibleAlternatives.map((candidate) => (
               <div className="alternative-row" key={candidate.candidate_id}>
                 <div>
                   <strong>{presentAlternativeCandidate(candidate)}</strong>
-                  <span>{productizeInternalLabel(candidate.reason) || candidate.confidence_label || "Possible continuation"}</span>
+                  <span>
+                    {[
+                      productizeInternalLabel(candidate.reason) || candidate.confidence_label || "Possible continuation",
+                      isThinCurrentWork ? "Older than your latest current work." : "",
+                    ].filter(Boolean).join(" ")}
+                  </span>
                 </div>
                 <button
                   className="secondary-button"
@@ -4749,6 +4824,49 @@ function isDirectResumeTargetOpenable(target?: ContinueReturnTarget | null) {
   );
 }
 
+function getContinueCardActionState(decision: ContinueDecisionResult): ContinueCardActionState {
+  const target = decision.resume_work_target || decision.return_target || null;
+  const hasOpenableReturnTarget = isDirectResumeTargetOpenable(target);
+  if (hasOpenableReturnTarget) {
+    return { kind: "openable_return_target", label: "Continue here" };
+  }
+
+  const evidenceNotes = continueDecisionEvidenceNotes(decision);
+  const unresolvedCurrentWork = decision.active_current_work_unresolved;
+  const hasThinCurrentWork =
+    Boolean(unresolvedCurrentWork && !unresolvedCurrentWork.has_openable_target) ||
+    evidenceNotes.includes("stale_return_target_suppressed:newer_current_focus") ||
+    (
+      normalizeToken(decision.candidate_kind) === "continue_current_work" &&
+      !hasOpenableReturnTarget
+    ) ||
+    evidenceNotes.includes("thin_evidence:no_human_return_target");
+
+  if (hasThinCurrentWork) {
+    return { kind: "thin_current_work", label: "Inspect latest evidence" };
+  }
+
+  return { kind: "no_clear_continuation", label: "Inspect evidence" };
+}
+
+function continueDecisionEvidenceNotes(decision: ContinueDecisionResult) {
+  return [
+    ...decision.missing_evidence,
+    ...decision.warnings,
+    ...decision.validation_failures,
+    ...(decision.active_current_work_unresolved?.missing_evidence || []),
+    ...(decision.active_current_work_unresolved?.warnings || []),
+  ].filter(Boolean);
+}
+
+function productEvidenceLines(decision: ContinueDecisionResult) {
+  return [...new Set(
+    continueDecisionEvidenceNotes(decision)
+      .map(productizeInternalLabel)
+      .filter(Boolean),
+  )];
+}
+
 function humanFocusLabel(focus?: ContinueFocusSummary | null) {
   if (!focus) return "No current focus returned.";
   return cleanHumanText(focus.title || focus.window_title || focus.app_name)
@@ -4851,6 +4969,13 @@ function productizeInternalLabel(value?: string | null) {
     no_last_meaningful_action: "No clear last action is grounded yet.",
     no_openable_target: "No directly openable target was found.",
     no_candidate_generated: "No continuation target could be grounded yet.",
+    missing_current_work_target_identity: "Exact task/thread identity is missing.",
+    missing_current_work_openable_target: "No URL or document path is available for this current work.",
+    missing_fresh_heavy_frame_for_current_focus: "No fresh screenshot/text snapshot is available for the current surface.",
+    missing_current_work_visible_text: "Current work needs clearer visible text.",
+    missing_current_work_thread_or_document_id: "Current work needs a thread or document identity.",
+    active_current_work_unresolved: "Fresh current work is visible but not safely reopenable yet.",
+    stale_return_target_suppressed_newer_current_focus: "An older return point was hidden because newer work was detected elsewhere.",
     micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local evidence.",
     smalltalk_self_observation_downranked: "Smalltalk ignored its own UI as evidence.",
     branch_surface_is_evidence_not_default_return_target: "Branch surface is evidence, not the default return target.",

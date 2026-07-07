@@ -19164,6 +19164,14 @@ fn export_continue_output_audit_to_plan(
         &serde_json::to_value(&result.current_focus).map_err(to_string)?,
     )?;
     write_json_pretty(
+        &decision_dir.join("active_current_work_unresolved.json"),
+        &active_current_work_unresolved_audit_json(&result.active_current_work_unresolved),
+    )?;
+    write_json_pretty(
+        &decision_dir.join("p0_quality_signals.json"),
+        &serde_json::to_value(&result.p0_quality_signals).map_err(to_string)?,
+    )?;
+    write_json_pretty(
         &decision_dir.join("current_surface_resolution.json"),
         &serde_json::to_value(&result.current_surface_resolution).map_err(to_string)?,
     )?;
@@ -20532,6 +20540,35 @@ fn continue_audit_full_raw_enabled(effective_mode: &str) -> bool {
             .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"))
 }
 
+fn active_current_work_unresolved_audit_json(
+    fact: &Option<crate::continuation::ActiveCurrentWorkUnresolved>,
+) -> Value {
+    match fact {
+        Some(fact) => serde_json::json!({
+            "present": true,
+            "observed_at_ms": fact.observed_at_ms,
+            "app_name": fact.app_name,
+            "window_title_present": fact.window_title.as_deref().is_some_and(|title| !title.trim().is_empty()),
+            "artifact_id_present": fact.artifact_id.is_some(),
+            "frame_id_present": fact.frame_id.is_some(),
+            "event_backed": fact.event_backed,
+            "event_count": fact.event_ids.len(),
+            "has_fresh_heavy_frame": fact.has_fresh_heavy_frame,
+            "has_human_readable_title": fact.has_human_readable_title,
+            "has_openable_target": fact.has_openable_target,
+            "evidence_quality": fact.evidence_quality,
+            "identity_confidence": fact.identity_confidence,
+            "activity_hint": fact.activity_hint,
+            "unresolved_reason": fact.unresolved_reason,
+            "missing_evidence": fact.missing_evidence,
+            "warnings": fact.warnings,
+        }),
+        None => serde_json::json!({
+            "present": false,
+        }),
+    }
+}
+
 fn continue_decision_trace_json(
     generated_at: i64,
     effective_mode: &str,
@@ -20567,6 +20604,14 @@ fn continue_decision_trace_json(
         "validation_status": result.validation_status,
         "quality_gate": result.quality_gate,
         "warnings": result.warnings,
+    }));
+    events.push(serde_json::json!({
+        "phase": "active_current_work_unresolved",
+        "summary": active_current_work_unresolved_audit_json(&result.active_current_work_unresolved),
+    }));
+    events.push(serde_json::json!({
+        "phase": "p0_quality_signals",
+        "summary": result.p0_quality_signals,
     }));
     events.push(serde_json::json!({
         "phase": "micro_inference",
@@ -20609,6 +20654,8 @@ fn continue_decision_trace_json(
         },
         "cache": cache_decision,
         "current_focus": result.current_focus,
+        "active_current_work_unresolved": active_current_work_unresolved_audit_json(&result.active_current_work_unresolved),
+        "p0_quality_signals": result.p0_quality_signals,
         "workstream": result.selected_workstream,
         "candidates": result.alternatives,
         "local_selection": {
@@ -31185,6 +31232,99 @@ mod tests {
     }
 
     #[test]
+    fn open_resume_point_refuses_suppressed_stale_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let stale_frame = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/suppressed-stale-chatgpt.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "ChatGPT - old task",
+            "https://chatgpt.com/c/suppressed-stale",
+            "chat_conversation",
+            "Older ChatGPT support branch.",
+            "phash-suppressed-stale",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-suppressed-stale",
+            "chat_conversation",
+            Some("https://chatgpt.com/c/suppressed-stale"),
+            None,
+            Some(stale_frame.to_string()),
+            "openable",
+            "ChatGPT - old task",
+            10,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-current-codex-thin",
+            "coding_agent_thread",
+            None,
+            None,
+            Some("event-current-codex".to_string()),
+            "frame_fallback",
+            "Codex current work",
+            30,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "continue-decision-suppressed-stale",
+            "workstream-current-codex",
+            "continue-candidate-current-codex",
+            "artifact-current-codex-thin",
+            "event-current-codex",
+            40,
+        );
+        conn.execute(
+            "INSERT INTO continue_workstream_artifacts (
+                workstream_id, artifact_id, durable_role, importance_score,
+                first_seen_frame_id, last_seen_frame_id, reason
+             ) VALUES (
+                'workstream-current-codex', 'artifact-suppressed-stale',
+                'support_context', 0.3, ?1, ?1, 'older suppressed return point'
+             )",
+            params![stale_frame.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continue_decisions
+             SET return_target_artifact_id = NULL,
+                 warnings = 'stale_return_target_suppressed:newer_current_focus',
+                 validation_status = 'thin_evidence',
+                 continue_output_mode = 'no_clear_continuation'
+             WHERE id = 'continue-decision-suppressed-stale'",
+            [],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "continue-decision-suppressed-stale",
+            None,
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("Strict Continue target artifact-current-codex-thin")
+                && warning.contains("Staying in Smalltalk")
+        }));
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("suppressed-stale")));
+    }
+
+    #[test]
     fn strict_continue_decision_opens_exact_displayed_openable_target() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -32276,6 +32416,7 @@ mod tests {
         assert!(audit_dir.join("audit_integrity.json").exists());
         assert!(audit_dir.join("decision/decision_trace.json").exists());
         assert!(audit_dir.join("decision/final_decision.json").exists());
+        assert!(audit_dir.join("decision/p0_quality_signals.json").exists());
         assert!(audit_dir.join("decision/candidates.json").exists());
         assert!(audit_dir.join("decision/copy_gate.json").exists());
         assert!(audit_dir.join("cache/cache_decision.json").exists());
