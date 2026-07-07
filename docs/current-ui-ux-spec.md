@@ -1569,16 +1569,16 @@ Animated frame transitions:
 
 Micro is only allowed when:
 
-- `snapshot.state == "ready"`
+- `snapshot.state` is `ready`, `recording_compact`, `recording_expanded`, or `resume_ready`
 - No `snapshot.lastError`
 
 Visual:
 
-- Tiny capsule.
+- Tiny evidence tape capsule.
 - Visual size: 58 x 10 px.
 - Hit area: 86 x 24 px.
+- Dark tape fill with subtle grid/scan treatment.
 - White/black strokes and subtle black shadow.
-- Transparent fill.
 
 Interactions:
 
@@ -1598,43 +1598,42 @@ Compact size:
 
 Layout:
 
-1. Left play/pause circular button.
+1. Left evidence tape.
 2. Center two-line copy block.
-3. Right evidence tape button.
+3. Right compact action button.
 
-Left control:
+Left tape:
 
-- `PlayPauseButton`
-- Active icon: `pause.fill`
-- Inactive icon: `play.fill`
-- Calls `toggle_meeting`.
+- `EvidenceTapeView`
+- Compact-left width: 34 px.
+- Compact-left height: 24 px.
+- Density: 5.
+- Uses the same state inputs as the expanded tape.
 
 Center copy:
 
 - Primary text uses `primaryDisplayText`.
 - Secondary text uses `secondaryDisplayText`.
-- Primary width is fixed to 96 scaled px.
+- Primary block width is fixed to 106 scaled px.
 
-Right tape:
+Right action:
 
-- `EvidenceTapeView`
-- Compact width: 60 px.
-- Compact height: 18 px.
-- Density: 4.
-- Button action: `open_expanded`.
+- Text comes from `compactActionLabel`.
+- Action comes from `primaryButtonAction`.
+- Disabled state follows `primaryActionDisabled`.
 
 Hover:
 
-- Hover over tape slightly scales it and adds glow.
+- Hover over the right action slightly scales it and raises contrast.
 - Hover over compact island sends `keep_compact`, which refreshes compact/micro timing.
 
 Background:
 
 - Capsule fill.
-- Active state warms the dark fill with red tint.
+- Active state warms the dark fill and uses the current state accent glow.
 - Inactive state is dark graphite.
 - Top white highlight.
-- Bottom red glow only when capture is active.
+- Bottom accent glow only when capture is active.
 
 ### 12.5 Expanded Presentation
 
@@ -1645,25 +1644,17 @@ Expanded size:
 Layout:
 
 1. Header row:
-   - Play/pause button.
+   - Left evidence tape.
    - Primary/secondary text.
-   - Evidence tape.
-2. Optional trail labels if not `resume_ready`.
-3. Resume detail block if `resume_ready`.
-4. Divider.
-5. Two action buttons.
-
-Trail labels:
-
-- `TrailRouteView`
-- Shows last 4 non-empty `trailLabels`.
-- Each label is a capsule.
-- Last label is brighter/bolder.
-- Chevron icons between labels.
+   - Larger right evidence tape.
+2. Resume detail block if `resume_ready`.
+3. Divider.
+4. Two action buttons.
 
 Resume detail block:
 
-- Only shown in `resume_ready`.
+- Only shown in `resume_ready` when the current state is not privacy/excluded.
+- Eyebrow: `resumeDetailEyebrow`.
 - Text: `resumeDetailLine`.
 - Provenance: `resumeProvenanceLine`.
 - Uses translucent rounded rectangle with subtle stroke.
@@ -1711,16 +1702,19 @@ Transitions:
 
 ## 13. Evidence Tape
 
-`EvidenceTapeView` is the animated right-side signal in compact and expanded presentations.
+`EvidenceTapeView` is the animated native island signal in micro, compact, and expanded presentations.
 
 Inputs:
 
 - `active`
 - `processing`
 - `error`
+- `privateMode`
+- `thinEvidence`
+- `ready`
 - `frameCount`
-- `pulseNonce`
 - `density`
+- `pulseNonce`
 - `scale`
 - `width`
 - `height`
@@ -1743,6 +1737,9 @@ State mapping:
 - Active capture: red scan/heat/glow.
 - Processing/trail reconstructing: white shimmer.
 - Error: amber stroke and error mark.
+- Thin evidence: amber tape accent.
+- Privacy/excluded: muted white tape accent and boundary mark.
+- Continue ready: green tape accent with slow scan.
 - Idle: dark low-contrast tape.
 
 Frame ticks:

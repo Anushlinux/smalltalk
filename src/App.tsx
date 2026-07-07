@@ -752,9 +752,11 @@ type ContinueFreshnessPresentation = {
 };
 
 const RECENT_MEMORY_DELETE_RANGE_MS = 60 * 60 * 1000;
-const BACKGROUND_CONTINUE_VISIBLE_DEBOUNCE_MS = 2200;
-const BACKGROUND_CONTINUE_IDLE_DEBOUNCE_MS = 14000;
-const BACKGROUND_CONTINUE_MIN_INTERVAL_MS = 12000;
+const BACKGROUND_CONTINUE_VISIBLE_DEBOUNCE_MS = 5000;
+const BACKGROUND_CONTINUE_IDLE_DEBOUNCE_MS = 30000;
+const BACKGROUND_CONTINUE_MIN_INTERVAL_MS = 60000;
+const STATUS_HEARTBEAT_RUNNING_MS = 15000;
+const STATUS_HEARTBEAT_IDLE_MS = 30000;
 
 const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: string }> = {
   off: {
@@ -1585,15 +1587,13 @@ function App() {
     const id = window.setInterval(() => {
       if (isDeleting) return;
       void refreshStatus();
-      if (status.running) {
+      if (status.running && diagnosticsOpen) {
         void refreshContinueMemory();
-        if (diagnosticsOpen) {
-          void runSearch();
-          void refreshTimeline();
-          void refreshWorkstreams();
-        }
+        void runSearch();
+        void refreshTimeline();
+        void refreshWorkstreams();
       }
-    }, status.running ? 1500 : 6000);
+    }, status.running ? STATUS_HEARTBEAT_RUNNING_MS : STATUS_HEARTBEAT_IDLE_MS);
 
     return () => window.clearInterval(id);
   }, [diagnosticsOpen, isDeleting, refreshContinueMemory, refreshStatus, refreshTimeline, refreshWorkstreams, runSearch, status.running]);
@@ -1970,22 +1970,10 @@ function App() {
 
     listen<CaptureStatus>("capture-status", (event) => {
       setStatus(event.payload);
-      void refreshContinueMemory();
       if (diagnosticsOpen) {
+        void refreshContinueMemory();
         void refreshWorkstreams();
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-        } else {
-          unlisteners.push(nextUnlisten);
-        }
-      })
-      .catch((err) => setError(String(err)));
-
-    listen<ContinueDecisionResult>("session-island-continue-ready", (event) => {
-      void applyContinueDecision(event.payload);
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -3211,9 +3199,6 @@ function continueEvidenceChanged(
   currentSnapshot: ContinueEvidenceSnapshot,
 ) {
   return currentSnapshot.frameCount > decisionSnapshot.frameCount ||
-    currentSnapshot.eventCount > decisionSnapshot.eventCount ||
-    currentSnapshot.signalCount > decisionSnapshot.signalCount ||
-    currentSnapshot.contentUnitCount > decisionSnapshot.contentUnitCount ||
     currentSnapshot.artifactCount > decisionSnapshot.artifactCount ||
     currentSnapshot.workstreamCount > decisionSnapshot.workstreamCount ||
     latestTimestamp(currentSnapshot) > latestTimestamp(decisionSnapshot);
@@ -3222,9 +3207,6 @@ function continueEvidenceChanged(
 function continueEvidenceSignature(snapshot: ContinueEvidenceSnapshot) {
   return [
     snapshot.frameCount,
-    snapshot.eventCount,
-    snapshot.signalCount,
-    snapshot.contentUnitCount,
     snapshot.artifactCount,
     snapshot.workstreamCount,
     latestTimestamp(snapshot),

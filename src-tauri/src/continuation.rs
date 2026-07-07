@@ -4368,39 +4368,60 @@ fn load_continue_current_focus(
     if !table_exists(conn, "frames")? {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT f.id, f.captured_at, f.app_name, f.window_name, f.browser_url,
-                f.document_path, a.id, a.artifact_kind, a.display_title,
-                a.browser_url, a.document_path
-         FROM frames f
-         LEFT JOIN continue_artifact_observations o ON o.frame_id = CAST(f.id AS TEXT)
-         LEFT JOIN continue_artifacts a ON a.id = o.artifact_id
-         WHERE (?1 IS NULL OR f.session_id = ?1)
-           AND LOWER(COALESCE(f.app_bundle_id, '')) NOT LIKE '%com.smalltalk.app%'
-           AND LOWER(COALESCE(f.app_name, '')) <> 'smalltalk'
-           AND LOWER(COALESCE(f.document_path, '')) NOT LIKE '%continue_outputs%'
-           AND LOWER(COALESCE(a.document_path, '')) NOT LIKE '%continue_outputs%'
-           AND LOWER(COALESCE(a.display_title, '')) NOT LIKE '%smalltalk continue%'
-         ORDER BY f.captured_at DESC, f.id DESC, o.observation_confidence DESC
-         LIMIT 1",
-        params![session_id],
-        |row| {
-            let frame_id: i64 = row.get(0)?;
-            Ok(ContinueFocusSummary {
-                frame_id: frame_id.to_string(),
-                captured_at_ms: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                browser_url: row.get::<_, Option<String>>(9)?.or(row.get(4)?),
-                document_path: row.get::<_, Option<String>>(10)?.or(row.get(5)?),
-                artifact_id: row.get(6)?,
-                artifact_kind: row.get(7)?,
-                title: row.get(8)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(to_string)
+    let sql = match session_id {
+        Some(_) => {
+            "SELECT f.id, f.captured_at, f.app_name, f.window_name, f.browser_url,
+                    f.document_path, a.id, a.artifact_kind, a.display_title,
+                    a.browser_url, a.document_path
+             FROM frames f
+             LEFT JOIN continue_artifact_observations o ON o.frame_id = CAST(f.id AS TEXT)
+             LEFT JOIN continue_artifacts a ON a.id = o.artifact_id
+             WHERE f.session_id = ?1
+               AND LOWER(COALESCE(f.app_bundle_id, '')) NOT LIKE '%com.smalltalk.app%'
+               AND LOWER(COALESCE(f.app_name, '')) <> 'smalltalk'
+               AND LOWER(COALESCE(f.document_path, '')) NOT LIKE '%continue_outputs%'
+               AND LOWER(COALESCE(a.document_path, '')) NOT LIKE '%continue_outputs%'
+               AND LOWER(COALESCE(a.display_title, '')) NOT LIKE '%smalltalk continue%'
+             ORDER BY f.captured_at DESC, f.id DESC, o.observation_confidence DESC
+             LIMIT 1"
+        }
+        None => {
+            "SELECT f.id, f.captured_at, f.app_name, f.window_name, f.browser_url,
+                    f.document_path, a.id, a.artifact_kind, a.display_title,
+                    a.browser_url, a.document_path
+             FROM frames f
+             LEFT JOIN continue_artifact_observations o ON o.frame_id = CAST(f.id AS TEXT)
+             LEFT JOIN continue_artifacts a ON a.id = o.artifact_id
+             WHERE LOWER(COALESCE(f.app_bundle_id, '')) NOT LIKE '%com.smalltalk.app%'
+               AND LOWER(COALESCE(f.app_name, '')) <> 'smalltalk'
+               AND LOWER(COALESCE(f.document_path, '')) NOT LIKE '%continue_outputs%'
+               AND LOWER(COALESCE(a.document_path, '')) NOT LIKE '%continue_outputs%'
+               AND LOWER(COALESCE(a.display_title, '')) NOT LIKE '%smalltalk continue%'
+             ORDER BY f.captured_at DESC, f.id DESC, o.observation_confidence DESC
+             LIMIT 1"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let map_row = |row: &Row<'_>| {
+        let frame_id: i64 = row.get(0)?;
+        Ok(ContinueFocusSummary {
+            frame_id: frame_id.to_string(),
+            captured_at_ms: row.get(1)?,
+            app_name: row.get(2)?,
+            window_title: row.get(3)?,
+            browser_url: row.get::<_, Option<String>>(9)?.or(row.get(4)?),
+            document_path: row.get::<_, Option<String>>(10)?.or(row.get(5)?),
+            artifact_id: row.get(6)?,
+            artifact_kind: row.get(7)?,
+            title: row.get(8)?,
+        })
+    };
+    let value = if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], map_row).optional()
+    } else {
+        stmt.query_row([], map_row).optional()
+    };
+    value.map_err(to_string)
 }
 
 fn resolve_current_surface(
@@ -5851,18 +5872,32 @@ fn latest_frame_marker(
     if !table_exists(conn, "frames")? {
         return Ok((None, None));
     }
-    conn.query_row(
-        "SELECT id, captured_at
-         FROM frames
-         WHERE (?1 IS NULL OR session_id = ?1)
-         ORDER BY captured_at DESC, id DESC
-         LIMIT 1",
-        params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()
-    .map_err(to_string)
-    .map(|value| value.unwrap_or((None, None)))
+    let sql = match session_id {
+        Some(_) => {
+            "SELECT id, captured_at
+             FROM frames
+             WHERE session_id = ?1
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1"
+        }
+        None => {
+            "SELECT id, captured_at
+             FROM frames
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let value = if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    } else {
+        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    };
+    value
+        .map_err(to_string)
+        .map(|value| value.unwrap_or((None, None)))
 }
 
 fn latest_ui_event_marker(
@@ -5872,18 +5907,32 @@ fn latest_ui_event_marker(
     if !table_exists(conn, "ui_events")? {
         return Ok((None, None));
     }
-    conn.query_row(
-        "SELECT id, ts_ms
-         FROM ui_events
-         WHERE (?1 IS NULL OR session_id = ?1)
-         ORDER BY ts_ms DESC, id DESC
-         LIMIT 1",
-        params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()
-    .map_err(to_string)
-    .map(|value| value.unwrap_or((None, None)))
+    let sql = match session_id {
+        Some(_) => {
+            "SELECT id, ts_ms
+             FROM ui_events
+             WHERE session_id = ?1
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT 1"
+        }
+        None => {
+            "SELECT id, ts_ms
+             FROM ui_events
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT 1"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let value = if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    } else {
+        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    };
+    value
+        .map_err(to_string)
+        .map(|value| value.unwrap_or((None, None)))
 }
 
 fn latest_meaningful_ui_event_marker(
@@ -5896,43 +5945,58 @@ fn latest_meaningful_ui_event_marker(
     let has_app_name = column_exists(conn, "ui_events", "app_name")?;
     let has_bundle_id = column_exists(conn, "ui_events", "app_bundle_id")?;
     let has_window_title = column_exists(conn, "ui_events", "window_title")?;
-    let mut stmt = conn
-        .prepare(
+    let sql = match session_id {
+        Some(_) => {
             "SELECT id, ts_ms, event_type, key_category, app_name, app_bundle_id, window_title
              FROM ui_events
-             WHERE (?1 IS NULL OR session_id = ?1)
+             WHERE session_id = ?1
              ORDER BY ts_ms DESC, id DESC
-             LIMIT 80",
-        )
-        .map_err(to_string)?;
-    let rows = stmt
-        .query_map(params![session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                if has_app_name {
-                    row.get::<_, Option<String>>(4)?
-                } else {
-                    None
-                },
-                if has_bundle_id {
-                    row.get::<_, Option<String>>(5)?
-                } else {
-                    None
-                },
-                if has_window_title {
-                    row.get::<_, Option<String>>(6)?
-                } else {
-                    None
-                },
-            ))
-        })
-        .map_err(to_string)?;
+             LIMIT 80"
+        }
+        None => {
+            "SELECT id, ts_ms, event_type, key_category, app_name, app_bundle_id, window_title
+             FROM ui_events
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT 80"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let map_row = |row: &Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            if has_app_name {
+                row.get::<_, Option<String>>(4)?
+            } else {
+                None
+            },
+            if has_bundle_id {
+                row.get::<_, Option<String>>(5)?
+            } else {
+                None
+            },
+            if has_window_title {
+                row.get::<_, Option<String>>(6)?
+            } else {
+                None
+            },
+        ))
+    };
+    let rows = if let Some(session_id) = session_id {
+        stmt.query_map(params![session_id], map_row)
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    } else {
+        stmt.query_map([], map_row)
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    };
     for row in rows {
-        let (id, ts_ms, event_type, key_category, app_name, bundle_id, window_title) =
-            row.map_err(to_string)?;
+        let (id, ts_ms, event_type, key_category, app_name, bundle_id, window_title) = row;
         let event_label = key_category
             .map(|category| format!("{}:{}", event_type, category))
             .unwrap_or(event_type);
@@ -5985,18 +6049,29 @@ fn latest_scoped_string_marker(
     if !table_exists(conn, table)? {
         return Ok((None, None));
     }
-    conn.query_row(
-        &format!(
-            "SELECT {}, {} FROM {} WHERE (?1 IS NULL OR {} = ?1)
+    let sql = match session_id {
+        Some(_) => format!(
+            "SELECT {}, {} FROM {} WHERE {} = ?1
              ORDER BY {} DESC, {} DESC LIMIT 1",
             id_column, ts_column, table, session_column, ts_column, id_column
         ),
-        params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()
-    .map_err(to_string)
-    .map(|value| value.unwrap_or((None, None)))
+        None => format!(
+            "SELECT {}, {} FROM {}
+             ORDER BY {} DESC, {} DESC LIMIT 1",
+            id_column, ts_column, table, ts_column, id_column
+        ),
+    };
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
+    let value = if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    } else {
+        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    };
+    value
+        .map_err(to_string)
+        .map(|value| value.unwrap_or((None, None)))
 }
 
 fn latest_app_context_marker(
@@ -6006,19 +6081,34 @@ fn latest_app_context_marker(
     if !table_exists(conn, "app_contexts")? || !table_exists(conn, "frames")? {
         return Ok((None, None));
     }
-    conn.query_row(
-        "SELECT c.id, f.captured_at
-         FROM app_contexts c
-         JOIN frames f ON CAST(f.id AS TEXT) = c.frame_id
-         WHERE (?1 IS NULL OR f.session_id = ?1)
-         ORDER BY f.captured_at DESC, c.id DESC
-         LIMIT 1",
-        params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()
-    .map_err(to_string)
-    .map(|value| value.unwrap_or((None, None)))
+    let sql = match session_id {
+        Some(_) => {
+            "SELECT c.id, f.captured_at
+             FROM app_contexts c
+             JOIN frames f ON CAST(f.id AS TEXT) = c.frame_id
+             WHERE f.session_id = ?1
+             ORDER BY f.captured_at DESC, c.id DESC
+             LIMIT 1"
+        }
+        None => {
+            "SELECT c.id, f.captured_at
+             FROM app_contexts c
+             JOIN frames f ON CAST(f.id AS TEXT) = c.frame_id
+             ORDER BY f.captured_at DESC, c.id DESC
+             LIMIT 1"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let value = if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    } else {
+        stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    };
+    value
+        .map_err(to_string)
+        .map(|value| value.unwrap_or((None, None)))
 }
 
 pub fn effective_continue_decision_mode(mode: Option<&str>, rebuild_layers: bool) -> &'static str {
@@ -6092,12 +6182,18 @@ fn latest_frame_timestamp(
     if !table_exists(conn, "frames")? {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT MAX(captured_at) FROM frames WHERE (?1 IS NULL OR session_id = ?1)",
-        params![session_id],
-        |row| row.get(0),
-    )
-    .map_err(to_string)
+    match session_id {
+        Some(session_id) => conn
+            .query_row(
+                "SELECT MAX(captured_at) FROM frames WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(to_string),
+        None => conn
+            .query_row("SELECT MAX(captured_at) FROM frames", [], |row| row.get(0))
+            .map_err(to_string),
+    }
 }
 
 fn latest_event_timestamp(
@@ -6107,12 +6203,18 @@ fn latest_event_timestamp(
     if !table_exists(conn, "ui_events")? {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT MAX(ts_ms) FROM ui_events WHERE (?1 IS NULL OR session_id = ?1)",
-        params![session_id],
-        |row| row.get(0),
-    )
-    .map_err(to_string)
+    match session_id {
+        Some(session_id) => conn
+            .query_row(
+                "SELECT MAX(ts_ms) FROM ui_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(to_string),
+        None => conn
+            .query_row("SELECT MAX(ts_ms) FROM ui_events", [], |row| row.get(0))
+            .map_err(to_string),
+    }
 }
 
 fn split_semicolon_list(value: Option<&str>) -> Vec<String> {

@@ -825,7 +825,7 @@ struct VisionOcrElement {
     height: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CapturePaths {
     root_dir: PathBuf,
     snapshot_dir: PathBuf,
@@ -3018,6 +3018,8 @@ fn run_continue_evidence_probes(
     request: &crate::continuation::NeedMoreEvidenceRequest,
 ) -> crate::continuation::NeedMoreEvidenceProbeResult {
     let started_at_ms = now_millis();
+    let budget = Duration::from_millis(request.max_probe_ms.clamp(100, 5_000) as u64);
+    let deadline = Instant::now() + budget;
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut probes_succeeded = Vec::new();
@@ -3026,7 +3028,15 @@ fn run_continue_evidence_probes(
 
     match capture_paths(app) {
         Ok(paths) => {
-            context = collect_accessibility_context(&paths);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| Duration::from_millis(0));
+            let (next_context, accessibility_timed_out) =
+                collect_accessibility_context_with_timeout(paths.clone(), remaining);
+            context = next_context;
+            if accessibility_timed_out {
+                warnings.push("accessibility_probe_timed_out".to_string());
+            }
             if context.error.is_some() {
                 warnings.push("accessibility_probe_returned_error".to_string());
             } else if context_has_accessibility_signal(&context) {
@@ -3044,8 +3054,11 @@ fn run_continue_evidence_probes(
                         .push(crate::continuation::EvidenceProbeKind::AccessibilityTextProbe);
                 }
             }
-            match collect_window_snapshot(&paths) {
-                Ok(snapshot) => {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| Duration::from_millis(0));
+            match collect_window_snapshot_with_timeout(paths, remaining) {
+                Ok((snapshot, false)) => {
                     window_count = snapshot.windows.len() as i64;
                     probes_succeeded.push(crate::continuation::EvidenceProbeKind::WindowGraphProbe);
                     if context.app_bundle_id.is_none() {
@@ -3066,6 +3079,12 @@ fn run_continue_evidence_probes(
                             }
                         }
                     }
+                }
+                Ok((_, true)) => {
+                    warnings.push("window_graph_probe_timed_out".to_string());
+                }
+                Err(error) if error == "window_graph_probe_timed_out" => {
+                    warnings.push("window_graph_probe_timed_out".to_string())
                 }
                 Err(error) => warnings.push(format!("window_graph_probe_failed:{}", error)),
             }
@@ -3131,6 +3150,60 @@ fn run_continue_evidence_probes(
         privacy_status: Some(privacy.status),
         warnings,
         errors,
+    }
+}
+
+fn collect_accessibility_context_with_timeout(
+    paths: CapturePaths,
+    timeout: Duration,
+) -> (AccessibilityContext, bool) {
+    if timeout.is_zero() {
+        return (
+            AccessibilityContext {
+                error: Some("accessibility_probe_timed_out".to_string()),
+                ..AccessibilityContext::default()
+            },
+            true,
+        );
+    }
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(collect_accessibility_context(&paths));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(context) => (context, false),
+        Err(RecvTimeoutError::Timeout) => (
+            AccessibilityContext {
+                error: Some("accessibility_probe_timed_out".to_string()),
+                ..AccessibilityContext::default()
+            },
+            true,
+        ),
+        Err(RecvTimeoutError::Disconnected) => (
+            AccessibilityContext {
+                error: Some("accessibility_probe_disconnected".to_string()),
+                ..AccessibilityContext::default()
+            },
+            false,
+        ),
+    }
+}
+
+fn collect_window_snapshot_with_timeout(
+    paths: CapturePaths,
+    timeout: Duration,
+) -> Result<(WindowSnapshotPayload, bool), String> {
+    if timeout.is_zero() {
+        return Err("window_graph_probe_timed_out".to_string());
+    }
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(collect_window_snapshot(&paths));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map(|snapshot| (snapshot, false)),
+        Err(RecvTimeoutError::Timeout) => Err("window_graph_probe_timed_out".to_string()),
+        Err(RecvTimeoutError::Disconnected) => Err("window_graph_probe_disconnected".to_string()),
     }
 }
 
@@ -16852,11 +16925,11 @@ fn capture_status_snapshot_inner(
     let active_session = conn.as_ref().and_then(|conn| {
         active_session_id
             .as_deref()
-            .and_then(|id| load_capture_session(conn, id).ok())
+            .and_then(|id| load_capture_session_for_status(conn, id).ok())
     });
     let latest_session = conn
         .as_ref()
-        .and_then(|conn| load_latest_session(conn).ok().flatten());
+        .and_then(|conn| load_latest_session_for_status(conn).ok().flatten());
     let scoped_session_id = active_session
         .as_ref()
         .or(latest_session.as_ref())
@@ -16865,7 +16938,7 @@ fn capture_status_snapshot_inner(
         .as_ref()
         .and_then(|conn| {
             scoped_session_id
-                .map(|session_id| session_counts(conn, session_id).ok())
+                .map(|session_id| session_status_counts(conn, session_id).ok())
                 .flatten()
         })
         .unwrap_or_default();
@@ -16874,23 +16947,9 @@ fn capture_status_snapshot_inner(
         .and_then(|conn| row_count(conn, "capture_sessions").ok())
         .unwrap_or(0);
 
-    let latest_frame = conn.as_ref().and_then(|conn| {
-        conn.query_row(
-            &format!(
-                "SELECT {}
-             FROM frames
-             WHERE (?1 IS NULL OR session_id = ?1)
-             ORDER BY captured_at DESC
-             LIMIT 1",
-                FRAME_COLUMNS
-            ),
-            params![scoped_session_id],
-            frame_from_row,
-        )
-        .optional()
-        .ok()
-        .flatten()
-    });
+    let latest_frame = conn
+        .as_ref()
+        .and_then(|conn| latest_status_frame(conn, scoped_session_id).ok().flatten());
     let recent_app_labels = conn
         .as_ref()
         .and_then(|conn| recent_app_labels(conn, scoped_session_id).ok())
@@ -16936,6 +16995,39 @@ fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<
     recent_frame_app_labels(conn, session_id)
 }
 
+fn latest_status_frame(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Option<CaptureFrame>, String> {
+    let sql = match session_id {
+        Some(_) => format!(
+            "SELECT {}
+             FROM frames
+             WHERE session_id = ?1
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1",
+            FRAME_COLUMNS
+        ),
+        None => format!(
+            "SELECT {}
+             FROM frames
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1",
+            FRAME_COLUMNS
+        ),
+    };
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
+    if let Some(session_id) = session_id {
+        stmt.query_row(params![session_id], frame_from_row)
+            .optional()
+            .map_err(to_string)
+    } else {
+        stmt.query_row([], frame_from_row)
+            .optional()
+            .map_err(to_string)
+    }
+}
+
 fn recent_event_app_labels(
     conn: &Connection,
     session_id: Option<&str>,
@@ -16945,47 +17037,84 @@ fn recent_event_app_labels(
     {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
+    let sql = match session_id {
+        Some(_) => {
             "SELECT app_name
              FROM (
                SELECT app_name, MAX(ts_ms) AS latest_ts
                FROM ui_events
-               WHERE (?1 IS NULL OR session_id = ?1)
+               WHERE session_id = ?1
                  AND app_name IS NOT NULL
                  AND TRIM(app_name) != ''
                GROUP BY LOWER(TRIM(app_name))
                ORDER BY latest_ts DESC
                LIMIT 5
              )
-             ORDER BY latest_ts ASC",
-        )
-        .map_err(to_string)?;
-    let rows = stmt
-        .query_map(params![session_id], |row| row.get::<_, String>(0))
-        .map_err(to_string)?;
-    clean_distinct_labels(rows)
+             ORDER BY latest_ts ASC"
+        }
+        None => {
+            "SELECT app_name
+             FROM (
+               SELECT app_name, MAX(ts_ms) AS latest_ts
+               FROM ui_events
+               WHERE app_name IS NOT NULL
+                 AND TRIM(app_name) != ''
+               GROUP BY LOWER(TRIM(app_name))
+               ORDER BY latest_ts DESC
+               LIMIT 5
+             )
+             ORDER BY latest_ts ASC"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    if let Some(session_id) = session_id {
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(to_string)?;
+        clean_distinct_labels(rows)
+    } else {
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(to_string)?;
+        clean_distinct_labels(rows)
+    }
 }
 
 fn recent_frame_app_labels(
     conn: &Connection,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare(
+    let sql = match session_id {
+        Some(_) => {
             "SELECT app_name
              FROM frames
-             WHERE (?1 IS NULL OR session_id = ?1)
+             WHERE session_id = ?1
                AND app_name IS NOT NULL
                AND TRIM(app_name) != ''
              ORDER BY captured_at DESC, id DESC
-             LIMIT 24",
-        )
-        .map_err(to_string)?;
-    let rows = stmt
-        .query_map(params![session_id], |row| row.get::<_, String>(0))
-        .map_err(to_string)?;
-    clean_distinct_labels(rows)
+             LIMIT 24"
+        }
+        None => {
+            "SELECT app_name
+             FROM frames
+             WHERE app_name IS NOT NULL
+               AND TRIM(app_name) != ''
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 24"
+        }
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    if let Some(session_id) = session_id {
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(to_string)?;
+        clean_distinct_labels(rows)
+    } else {
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(to_string)?;
+        clean_distinct_labels(rows)
+    }
 }
 
 fn clean_distinct_labels<I>(rows: I) -> Result<Vec<String>, String>
@@ -17023,12 +17152,18 @@ fn local_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
     if event_count > 0 {
         return Ok(event_count);
     }
-    conn.query_row(
-        "SELECT COUNT(*) FROM frames WHERE (?1 IS NULL OR session_id = ?1)",
-        params![session_id],
-        |row| row.get(0),
-    )
-    .map_err(to_string)
+    match session_id {
+        Some(session_id) => conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(to_string),
+        None => conn
+            .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
+            .map_err(to_string),
+    }
 }
 
 fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64, String> {
@@ -17043,39 +17178,64 @@ fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
     } else {
         "NULL"
     };
-    let sql = format!(
-        "SELECT ts_ms, event_type, key_category, {}, {}
-         FROM (
-           SELECT ts_ms, event_type, key_category, {}, {}
-           FROM ui_events
-           WHERE (?1 IS NULL OR session_id = ?1)
-             AND ts_ms >= COALESCE((
-               SELECT MAX(ts_ms)
+    let sql = match session_id {
+        Some(_) => format!(
+            "SELECT ts_ms, event_type, key_category, {}, {}
+             FROM (
+               SELECT ts_ms, event_type, key_category, {}, {}
                FROM ui_events
-               WHERE (?1 IS NULL OR session_id = ?1)
-             ), 0) - ?2
-           ORDER BY ts_ms DESC
-           LIMIT {}
-         )
-         ORDER BY ts_ms ASC",
-        app_expr, window_expr, app_expr, window_expr, MAX_LOCAL_SIGNAL_EVENTS
-    );
+               WHERE session_id = ?1
+                 AND ts_ms >= COALESCE((
+                   SELECT MAX(ts_ms)
+                   FROM ui_events
+                   WHERE session_id = ?1
+                 ), 0) - ?2
+               ORDER BY ts_ms DESC
+               LIMIT {}
+             )
+             ORDER BY ts_ms ASC",
+            app_expr, window_expr, app_expr, window_expr, MAX_LOCAL_SIGNAL_EVENTS
+        ),
+        None => format!(
+            "SELECT ts_ms, event_type, key_category, {}, {}
+             FROM (
+               SELECT ts_ms, event_type, key_category, {}, {}
+               FROM ui_events
+               WHERE ts_ms >= COALESCE((
+                   SELECT MAX(ts_ms)
+                   FROM ui_events
+                 ), 0) - ?1
+               ORDER BY ts_ms DESC
+               LIMIT {}
+             )
+             ORDER BY ts_ms ASC",
+            app_expr, window_expr, app_expr, window_expr, MAX_LOCAL_SIGNAL_EVENTS
+        ),
+    };
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
-    let rows = stmt
-        .query_map(params![session_id, LOCAL_SIGNAL_RECENT_WINDOW_MS], |row| {
-            let event_type: String = row.get(1)?;
-            let key_category: Option<String> = row.get(2)?;
-            let app_name: Option<String> = row.get(3)?;
-            let window_title: Option<String> = row.get(4)?;
-            Ok(SignalEventRow {
-                ts_ms: row.get(0)?,
-                signal_kind: signal_kind(&event_type, key_category.as_deref()),
-                app_label: clean_label(app_name.as_deref().unwrap_or("")),
-                window_label: clean_label(window_title.as_deref().unwrap_or("")),
-            })
+    let map_row = |row: &Row<'_>| {
+        let event_type: String = row.get(1)?;
+        let key_category: Option<String> = row.get(2)?;
+        let app_name: Option<String> = row.get(3)?;
+        let window_title: Option<String> = row.get(4)?;
+        Ok(SignalEventRow {
+            ts_ms: row.get(0)?,
+            signal_kind: signal_kind(&event_type, key_category.as_deref()),
+            app_label: clean_label(app_name.as_deref().unwrap_or("")),
+            window_label: clean_label(window_title.as_deref().unwrap_or("")),
         })
-        .map_err(to_string)?;
-    let rows = rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?;
+    };
+    let rows = if let Some(session_id) = session_id {
+        stmt.query_map(params![session_id, LOCAL_SIGNAL_RECENT_WINDOW_MS], map_row)
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    } else {
+        stmt.query_map(params![LOCAL_SIGNAL_RECENT_WINDOW_MS], map_row)
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?
+    };
     Ok(bucket_signal_events(&rows).min(MAX_VISIBLE_SIGNAL_MOMENTS))
 }
 
@@ -18201,9 +18361,10 @@ fn latest_session_id(conn: &Connection) -> Result<Option<String>, String> {
     .map_err(to_string)
 }
 
-fn load_latest_session(conn: &Connection) -> Result<Option<CaptureSession>, String> {
+fn load_latest_session_for_status(conn: &Connection) -> Result<Option<CaptureSession>, String> {
     let id = latest_session_id(conn)?;
-    id.map(|id| load_capture_session(conn, &id)).transpose()
+    id.map(|id| load_capture_session_for_status(conn, &id))
+        .transpose()
 }
 
 fn load_capture_session(conn: &Connection, session_id: &str) -> Result<CaptureSession, String> {
@@ -18230,6 +18391,33 @@ fn load_capture_session(conn: &Connection, session_id: &str) -> Result<CaptureSe
     Ok(session)
 }
 
+fn load_capture_session_for_status(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<CaptureSession, String> {
+    let mut session = conn
+        .query_row(
+            "SELECT id, sequence, started_at_ms, stopped_at_ms, status, export_path
+             FROM capture_sessions
+             WHERE id = ?1",
+            params![session_id],
+            |row| {
+                Ok(CaptureSession {
+                    id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    started_at: row.get(2)?,
+                    stopped_at: row.get(3)?,
+                    status: row.get(4)?,
+                    export_path: row.get(5)?,
+                    counts: SessionCounts::default(),
+                })
+            },
+        )
+        .map_err(to_string)?;
+    session.counts = session_status_counts(conn, session_id)?;
+    Ok(session)
+}
+
 fn refresh_session_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
     let counts = session_counts(conn, session_id)?;
     conn.execute(
@@ -18249,6 +18437,38 @@ fn refresh_session_counts(conn: &Connection, session_id: &str) -> Result<Session
     )
     .map_err(to_string)?;
     Ok(counts)
+}
+
+fn session_status_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
+    let content_units = conn
+        .query_row(
+            "SELECT content_unit_count
+             FROM capture_sessions
+             WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(SessionCounts {
+        frames: session_count_query(
+            conn,
+            "SELECT COUNT(*) FROM frames WHERE session_id = ?1",
+            session_id,
+        )?,
+        events: session_count_query(
+            conn,
+            "SELECT COUNT(*) FROM ui_events WHERE session_id = ?1",
+            session_id,
+        )?,
+        transitions: session_count_query(
+            conn,
+            "SELECT COUNT(*) FROM event_transitions WHERE session_id = ?1",
+            session_id,
+        )?,
+        content_units,
+        ..SessionCounts::default()
+    })
 }
 
 fn session_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
@@ -23119,6 +23339,10 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           screen_count INTEGER,
           raw_json TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_window_snapshots_frame
+          ON window_snapshots(frame_id);
+        CREATE INDEX IF NOT EXISTS idx_window_snapshots_ts
+          ON window_snapshots(ts_ms DESC, id DESC);
 
         CREATE TABLE IF NOT EXISTS windows (
           id TEXT PRIMARY KEY,
@@ -23140,6 +23364,8 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           raw_json TEXT,
           FOREIGN KEY(window_snapshot_id) REFERENCES window_snapshots(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_windows_snapshot
+          ON windows(window_snapshot_id);
 
         CREATE TABLE IF NOT EXISTS ax_nodes (
           id TEXT PRIMARY KEY,
@@ -23266,6 +23492,10 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           FOREIGN KEY(from_frame_id) REFERENCES frames(id),
           FOREIGN KEY(to_frame_id) REFERENCES frames(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_frame_diffs_session
+          ON frame_diffs(session_id);
+        CREATE INDEX IF NOT EXISTS idx_frame_diffs_to_frame
+          ON frame_diffs(to_frame_id);
 
         CREATE TABLE IF NOT EXISTS app_contexts (
           id TEXT PRIMARY KEY,
@@ -23284,6 +23514,8 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           metadata_json TEXT,
           FOREIGN KEY(frame_id) REFERENCES frames(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_app_contexts_frame
+          ON app_contexts(frame_id);
 
         CREATE TABLE IF NOT EXISTS clipboard_events (
           id TEXT PRIMARY KEY,
@@ -23300,6 +23532,10 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           pasted_within_ms INTEGER,
           metadata_json TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_clipboard_events_session
+          ON clipboard_events(session_id);
+        CREATE INDEX IF NOT EXISTS idx_clipboard_events_source_frame
+          ON clipboard_events(source_frame_id);
 
         CREATE TABLE IF NOT EXISTS typing_bursts (
           id TEXT PRIMARY KEY,
@@ -23326,6 +23562,12 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           pre_frame_id TEXT,
           post_frame_id TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_typing_bursts_session
+          ON typing_bursts(session_id);
+        CREATE INDEX IF NOT EXISTS idx_typing_bursts_pre_frame
+          ON typing_bursts(pre_frame_id);
+        CREATE INDEX IF NOT EXISTS idx_typing_bursts_post_frame
+          ON typing_bursts(post_frame_id);
 
         CREATE TABLE IF NOT EXISTS presence_samples (
           id TEXT PRIMARY KEY,
@@ -23338,6 +23580,8 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           cursor_moved_recently INTEGER,
           frontmost_app_bundle_id TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_presence_samples_session
+          ON presence_samples(session_id);
 
         CREATE TABLE IF NOT EXISTS exclusion_rules (
           id TEXT PRIMARY KEY,
@@ -23361,6 +23605,8 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           action_taken TEXT,
           metadata_json TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_sensitive_regions_frame
+          ON sensitive_regions(frame_id);
 
         CREATE TABLE IF NOT EXISTS frame_text_resolutions (
           frame_id TEXT PRIMARY KEY,
@@ -31896,6 +32142,33 @@ mod tests {
         assert_eq!(second.sequence, 2);
         assert_eq!(session_folder_name(first.sequence), "session-001");
         assert_eq!(session_folder_name(second.sequence), "session-002");
+    }
+
+    #[test]
+    fn status_session_loader_keeps_liveness_counts_hot_without_full_recount() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_root =
+            std::env::temp_dir().join(format!("smalltalk-status-counts-{}", now_millis()));
+        fs::create_dir_all(&source_root).unwrap();
+        let image_path = source_root.join("frame.png");
+        fs::write(&image_path, tiny_png()).unwrap();
+
+        let session = insert_numbered_test_session(&conn);
+        insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+
+        let status_session = load_capture_session_for_status(&conn, &session.id).unwrap();
+        assert_eq!(status_session.counts.frames, 1);
+        assert_eq!(status_session.counts.events, 1);
+        assert_eq!(status_session.counts.transitions, 1);
+        assert_eq!(status_session.counts.content_units, 0);
+        assert_eq!(status_session.counts.ax_nodes, 0);
+
+        let full_session = load_capture_session(&conn, &session.id).unwrap();
+        assert_eq!(full_session.counts.content_units, 1);
+        assert_eq!(full_session.counts.ax_nodes, 1);
+
+        fs::remove_dir_all(source_root).unwrap();
     }
 
     #[test]

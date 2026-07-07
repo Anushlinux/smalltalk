@@ -197,7 +197,7 @@ private final class AnimationTick: ObservableObject {
 }
 
 @available(macOS 13.0, *)
-private struct MemorySignalView: View {
+private struct EvidenceTapeView: View {
     let active: Bool
     let processing: Bool
     let error: Bool
@@ -222,11 +222,10 @@ private struct MemorySignalView: View {
         let pulseAge = pulseStartedAt.map { max(0, anim.value - $0) } ?? 999
         let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.46)
         let pulseStrength = max(0, 1 - pulseProgress)
-        let motionActive = active
-        let heat = motionActive && !reduceMotion ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
+        let heat = active && !reduceMotion ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
 
         Canvas { context, size in
-            drawMemorySignal(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
+            drawTape(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
         }
         .frame(width: width * scale, height: height * scale)
         .background(
@@ -234,8 +233,7 @@ private struct MemorySignalView: View {
                 LinearGradient(
                     colors: [
                         Color(red: 0.018, green: 0.020, blue: 0.024).opacity(0.96),
-                        signalColor.opacity(motionActive ? 0.16 : 0.04),
-                        Color(red: 0.042, green: 0.047, blue: 0.052).opacity(0.95),
+                        Color(red: 0.045, green: 0.048, blue: 0.056).opacity(0.94),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -244,23 +242,23 @@ private struct MemorySignalView: View {
         )
         .overlay(
             shape.stroke(
-                signalColor.opacity(motionActive || processing || error || thinEvidence || privateMode ? 0.30 + 0.12 * heat : 0.12),
+                tapeAccent.opacity(active || processing || error || thinEvidence || ready || privateMode ? 0.28 + 0.12 * heat : 0.10),
                 lineWidth: 0.7
             )
         )
         .overlay(alignment: .top) {
             shape
-                .stroke(Color.white.opacity(motionActive ? 0.09 : 0.055), lineWidth: 1)
+                .stroke(Color.white.opacity(active || ready ? 0.08 : 0.055), lineWidth: 1)
                 .blur(radius: 0.25)
                 .offset(y: -0.5 * scale)
         }
         .overlay(
             shape.fill(
-                signalColor.opacity(pulseStrength * (compact ? 0.16 : 0.12))
+                tapeAccent.opacity(pulseStrength * (compact ? 0.13 : 0.11))
             )
         )
         .shadow(
-            color: signalColor.opacity(motionActive || pulseStrength > 0 ? 0.10 + 0.06 * heat : 0),
+            color: tapeAccent.opacity(active || ready || pulseStrength > 0 || error ? 0.10 + 0.06 * heat : 0),
             radius: 9 * scale,
             x: 0,
             y: 0
@@ -287,9 +285,9 @@ private struct MemorySignalView: View {
         .animation(IslandMotion.settle(reduceMotion), value: frameCount)
     }
 
-    private var signalColor: Color {
+    private var tapeAccent: Color {
         if error {
-            return Color(red: 1.0, green: 0.36, blue: 0.28)
+            return Color(red: 1.0, green: 0.62, blue: 0.24)
         }
         if thinEvidence || processing {
             return Color(red: 1.0, green: 0.68, blue: 0.28)
@@ -298,82 +296,82 @@ private struct MemorySignalView: View {
             return Color.white.opacity(0.62)
         }
         if active || ready {
-            return Color(red: 0.36, green: 0.84, blue: 0.68)
+            return active ? Color(red: 1.0, green: 0.22, blue: 0.16) : Color(red: 0.36, green: 0.84, blue: 0.68)
         }
         return Color.white.opacity(0.42)
     }
 
-    private func drawMemorySignal(
+    private func drawTape(
         context: inout GraphicsContext,
         size: CGSize,
         pulseStrength: Double,
         heat: Double
     ) {
         let tick = anim.value
-        let signalRect = CGRect(origin: .zero, size: size)
-        let motionActive = active
-        let tone = signalColor
-        let alert = error ? Color(red: 1.0, green: 0.62, blue: 0.24) : tone
-        let centerY = round(size.height * 0.54)
-        let startX = size.width * 0.16
-        let endX = size.width * 0.84
-        let span = max(1, endX - startX)
+        let tapeRect = CGRect(origin: .zero, size: size)
+        let accent = tapeAccent
+        let phase = scanPhase(tick)
+        let scanX = round(phase * size.width)
 
-        context.fill(Path(signalRect), with: .color(.black.opacity(0.16)))
+        context.fill(Path(tapeRect), with: .color(.black.opacity(0.18)))
 
-        var signalLine = Path()
-        signalLine.move(to: CGPoint(x: startX, y: centerY))
-        signalLine.addLine(to: CGPoint(x: endX, y: centerY))
-        context.stroke(
-            signalLine,
-            with: .color(tone.opacity(motionActive || ready ? 0.42 : 0.22)),
-            lineWidth: max(1, 1.1 * scale)
-        )
-
-        let maxAnchors = compact ? 4 : 6
-        let anchorCountFromEvidence: Int
-        if frameCount > 0 {
-            anchorCountFromEvidence = Int(min(frameCount, Int64(maxAnchors)))
-        } else {
-            anchorCountFromEvidence = min(maxAnchors, max(2, Int(round(density))))
+        let rows = max(3, Int(round(density)))
+        for index in 1..<rows {
+            let offset = index % 2 == 0 ? 0.18 : -0.08
+            let y = round((Double(index) + offset) * size.height / Double(rows))
+            context.fill(
+                Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
+                with: .color(.white.opacity(active || ready ? 0.040 : 0.028))
+            )
         }
-        let anchorCount = max(2, anchorCountFromEvidence)
 
-        for index in 0..<anchorCount {
-            let fraction = anchorCount == 1 ? 0.5 : Double(index) / Double(anchorCount - 1)
-            let x = startX + span * CGFloat(fraction)
-            let y = centerY + CGFloat(sin((Double(index) + 1.0) * 1.7) * Double(size.height) * 0.055)
-            let newest = index == anchorCount - 1
-            let anchorHeat = newest && motionActive && !reduceMotion ? heat : 0
-            let radius = max(2.2 * scale, (newest ? 3.5 : 2.5) * scale + CGFloat(anchorHeat) * 0.8 * scale)
-            let anchorRect = CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2)
-            let opacity = newest ? 0.78 + 0.14 * anchorHeat : 0.34 + 0.04 * Double(index % 2)
+        let columns = max(4, Int(round(density + 2)))
+        for index in 1..<columns {
+            let skew = (index % 3 == 0 ? 0.30 : index % 2 == 0 ? -0.16 : 0.06)
+            let x = round((Double(index) + skew) * size.width / Double(columns))
+            context.fill(
+                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
+                with: .color(.white.opacity(active || ready ? 0.028 : 0.017))
+            )
+        }
 
-            context.fill(Path(ellipseIn: anchorRect), with: .color(tone.opacity(opacity)))
-            context.stroke(
-                Path(ellipseIn: anchorRect.insetBy(dx: -2.2 * scale, dy: -2.2 * scale)),
-                with: .color(tone.opacity(newest && (ready || motionActive) ? 0.25 + 0.10 * anchorHeat : 0.08)),
-                lineWidth: max(0.7, 0.8 * scale)
+        if active || ready || pulseStrength > 0 {
+            let filledWidth = max(0, min(size.width, scanX))
+            context.fill(
+                Path(CGRect(x: 0, y: 0, width: filledWidth, height: size.height)),
+                with: .color(accent.opacity(active ? 0.035 + 0.025 * heat : 0.018 + 0.018 * pulseStrength))
+            )
+        }
+
+        drawFrameTicks(context: &context, size: size, accent: accent, pulseStrength: pulseStrength)
+
+        if active || ready || pulseStrength > 0 || processing {
+            let width = processing ? max(2, 2 * scale) : max(1, 1.2 * scale)
+            context.fill(
+                Path(CGRect(x: scanX, y: 1 * scale, width: width, height: max(1, size.height - 2 * scale))),
+                with: .color((processing ? Color.white : accent).opacity(processing ? 0.30 : 0.44 + 0.20 * heat))
             )
         }
 
         if pulseStrength > 0 {
-            let bloomRadius = max(size.height * 0.56, 8 * scale) * CGFloat(1.0 + (1.0 - pulseStrength) * 0.35)
+            let bloomX = max(0, min(size.width - 2 * scale, scanX - 1 * scale))
             let bloomRect = CGRect(
-                x: endX - bloomRadius,
-                y: centerY - bloomRadius,
-                width: bloomRadius * 2,
-                height: bloomRadius * 2
+                x: max(0, bloomX - size.width * 0.22),
+                y: 0,
+                width: min(size.width * 0.44, size.width),
+                height: size.height
             )
-            context.stroke(
-                Path(ellipseIn: bloomRect),
-                with: .color(tone.opacity(0.30 * pulseStrength)),
-                lineWidth: max(1, 1.2 * scale)
+            let bloom = GraphicsContext.Shading.linearGradient(
+                Gradient(stops: [
+                    .init(color: .white.opacity(0), location: 0.0),
+                    .init(color: .white.opacity(0.24 * pulseStrength), location: 0.42),
+                    .init(color: accent.opacity(0.24 * pulseStrength), location: 0.58),
+                    .init(color: .white.opacity(0), location: 1.0),
+                ]),
+                startPoint: CGPoint(x: bloomRect.minX, y: bloomRect.midY),
+                endPoint: CGPoint(x: bloomRect.maxX, y: bloomRect.midY)
             )
-            context.fill(
-                Path(ellipseIn: bloomRect.insetBy(dx: bloomRadius * 0.34, dy: bloomRadius * 0.34)),
-                with: .color(tone.opacity(0.10 * pulseStrength))
-            )
+            context.fill(Path(bloomRect), with: bloom)
         }
 
         if processing {
@@ -397,15 +395,59 @@ private struct MemorySignalView: View {
         }
 
         if error || privateMode {
-            var slash = Path()
-            slash.move(to: CGPoint(x: size.width * 0.22, y: size.height * 0.72))
-            slash.addLine(to: CGPoint(x: size.width * 0.78, y: size.height * 0.28))
-            context.stroke(
-                slash,
-                with: .color(alert.opacity(0.62)),
-                lineWidth: max(1, 1.3 * scale)
+            let y = round(size.height * 0.63)
+            context.fill(
+                Path(CGRect(x: size.width * 0.12, y: y, width: size.width * 0.76, height: max(1, 1 * scale))),
+                with: .color(accent.opacity(error ? 0.50 : 0.36))
+            )
+            context.fill(
+                Path(CGRect(x: size.width * 0.58, y: max(0, y - 3 * scale), width: max(1, 1 * scale), height: min(size.height, 6 * scale))),
+                with: .color(accent.opacity(error ? 0.72 : 0.48))
             )
         }
+    }
+
+    private func drawFrameTicks(
+        context: inout GraphicsContext,
+        size: CGSize,
+        accent: Color,
+        pulseStrength: Double
+    ) {
+        let count = max(0, frameCount)
+        guard count > 0 else { return }
+        let tickCount = Int(min(count, compact ? 9 : 18))
+        let first = count - Int64(tickCount) + 1
+
+        for offset in 0..<tickCount {
+            let frameOrdinal = first + Int64(offset)
+            let fraction = tickFraction(frameOrdinal)
+            let tickHeight = size.height * (0.34 + 0.10 * Double((frameOrdinal % 3 + 3) % 3))
+            let x = round(max(1, min(size.width - 2, fraction * size.width)))
+            let y = round((size.height - tickHeight) / 2.0)
+            let isNewest = offset == tickCount - 1
+            let alpha = isNewest ? 0.55 + 0.32 * pulseStrength : 0.20 + 0.07 * Double(offset % 3)
+            let color = isNewest && (active || ready || pulseStrength > 0) ? accent.opacity(alpha) : Color.white.opacity(alpha)
+            context.fill(
+                Path(CGRect(x: x, y: y, width: max(1, 1 * scale), height: tickHeight)),
+                with: .color(color)
+            )
+        }
+    }
+
+    private func scanPhase(_ tick: Double) -> Double {
+        if processing {
+            return 0.78
+        }
+        if reduceMotion {
+            return active || ready ? 0.62 : 0.38
+        }
+        let speed = active ? 0.18 : ready ? 0.060 : 0.030
+        return fmod(tick * speed + (active ? 0.12 : 0.04), 1.0)
+    }
+
+    private func tickFraction(_ value: Int64) -> Double {
+        let raw = fmod(Double(value) * 0.61803398875 + Double((value % 7 + 7) % 7) * 0.031, 1.0)
+        return 0.08 + raw * 0.84
     }
 }
 
@@ -900,7 +942,7 @@ private struct SessionIslandView: View {
             presentation = .compact
             onAction("reveal_compact")
         } label: {
-            MemorySignalView(
+            EvidenceTapeView(
                 active: captureActive,
                 processing: isProcessing,
                 error: hasError,
@@ -932,7 +974,7 @@ private struct SessionIslandView: View {
 
     private var collapsedView: some View {
         HStack(spacing: s(7)) {
-            MemorySignalView(
+            EvidenceTapeView(
                 active: captureActive,
                 processing: isProcessing,
                 error: hasError,
@@ -1044,7 +1086,7 @@ private struct SessionIslandView: View {
     private var expandedView: some View {
         VStack(alignment: .leading, spacing: s(13)) {
             HStack(alignment: .center, spacing: s(11)) {
-                MemorySignalView(
+                EvidenceTapeView(
                     active: captureActive,
                     processing: isProcessing,
                     error: hasError,
@@ -1084,7 +1126,7 @@ private struct SessionIslandView: View {
 
                 Spacer(minLength: s(8))
 
-                MemorySignalView(
+                EvidenceTapeView(
                     active: captureActive,
                     processing: isProcessing,
                     error: hasError,

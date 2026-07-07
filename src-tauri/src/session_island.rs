@@ -483,14 +483,7 @@ fn continue_from_island() {
     thread::spawn(move || {
         match crate::capture::get_continue_decision(
             app.clone(),
-            Some(crate::continuation::ContinueDecisionRequest {
-                mode: Some("normal".to_string()),
-                rebuild_layers: Some(false),
-                micro_inference_enabled: Some(true),
-                max_candidates_for_model: Some(5),
-                audit_output_enabled: Some(true),
-                ..Default::default()
-            }),
+            Some(island_continue_decision_request()),
         ) {
             Ok(decision) => {
                 remember_continue_decision(&decision);
@@ -523,7 +516,6 @@ fn continue_from_island() {
                 let mut snapshot =
                     snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
                 apply_continue_decision_to_snapshot(&mut snapshot, &decision);
-                let _ = app.emit("session-island-continue-ready", decision.clone());
                 let _ = app.emit("smalltalk-continue-updated", decision.clone());
                 update_session_island(snapshot);
                 show_session_island();
@@ -534,6 +526,17 @@ fn continue_from_island() {
             }
         }
     });
+}
+
+fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRequest {
+    crate::continuation::ContinueDecisionRequest {
+        mode: Some("normal".to_string()),
+        rebuild_layers: Some(false),
+        micro_inference_enabled: Some(true),
+        max_candidates_for_model: Some(5),
+        audit_output_enabled: Some(true),
+        ..Default::default()
+    }
 }
 
 fn apply_continue_decision_to_snapshot(
@@ -588,23 +591,25 @@ fn apply_continue_decision_to_snapshot(
             })
             .or(decision.next_action.as_deref()),
     );
-    snapshot.resume_point = clean_one_line(
+    snapshot.resume_point = clean_one_line(target.and_then(|target| {
         target
-            .and_then(|target| {
-                target
-                    .title
-                    .as_deref()
-                    .or(target.browser_url.as_deref())
-                    .or(target.document_path.as_deref())
-                    .or(target.artifact_kind.as_deref())
-            }),
-    );
+            .title
+            .as_deref()
+            .or(target.browser_url.as_deref())
+            .or(target.document_path.as_deref())
+            .or(target.artifact_kind.as_deref())
+    }));
     snapshot.resume_warning = decision
         .missing_evidence
         .first()
         .or_else(|| decision.warnings.first())
         .and_then(|warning| clean_one_line(Some(warning)));
-    remember_continue_decision_from_snapshot(decision, snapshot, continue_freshness, continue_openable);
+    remember_continue_decision_from_snapshot(
+        decision,
+        snapshot,
+        continue_freshness,
+        continue_openable,
+    );
 }
 
 fn decision_evidence_updated_at_ms(
@@ -1042,9 +1047,15 @@ mod tests {
 
         let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
 
-        assert_eq!(snapshot.continue_decision_id.as_deref(), Some("decision-test"));
+        assert_eq!(
+            snapshot.continue_decision_id.as_deref(),
+            Some("decision-test")
+        );
         assert_eq!(snapshot.continue_freshness.as_deref(), Some("current"));
-        assert_eq!(snapshot.resume_headline.as_deref(), Some("Ready to continue"));
+        assert_eq!(
+            snapshot.resume_headline.as_deref(),
+            Some("Ready to continue")
+        );
         assert_eq!(snapshot.resume_point.as_deref(), Some("PRODUCT.md"));
     }
 
@@ -1056,11 +1067,25 @@ mod tests {
 
         let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
 
-        assert_eq!(snapshot.continue_decision_id.as_deref(), Some("decision-test"));
+        assert_eq!(
+            snapshot.continue_decision_id.as_deref(),
+            Some("decision-test")
+        );
         assert_eq!(snapshot.continue_freshness.as_deref(), Some("new_evidence"));
         assert_eq!(snapshot.resume_headline.as_deref(), Some("New evidence"));
         assert_eq!(snapshot.resume_detail.as_deref(), Some("Refresh Continue"));
         assert_eq!(snapshot.resume_point.as_deref(), Some("PRODUCT.md"));
+    }
+
+    #[test]
+    fn island_continue_request_writes_audit_output() {
+        let request = island_continue_decision_request();
+
+        assert_eq!(request.mode.as_deref(), Some("normal"));
+        assert_eq!(request.rebuild_layers, Some(false));
+        assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.max_candidates_for_model, Some(5));
+        assert_eq!(request.audit_output_enabled, Some(true));
     }
 
     fn clear_remembered_continue_for_test() {
