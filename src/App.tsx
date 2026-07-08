@@ -115,6 +115,16 @@ type RuntimeDiagnostics = {
   continue_normal_calls: number;
   continue_rebuild_calls: number;
   decision_cache_hits: number;
+  continue_output_audit_failures: number;
+  weak_surface_enrichment_attempts: number;
+  weak_surface_enrichment_success_strong: number;
+  weak_surface_enrichment_success_medium: number;
+  weak_surface_enrichment_success_thin: number;
+  weak_surface_enrichment_skipped_privacy: number;
+  weak_surface_enrichment_skipped_budget: number;
+  weak_surface_enrichment_failed: number;
+  latest_weak_surface_attempt?: string | null;
+  latest_weak_surface_snapshot_id?: string | null;
 };
 
 type CaptureStatus = {
@@ -327,6 +337,7 @@ type VerificationSignals = {
 type FrameDetail = {
   frame: CaptureFrame;
   verification: VerificationSignals;
+  weak_surface_classification?: WeakSurfaceClassification | null;
   events: TimelineEvent[];
   ax_nodes: BoxLike[];
   ocr_spans: BoxLike[];
@@ -335,6 +346,18 @@ type FrameDetail = {
   sensitive_regions: BoxLike[];
   windows: WindowSummary[];
   transitions: TransitionSummary[];
+};
+
+type WeakSurfaceClassification = {
+  domain: string;
+  enrichment_need: string;
+  confidence: number;
+  reasons: string[];
+  adapter_key?: string | null;
+  privacy_tier: string;
+  observed_app_name?: string | null;
+  observed_bundle_id?: string | null;
+  observed_window_title?: string | null;
 };
 
 type OpenResumePointResult = {
@@ -377,12 +400,55 @@ type ContinueFocusSummary = {
   frame_id: string;
   artifact_id?: string | null;
   artifact_kind?: string | null;
+  domain?: string | null;
   app_name?: string | null;
   window_title?: string | null;
   title?: string | null;
+  display_title?: string | null;
   browser_url?: string | null;
   document_path?: string | null;
+  activity_state?: string | null;
+  task_state?: string | null;
+  evidence_quality?: string | null;
+  identity_confidence?: number | null;
+  snapshot_id?: string | null;
+  missing_fields?: string[];
+  openability?: string | null;
   captured_at_ms: number;
+};
+
+type WeakSurfaceEnrichmentAttempt = {
+  attempt_id: string;
+  observed_at_ms: number;
+  scheduled_at_ms: number;
+  completed_at_ms?: number | null;
+  surface_key: string;
+  weak_domain: string;
+  app_name?: string | null;
+  bundle_id?: string | null;
+  window_title_hash?: string | null;
+  window_title_capped?: string | null;
+  window_id?: number | null;
+  trigger_event_ids: string[];
+  trigger_type: string;
+  attempt_index: number;
+  status: string;
+  reason?: string | null;
+  snapshot_id?: string | null;
+  missing_fields: string[];
+  adapter_key?: string | null;
+};
+
+type WeakSurfaceEnrichmentDiagnostics = {
+  weak_surface_enrichment_attempts: number;
+  weak_surface_enrichment_success_strong: number;
+  weak_surface_enrichment_success_medium: number;
+  weak_surface_enrichment_success_thin: number;
+  weak_surface_enrichment_skipped_privacy: number;
+  weak_surface_enrichment_skipped_budget: number;
+  weak_surface_enrichment_failed: number;
+  latest_weak_surface_attempt?: WeakSurfaceEnrichmentAttempt | null;
+  latest_weak_surface_snapshot_id?: string | null;
 };
 
 type ContinueSelectedWorkstream = {
@@ -515,8 +581,10 @@ type ActiveCurrentWorkUnresolved = {
   bundle_id?: string | null;
   window_title?: string | null;
   artifact_id?: string | null;
+  observation_id?: string | null;
   frame_id?: string | null;
   event_ids: string[];
+  task_action_ids?: string[];
   event_backed: boolean;
   has_fresh_heavy_frame: boolean;
   has_human_readable_title: boolean;
@@ -571,6 +639,18 @@ type ContinueDecisionResult = {
   excluded_branch_candidate_ids?: string[];
   support_evidence_count?: number;
   branch_validation_failures?: string[];
+  current_surface_resolution?: {
+    selected?: {
+      evidence_ids?: string[];
+      evidence_kinds?: string[];
+      reason?: string;
+      weak_surface_classification?: {
+        adapter_key?: string | null;
+      } | null;
+    } | null;
+  } | null;
+  evidence_freshness_ledger?: unknown | null;
+  weak_surface_enrichment?: WeakSurfaceEnrichmentDiagnostics | null;
   observe_before_decide?: unknown | null;
   app_activity?: unknown | null;
   activity_summary?: ContinueActivitySummary | null;
@@ -601,7 +681,7 @@ type ContinueHandoff = {
 
 type ContinueCardActionState =
   | { kind: "openable_return_target"; label: "Continue here" }
-  | { kind: "thin_current_work"; label: "Inspect latest evidence" }
+  | { kind: "thin_current_work"; label: "Inspect evidence" }
   | { kind: "no_clear_continuation"; label: "Inspect evidence" };
 
 type RecentContinueWorkstream = {
@@ -916,6 +996,16 @@ const emptyRuntimeDiagnostics: RuntimeDiagnostics = {
   continue_normal_calls: 0,
   continue_rebuild_calls: 0,
   decision_cache_hits: 0,
+  continue_output_audit_failures: 0,
+  weak_surface_enrichment_attempts: 0,
+  weak_surface_enrichment_success_strong: 0,
+  weak_surface_enrichment_success_medium: 0,
+  weak_surface_enrichment_success_thin: 0,
+  weak_surface_enrichment_skipped_privacy: 0,
+  weak_surface_enrichment_skipped_budget: 0,
+  weak_surface_enrichment_failed: 0,
+  latest_weak_surface_attempt: null,
+  latest_weak_surface_snapshot_id: null,
 };
 
 const initialStatus: CaptureStatus = {
@@ -2879,6 +2969,14 @@ function App() {
                 <dd>{activeTransition?.transition_type || selectedFrame?.capture_trigger || "none"}</dd>
               </div>
               <div>
+                <dt>Weak surface</dt>
+                <dd>
+                  {frameDetail?.weak_surface_classification
+                    ? `${sentenceCase(frameDetail.weak_surface_classification.domain)} / ${sentenceCase(frameDetail.weak_surface_classification.enrichment_need)}`
+                    : "not classified"}
+                </dd>
+              </div>
+              <div>
                 <dt>Strongest text</dt>
                 <dd>{topContentUnit(frameDetail)?.text || selectedText || "Capture more evidence to inspect text."}</dd>
               </div>
@@ -3525,49 +3623,27 @@ function ContinuationAnswer({
   const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
   const lowConfidence = decision ? decision.confidence < 0.55 : false;
   const handoff = decision?.handoff || null;
-  const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
+  const presentation = decision ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
   const alternatives = (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const evidenceLines = decision ? productEvidenceLines(decision).slice(0, 3) : [];
   const supportEvidenceLines = decision ? supportEvidenceProductLines(decision).slice(0, 3) : [];
-  const rawWorkstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
+  const productState = decision && actionState && presentation
+    ? buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
+    : null;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
   const targetLooksInternal = isInternalFacingText(rawTargetLine);
-  const workstreamLine = isThinCurrentWork
-    ? "Most recent work seen"
-    : targetLooksInternal
-    ? "No reliable continuation target yet"
-    : safeProductLine(rawWorkstreamLine, "Recent work");
-  const targetLine = isInspectPrimary
-    ? "Exact return target missing"
-    : targetLooksInternal
-    ? "No reliable return target is grounded yet."
-    : safeProductLine(rawTargetLine, "No stable place to continue yet.");
-  const targetMeta = isThinCurrentWork
-    ? "Smalltalk saw recent activity here, but does not yet have enough evidence to reopen the exact task safely."
-    : isInspectPrimary
-    ? "Smalltalk does not yet have enough evidence to reopen an exact task safely."
-    : targetLooksInternal
-    ? "I don't have a reliable app or page target for this yet."
-    : presentation?.targetMeta || humanTargetMeta(resumeTarget);
-  const lastStateLine = targetLooksInternal
-    ? "I do not have enough local evidence to identify a reliable unfinished task."
-    : safeProductLine(
-        handoff?.last_state_line || presentation?.lastState || "No last meaningful state is clear yet.",
-        "No last meaningful state is clear yet.",
-      );
-  const nextActionLine =
-    targetLooksInternal
-      ? "Use more local evidence before selecting a continuation target."
-      : safeProductLine(
-          handoff?.next_action ||
-            presentation?.nextAction ||
-            "Open the target and continue from the last meaningful state.",
-          "Open the target and continue from the last meaningful state.",
-        );
-  const currentFocusLine = stripCurrentFocusPrefix(
+  const workstreamLine = productState?.headline || safeProductLine(
+    handoff?.headline || presentation?.workstreamTitle || primaryMessage,
+    "Recent work",
+  );
+  const targetLine = productState?.targetLine || safeProductLine(rawTargetLine, "No stable place to continue yet.");
+  const targetMeta = productState?.targetMeta || presentation?.targetMeta || humanTargetMeta(resumeTarget);
+  const lastStateLine = productState?.lastStateLine || "No last meaningful state is clear yet.";
+  const nextActionLine = productState?.nextActionLine || "Inspect the latest evidence before choosing a return point.";
+  const currentFocusLine = productState?.currentFocusLine || stripCurrentFocusPrefix(
     safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
   ) || humanFocusLabel(decision?.current_focus);
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
@@ -3581,21 +3657,18 @@ function ContinuationAnswer({
     .map((line) => safeProductLine(line, ""))
     .filter(Boolean)
     .slice(0, 3);
-  const targetBlockLabel = isInspectPrimary
-    ? "No safe return target yet"
-    : lowConfidence
-      ? "Best available place to continue"
-      : "Continue at";
+  const targetBlockLabel = productState?.targetBlockLabel || (
+    isInspectPrimary
+      ? "No safe return target yet"
+      : lowConfidence
+        ? "Best available place to continue"
+        : "Continue at"
+  );
   const openButtonLabel =
     busyAction === "open_continue_target" && canOpenResumeTarget
       ? "Opening"
       : actionState?.label || "Inspect evidence";
-  const uncertaintyLine =
-    isThinCurrentWork
-      ? evidenceLines[0] || "Evidence is thin."
-      : isInspectPrimary
-      ? evidenceLines[0] || "No safe return target is grounded yet."
-      :
+  const uncertaintyLine = productState?.uncertaintyLine || (
     targetLooksInternal
       ? "I saw the current focus, but I don't have a reliable return target yet."
       : safeProductLine(
@@ -3604,12 +3677,15 @@ function ContinuationAnswer({
             presentation?.missingEvidenceSummary ||
             "",
           "",
-        );
+        )
+  );
   const showCurrentFocus =
     Boolean(currentFocusLine) &&
     currentFocusLine !== "No current focus returned." &&
-    (isThinCurrentWork || currentFocusLine !== targetLine) &&
+    currentFocusLine !== workstreamLine &&
+    (Boolean(productState) || isThinCurrentWork || currentFocusLine !== targetLine) &&
     (
+      Boolean(productState && productState.kind !== "openable_enriched") ||
       isThinCurrentWork ||
       decision?.warnings.includes("current_focus_differs_from_return_target") ||
       decision?.warnings.includes("current_focus_mismatch") ||
@@ -3677,10 +3753,13 @@ function ContinuationAnswer({
             <span className="freshness-updated">{freshness.updatedAtLabel}</span>
           ) : null}
           <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
+          {productState?.statusPills.map((pill) => (
+            <span className="answer-status-pill" key={pill}>{pill}</span>
+          ))}
         </div>
 
         <div className="answer-hero">
-          <p>{isThinCurrentWork ? "Current work detected" : "You were working on"}</p>
+          <p>{productState?.heroLabel || (isThinCurrentWork ? "Current work detected" : "You were working on")}</p>
           <h2>{workstreamLine}</h2>
         </div>
 
@@ -3713,10 +3792,14 @@ function ContinuationAnswer({
 
         {isInspectPrimary && evidenceLines.length ? (
           <div className="answer-why-strip" aria-label="Missing evidence">
-            {evidenceLines.map((line) => (
+            {(productState?.missingEvidenceLines.length ? productState.missingEvidenceLines : evidenceLines).map((line) => (
               <span key={line}>{line}</span>
             ))}
           </div>
+        ) : null}
+
+        {productState?.olderContextLine ? (
+          <p className="answer-context">{productState.olderContextLine}</p>
         ) : null}
 
         {supportEvidenceLines.length ? (
@@ -3880,6 +3963,7 @@ function ContinueEvidencePanel({
   ].map(productizeInternalLabel);
   const presentation = decision ? presentContinueDecision(decision) : null;
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
+  const surfaceDiagnostics = decision ? continueSurfaceDiagnostics(decision) : [];
 
   if (!decision) {
     return (
@@ -3939,6 +4023,12 @@ function ContinueEvidencePanel({
             <dt>How this was chosen</dt>
             <dd>{provenanceLabel}</dd>
           </div>
+          {surfaceDiagnostics.map((item) => (
+            <div key={item.label}>
+              <dt>{item.label}</dt>
+              <dd>{item.value}</dd>
+            </div>
+          ))}
         </dl>
 
         <div className="anchor-preview">
@@ -3957,6 +4047,13 @@ function ContinueEvidencePanel({
             </div>
           )}
         </div>
+      </div>
+
+      <div className="anchor-id-grid weak-surface-id-grid" aria-label="Continue diagnostic ids">
+        <AnchorIdGroup title="Frames" ids={decision.evidence_anchors.frame_ids} />
+        <AnchorIdGroup title="Artifacts" ids={decision.evidence_anchors.artifact_ids} />
+        <AnchorIdGroup title="Actions" ids={decision.evidence_anchors.action_ids} />
+        <AnchorIdGroup title="Episodes" ids={decision.evidence_anchors.episode_ids} />
       </div>
 
       {warnings.length ? (
@@ -4577,6 +4674,18 @@ function EvidencePanel({
   if (tab === "context") {
     return (
       <div className="drawer-list">
+        {detail?.weak_surface_classification && (
+          <div className="drawer-row">
+            <strong>{sentenceCase(detail.weak_surface_classification.domain)}</strong>
+            <span>
+              {sentenceCase(detail.weak_surface_classification.enrichment_need)}
+              {detail.weak_surface_classification.adapter_key ? ` via ${detail.weak_surface_classification.adapter_key}` : ""}
+            </span>
+            <small>
+              {confidenceLabel(detail.weak_surface_classification.confidence)}; {detail.weak_surface_classification.reasons.slice(0, 4).join(", ") || "no reasons"}
+            </small>
+          </div>
+        )}
         {detail?.app_contexts.map((context) => (
           <div className="drawer-row" key={context.id}>
             <strong>{context.object_type}</strong>
@@ -4857,6 +4966,29 @@ type ContinuePresentation = {
   decisionReason: string;
 };
 
+type ContinueProductStateKind =
+  | "openable_enriched"
+  | "enriched_not_openable"
+  | "thin_current_work"
+  | "older_context_with_thin_current_work"
+  | "no_clear_continuation";
+
+type ContinueProductStateCopy = {
+  kind: ContinueProductStateKind;
+  heroLabel: string;
+  headline: string;
+  targetBlockLabel: string;
+  targetLine: string;
+  targetMeta: string;
+  lastStateLine: string;
+  nextActionLine: string;
+  currentFocusLine: string;
+  uncertaintyLine: string;
+  missingEvidenceLines: string[];
+  statusPills: string[];
+  olderContextLine?: string;
+};
+
 function presentContinueDecision(decision: ContinueDecisionResult): ContinuePresentation {
   const target = decision.resume_work_target || decision.return_target || null;
   const unresolvedState = productizeUnresolvedState(
@@ -4899,6 +5031,209 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
       || unresolvedState
       || "Selected from local workstream evidence.",
   };
+}
+
+function buildContinueProductStateCopy(
+  decision: ContinueDecisionResult,
+  actionState: ContinueCardActionState,
+  presentation: ContinuePresentation,
+  primaryMessage: string,
+): ContinueProductStateCopy {
+  const target = decision.resume_work_target || decision.return_target || null;
+  const focus = decision.current_focus || null;
+  const activeWork = decision.active_current_work_unresolved || null;
+  const targetLooksInternal = isInternalFacingText(presentation.returnTarget);
+  const currentFocusLine = humanEnrichedFocusLabel(focus, activeWork);
+  const missingEvidenceLines = productMissingEvidenceLines(decision).slice(0, 4);
+  const safeLastState = safeProductLine(
+    decision.handoff?.last_state_line || presentation.lastState || "",
+    "No last meaningful state is clear yet.",
+  );
+  const safeNextAction = safeProductLine(
+    decision.handoff?.next_action || presentation.nextAction || "",
+    "Inspect the latest evidence before choosing a return point.",
+  );
+  const openability = normalizeToken(focus?.openability || target?.openability);
+  const quality = surfaceQualityToken(focus?.evidence_quality, focus?.identity_confidence, activeWork);
+  const hasEnrichedSurface = hasEnrichedCurrentSurface(focus, activeWork);
+  const hasOlderContext =
+    Boolean(target && actionState.kind !== "openable_return_target") &&
+    (
+      Boolean(activeWork) ||
+      continueDecisionEvidenceNotes(decision).some((note) =>
+        normalizeToken(note).includes("newer_current_focus"),
+      )
+    );
+
+  if (actionState.kind === "openable_return_target") {
+    const targetLine = targetLooksInternal
+      ? "Openable return target"
+      : safeProductLine(presentation.returnTarget, "Openable return target");
+    return {
+      kind: "openable_enriched",
+      heroLabel: "Current focus",
+      headline: currentFocusLine || safeProductLine(presentation.workstreamTitle, primaryMessage),
+      targetBlockLabel: "Return target",
+      targetLine,
+      targetMeta: humanTargetMeta(target),
+      lastStateLine: safeLastState,
+      nextActionLine: safeProductLine(
+        decision.handoff?.next_action || presentation.nextAction || "",
+        "Open the target and continue from the last meaningful state.",
+      ),
+      currentFocusLine,
+      uncertaintyLine: presentation.missingEvidenceSummary || "",
+      missingEvidenceLines,
+      statusPills: continueStatusPills({ quality, openability, actionState, activeWork, hasEnrichedSurface }),
+    };
+  }
+
+  if (hasOlderContext) {
+    return {
+      kind: "older_context_with_thin_current_work",
+      heroLabel: "Current focus",
+      headline: `${currentFocusLine || "Current work"} - current work is visible but thin`,
+      targetBlockLabel: "Older context",
+      targetLine: humanTargetLabel(target) || "Older possible return point",
+      targetMeta:
+        "There is an older target that may be related, but newer current work makes it unsafe as the main action.",
+      lastStateLine: safeLastState,
+      nextActionLine: "Inspect the latest evidence, then return to the right app or window.",
+      currentFocusLine,
+      uncertaintyLine:
+        missingEvidenceLines[0] ||
+        "Smalltalk saw newer current work, but the exact return target is not grounded.",
+      missingEvidenceLines,
+      statusPills: continueStatusPills({ quality, openability, actionState, activeWork, hasEnrichedSurface }),
+      olderContextLine:
+        "Older targets stay secondary until local evidence proves they are still the right continuation.",
+    };
+  }
+
+  if (actionState.kind === "thin_current_work") {
+    return {
+      kind: "thin_current_work",
+      heroLabel: "Current focus",
+      headline: currentFocusLine || activeWork?.app_name || "Current work is visible but thin",
+      targetBlockLabel: "Evidence status",
+      targetLine:
+        "Smalltalk saw fresh activity, but the exact project, thread, or file was not visible.",
+      targetMeta: missingEvidenceLines.length
+        ? missingEvidenceLines[0]
+        : "No safe exact target is available yet.",
+      lastStateLine: productizeInternalLabel(activeWork?.activity_hint || "") || safeLastState,
+      nextActionLine: "Inspect the latest evidence, then return to the app or window manually.",
+      currentFocusLine,
+      uncertaintyLine:
+        missingEvidenceLines[0] ||
+        "Evidence is thin, so Smalltalk will not show a fake confident continuation target.",
+      missingEvidenceLines,
+      statusPills: continueStatusPills({ quality, openability, actionState, activeWork, hasEnrichedSurface }),
+    };
+  }
+
+  if (hasEnrichedSurface && ["strong", "medium"].includes(quality)) {
+    return {
+      kind: "enriched_not_openable",
+      heroLabel: "Current focus",
+      headline: currentFocusLine || safeProductLine(presentation.currentFocus, "Current work"),
+      targetBlockLabel: "Best available return point",
+      targetLine:
+        "The latest work is visible, but Smalltalk cannot reopen the exact target safely yet.",
+      targetMeta:
+        openability === "app_focus_only"
+          ? "Smalltalk can identify the app, but not the exact thread, file, or page."
+          : "No direct URL, document path, or exact target is grounded yet.",
+      lastStateLine: safeLastState,
+      nextActionLine: "Inspect the latest evidence, then return to that app or window.",
+      currentFocusLine,
+      uncertaintyLine:
+        missingEvidenceLines[0] ||
+        "The current work is enriched, but the opener does not have a safe exact target.",
+      missingEvidenceLines,
+      statusPills: continueStatusPills({ quality, openability, actionState, activeWork, hasEnrichedSurface }),
+    };
+  }
+
+  return {
+    kind: "no_clear_continuation",
+    heroLabel: "Best available answer",
+    headline: targetLooksInternal
+      ? "No reliable continuation target yet"
+      : safeProductLine(presentation.workstreamTitle || primaryMessage, "No reliable continuation target yet"),
+    targetBlockLabel: "No safe return target yet",
+    targetLine: "Exact return target missing",
+    targetMeta: "Smalltalk does not yet have enough local evidence to reopen an exact task safely.",
+    lastStateLine: safeLastState,
+    nextActionLine: safeNextAction,
+    currentFocusLine,
+    uncertaintyLine:
+      missingEvidenceLines[0] ||
+      "Use more local evidence before selecting a continuation target.",
+    missingEvidenceLines,
+    statusPills: continueStatusPills({ quality, openability, actionState, activeWork, hasEnrichedSurface }),
+  };
+}
+
+function hasEnrichedCurrentSurface(
+  focus?: ContinueFocusSummary | null,
+  activeWork?: ActiveCurrentWorkUnresolved | null,
+) {
+  return Boolean(
+    focus?.domain ||
+      focus?.display_title ||
+      focus?.activity_state ||
+      focus?.task_state ||
+      focus?.evidence_quality ||
+      focus?.openability ||
+      focus?.snapshot_id ||
+      (focus?.missing_fields && focus.missing_fields.length > 0) ||
+      activeWork,
+  );
+}
+
+function surfaceQualityToken(
+  evidenceQuality?: string | null,
+  identityConfidence?: number | null,
+  activeWork?: ActiveCurrentWorkUnresolved | null,
+) {
+  const quality = normalizeToken(evidenceQuality || activeWork?.evidence_quality);
+  if (["strong", "medium", "thin", "unknown"].includes(quality)) return quality;
+  const confidence =
+    typeof identityConfidence === "number"
+      ? identityConfidence
+      : typeof activeWork?.identity_confidence === "number"
+        ? activeWork.identity_confidence
+        : null;
+  if (typeof confidence === "number") {
+    if (confidence >= 0.78) return "strong";
+    if (confidence >= 0.55) return "medium";
+    if (confidence > 0) return "thin";
+  }
+  return "unknown";
+}
+
+function continueStatusPills({
+  quality,
+  openability,
+  actionState,
+  activeWork,
+  hasEnrichedSurface,
+}: {
+  quality: string;
+  openability: string;
+  actionState: ContinueCardActionState;
+  activeWork?: ActiveCurrentWorkUnresolved | null;
+  hasEnrichedSurface: boolean;
+}) {
+  const pills = new Set<string>();
+  if (activeWork || hasEnrichedSurface) pills.add("Fresh current work");
+  if (quality === "thin" || actionState.kind === "thin_current_work") pills.add("Thin evidence");
+  if (actionState.kind !== "openable_return_target") pills.add("Exact target missing");
+  if (openability === "app_focus_only") pills.add("App focus only");
+  if (openability === "frame_fallback") pills.add("Evidence preview only");
+  if (quality === "strong" || quality === "medium") pills.add(`${sentenceCase(quality)} evidence`);
+  return [...pills].slice(0, 4);
 }
 
 function continueProvenanceLabel(decision: ContinueDecisionResult) {
@@ -4965,7 +5300,7 @@ function getContinueCardActionState(decision: ContinueDecisionResult): ContinueC
     evidenceNotes.includes("thin_evidence:no_human_return_target");
 
   if (hasThinCurrentWork) {
-    return { kind: "thin_current_work", label: "Inspect latest evidence" };
+    return { kind: "thin_current_work", label: "Inspect evidence" };
   }
 
   return { kind: "no_clear_continuation", label: "Inspect evidence" };
@@ -5103,9 +5438,86 @@ function productizeSupportEvidenceRole(value?: string | null) {
 function productEvidenceLines(decision: ContinueDecisionResult) {
   return [...new Set(
     continueDecisionEvidenceNotes(decision)
-      .map(productizeInternalLabel)
+      .map((note) => productSafeEvidenceNote(note) || productizeInternalLabel(note))
       .filter(Boolean),
   )];
+}
+
+function productMissingEvidenceLines(decision: ContinueDecisionResult) {
+  const notes = [
+    ...(decision.current_focus?.missing_fields || []),
+    ...(decision.active_current_work_unresolved?.missing_evidence || []),
+    ...(decision.missing_evidence || []),
+    ...(decision.weak_surface_enrichment?.latest_weak_surface_attempt?.missing_fields || []),
+  ];
+  return [...new Set(notes.map(productSafeEvidenceNote).filter(Boolean))];
+}
+
+function continueSurfaceDiagnostics(decision: ContinueDecisionResult) {
+  const focus = decision.current_focus || null;
+  const activeWork = decision.active_current_work_unresolved || null;
+  const attempt = decision.weak_surface_enrichment?.latest_weak_surface_attempt || null;
+  const selectedSurface = decision.current_surface_resolution?.selected || null;
+  const target = decision.resume_work_target || decision.return_target || null;
+  const adapterKey =
+    attempt?.adapter_key ||
+    selectedSurface?.weak_surface_classification?.adapter_key ||
+    "none";
+  const evidenceSources = selectedSurface?.evidence_kinds || [];
+  const missingFields = [
+    ...(focus?.missing_fields || []),
+    ...(activeWork?.missing_evidence || []),
+    ...(attempt?.missing_fields || []),
+  ];
+  const linkedIds = [
+    focus?.artifact_id ? `artifact ${focus.artifact_id}` : "",
+    decision.selected_workstream?.workstream_id ? `workstream ${decision.selected_workstream.workstream_id}` : "",
+    decision.selected_candidate_id ? `candidate ${decision.selected_candidate_id}` : "",
+    attempt?.attempt_id ? `attempt ${attempt.attempt_id}` : "",
+  ].filter(Boolean);
+
+  return [
+    { label: "Weak surface domain", value: sentenceCase(focus?.domain || attempt?.weak_domain || "unknown") },
+    { label: "Adapter key/version", value: `${adapterKey} / version not exposed` },
+    { label: "Snapshot id", value: focus?.snapshot_id || attempt?.snapshot_id || decision.weak_surface_enrichment?.latest_weak_surface_snapshot_id || "none" },
+    { label: "Attempt status", value: sentenceCase(attempt?.status || "unknown") },
+    { label: "Observed time", value: formatTime(attempt?.observed_at_ms || focus?.captured_at_ms || activeWork?.observed_at_ms || null) },
+    { label: "Evidence quality", value: sentenceCase(focus?.evidence_quality || activeWork?.evidence_quality || "unknown") },
+    { label: "Identity confidence", value: confidenceLabel(focus?.identity_confidence ?? activeWork?.identity_confidence ?? null) },
+    { label: "Openability", value: productizeOpenability(focus?.openability || target?.openability) || sentenceCase(focus?.openability || target?.openability || "unknown") },
+    { label: "Missing fields", value: formatDiagnosticList(missingFields) },
+    { label: "Evidence sources", value: formatDiagnosticList(evidenceSources) },
+    { label: "Activity state", value: sentenceCase(focus?.activity_state || activeWork?.activity_hint || "unknown") },
+    { label: "Task state", value: sentenceCase(focus?.task_state || activeWork?.unresolved_reason || "unknown") },
+    { label: "Safe display title", value: humanEnrichedFocusLabel(focus, activeWork) || "unknown" },
+    { label: "Linked ids", value: formatDiagnosticList(linkedIds) },
+  ];
+}
+
+function formatDiagnosticList(values: Array<string | null | undefined>) {
+  const unique = [...new Set(values.map((value) => cleanHumanText(value || "")).filter(Boolean))];
+  return unique.length ? unique.slice(0, 8).join(" / ") : "none";
+}
+
+function productSafeEvidenceNote(value?: string | null) {
+  const key = normalizeToken(value);
+  const labels: Record<string, string> = {
+    repo_root_missing: "Workspace or repository identity was not visible.",
+    workspace_identity_missing: "Workspace identity was not visible.",
+    project_identity_missing: "Workspace or repository identity was not visible.",
+    thread_identity_missing: "Exact Codex thread was not visible.",
+    thread_identity_uncertain: "Exact Codex thread was not visible.",
+    active_file_missing: "Active file could not be identified.",
+    command_state_missing: "Terminal command state was not clear.",
+    command_signature_missing: "Terminal command state was not clear.",
+    focused_control_missing: "Focused control was not available.",
+    fresh_heavy_frame_missing: "Latest surface was event-backed without a fresh screenshot.",
+    missing_fresh_heavy_frame_for_current_focus: "Latest surface was event-backed without a fresh screenshot.",
+    openable_target_missing: "There is no safe exact target to open.",
+    no_direct_url_or_document_path: "There is no safe exact target to open.",
+    privacy_blocked_text: "Privacy rules blocked some visible evidence.",
+  };
+  return labels[key] || "";
 }
 
 function humanFocusLabel(focus?: ContinueFocusSummary | null) {
@@ -5113,6 +5525,24 @@ function humanFocusLabel(focus?: ContinueFocusSummary | null) {
   return cleanHumanText(focus.title || focus.window_title || focus.app_name)
     || productizeArtifactKind(focus.artifact_kind)
     || "Current focus";
+}
+
+function humanEnrichedFocusLabel(
+  focus?: ContinueFocusSummary | null,
+  activeWork?: ActiveCurrentWorkUnresolved | null,
+) {
+  const appName = cleanHumanText(focus?.app_name || activeWork?.app_name || "");
+  const title = cleanHumanText(
+    focus?.display_title ||
+      focus?.title ||
+      focus?.window_title ||
+      activeWork?.window_title ||
+      "",
+  );
+  if (appName && title && normalizeToken(title) !== normalizeToken(appName)) {
+    return `${appName} - ${title}`;
+  }
+  return appName || title || productizeArtifactKind(focus?.artifact_kind) || "";
 }
 
 function productizeAction(action?: ContinueActionSummary | null) {
@@ -5278,6 +5708,7 @@ function productizeOpenability(value?: string | null) {
   const key = normalizeToken(value);
   const labels: Record<string, string> = {
     openable: "Openable",
+    app_focus_only: "App focus only",
     frame_fallback: "Needs evidence preview",
     blocked: "Opening may be blocked",
     unknown: "Openability unknown",

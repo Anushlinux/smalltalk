@@ -1,5 +1,17 @@
 #![allow(dead_code)]
 
+pub(crate) mod enrichment;
+
+use self::enrichment::{
+    classify_weak_surface, domain_app_family, domain_artifact_kind,
+    ensure_weak_surface_enrichment_schema, evaluate_surface_snapshot_quality,
+    link_surface_snapshot_to_artifact, load_latest_surface_snapshot_for_frame,
+    load_recent_surface_snapshots, product_safe_missing_evidence,
+    run_continue_request_weak_surface_enrichment, weak_surface_enrichment_diagnostics,
+    weak_surface_identity_from_snapshot, EvidenceQuality, StaleSuppressionStrength,
+    WeakSurfaceClassification, WeakSurfaceClassificationInput, WeakSurfaceDomain,
+    WeakSurfaceEnrichmentDiagnostics, WeakSurfaceIdentity,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +23,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
-pub const CONTINUE_SCHEMA_VERSION: i64 = 4;
+pub const CONTINUE_SCHEMA_VERSION: i64 = 5;
 
 const FEEDBACK_INFERENCE_MIN_AGE_MS: i64 = 2 * 60 * 1000;
 const FEEDBACK_ACCEPTED_MIN_DWELL_MS: i64 = 30 * 1000;
@@ -53,6 +65,9 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_pairwise_preferences",
     "continue_eval_fixtures",
     "continue_evidence_probes",
+    "continue_weak_surface_enrichment_attempts",
+    "continue_surface_enrichment_attempts",
+    "continue_surface_snapshots",
     "continue_app_activity_segments",
     "continue_activity_classifications",
     "continue_candidates",
@@ -1159,6 +1174,8 @@ pub struct ContinueMemoryCounts {
     pub ranking_priors: i64,
     pub pairwise_preferences: i64,
     pub eval_fixtures: i64,
+    pub surface_enrichment_attempts: i64,
+    pub surface_snapshots: i64,
     pub app_activity_segments: i64,
     pub activity_classifications: i64,
     pub candidates: i64,
@@ -1339,6 +1356,7 @@ pub struct ContinueDecisionResult {
     pub continue_dossier: Option<ContinueDossierV1>,
     pub memory_retrieval: Option<ContinueMemoryRetrievalReport>,
     pub observe_before_decide: Option<ObserveBeforeDecideTrace>,
+    pub weak_surface_enrichment: WeakSurfaceEnrichmentDiagnostics,
     pub app_activity: Option<ContinueAppActivityIntelligence>,
     pub activity_summary: Option<ContinueActivitySummary>,
     pub quality_gate: Option<ContinueDecisionQualityGate>,
@@ -1633,6 +1651,18 @@ pub struct ContinueEvalReport {
     pub model_feedback_validation_failure_count: i64,
     pub feedback_obedience_placeholder_rate: f64,
     pub suppressed_target_open_attempt_count: usize,
+    pub weak_surface_case_count: i64,
+    pub weak_surface_enrichment_attempt_rate: f64,
+    pub weak_surface_enrichment_success_rate: f64,
+    pub weak_surface_strong_or_medium_rate: f64,
+    pub weak_surface_thin_truthfulness_rate: f64,
+    pub weak_surface_candidate_recall_at_k: f64,
+    pub stale_url_over_weak_surface_false_positive_rate: f64,
+    pub fake_open_target_count: i64,
+    pub missing_evidence_render_rate: f64,
+    pub privacy_violation_count: i64,
+    pub p1_feedback_gate_regression_count: i64,
+    pub p2_support_gate_regression_count: i64,
     pub cases: Vec<ContinueEvalCaseReport>,
 }
 
@@ -1727,6 +1757,20 @@ pub struct ContinueEvalCaseReport {
     pub model_feedback_validation_failure: bool,
     pub feedback_obedience_placeholder: bool,
     pub suppressed_target_open_attempted: bool,
+    pub weak_surface_case: bool,
+    pub weak_surface_enrichment_attempted: bool,
+    pub weak_surface_enrichment_success: bool,
+    pub weak_surface_strong_or_medium: bool,
+    pub weak_surface_thin_truthful: bool,
+    pub weak_surface_candidate_recalled_at_k: bool,
+    pub stale_url_over_weak_surface_risk: bool,
+    pub stale_url_over_weak_surface_false_positive: bool,
+    pub fake_open_target: bool,
+    pub missing_evidence_render_expected: bool,
+    pub missing_evidence_rendered: bool,
+    pub privacy_violation: bool,
+    pub p1_feedback_gate_regression: bool,
+    pub p2_support_gate_regression: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1815,6 +1859,7 @@ pub struct TraceFrameSummary {
     pub app_name: Option<String>,
     pub window_title: Option<String>,
     pub trigger: Option<String>,
+    pub weak_surface_classification: WeakSurfaceClassification,
     pub safe_snippet: Option<String>,
 }
 
@@ -2045,11 +2090,20 @@ pub struct ContinueFocusSummary {
     pub frame_id: String,
     pub artifact_id: Option<String>,
     pub artifact_kind: Option<String>,
+    pub domain: Option<String>,
     pub app_name: Option<String>,
     pub window_title: Option<String>,
     pub title: Option<String>,
+    pub display_title: Option<String>,
     pub browser_url: Option<String>,
     pub document_path: Option<String>,
+    pub activity_state: Option<String>,
+    pub task_state: Option<String>,
+    pub evidence_quality: Option<String>,
+    pub identity_confidence: Option<f64>,
+    pub snapshot_id: Option<String>,
+    pub missing_fields: Vec<String>,
+    pub openability: Option<String>,
     pub captured_at_ms: i64,
 }
 
@@ -2068,6 +2122,14 @@ struct FocusEvidenceRow {
     trigger_type: Option<String>,
     event_type: Option<String>,
     transition_label: Option<String>,
+    domain: Option<String>,
+    activity_state: Option<String>,
+    task_state: Option<String>,
+    identity_confidence: Option<f64>,
+    snapshot_id: Option<String>,
+    missing_fields: Vec<String>,
+    openability: Option<String>,
+    evidence_quality: Option<String>,
     has_active_window: bool,
     has_screenshot: bool,
     has_ax: bool,
@@ -2098,6 +2160,13 @@ struct ResolvedCurrentSurface {
     focus_confidence: f64,
     evidence_quality: String,
     openability: String,
+    domain: Option<String>,
+    activity_state: Option<String>,
+    task_state: Option<String>,
+    identity_confidence: Option<f64>,
+    snapshot_id: Option<String>,
+    missing_fields: Vec<String>,
+    weak_surface_classification: WeakSurfaceClassification,
     reason: String,
     warnings: Vec<String>,
 }
@@ -2657,6 +2726,9 @@ struct ResolvedArtifact {
     evidence_quality: String,
     openability: String,
     reason: String,
+    identity_missing_fields: Vec<String>,
+    identity_merge_keys: Vec<String>,
+    surface_snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2820,11 +2892,13 @@ struct ScorerArtifact {
     display_title: Option<String>,
     browser_url: Option<String>,
     document_path: Option<String>,
+    identity_confidence: f64,
     evidence_quality: String,
     privacy_status: Option<String>,
     openability: String,
     last_seen_frame_id: Option<String>,
     last_seen_timestamp: i64,
+    identity_missing_fields: Vec<String>,
     branch_promotion_state: Option<String>,
     branch_public_return_eligible: Option<bool>,
     branch_promotion_reason: Option<String>,
@@ -3272,6 +3346,8 @@ struct ContinueEvalCaseFixture {
     cache_feedback_newer_than_cached_decision: Option<bool>,
     #[serde(default)]
     model_feedback_validation_failure_expected: Option<bool>,
+    #[serde(default)]
+    missing_evidence_render_expected: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3322,6 +3398,24 @@ struct ContinueEvalCandidateFixture {
     feedback_suppression_state: Option<String>,
     #[serde(default)]
     feedback_score_capped: Option<bool>,
+    #[serde(default)]
+    is_weak_surface: Option<bool>,
+    #[serde(default)]
+    weak_surface_enrichment_attempted: Option<bool>,
+    #[serde(default)]
+    weak_surface_snapshot_quality: Option<String>,
+    #[serde(default)]
+    weak_surface_candidate_expected: Option<bool>,
+    #[serde(default)]
+    stale_url_over_weak_surface_risk: Option<bool>,
+    #[serde(default)]
+    fake_open_target_exposed: Option<bool>,
+    #[serde(default)]
+    privacy_violation: Option<bool>,
+    #[serde(default)]
+    p1_feedback_gate_regression: Option<bool>,
+    #[serde(default)]
+    p2_support_gate_regression: Option<bool>,
 }
 
 pub fn rebuild_continue_second_layer(
@@ -3338,8 +3432,11 @@ pub fn rebuild_continue_second_layer(
 
     let mut frame_artifacts = HashMap::new();
     for frame in &frames {
-        let artifact = resolve_artifact(frame);
+        let artifact = resolve_artifact(conn, frame);
         upsert_continue_artifact(conn, frame, &artifact)?;
+        if let Some(snapshot_id) = artifact.surface_snapshot_id.as_deref() {
+            link_surface_snapshot_to_artifact(conn, snapshot_id, &artifact.id)?;
+        }
         upsert_continue_artifact_observation(conn, frame, &artifact)?;
         frame_artifacts.insert(frame.id.clone(), artifact);
     }
@@ -3363,6 +3460,9 @@ pub fn rebuild_continue_second_layer(
         insert_continue_task_action(conn, action)?;
     }
     let event_backed_promotions = promote_event_backed_weak_surfaces(conn, &request, &frames)?;
+    let snapshot_backed_promotions = promote_snapshot_backed_weak_surfaces(conn, &request)?;
+    let mut event_backed_promotions = event_backed_promotions;
+    event_backed_promotions.extend(snapshot_backed_promotions);
 
     Ok(ContinueSecondLayerRebuildResult {
         processed_frames: frames.len() as i64,
@@ -3713,6 +3813,12 @@ pub fn get_continue_decision(
     );
     let force_rebuild = effective_mode == "rebuild";
     let micro_inference_enabled = request.micro_inference_enabled.unwrap_or(false);
+    let requested_at_ms = current_time_millis();
+    let pre_decision_enrichment = run_continue_request_weak_surface_enrichment(
+        conn,
+        request.session_id.as_deref(),
+        requested_at_ms,
+    )?;
     infer_pending_continue_feedback(conn, FEEDBACK_INFERENCE_MIN_AGE_MS)?;
     let mut current_watermark =
         build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
@@ -3726,7 +3832,7 @@ pub fn get_continue_decision(
             micro_inference_enabled,
         )?
     };
-    let cached_meta = if !force_rebuild {
+    let mut cached_meta = if !force_rebuild {
         fresh_cached_continue_decision(
             conn,
             request.session_id.as_deref(),
@@ -3736,13 +3842,23 @@ pub fn get_continue_decision(
     } else {
         None
     };
+    if pre_decision_enrichment
+        .as_ref()
+        .is_some_and(|attempt| attempt.produced_snapshot())
+    {
+        cached_meta = None;
+        cache_bypass_reasons.push("weak_surface_enrichment_snapshot".to_string());
+    }
     if cached_meta.is_some() {
         cache_bypass_reasons.clear();
     }
 
     let semantic_rebuild_needed = cached_meta.is_none()
         && (force_rebuild || continue_layers_need_rebuild(conn, request.session_id.as_deref())?);
-    if semantic_rebuild_needed {
+    let enrichment_rebuild_needed = pre_decision_enrichment
+        .as_ref()
+        .is_some_and(|attempt| attempt.produced_snapshot());
+    if semantic_rebuild_needed || enrichment_rebuild_needed {
         let start_frame_id = if force_rebuild {
             None
         } else {
@@ -3765,7 +3881,6 @@ pub fn get_continue_decision(
         rebuild_continue_third_layer(conn, third_request)?;
     }
 
-    let requested_at_ms = current_time_millis();
     let lookback_ms = request.lookback_ms.unwrap_or(45 * 60 * 1000);
     let current_surface_resolution = resolve_current_surface(
         conn,
@@ -4563,9 +4678,14 @@ pub fn get_continue_decision(
                         .iter()
                         .filter(|candidate| candidate_selectable_for_micro_inference(candidate))
                         .count(),
-                    excluded_branch_candidate_ids: branch_filter_excluded_candidate_ids(&candidates),
-                    support_evidence_count: support_evidence_items_for_candidates(&candidates).len(),
-                    branch_validation_failures: branch_validation_failures_from_failures(&[error.clone()]),
+                    excluded_branch_candidate_ids: branch_filter_excluded_candidate_ids(
+                        &candidates,
+                    ),
+                    support_evidence_count: support_evidence_items_for_candidates(&candidates)
+                        .len(),
+                    branch_validation_failures: branch_validation_failures_from_failures(&[
+                        error.clone()
+                    ]),
                     feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
                     pack: None,
                     request: None,
@@ -4981,6 +5101,7 @@ pub fn get_continue_decision(
         &missing_evidence,
         &warnings,
     );
+    let weak_surface_enrichment = weak_surface_enrichment_diagnostics(conn)?;
 
     Ok(ContinueDecisionResult {
         decision_id,
@@ -5066,6 +5187,7 @@ pub fn get_continue_decision(
         continue_dossier: Some(continue_dossier),
         memory_retrieval: Some(memory_retrieval),
         observe_before_decide: None,
+        weak_surface_enrichment,
         app_activity: Some(app_activity.clone()),
         activity_summary: Some(app_activity.summary.clone()),
         quality_gate,
@@ -5605,6 +5727,15 @@ fn load_continue_current_focus(
             artifact_id: row.get(6)?,
             artifact_kind: row.get(7)?,
             title: row.get(8)?,
+            display_title: row.get(8)?,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
         })
     };
     let value = if let Some(session_id) = session_id {
@@ -5758,6 +5889,7 @@ fn load_recent_focus_evidence(
     load_recent_window_focus_evidence(conn, session_id, since_ms, limit, &mut rows)?;
     load_recent_typing_focus_evidence(conn, session_id, since_ms, limit, &mut rows)?;
     load_recent_probe_focus_evidence(conn, since_ms, limit, &mut rows)?;
+    load_recent_surface_snapshot_focus_evidence(conn, since_ms, limit, &mut rows)?;
     rows.sort_by(|left, right| right.observed_at_ms.cmp(&left.observed_at_ms));
     rows.truncate(limit);
     Ok(rows)
@@ -5809,6 +5941,14 @@ fn load_recent_frame_focus_evidence(
                 trigger_type: row.get(7)?,
                 event_type: None,
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: row.get::<_, Option<String>>(10)?.is_some(),
                 has_screenshot: true,
                 has_ax: has_ax && frame_has_rows(conn, "ax_nodes", &frame_id).unwrap_or(false),
@@ -5870,6 +6010,14 @@ fn load_recent_artifact_observation_focus_evidence(
                 trigger_type: None,
                 event_type: None,
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: false,
                 has_screenshot: row.get::<_, Option<String>>(2)?.is_some(),
                 has_ax: false,
@@ -5924,6 +6072,14 @@ fn load_recent_app_context_focus_evidence(
                 trigger_type: None,
                 event_type: None,
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: true,
                 has_screenshot: true,
                 has_ax: false,
@@ -5982,6 +6138,14 @@ fn load_recent_ui_event_focus_evidence(
                         .unwrap_or(event_type),
                 ),
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: true,
                 has_screenshot: false,
                 has_ax: false,
@@ -6037,6 +6201,14 @@ fn load_recent_window_focus_evidence(
                 trigger_type: None,
                 event_type: Some("active_window".to_string()),
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: true,
                 has_screenshot: false,
                 has_ax: false,
@@ -6102,6 +6274,14 @@ fn load_recent_typing_focus_evidence(
                     commit_signal.unwrap_or_else(|| "none".to_string())
                 )),
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: true,
                 has_screenshot: false,
                 has_ax: false,
@@ -6159,6 +6339,14 @@ fn load_recent_probe_focus_evidence(
                 trigger_type: Some("observe_before_decide".to_string()),
                 event_type: Some("evidence_probe".to_string()),
                 transition_label: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
+                evidence_quality: None,
                 has_active_window: !privacy_blocked
                     && (row.get::<_, Option<String>>(2)?.is_some()
                         || row.get::<_, Option<String>>(4)?.is_some()),
@@ -6177,6 +6365,96 @@ fn load_recent_probe_focus_evidence(
         rows.push(row.map_err(to_string)?);
     }
     Ok(())
+}
+
+fn load_recent_surface_snapshot_focus_evidence(
+    conn: &Connection,
+    since_ms: i64,
+    limit: usize,
+    rows: &mut Vec<FocusEvidenceRow>,
+) -> Result<(), String> {
+    if !table_exists(conn, "continue_surface_snapshots")? {
+        return Ok(());
+    }
+    for snapshot in load_recent_surface_snapshots(conn, since_ms, limit)? {
+        let quality = evaluate_surface_snapshot_quality(&snapshot);
+        let mut quality_warnings = quality.warnings;
+        quality_warnings.extend(
+            quality
+                .missing_evidence
+                .iter()
+                .map(|value| format!("surface_snapshot_missing:{}", value)),
+        );
+        quality_warnings.push(format!(
+            "surface_snapshot:evidence_quality:{}",
+            quality.evidence_quality.as_str()
+        ));
+        quality_warnings.push(format!(
+            "surface_snapshot:stale_suppression:{}",
+            quality.stale_target_suppression_strength.as_str()
+        ));
+        rows.push(FocusEvidenceRow {
+            evidence_id: snapshot.id.clone(),
+            evidence_kind: "surface_snapshot".to_string(),
+            observed_at_ms: snapshot.observed_at_ms,
+            app_name: snapshot.app_name.clone(),
+            bundle_id: snapshot.bundle_id.clone(),
+            window_title: snapshot
+                .thread_title
+                .clone()
+                .or(snapshot.active_relative_file.clone())
+                .or(snapshot.window_title.clone()),
+            artifact_id: snapshot.artifact_id.clone(),
+            artifact_kind: Some(surface_snapshot_artifact_kind(&snapshot.domain).to_string()),
+            browser_url: None,
+            document_path: if quality.openability.as_str() == "openable" {
+                snapshot.active_file_path.clone()
+            } else {
+                None
+            },
+            trigger_type: snapshot.activity_state.clone(),
+            event_type: snapshot
+                .task_state
+                .clone()
+                .or(snapshot.command_state.clone()),
+            transition_label: None,
+            domain: Some(snapshot.domain.clone()),
+            activity_state: snapshot.activity_state.clone(),
+            task_state: snapshot
+                .task_state
+                .clone()
+                .or(snapshot.command_state.clone()),
+            identity_confidence: Some(identity_confidence_score(
+                quality.identity_confidence.as_str(),
+            )),
+            snapshot_id: Some(snapshot.id.clone()),
+            missing_fields: quality.missing_evidence.clone(),
+            openability: Some(quality.openability.as_str().to_string()),
+            evidence_quality: Some(quality.evidence_quality.as_str().to_string()),
+            has_active_window: snapshot.window_id.is_some()
+                || snapshot.focused_control_role.is_some()
+                || snapshot.focused_control_label.is_some(),
+            has_screenshot: snapshot.frame_id.is_some(),
+            has_ax: snapshot.focused_control_role.is_some()
+                || snapshot.focused_control_label.is_some()
+                || snapshot.visible_text_hash.is_some(),
+            has_ocr: false,
+            has_content_units: snapshot.visible_text_hash.is_some(),
+            privacy_status: snapshot.privacy_status.clone(),
+            quality_warnings,
+        });
+    }
+    Ok(())
+}
+
+fn surface_snapshot_artifact_kind(domain: &str) -> &'static str {
+    match domain {
+        "codex_cli" => "terminal",
+        "codex_desktop_app" | "codex_ide_extension" | "code_editor" => "code_editor",
+        "terminal" => "terminal",
+        "native_agent_window" => "unknown",
+        _ => "unknown",
+    }
 }
 
 fn resolved_surface_from_group(
@@ -6286,6 +6564,7 @@ fn resolved_surface_from_group(
         "unknown"
     }
     .to_string();
+    let weak_surface_classification = weak_surface_classification_for_focus_group(group, best);
     let reason = if is_self {
         "demoted_smalltalk_self_surface"
     } else if is_debug {
@@ -6322,6 +6601,20 @@ fn resolved_surface_from_group(
         focus_confidence: round_score(score),
         evidence_quality,
         openability,
+        domain: best.domain.clone().or_else(|| {
+            let domain = weak_surface_classification_for_focus_group(group, best).domain;
+            if domain == WeakSurfaceDomain::NotWeakSurface {
+                None
+            } else {
+                Some(weak_surface_domain_label(&domain).to_string())
+            }
+        }),
+        activity_state: best.activity_state.clone(),
+        task_state: best.task_state.clone(),
+        identity_confidence: best.identity_confidence,
+        snapshot_id: best.snapshot_id.clone(),
+        missing_fields: best.missing_fields.clone(),
+        weak_surface_classification,
         reason,
         warnings,
     }
@@ -6348,9 +6641,45 @@ fn no_clear_current_surface(now_ms: i64) -> ResolvedCurrentSurface {
         focus_confidence: 0.0,
         evidence_quality: "unknown".to_string(),
         openability: "unknown".to_string(),
+        domain: None,
+        activity_state: None,
+        task_state: None,
+        identity_confidence: None,
+        snapshot_id: None,
+        missing_fields: Vec::new(),
+        weak_surface_classification: classify_weak_surface(
+            &WeakSurfaceClassificationInput::default(),
+        ),
         reason: "no_recent_non_self_focus_evidence".to_string(),
         warnings: vec!["current_surface:no_clear_non_self_surface".to_string()],
     }
+}
+
+fn weak_surface_classification_for_focus_group(
+    group: &[FocusEvidenceRow],
+    best: &FocusEvidenceRow,
+) -> WeakSurfaceClassification {
+    let mut event_types = group
+        .iter()
+        .filter_map(|row| row.event_type.clone())
+        .collect::<Vec<_>>();
+    event_types.sort();
+    event_types.dedup();
+    let trigger_type = group.iter().find_map(|row| row.trigger_type.clone());
+    classify_weak_surface(&WeakSurfaceClassificationInput {
+        app_name: best.app_name.clone(),
+        bundle_id: best.bundle_id.clone(),
+        window_title: best.window_title.clone(),
+        browser_url: best.browser_url.clone(),
+        document_path: best.document_path.clone(),
+        text_source: None,
+        full_text_sample: None,
+        content_unit_roles: best.artifact_kind.clone().into_iter().collect(),
+        focused_node_role: None,
+        event_types,
+        trigger_type,
+        privacy_status: best.privacy_status.clone(),
+    })
 }
 
 fn focus_row_score(row: &FocusEvidenceRow, now_ms: i64) -> f64 {
@@ -6479,13 +6808,37 @@ fn focus_summary_from_resolved_surface(
             .unwrap_or_else(|| surface.surface_id.clone()),
         artifact_id: surface.artifact_id.clone(),
         artifact_kind: Some(surface.artifact_kind.clone()),
+        domain: surface.domain.clone(),
         app_name: surface.app_name.clone(),
         window_title: surface.window_title.clone(),
         title: surface.window_title.clone(),
+        display_title: surface.window_title.clone(),
         browser_url: surface.browser_url.clone(),
         document_path: surface.document_path.clone(),
+        activity_state: surface.activity_state.clone(),
+        task_state: surface.task_state.clone(),
+        evidence_quality: Some(surface.evidence_quality.clone()),
+        identity_confidence: surface
+            .identity_confidence
+            .or(Some(surface.focus_confidence)),
+        snapshot_id: surface.snapshot_id.clone(),
+        missing_fields: surface.missing_fields.clone(),
+        openability: Some(surface.openability.clone()),
         captured_at_ms: surface.observed_at_ms,
     })
+}
+
+fn weak_surface_domain_label(domain: &WeakSurfaceDomain) -> &'static str {
+    match domain {
+        WeakSurfaceDomain::CodexCli => "codex_cli",
+        WeakSurfaceDomain::CodexDesktopApp => "codex_desktop_app",
+        WeakSurfaceDomain::CodexIdeExtension => "codex_ide_extension",
+        WeakSurfaceDomain::CodeEditor => "code_editor",
+        WeakSurfaceDomain::Terminal => "terminal",
+        WeakSurfaceDomain::NativeAgentWindow => "native_agent_window",
+        WeakSurfaceDomain::UnknownWeakSurface => "unknown_weak_surface",
+        WeakSurfaceDomain::NotWeakSurface => "not_weak_surface",
+    }
 }
 
 fn build_evidence_freshness_ledger(
@@ -6628,7 +6981,8 @@ fn derive_active_current_work_unresolved(
         current_surface.app_name.as_deref(),
         current_surface.bundle_id.as_deref(),
         current_surface.window_title.as_deref(),
-    );
+    ) || current_surface.weak_surface_classification.domain
+        != WeakSurfaceDomain::NotWeakSurface;
     if !has_meaningful_activity && !weak_domain {
         return None;
     }
@@ -6846,6 +7200,12 @@ fn active_current_work_evidence_quality(
     if current_surface.app_name.is_none() && current_surface.bundle_id.is_none() {
         return "unknown".to_string();
     }
+    if matches!(
+        current_surface.evidence_quality.as_str(),
+        "strong" | "medium"
+    ) {
+        return current_surface.evidence_quality.clone();
+    }
     if current_artifact.is_some()
         && has_human_readable_title
         && event_backed
@@ -6878,31 +7238,8 @@ fn is_known_weak_current_work_domain(
     bundle_id: Option<&str>,
     window_title: Option<&str>,
 ) -> bool {
-    let haystack = [app_name, bundle_id, window_title]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    contains_any(
-        &haystack,
-        &[
-            "codex",
-            "com.openai.codex",
-            "claude code",
-            "cursor",
-            "visual studio code",
-            "vscode",
-            "com.microsoft.vscode",
-            "xcode",
-            "intellij",
-            "jetbrains",
-            "terminal",
-            "iterm",
-            "warp",
-            "agent",
-        ],
-    )
+    classify_event_surface(app_name, bundle_id, window_title).domain
+        != WeakSurfaceDomain::NotWeakSurface
 }
 
 fn active_current_work_for_model(
@@ -7335,6 +7672,7 @@ fn model_safe_current_focus(focus: Option<&ContinueFocusSummary>) -> Option<Cont
     focus.cloned().map(|mut focus| {
         focus.title = focus.title.as_deref().map(safe_model_label);
         focus.window_title = focus.window_title.as_deref().map(safe_model_label);
+        focus.display_title = focus.display_title.as_deref().map(safe_model_label);
         focus.browser_url = None;
         focus.document_path = None;
         focus
@@ -7864,6 +8202,8 @@ fn build_continue_evidence_watermark(
         max_i64_if_present(conn, "continue_memory_edges", "updated_at_ms")?;
     let (latest_evidence_probe_id, latest_evidence_probe_at_ms) =
         latest_string_marker(conn, "continue_evidence_probes", "id", "completed_at_ms")?;
+    let (latest_surface_snapshot_id, latest_surface_snapshot_at_ms) =
+        latest_string_marker(conn, "continue_surface_snapshots", "id", "updated_at_ms")?;
     let (latest_app_activity_segment_id, latest_app_activity_segment_at_ms) =
         latest_string_marker(conn, "continue_app_activity_segments", "id", "ended_at_ms")?;
     let (latest_activity_classification_id, latest_activity_classification_at_ms) =
@@ -7899,6 +8239,8 @@ fn build_continue_evidence_watermark(
         "latest_memory_edge_at_ms": latest_memory_edge_at_ms,
         "latest_evidence_probe_id": latest_evidence_probe_id,
         "latest_evidence_probe_at_ms": latest_evidence_probe_at_ms,
+        "latest_surface_snapshot_id": latest_surface_snapshot_id,
+        "latest_surface_snapshot_at_ms": latest_surface_snapshot_at_ms,
         "latest_app_activity_segment_id": latest_app_activity_segment_id,
         "latest_app_activity_segment_at_ms": latest_app_activity_segment_at_ms,
         "latest_activity_classification_id": latest_activity_classification_id,
@@ -8216,7 +8558,15 @@ fn continue_layers_need_rebuild(
     }
     let latest_artifact_ts =
         max_i64_if_present(conn, "continue_artifact_observations", "timestamp_ms")?.unwrap_or(0);
-    Ok(latest_frame_ts > latest_artifact_ts)
+    if latest_frame_ts > latest_artifact_ts {
+        return Ok(true);
+    }
+    if latest_event_timestamp(conn, session_id)?
+        .is_some_and(|latest_event_ts| latest_event_ts > latest_artifact_ts)
+    {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn latest_continue_processed_frame_id(conn: &Connection) -> Result<Option<i64>, String> {
@@ -8460,8 +8810,9 @@ fn load_scorer_workstream_artifacts(
     let mut stmt = conn
         .prepare(
             "SELECT a.id, a.artifact_kind, a.display_title, a.browser_url,
-                    a.document_path, a.evidence_quality, a.privacy_status,
-                    a.openability, a.last_seen_frame_id, a.last_seen_timestamp,
+                    a.document_path, a.identity_confidence, a.evidence_quality,
+                    a.privacy_status, a.openability, a.last_seen_frame_id,
+                    a.last_seen_timestamp, a.identity_missing_fields_json,
                     wa.durable_role, wa.importance_score, wa.first_seen_frame_id,
                     wa.last_seen_frame_id,
                     (
@@ -8507,21 +8858,27 @@ fn load_scorer_workstream_artifacts(
                     display_title: row.get(2)?,
                     browser_url: row.get(3)?,
                     document_path: row.get(4)?,
-                    evidence_quality: row.get(5)?,
-                    privacy_status: row.get(6)?,
-                    openability: row.get(7)?,
-                    last_seen_frame_id: row.get(8)?,
-                    last_seen_timestamp: row.get(9)?,
-                    branch_promotion_state: row.get(14)?,
+                    identity_confidence: row.get(5)?,
+                    evidence_quality: row.get(6)?,
+                    privacy_status: row.get(7)?,
+                    openability: row.get(8)?,
+                    last_seen_frame_id: row.get(9)?,
+                    last_seen_timestamp: row.get(10)?,
+                    identity_missing_fields: row
+                        .get::<_, Option<String>>(11)?
+                        .as_deref()
+                        .map(parse_string_array)
+                        .unwrap_or_default(),
+                    branch_promotion_state: row.get(16)?,
                     branch_public_return_eligible: row
-                        .get::<_, Option<i64>>(15)?
+                        .get::<_, Option<i64>>(17)?
                         .map(|value| value != 0),
-                    branch_promotion_reason: row.get(16)?,
+                    branch_promotion_reason: row.get(18)?,
                 },
-                durable_role: row.get(10)?,
-                importance_score: row.get(11)?,
-                first_seen_frame_id: row.get(12)?,
-                last_seen_frame_id: row.get(13)?,
+                durable_role: row.get(12)?,
+                importance_score: row.get(13)?,
+                first_seen_frame_id: row.get(14)?,
+                last_seen_frame_id: row.get(15)?,
             })
         })
         .map_err(to_string)?;
@@ -9406,13 +9763,26 @@ fn load_trace_frames(
     let rows = stmt
         .query_map(params![limit as i64], |row| {
             let raw: Option<String> = row.get(6)?;
+            let app_name: Option<String> = row.get(3)?;
+            let window_title: Option<String> = row.get(4)?;
+            let trigger: Option<String> = row.get(5)?;
+            let weak_surface_classification =
+                classify_weak_surface(&WeakSurfaceClassificationInput {
+                    app_name: app_name.clone(),
+                    window_title: window_title.clone(),
+                    full_text_sample: raw.as_deref().and_then(redacted_trace_snippet_for_registry),
+                    event_types: trigger.clone().into_iter().collect(),
+                    trigger_type: trigger.clone(),
+                    ..Default::default()
+                });
             Ok(TraceFrameSummary {
                 frame_id: row.get(0)?,
                 captured_at_ms: row.get(1)?,
                 session_id: row.get(2)?,
-                app_name: row.get(3)?,
-                window_title: row.get(4)?,
-                trigger: row.get(5)?,
+                app_name,
+                window_title,
+                trigger,
+                weak_surface_classification,
                 safe_snippet: if include_snippets {
                     raw.and_then(|value| redacted_trace_snippet(&value, 120))
                 } else {
@@ -9422,6 +9792,10 @@ fn load_trace_frames(
         })
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn redacted_trace_snippet_for_registry(value: &str) -> Option<String> {
+    redacted_trace_snippet(value, 160)
 }
 
 fn load_trace_events(conn: &Connection, limit: usize) -> Result<Vec<TraceEventSummary>, String> {
@@ -11323,7 +11697,11 @@ fn branch_filter_selectable_count_before(candidates: &[ScoredContinueCandidate])
 fn branch_validation_failures_from_failures(failures: &[String]) -> Vec<String> {
     failures
         .iter()
-        .filter(|failure| failure.contains("branch") || failure.contains("interrupt") || failure.contains("diagnostic"))
+        .filter(|failure| {
+            failure.contains("branch")
+                || failure.contains("interrupt")
+                || failure.contains("diagnostic")
+        })
         .cloned()
         .collect()
 }
@@ -12939,6 +13317,14 @@ fn focus_row_from_current_surface(surface: &ResolvedCurrentSurface) -> FocusEvid
         trigger_type: Some("resolved_current_surface".to_string()),
         event_type: Some(surface.evidence_kinds.join("+")),
         transition_label: None,
+        domain: surface.domain.clone(),
+        activity_state: surface.activity_state.clone(),
+        task_state: surface.task_state.clone(),
+        identity_confidence: surface.identity_confidence,
+        snapshot_id: surface.snapshot_id.clone(),
+        missing_fields: surface.missing_fields.clone(),
+        openability: Some(surface.openability.clone()),
+        evidence_quality: Some(surface.evidence_quality.clone()),
         has_active_window: true,
         has_screenshot: surface.evidence_kinds.iter().any(|kind| kind == "frame"),
         has_ax: surface
@@ -13482,6 +13868,15 @@ fn resolve_app_family(
     bundle_id: Option<&str>,
     window_title: Option<&str>,
 ) -> String {
+    let classification = classify_weak_surface(&WeakSurfaceClassificationInput {
+        app_name: non_empty(app_name.to_string()),
+        bundle_id: bundle_id.map(str::to_string),
+        window_title: window_title.map(str::to_string),
+        ..Default::default()
+    });
+    if let Some(app_family) = domain_app_family(&classification.domain) {
+        return app_family.to_string();
+    }
     let haystack = format!(
         "{} {} {}",
         app_name,
@@ -15009,6 +15404,14 @@ fn surface_type_for_scorer_artifact(target: &ScorerArtifact, app_family: &str) -
         trigger_type: None,
         event_type: None,
         transition_label: None,
+        domain: None,
+        activity_state: None,
+        task_state: None,
+        identity_confidence: Some(target.identity_confidence),
+        snapshot_id: None,
+        missing_fields: target.identity_missing_fields.clone(),
+        openability: Some(target.openability.clone()),
+        evidence_quality: Some(target.evidence_quality.clone()),
         has_active_window: false,
         has_screenshot: target.last_seen_frame_id.is_some(),
         has_ax: false,
@@ -15492,6 +15895,41 @@ fn apply_candidate_risk_caps(
         if target.artifact_kind == "unknown" || target.evidence_quality == "thin" {
             cap_candidate_score(candidate, 0.55, "thin_or_unknown_target");
         }
+        if target.evidence_quality == "medium" {
+            cap_candidate_score(candidate, 0.72, "medium_surface_snapshot_evidence");
+        }
+        if target.evidence_quality == "thin" {
+            cap_candidate_score(
+                candidate,
+                0.42,
+                "thin_surface_snapshot_not_primary_eligible",
+            );
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = Some(
+                "thin surface evidence is current-work state, not a confident return target"
+                    .to_string(),
+            );
+        } else if target.evidence_quality == "unknown" {
+            cap_candidate_score(
+                candidate,
+                0.35,
+                "unknown_surface_snapshot_not_primary_eligible",
+            );
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = Some(
+                "unknown surface evidence cannot be used as a confident return target".to_string(),
+            );
+        }
+        if target
+            .privacy_status
+            .as_deref()
+            .is_some_and(privacy_status_is_limited)
+        {
+            cap_candidate_score(candidate, 0.35, "privacy_blocked_surface_snapshot");
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason =
+                Some("privacy rules blocked evidence for this target".to_string());
+        }
         if target.openability == "frame_fallback" {
             let cap = if target_matches_current_focus(candidate, current_focus) {
                 0.72
@@ -15715,9 +16153,13 @@ fn confidence_cap_for_candidate(
                     "no_action_or_unresolved_state" => 0.48,
                     "thin_or_unattributed_evidence" => 0.52,
                     "thin_or_unknown_target" => 0.55,
+                    "privacy_blocked_surface_snapshot"
+                    | "unknown_surface_snapshot_not_primary_eligible" => 0.35,
+                    "thin_surface_snapshot_not_primary_eligible" => 0.42,
                     "smalltalk_self_observation" => 0.58,
                     "stale_mismatched_openable_current_work" => 0.58,
                     "continue_current_work_thin_candidate" => 0.62,
+                    "medium_surface_snapshot_evidence" => 0.72,
                     "frame_fallback_inspectable" => 0.72,
                     "thin_open_loop" | "no_direct_url_or_document_path" => 0.62,
                     "collapsed_repeated_action" => 0.64,
@@ -16187,13 +16629,28 @@ fn apply_active_current_work_stale_openable_caps(
         {
             continue;
         }
-        cap_candidate_score(candidate, 0.58, "stale_mismatched_openable_current_work");
-        candidate.score = round_score(f64::min(candidate.score, 0.58));
+        let suppression_strength =
+            active_current_work_stale_suppression_strength(active_current_work);
+        let cap = match suppression_strength {
+            StaleSuppressionStrength::Strong => 0.45,
+            StaleSuppressionStrength::Medium => 0.52,
+            StaleSuppressionStrength::Weak => 0.58,
+            StaleSuppressionStrength::None => 0.64,
+        };
+        cap_candidate_score(candidate, cap, "stale_mismatched_openable_current_work");
+        candidate.score = round_score(f64::min(candidate.score, cap));
         candidate.selection_demotion_reason =
             Some("older openable target lost to fresh current work evidence".to_string());
         push_string_once(
             &mut candidate.warnings,
             "active_current_work_outranks_stale_openable_target",
+        );
+        push_string_once(
+            &mut candidate.warnings,
+            &format!(
+                "active_current_work_stale_suppression:{}",
+                suppression_strength.as_str()
+            ),
         );
         candidate.risk_flags.sort();
         candidate.risk_flags.dedup();
@@ -16207,6 +16664,24 @@ fn apply_active_current_work_stale_openable_caps(
             .extend(candidate.risk_flags.iter().cloned());
         candidate.warnings.sort();
         candidate.warnings.dedup();
+    }
+}
+
+fn active_current_work_stale_suppression_strength(
+    active_current_work: &ActiveCurrentWorkUnresolved,
+) -> StaleSuppressionStrength {
+    match active_current_work.evidence_quality.as_str() {
+        "strong" => StaleSuppressionStrength::Strong,
+        "medium" => StaleSuppressionStrength::Medium,
+        "thin"
+            if active_current_work.event_backed
+                && (!active_current_work.task_action_ids.is_empty()
+                    || active_current_work.activity_hint.is_some()) =>
+        {
+            StaleSuppressionStrength::Medium
+        }
+        "thin" => StaleSuppressionStrength::Weak,
+        _ => StaleSuppressionStrength::Weak,
     }
 }
 
@@ -16762,6 +17237,18 @@ fn missing_evidence_for_candidate(
     {
         missing.push("no_direct_url_or_document_path".to_string());
     }
+    if let Some(target) = candidate.target_artifact.as_ref() {
+        missing.extend(product_safe_missing_evidence(
+            &target.identity_missing_fields,
+        ));
+        if target.evidence_quality == "medium" {
+            push_string_once(&mut missing, "medium_surface_snapshot_evidence");
+        } else if target.evidence_quality == "thin" {
+            push_string_once(&mut missing, "thin_surface_snapshot_evidence");
+        } else if target.evidence_quality == "unknown" {
+            push_string_once(&mut missing, "unknown_surface_snapshot_evidence");
+        }
+    }
     if candidate.evidence_quality_score < 0.45 {
         missing.push("thin_evidence_quality".to_string());
     }
@@ -16798,6 +17285,11 @@ fn warnings_for_candidate(
     {
         if role == "branch" && !branch_promotion_allows_public_return(candidate) {
             warnings.push("branch_surface_is_evidence_not_default_return_target".to_string());
+        }
+    }
+    if let Some(target) = candidate.target_artifact.as_ref() {
+        for missing in &target.identity_missing_fields {
+            push_string_once(&mut warnings, &format!("target_missing_field:{}", missing));
         }
     }
     if candidate.privacy_safety_score < 0.7 {
@@ -18690,12 +19182,40 @@ fn validate_micro_inference_output(
     if branch_support_target_requires_local_candidate_guard(&candidate) {
         failures.push("branch_or_support_target_promoted_without_strong_local_score".to_string());
     }
+    if model_selected_stale_target_over_fresh_current_work(&candidate, pack) {
+        failures.push("model_revived_stale_target_over_fresh_current_work".to_string());
+    }
 
     if failures.is_empty() {
         Ok(Some(candidate))
     } else {
         Err(failures)
     }
+}
+
+fn model_selected_stale_target_over_fresh_current_work(
+    candidate: &ScoredContinueCandidate,
+    pack: &ContinueMicroInferencePack,
+) -> bool {
+    let Some(active_current_work) = pack.active_current_work_unresolved.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        active_current_work.evidence_quality.as_str(),
+        "strong" | "medium"
+    ) {
+        return false;
+    }
+    if candidate.candidate_kind == "continue_current_work" {
+        return false;
+    }
+    candidate.score_caps_applied.iter().any(|cap| {
+        cap == "score_capped:stale_mismatched_openable_current_work"
+            || cap == "score_capped:stale_openable_target"
+    }) || candidate.warnings.iter().any(|warning| {
+        warning == "active_current_work_outranks_stale_openable_target"
+            || warning == "stale_return_target_suppressed:newer_current_focus"
+    })
 }
 
 fn unsupported_locator_in_model_output(output: &ContinueMicroInferenceOutput) -> bool {
@@ -20360,6 +20880,15 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 suppressed_target_open_attempted: None,
                 feedback_suppression_state: None,
                 feedback_score_capped: None,
+                is_weak_surface: None,
+                weak_surface_enrichment_attempted: None,
+                weak_surface_snapshot_quality: None,
+                weak_surface_candidate_expected: None,
+                stale_url_over_weak_surface_risk: None,
+                fake_open_target_exposed: None,
+                privacy_violation: None,
+                p1_feedback_gate_regression: None,
+                p2_support_gate_regression: None,
             }],
         ),
         eval_case(
@@ -20392,6 +20921,15 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 suppressed_target_open_attempted: None,
                 feedback_suppression_state: None,
                 feedback_score_capped: None,
+                is_weak_surface: None,
+                weak_surface_enrichment_attempted: None,
+                weak_surface_snapshot_quality: None,
+                weak_surface_candidate_expected: None,
+                stale_url_over_weak_surface_risk: None,
+                fake_open_target_exposed: None,
+                privacy_violation: None,
+                p1_feedback_gate_regression: None,
+                p2_support_gate_regression: None,
             }],
         ),
         eval_case_with_model_output(
@@ -20664,7 +21202,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("origin-editor"),
             vec![
-                eval_candidate("c-origin-editor", "w-p2-origin", Some("origin-editor"), 0.82, "strong"),
+                eval_candidate(
+                    "c-origin-editor",
+                    "w-p2-origin",
+                    Some("origin-editor"),
+                    0.82,
+                    "strong",
+                ),
                 branch_eval_candidate(
                     "c-search-branch",
                     "w-p2-origin",
@@ -20685,7 +21229,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("docs-reference"),
             vec![
-                eval_candidate("c-origin-docs", "w-p2-docs", Some("origin-editor"), 0.72, "medium"),
+                eval_candidate(
+                    "c-origin-docs",
+                    "w-p2-docs",
+                    Some("origin-editor"),
+                    0.72,
+                    "medium",
+                ),
                 branch_eval_candidate(
                     "c-docs-reference",
                     "w-p2-docs",
@@ -20706,7 +21256,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("gmail-thread"),
             vec![
-                eval_candidate("c-origin-gmail-read", "w-p2-gmail-read", Some("origin-editor"), 0.7, "medium"),
+                eval_candidate(
+                    "c-origin-gmail-read",
+                    "w-p2-gmail-read",
+                    Some("origin-editor"),
+                    0.7,
+                    "medium",
+                ),
                 branch_eval_candidate(
                     "c-gmail-thread",
                     "w-p2-gmail-read",
@@ -20739,7 +21295,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                     Some("origin-editor"),
                     true,
                 ),
-                eval_candidate("c-origin-gmail-compose", "w-p2-gmail-compose", Some("origin-editor"), 0.58, "medium"),
+                eval_candidate(
+                    "c-origin-gmail-compose",
+                    "w-p2-gmail-compose",
+                    Some("origin-editor"),
+                    0.58,
+                    "medium",
+                ),
             ],
         ),
         eval_case(
@@ -20748,7 +21310,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("smalltalk-diagnostics"),
             vec![
-                eval_candidate("c-origin-diagnostics", "w-p2-diagnostics", Some("origin-editor"), 0.69, "medium"),
+                eval_candidate(
+                    "c-origin-diagnostics",
+                    "w-p2-diagnostics",
+                    Some("origin-editor"),
+                    0.69,
+                    "medium",
+                ),
                 branch_eval_candidate(
                     "c-smalltalk-diagnostics",
                     "w-p2-diagnostics",
@@ -20769,7 +21337,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("terminal-logs"),
             vec![
-                eval_candidate("c-origin-terminal-logs", "w-p2-terminal-logs", Some("origin-editor"), 0.68, "medium"),
+                eval_candidate(
+                    "c-origin-terminal-logs",
+                    "w-p2-terminal-logs",
+                    Some("origin-editor"),
+                    0.68,
+                    "medium",
+                ),
                 branch_eval_candidate(
                     "c-terminal-logs",
                     "w-p2-terminal-logs",
@@ -20802,7 +21376,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                     Some("origin-editor"),
                     true,
                 ),
-                eval_candidate("c-origin-terminal-error", "w-p2-terminal-error", Some("origin-editor"), 0.55, "medium"),
+                eval_candidate(
+                    "c-origin-terminal-error",
+                    "w-p2-terminal-error",
+                    Some("origin-editor"),
+                    0.55,
+                    "medium",
+                ),
             ],
         ),
         eval_case_with_model_output(
@@ -20811,7 +21391,13 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
             "origin-editor",
             Some("search-results"),
             vec![
-                eval_candidate("c-origin-model-branch", "w-p2-model-branch", Some("origin-editor"), 0.74, "medium"),
+                eval_candidate(
+                    "c-origin-model-branch",
+                    "w-p2-model-branch",
+                    Some("origin-editor"),
+                    0.74,
+                    "medium",
+                ),
                 branch_eval_candidate(
                     "c-model-search-branch",
                     "w-p2-model-branch",
@@ -20875,7 +21461,326 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
         ),
     ];
     cases.extend(p1_feedback_eval_cases());
+    cases.extend(p3_weak_surface_eval_cases());
     ContinueEvalFixture { cases, k: Some(3) }
+}
+
+fn p3_weak_surface_eval_cases() -> Vec<ContinueEvalCaseFixture> {
+    let mut privacy_blocked = eval_case(
+        "p3_privacy_blocked_weak_surface",
+        "P3 privacy-blocked weak surface should stay truthful without visible samples",
+        "unknown",
+        Some("privacy-current"),
+        vec![weak_surface_eval_candidate(
+            "c-p3-privacy-current",
+            "w-p3-privacy",
+            Some("unknown"),
+            0.34,
+            "thin",
+            "evidence_only",
+            WeakSurfaceEvalFlags {
+                attempted: false,
+                snapshot_quality: Some("unknown"),
+                candidate_expected: true,
+                fake_open_target: false,
+                privacy_violation: false,
+                missing: vec!["privacy_blocked", "no_visible_sample_stored"],
+                ..Default::default()
+            },
+        )],
+    );
+    privacy_blocked.missing_evidence_render_expected = Some(true);
+
+    let mut p1_suppressed = eval_case(
+        "p3_p1_suppressed_enriched_target",
+        "P3 enriched target with repeated negative feedback cannot become primary",
+        "artifact-safe-current",
+        Some("artifact-suppressed-codex"),
+        vec![
+            weak_surface_eval_candidate(
+                "c-p3-safe-current",
+                "w-p3-safe",
+                Some("artifact-safe-current"),
+                0.62,
+                "medium",
+                "continue_current_work",
+                WeakSurfaceEvalFlags {
+                    attempted: true,
+                    snapshot_quality: Some("medium"),
+                    candidate_expected: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+            ),
+            feedback_eval_candidate(
+                "c-p3-suppressed-enriched",
+                "w-p3-suppressed",
+                Some("artifact-suppressed-codex"),
+                0.2,
+                "medium",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    p1_suppressed.expected_suppressed_artifact_ids = vec!["artifact-suppressed-codex".to_string()];
+    p1_suppressed.expected_not_return_target_artifact_ids =
+        vec!["artifact-suppressed-codex".to_string()];
+
+    vec![
+        eval_case(
+            "p3_codex_cli_event_only_composing",
+            "P3 Codex CLI event-only composing suppresses stale ChatGPT and reports missing repo/thread evidence",
+            "codex-cli-current",
+            Some("codex-cli-current"),
+            vec![
+                weak_surface_eval_candidate(
+                    "c-p3-codex-cli-current",
+                    "w-p3-codex-cli",
+                    Some("codex-cli-current"),
+                    0.56,
+                    "thin",
+                    "continue_current_work",
+                    WeakSurfaceEvalFlags {
+                        attempted: true,
+                        snapshot_quality: Some("thin"),
+                        candidate_expected: true,
+                        stale_url_risk: true,
+                        missing: vec![
+                            "missing_repo_or_thread",
+                            "missing_fresh_heavy_frame_for_current_focus",
+                        ],
+                        ..Default::default()
+                    },
+                ),
+                p0_eval_candidate(
+                    "c-p3-old-chatgpt",
+                    "w-p3-chatgpt",
+                    Some("old-chatgpt"),
+                    0.41,
+                    "strong",
+                    "continue_reply",
+                    P0EvalCandidateFlags {
+                        stale_return_target: true,
+                        stale_target_suppressed: true,
+                        return_target_openable: true,
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        ),
+        eval_case(
+            "p3_codex_cli_repo_prompt_visible",
+            "P3 Codex CLI repo and prompt visible creates a medium enriched candidate over stale browser",
+            "codex-cli-repo",
+            Some("codex-cli-repo"),
+            vec![
+                weak_surface_eval_candidate(
+                    "c-p3-codex-cli-repo",
+                    "w-p3-codex-repo",
+                    Some("codex-cli-repo"),
+                    0.66,
+                    "medium",
+                    "continue_current_work",
+                    WeakSurfaceEvalFlags {
+                        attempted: true,
+                        snapshot_quality: Some("medium"),
+                        candidate_expected: true,
+                        stale_url_risk: true,
+                        return_target_openable: true,
+                        ..Default::default()
+                    },
+                ),
+                p0_eval_candidate(
+                    "c-p3-stale-browser",
+                    "w-p3-browser",
+                    Some("old-browser-target"),
+                    0.4,
+                    "strong",
+                    "continue_reply",
+                    P0EvalCandidateFlags {
+                        stale_return_target: true,
+                        stale_target_suppressed: true,
+                        return_target_openable: true,
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                ),
+            ],
+        ),
+        eval_case(
+            "p3_codex_desktop_project_thread_visible",
+            "P3 Codex desktop project/thread visible produces stable medium-or-strong identity",
+            "codex-desktop-thread",
+            Some("codex-desktop-thread"),
+            vec![weak_surface_eval_candidate(
+                "c-p3-codex-desktop-thread",
+                "w-p3-codex-desktop",
+                Some("codex-desktop-thread"),
+                0.78,
+                "strong",
+                "continue_current_work",
+                WeakSurfaceEvalFlags {
+                    attempted: true,
+                    snapshot_quality: Some("strong"),
+                    candidate_expected: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+            )],
+        ),
+        eval_case(
+            "p3_codex_ide_extension_editor",
+            "P3 Codex IDE extension keeps workspace/file plus panel evidence",
+            "codex-ide-panel",
+            Some("codex-ide-panel"),
+            vec![weak_surface_eval_candidate(
+                "c-p3-codex-ide-panel",
+                "w-p3-codex-ide",
+                Some("codex-ide-panel"),
+                0.7,
+                "medium",
+                "continue_edit",
+                WeakSurfaceEvalFlags {
+                    attempted: true,
+                    snapshot_quality: Some("medium"),
+                    candidate_expected: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+            )],
+        ),
+        eval_case(
+            "p3_generic_editor_active_file",
+            "P3 generic editor active file creates continue_edit with document openability",
+            "editor-active-file",
+            Some("editor-active-file"),
+            vec![weak_surface_eval_candidate(
+                "c-p3-editor-active-file",
+                "w-p3-editor",
+                Some("editor-active-file"),
+                0.72,
+                "medium",
+                "continue_edit",
+                WeakSurfaceEvalFlags {
+                    attempted: true,
+                    snapshot_quality: Some("medium"),
+                    candidate_expected: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+            )],
+        ),
+        eval_case(
+            "p3_terminal_command_failure",
+            "P3 terminal command failure creates visible_error_unresolved rerun candidate",
+            "terminal-command-error",
+            Some("terminal-command-error"),
+            vec![weak_surface_eval_candidate(
+                "c-p3-terminal-error",
+                "w-p3-terminal",
+                Some("terminal-command-error"),
+                0.74,
+                "medium",
+                "resolve_error",
+                WeakSurfaceEvalFlags {
+                    attempted: true,
+                    snapshot_quality: Some("medium"),
+                    candidate_expected: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+            )],
+        ),
+        privacy_blocked,
+        p1_suppressed,
+        eval_case(
+            "p3_p2_support_branch_weak_surface",
+            "P3 weak support branch stays support evidence unless locally promoted",
+            "origin-workstream-target",
+            Some("support-terminal-doc"),
+            vec![
+                weak_surface_eval_candidate(
+                    "c-p3-origin-work",
+                    "w-p3-origin",
+                    Some("origin-workstream-target"),
+                    0.63,
+                    "medium",
+                    "continue_edit",
+                    WeakSurfaceEvalFlags {
+                        attempted: true,
+                        snapshot_quality: Some("medium"),
+                        candidate_expected: true,
+                        return_target_openable: true,
+                        ..Default::default()
+                    },
+                ),
+                branch_eval_candidate(
+                    "c-p3-support-branch",
+                    "w-p3-origin",
+                    Some("support-terminal-doc"),
+                    0.24,
+                    "medium",
+                    "terminal_support",
+                    "unpromoted",
+                    false,
+                    Some("origin-workstream-target"),
+                    false,
+                ),
+            ],
+        ),
+    ]
+}
+
+#[derive(Default)]
+struct WeakSurfaceEvalFlags {
+    attempted: bool,
+    snapshot_quality: Option<&'static str>,
+    candidate_expected: bool,
+    stale_url_risk: bool,
+    fake_open_target: bool,
+    privacy_violation: bool,
+    return_target_openable: bool,
+    missing: Vec<&'static str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn weak_surface_eval_candidate(
+    id: &str,
+    workstream_id: &str,
+    target_artifact_id: Option<&str>,
+    score: f64,
+    evidence_quality: &str,
+    candidate_kind: &str,
+    flags: WeakSurfaceEvalFlags,
+) -> ContinueEvalCandidateFixture {
+    let mut candidate = eval_candidate_with_missing(
+        id,
+        workstream_id,
+        target_artifact_id,
+        score,
+        evidence_quality,
+        flags.missing,
+    );
+    candidate.candidate_kind = Some(candidate_kind.to_string());
+    candidate.expected_candidate_kind = Some(candidate_kind.to_string());
+    candidate.expected_output_mode = if evidence_quality == "thin" || evidence_quality == "unknown"
+    {
+        Some("thin_continue".to_string())
+    } else {
+        Some("strong_continue".to_string())
+    };
+    candidate.is_fresh_current_work = Some(true);
+    candidate.is_weak_surface = Some(true);
+    candidate.weak_surface_enrichment_attempted = Some(flags.attempted);
+    candidate.weak_surface_snapshot_quality = flags.snapshot_quality.map(str::to_string);
+    candidate.weak_surface_candidate_expected = Some(flags.candidate_expected);
+    candidate.stale_url_over_weak_surface_risk = Some(flags.stale_url_risk);
+    candidate.fake_open_target_exposed = Some(flags.fake_open_target);
+    candidate.privacy_violation = Some(flags.privacy_violation);
+    candidate.return_target_openable = Some(flags.return_target_openable);
+    candidate
 }
 
 fn p1_feedback_eval_cases() -> Vec<ContinueEvalCaseFixture> {
@@ -21217,6 +22122,7 @@ fn eval_case(
         cached_decision_target_artifact_id: None,
         cache_feedback_newer_than_cached_decision: None,
         model_feedback_validation_failure_expected: None,
+        missing_evidence_render_expected: None,
     }
 }
 
@@ -21245,6 +22151,7 @@ fn eval_case_with_model_output(
         cached_decision_target_artifact_id: None,
         cache_feedback_newer_than_cached_decision: None,
         model_feedback_validation_failure_expected: None,
+        missing_evidence_render_expected: None,
     }
 }
 
@@ -21303,6 +22210,15 @@ fn eval_candidate_with_missing(
         suppressed_target_open_attempted: None,
         feedback_suppression_state: None,
         feedback_score_capped: None,
+        is_weak_surface: None,
+        weak_surface_enrichment_attempted: None,
+        weak_surface_snapshot_quality: None,
+        weak_surface_candidate_expected: None,
+        stale_url_over_weak_surface_risk: None,
+        fake_open_target_exposed: None,
+        privacy_violation: None,
+        p1_feedback_gate_regression: None,
+        p2_support_gate_regression: None,
     }
 }
 
@@ -21355,6 +22271,15 @@ fn p0_eval_candidate(
         suppressed_target_open_attempted: Some(flags.suppressed_target_open_attempted),
         feedback_suppression_state: None,
         feedback_score_capped: None,
+        is_weak_surface: None,
+        weak_surface_enrichment_attempted: None,
+        weak_surface_snapshot_quality: None,
+        weak_surface_candidate_expected: None,
+        stale_url_over_weak_surface_risk: None,
+        fake_open_target_exposed: None,
+        privacy_violation: None,
+        p1_feedback_gate_regression: None,
+        p2_support_gate_regression: None,
     }
 }
 
@@ -21465,6 +22390,25 @@ fn summarize_continue_eval_fixture(
         .iter()
         .filter(|case| case.model_branch_policy_violation)
         .count() as i64;
+    let weak_surface_case_count =
+        reports.iter().filter(|case| case.weak_surface_case).count() as i64;
+    let weak_surface_denom = if weak_surface_case_count == 0 {
+        1.0
+    } else {
+        weak_surface_case_count as f64
+    };
+    let weak_surface_thin_case_count = reports
+        .iter()
+        .filter(|case| case.weak_surface_case && !case.weak_surface_strong_or_medium)
+        .count() as i64;
+    let stale_weak_surface_risk_count = reports
+        .iter()
+        .filter(|case| case.stale_url_over_weak_surface_risk)
+        .count() as i64;
+    let missing_render_expected_count = reports
+        .iter()
+        .filter(|case| case.missing_evidence_render_expected)
+        .count() as i64;
     let denom = if case_count == 0 {
         1.0
     } else {
@@ -21565,6 +22509,85 @@ fn summarize_continue_eval_fixture(
             .iter()
             .filter(|case| case.suppressed_target_open_attempted)
             .count(),
+        weak_surface_case_count,
+        weak_surface_enrichment_attempt_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| case.weak_surface_case && case.weak_surface_enrichment_attempted)
+                .count() as f64
+                / weak_surface_denom,
+        ),
+        weak_surface_enrichment_success_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| case.weak_surface_case && case.weak_surface_enrichment_success)
+                .count() as f64
+                / weak_surface_denom,
+        ),
+        weak_surface_strong_or_medium_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| case.weak_surface_case && case.weak_surface_strong_or_medium)
+                .count() as f64
+                / weak_surface_denom,
+        ),
+        weak_surface_thin_truthfulness_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| {
+                    case.weak_surface_case
+                        && !case.weak_surface_strong_or_medium
+                        && case.weak_surface_thin_truthful
+                })
+                .count() as f64
+                / if weak_surface_thin_case_count == 0 {
+                    1.0
+                } else {
+                    weak_surface_thin_case_count as f64
+                },
+        ),
+        weak_surface_candidate_recall_at_k: round_score(
+            reports
+                .iter()
+                .filter(|case| case.weak_surface_case && case.weak_surface_candidate_recalled_at_k)
+                .count() as f64
+                / weak_surface_denom,
+        ),
+        stale_url_over_weak_surface_false_positive_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| case.stale_url_over_weak_surface_false_positive)
+                .count() as f64
+                / if stale_weak_surface_risk_count == 0 {
+                    1.0
+                } else {
+                    stale_weak_surface_risk_count as f64
+                },
+        ),
+        fake_open_target_count: reports.iter().filter(|case| case.fake_open_target).count() as i64,
+        missing_evidence_render_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| {
+                    case.missing_evidence_render_expected && case.missing_evidence_rendered
+                })
+                .count() as f64
+                / if missing_render_expected_count == 0 {
+                    1.0
+                } else {
+                    missing_render_expected_count as f64
+                },
+        ),
+        privacy_violation_count: reports.iter().filter(|case| case.privacy_violation).count()
+            as i64,
+        p1_feedback_gate_regression_count: reports
+            .iter()
+            .filter(|case| case.p1_feedback_gate_regression)
+            .count() as i64,
+        p2_support_gate_regression_count: reports
+            .iter()
+            .filter(|case| case.p2_support_gate_regression)
+            .count() as i64,
         cases: reports,
     })
 }
@@ -22034,7 +23057,8 @@ fn evaluate_continue_fixture_case(
             .iter()
             .any(|failure| failure.contains("feedback"));
     let selected_branch_kind = selected.and_then(|candidate| candidate.branch_kind.as_deref());
-    let selected_branch_state = selected.and_then(|candidate| candidate.branch_promotion_state.as_deref());
+    let selected_branch_state =
+        selected.and_then(|candidate| candidate.branch_promotion_state.as_deref());
     let selected_public_branch_eligible =
         selected.and_then(|candidate| candidate.branch_public_return_eligible);
     let selected_is_unpromoted_branch = selected
@@ -22062,10 +23086,11 @@ fn evaluate_continue_fixture_case(
                 .is_some_and(|origin| origin == &expected)
                 || candidate.target_artifact_id.as_ref() == Some(&expected)
         });
-    let branch_selected = selected
-        .is_some_and(|candidate| candidate.is_support_branch.unwrap_or(false));
-    let selected_branch_expected_promoted =
-        selected.and_then(|candidate| candidate.expected_branch_promoted).unwrap_or(false);
+    let branch_selected =
+        selected.is_some_and(|candidate| candidate.is_support_branch.unwrap_or(false));
+    let selected_branch_expected_promoted = selected
+        .and_then(|candidate| candidate.expected_branch_promoted)
+        .unwrap_or(false);
     let promoted_branch_selection_correct = !branch_selected
         || selected_public_branch_eligible != Some(true)
         || selected_branch_expected_promoted;
@@ -22081,7 +23106,11 @@ fn evaluate_continue_fixture_case(
             .model_output
             .as_ref()
             .and_then(|output| output.selected_candidate_id.as_deref())
-            .and_then(|selected_id| case.candidates.iter().find(|candidate| candidate.id == selected_id))
+            .and_then(|selected_id| {
+                case.candidates
+                    .iter()
+                    .find(|candidate| candidate.id == selected_id)
+            })
             .is_some_and(|candidate| {
                 candidate.is_support_branch.unwrap_or(false)
                     && candidate.branch_public_return_eligible == Some(false)
@@ -22090,6 +23119,63 @@ fn evaluate_continue_fixture_case(
         case.expected_feedback_obedience_placeholder.unwrap_or(true);
     let selected_return_target_openable =
         selected.is_some_and(|candidate| candidate.return_target_openable.unwrap_or(false));
+    let weak_surface_case = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.is_weak_surface.unwrap_or(false));
+    let weak_surface_enrichment_attempted = case.candidates.iter().any(|candidate| {
+        candidate.is_weak_surface.unwrap_or(false)
+            && candidate.weak_surface_enrichment_attempted.unwrap_or(false)
+    });
+    let weak_surface_strong_or_medium = case.candidates.iter().any(|candidate| {
+        candidate.is_weak_surface.unwrap_or(false)
+            && candidate
+                .weak_surface_snapshot_quality
+                .as_deref()
+                .is_some_and(|quality| matches!(quality, "strong" | "medium"))
+    });
+    let weak_surface_enrichment_success = weak_surface_strong_or_medium;
+    let weak_surface_candidate_expected = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.weak_surface_candidate_expected.unwrap_or(false));
+    let weak_surface_candidate_recalled_at_k = !weak_surface_candidate_expected
+        || case
+            .candidates
+            .iter()
+            .enumerate()
+            .any(|(index, candidate)| {
+                index < k && candidate.weak_surface_candidate_expected.unwrap_or(false)
+            });
+    let stale_url_over_weak_surface_risk = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.stale_url_over_weak_surface_risk.unwrap_or(false));
+    let stale_url_over_weak_surface_false_positive =
+        stale_url_over_weak_surface_risk && selected_is_stale_target;
+    let fake_open_target = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.fake_open_target_exposed.unwrap_or(false));
+    let missing_evidence_render_expected = case
+        .missing_evidence_render_expected
+        .unwrap_or_else(|| weak_surface_case && !selected_missing.is_empty());
+    let missing_evidence_rendered =
+        !missing_evidence_render_expected || !selected_missing.is_empty();
+    let privacy_violation = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.privacy_violation.unwrap_or(false));
+    let p1_feedback_gate_regression = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.p1_feedback_gate_regression.unwrap_or(false))
+        || feedback_suppressed_target_exposed;
+    let p2_support_gate_regression = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.p2_support_gate_regression.unwrap_or(false))
+        || support_branch_false_positive;
     let truthful_thin_mode = if selected_return_target_openable && target_correct {
         true
     } else if stale_target_required || fresh_surface_required {
@@ -22100,6 +23186,8 @@ fn evaluate_continue_fixture_case(
             || selected_missing.iter().any(|item| {
                 item.contains("missing_current_work")
                     || item.contains("stale_return_target_suppressed")
+                    || item.contains("missing_repo")
+                    || item.contains("privacy_blocked")
                     || item.contains("no_clear")
                     || item.contains("thin")
             })
@@ -22181,6 +23269,23 @@ fn evaluate_continue_fixture_case(
         model_feedback_validation_failure,
         feedback_obedience_placeholder,
         suppressed_target_open_attempted,
+        weak_surface_case,
+        weak_surface_enrichment_attempted,
+        weak_surface_enrichment_success,
+        weak_surface_strong_or_medium,
+        weak_surface_thin_truthful: !weak_surface_case
+            || weak_surface_strong_or_medium
+            || truthful_thin_mode
+            || !selected_missing.is_empty(),
+        weak_surface_candidate_recalled_at_k,
+        stale_url_over_weak_surface_risk,
+        stale_url_over_weak_surface_false_positive,
+        fake_open_target,
+        missing_evidence_render_expected,
+        missing_evidence_rendered,
+        privacy_violation,
+        p1_feedback_gate_regression,
+        p2_support_gate_regression,
     })
 }
 
@@ -24270,9 +25375,9 @@ fn load_continue_action_records(
             LEFT JOIN continue_artifacts a ON a.id = ta.artifact_id
             LEFT JOIN continue_artifacts sa ON sa.id = ta.secondary_artifact_id
             LEFT JOIN frames f ON CAST(ta.frame_id AS INTEGER) = f.id
-            WHERE (?1 IS NULL OR f.session_id = ?1)
-              AND (?2 IS NULL OR CAST(ta.frame_id AS INTEGER) >= ?2)
-              AND (?3 IS NULL OR CAST(ta.frame_id AS INTEGER) <= ?3)
+            WHERE (?1 IS NULL OR f.session_id = ?1 OR ta.frame_id LIKE 'event-surface-%')
+              AND (?2 IS NULL OR ta.frame_id LIKE 'event-surface-%' OR CAST(ta.frame_id AS INTEGER) >= ?2)
+              AND (?3 IS NULL OR ta.frame_id LIKE 'event-surface-%' OR CAST(ta.frame_id AS INTEGER) <= ?3)
               AND (?4 IS NULL OR ta.created_at_ms >= ?4)
             ORDER BY ta.created_at_ms DESC, CAST(ta.frame_id AS INTEGER) DESC, ta.id DESC
             LIMIT ?5
@@ -24347,7 +25452,11 @@ fn artifact_record_from_row(
     }))
 }
 
-fn resolve_artifact(frame: &EvidenceFrame) -> ResolvedArtifact {
+fn resolve_artifact(conn: &Connection, frame: &EvidenceFrame) -> ResolvedArtifact {
+    if let Some(artifact) = resolve_weak_surface_snapshot_artifact(conn, frame) {
+        return artifact;
+    }
+
     let context = frame.app_contexts.first();
     let privacy_blocked = frame
         .privacy_status
@@ -24555,6 +25664,73 @@ fn artifact_with_key(
         evidence_quality: evidence_quality.to_string(),
         openability: openability.to_string(),
         reason: reason.to_string(),
+        identity_missing_fields: Vec::new(),
+        identity_merge_keys: Vec::new(),
+        surface_snapshot_id: None,
+    }
+}
+
+fn resolve_weak_surface_snapshot_artifact(
+    conn: &Connection,
+    frame: &EvidenceFrame,
+) -> Option<ResolvedArtifact> {
+    let snapshot = load_latest_surface_snapshot_for_frame(conn, &frame.id)
+        .ok()
+        .flatten()?;
+    let quality = evaluate_surface_snapshot_quality(&snapshot);
+    if !quality.candidate_eligible {
+        return None;
+    }
+    let identity = weak_surface_identity_from_snapshot(&snapshot)?;
+    if matches!(
+        quality.evidence_quality,
+        EvidenceQuality::Thin | EvidenceQuality::Unknown
+    ) || identity.identity_confidence == "thin"
+    {
+        return None;
+    }
+    let confidence = identity_confidence_score(quality.identity_confidence.as_str());
+    Some(resolved_artifact_from_weak_identity(
+        frame,
+        identity,
+        snapshot.id,
+        confidence,
+        quality.evidence_quality.as_str(),
+        quality.openability.as_str(),
+    ))
+}
+
+fn resolved_artifact_from_weak_identity(
+    frame: &EvidenceFrame,
+    identity: WeakSurfaceIdentity,
+    snapshot_id: String,
+    confidence: f64,
+    evidence_quality: &str,
+    openability: &str,
+) -> ResolvedArtifact {
+    ResolvedArtifact {
+        id: format!("artifact-{}", stable_hash(identity.stable_key.as_bytes())),
+        kind: identity.artifact_kind,
+        stable_key: identity.stable_key,
+        display_title: Some(identity.display_title).or_else(|| frame.window_name.clone()),
+        browser_url: frame.browser_url.clone(),
+        document_path: frame.document_path.clone(),
+        identity_confidence: confidence,
+        evidence_quality: evidence_quality.to_string(),
+        openability: openability.to_string(),
+        reason: "weak_surface_identity_snapshot".to_string(),
+        identity_missing_fields: identity.missing_fields,
+        identity_merge_keys: identity.merge_keys,
+        surface_snapshot_id: Some(snapshot_id),
+    }
+}
+
+fn identity_confidence_score(confidence: &str) -> f64 {
+    match confidence {
+        "strong" => 0.92,
+        "medium" => 0.72,
+        "thin" => 0.45,
+        _ => 0.35,
     }
 }
 
@@ -24563,15 +25739,20 @@ fn upsert_continue_artifact(
     frame: &EvidenceFrame,
     artifact: &ResolvedArtifact,
 ) -> Result<(), String> {
+    let missing_fields_json =
+        serde_json::to_string(&artifact.identity_missing_fields).map_err(to_string)?;
+    let merge_keys_json =
+        serde_json::to_string(&artifact.identity_merge_keys).map_err(to_string)?;
     conn.execute(
         "INSERT OR IGNORE INTO continue_artifacts (
             id, artifact_kind, stable_key, app_name, bundle_id, window_title,
             browser_url, document_path, display_title, first_seen_frame_id,
             last_seen_frame_id, first_seen_timestamp, last_seen_timestamp,
             identity_confidence, evidence_quality, privacy_status, openability,
+            identity_missing_fields_json, identity_merge_keys_json,
             created_at_ms, updated_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?11,
-                   ?12, ?13, ?14, ?15, ?11, ?11)",
+                   ?12, ?13, ?14, ?15, ?16, ?17, ?11, ?11)",
         params![
             artifact.id,
             artifact.kind,
@@ -24588,6 +25769,8 @@ fn upsert_continue_artifact(
             artifact.evidence_quality,
             frame.privacy_status,
             artifact.openability,
+            missing_fields_json,
+            merge_keys_json,
         ],
     )
     .map_err(to_string)?;
@@ -24611,6 +25794,8 @@ fn upsert_continue_artifact(
                ELSE evidence_quality END,
              privacy_status = COALESCE(?13, privacy_status),
              openability = CASE WHEN openability = 'openable' THEN openability ELSE ?14 END,
+             identity_missing_fields_json = ?15,
+             identity_merge_keys_json = ?16,
              updated_at_ms = MAX(updated_at_ms, ?9)
          WHERE stable_key = ?1",
         params![
@@ -24628,6 +25813,8 @@ fn upsert_continue_artifact(
             artifact.evidence_quality,
             frame.privacy_status,
             artifact.openability,
+            missing_fields_json,
+            merge_keys_json,
         ],
     )
     .map_err(to_string)?;
@@ -24698,6 +25885,12 @@ struct EventBackedSurfaceGroup {
     app_name: Option<String>,
     bundle_id: Option<String>,
     window_title: Option<String>,
+    domain: Option<String>,
+    activity_state: Option<String>,
+    task_state: Option<String>,
+    command_state: Option<String>,
+    snapshot_ids: Vec<String>,
+    missing_fields: Vec<String>,
     first_ts_ms: i64,
     last_ts_ms: i64,
     event_ids: Vec<String>,
@@ -24787,6 +25980,12 @@ fn promote_event_backed_weak_surfaces(
             evidence_quality,
             openability: "unknown".to_string(),
             reason: "event_backed_weak_surface_identity".to_string(),
+            identity_missing_fields: vec![
+                "repo_root_missing".to_string(),
+                "thread_identity_missing".to_string(),
+            ],
+            identity_merge_keys: Vec::new(),
+            surface_snapshot_id: None,
         };
         let entry = groups
             .entry(stable_key.clone())
@@ -24796,6 +25995,12 @@ fn promote_event_backed_weak_surfaces(
                 app_name,
                 bundle_id,
                 window_title,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                command_state: None,
+                snapshot_ids: Vec::new(),
+                missing_fields: Vec::new(),
                 first_ts_ms: row.ts_ms,
                 last_ts_ms: row.ts_ms,
                 event_ids: Vec::new(),
@@ -24846,6 +26051,149 @@ fn promote_event_backed_weak_surfaces(
         });
     }
     Ok(summaries)
+}
+
+fn promote_snapshot_backed_weak_surfaces(
+    conn: &Connection,
+    request: &ContinueSecondLayerRebuildRequest,
+) -> Result<Vec<EventBackedPromotionSummary>, String> {
+    if !table_exists(conn, "continue_surface_snapshots")? {
+        return Ok(Vec::new());
+    }
+    let since_ms = surface_snapshot_rebuild_cutoff(conn, request)?;
+    let limit = request.limit.unwrap_or(300).clamp(1, 2_000) as usize;
+    let snapshots = load_recent_surface_snapshots(conn, since_ms, limit)?;
+    let mut groups = Vec::new();
+    for snapshot in snapshots {
+        if snapshot.frame_id.is_some() || snapshot.artifact_id.is_some() {
+            continue;
+        }
+        if request
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| snapshot.session_id.as_deref() != Some(session_id))
+        {
+            continue;
+        }
+        let quality = evaluate_surface_snapshot_quality(&snapshot);
+        if !quality.candidate_eligible {
+            continue;
+        }
+        let Some(identity) = weak_surface_identity_from_snapshot(&snapshot) else {
+            continue;
+        };
+        let confidence = identity_confidence_score(quality.identity_confidence.as_str());
+        let document_path = if quality.openability.as_str() == "openable" {
+            snapshot
+                .active_file_path
+                .clone()
+                .or(snapshot.git_worktree_path.clone())
+                .or(snapshot.workspace_path.clone())
+        } else {
+            None
+        };
+        let mut missing_fields = identity.missing_fields.clone();
+        for missing in &quality.missing_evidence {
+            push_string_once(&mut missing_fields, missing);
+        }
+        let artifact = ResolvedArtifact {
+            id: format!("artifact-{}", stable_hash(identity.stable_key.as_bytes())),
+            kind: identity.artifact_kind,
+            stable_key: identity.stable_key.clone(),
+            display_title: Some(identity.display_title),
+            browser_url: None,
+            document_path,
+            identity_confidence: confidence,
+            evidence_quality: quality.evidence_quality.as_str().to_string(),
+            openability: quality.openability.as_str().to_string(),
+            reason: "surface_snapshot_identity".to_string(),
+            identity_missing_fields: missing_fields.clone(),
+            identity_merge_keys: identity.merge_keys.clone(),
+            surface_snapshot_id: Some(snapshot.id.clone()),
+        };
+        let mut event_ids = snapshot
+            .event_ids_json
+            .as_deref()
+            .map(parse_string_array)
+            .unwrap_or_default();
+        if event_ids.is_empty() {
+            event_ids.push(format!("surface-snapshot:{}", snapshot.id));
+        }
+        let group = EventBackedSurfaceGroup {
+            stable_key: identity.stable_key,
+            artifact,
+            app_name: snapshot.app_name.clone(),
+            bundle_id: snapshot.bundle_id.clone(),
+            window_title: snapshot
+                .thread_title
+                .clone()
+                .or(snapshot.active_relative_file.clone())
+                .or(snapshot.window_title.clone()),
+            domain: Some(snapshot.domain.clone()),
+            activity_state: snapshot.activity_state.clone(),
+            task_state: snapshot.task_state.clone(),
+            command_state: snapshot.command_state.clone(),
+            snapshot_ids: vec![snapshot.id.clone()],
+            missing_fields,
+            first_ts_ms: snapshot.observed_at_ms,
+            last_ts_ms: snapshot.observed_at_ms,
+            event_ids,
+            event_kinds: Vec::new(),
+            key_categories: Vec::new(),
+        };
+        groups.push(group);
+    }
+
+    groups.sort_by_key(|group| (group.first_ts_ms, group.stable_key.clone()));
+    let synthetic_frame_ids = groups
+        .iter()
+        .map(event_backed_surface_frame_id)
+        .collect::<Vec<_>>();
+    clear_second_layer_rows_for_frames(conn, &synthetic_frame_ids)?;
+
+    let mut summaries = Vec::new();
+    for group in groups {
+        upsert_event_backed_continue_artifact(conn, &group)?;
+        for snapshot_id in &group.snapshot_ids {
+            link_surface_snapshot_to_artifact(conn, snapshot_id, &group.artifact.id)?;
+        }
+        let observation_id = upsert_event_backed_artifact_observation(conn, &group)?;
+        let action = event_backed_task_action_for_group(&group, &observation_id);
+        if let Some(action) = &action {
+            insert_continue_task_action(conn, action)?;
+        }
+        summaries.push(EventBackedPromotionSummary {
+            artifact_id: group.artifact.id.clone(),
+            artifact_kind: group.artifact.kind.clone(),
+            app_name: group.app_name.clone(),
+            event_count: group.event_ids.len().max(1) as i64,
+            action_kind: action.map(|action| action.action_kind),
+            evidence_quality: group.artifact.evidence_quality.clone(),
+            openability: group.artifact.openability.clone(),
+            identity_confidence: group.artifact.identity_confidence,
+        });
+    }
+    Ok(summaries)
+}
+
+fn surface_snapshot_rebuild_cutoff(
+    conn: &Connection,
+    request: &ContinueSecondLayerRebuildRequest,
+) -> Result<i64, String> {
+    let Some(lookback_ms) = request.lookback_ms.filter(|value| *value > 0) else {
+        return Ok(0);
+    };
+    let latest = conn
+        .query_row(
+            "SELECT MAX(observed_at_ms) FROM continue_surface_snapshots",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .flatten()
+        .unwrap_or_default();
+    Ok(latest.saturating_sub(lookback_ms))
 }
 
 fn load_event_backed_surface_rows(
@@ -24922,15 +26270,20 @@ fn upsert_event_backed_continue_artifact(
     group: &EventBackedSurfaceGroup,
 ) -> Result<(), String> {
     let frame_id = event_backed_surface_frame_id(group);
+    let missing_fields_json =
+        serde_json::to_string(&group.artifact.identity_missing_fields).map_err(to_string)?;
+    let merge_keys_json =
+        serde_json::to_string(&group.artifact.identity_merge_keys).map_err(to_string)?;
     conn.execute(
         "INSERT OR IGNORE INTO continue_artifacts (
             id, artifact_kind, stable_key, app_name, bundle_id, window_title,
             browser_url, document_path, display_title, first_seen_frame_id,
             last_seen_frame_id, first_seen_timestamp, last_seen_timestamp,
             identity_confidence, evidence_quality, privacy_status, openability,
+            identity_missing_fields_json, identity_merge_keys_json,
             created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?8, ?9, ?10,
-                   ?11, ?12, NULL, 'unknown', ?9, ?10)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12,
+                   ?13, ?14, NULL, ?15, ?16, ?17, ?11, ?12)",
         params![
             group.artifact.id,
             group.artifact.kind,
@@ -24938,12 +26291,17 @@ fn upsert_event_backed_continue_artifact(
             group.app_name,
             group.bundle_id,
             group.window_title,
+            group.artifact.browser_url,
+            group.artifact.document_path,
             group.artifact.display_title,
             frame_id,
             group.first_ts_ms,
             group.last_ts_ms,
             group.artifact.identity_confidence,
             group.artifact.evidence_quality,
+            group.artifact.openability,
+            missing_fields_json,
+            merge_keys_json,
         ],
     )
     .map_err(to_string)?;
@@ -24954,16 +26312,20 @@ fn upsert_event_backed_continue_artifact(
              bundle_id = COALESCE(?4, bundle_id),
              window_title = COALESCE(?5, window_title),
              display_title = COALESCE(?6, display_title),
+             browser_url = COALESCE(?7, browser_url),
+             document_path = COALESCE(?8, document_path),
              last_seen_frame_id = CASE
-               WHEN ?7 >= last_seen_timestamp THEN ?8 ELSE last_seen_frame_id END,
-             last_seen_timestamp = MAX(last_seen_timestamp, ?7),
-             identity_confidence = MAX(identity_confidence, ?9),
+               WHEN ?9 >= last_seen_timestamp THEN ?10 ELSE last_seen_frame_id END,
+             last_seen_timestamp = MAX(last_seen_timestamp, ?9),
+             identity_confidence = MAX(identity_confidence, ?11),
              evidence_quality = CASE
                WHEN evidence_quality = 'strong' THEN evidence_quality
-               WHEN ?10 = 'medium' AND evidence_quality = 'thin' THEN ?10
+               WHEN ?12 = 'medium' AND evidence_quality = 'thin' THEN ?12
                ELSE evidence_quality END,
-             openability = CASE WHEN openability = 'openable' THEN openability ELSE 'unknown' END,
-             updated_at_ms = MAX(updated_at_ms, ?7)
+             openability = CASE WHEN openability = 'openable' THEN openability ELSE ?13 END,
+             identity_missing_fields_json = ?14,
+             identity_merge_keys_json = ?15,
+             updated_at_ms = MAX(updated_at_ms, ?9)
          WHERE stable_key = ?1",
         params![
             group.artifact.stable_key,
@@ -24972,10 +26334,15 @@ fn upsert_event_backed_continue_artifact(
             group.bundle_id,
             group.window_title,
             group.artifact.display_title,
+            group.artifact.browser_url,
+            group.artifact.document_path,
             group.last_ts_ms,
             frame_id,
             group.artifact.identity_confidence,
             group.artifact.evidence_quality,
+            group.artifact.openability,
+            missing_fields_json,
+            merge_keys_json,
         ],
     )
     .map_err(to_string)?;
@@ -25067,6 +26434,11 @@ fn event_backed_task_action_for_group(
                 "source": "event_backed_weak_surface",
                 "observation_id": observation_id,
                 "event_count": group.event_ids.len(),
+                "snapshot_ids": group.snapshot_ids.clone(),
+                "domain": group.domain.clone(),
+                "activity_state": group.activity_state.clone(),
+                "task_state": group.task_state.clone(),
+                "missing_evidence": group.missing_fields.clone(),
                 "app_name": group.app_name.clone(),
                 "window_title_present": group.window_title.is_some(),
                 "openability": group.artifact.openability.clone(),
@@ -25089,6 +26461,9 @@ fn event_backed_task_action_for_group(
 fn event_backed_action_classification(
     group: &EventBackedSurfaceGroup,
 ) -> Option<(String, String, f64, String)> {
+    if let Some(classification) = snapshot_state_action_classification(group) {
+        return Some(classification);
+    }
     let artifact_kind = group.artifact.kind.as_str();
     let has_typing = group
         .event_kinds
@@ -25176,6 +26551,58 @@ fn event_backed_action_classification(
     None
 }
 
+fn snapshot_state_action_classification(
+    group: &EventBackedSurfaceGroup,
+) -> Option<(String, String, f64, String)> {
+    let state = group
+        .task_state
+        .as_deref()
+        .filter(|state| *state != "unknown")
+        .or_else(|| group.activity_state.as_deref())
+        .or_else(|| group.command_state.as_deref())?;
+    let domain = group.domain.as_deref().unwrap_or("unknown_weak_surface");
+    let role = snapshot_state_action_role(state, domain);
+    let app = group.app_name.as_deref().unwrap_or("this surface");
+    let (kind, confidence) = match state {
+        "actively_editing" => ("editing", 0.70),
+        "composing_prompt" => ("composing", 0.68),
+        "running_command" | "command_running" => ("running_command", 0.70),
+        "observing_output" | "command_completed" => ("observing_command_output", 0.62),
+        "reviewing_diff" => ("reviewing_output", 0.68),
+        "visible_error_unresolved" | "encountering_error" | "command_failed" => {
+            ("encountering_error", 0.78)
+        }
+        "idle_after_progress" => ("idle_after_progress", 0.60),
+        "reading" => ("reading", 0.54),
+        _ => return None,
+    };
+    Some((
+        kind.to_string(),
+        role.to_string(),
+        confidence,
+        format!(
+            "surface snapshot state {} in {} mapped to {} action",
+            state, app, kind
+        ),
+    ))
+}
+
+fn snapshot_state_action_role(state: &str, domain: &str) -> &'static str {
+    if matches!(state, "observing_output" | "command_completed" | "reading")
+        && matches!(
+            domain,
+            "unknown_weak_surface" | "native_agent_window" | "codex_desktop_app"
+        )
+    {
+        return "support";
+    }
+    match state {
+        "unknown" => "unknown",
+        "observing_output" | "command_completed" | "reading" => "support",
+        _ => "primary",
+    }
+}
+
 fn event_backed_current_work_links(
     conn: &Connection,
     surface: &ResolvedCurrentSurface,
@@ -25251,12 +26678,22 @@ fn event_backed_surface_frame_id(group: &EventBackedSurfaceGroup) -> String {
         .last()
         .map(String::as_str)
         .unwrap_or(first_event);
+    let snapshot_key = group
+        .snapshot_ids
+        .first()
+        .map(String::as_str)
+        .unwrap_or("no-snapshot");
     format!(
         "event-surface-{}",
         stable_hash(
             format!(
-                "{}:{}:{}:{}:{}",
-                group.stable_key, group.first_ts_ms, group.last_ts_ms, first_event, last_event
+                "{}:{}:{}:{}:{}:{}",
+                group.stable_key,
+                group.first_ts_ms,
+                group.last_ts_ms,
+                first_event,
+                last_event,
+                snapshot_key
             )
             .as_bytes()
         )
@@ -25264,8 +26701,14 @@ fn event_backed_surface_frame_id(group: &EventBackedSurfaceGroup) -> String {
 }
 
 fn event_backed_observation_reason(group: &EventBackedSurfaceGroup) -> String {
+    let source = if group.snapshot_ids.is_empty() {
+        "event_only_weak_surface"
+    } else {
+        "surface_snapshot_weak_surface"
+    };
     format!(
-        "event_only_weak_surface:{}:{}",
+        "{}:{}:{}",
+        source,
         group.artifact.kind,
         group.event_ids.len().max(1)
     )
@@ -25310,7 +26753,8 @@ fn event_surface_is_promotable(
     bundle_id: Option<&str>,
     window_title: Option<&str>,
 ) -> bool {
-    is_known_weak_current_work_domain(app_name, bundle_id, window_title)
+    let classification = classify_event_surface(app_name, bundle_id, window_title);
+    classification.domain != WeakSurfaceDomain::NotWeakSurface
         || artifact_kind_for_event_surface(app_name.unwrap_or(""), bundle_id, window_title)
             != "unknown"
 }
@@ -25379,6 +26823,11 @@ fn artifact_kind_for_event_surface(
     bundle_id: Option<&str>,
     window_title: Option<&str>,
 ) -> String {
+    let classification = classify_event_surface(Some(app_name), bundle_id, window_title);
+    let artifact_kind = domain_artifact_kind(&classification.domain);
+    if artifact_kind != "unknown" {
+        return artifact_kind.to_string();
+    }
     let haystack = [Some(app_name), bundle_id, window_title]
         .into_iter()
         .flatten()
@@ -25414,6 +26863,20 @@ fn artifact_kind_for_event_surface(
     } else {
         "unknown".to_string()
     }
+}
+
+fn classify_event_surface(
+    app_name: Option<&str>,
+    bundle_id: Option<&str>,
+    window_title: Option<&str>,
+) -> WeakSurfaceClassification {
+    classify_weak_surface(&WeakSurfaceClassificationInput {
+        app_name: app_name.map(str::to_string),
+        bundle_id: bundle_id.map(str::to_string),
+        window_title: window_title.map(str::to_string),
+        event_types: vec!["ui_event".to_string()],
+        ..Default::default()
+    })
 }
 
 fn weak_surface_identity_confidence(
@@ -33214,6 +34677,7 @@ fn current_time_millis() -> i64 {
 }
 
 pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
+    ensure_weak_surface_enrichment_schema(conn)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS continue_schema_migrations (
@@ -33234,6 +34698,9 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
         VALUES (4, 'continue_app_activity_work_value_router', CAST(strftime('%s','now') AS INTEGER) * 1000);
 
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (5, 'continue_surface_snapshot_schema_store', CAST(strftime('%s','now') AS INTEGER) * 1000);
+
         CREATE TABLE IF NOT EXISTS continue_artifacts (
           id TEXT PRIMARY KEY,
           artifact_kind TEXT NOT NULL,
@@ -33252,6 +34719,8 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           evidence_quality TEXT NOT NULL DEFAULT 'thin',
           privacy_status TEXT,
           openability TEXT NOT NULL DEFAULT 'unknown',
+          identity_missing_fields_json TEXT NOT NULL DEFAULT '[]',
+          identity_merge_keys_json TEXT NOT NULL DEFAULT '[]',
           created_at_ms INTEGER NOT NULL,
           updated_at_ms INTEGER NOT NULL
         );
@@ -33957,6 +35426,18 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(to_string)?;
+    ensure_column_exists(
+        conn,
+        "continue_artifacts",
+        "identity_missing_fields_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_artifacts",
+        "identity_merge_keys_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     ensure_column_exists(conn, "continue_candidates", "supporting_episode_id", "TEXT")?;
     ensure_column_exists(
         conn,
@@ -34405,6 +35886,11 @@ pub fn continue_memory_status(conn: &Connection) -> Result<ContinueMemoryStatus,
             ranking_priors: count_if_present(conn, "continue_ranking_priors")?,
             pairwise_preferences: count_if_present(conn, "continue_pairwise_preferences")?,
             eval_fixtures: count_if_present(conn, "continue_eval_fixtures")?,
+            surface_enrichment_attempts: count_if_present(
+                conn,
+                "continue_surface_enrichment_attempts",
+            )?,
+            surface_snapshots: count_if_present(conn, "continue_surface_snapshots")?,
             app_activity_segments: count_if_present(conn, "continue_app_activity_segments")?,
             activity_classifications: count_if_present(conn, "continue_activity_classifications")?,
             candidates: count_if_present(conn, "continue_candidates")?,
@@ -34537,9 +36023,38 @@ mod tests {
         assert_eq!(status.counts.artifacts, 0);
         assert_eq!(status.counts.memory_cells, 0);
         assert_eq!(status.counts.memory_edges, 0);
+        assert_eq!(status.counts.surface_enrichment_attempts, 0);
+        assert_eq!(status.counts.surface_snapshots, 0);
         assert_eq!(status.counts.decisions, 0);
         assert_eq!(status.latest_artifact_timestamp, None);
         assert_eq!(status.latest_workstream_timestamp, None);
+    }
+
+    #[test]
+    fn empty_surface_snapshot_tables_do_not_break_get_continue_decision() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        ensure_continue_schema(&conn).unwrap();
+
+        let result = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.validation_status == "no_candidates" || result.confidence <= 0.45);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM continue_surface_snapshots",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -36412,6 +37927,9 @@ mod tests {
             evidence_quality: "strong".to_string(),
             openability: "openable".to_string(),
             reason: "test".to_string(),
+            identity_missing_fields: Vec::new(),
+            identity_merge_keys: Vec::new(),
+            surface_snapshot_id: None,
         }
     }
 
@@ -36714,11 +38232,13 @@ mod tests {
             display_title: Some("Unknown".to_string()),
             browser_url: None,
             document_path: None,
+            identity_confidence: 0.45,
             evidence_quality: "thin".to_string(),
             privacy_status: None,
             openability: "frame_fallback".to_string(),
             last_seen_frame_id: Some("1".to_string()),
             last_seen_timestamp: 1_000,
+            identity_missing_fields: Vec::new(),
             branch_promotion_state: None,
             branch_public_return_eligible: None,
             branch_promotion_reason: None,
@@ -36809,11 +38329,13 @@ mod tests {
             display_title: Some("Smalltalk Continue".to_string()),
             browser_url: None,
             document_path: None,
+            identity_confidence: 0.72,
             evidence_quality: "medium".to_string(),
             privacy_status: None,
             openability: "openable".to_string(),
             last_seen_frame_id: Some("2".to_string()),
             last_seen_timestamp: 2_000,
+            identity_missing_fields: Vec::new(),
             branch_promotion_state: None,
             branch_public_return_eligible: None,
             branch_promotion_reason: None,
@@ -36852,11 +38374,13 @@ mod tests {
             display_title: Some(title.to_string()),
             browser_url: None,
             document_path: Some(format!("/Users/me/project/{}", title)),
+            identity_confidence: 0.92,
             evidence_quality: "strong".to_string(),
             privacy_status: None,
             openability: "openable".to_string(),
             last_seen_frame_id: Some("1".to_string()),
             last_seen_timestamp: 1_000,
+            identity_missing_fields: Vec::new(),
             branch_promotion_state: None,
             branch_public_return_eligible: None,
             branch_promotion_reason: None,
@@ -37096,6 +38620,18 @@ mod tests {
             focus_confidence: 0.48,
             evidence_quality: "thin".to_string(),
             openability: "unknown".to_string(),
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            weak_surface_classification: classify_weak_surface(&WeakSurfaceClassificationInput {
+                app_name: Some(app_name.to_string()),
+                window_title: Some(title.to_string()),
+                event_types: vec!["ui_event".to_string()],
+                ..Default::default()
+            }),
             reason: "test_current_surface".to_string(),
             warnings: vec![
                 "current_surface:event_backed_no_screenshot".to_string(),
@@ -37403,6 +38939,15 @@ mod tests {
             title: Some("Downloads".to_string()),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 120_000,
         };
         let surface = test_current_surface(None, "Finder", "Downloads", 120_000, false);
@@ -37717,6 +39262,15 @@ mod tests {
             title: Some("Codex".to_string()),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 120_000,
         };
         let surface = test_current_surface(None, "Codex", "Codex", 120_000, false);
@@ -37763,6 +39317,15 @@ mod tests {
             title: Some("ChatGPT - Helium".to_string()),
             browser_url: target.browser_url.clone(),
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 120_000,
         };
         let surface = test_current_surface(
@@ -37808,6 +39371,15 @@ mod tests {
             title: Some("Codex".to_string()),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 120_000,
         };
         let surface = test_current_surface(None, "Codex", "Codex", 120_000, false);
@@ -37845,6 +39417,15 @@ mod tests {
             title: Some("Smalltalk Continue".to_string()),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 120_000,
         };
         let surface = test_current_surface(None, "Smalltalk", "Smalltalk Continue", 120_000, true);
@@ -37999,6 +39580,15 @@ mod tests {
                 title: Some("Smalltalk planning".to_string()),
                 browser_url: None,
                 document_path: None,
+                display_title: None,
+                domain: None,
+                activity_state: None,
+                task_state: None,
+                evidence_quality: None,
+                identity_confidence: None,
+                snapshot_id: None,
+                missing_fields: Vec::new(),
+                openability: None,
                 captured_at_ms: current_time_millis(),
             }),
             active_current_work_unresolved: None,
@@ -38097,6 +39687,7 @@ mod tests {
             continue_dossier: None,
             memory_retrieval: None,
             observe_before_decide: None,
+            weak_surface_enrichment: WeakSurfaceEnrichmentDiagnostics::default(),
             app_activity: None,
             activity_summary: None,
             quality_gate: None,
@@ -38397,11 +39988,13 @@ mod tests {
             ),
             browser_url: Some("https://www.youtube.com/shorts/0SMgxlv0Mfc".to_string()),
             document_path: None,
+            identity_confidence: 0.92,
             evidence_quality: "strong".to_string(),
             privacy_status: None,
             openability: "openable".to_string(),
             last_seen_frame_id: Some("1664".to_string()),
             last_seen_timestamp: 1_000,
+            identity_missing_fields: Vec::new(),
             branch_promotion_state: None,
             branch_public_return_eligible: None,
             branch_promotion_reason: None,
@@ -38412,11 +40005,13 @@ mod tests {
             display_title: Some("smalltalk".to_string()),
             browser_url: None,
             document_path: None,
+            identity_confidence: 0.72,
             evidence_quality: "medium".to_string(),
             privacy_status: None,
             openability: "frame_fallback".to_string(),
             last_seen_frame_id: Some("1667".to_string()),
             last_seen_timestamp: 2_000,
+            identity_missing_fields: Vec::new(),
             branch_promotion_state: None,
             branch_public_return_eligible: None,
             branch_promotion_reason: None,
@@ -38518,6 +40113,15 @@ mod tests {
             title: Some("smalltalk".to_string()),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 2_000,
         };
         let mut candidates = vec![
@@ -38759,6 +40363,15 @@ mod tests {
             title: Some("lib.rs".to_string()),
             browser_url: None,
             document_path: code_target.document_path.clone(),
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 30_000,
         };
 
@@ -39082,6 +40695,15 @@ mod tests {
             title: Some("https://example.com/private /Users/me/project".to_string()),
             browser_url: Some("https://example.com/private?token=secret".to_string()),
             document_path: Some("/Users/me/project/secret.md".to_string()),
+            display_title: Some("https://example.com/private /Users/me/project".to_string()),
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 10_000,
         };
         let surface = ResolvedCurrentSurface {
@@ -39104,6 +40726,20 @@ mod tests {
             focus_confidence: 0.72,
             evidence_quality: "medium".to_string(),
             openability: "openable".to_string(),
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            weak_surface_classification: classify_weak_surface(&WeakSurfaceClassificationInput {
+                app_name: Some("Helium".to_string()),
+                window_title: Some("https://example.com/private /Users/me/project".to_string()),
+                browser_url: Some("https://example.com/private?token=secret".to_string()),
+                document_path: Some("/Users/me/project/secret.md".to_string()),
+                event_types: vec!["ui_event".to_string()],
+                ..Default::default()
+            }),
             reason: "selected_recent_event_backed_surface".to_string(),
             warnings: vec!["current_surface:event_backed_no_screenshot".to_string()],
         };
@@ -39167,6 +40803,15 @@ mod tests {
             title: Some("lib.rs".to_string()),
             browser_url: None,
             document_path: fresh_target.document_path.clone(),
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 25 * 60 * 1000,
         };
         let mut stale_candidate = test_candidate(
@@ -39266,6 +40911,47 @@ mod tests {
     }
 
     #[test]
+    fn thin_surface_snapshot_target_is_not_primary_even_with_high_score() {
+        let mut target = test_artifact("artifact-thin-surface", "coding_agent_thread", "Codex");
+        target.identity_confidence = 0.92;
+        target.evidence_quality = "thin".to_string();
+        target.openability = "app_focus_only".to_string();
+        target.document_path = None;
+        target.identity_missing_fields = vec![
+            "thread_identity_missing".to_string(),
+            "openable_target_missing".to_string(),
+        ];
+        let action = test_action(&target.id, "editing");
+        let open_loop = test_open_loop(&target.id, "draft_or_composer_active");
+        let workstream = test_workstream(
+            target.clone(),
+            "primary_target",
+            Some(action.clone()),
+            Some(open_loop.clone()),
+        );
+        let mut candidate =
+            test_candidate("continue_edit", Some(target), Some(action), Some(open_loop));
+        candidate.score = 0.95;
+        candidate.pre_cap_score = 0.95;
+
+        apply_candidate_risk_caps(&mut candidate, &workstream, None);
+        candidate.score = round_score(confidence_cap_for_candidate(&candidate, &workstream));
+        candidate.missing_evidence = missing_evidence_for_candidate(&candidate, &workstream);
+
+        assert!(!candidate.eligible_for_primary_selection);
+        assert!(candidate.score <= 0.42);
+        assert!(candidate
+            .score_caps_applied
+            .contains(&"score_capped:thin_surface_snapshot_not_primary_eligible".to_string()));
+        assert!(candidate
+            .missing_evidence
+            .contains(&"thin_surface_snapshot_evidence".to_string()));
+        assert!(candidate
+            .missing_evidence
+            .contains(&"Exact Codex thread was not visible.".to_string()));
+    }
+
+    #[test]
     fn thin_gemini_focus_handoff_does_not_expose_candidate_id() {
         let mut candidate = test_candidate("resolve_error", None, None, None);
         candidate.id = "continue-candidate-6afa36c62303d2af".to_string();
@@ -39285,6 +40971,15 @@ mod tests {
             ),
             browser_url: None,
             document_path: None,
+            display_title: None,
+            domain: None,
+            activity_state: None,
+            task_state: None,
+            evidence_quality: None,
+            identity_confidence: None,
+            snapshot_id: None,
+            missing_fields: Vec::new(),
+            openability: None,
             captured_at_ms: 1_658,
         };
 
@@ -39428,6 +41123,46 @@ mod tests {
         assert!(classification
             .hard_failures
             .contains(&"model_selected_feedback_suppressed_candidate".to_string()));
+    }
+
+    #[test]
+    fn model_selected_stale_target_over_medium_current_work_is_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let mut stale_target = test_artifact("artifact-chatgpt", "browser_tab", "ChatGPT");
+        stale_target.browser_url = Some("https://chatgpt.com/c/old".to_string());
+        stale_target.openability = "openable".to_string();
+        stale_target.last_seen_timestamp = 1_000;
+        let mut candidate = test_candidate("continue_reply", Some(stale_target), None, None);
+        candidate.id = "continue-candidate-stale".to_string();
+        candidate.score = 0.52;
+        candidate.score_caps_applied =
+            vec!["score_capped:stale_mismatched_openable_current_work".to_string()];
+        candidate.warnings = vec!["active_current_work_outranks_stale_openable_target".to_string()];
+        let mut active =
+            active_current_work_fact_for_test(Some("artifact-codex"), 120_000, "Codex", vec![]);
+        active.evidence_quality = "medium".to_string();
+        active.identity_confidence = 0.72;
+
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            130_000,
+            &[],
+            &[candidate.clone()],
+            5,
+            Some(&active),
+            None,
+        )
+        .unwrap();
+        let output = selected_candidate_model_output(&candidate);
+
+        let failures = validate_micro_inference_output(&output, &[candidate], &pack)
+            .expect_err("model must not revive stale target over fresh current work");
+        assert!(
+            failures.contains(&"model_revived_stale_target_over_fresh_current_work".to_string())
+        );
     }
 
     #[test]
@@ -44083,6 +45818,253 @@ mod tests {
     }
 
     #[test]
+    fn second_layer_uses_enriched_weak_surface_identity_when_snapshot_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        ensure_continue_schema(&conn).unwrap();
+
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/src/lib.rs"),
+            "typing_pause",
+            "fn continue_identity() {}",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/smalltalk/src/lib.rs"),
+            None,
+        );
+        super::enrichment::upsert_surface_snapshot(
+            &conn,
+            &super::enrichment::SurfaceSnapshot {
+                id: "snapshot-code-editor".to_string(),
+                session_id: Some("session-a".to_string()),
+                surface_key: "surface-code-editor".to_string(),
+                domain: "code_editor".to_string(),
+                adapter_key: Some("code_editor_adapter".to_string()),
+                adapter_version: "test".to_string(),
+                observed_at_ms: 1_000,
+                frame_id: Some(1),
+                event_ids_json: Some("[]".to_string()),
+                artifact_id: None,
+                app_name: Some("Cursor".to_string()),
+                bundle_id: Some("com.todesktop.230313mzl4w4u92".to_string()),
+                app_pid: None,
+                window_id: Some(42),
+                window_title: Some("lib.rs - smalltalk".to_string()),
+                window_title_hash: None,
+                workspace_path: None,
+                workspace_path_hash: None,
+                repo_root_path: None,
+                repo_root_hash: Some("repo-hash".to_string()),
+                git_branch: None,
+                git_worktree_path: None,
+                git_worktree_hash: None,
+                thread_title: None,
+                thread_key_hash: None,
+                active_file_path: Some("/Users/me/smalltalk/src/lib.rs".to_string()),
+                active_file_path_hash: None,
+                active_relative_file: Some("src/lib.rs".to_string()),
+                focused_control_role: None,
+                focused_control_label: None,
+                selected_text_hash: None,
+                focused_text_hash: None,
+                visible_text_sample: None,
+                visible_text_hash: None,
+                activity_state: Some("actively_editing".to_string()),
+                task_state: Some("editing_file".to_string()),
+                command_state: Some("not_terminal".to_string()),
+                error_markers_json: Some("[]".to_string()),
+                activity_signals_json: Some("{}".to_string()),
+                identity_confidence: "strong".to_string(),
+                evidence_quality: "strong".to_string(),
+                openability: "openable".to_string(),
+                privacy_status: None,
+                missing_fields_json: Some("[]".to_string()),
+                evidence_sources_json: "[]".to_string(),
+                redaction_notes_json: Some("[]".to_string()),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        rebuild_continue_second_layer(
+            &conn,
+            ContinueSecondLayerRebuildRequest {
+                session_id: Some("session-a".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let (stable_key, merge_keys_json): (String, String) = conn
+            .query_row(
+                "SELECT stable_key, identity_merge_keys_json
+                 FROM continue_artifacts
+                 WHERE artifact_kind = 'code_editor'
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(stable_key.starts_with("code_editor:repo-hash:"));
+        assert!(merge_keys_json.contains("repo:repo-hash"));
+        assert!(!stable_key.contains("/Users/me/smalltalk"));
+
+        let linked_artifact_id: String = conn
+            .query_row(
+                "SELECT artifact_id
+                 FROM continue_surface_snapshots
+                 WHERE id = 'snapshot-code-editor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!linked_artifact_id.is_empty());
+    }
+
+    #[test]
+    fn second_layer_promotes_event_only_surface_snapshot_to_artifact_observation_and_action() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+
+        super::enrichment::upsert_surface_snapshot(
+            &conn,
+            &super::enrichment::SurfaceSnapshot {
+                id: "snapshot-codex-cli".to_string(),
+                session_id: Some("session-a".to_string()),
+                surface_key: "surface-codex-cli".to_string(),
+                domain: "codex_cli".to_string(),
+                adapter_key: Some("codex_cli_adapter".to_string()),
+                adapter_version: "test".to_string(),
+                observed_at_ms: 2_000,
+                frame_id: None,
+                event_ids_json: Some("[\"event-typing\"]".to_string()),
+                artifact_id: None,
+                app_name: Some("Terminal".to_string()),
+                bundle_id: Some("com.apple.Terminal".to_string()),
+                app_pid: None,
+                window_id: Some(7),
+                window_title: Some("smalltalk - codex".to_string()),
+                window_title_hash: None,
+                workspace_path: None,
+                workspace_path_hash: None,
+                repo_root_path: None,
+                repo_root_hash: Some("repo-hash".to_string()),
+                git_branch: Some("codex/p3".to_string()),
+                git_worktree_path: None,
+                git_worktree_hash: None,
+                thread_title: Some("P3 continue integration".to_string()),
+                thread_key_hash: Some("thread-hash".to_string()),
+                active_file_path: None,
+                active_file_path_hash: None,
+                active_relative_file: None,
+                focused_control_role: Some("AXTextArea".to_string()),
+                focused_control_label: Some("Prompt".to_string()),
+                selected_text_hash: None,
+                focused_text_hash: Some("focused-hash".to_string()),
+                visible_text_sample: None,
+                visible_text_hash: Some("visible-hash".to_string()),
+                activity_state: Some("composing_prompt".to_string()),
+                task_state: Some("composing_prompt".to_string()),
+                command_state: Some("prompt_ready".to_string()),
+                error_markers_json: Some("[]".to_string()),
+                activity_signals_json: Some("{\"recent_typing\":true}".to_string()),
+                identity_confidence: "strong".to_string(),
+                evidence_quality: "strong".to_string(),
+                openability: "unknown".to_string(),
+                privacy_status: None,
+                missing_fields_json: Some("[]".to_string()),
+                evidence_sources_json: "[\"app_context\",\"typing_burst\"]".to_string(),
+                redaction_notes_json: Some("[]".to_string()),
+                created_at_ms: 2_000,
+                updated_at_ms: 2_000,
+            },
+        )
+        .unwrap();
+
+        let result = rebuild_continue_second_layer(
+            &conn,
+            ContinueSecondLayerRebuildRequest {
+                session_id: Some("session-a".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.event_backed_promotions.len(), 1);
+        assert_eq!(result.event_backed_promotions[0].artifact_kind, "terminal");
+        assert_eq!(
+            result.event_backed_promotions[0].action_kind.as_deref(),
+            Some("composing")
+        );
+
+        let (artifact_id, artifact_kind, stable_key): (String, String, String) = conn
+            .query_row(
+                "SELECT id, artifact_kind, stable_key
+                 FROM continue_artifacts
+                 WHERE artifact_kind = 'terminal'
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(artifact_kind, "terminal");
+        assert!(stable_key.starts_with("codex_cli:repo-hash:"));
+
+        let linked_artifact_id: String = conn
+            .query_row(
+                "SELECT artifact_id
+                 FROM continue_surface_snapshots
+                 WHERE id = 'snapshot-codex-cli'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_artifact_id, artifact_id);
+
+        let observation_reason: String = conn
+            .query_row(
+                "SELECT reason
+                 FROM continue_artifact_observations
+                 WHERE artifact_id = ?1
+                 LIMIT 1",
+                params![artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(observation_reason.starts_with("surface_snapshot_weak_surface"));
+
+        let (action_kind, action_role, context_json): (String, String, String) = conn
+            .query_row(
+                "SELECT action_kind, action_role, classifier_context_json
+                 FROM continue_task_actions
+                 WHERE artifact_id = ?1
+                 LIMIT 1",
+                params![linked_artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(action_kind, "composing");
+        assert_eq!(action_role, "primary");
+        assert!(context_json.contains("snapshot-codex-cli"));
+        assert!(context_json.contains("composing_prompt"));
+    }
+
+    #[test]
     fn third_layer_groups_same_artifact_and_closes_on_idle() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
@@ -45287,12 +47269,12 @@ mod tests {
         let report = run_continue_eval(None).unwrap();
 
         assert_eq!(report.schema, "smalltalk.continue_eval.v1");
-        assert_eq!(report.case_count, 46);
-        assert_eq!(report.target_artifact_correct, 46);
+        assert_eq!(report.case_count, 55);
+        assert_eq!(report.target_artifact_correct, 55);
         assert_eq!(report.recall_at_k, 1.0);
         assert_eq!(report.mrr, 1.0);
         assert_eq!(report.hallucinated_artifact_count, 1);
-        assert_eq!(report.model_validation_fallback_rate, 0.07);
+        assert_eq!(report.model_validation_fallback_rate, 0.05);
         assert_eq!(report.fresh_surface_retention_rate, 1.0);
         assert_eq!(report.stale_target_suppression_rate, 1.0);
         assert_eq!(report.support_branch_false_promotion_rate, 0.0);
@@ -45304,7 +47286,7 @@ mod tests {
         assert_eq!(report.diagnostic_self_selected_count, 0);
         assert_eq!(report.model_branch_policy_violation_count, 1);
         assert_eq!(report.truthful_thin_mode_rate, 1.0);
-        assert_eq!(report.feedback_obedience_case_count, 7);
+        assert_eq!(report.feedback_obedience_case_count, 8);
         assert_eq!(report.feedback_suppressed_target_exposed_count, 0);
         assert_eq!(report.feedback_suppressed_target_exposed_rate, 0.0);
         assert_eq!(report.corrected_artifact_preferred_count, 1);
@@ -45312,6 +47294,18 @@ mod tests {
         assert_eq!(report.model_feedback_validation_failure_count, 1);
         assert_eq!(report.feedback_obedience_placeholder_rate, 1.0);
         assert_eq!(report.suppressed_target_open_attempt_count, 0);
+        assert_eq!(report.weak_surface_case_count, 9);
+        assert_eq!(report.weak_surface_enrichment_attempt_rate, 0.89);
+        assert_eq!(report.weak_surface_enrichment_success_rate, 0.78);
+        assert_eq!(report.weak_surface_strong_or_medium_rate, 0.78);
+        assert_eq!(report.weak_surface_thin_truthfulness_rate, 1.0);
+        assert_eq!(report.weak_surface_candidate_recall_at_k, 1.0);
+        assert_eq!(report.stale_url_over_weak_surface_false_positive_rate, 0.0);
+        assert_eq!(report.fake_open_target_count, 0);
+        assert_eq!(report.missing_evidence_render_rate, 1.0);
+        assert_eq!(report.privacy_violation_count, 0);
+        assert_eq!(report.p1_feedback_gate_regression_count, 0);
+        assert_eq!(report.p2_support_gate_regression_count, 0);
         assert!(report.last_state_specificity > 0.0);
         assert!(report.next_action_specificity > 0.0);
         assert!(report.source_provenance_correctness > 0.0);
@@ -45334,9 +47328,24 @@ mod tests {
             == "p2_model_selects_unpromoted_branch_rejected"
             && case.validation_status == "fallback"
             && case.model_branch_policy_violation));
-        assert!(report.cases.iter().any(|case| case.name
-            == "p2_gmail_compose_promoted"
-            && case.promoted_branch_selection_correct));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "p2_gmail_compose_promoted"
+                && case.promoted_branch_selection_correct));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "p3_codex_cli_event_only_composing"
+                && case.weak_surface_case
+                && case.stale_url_over_weak_surface_risk
+                && !case.stale_url_over_weak_surface_false_positive));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "p3_privacy_blocked_weak_surface"
+                && case.missing_evidence_rendered
+                && !case.privacy_violation));
     }
 
     #[test]
@@ -45384,6 +47393,7 @@ mod tests {
                 cached_decision_target_artifact_id: None,
                 cache_feedback_newer_than_cached_decision: None,
                 model_feedback_validation_failure_expected: None,
+                missing_evidence_render_expected: None,
             }],
         };
 
@@ -45441,6 +47451,7 @@ mod tests {
                 cached_decision_target_artifact_id: None,
                 cache_feedback_newer_than_cached_decision: None,
                 model_feedback_validation_failure_expected: None,
+                missing_evidence_render_expected: None,
             }],
         };
 

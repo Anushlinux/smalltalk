@@ -7,6 +7,13 @@ use crate::capture_core::quality::{
 use crate::capture_core::resume_dossier::{
     bounded_json_chars, bounded_model_images, RESUME_QUERY_SCHEMA_V2,
 };
+use crate::continuation::enrichment::{
+    classify_weak_surface, enrich_surface, record_weak_surface_enrichment_for_event,
+    upsert_surface_snapshot, AppContextLite, AxNodeLite, CaptureFrameLite, ClipboardMetadataLite,
+    ContentUnitLite, OcrSpanLite, SurfaceEnrichmentInput, TypingBurstLite, UiEventLite,
+    WeakSurfaceClassification, WeakSurfaceClassificationInput, WeakSurfaceDomain,
+    WeakSurfaceEnrichmentEventInput, WindowSnapshotLite,
+};
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
@@ -286,6 +293,15 @@ pub struct RuntimeDiagnostics {
     pub continue_rebuild_calls: i64,
     pub decision_cache_hits: i64,
     pub continue_output_audit_failures: i64,
+    pub weak_surface_enrichment_attempts: i64,
+    pub weak_surface_enrichment_success_strong: i64,
+    pub weak_surface_enrichment_success_medium: i64,
+    pub weak_surface_enrichment_success_thin: i64,
+    pub weak_surface_enrichment_skipped_privacy: i64,
+    pub weak_surface_enrichment_skipped_budget: i64,
+    pub weak_surface_enrichment_failed: i64,
+    pub latest_weak_surface_attempt: Option<String>,
+    pub latest_weak_surface_snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -932,6 +948,7 @@ pub struct AxNodeSummary {
     pub parent_id: Option<String>,
     pub role: Option<String>,
     pub text: Option<String>,
+    pub selected_text: Option<String>,
     pub focused: Option<bool>,
     pub bounds_x: Option<f64>,
     pub bounds_y: Option<f64>,
@@ -1050,6 +1067,7 @@ pub struct VerificationSignals {
 pub struct FrameDetail {
     pub frame: CaptureFrame,
     pub verification: VerificationSignals,
+    pub weak_surface_classification: WeakSurfaceClassification,
     pub events: Vec<UiEventSummary>,
     pub ax_nodes: Vec<AxNodeSummary>,
     pub ocr_spans: Vec<OcrSpanSummary>,
@@ -2358,9 +2376,17 @@ pub fn get_frame_detail(app: AppHandle, frame_id: i64) -> Result<Option<FrameDet
         &transitions,
         &events,
     );
+    let weak_surface_classification = weak_surface_classification_for_frame_detail(
+        &frame,
+        &content_units,
+        &app_contexts,
+        &ax_nodes,
+        &events,
+    );
     Ok(Some(FrameDetail {
         frame,
         verification,
+        weak_surface_classification,
         events,
         ax_nodes,
         ocr_spans,
@@ -2370,6 +2396,193 @@ pub fn get_frame_detail(app: AppHandle, frame_id: i64) -> Result<Option<FrameDet
         windows,
         transitions,
     }))
+}
+
+fn weak_surface_classification_for_frame_detail(
+    frame: &CaptureFrame,
+    content_units: &[ContentUnitSummary],
+    app_contexts: &[AppContextSummary],
+    ax_nodes: &[AxNodeSummary],
+    events: &[UiEventSummary],
+) -> WeakSurfaceClassification {
+    let mut content_unit_roles = content_units
+        .iter()
+        .filter_map(|unit| {
+            unit.semantic_role
+                .clone()
+                .or_else(|| Some(unit.unit_type.clone()))
+        })
+        .take(24)
+        .collect::<Vec<_>>();
+    content_unit_roles.sort();
+    content_unit_roles.dedup();
+    let focused_node_role = ax_nodes
+        .iter()
+        .find(|node| node.focused.unwrap_or(false))
+        .and_then(|node| node.role.clone());
+    let mut event_types = events
+        .iter()
+        .map(|event| {
+            event
+                .key_category
+                .as_ref()
+                .map(|category| format!("{}:{}", event.event_type, category))
+                .unwrap_or_else(|| event.event_type.clone())
+        })
+        .collect::<Vec<_>>();
+    if !frame.capture_trigger.trim().is_empty() {
+        event_types.push(frame.capture_trigger.clone());
+    }
+    event_types.sort();
+    event_types.dedup();
+    let context = app_contexts.first();
+    classify_weak_surface(&WeakSurfaceClassificationInput {
+        app_name: frame.app_name.clone(),
+        bundle_id: frame.app_bundle_id.clone(),
+        window_title: context
+            .and_then(|context| context.title.clone())
+            .or_else(|| frame.window_name.clone()),
+        browser_url: frame
+            .browser_url
+            .clone()
+            .or_else(|| context.and_then(|context| context.url.clone())),
+        document_path: frame
+            .document_path
+            .clone()
+            .or_else(|| context.and_then(|context| context.file_path.clone())),
+        text_source: frame.text_source.clone(),
+        full_text_sample: bounded_classification_text(frame.full_text.as_deref()),
+        content_unit_roles,
+        focused_node_role,
+        event_types,
+        trigger_type: Some(frame.capture_trigger.clone()),
+        privacy_status: frame.privacy_status.clone(),
+    })
+}
+
+fn bounded_classification_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(512).collect::<String>())
+}
+
+fn persist_frame_surface_enrichment(
+    conn: &Connection,
+    frame: &CaptureFrame,
+    content_units: &[ContentUnitSummary],
+    app_contexts: &[AppContextSummary],
+    ax_nodes: &[AxNodeSummary],
+    ocr_spans: &[OcrSpanSummary],
+    events: &[UiEventSummary],
+    window_snapshot: Option<&WindowSnapshotPayload>,
+) -> Result<(), String> {
+    let classification = weak_surface_classification_for_frame_detail(
+        frame,
+        content_units,
+        app_contexts,
+        ax_nodes,
+        events,
+    );
+    if classification.domain == WeakSurfaceDomain::NotWeakSurface {
+        return Ok(());
+    }
+    let input = SurfaceEnrichmentInput {
+        classification,
+        observed_at_ms: frame.captured_at,
+        session_id: frame.session_id.clone(),
+        frame: Some(CaptureFrameLite {
+            id: Some(frame.id),
+            app_name: frame.app_name.clone(),
+            bundle_id: frame.app_bundle_id.clone(),
+            app_pid: frame.app_pid,
+            window_id: frame.window_id,
+            window_title: frame.window_name.clone(),
+            browser_url: frame.browser_url.clone(),
+            document_path: frame.document_path.clone(),
+            full_text: frame.full_text.clone(),
+            text_source: frame.text_source.clone(),
+            capture_trigger: Some(frame.capture_trigger.clone()),
+            privacy_status: frame.privacy_status.clone(),
+        }),
+        recent_events: events
+            .iter()
+            .map(|event| UiEventLite {
+                id: event.id.clone(),
+                event_type: event.event_type.clone(),
+                key_category: event.key_category.clone(),
+            })
+            .collect(),
+        content_units: content_units
+            .iter()
+            .map(|unit| ContentUnitLite {
+                id: unit.id.clone(),
+                source: unit.source.clone(),
+                unit_type: unit.unit_type.clone(),
+                semantic_role: unit.semantic_role.clone(),
+                text: unit.text.clone(),
+                confidence: unit.confidence,
+            })
+            .collect(),
+        ax_nodes: ax_nodes
+            .iter()
+            .map(|node| AxNodeLite {
+                id: node.id.clone(),
+                role: node.role.clone(),
+                text: node.text.clone(),
+                selected_text: node.selected_text.clone(),
+                focused: node.focused,
+                depth: node.depth,
+            })
+            .collect(),
+        ocr_spans: ocr_spans
+            .iter()
+            .map(|span| OcrSpanLite {
+                id: span.id.clone(),
+                text: span.text.clone(),
+                confidence: span.confidence,
+                source_scope: span.source_scope.clone(),
+                ownership_kind: span.ownership_kind.clone(),
+            })
+            .collect(),
+        app_contexts: app_contexts
+            .iter()
+            .map(|context| AppContextLite {
+                id: context.id.clone(),
+                adapter_id: context.adapter_id.clone(),
+                object_type: context.object_type.clone(),
+                title: context.title.clone(),
+                url: context.url.clone(),
+                file_path: context.file_path.clone(),
+                selected_text: context.selected_text.clone(),
+                focused_object: context.focused_object.clone(),
+                confidence: context.confidence,
+            })
+            .collect(),
+        window_snapshot: window_snapshot.map(|snapshot| WindowSnapshotLite {
+            active_window_id: snapshot.active_window_id,
+            active_app_pid: snapshot.active_app_pid,
+            active_app_bundle_id: snapshot.active_app_bundle_id.clone(),
+            active_app_name: snapshot
+                .windows
+                .iter()
+                .find(|window| window.is_active)
+                .and_then(|window| window.owner_name.clone())
+                .or_else(|| frame.app_name.clone()),
+            active_window_title: snapshot
+                .windows
+                .iter()
+                .find(|window| window.is_active)
+                .and_then(|window| window.window_title.clone())
+                .or_else(|| frame.window_name.clone()),
+        }),
+        typing_bursts: query_typing_bursts_for_surface_enrichment(conn, frame)?,
+        clipboard_metadata: query_clipboard_metadata_for_surface_enrichment(conn, frame)?,
+    };
+    if let Some(snapshot) = enrich_surface(&input).snapshot {
+        upsert_surface_snapshot(conn, &snapshot)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -14477,6 +14690,23 @@ fn queue_event_trigger(
         settle_delay_ms: settle_delay.as_millis() as i64,
         ready_at: Instant::now() + settle_delay,
     };
+    let _ = record_weak_surface_enrichment_for_event(
+        &conn,
+        WeakSurfaceEnrichmentEventInput {
+            session_id: Some(session_id.to_string()),
+            observed_at_ms: event.ts_ms,
+            now_ms: now,
+            trigger_type: trigger.capture_trigger.clone(),
+            trigger_event_ids: trigger.caused_by_event_ids.clone(),
+            app_name: event.app_name.clone(),
+            bundle_id: event.app_bundle_id.clone(),
+            window_title: event.window_title.clone(),
+            window_id: event.window_id,
+            key_category: event.key_category.clone(),
+            privacy_status: None,
+            force_attempt: false,
+        },
+    );
     insert_capture_trigger(&conn, session_id, &trigger, now, false, "event_bucket")?;
     *pending = Some(trigger);
     Ok(())
@@ -15420,50 +15650,65 @@ fn capture_frame(
     )?;
     persist_sensitive_regions(&conn, frame_id, &context, &privacy)?;
     persist_presence_sample(&conn, session_id, &context)?;
-    let _ = validate_frame_consistency_inner(
+    let stored_frame = CaptureFrame {
+        id: frame_id,
+        captured_at,
+        snapshot_path: snapshot_path.to_string_lossy().to_string(),
+        app_name: context.app_name.clone(),
+        window_name: context.window_name.clone(),
+        browser_url: context.browser_url.clone(),
+        document_path: context.document_path.clone(),
+        focused: true,
+        capture_trigger: capture_trigger.to_string(),
+        text_source: text_source.map(str::to_string),
+        accessibility_text: accessibility_text.clone(),
+        accessibility_tree_json: None,
+        full_text: full_text.clone(),
+        content_hash: content_hash.clone(),
+        image_hash: None,
+        capture_provider: Some(metadata.capture_provider.clone()),
+        scope: Some(metadata.scope.clone()),
+        display_id: metadata.display_id.clone(),
+        window_id: metadata.window_id,
+        app_pid: metadata.app_pid,
+        app_bundle_id: metadata.app_bundle_id.clone(),
+        screen_scale: Some(metadata.screen_scale),
+        pixel_width: metadata.pixel_width,
+        pixel_height: metadata.pixel_height,
+        full_screenshot_path: Some(metadata.full_screenshot_path.clone()),
+        active_window_crop_path: metadata.active_window_crop_path.clone(),
+        active_element_crop_path: metadata.active_element_crop_path.clone(),
+        phash: metadata.phash.clone(),
+        privacy_status: Some(metadata.privacy_status.clone()),
+        capture_trigger_id: capture_trigger_id.map(str::to_string),
+        previous_frame_id: previous_frame_id.map(str::to_string),
+        session_id: Some(session_id.to_string()),
+        sck_display_id: metadata.sck_display_id.clone(),
+        sck_window_id: metadata.sck_window_id,
+        sck_owning_bundle_id: metadata.sck_owning_bundle_id.clone(),
+        sck_filter_summary_json: metadata.sck_filter_summary_json.clone(),
+        sck_configuration_summary_json: metadata.sck_configuration_summary_json.clone(),
+        sck_frame_metadata_json: metadata.sck_frame_metadata_json.clone(),
+        sck_capture_mode: metadata.sck_capture_mode.clone(),
+        sck_audio_policy: metadata.sck_audio_policy.clone(),
+    };
+    let _ = validate_frame_consistency_inner(&conn, &stored_frame);
+    let frame_key = frame_id.to_string();
+    let enrichment_ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap_or_default();
+    let enrichment_ocr_spans = query_ocr_spans(&conn, &frame_key).unwrap_or_default();
+    let enrichment_content_units =
+        query_content_units_for_frame(&conn, &frame_key).unwrap_or_default();
+    let enrichment_app_contexts = query_app_contexts(&conn, &frame_key).unwrap_or_default();
+    let enrichment_events = query_events_for_frame(&conn, &stored_frame).unwrap_or_default();
+    let _ = persist_frame_surface_enrichment(
         &conn,
-        &CaptureFrame {
-            id: frame_id,
-            captured_at,
-            snapshot_path: snapshot_path.to_string_lossy().to_string(),
-            app_name: context.app_name.clone(),
-            window_name: context.window_name.clone(),
-            browser_url: context.browser_url.clone(),
-            document_path: context.document_path.clone(),
-            focused: true,
-            capture_trigger: capture_trigger.to_string(),
-            text_source: text_source.map(str::to_string),
-            accessibility_text: accessibility_text.clone(),
-            accessibility_tree_json: None,
-            full_text: full_text.clone(),
-            content_hash: content_hash.clone(),
-            image_hash: None,
-            capture_provider: Some(metadata.capture_provider.clone()),
-            scope: Some(metadata.scope.clone()),
-            display_id: metadata.display_id.clone(),
-            window_id: metadata.window_id,
-            app_pid: metadata.app_pid,
-            app_bundle_id: metadata.app_bundle_id.clone(),
-            screen_scale: Some(metadata.screen_scale),
-            pixel_width: metadata.pixel_width,
-            pixel_height: metadata.pixel_height,
-            full_screenshot_path: Some(metadata.full_screenshot_path.clone()),
-            active_window_crop_path: metadata.active_window_crop_path.clone(),
-            active_element_crop_path: metadata.active_element_crop_path.clone(),
-            phash: metadata.phash.clone(),
-            privacy_status: Some(metadata.privacy_status.clone()),
-            capture_trigger_id: capture_trigger_id.map(str::to_string),
-            previous_frame_id: previous_frame_id.map(str::to_string),
-            session_id: Some(session_id.to_string()),
-            sck_display_id: metadata.sck_display_id.clone(),
-            sck_window_id: metadata.sck_window_id,
-            sck_owning_bundle_id: metadata.sck_owning_bundle_id.clone(),
-            sck_filter_summary_json: metadata.sck_filter_summary_json.clone(),
-            sck_configuration_summary_json: metadata.sck_configuration_summary_json.clone(),
-            sck_frame_metadata_json: metadata.sck_frame_metadata_json.clone(),
-            sck_capture_mode: metadata.sck_capture_mode.clone(),
-            sck_audio_policy: metadata.sck_audio_policy.clone(),
-        },
+        &stored_frame,
+        &enrichment_content_units,
+        &enrichment_app_contexts,
+        &enrichment_ax_nodes,
+        &enrichment_ocr_spans,
+        &enrichment_events,
+        window_snapshot.as_ref(),
     );
     if let Some(previous) = previous_frame_id {
         persist_frame_diff(
@@ -17644,8 +17889,8 @@ fn query_ax_nodes(conn: &Connection, frame_id: &str) -> Result<Vec<AxNodeSummary
         .prepare(
             "SELECT id, parent_id, role,
                     trim(coalesce(title, '') || ' ' || coalesce(value, '') || ' ' ||
-                         coalesce(description, '') || ' ' || coalesce(selected_text, '')) AS text,
-                    focused, bounds_x, bounds_y, bounds_w, bounds_h, depth
+                         coalesce(description, '')) AS text,
+                    selected_text, focused, bounds_x, bounds_y, bounds_w, bounds_h, depth
              FROM ax_nodes
              WHERE frame_id = ?1
              ORDER BY depth ASC, id ASC
@@ -17659,12 +17904,13 @@ fn query_ax_nodes(conn: &Connection, frame_id: &str) -> Result<Vec<AxNodeSummary
                 parent_id: row.get(1)?,
                 role: row.get(2)?,
                 text: row.get(3)?,
-                focused: row.get::<_, Option<i64>>(4)?.map(|v| v == 1),
-                bounds_x: row.get(5)?,
-                bounds_y: row.get(6)?,
-                bounds_w: row.get(7)?,
-                bounds_h: row.get(8)?,
-                depth: row.get(9)?,
+                selected_text: row.get(4)?,
+                focused: row.get::<_, Option<i64>>(5)?.map(|v| v == 1),
+                bounds_x: row.get(6)?,
+                bounds_y: row.get(7)?,
+                bounds_w: row.get(8)?,
+                bounds_h: row.get(9)?,
+                depth: row.get(10)?,
             })
         })
         .map_err(to_string)?;
@@ -17778,6 +18024,74 @@ fn query_app_contexts(conn: &Connection, frame_id: &str) -> Result<Vec<AppContex
                 focused_object: row.get(7)?,
                 confidence: row.get(8)?,
                 metadata_json: row.get(9)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_typing_bursts_for_surface_enrichment(
+    conn: &Connection,
+    frame: &CaptureFrame,
+) -> Result<Vec<TypingBurstLite>, String> {
+    if !table_exists_in_capture(conn, "typing_bursts")? {
+        return Ok(Vec::new());
+    }
+    let frame_id = frame.id.to_string();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, enter_count, paste_count, committed, commit_signal
+             FROM typing_bursts
+             WHERE pre_frame_id = ?1
+                OR post_frame_id = ?1
+                OR (?2 BETWEEN started_at_ms - 250 AND ended_at_ms + 1500)
+             ORDER BY ended_at_ms DESC
+             LIMIT 8",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id, frame.captured_at], |row| {
+            let committed: Option<i64> = row.get(3)?;
+            Ok(TypingBurstLite {
+                id: row.get(0)?,
+                enter_count: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                paste_count: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                committed: committed.unwrap_or(0) != 0,
+                commit_signal: row.get(4)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_clipboard_metadata_for_surface_enrichment(
+    conn: &Connection,
+    frame: &CaptureFrame,
+) -> Result<Vec<ClipboardMetadataLite>, String> {
+    if !table_exists_in_capture(conn, "clipboard_events")? {
+        return Ok(Vec::new());
+    }
+    let frame_id = frame.id.to_string();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content_type, source_frame_id, target_frame_id
+             FROM clipboard_events
+             WHERE source_frame_id = ?1
+                OR target_frame_id = ?1
+                OR ABS(ts_ms - ?2) <= 2500
+             ORDER BY ts_ms DESC
+             LIMIT 8",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id, frame.captured_at], |row| {
+            Ok(ClipboardMetadataLite {
+                id: row.get(0)?,
+                event_kind: row
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "clipboard".to_string()),
+                source_frame_id: row.get(2)?,
+                target_frame_id: row.get(3)?,
             })
         })
         .map_err(to_string)?;
@@ -18703,6 +19017,8 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
     "continue_pairwise_preferences",
     "continue_eval_fixtures",
     "continue_evidence_probes",
+    "continue_surface_enrichment_attempts",
+    "continue_surface_snapshots",
     "continue_app_activity_segments",
     "continue_activity_classifications",
     "continue_boundary_revisions",
@@ -19245,6 +19561,22 @@ fn export_continue_output_audit_to_plan(
         &serde_json::to_value(&result.evidence_freshness_ledger).map_err(to_string)?,
     )?;
     write_json_pretty(
+        &decision_dir.join("surface-enrichment-attempts.json"),
+        &continue_surface_enrichment_attempts_audit_json(conn, result)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("surface-snapshots.json"),
+        &continue_surface_snapshots_audit_json(conn, result)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("enriched-current-focus.json"),
+        &continue_enriched_current_focus_audit_json(conn, result)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("weak-surface-candidate-gates.json"),
+        &continue_weak_surface_candidate_gates_audit_json(result),
+    )?;
+    write_json_pretty(
         &decision_dir.join("selected_workstream.json"),
         &serde_json::to_value(&result.selected_workstream).map_err(to_string)?,
     )?;
@@ -19454,7 +19786,11 @@ fn write_continue_export_status(
                 "finalDecision": "final/continue_decision_result.json",
                 "handoff": "final/handoff.json",
                 "currentSurfaceResolution": "decision/current_surface_resolution.json",
-                "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json"
+                "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json",
+                "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
+                "surfaceSnapshots": "decision/surface-snapshots.json",
+                "enrichedCurrentFocus": "decision/enriched-current-focus.json",
+                "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json"
             },
             "rawArtifacts": {
                 "database": "raw/smalltalk-capture.sqlite",
@@ -19525,6 +19861,10 @@ fn write_continue_output_manifest(
         "finalDecision": "decision/final_decision.json",
         "currentSurfaceResolution": "decision/current_surface_resolution.json",
         "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json",
+        "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
+        "surfaceSnapshots": "decision/surface-snapshots.json",
+        "enrichedCurrentFocus": "decision/enriched-current-focus.json",
+        "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json",
         "legacyFinalDecision": "final/continue_decision_result.json",
         "evidenceClosure": "evidence/evidence_closure.json",
         "candidateScores": "decision/candidates.json",
@@ -19565,6 +19905,10 @@ fn write_continue_output_manifest(
         "cacheDecision": "cache/cache_decision.json",
         "model": "model/",
         "copyGate": "decision/copy_gate.json",
+        "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
+        "surfaceSnapshots": "decision/surface-snapshots.json",
+        "enrichedCurrentFocus": "decision/enriched-current-focus.json",
+        "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json",
         "auditIntegrity": "audit_integrity.json",
         "inference": inference_manifest,
         "finalDecision": "final/continue_decision_result.json",
@@ -19789,6 +20133,308 @@ fn continue_candidate_feedback_target_keys(
         keys.push(format!("TargetArtifact:{}", target_artifact_id));
     }
     keys
+}
+
+fn continue_surface_enrichment_attempts_audit_json(
+    conn: &Connection,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<Value, String> {
+    if !table_exists_in_capture(conn, "continue_surface_enrichment_attempts")? {
+        return Ok(serde_json::json!({
+            "schema": "smalltalk.continue_audit_surface_enrichment_attempts.v1",
+            "available": false,
+            "rows": []
+        }));
+    }
+    let decision_ms =
+        continue_decision_requested_at_ms(conn, &result.decision_id)?.unwrap_or_else(now_millis);
+    let since_ms = decision_ms.saturating_sub(45 * 60 * 1000);
+    let rows = query_json_rows_with_params(
+        conn,
+        "SELECT *
+         FROM continue_surface_enrichment_attempts
+         WHERE observed_at_ms >= ?1
+         ORDER BY observed_at_ms DESC, created_at_ms DESC
+         LIMIT 40",
+        &[&since_ms],
+    )?;
+    Ok(serde_json::json!({
+        "schema": "smalltalk.continue_audit_surface_enrichment_attempts.v1",
+        "available": true,
+        "decisionId": result.decision_id,
+        "sinceMs": since_ms,
+        "rowCount": rows.len(),
+        "rows": rows
+    }))
+}
+
+fn continue_surface_snapshots_audit_json(
+    conn: &Connection,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<Value, String> {
+    if !table_exists_in_capture(conn, "continue_surface_snapshots")? {
+        return Ok(serde_json::json!({
+            "schema": "smalltalk.continue_audit_surface_snapshots.v1",
+            "available": false,
+            "rows": []
+        }));
+    }
+    let decision_ms =
+        continue_decision_requested_at_ms(conn, &result.decision_id)?.unwrap_or_else(now_millis);
+    let since_ms = decision_ms.saturating_sub(45 * 60 * 1000);
+    let rows = query_json_rows_with_params(
+        conn,
+        "SELECT *
+         FROM continue_surface_snapshots
+         WHERE observed_at_ms >= ?1
+         ORDER BY observed_at_ms DESC, updated_at_ms DESC
+         LIMIT 40",
+        &[&since_ms],
+    )?;
+    Ok(serde_json::json!({
+        "schema": "smalltalk.continue_audit_surface_snapshots.v1",
+        "available": true,
+        "decisionId": result.decision_id,
+        "sinceMs": since_ms,
+        "rowCount": rows.len(),
+        "rows": rows
+    }))
+}
+
+fn continue_enriched_current_focus_audit_json(
+    conn: &Connection,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<Value, String> {
+    let focus = result.current_focus.as_ref();
+    let domain = focus.and_then(|focus| focus.domain.clone());
+    let requires_enrichment = domain.as_deref().is_some_and(|domain| {
+        matches!(
+            domain,
+            "codex_cli"
+                | "codex_desktop_app"
+                | "codex_ide_extension"
+                | "code_editor"
+                | "terminal"
+                | "native_agent_window"
+                | "unknown_weak_surface"
+        )
+    });
+    let latest_attempt = result
+        .weak_surface_enrichment
+        .latest_weak_surface_attempt
+        .clone();
+    let attempted = latest_attempt.is_some()
+        || result
+            .weak_surface_enrichment
+            .weak_surface_enrichment_attempts
+            > 0;
+    let snapshot_id = focus
+        .and_then(|focus| focus.snapshot_id.clone())
+        .or_else(|| {
+            result
+                .weak_surface_enrichment
+                .latest_weak_surface_snapshot_id
+                .clone()
+        });
+    let snapshot_rows = if let Some(snapshot_id) = snapshot_id.as_deref() {
+        if table_exists_in_capture(conn, "continue_surface_snapshots")? {
+            query_json_rows_with_params(
+                conn,
+                "SELECT id, session_id, surface_key, domain, adapter_key, observed_at_ms,
+                        frame_id, event_ids_json, artifact_id, app_name, bundle_id,
+                        window_title_hash, workspace_path_hash, repo_root_hash, git_branch,
+                        git_worktree_hash, thread_key_hash, active_file_path_hash,
+                        active_relative_file, focused_control_role, focused_control_label,
+                        visible_text_hash, activity_state, task_state, command_state,
+                        error_markers_json, activity_signals_json, identity_confidence,
+                        evidence_quality, openability, privacy_status, missing_fields_json,
+                        evidence_sources_json, redaction_notes_json
+                 FROM continue_surface_snapshots
+                 WHERE id = ?1
+                 LIMIT 1",
+                &[&snapshot_id],
+            )?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let task_action_created = result
+        .last_meaningful_action
+        .as_ref()
+        .is_some_and(|action| {
+            focus
+                .and_then(|focus| focus.artifact_id.as_deref())
+                .is_some_and(|artifact_id| action.artifact_id.as_deref() == Some(artifact_id))
+                || snapshot_id.as_deref().is_some_and(|id| {
+                    action.evidence_frame_id == format!("surface-snapshot:{}", id)
+                })
+        });
+    let candidate_included = result.alternatives.iter().any(|candidate| {
+        focus
+            .and_then(|focus| focus.artifact_id.as_deref())
+            .is_some_and(|artifact_id| candidate.target_artifact_id.as_deref() == Some(artifact_id))
+    });
+    let selected_candidate = result
+        .selected_candidate_id
+        .as_deref()
+        .and_then(|selected_id| {
+            result
+                .alternatives
+                .iter()
+                .find(|candidate| candidate.candidate_id == selected_id)
+        });
+    Ok(serde_json::json!({
+        "schema": "smalltalk.continue_audit_enriched_current_focus.v1",
+        "decisionId": result.decision_id,
+        "latestCurrentFocusRequiresEnrichment": requires_enrichment,
+        "enrichmentAttempted": attempted,
+        "latestAttempt": latest_attempt,
+        "latestSnapshotId": snapshot_id,
+        "snapshotLinkedToArtifact": focus.and_then(|focus| focus.artifact_id.clone()).is_some(),
+        "taskActionCreated": task_action_created,
+        "candidateGenerationIncludedCurrentFocus": candidate_included,
+        "selectedCandidateId": result.selected_candidate_id,
+        "selectedCandidateWeakSurfaceRelation": selected_candidate.map(|candidate| {
+            serde_json::json!({
+                "candidateId": candidate.candidate_id,
+                "candidateKind": candidate.candidate_kind,
+                "targetArtifactId": candidate.target_artifact_id,
+                "score": candidate.score,
+                "eligibleForPrimarySelection": candidate.eligible_for_primary_selection,
+                "publicReturnEligible": candidate.public_return_eligible,
+                "selectionDemotionReason": candidate.selection_demotion_reason,
+                "scoreCapsApplied": candidate.score_caps_applied,
+                "missingEvidence": candidate.missing_evidence,
+            })
+        }),
+        "uiReceived": {
+            "continueOutputMode": result.continue_output_mode,
+            "currentFocus": focus,
+            "returnTarget": result.return_target,
+            "resumeWorkTarget": result.resume_work_target,
+            "missingEvidence": result.missing_evidence,
+            "warnings": result.warnings,
+        },
+        "snapshotRows": snapshot_rows,
+    }))
+}
+
+fn continue_weak_surface_candidate_gates_audit_json(
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Value {
+    let selected_id = result.selected_candidate_id.as_deref();
+    let current_focus_artifact_id = result
+        .current_focus
+        .as_ref()
+        .and_then(|focus| focus.artifact_id.as_deref());
+    let rows = result
+        .alternatives
+        .iter()
+        .filter(|candidate| {
+            is_weak_surface_candidate_for_audit(candidate, current_focus_artifact_id)
+        })
+        .map(|candidate| {
+            let selected = selected_id == Some(candidate.candidate_id.as_str());
+            let gate_outcome = if selected {
+                "selected"
+            } else if !candidate.eligible_for_primary_selection {
+                "rejected"
+            } else if candidate.selection_demotion_reason.is_some()
+                || !candidate.score_caps_applied.is_empty()
+            {
+                "downgraded"
+            } else if candidate.public_return_eligible {
+                "public_alternative"
+            } else {
+                "candidate_only"
+            };
+            serde_json::json!({
+                "candidateId": candidate.candidate_id,
+                "workstreamId": candidate.workstream_id,
+                "targetArtifactId": candidate.target_artifact_id,
+                "candidateKind": candidate.candidate_kind,
+                "selected": selected,
+                "gateOutcome": gate_outcome,
+                "preCapScore": candidate.pre_cap_score,
+                "score": candidate.score,
+                "confidenceLabel": candidate.confidence_label,
+                "eligibleForPrimarySelection": candidate.eligible_for_primary_selection,
+                "publicReturnEligible": candidate.public_return_eligible,
+                "publicAlternativeEligibleAfterFeedback": candidate.public_alternative_eligible_after_feedback,
+                "selectionDemotionReason": candidate.selection_demotion_reason,
+                "blockedReason": candidate.blocked_reason,
+                "branchKind": candidate.branch_kind,
+                "branchPromotionState": candidate.branch_promotion_state,
+                "branchPublicReturnEligible": candidate.branch_public_return_eligible,
+                "feedbackSuppressionState": candidate.feedback_suppression_state,
+                "feedbackReasonCodes": candidate.feedback_reason_codes,
+                "scoreCapsApplied": candidate.score_caps_applied,
+                "riskFlags": candidate.risk_flags,
+                "missingEvidence": candidate.missing_evidence,
+                "scoreComponents": candidate.components,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "smalltalk.continue_audit_weak_surface_candidate_gates.v1",
+        "decisionId": result.decision_id,
+        "selectedCandidateId": result.selected_candidate_id,
+        "candidateCount": rows.len(),
+        "staleOpenableAlternativesSuppressed": result
+            .missing_evidence
+            .iter()
+            .chain(result.warnings.iter())
+            .any(|item| item.contains("stale_return_target_suppressed")
+                || item.contains("stale_openable")
+                || item.contains("active_current_work_outranks_stale_openable_target")),
+        "feedbackSuppressedCandidateCount": result.feedback_suppressed_candidate_count,
+        "supportBranchExcludedCandidateIds": result.excluded_branch_candidate_ids,
+        "rows": rows,
+    })
+}
+
+fn is_weak_surface_candidate_for_audit(
+    candidate: &crate::continuation::ContinueCandidateSummary,
+    current_focus_artifact_id: Option<&str>,
+) -> bool {
+    candidate
+        .target_artifact_id
+        .as_deref()
+        .is_some_and(|artifact_id| Some(artifact_id) == current_focus_artifact_id)
+        || matches!(
+            candidate.candidate_kind.as_str(),
+            "continue_current_work" | "continue_edit" | "resolve_error" | "rerun_command"
+        )
+        || candidate
+            .risk_flags
+            .iter()
+            .chain(candidate.missing_evidence.iter())
+            .chain(candidate.score_caps_applied.iter())
+            .any(|item| {
+                item.contains("weak_surface")
+                    || item.contains("surface_snapshot")
+                    || item.contains("missing_current_work")
+                    || item.contains("stale_return_target_suppressed")
+                    || item.contains("stale_mismatched_openable_current_work")
+            })
+}
+
+fn continue_decision_requested_at_ms(
+    conn: &Connection,
+    decision_id: &str,
+) -> Result<Option<i64>, String> {
+    if !table_exists_in_capture(conn, "continue_decisions")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT requested_at_ms FROM continue_decisions WHERE id = ?1",
+        params![decision_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
 }
 
 fn continue_copy_gate_json(result: &crate::continuation::ContinueDecisionResult) -> Value {
@@ -20926,6 +21572,64 @@ fn continue_output_explain_markdown_v2(
         .get("copy_mode_expected")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let weak_surface_domain = result
+        .current_focus
+        .as_ref()
+        .and_then(|focus| focus.domain.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let weak_surface_attempt = result
+        .weak_surface_enrichment
+        .latest_weak_surface_attempt
+        .as_ref()
+        .map(|attempt| {
+            format!(
+                "{} via {}",
+                attempt.status.as_str(),
+                attempt.adapter_key.as_deref().unwrap_or("unknown_adapter")
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let weak_surface_snapshot_quality = result
+        .current_focus
+        .as_ref()
+        .and_then(|focus| focus.evidence_quality.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let weak_surface_identity_confidence = result
+        .current_focus
+        .as_ref()
+        .and_then(|focus| focus.identity_confidence)
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| "unknown".to_string());
+    let weak_surface_candidate_eligibility = result
+        .selected_candidate_id
+        .as_deref()
+        .and_then(|selected_id| {
+            result
+                .alternatives
+                .iter()
+                .find(|candidate| candidate.candidate_id == selected_id)
+        })
+        .map(|candidate| {
+            format!(
+                "{}; primary_eligible={}; public_return_eligible={}",
+                candidate.candidate_kind,
+                candidate.eligible_for_primary_selection,
+                candidate.public_return_eligible
+            )
+        })
+        .unwrap_or_else(|| "no selected candidate".to_string());
+    let stale_alternative_rationale = if result
+        .missing_evidence
+        .iter()
+        .chain(result.warnings.iter())
+        .any(|item| {
+            item.contains("stale_return_target_suppressed")
+                || item.contains("active_current_work_outranks_stale_openable_target")
+        }) {
+        "older openable alternatives were suppressed by newer current-work evidence"
+    } else {
+        "no stale/openable alternative suppression was required"
+    };
     format!(
         "# Continue Decision Audit\n\n\
 This audit may contain sensitive local screenshots, OCR text, Accessibility text, URLs, file paths, and raw decision diagnostics. It is generated private developer output and must not be committed or uploaded accidentally.\n\n\
@@ -20957,6 +21661,14 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
 - Evidence closure: `evidence/evidence_closure.json`\n\
 - Selected frame folders: `evidence/frames/`\n\
 - Broad capture frame dump: `capture/frames/` ({frame_count} folders)\n\n\
+## Weak-surface enrichment\n\n\
+- Latest surface domain: `{weak_surface_domain}`\n\
+- Enrichment attempts: `{weak_surface_attempt}`\n\
+- Latest snapshot quality: `{weak_surface_snapshot_quality}`\n\
+- Identity confidence: `{weak_surface_identity_confidence}`\n\
+- Candidate eligibility: `{weak_surface_candidate_eligibility}`\n\
+- Stale/openable alternatives: {stale_alternative_rationale}\n\
+- Audit files: `decision/surface-enrichment-attempts.json`, `decision/surface-snapshots.json`, `decision/enriched-current-focus.json`, `decision/weak-surface-candidate-gates.json`\n\n\
 ## Model Audit\n\n\
 - Called/skipped: `{model_called}`\n\
 - Legacy inference events: {inference_count}\n\
@@ -21056,6 +21768,12 @@ This audit may contain sensitive local screenshots, OCR text, Accessibility text
         },
         frame_ids = if frame_ids.is_empty() { "none".to_string() } else { frame_ids },
         frame_count = frame_count,
+        weak_surface_domain = weak_surface_domain,
+        weak_surface_attempt = weak_surface_attempt,
+        weak_surface_snapshot_quality = weak_surface_snapshot_quality,
+        weak_surface_identity_confidence = weak_surface_identity_confidence,
+        weak_surface_candidate_eligibility = weak_surface_candidate_eligibility,
+        stale_alternative_rationale = stale_alternative_rationale,
         inference_count = inference_manifest.len(),
         integrity_status = integrity_status,
     )
@@ -22849,16 +23567,16 @@ fn cleanup_candidate_frame_ids(conn: &Connection) -> Result<Vec<i64>, String> {
 fn protected_cleanup_frame_ids(conn: &Connection) -> Result<HashSet<i64>, String> {
     let mut protected = HashSet::new();
     for query in [
-        "SELECT CAST(evidence_frame_id AS INTEGER) FROM continue_candidates WHERE evidence_frame_id IS NOT NULL",
-        "SELECT CAST(frame_id AS INTEGER) FROM continue_task_actions",
-        "SELECT CAST(first_frame_id AS INTEGER) FROM continue_task_actions WHERE first_frame_id IS NOT NULL",
-        "SELECT CAST(last_frame_id AS INTEGER) FROM continue_task_actions WHERE last_frame_id IS NOT NULL",
-        "SELECT CAST(strongest_frame_id AS INTEGER) FROM continue_task_actions WHERE strongest_frame_id IS NOT NULL",
+        "SELECT CAST(evidence_frame_id AS INTEGER) FROM continue_candidates WHERE evidence_frame_id GLOB '[0-9]*'",
+        "SELECT CAST(frame_id AS INTEGER) FROM continue_task_actions WHERE frame_id GLOB '[0-9]*'",
+        "SELECT CAST(first_frame_id AS INTEGER) FROM continue_task_actions WHERE first_frame_id GLOB '[0-9]*'",
+        "SELECT CAST(last_frame_id AS INTEGER) FROM continue_task_actions WHERE last_frame_id GLOB '[0-9]*'",
+        "SELECT CAST(strongest_frame_id AS INTEGER) FROM continue_task_actions WHERE strongest_frame_id GLOB '[0-9]*'",
         "SELECT pre_frame_id FROM continue_semantic_moments WHERE pre_frame_id IS NOT NULL",
         "SELECT post_frame_id FROM continue_semantic_moments WHERE post_frame_id IS NOT NULL",
-        "SELECT CAST(start_frame_id AS INTEGER) FROM continue_episodes WHERE start_frame_id IS NOT NULL",
-        "SELECT CAST(end_frame_id AS INTEGER) FROM continue_episodes WHERE end_frame_id IS NOT NULL",
-        "SELECT CAST(frame_id AS INTEGER) FROM continue_artifact_observations WHERE frame_id IS NOT NULL",
+        "SELECT CAST(start_frame_id AS INTEGER) FROM continue_episodes WHERE start_frame_id GLOB '[0-9]*'",
+        "SELECT CAST(end_frame_id AS INTEGER) FROM continue_episodes WHERE end_frame_id GLOB '[0-9]*'",
+        "SELECT CAST(frame_id AS INTEGER) FROM continue_artifact_observations WHERE frame_id GLOB '[0-9]*'",
     ] {
         let table_name = query
             .split(" FROM ")
@@ -23243,6 +23961,39 @@ fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostic
         decision_cache_hits: maintenance_i64(conn, "decision_cache_hits").unwrap_or(0),
         continue_output_audit_failures: maintenance_i64(conn, "continue_output_audit_failures")
             .unwrap_or(0),
+        weak_surface_enrichment_attempts: maintenance_i64(conn, "weak_surface_enrichment_attempts")
+            .unwrap_or(0),
+        weak_surface_enrichment_success_strong: maintenance_i64(
+            conn,
+            "weak_surface_enrichment_success_strong",
+        )
+        .unwrap_or(0),
+        weak_surface_enrichment_success_medium: maintenance_i64(
+            conn,
+            "weak_surface_enrichment_success_medium",
+        )
+        .unwrap_or(0),
+        weak_surface_enrichment_success_thin: maintenance_i64(
+            conn,
+            "weak_surface_enrichment_success_thin",
+        )
+        .unwrap_or(0),
+        weak_surface_enrichment_skipped_privacy: maintenance_i64(
+            conn,
+            "weak_surface_enrichment_skipped_privacy",
+        )
+        .unwrap_or(0),
+        weak_surface_enrichment_skipped_budget: maintenance_i64(
+            conn,
+            "weak_surface_enrichment_skipped_budget",
+        )
+        .unwrap_or(0),
+        weak_surface_enrichment_failed: maintenance_i64(conn, "weak_surface_enrichment_failed")
+            .unwrap_or(0),
+        latest_weak_surface_attempt: maintenance_value(conn, "latest_weak_surface_attempt")
+            .unwrap_or(None),
+        latest_weak_surface_snapshot_id: maintenance_value(conn, "latest_weak_surface_snapshot_id")
+            .unwrap_or(None),
     }
 }
 
@@ -32593,6 +33344,175 @@ mod tests {
             .any(|warning| warning.warning_type == "browser_url_missing"));
         let persisted = query_frame_quality_warnings(&conn, &frame_id.to_string()).unwrap();
         assert_eq!(persisted.len(), report.warnings.len());
+    }
+
+    #[test]
+    fn frame_surface_enrichment_persists_rich_codex_ide_snapshot_without_raw_selection() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            INSERT_FRAME_SQL,
+            params![
+                1_000_i64,
+                "/tmp/smalltalk-frame.jpg",
+                Some("Cursor"),
+                Some("enrichment.rs - smalltalk - Cursor"),
+                Option::<String>::None,
+                Some("/Users/me/smalltalk/src-tauri/src/continuation/enrichment.rs"),
+                true,
+                "typing_pause",
+                "accessibility",
+                Some("Ask Codex\nThread: adapter implementation\nfn enrich_surface()"),
+                Option::<String>::None,
+                Some("Ask Codex\nThread: adapter implementation\nfn enrich_surface()"),
+                Some("content-hash"),
+                Some("image-hash"),
+                1_000_i64,
+                "screencapture_cli",
+                "active_window",
+                Some("main"),
+                Some(17_i64),
+                Some(4242_i64),
+                Some("com.todesktop.230313mzl4w4u92"),
+                1.0_f64,
+                Some(1440_i64),
+                Some(900_i64),
+                "/tmp/smalltalk-frame.jpg",
+                Option::<String>::None,
+                Option::<String>::None,
+                Some("phash"),
+                "normal",
+                Some("trigger-1"),
+                Option::<String>::None,
+                Some("session-rich"),
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+            ],
+        )
+        .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        let frame = conn
+            .query_row(
+                &format!("SELECT {} FROM frames WHERE id = ?1", FRAME_COLUMNS),
+                params![frame_id],
+                frame_from_row,
+            )
+            .unwrap();
+        let frame_key = frame_id.to_string();
+        conn.execute(
+            "INSERT INTO app_contexts (
+                id, frame_id, adapter_id, object_type, title, file_path,
+                selected_text, focused_object, confidence
+             ) VALUES (
+                'ctx-rich', ?1, 'accessibility', 'document',
+                'Thread: adapter implementation',
+                '/Users/me/smalltalk/src-tauri/src/continuation/enrichment.rs',
+                'raw selected code must not leak', 'editor', 0.95
+             )",
+            params![frame_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ax_nodes (
+                id, frame_id, role, value, selected_text, focused, depth
+             ) VALUES (
+                'ax-rich', ?1, 'AXTextArea', 'Ask Codex about adapter implementation',
+                'raw selected code must not leak', 1, 1
+             )",
+            params![frame_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units (
+                id, frame_id, source, unit_type, text, semantic_role,
+                confidence, created_at_ms
+             ) VALUES (
+                'unit-rich', ?1, 'accessibility', 'text',
+                'Ask Codex\nThread: adapter implementation\nfn enrich_surface()',
+                'main_content', 0.94, 1000
+             )",
+            params![frame_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ui_events (
+                id, session_id, ts_ms, event_type, app_name, app_bundle_id,
+                window_id, window_title, key_category, created_at_ms
+             ) VALUES (
+                'evt-rich', 'session-rich', 990, 'key_down', 'Cursor',
+                'com.todesktop.230313mzl4w4u92', 17,
+                'enrichment.rs - smalltalk - Cursor', 'char', 990
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO typing_bursts (
+                id, session_id, started_at_ms, ended_at_ms, app_name,
+                window_title, char_count, committed, pre_frame_id, post_frame_id
+             ) VALUES (
+                'type-rich', 'session-rich', 980, 1000, 'Cursor',
+                'enrichment.rs - smalltalk - Cursor', 12, 0, ?1, ?1
+             )",
+            params![frame_key],
+        )
+        .unwrap();
+        let ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap();
+        let content_units = query_content_units_for_frame(&conn, &frame_key).unwrap();
+        let app_contexts = query_app_contexts(&conn, &frame_key).unwrap();
+        let events = query_events_for_frame(&conn, &frame).unwrap();
+
+        persist_frame_surface_enrichment(
+            &conn,
+            &frame,
+            &content_units,
+            &app_contexts,
+            &ax_nodes,
+            &[],
+            &events,
+            None,
+        )
+        .unwrap();
+
+        let (domain, active_relative_file, openability, selected_hash, visible_sample): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT domain, active_relative_file, openability,
+                        selected_text_hash, visible_text_sample
+                 FROM continue_surface_snapshots
+                 WHERE frame_id = ?1",
+                params![frame_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(domain, "codex_ide_extension");
+        assert_eq!(active_relative_file.as_deref(), Some("enrichment.rs"));
+        assert_eq!(openability, "openable");
+        assert!(selected_hash.is_some());
+        assert!(!visible_sample
+            .as_deref()
+            .unwrap_or("")
+            .contains("raw selected code must not leak"));
     }
 
     #[test]

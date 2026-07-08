@@ -659,6 +659,13 @@ h3 {
   background: rgba(235, 239, 240, 0.86);
 }
 
+.answer-eyebrow .answer-status-pill {
+  border-color: rgba(93, 102, 108, 0.14);
+  color: #596267;
+  background: rgba(244, 247, 247, 0.86);
+  font-weight: 720;
+}
+
 .answer-hero {
   display: grid;
   gap: 10px;
@@ -1468,6 +1475,10 @@ h3 {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
+}
+
+.weak-surface-id-grid {
+  align-items: stretch;
 }
 
 .anchor-id-group {
