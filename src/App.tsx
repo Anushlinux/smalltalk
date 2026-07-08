@@ -444,6 +444,13 @@ type ContinueCandidateSummary = {
   feedback_last_reconfirming_evidence_ms?: number | null;
   feedback_score_cap?: number | null;
   feedback_reason_codes?: string[];
+  branch_promotion_state?: string | null;
+  branch_public_return_eligible?: boolean | null;
+  branch_promotion_reason?: string | null;
+  branch_kind?: string | null;
+  branch_eligibility_state?: string | null;
+  public_return_eligible?: boolean;
+  blocked_reason?: string | null;
   evidence_frame_id?: string | null;
   supporting_episode_id?: string | null;
   last_meaningful_action_id?: string | null;
@@ -547,6 +554,7 @@ type ContinueDecisionResult = {
   warnings: string[];
   validation_failures: string[];
   handoff: ContinueHandoff;
+  support_evidence?: ContinueSupportEvidenceItem[];
   alternatives: ContinueCandidateSummary[];
   generated_candidates: number;
   validation_status: string;
@@ -558,9 +566,25 @@ type ContinueDecisionResult = {
   eligible_candidate_count_after_feedback_gate?: number;
   model_candidate_count_before_feedback_filter?: number;
   model_candidate_count_after_feedback_filter?: number;
+  selectable_candidate_count_before_branch_filter?: number;
+  selectable_candidate_count_after_branch_filter?: number;
+  excluded_branch_candidate_ids?: string[];
+  support_evidence_count?: number;
+  branch_validation_failures?: string[];
   observe_before_decide?: unknown | null;
   app_activity?: unknown | null;
   activity_summary?: ContinueActivitySummary | null;
+};
+
+type ContinueSupportEvidenceItem = {
+  artifact_id?: string | null;
+  artifact_kind?: string | null;
+  title?: string | null;
+  branch_kind: string;
+  origin_artifact_id?: string | null;
+  role: string;
+  public_return_eligible: boolean;
+  reason: string;
 };
 
 type ContinueHandoff = {
@@ -645,6 +669,13 @@ type ContinueEvalReport = {
   current_focus_false_positive_rate: number;
   hallucinated_artifact_count: number;
   model_validation_fallback_rate: number;
+  support_branch_false_positive_rate?: number;
+  unpromoted_branch_selected_count?: number;
+  branch_origin_recall_rate?: number;
+  promoted_branch_selection_precision?: number;
+  message_interrupt_false_positive_rate?: number;
+  diagnostic_self_selected_count?: number;
+  model_branch_policy_violation_count?: number;
   cases: Array<{
     name: string;
     scenario: string;
@@ -653,6 +684,13 @@ type ContinueEvalReport = {
     target_artifact_correct: boolean;
     validation_status: string;
     validation_failures: string[];
+    support_branch_false_positive?: boolean;
+    unpromoted_branch_selected?: boolean;
+    branch_origin_recalled?: boolean;
+    promoted_branch_selection_correct?: boolean;
+    message_interrupt_false_positive?: boolean;
+    diagnostic_self_selected?: boolean;
+    model_branch_policy_violation?: boolean;
   }>;
 };
 
@@ -741,8 +779,13 @@ type ContinueWorkstreamCandidateDetail = {
   why_not_primary?: string | null;
   feedback_suppression_state?: string;
   feedback_reason_codes?: string[];
+  risk_flags?: string[];
+  score_caps_applied?: string[];
   eligible_for_primary_selection?: boolean;
   public_alternative_eligible_after_feedback?: boolean;
+  branch_promotion_state?: string | null;
+  branch_public_return_eligible?: boolean | null;
+  branch_promotion_reason?: string | null;
   created_at_ms: number;
 };
 
@@ -1211,6 +1254,11 @@ function App() {
 
   const openContinueTarget = useCallback(async () => {
     if (!continueDecision) return;
+    if (getContinueCardActionState(continueDecision).kind !== "openable_return_target") {
+      setContinueOpenResult(null);
+      setContinueError("This surface is supporting evidence, not a safe continuation target.");
+      return;
+    }
     const resumeTarget = continueDecision.resume_work_target || continueDecision.return_target || null;
     setBusyAction("open_continue_target");
     setContinueOpenResult(null);
@@ -3480,9 +3528,10 @@ function ContinuationAnswer({
   const presentation = decision && !handoff ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
-  const alternatives = decision?.alternatives || [];
+  const alternatives = (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const evidenceLines = decision ? productEvidenceLines(decision).slice(0, 3) : [];
+  const supportEvidenceLines = decision ? supportEvidenceProductLines(decision).slice(0, 3) : [];
   const rawWorkstreamLine = handoff?.headline || presentation?.workstreamTitle || primaryMessage;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
   const targetLooksInternal = isInternalFacingText(rawTargetLine);
@@ -3665,6 +3714,14 @@ function ContinuationAnswer({
         {isInspectPrimary && evidenceLines.length ? (
           <div className="answer-why-strip" aria-label="Missing evidence">
             {evidenceLines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </div>
+        ) : null}
+
+        {supportEvidenceLines.length ? (
+          <div className="answer-why-strip support-evidence-strip" aria-label="Support evidence">
+            {supportEvidenceLines.map((line) => (
               <span key={line}>{line}</span>
             ))}
           </div>
@@ -3972,8 +4029,9 @@ function WorkstreamDetailPanel({
   const primaryCandidate =
     detail.candidates.find(
       (candidate) =>
-        candidate.candidate_id === detail.latest_decision?.selected_candidate_id,
-    ) || detail.candidates[0] || null;
+        candidate.candidate_id === detail.latest_decision?.selected_candidate_id &&
+        !candidateIsSupportEvidenceOnly(candidate),
+    ) || detail.candidates.find((candidate) => !candidateIsSupportEvidenceOnly(candidate)) || null;
   const artifactGroups = groupArtifactsByRole(detail.artifacts);
   const latestFeedback = detail.feedback_events[0];
 
@@ -4140,29 +4198,37 @@ function WorkstreamDetailPanel({
             <h3>Candidate targets</h3>
             <span>{detail.candidates.length}</span>
           </div>
-          {detail.candidates.slice(0, 6).map((candidate) => (
-            <div className="candidate-row" key={candidate.candidate_id}>
-              <div>
-                <strong>{candidate.target_title || candidate.target_artifact_id || sentenceCase(candidate.candidate_kind)}</strong>
-                <span>{candidate.reason || "No local reason returned."}</span>
-                <small>
-                  {[
-                    sentenceCase(candidate.candidate_kind),
-                    candidate.confidence_label || confidenceLabel(candidate.score),
-                    candidate.target_openability,
-                  ].filter(Boolean).join(" / ")}
-                </small>
+          {detail.candidates.slice(0, 6).map((candidate) => {
+            const supportOnly = candidateIsSupportEvidenceOnly(candidate);
+            return (
+              <div className="candidate-row" key={candidate.candidate_id}>
+                <div>
+                  <strong>{candidate.target_title || candidate.target_artifact_id || sentenceCase(candidate.candidate_kind)}</strong>
+                  <span>
+                    {supportOnly
+                      ? productizeInternalLabel(candidate.why_not_primary || candidate.branch_promotion_reason || candidate.reason) ||
+                        "Supporting evidence, not a continuation target."
+                      : candidate.reason || "No local reason returned."}
+                  </span>
+                  <small>
+                    {[
+                      sentenceCase(candidate.candidate_kind),
+                      candidate.confidence_label || confidenceLabel(candidate.score),
+                      candidate.target_openability,
+                    ].filter(Boolean).join(" / ")}
+                  </small>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={busyAction !== null || supportOnly}
+                  onClick={() => onContinueFromCandidate(candidate)}
+                >
+                  {supportOnly ? "Evidence only" : "Continue from this"}
+                </button>
               </div>
-              <button
-                className="secondary-button"
-                type="button"
-                disabled={busyAction !== null}
-                onClick={() => onContinueFromCandidate(candidate)}
-              >
-                Continue from this
-              </button>
-            </div>
-          ))}
+            );
+          })}
           {detail.candidates.length === 0 ? (
             <div className="workstream-empty">
               <strong>No return targets yet</strong>
@@ -4883,7 +4949,7 @@ function isDirectResumeTargetOpenable(target?: ContinueReturnTarget | null) {
 function getContinueCardActionState(decision: ContinueDecisionResult): ContinueCardActionState {
   const target = decision.resume_work_target || decision.return_target || null;
   const hasOpenableReturnTarget = isDirectResumeTargetOpenable(target);
-  if (hasOpenableReturnTarget) {
+  if (hasOpenableReturnTarget && !decisionReturnTargetIsSupportEvidence(decision)) {
     return { kind: "openable_return_target", label: "Continue here" };
   }
 
@@ -4905,6 +4971,90 @@ function getContinueCardActionState(decision: ContinueDecisionResult): ContinueC
   return { kind: "no_clear_continuation", label: "Inspect evidence" };
 }
 
+function decisionReturnTargetIsSupportEvidence(decision: ContinueDecisionResult) {
+  const target = decision.resume_work_target || decision.return_target || null;
+  if (!target) return false;
+  const selectedCandidate = decision.alternatives?.find(
+    (candidate) =>
+      candidate.candidate_id === decision.selected_candidate_id ||
+      candidate.target_artifact_id === target.artifact_id,
+  );
+  if (selectedCandidate && candidateIsSupportEvidenceOnly(selectedCandidate)) {
+    return true;
+  }
+  if (
+    decision.support_evidence?.some(
+      (item) => item.artifact_id && item.artifact_id === target.artifact_id && !item.public_return_eligible,
+    )
+  ) {
+    return true;
+  }
+  return continueDecisionEvidenceNotes(decision).some((note) => {
+    const key = normalizeToken(note);
+    return (
+      key === "branch_surface_is_evidence_not_default_return_target" ||
+      key === "model_selected_unpromoted_branch" ||
+      key === "model_selected_diagnostic_self" ||
+      key === "model_selected_interrupt_without_promotion" ||
+      key === "model_ignored_branch_eligibility" ||
+      key.includes("branch_promotion_state_unpromoted") ||
+      key.includes("branch_support")
+    );
+  });
+}
+
+function isPublicAlternativeCandidate(candidate: ContinueCandidateSummary) {
+  return !candidateIsSupportEvidenceOnly(candidate);
+}
+
+function candidateIsSupportEvidenceOnly(candidate: ContinueCandidateSummary | ContinueWorkstreamCandidateDetail) {
+  if (candidate.branch_public_return_eligible === false) return true;
+  const branchState = normalizeToken(candidate.branch_promotion_state);
+  if (
+    [
+      "unpromoted",
+      "blocked_diagnostic_self",
+      "blocked_feedback_suppressed",
+      "blocked_thin_current_focus",
+    ].includes(branchState)
+  ) {
+    return true;
+  }
+  const role = normalizeToken(candidate.continuation_role);
+  if (
+    [
+      "support_context",
+      "interruption",
+      "diagnostic_only",
+      "current_focus_only",
+      "background_consumption",
+      "suppressed",
+      "needs_fresh_capture",
+    ].includes(role)
+  ) {
+    return true;
+  }
+  if (candidate.candidate_kind === "evidence_only") return true;
+  if (candidate.eligible_for_primary_selection === false) return true;
+  if (candidate.public_alternative_eligible_after_feedback === false) return true;
+  const notes = [
+    ...(candidate.risk_flags || []),
+    ...(candidate.score_caps_applied || []),
+    candidate.why_not_primary || "",
+    candidate.branch_promotion_reason || "",
+    candidate.reason || "",
+  ].map(normalizeToken);
+  return notes.some(
+    (note) =>
+      note.includes("support_branch") ||
+      note.includes("support_evidence") ||
+      note.includes("unpromoted_branch") ||
+      note.includes("branch_support") ||
+      note.includes("not_primary_return_target") ||
+      note.includes("only_evidence"),
+  );
+}
+
 function continueDecisionEvidenceNotes(decision: ContinueDecisionResult) {
   return [
     ...decision.missing_evidence,
@@ -4913,6 +5063,41 @@ function continueDecisionEvidenceNotes(decision: ContinueDecisionResult) {
     ...(decision.active_current_work_unresolved?.missing_evidence || []),
     ...(decision.active_current_work_unresolved?.warnings || []),
   ].filter(Boolean);
+}
+
+function supportEvidenceProductLines(decision: ContinueDecisionResult) {
+  return [...new Set((decision.support_evidence || [])
+    .filter((item) => !item.public_return_eligible)
+    .map(supportEvidenceProductLine)
+    .filter(Boolean))];
+}
+
+function supportEvidenceProductLine(item: ContinueSupportEvidenceItem) {
+  const title = cleanHumanText(item.title || "") || productizeArtifactKind(item.artifact_kind);
+  const role = productizeSupportEvidenceRole(item.branch_kind || item.role);
+  const reason = productizeInternalLabel(item.reason) || productizeSupportEvidenceRole(item.reason);
+  if (title && role) return `${title}: ${role}`;
+  if (role) return role;
+  if (reason) return reason;
+  return "Supporting evidence, not the return target.";
+}
+
+function productizeSupportEvidenceRole(value?: string | null) {
+  const key = normalizeToken(value);
+  const labels: Record<string, string> = {
+    support_context: "Supporting evidence, not the return target.",
+    support_evidence: "Supporting evidence, not the return target.",
+    search_branch: "Search evidence, not the return target.",
+    documentation_reference: "Reference material for the task.",
+    source_evidence: "Source evidence for the task.",
+    message_interrupt: "Interruption context, not the unfinished task.",
+    interruption: "Interruption context, not the unfinished task.",
+    diagnostic_only: "Diagnostic evidence, not the return target.",
+    current_focus_only: "Current focus only; no safe return target yet.",
+    branch_search_without_origin: "Search branch has no grounded origin target.",
+    branch_no_origin: "Support branch has no grounded origin target.",
+  };
+  return labels[key] || "";
 }
 
 function productEvidenceLines(decision: ContinueDecisionResult) {
@@ -5039,6 +5224,14 @@ function productizeInternalLabel(value?: string | null) {
     micro_inference_missing_openai_api_key: "AI ranking is unavailable; using local evidence.",
     smalltalk_self_observation_downranked: "Smalltalk ignored its own UI as evidence.",
     branch_surface_is_evidence_not_default_return_target: "Branch surface is evidence, not the default return target.",
+    model_selected_unpromoted_branch: "Support branch was blocked as a return target.",
+    model_selected_diagnostic_self: "Diagnostic evidence was blocked as a return target.",
+    model_selected_interrupt_without_promotion: "Interruption context was blocked as a return target.",
+    model_ignored_branch_eligibility: "Branch evidence was kept out of the return target.",
+    model_promoted_support_without_local_evidence: "Support evidence was not promoted without local proof.",
+    branch_or_support_target_promoted_without_strong_local_score: "Support branch lacked enough local evidence to become the target.",
+    branch_support_unpromoted_public_return_gate: "Support branch was not promoted to a return target.",
+    branch_support_not_default_return_target: "Support branch is evidence, not the default return target.",
     privacy_sensitive_or_redacted_target_local_only: "Target contains sensitive or redacted evidence and stays local.",
     current_focus_mismatch: "Current focus is not the return target.",
   };

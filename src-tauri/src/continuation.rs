@@ -21,6 +21,11 @@ const FEEDBACK_NEGATIVE_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const FEEDBACK_HARD_NEGATIVE_RECENT_MS: i64 = 48 * 60 * 60 * 1000;
 const FEEDBACK_SCORE_CAP_AFTER_SOFT_NEGATIVE: f64 = 0.44;
 const FEEDBACK_SCORE_CAP_AFTER_REPEATED_IGNORES: f64 = 0.35;
+const BRANCH_ORIGIN_DEFAULT_LOOKBACK_MS: i64 = 15 * 60 * 1000;
+const SUSTAINED_BRANCH_MIN_ACTIONS: usize = 3;
+const SUSTAINED_BRANCH_MIN_MS: i64 = 90_000;
+const BRIEF_INTERRUPT_MAX_MS: i64 = 120_000;
+const PROMOTION_CONFIDENCE_MIN: f64 = 0.65;
 
 const CONTINUE_TABLES: &[&str] = &[
     "continue_schema_migrations",
@@ -37,6 +42,7 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_workstream_artifacts",
     "continue_workstream_state_snapshots",
     "continue_workstream_edges",
+    "continue_branch_contexts",
     "continue_open_loops",
     "continue_open_loop_artifacts",
     "continue_open_loop_evidence",
@@ -129,6 +135,162 @@ pub enum ContinueActionRole {
     Return,
     Interrupt,
     Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchKind {
+    PrimaryWork,
+    SearchBranch,
+    DocumentationReference,
+    SourceEvidence,
+    VerificationBranch,
+    MessageInterrupt,
+    DiagnosticSelf,
+    SettingsOrAdmin,
+    TerminalSupportOutput,
+    ToolOrAgentOutput,
+    CurrentFocusOnly,
+    NewCurrentTask,
+    UnknownSupport,
+    UnknownPrimary,
+}
+
+impl BranchKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            BranchKind::PrimaryWork => "primary_work",
+            BranchKind::SearchBranch => "search_branch",
+            BranchKind::DocumentationReference => "documentation_reference",
+            BranchKind::SourceEvidence => "source_evidence",
+            BranchKind::VerificationBranch => "verification_branch",
+            BranchKind::MessageInterrupt => "message_interrupt",
+            BranchKind::DiagnosticSelf => "diagnostic_self",
+            BranchKind::SettingsOrAdmin => "settings_or_admin",
+            BranchKind::TerminalSupportOutput => "terminal_support_output",
+            BranchKind::ToolOrAgentOutput => "tool_or_agent_output",
+            BranchKind::CurrentFocusOnly => "current_focus_only",
+            BranchKind::NewCurrentTask => "new_current_task",
+            BranchKind::UnknownSupport => "unknown_support",
+            BranchKind::UnknownPrimary => "unknown_primary",
+        }
+    }
+
+    fn default_action_role(&self) -> &'static str {
+        match self {
+            BranchKind::PrimaryWork | BranchKind::NewCurrentTask | BranchKind::UnknownPrimary => {
+                "primary"
+            }
+            BranchKind::SearchBranch | BranchKind::VerificationBranch => "branch",
+            BranchKind::MessageInterrupt => "interrupt",
+            BranchKind::CurrentFocusOnly => "unknown",
+            BranchKind::DocumentationReference
+            | BranchKind::SourceEvidence
+            | BranchKind::DiagnosticSelf
+            | BranchKind::SettingsOrAdmin
+            | BranchKind::TerminalSupportOutput
+            | BranchKind::ToolOrAgentOutput
+            | BranchKind::UnknownSupport => "support",
+        }
+    }
+
+    fn promotion_eligible_by_default(&self) -> bool {
+        matches!(
+            self,
+            BranchKind::PrimaryWork | BranchKind::NewCurrentTask | BranchKind::UnknownPrimary
+        )
+    }
+
+    fn public_return_eligible_by_default(&self) -> bool {
+        matches!(
+            self,
+            BranchKind::PrimaryWork | BranchKind::NewCurrentTask | BranchKind::UnknownPrimary
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchClassification {
+    pub branch_kind: BranchKind,
+    pub action_role: String,
+    pub promotion_eligible_by_default: bool,
+    pub public_return_eligible_by_default: bool,
+    pub confidence: f64,
+    pub reason_code: String,
+}
+
+impl BranchClassification {
+    fn new(branch_kind: BranchKind, confidence: f64, reason_code: &str) -> Self {
+        Self {
+            action_role: branch_kind.default_action_role().to_string(),
+            promotion_eligible_by_default: branch_kind.promotion_eligible_by_default(),
+            public_return_eligible_by_default: branch_kind.public_return_eligible_by_default(),
+            branch_kind,
+            confidence,
+            reason_code: reason_code.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentationEpisodePolicy {
+    SamePrimaryEpisode,
+    SupportBranchEpisode,
+    VerificationBranchEpisode,
+    InterruptEpisode,
+    DiagnosticEpisode,
+    NewPrimaryEpisode,
+    CurrentFocusOnlyEpisode,
+}
+
+impl SegmentationEpisodePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            SegmentationEpisodePolicy::SamePrimaryEpisode => "same_primary_episode",
+            SegmentationEpisodePolicy::SupportBranchEpisode => "support_branch_episode",
+            SegmentationEpisodePolicy::VerificationBranchEpisode => "verification_branch_episode",
+            SegmentationEpisodePolicy::InterruptEpisode => "interrupt_episode",
+            SegmentationEpisodePolicy::DiagnosticEpisode => "diagnostic_episode",
+            SegmentationEpisodePolicy::NewPrimaryEpisode => "new_primary_episode",
+            SegmentationEpisodePolicy::CurrentFocusOnlyEpisode => "current_focus_only_episode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentationWorkstreamPolicy {
+    AttachAsSupportToOrigin,
+    AttachAsVerificationToOrigin,
+    AttachAsInterruptContext,
+    SplitNewWorkstream,
+    IgnoreForPrimarySelection,
+    KeepCurrentFocusOnly,
+}
+
+impl SegmentationWorkstreamPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin => "attach_as_support_to_origin",
+            SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin => {
+                "attach_as_verification_to_origin"
+            }
+            SegmentationWorkstreamPolicy::AttachAsInterruptContext => "attach_as_interrupt_context",
+            SegmentationWorkstreamPolicy::SplitNewWorkstream => "split_new_workstream",
+            SegmentationWorkstreamPolicy::IgnoreForPrimarySelection => {
+                "ignore_for_primary_selection"
+            }
+            SegmentationWorkstreamPolicy::KeepCurrentFocusOnly => "keep_current_focus_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SegmentationDecision {
+    episode_policy: SegmentationEpisodePolicy,
+    workstream_policy: SegmentationWorkstreamPolicy,
+    artifact_role_override: Option<&'static str>,
+    reason_code: &'static str,
+    confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,6 +848,12 @@ pub struct ContinueTaskAction {
     pub attribution_confidence: Option<f64>,
     pub classifier_context: Option<Value>,
     pub quality_flags: Vec<String>,
+    pub branch_kind: Option<String>,
+    pub branch_action_role: Option<String>,
+    pub branch_promotion_eligible_by_default: Option<bool>,
+    pub branch_public_return_eligible_by_default: Option<bool>,
+    pub branch_confidence: Option<f64>,
+    pub branch_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,6 +980,101 @@ pub struct ContinueWorkstreamEdge {
     pub last_seen_ms: i64,
     pub evidence_action_ids: Vec<String>,
     pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueBranchContext {
+    pub id: String,
+    pub branch_action_id: String,
+    pub branch_artifact_id: String,
+    pub origin_artifact_id: Option<String>,
+    pub origin_workstream_id: Option<String>,
+    pub branch_kind: String,
+    pub branch_started_at_ms: i64,
+    pub last_branch_seen_at_ms: i64,
+    pub returned_to_origin: bool,
+    pub returned_to_origin_at_ms: Option<i64>,
+    pub promotion_state: String,
+    pub promotion_reason: Option<String>,
+    pub confidence: f64,
+    pub reason_code: Option<String>,
+    pub evidence_action_ids: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchPromotionState {
+    Unpromoted,
+    PromotedPrimary,
+    PromotedBlocker,
+    PromotedUserCorrected,
+    PromotedUserAccepted,
+    PromotedSustainedWork,
+    BlockedDiagnosticSelf,
+    BlockedFeedbackSuppressed,
+    BlockedThinCurrentFocus,
+}
+
+impl BranchPromotionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            BranchPromotionState::Unpromoted => "unpromoted",
+            BranchPromotionState::PromotedPrimary => "promoted_primary",
+            BranchPromotionState::PromotedBlocker => "promoted_blocker",
+            BranchPromotionState::PromotedUserCorrected => "promoted_user_corrected",
+            BranchPromotionState::PromotedUserAccepted => "promoted_user_accepted",
+            BranchPromotionState::PromotedSustainedWork => "promoted_sustained_work",
+            BranchPromotionState::BlockedDiagnosticSelf => "blocked_diagnostic_self",
+            BranchPromotionState::BlockedFeedbackSuppressed => "blocked_feedback_suppressed",
+            BranchPromotionState::BlockedThinCurrentFocus => "blocked_thin_current_focus",
+        }
+    }
+
+    fn public_return_eligible(self) -> bool {
+        matches!(
+            self,
+            BranchPromotionState::PromotedPrimary
+                | BranchPromotionState::PromotedBlocker
+                | BranchPromotionState::PromotedUserCorrected
+                | BranchPromotionState::PromotedUserAccepted
+                | BranchPromotionState::PromotedSustainedWork
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BranchPromotionActionEvidence {
+    action_id: String,
+    action_kind: String,
+    action_role: String,
+    branch_kind: Option<String>,
+    branch_action_role: Option<String>,
+    created_at_ms: i64,
+    confidence: f64,
+    collapse_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct BranchPromotionInput {
+    branch_kind: String,
+    branch_started_at_ms: i64,
+    returned_to_origin_at_ms: Option<i64>,
+    feedback_hard_suppressed: bool,
+    feedback_positive_kind: Option<String>,
+    has_origin: bool,
+    actions: Vec<BranchPromotionActionEvidence>,
+}
+
+#[derive(Debug, Clone)]
+struct BranchPromotionDecision {
+    promotion_state: BranchPromotionState,
+    public_return_eligible: bool,
+    promoted_at_ms: Option<i64>,
+    promotion_reason: String,
+    confidence: f64,
+    evidence_action_ids: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1051,6 +1314,7 @@ pub struct ContinueDecisionResult {
     pub warnings: Vec<String>,
     pub validation_failures: Vec<String>,
     pub handoff: ContinueHandoff,
+    pub support_evidence: Vec<ContinueSupportEvidenceItem>,
     pub alternatives: Vec<ContinueCandidateSummary>,
     pub generated_candidates: i64,
     pub validation_status: String,
@@ -1062,6 +1326,11 @@ pub struct ContinueDecisionResult {
     pub eligible_candidate_count_after_feedback_gate: usize,
     pub model_candidate_count_before_feedback_filter: usize,
     pub model_candidate_count_after_feedback_filter: usize,
+    pub selectable_candidate_count_before_branch_filter: usize,
+    pub selectable_candidate_count_after_branch_filter: usize,
+    pub excluded_branch_candidate_ids: Vec<String>,
+    pub support_evidence_count: usize,
+    pub branch_validation_failures: Vec<String>,
     pub continue_output_mode: String,
     pub evidence_watermark_hash: String,
     pub latest_boundary_revision: Option<i64>,
@@ -1118,6 +1387,11 @@ pub struct ContinueAuditInferenceEvent {
     pub model_candidate_count_before_feedback_filter: usize,
     pub model_candidate_count_after_feedback_filter: usize,
     pub suppressed_candidate_ids_not_sent: Vec<String>,
+    pub selectable_candidate_count_before_branch_filter: usize,
+    pub selectable_candidate_count_after_branch_filter: usize,
+    pub excluded_branch_candidate_ids: Vec<String>,
+    pub support_evidence_count: usize,
+    pub branch_validation_failures: Vec<String>,
     pub feedback_policy_version: String,
     pub pack: Option<Value>,
     pub request: Option<Value>,
@@ -1343,6 +1617,13 @@ pub struct ContinueEvalReport {
     pub fresh_surface_retention_rate: f64,
     pub stale_target_suppression_rate: f64,
     pub support_branch_false_promotion_rate: f64,
+    pub support_branch_false_positive_rate: f64,
+    pub unpromoted_branch_selected_count: i64,
+    pub branch_origin_recall_rate: f64,
+    pub promoted_branch_selection_precision: f64,
+    pub message_interrupt_false_positive_rate: f64,
+    pub diagnostic_self_selected_count: i64,
+    pub model_branch_policy_violation_count: i64,
     pub truthful_thin_mode_rate: f64,
     pub feedback_obedience_case_count: i64,
     pub feedback_suppressed_target_exposed_count: i64,
@@ -1431,6 +1712,13 @@ pub struct ContinueEvalCaseReport {
     pub fresh_surface_retained: bool,
     pub stale_target_suppressed: bool,
     pub support_branch_false_promotion: bool,
+    pub support_branch_false_positive: bool,
+    pub unpromoted_branch_selected: bool,
+    pub branch_origin_recalled: bool,
+    pub promoted_branch_selection_correct: bool,
+    pub message_interrupt_false_positive: bool,
+    pub diagnostic_self_selected: bool,
+    pub model_branch_policy_violation: bool,
     pub truthful_thin_mode: bool,
     pub feedback_obedience_case: bool,
     pub feedback_suppressed_target_exposed: bool,
@@ -1508,6 +1796,7 @@ pub struct ContinueDecisionTrace {
     pub workstreams: Vec<TraceWorkstreamSummary>,
     pub workstream_state_snapshots: Vec<ContinueWorkstreamStateSnapshot>,
     pub workstream_edges: Vec<ContinueWorkstreamEdge>,
+    pub branch_contexts: Vec<ContinueBranchContext>,
     pub open_loops: Vec<ContinueOpenLoop>,
     pub candidates: Vec<TraceCandidateSummary>,
     pub scoring: Vec<TraceScoringSummary>,
@@ -1559,6 +1848,12 @@ pub struct TraceTaskActionSummary {
     pub attribution_confidence: Option<f64>,
     pub classifier_context: Option<Value>,
     pub quality_flags: Vec<String>,
+    pub branch_kind: Option<String>,
+    pub branch_action_role: Option<String>,
+    pub branch_promotion_eligible_by_default: Option<bool>,
+    pub branch_public_return_eligible_by_default: Option<bool>,
+    pub branch_confidence: Option<f64>,
+    pub branch_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2005,6 +2300,13 @@ pub struct ContinueCandidateSummary {
     pub feedback_last_reconfirming_evidence_ms: Option<i64>,
     pub feedback_score_cap: Option<f64>,
     pub feedback_reason_codes: Vec<String>,
+    pub branch_promotion_state: Option<String>,
+    pub branch_public_return_eligible: Option<bool>,
+    pub branch_promotion_reason: Option<String>,
+    pub branch_kind: Option<String>,
+    pub branch_eligibility_state: Option<String>,
+    pub public_return_eligible: bool,
+    pub blocked_reason: Option<String>,
     pub evidence_frame_id: Option<String>,
     pub supporting_episode_id: Option<String>,
     pub last_meaningful_action_id: Option<String>,
@@ -2072,6 +2374,12 @@ pub struct RecentContinueTaskAction {
     pub attribution_confidence: Option<f64>,
     pub classifier_context: Option<Value>,
     pub quality_flags: Vec<String>,
+    pub branch_kind: Option<String>,
+    pub branch_action_role: Option<String>,
+    pub branch_promotion_eligible_by_default: Option<bool>,
+    pub branch_public_return_eligible_by_default: Option<bool>,
+    pub branch_confidence: Option<f64>,
+    pub branch_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2383,6 +2691,12 @@ struct ExtractedTaskAction {
     attribution_confidence: Option<f64>,
     classifier_context_json: Option<String>,
     quality_flags: Vec<String>,
+    branch_kind: Option<String>,
+    branch_action_role: Option<String>,
+    branch_promotion_eligible_by_default: Option<bool>,
+    branch_public_return_eligible_by_default: Option<bool>,
+    branch_confidence: Option<f64>,
+    branch_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2424,6 +2738,10 @@ struct ContinueActionRecord {
     semantic_evidence_quote: Option<String>,
     semantic_delta_confidence: Option<f64>,
     semantic_moment_id: Option<String>,
+    branch_kind: Option<String>,
+    branch_action_role: Option<String>,
+    branch_confidence: Option<f64>,
+    branch_reason_code: Option<String>,
     artifact: Option<ContinueArtifactRecord>,
     secondary_artifact: Option<ContinueArtifactRecord>,
 }
@@ -2507,6 +2825,9 @@ struct ScorerArtifact {
     openability: String,
     last_seen_frame_id: Option<String>,
     last_seen_timestamp: i64,
+    branch_promotion_state: Option<String>,
+    branch_public_return_eligible: Option<bool>,
+    branch_promotion_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2645,6 +2966,9 @@ struct ScoredContinueCandidate {
     feedback_reason_codes: Vec<String>,
     eligible_for_primary_selection: bool,
     selection_demotion_reason: Option<String>,
+    branch_promotion_state: Option<String>,
+    branch_public_return_eligible: Option<bool>,
+    branch_promotion_reason: Option<String>,
     resume_work_target: Option<ScorerArtifact>,
     open_loop: Option<ScorerOpenLoop>,
 }
@@ -2662,6 +2986,7 @@ struct ContinueMicroInferencePack {
     current_surface: Option<CurrentSurfaceForModel>,
     workstreams: Vec<ContinuePackWorkstream>,
     candidates: Vec<ContinuePackCandidate>,
+    support_evidence: Vec<ContinueSupportEvidenceItem>,
     evidence_packs_v2: Vec<CandidateEvidencePackV2>,
     artifact_roles: Vec<ContinuePackArtifactRole>,
     breadcrumbs: Vec<ContinuePackBreadcrumb>,
@@ -2703,6 +3028,21 @@ pub struct CandidateEvidencePackV2 {
     pub feedback_last_negative_ms: Option<i64>,
     pub feedback_last_reconfirming_evidence_ms: Option<i64>,
     pub feedback_reason_codes: Vec<String>,
+    pub branch_promotion_state: Option<String>,
+    pub branch_public_return_eligible: Option<bool>,
+    pub branch_promotion_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueSupportEvidenceItem {
+    pub artifact_id: Option<String>,
+    pub artifact_kind: Option<String>,
+    pub title: Option<String>,
+    pub branch_kind: String,
+    pub origin_artifact_id: Option<String>,
+    pub role: String,
+    pub public_return_eligible: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2823,6 +3163,12 @@ struct ContinuePackCandidate {
     feedback_last_negative_ms: Option<i64>,
     feedback_last_reconfirming_evidence_ms: Option<i64>,
     feedback_reason_codes: Vec<String>,
+    branch_promotion_state: Option<String>,
+    branch_public_return_eligible: Option<bool>,
+    branch_promotion_reason: Option<String>,
+    branch_eligibility_state: Option<String>,
+    public_return_eligible: bool,
+    blocked_reason: Option<String>,
     local_reason: Option<String>,
 }
 
@@ -2959,6 +3305,16 @@ struct ContinueEvalCandidateFixture {
     #[serde(default)]
     is_support_branch: Option<bool>,
     #[serde(default)]
+    branch_kind: Option<String>,
+    #[serde(default)]
+    branch_promotion_state: Option<String>,
+    #[serde(default)]
+    branch_public_return_eligible: Option<bool>,
+    #[serde(default)]
+    expected_branch_promoted: Option<bool>,
+    #[serde(default)]
+    origin_artifact_id: Option<String>,
+    #[serde(default)]
     stale_target_suppressed: Option<bool>,
     #[serde(default)]
     suppressed_target_open_attempted: Option<bool>,
@@ -3080,7 +3436,10 @@ pub fn recent_continue_task_actions(
                     semantic_after_hint, semantic_evidence_quote, semantic_delta_confidence,
                     semantic_moment_id, evidence_source_kind, evidence_span_ids_json,
                     evidence_attribution_json, attribution_confidence, classifier_context_json,
-                    quality_flags_json
+                    quality_flags_json, branch_kind, branch_action_role,
+                    branch_promotion_eligible_by_default,
+                    branch_public_return_eligible_by_default,
+                    branch_confidence, branch_reason_code
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -3122,6 +3481,16 @@ pub fn recent_continue_task_actions(
                 attribution_confidence: row.get(27)?,
                 classifier_context: parse_optional_json_value(row.get(28)?),
                 quality_flags: parse_string_array(&quality_flags_json),
+                branch_kind: row.get(30)?,
+                branch_action_role: row.get(31)?,
+                branch_promotion_eligible_by_default: row
+                    .get::<_, Option<i64>>(32)?
+                    .map(|value| value != 0),
+                branch_public_return_eligible_by_default: row
+                    .get::<_, Option<i64>>(33)?
+                    .map(|value| value != 0),
+                branch_confidence: row.get(34)?,
+                branch_reason_code: row.get(35)?,
             })
         })
         .map_err(to_string)?;
@@ -3179,6 +3548,115 @@ pub fn recent_continue_semantic_moments(
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
 
+pub fn load_branch_context_for_artifact(
+    conn: &Connection,
+    artifact_id: &str,
+) -> Result<Option<ContinueBranchContext>, String> {
+    ensure_continue_schema(conn)?;
+    conn.query_row(
+        "SELECT id, branch_action_id, origin_artifact_id, origin_workstream_id,
+                branch_artifact_id, branch_kind, branch_started_at_ms,
+                last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
+                promotion_reason, confidence, reason_code, evidence_action_ids_json,
+                created_at_ms, updated_at_ms
+         FROM continue_branch_contexts
+         WHERE branch_artifact_id = ?1 OR origin_artifact_id = ?1
+         ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC
+         LIMIT 1",
+        params![artifact_id],
+        branch_context_from_row,
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+pub fn load_branch_context_for_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<ContinueBranchContext>, String> {
+    ensure_continue_schema(conn)?;
+    let evidence_pattern = format!("%\"{}\"%", action_id.replace('"', ""));
+    conn.query_row(
+        "SELECT id, branch_action_id, origin_artifact_id, origin_workstream_id,
+                branch_artifact_id, branch_kind, branch_started_at_ms,
+                last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
+                promotion_reason, confidence, reason_code, evidence_action_ids_json,
+                created_at_ms, updated_at_ms
+         FROM continue_branch_contexts
+         WHERE branch_action_id = ?1
+            OR evidence_action_ids_json LIKE ?2
+         ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC
+         LIMIT 1",
+        params![action_id, evidence_pattern],
+        branch_context_from_row,
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+pub fn load_recent_branch_contexts(
+    conn: &Connection,
+    limit: Option<i64>,
+) -> Result<Vec<ContinueBranchContext>, String> {
+    ensure_continue_schema(conn)?;
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, branch_action_id, origin_artifact_id, origin_workstream_id,
+                    branch_artifact_id, branch_kind, branch_started_at_ms,
+                    last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
+                    promotion_reason, confidence, reason_code, evidence_action_ids_json,
+                    created_at_ms, updated_at_ms
+             FROM continue_branch_contexts
+             ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC
+             LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit], branch_context_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+pub fn has_returned_to_origin(conn: &Connection, branch_artifact_id: &str) -> Result<bool, String> {
+    ensure_continue_schema(conn)?;
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM continue_branch_contexts
+            WHERE branch_artifact_id = ?1
+              AND returned_to_origin_at_ms IS NOT NULL
+        )",
+        params![branch_artifact_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(to_string)
+}
+
+fn branch_context_from_row(row: &Row<'_>) -> rusqlite::Result<ContinueBranchContext> {
+    let evidence_action_ids_json: String = row.get(13)?;
+    let returned_to_origin_at_ms: Option<i64> = row.get(8)?;
+    Ok(ContinueBranchContext {
+        id: row.get(0)?,
+        branch_action_id: row.get(1)?,
+        origin_artifact_id: row.get(2)?,
+        origin_workstream_id: row.get(3)?,
+        branch_artifact_id: row.get(4)?,
+        branch_kind: row.get(5)?,
+        branch_started_at_ms: row.get(6)?,
+        last_branch_seen_at_ms: row.get(7)?,
+        returned_to_origin: returned_to_origin_at_ms.is_some(),
+        returned_to_origin_at_ms,
+        promotion_state: row.get(9)?,
+        promotion_reason: row.get(10)?,
+        confidence: row.get(11)?,
+        reason_code: row.get(12)?,
+        evidence_action_ids: parse_string_array(&evidence_action_ids_json),
+        created_at_ms: row.get(14)?,
+        updated_at_ms: row.get(15)?,
+    })
+}
+
 pub fn rebuild_continue_third_layer(
     conn: &Connection,
     request: ContinueThirdLayerRebuildRequest,
@@ -3194,6 +3672,7 @@ pub fn rebuild_continue_third_layer(
     for workstream in &workstreams {
         insert_continue_workstream(conn, workstream)?;
     }
+    rebuild_continue_branch_contexts(conn, &actions, &workstreams)?;
     rebuild_continue_workstream_state_memory(conn, &workstreams)?;
     rebuild_continue_open_loops(conn, &workstreams)?;
     promote_continue_memory_cells(conn, current_time_millis())?;
@@ -3522,6 +4001,9 @@ pub fn get_continue_decision(
 
     let has_model_eligible_candidate = primary_eligible_candidates_after_feedback_gate > 0;
     if micro_inference_enabled && !has_model_eligible_candidate && !candidates.is_empty() {
+        let excluded_branch_candidate_ids = branch_filter_excluded_candidate_ids(&candidates);
+        let branch_validation_failures =
+            vec!["branch:no_selectable_public_return_candidates".to_string()];
         audit_inference_events.push(ContinueAuditInferenceEvent {
             inference_id: format!("continue-micro-{}", current_time_millis()),
             inference_kind: "continue_micro_inference".to_string(),
@@ -3531,6 +4013,13 @@ pub fn get_continue_decision(
             model_candidate_count_before_feedback_filter: candidates.len(),
             model_candidate_count_after_feedback_filter: 0,
             suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(&candidates),
+            selectable_candidate_count_before_branch_filter: branch_filter_selectable_count_before(
+                &candidates,
+            ),
+            selectable_candidate_count_after_branch_filter: 0,
+            excluded_branch_candidate_ids,
+            support_evidence_count: support_evidence_items_for_candidates(&candidates).len(),
+            branch_validation_failures,
             feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
             pack: None,
             request: None,
@@ -3577,6 +4066,14 @@ pub fn get_continue_decision(
                         suppressed_candidate_ids_not_sent: pack
                             .suppressed_candidate_ids_not_sent
                             .clone(),
+                        selectable_candidate_count_before_branch_filter:
+                            branch_filter_selectable_count_before(&candidates),
+                        selectable_candidate_count_after_branch_filter: pack.candidates.len(),
+                        excluded_branch_candidate_ids: branch_filter_excluded_candidate_ids(
+                            &candidates,
+                        ),
+                        support_evidence_count: pack.support_evidence.len(),
+                        branch_validation_failures: Vec::new(),
                         feedback_policy_version: pack.feedback_policy_version.clone(),
                         pack: serde_json::to_value(&pack).ok(),
                         request: None,
@@ -3800,6 +4297,10 @@ pub fn get_continue_decision(
                                                         );
                                                     audit_event.validation_failures =
                                                         validation_failures.clone();
+                                                    audit_event.branch_validation_failures =
+                                                        branch_validation_failures_from_failures(
+                                                            &validation_failures,
+                                                        );
                                                     audit_event.validation_classification =
                                                         Some(classification.as_audit_value());
                                                     if classification.recoverable {
@@ -4013,6 +4514,18 @@ pub fn get_continue_decision(
                         suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(
                             &candidates,
                         ),
+                        selectable_candidate_count_before_branch_filter:
+                            branch_filter_selectable_count_before(&candidates),
+                        selectable_candidate_count_after_branch_filter: candidates
+                            .iter()
+                            .filter(|candidate| candidate_selectable_for_micro_inference(candidate))
+                            .count(),
+                        excluded_branch_candidate_ids: branch_filter_excluded_candidate_ids(
+                            &candidates,
+                        ),
+                        support_evidence_count: support_evidence_items_for_candidates(&candidates)
+                            .len(),
+                        branch_validation_failures: vec![],
                         feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
                         pack: None,
                         request: None,
@@ -4044,6 +4557,15 @@ pub fn get_continue_decision(
                     suppressed_candidate_ids_not_sent: feedback_gate_suppressed_candidate_ids(
                         &candidates,
                     ),
+                    selectable_candidate_count_before_branch_filter:
+                        branch_filter_selectable_count_before(&candidates),
+                    selectable_candidate_count_after_branch_filter: candidates
+                        .iter()
+                        .filter(|candidate| candidate_selectable_for_micro_inference(candidate))
+                        .count(),
+                    excluded_branch_candidate_ids: branch_filter_excluded_candidate_ids(&candidates),
+                    support_evidence_count: support_evidence_items_for_candidates(&candidates).len(),
+                    branch_validation_failures: branch_validation_failures_from_failures(&[error.clone()]),
                     feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
                     pack: None,
                     request: None,
@@ -4399,10 +4921,15 @@ pub fn get_continue_decision(
     );
     let alternatives = candidates
         .iter()
-        .filter(|candidate| candidate_available_after_feedback_gate(candidate))
+        .filter(|candidate| {
+            candidate_available_after_feedback_gate(candidate)
+                && candidate_branch_public_return_gate(candidate)
+                && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+        })
         .take(3)
         .map(candidate_summary)
         .collect::<Vec<_>>();
+    let support_evidence = support_evidence_items_for_candidates(&candidates);
     let feedback_watermark_ms = latest_continue_feedback_watermark_ms(conn)?;
     let open_watermark_ms = latest_continue_open_watermark_ms(conn)?;
     let feedback_suppressed_candidate_count = candidates
@@ -4424,6 +4951,25 @@ pub fn get_continue_decision(
         .last()
         .map(|event| event.model_candidate_count_after_feedback_filter)
         .unwrap_or(primary_eligible_candidates_after_feedback_gate);
+    let selectable_candidate_count_before_branch_filter = audit_inference_events
+        .last()
+        .map(|event| event.selectable_candidate_count_before_branch_filter)
+        .unwrap_or_else(|| branch_filter_selectable_count_before(&candidates));
+    let selectable_candidate_count_after_branch_filter = audit_inference_events
+        .last()
+        .map(|event| event.selectable_candidate_count_after_branch_filter)
+        .unwrap_or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate_selectable_for_micro_inference(candidate))
+                .count()
+        });
+    let excluded_branch_candidate_ids = audit_inference_events
+        .last()
+        .map(|event| event.excluded_branch_candidate_ids.clone())
+        .unwrap_or_else(|| branch_filter_excluded_candidate_ids(&candidates));
+    let branch_validation_failures = branch_validation_failures_from_failures(&validation_failures);
+    let support_evidence_count = support_evidence.len();
     let p0_quality_signals = p0_quality_signals_for_decision(
         active_current_work_unresolved.as_ref(),
         &stale_target_suppression,
@@ -4488,6 +5034,7 @@ pub fn get_continue_decision(
         warnings,
         validation_failures,
         handoff,
+        support_evidence,
         alternatives,
         generated_candidates: candidates.len() as i64,
         validation_status,
@@ -4500,6 +5047,11 @@ pub fn get_continue_decision(
             primary_eligible_candidates_after_feedback_gate,
         model_candidate_count_before_feedback_filter,
         model_candidate_count_after_feedback_filter,
+        selectable_candidate_count_before_branch_filter,
+        selectable_candidate_count_after_branch_filter,
+        excluded_branch_candidate_ids,
+        support_evidence_count,
+        branch_validation_failures,
         continue_output_mode: continue_output_mode.as_str().to_string(),
         evidence_watermark_hash: cached_meta
             .as_ref()
@@ -7911,7 +8463,35 @@ fn load_scorer_workstream_artifacts(
                     a.document_path, a.evidence_quality, a.privacy_status,
                     a.openability, a.last_seen_frame_id, a.last_seen_timestamp,
                     wa.durable_role, wa.importance_score, wa.first_seen_frame_id,
-                    wa.last_seen_frame_id
+                    wa.last_seen_frame_id,
+                    (
+                        SELECT bc.promotion_state
+                        FROM continue_branch_contexts bc
+                        WHERE bc.branch_artifact_id = wa.artifact_id
+                        ORDER BY bc.last_branch_seen_at_ms DESC, bc.updated_at_ms DESC
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT CASE
+                            WHEN bc.promotion_state IN (
+                                'promoted_primary',
+                                'promoted_blocker',
+                                'promoted_user_corrected',
+                                'promoted_user_accepted',
+                                'promoted_sustained_work'
+                            ) THEN 1 ELSE 0 END
+                        FROM continue_branch_contexts bc
+                        WHERE bc.branch_artifact_id = wa.artifact_id
+                        ORDER BY bc.last_branch_seen_at_ms DESC, bc.updated_at_ms DESC
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT bc.promotion_reason
+                        FROM continue_branch_contexts bc
+                        WHERE bc.branch_artifact_id = wa.artifact_id
+                        ORDER BY bc.last_branch_seen_at_ms DESC, bc.updated_at_ms DESC
+                        LIMIT 1
+                    )
              FROM continue_workstream_artifacts wa
              JOIN continue_artifacts a ON a.id = wa.artifact_id
              WHERE wa.workstream_id = ?1
@@ -7932,6 +8512,11 @@ fn load_scorer_workstream_artifacts(
                     openability: row.get(7)?,
                     last_seen_frame_id: row.get(8)?,
                     last_seen_timestamp: row.get(9)?,
+                    branch_promotion_state: row.get(14)?,
+                    branch_public_return_eligible: row
+                        .get::<_, Option<i64>>(15)?
+                        .map(|value| value != 0),
+                    branch_promotion_reason: row.get(16)?,
                 },
                 durable_role: row.get(10)?,
                 importance_score: row.get(11)?,
@@ -8693,6 +9278,7 @@ pub fn get_continue_decision_trace(
         workstreams: load_trace_workstreams(conn, limit)?,
         workstream_state_snapshots: load_trace_workstream_state_snapshots(conn, limit)?,
         workstream_edges: load_trace_workstream_edges(conn, limit)?,
+        branch_contexts: load_trace_branch_contexts(conn, limit)?,
         open_loops: load_trace_open_loops(conn, limit)?,
         candidates: load_trace_candidates(conn, limit)?,
         scoring: load_trace_scoring(conn, limit)?,
@@ -8989,7 +9575,11 @@ fn load_trace_task_actions(
                     semantic_subject, semantic_moment_id, confidence,
                     created_at_ms, reason, evidence_source_kind,
                     evidence_span_ids_json, evidence_attribution_json,
-                    attribution_confidence, classifier_context_json, quality_flags_json
+                    attribution_confidence, classifier_context_json, quality_flags_json,
+                    branch_kind, branch_action_role,
+                    branch_promotion_eligible_by_default,
+                    branch_public_return_eligible_by_default,
+                    branch_confidence, branch_reason_code
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -9022,6 +9612,16 @@ fn load_trace_task_actions(
                 attribution_confidence: row.get(15)?,
                 classifier_context: parse_optional_json_value(row.get(16)?),
                 quality_flags: parse_string_array(&quality_flags_json),
+                branch_kind: row.get(18)?,
+                branch_action_role: row.get(19)?,
+                branch_promotion_eligible_by_default: row
+                    .get::<_, Option<i64>>(20)?
+                    .map(|value| value != 0),
+                branch_public_return_eligible_by_default: row
+                    .get::<_, Option<i64>>(21)?
+                    .map(|value| value != 0),
+                branch_confidence: row.get(22)?,
+                branch_reason_code: row.get(23)?,
             })
         })
         .map_err(to_string)?;
@@ -9178,6 +9778,31 @@ fn load_trace_workstream_edges(
                 confidence: row.get(8)?,
             })
         })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_trace_branch_contexts(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<ContinueBranchContext>, String> {
+    if !table_exists(conn, "continue_branch_contexts")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, branch_action_id, origin_artifact_id, origin_workstream_id,
+                    branch_artifact_id, branch_kind, branch_started_at_ms,
+                    last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
+                    promotion_reason, confidence, reason_code, evidence_action_ids_json,
+                    created_at_ms, updated_at_ms
+             FROM continue_branch_contexts
+             ORDER BY last_branch_seen_at_ms DESC, confidence DESC
+             LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit as i64], branch_context_from_row)
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
@@ -10646,6 +11271,12 @@ fn candidate_primary_eligible_after_feedback_gate(candidate: &ScoredContinueCand
         && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
 }
 
+fn candidate_selectable_for_micro_inference(candidate: &ScoredContinueCandidate) -> bool {
+    candidate_primary_eligible_after_feedback_gate(candidate)
+        && candidate_branch_public_return_gate(candidate)
+        && !branch_promotion_blocks_primary_selection(candidate)
+}
+
 fn candidate_available_after_feedback_gate(candidate: &ScoredContinueCandidate) -> bool {
     !candidate_feedback_hard_suppressed(candidate)
         && !candidate_feedback_unreconfirmed_ignored_workstream(candidate)
@@ -10656,6 +11287,44 @@ fn feedback_gate_suppressed_candidate_ids(candidates: &[ScoredContinueCandidate]
         .iter()
         .filter(|candidate| !candidate_primary_eligible_after_feedback_gate(candidate))
         .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn micro_inference_suppressed_candidate_ids(candidates: &[ScoredContinueCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| !candidate_selectable_for_micro_inference(candidate))
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn branch_filter_excluded_candidate_ids(candidates: &[ScoredContinueCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate_primary_eligible_after_feedback_gate(candidate)
+                && !candidate_selectable_for_micro_inference(candidate)
+                && (branch_promotion_blocks_primary_selection(candidate)
+                    || candidate.branch_public_return_eligible == Some(false)
+                    || candidate_branch_promotion_state(candidate).is_some()
+                    || candidate_is_support_evidence_for_model(candidate))
+        })
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn branch_filter_selectable_count_before(candidates: &[ScoredContinueCandidate]) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+        .count()
+}
+
+fn branch_validation_failures_from_failures(failures: &[String]) -> Vec<String> {
+    failures
+        .iter()
+        .filter(|failure| failure.contains("branch") || failure.contains("interrupt") || failure.contains("diagnostic"))
+        .cloned()
         .collect()
 }
 
@@ -14512,6 +15181,15 @@ fn build_scored_candidate(
         })
         .or_else(|| latest_episode_frame_id(workstream));
     let id = format!("continue-candidate-{}", stable_hash(key.as_bytes()));
+    let branch_promotion_state = target_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.branch_promotion_state.clone());
+    let branch_public_return_eligible = target_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.branch_public_return_eligible);
+    let branch_promotion_reason = target_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.branch_promotion_reason.clone());
     ScoredContinueCandidate {
         id,
         workstream_id: workstream.id.clone(),
@@ -14568,6 +15246,9 @@ fn build_scored_candidate(
         feedback_reason_codes: Vec::new(),
         eligible_for_primary_selection: true,
         selection_demotion_reason: None,
+        branch_promotion_state,
+        branch_public_return_eligible,
+        branch_promotion_reason,
         resume_work_target,
         open_loop,
     }
@@ -14897,22 +15578,67 @@ fn apply_candidate_risk_caps(
     if let Some(target_id) = candidate
         .target_artifact
         .as_ref()
-        .map(|artifact| artifact.id.as_str())
+        .map(|artifact| artifact.id.clone())
     {
+        if branch_promotion_blocks_primary_selection(candidate) {
+            let state = candidate_branch_promotion_state(candidate)
+                .unwrap_or("unpromoted")
+                .to_string();
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("branch_promotion_state:{}", state),
+            );
+            push_string_once(
+                &mut candidate.risk_flags,
+                "unpromoted_branch_support_target",
+            );
+            cap_candidate_score(
+                candidate,
+                0.42,
+                "branch_support_unpromoted_public_return_gate",
+            );
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = candidate_branch_promotion_reason(candidate)
+                .or_else(|| Some("branch/support target was not promoted for return".to_string()));
+        }
         if matches!(
-            durable_role_for_target(workstream, target_id),
+            durable_role_for_target(workstream, &target_id),
             Some("branch" | "support_source")
-        ) && !branch_became_primary(candidate, workstream)
+        ) && !branch_promotion_allows_public_return(candidate)
         {
             if candidate.memory_support_score > 0.0 {
                 candidate
                     .warnings
                     .push("memory_supports_branch_not_target".to_string());
             }
+            let state = candidate
+                .branch_promotion_state
+                .as_deref()
+                .or_else(|| {
+                    candidate
+                        .target_artifact
+                        .as_ref()
+                        .and_then(|target| target.branch_promotion_state.as_deref())
+                })
+                .unwrap_or("unpromoted");
+            push_string_once(
+                &mut candidate.warnings,
+                &format!("branch_promotion_state:{}", state),
+            );
             cap_candidate_score(candidate, 0.42, "branch_support_not_default_return_target");
             candidate.eligible_for_primary_selection = false;
-            candidate.selection_demotion_reason =
-                Some("support branch lacked evidence that it was unfinished itself".to_string());
+            candidate.selection_demotion_reason = candidate
+                .branch_promotion_reason
+                .clone()
+                .or_else(|| {
+                    candidate
+                        .target_artifact
+                        .as_ref()
+                        .and_then(|target| target.branch_promotion_reason.clone())
+                })
+                .or_else(|| {
+                    Some("support branch lacked evidence that it was unfinished itself".to_string())
+                });
         }
     }
     if candidate.recency_score >= 0.95
@@ -15132,7 +15858,7 @@ fn branch_origin_score(candidate: &ScoredContinueCandidate, workstream: &ScorerW
         .as_ref()
         .map(|artifact| artifact.id.as_str());
     let target_role = target_id.and_then(|id| durable_role_for_target(workstream, id));
-    if matches!(target_role, Some("branch")) && !branch_became_primary(candidate, workstream) {
+    if matches!(target_role, Some("branch")) && !branch_promotion_allows_public_return(candidate) {
         return 0.08;
     }
     if has_recent_branch
@@ -15709,26 +16435,101 @@ fn durable_role_for_target<'a>(
         .map(|artifact| artifact.durable_role.as_str())
 }
 
-fn branch_became_primary(
-    candidate: &ScoredContinueCandidate,
-    workstream: &ScorerWorkstream,
-) -> bool {
-    let target_id = candidate
-        .target_artifact
-        .as_ref()
-        .map(|artifact| artifact.id.as_str());
-    target_id.is_some()
-        && target_id == workstream.primary_artifact_id.as_deref()
-        && candidate
-            .last_meaningful_action
+fn branch_promotion_allows_public_return(candidate: &ScoredContinueCandidate) -> bool {
+    candidate.branch_public_return_eligible.unwrap_or_else(|| {
+        candidate
+            .target_artifact
             .as_ref()
-            .map(|action| {
-                matches!(
-                    action.action_kind.as_str(),
-                    "editing" | "composing" | "copying_evidence" | "returning_to_origin"
-                )
-            })
+            .and_then(|artifact| artifact.branch_public_return_eligible)
             .unwrap_or(false)
+    })
+}
+
+fn candidate_branch_promotion_state(candidate: &ScoredContinueCandidate) -> Option<&str> {
+    candidate.branch_promotion_state.as_deref().or_else(|| {
+        candidate
+            .target_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.branch_promotion_state.as_deref())
+    })
+}
+
+fn candidate_branch_promotion_reason(candidate: &ScoredContinueCandidate) -> Option<String> {
+    candidate.branch_promotion_reason.clone().or_else(|| {
+        candidate
+            .target_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.branch_promotion_reason.clone())
+    })
+}
+
+fn branch_promotion_state_allows_public_return(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some(
+            "promoted_primary"
+                | "promoted_blocker"
+                | "promoted_user_corrected"
+                | "promoted_user_accepted"
+                | "promoted_sustained_work"
+        )
+    )
+}
+
+fn branch_promotion_blocks_primary_selection(candidate: &ScoredContinueCandidate) -> bool {
+    let explicit_public_return_eligibility =
+        candidate.branch_public_return_eligible.or_else(|| {
+            candidate
+                .target_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.branch_public_return_eligible)
+        });
+    let state = candidate_branch_promotion_state(candidate);
+    if explicit_public_return_eligibility == Some(true)
+        || branch_promotion_state_allows_public_return(state)
+    {
+        return false;
+    }
+    explicit_public_return_eligibility == Some(false) || state.is_some()
+}
+
+fn candidate_branch_eligibility_state(candidate: &ScoredContinueCandidate) -> Option<String> {
+    if branch_promotion_allows_public_return(candidate) {
+        return Some("eligible_promoted_branch".to_string());
+    }
+    if branch_promotion_blocks_primary_selection(candidate) {
+        return Some("ineligible_unpromoted_branch".to_string());
+    }
+    if activity_role_is_suppressed(candidate.continuation_role.as_deref()) {
+        return Some("ineligible_support_or_interrupt".to_string());
+    }
+    if candidate.eligible_for_primary_selection {
+        Some("eligible_primary_candidate".to_string())
+    } else {
+        Some("ineligible_local_gate".to_string())
+    }
+}
+
+fn candidate_public_return_eligible(candidate: &ScoredContinueCandidate) -> bool {
+    candidate_selectable_for_micro_inference(candidate)
+        && candidate.eligible_for_primary_selection
+        && candidate_available_after_feedback_gate(candidate)
+}
+
+fn candidate_blocked_reason(candidate: &ScoredContinueCandidate) -> Option<String> {
+    if branch_promotion_blocks_primary_selection(candidate) {
+        return candidate_branch_promotion_reason(candidate)
+            .or_else(|| Some("branch:unpromoted_support_target_blocked".to_string()));
+    }
+    if candidate.branch_public_return_eligible == Some(false) {
+        return Some("branch:public_return_ineligible".to_string());
+    }
+    candidate.selection_demotion_reason.clone().or_else(|| {
+        candidate
+            .score_caps_applied
+            .iter()
+            .find_map(|cap| cap.strip_prefix("score_capped:").map(str::to_string))
+    })
 }
 
 fn latest_episode_id(workstream: &ScorerWorkstream) -> Option<String> {
@@ -15995,7 +16796,7 @@ fn warnings_for_candidate(
         .as_ref()
         .and_then(|artifact| durable_role_for_target(workstream, &artifact.id))
     {
-        if role == "branch" && !branch_became_primary(candidate, workstream) {
+        if role == "branch" && !branch_promotion_allows_public_return(candidate) {
             warnings.push("branch_surface_is_evidence_not_default_return_target".to_string());
         }
     }
@@ -16304,7 +17105,7 @@ fn evaluate_continue_decision_quality(
         }
     }
     if matches!(target_role, "branch" | "support_source")
-        && !branch_became_primary_by_role(candidate)
+        && !branch_promotion_allows_public_return(candidate)
     {
         fatal_missing.push("support_branch_not_primary_return_target".to_string());
     }
@@ -16381,19 +17182,6 @@ fn evaluate_continue_decision_quality(
         warnings,
         output_mode,
     }
-}
-
-fn branch_became_primary_by_role(candidate: &ScoredContinueCandidate) -> bool {
-    candidate
-        .resume_work_target
-        .as_ref()
-        .is_some_and(|resume_target| {
-            candidate
-                .target_artifact
-                .as_ref()
-                .is_some_and(|target| target.id == resume_target.id)
-        })
-        && candidate.score >= 0.75
 }
 
 fn local_gate_validation_status(gate: &ContinueDecisionQualityGate) -> String {
@@ -16636,6 +17424,9 @@ fn build_candidate_evidence_pack_v2(
         feedback_last_negative_ms: candidate.feedback_last_negative_ms,
         feedback_last_reconfirming_evidence_ms: candidate.feedback_last_reconfirming_evidence_ms,
         feedback_reason_codes: candidate.feedback_reason_codes.clone(),
+        branch_promotion_state: candidate.branch_promotion_state.clone(),
+        branch_public_return_eligible: candidate.branch_public_return_eligible,
+        branch_promotion_reason: candidate.branch_promotion_reason.clone(),
     }
 }
 
@@ -16661,6 +17452,9 @@ fn candidate_local_score_components_json(candidate: &ScoredContinueCandidate) ->
         "feedback_last_reconfirming_evidence_ms": candidate.feedback_last_reconfirming_evidence_ms,
         "feedback_score_cap": candidate.feedback_score_cap.map(round_score),
         "feedback_reason_codes": candidate.feedback_reason_codes.clone(),
+        "branch_promotion_state": candidate.branch_promotion_state.clone(),
+        "branch_public_return_eligible": candidate.branch_public_return_eligible,
+        "branch_promotion_reason": candidate.branch_promotion_reason.clone(),
         "retrieval_confidence_score": components.retrieval_confidence,
         "work_value_score": components.work_value,
         "resume_likelihood_score": components.resume_likelihood,
@@ -16741,6 +17535,147 @@ fn local_reasons_for_candidate(candidate: &ScoredContinueCandidate) -> Vec<Strin
     reasons.into_iter().take(6).collect()
 }
 
+fn support_evidence_items_for_candidates(
+    candidates: &[ScoredContinueCandidate],
+) -> Vec<ContinueSupportEvidenceItem> {
+    let mut seen_artifacts = HashSet::new();
+    let mut evidence = Vec::new();
+    for candidate in candidates {
+        if !candidate_is_support_evidence_for_model(candidate) {
+            continue;
+        }
+        let artifact_key = candidate
+            .target_artifact
+            .as_ref()
+            .map(|artifact| artifact.id.clone())
+            .unwrap_or_else(|| candidate.id.clone());
+        if !seen_artifacts.insert(artifact_key) {
+            continue;
+        }
+        evidence.push(support_evidence_item_for_candidate(candidate));
+        if evidence.len() >= 6 {
+            break;
+        }
+    }
+    evidence
+}
+
+fn candidate_is_support_evidence_for_model(candidate: &ScoredContinueCandidate) -> bool {
+    candidate.branch_public_return_eligible == Some(false)
+        || candidate
+            .target_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.branch_public_return_eligible)
+            == Some(false)
+        || branch_promotion_blocks_primary_selection(candidate)
+        || activity_role_is_suppressed(candidate.continuation_role.as_deref())
+        || candidate.risk_flags.iter().any(|flag| {
+            flag == "unpromoted_branch_support_target"
+                || flag == "feedback_hard_suppressed"
+                || flag.contains("support")
+                || flag.contains("branch")
+        })
+        || candidate.warnings.iter().any(|warning| {
+            warning == "branch_surface_is_evidence_not_default_return_target"
+                || warning.starts_with("branch_promotion_state:")
+                || warning.contains("branch_support")
+        })
+}
+
+fn support_evidence_item_for_candidate(
+    candidate: &ScoredContinueCandidate,
+) -> ContinueSupportEvidenceItem {
+    let target = candidate.target_artifact.as_ref();
+    let origin_artifact_id = candidate
+        .resume_work_target
+        .as_ref()
+        .map(|artifact| artifact.id.clone())
+        .filter(|origin_id| target.map(|artifact| artifact.id.as_str()) != Some(origin_id.as_str()))
+        .or_else(|| {
+            candidate
+                .open_loop
+                .as_ref()
+                .and_then(|open_loop| open_loop.origin_artifact_id.clone())
+        });
+    ContinueSupportEvidenceItem {
+        artifact_id: target.map(|artifact| artifact.id.clone()),
+        artifact_kind: target.map(|artifact| artifact.artifact_kind.clone()),
+        title: target
+            .and_then(artifact_title_for_scorer)
+            .map(|title| safe_model_label(&title)),
+        branch_kind: support_branch_kind_for_candidate(candidate),
+        origin_artifact_id,
+        role: support_role_for_candidate(candidate),
+        public_return_eligible: false,
+        reason: support_reason_for_candidate(candidate),
+    }
+}
+
+fn support_branch_kind_for_candidate(candidate: &ScoredContinueCandidate) -> String {
+    if let Some(role) = candidate.continuation_role.as_deref() {
+        if matches!(
+            role,
+            "support_context" | "interruption" | "diagnostic_only" | "current_focus_only"
+        ) {
+            return role.to_string();
+        }
+    }
+    if let Some(reason) = candidate_branch_promotion_reason(candidate) {
+        let normalized = normalize_reason_token(&reason);
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    candidate
+        .open_loop
+        .as_ref()
+        .map(|open_loop| open_loop.boundary_kind.clone())
+        .unwrap_or_else(|| "support_evidence".to_string())
+}
+
+fn support_role_for_candidate(candidate: &ScoredContinueCandidate) -> String {
+    candidate
+        .continuation_role
+        .clone()
+        .or_else(|| {
+            candidate
+                .target_artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_kind.clone())
+        })
+        .unwrap_or_else(|| "support_evidence".to_string())
+}
+
+fn support_reason_for_candidate(candidate: &ScoredContinueCandidate) -> String {
+    candidate
+        .selection_demotion_reason
+        .clone()
+        .or_else(|| candidate.why_not_primary.clone())
+        .or_else(|| candidate_branch_promotion_reason(candidate))
+        .or_else(|| candidate.reason.clone())
+        .map(|reason| safe_model_label(&reason))
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "Evidence-only support branch.".to_string())
+}
+
+fn normalize_reason_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 fn artifact_audit_from_pack(pack: &CandidateEvidencePackV2) -> Option<ArtifactIdentityAudit> {
     pack.artifact_identity_audit
         .as_ref()
@@ -16764,16 +17699,17 @@ fn build_micro_inference_pack(
     active_current_work_unresolved: Option<&ActiveCurrentWorkUnresolved>,
     continue_dossier: Option<&ContinueDossierV1>,
 ) -> Result<ContinueMicroInferencePack, String> {
-    let feedback_eligible_candidates = candidates
+    let model_selectable_candidates = candidates
         .iter()
-        .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+        .filter(|candidate| candidate_selectable_for_micro_inference(candidate))
         .cloned()
         .collect::<Vec<_>>();
-    let suppressed_candidate_ids_not_sent = feedback_gate_suppressed_candidate_ids(candidates);
+    let suppressed_candidate_ids_not_sent = micro_inference_suppressed_candidate_ids(candidates);
+    let support_evidence = support_evidence_items_for_candidates(candidates);
     let selected_candidates = select_recall_first_candidates(
         current_focus,
         workstreams,
-        &feedback_eligible_candidates,
+        &model_selectable_candidates,
         candidate_limit,
     );
     let selected_workstream_ids = selected_candidates
@@ -16903,6 +17839,12 @@ fn build_micro_inference_pack(
                 feedback_last_reconfirming_evidence_ms: candidate
                     .feedback_last_reconfirming_evidence_ms,
                 feedback_reason_codes: candidate.feedback_reason_codes.clone(),
+                branch_promotion_state: candidate.branch_promotion_state.clone(),
+                branch_public_return_eligible: candidate.branch_public_return_eligible,
+                branch_promotion_reason: candidate.branch_promotion_reason.clone(),
+                branch_eligibility_state: candidate_branch_eligibility_state(candidate),
+                public_return_eligible: candidate_public_return_eligible(candidate),
+                blocked_reason: candidate_blocked_reason(candidate),
                 local_reason: candidate
                     .open_loop
                     .as_ref()
@@ -16925,7 +17867,7 @@ fn build_micro_inference_pack(
 
     Ok(ContinueMicroInferencePack {
         schema: "smalltalk.continue_micro_inference_pack.v2".to_string(),
-        instructions: "Candidate IDs provided are the only valid choices. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Never select a candidate whose continuation_role is divergence, diagnostic_only, interruption, background_consumption, support_context, current_focus_only, suppressed, or needs_fresh_capture. feedback_state is authoritative local policy context: do not treat soft_penalty or score_capped candidates as clean high-confidence choices, and never assume a rejected target is valid without fresh reconfirmation. active_current_work_unresolved is factual evidence that fresh current work exists; by itself it is not a return target, but a supplied continue_current_work candidate is valid as a thin current-work answer when the facts support inspect/capture rather than opening a URL or path. Reject high confidence when evidence_sufficiency_score is below 0.50. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
+        instructions: "Candidate IDs provided in candidates are the only valid choices. support_evidence explains branch/reference/interrupt context but is never selectable and must never be phrased as the return target. If no supplied candidate is specific enough, return need_more_evidence or no_clear_continuation. Never select a candidate whose continuation_role is divergence, diagnostic_only, interruption, background_consumption, support_context, current_focus_only, suppressed, or needs_fresh_capture. Never promote a branch/reference/interrupt/current-focus-only surface unless branch_public_return_eligible is true and branch_promotion_state is promoted. feedback_state is authoritative local policy context: do not treat soft_penalty or score_capped candidates as clean high-confidence choices, and never assume a rejected target is valid without fresh reconfirmation. active_current_work_unresolved is factual evidence that fresh current work exists; by itself it is not a return target, but a supplied continue_current_work candidate is valid as a thin current-work answer when the facts support inspect/capture rather than opening a URL or path. Reject high confidence when evidence_sufficiency_score is below 0.50. Use only supplied evidence cues. Do not invent artifacts, URLs, paths, titles, evidence ids, user intent, or next actions. Current focus is factual; return target is the selected local candidate target only when the evidence pack supports it. Keep the handoff concise and honest.".to_string(),
         feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
         model_candidate_count_before_feedback_filter: candidates.len(),
         model_candidate_count_after_feedback_filter: selected_candidates.len(),
@@ -16936,6 +17878,7 @@ fn build_micro_inference_pack(
         current_surface: current_surface.and_then(|surface| current_surface_for_model(surface, now_ms)),
         workstreams: pack_workstreams,
         candidates: pack_candidates,
+        support_evidence,
         evidence_packs_v2,
         artifact_roles,
         breadcrumbs,
@@ -17407,6 +18350,11 @@ fn classify_micro_inference_validation_failure(
         | "selected_workstream_id_mismatch"
         | "selected_candidate_not_sent_to_model"
         | "model_selected_candidate_not_primary_eligible"
+        | "model_selected_unpromoted_branch"
+        | "model_selected_diagnostic_self"
+        | "model_selected_interrupt_without_promotion"
+        | "model_ignored_branch_eligibility"
+        | "model_promoted_support_without_local_evidence"
         | "model_selected_feedback_suppressed_candidate"
         | "model_output_contains_unsupported_url_or_path"
         | "escape_hatch_cannot_claim_high_confidence"
@@ -17678,6 +18626,15 @@ fn validate_micro_inference_output(
     if !candidate_primary_eligible_after_feedback_gate(&candidate) {
         failures.push("model_selected_candidate_not_primary_eligible".to_string());
     }
+    if branch_promotion_blocks_primary_selection(&candidate)
+        || !candidate_branch_public_return_gate(&candidate)
+    {
+        failures.push(branch_validation_failure_for_candidate(&candidate));
+        failures.push("model_ignored_branch_eligibility".to_string());
+    }
+    if model_output_promotes_support_without_local_evidence(output, &candidate) {
+        failures.push("model_promoted_support_without_local_evidence".to_string());
+    }
     if output.next_action.as_ref().is_some_and(|action| {
         action.trim().is_empty()
             || action.len() > 220
@@ -17783,6 +18740,79 @@ fn model_output_contains_internal_reference(output: &ContinueMicroInferenceOutpu
     ]
     .iter()
     .any(|value| contains_internal_continue_reference(value))
+}
+
+fn branch_validation_failure_for_candidate(candidate: &ScoredContinueCandidate) -> String {
+    match candidate_branch_promotion_state(candidate) {
+        Some("blocked_diagnostic_self") => "model_selected_diagnostic_self".to_string(),
+        Some("blocked_feedback_suppressed") => {
+            "model_selected_feedback_suppressed_candidate".to_string()
+        }
+        Some("blocked_thin_current_focus") => "model_selected_unpromoted_branch".to_string(),
+        Some("unpromoted") => match candidate.continuation_role.as_deref() {
+            Some("interruption") => "model_selected_interrupt_without_promotion".to_string(),
+            Some("diagnostic_only") => "model_selected_diagnostic_self".to_string(),
+            _ => "model_selected_unpromoted_branch".to_string(),
+        },
+        Some(_) => "model_ignored_branch_eligibility".to_string(),
+        None => {
+            if matches!(candidate.continuation_role.as_deref(), Some("interruption")) {
+                "model_selected_interrupt_without_promotion".to_string()
+            } else if matches!(
+                candidate.continuation_role.as_deref(),
+                Some("diagnostic_only")
+            ) {
+                "model_selected_diagnostic_self".to_string()
+            } else {
+                "model_selected_unpromoted_branch".to_string()
+            }
+        }
+    }
+}
+
+fn model_output_promotes_support_without_local_evidence(
+    output: &ContinueMicroInferenceOutput,
+    candidate: &ScoredContinueCandidate,
+) -> bool {
+    if branch_promotion_allows_public_return(candidate) {
+        return false;
+    }
+    let supportish = candidate.branch_public_return_eligible == Some(false)
+        || activity_role_is_suppressed(candidate.continuation_role.as_deref())
+        || candidate.target_artifact.as_ref().is_some_and(|target| {
+            matches!(
+                target.artifact_kind.as_str(),
+                "browser_tab" | "chat_conversation" | "terminal" | "messaging"
+            )
+        });
+    if !supportish {
+        return false;
+    }
+    let why_this = output.why_this.join(" ");
+    let joined = [
+        output.headline.as_str(),
+        output.return_line.as_str(),
+        output.last_state_line.as_str(),
+        output.next_action.as_deref().unwrap_or(""),
+        why_this.as_str(),
+        output.reason.as_str(),
+    ]
+    .join(" ")
+    .to_lowercase();
+    let action_terms = ["continue", "return", "open", "resume", "use"];
+    let support_terms = [
+        "support",
+        "branch",
+        "search",
+        "docs",
+        "documentation",
+        "reference",
+        "interrupt",
+        "message",
+        "diagnostic",
+    ];
+    action_terms.iter().any(|term| joined.contains(term))
+        && support_terms.iter().any(|term| joined.contains(term))
 }
 
 fn branch_support_target_requires_local_candidate_guard(
@@ -19321,6 +20351,11 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 is_fresh_current_work: None,
                 is_stale_return_target: None,
                 is_support_branch: None,
+                branch_kind: None,
+                branch_promotion_state: None,
+                branch_public_return_eligible: None,
+                expected_branch_promoted: None,
+                origin_artifact_id: None,
                 stale_target_suppressed: None,
                 suppressed_target_open_attempted: None,
                 feedback_suppression_state: None,
@@ -19348,6 +20383,11 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                 is_fresh_current_work: None,
                 is_stale_return_target: None,
                 is_support_branch: None,
+                branch_kind: None,
+                branch_promotion_state: None,
+                branch_public_return_eligible: None,
+                expected_branch_promoted: None,
+                origin_artifact_id: None,
                 stale_target_suppressed: None,
                 suppressed_target_open_attempted: None,
                 feedback_suppression_state: None,
@@ -19615,6 +20655,221 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
                     0.29,
                     "thin",
                     vec!["legacy_stop_cloud_error"],
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_search_branch_returns_to_origin",
+            "Editor/Codex primary work -> browser search/docs support branch -> return to origin",
+            "origin-editor",
+            Some("origin-editor"),
+            vec![
+                eval_candidate("c-origin-editor", "w-p2-origin", Some("origin-editor"), 0.82, "strong"),
+                branch_eval_candidate(
+                    "c-search-branch",
+                    "w-p2-origin",
+                    Some("search-results"),
+                    0.41,
+                    "medium",
+                    "search_branch",
+                    "unpromoted",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_docs_reference_without_promotion_returns_origin",
+            "Editor/Codex primary work -> docs reference current focus -> stop without promotion",
+            "origin-editor",
+            Some("docs-reference"),
+            vec![
+                eval_candidate("c-origin-docs", "w-p2-docs", Some("origin-editor"), 0.72, "medium"),
+                branch_eval_candidate(
+                    "c-docs-reference",
+                    "w-p2-docs",
+                    Some("docs-reference"),
+                    0.39,
+                    "medium",
+                    "documentation_reference",
+                    "unpromoted",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_gmail_read_only_interrupt_blocked",
+            "Editor/Codex primary work -> Gmail read-only message interrupt -> return or stop",
+            "origin-editor",
+            Some("gmail-thread"),
+            vec![
+                eval_candidate("c-origin-gmail-read", "w-p2-gmail-read", Some("origin-editor"), 0.7, "medium"),
+                branch_eval_candidate(
+                    "c-gmail-thread",
+                    "w-p2-gmail-read",
+                    Some("gmail-thread"),
+                    0.33,
+                    "medium",
+                    "message_interrupt",
+                    "unpromoted",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_gmail_compose_promoted",
+            "Editor/Codex primary work -> Gmail draft compose with sustained composing -> stop",
+            "gmail-draft",
+            Some("gmail-draft"),
+            vec![
+                branch_eval_candidate(
+                    "c-gmail-draft",
+                    "w-p2-gmail-compose",
+                    Some("gmail-draft"),
+                    0.83,
+                    "strong",
+                    "message_interrupt",
+                    "promoted_sustained_work",
+                    true,
+                    Some("origin-editor"),
+                    true,
+                ),
+                eval_candidate("c-origin-gmail-compose", "w-p2-gmail-compose", Some("origin-editor"), 0.58, "medium"),
+            ],
+        ),
+        eval_case(
+            "p2_smalltalk_diagnostics_evidence_only",
+            "Primary task -> Smalltalk diagnostics/audit output visible -> stop",
+            "origin-editor",
+            Some("smalltalk-diagnostics"),
+            vec![
+                eval_candidate("c-origin-diagnostics", "w-p2-diagnostics", Some("origin-editor"), 0.69, "medium"),
+                branch_eval_candidate(
+                    "c-smalltalk-diagnostics",
+                    "w-p2-diagnostics",
+                    Some("smalltalk-diagnostics"),
+                    0.22,
+                    "thin",
+                    "diagnostic_self",
+                    "blocked_diagnostic_self",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_terminal_logs_support_only",
+            "Editor primary -> terminal logs only -> stop",
+            "origin-editor",
+            Some("terminal-logs"),
+            vec![
+                eval_candidate("c-origin-terminal-logs", "w-p2-terminal-logs", Some("origin-editor"), 0.68, "medium"),
+                branch_eval_candidate(
+                    "c-terminal-logs",
+                    "w-p2-terminal-logs",
+                    Some("terminal-logs"),
+                    0.36,
+                    "medium",
+                    "terminal_support_output",
+                    "unpromoted",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+        ),
+        eval_case(
+            "p2_terminal_active_command_promoted",
+            "Editor primary -> terminal command/rerun/error unresolved -> stop",
+            "terminal-error",
+            Some("terminal-error"),
+            vec![
+                branch_eval_candidate(
+                    "c-terminal-error",
+                    "w-p2-terminal-error",
+                    Some("terminal-error"),
+                    0.84,
+                    "strong",
+                    "verification_branch",
+                    "promoted_blocker",
+                    true,
+                    Some("origin-editor"),
+                    true,
+                ),
+                eval_candidate("c-origin-terminal-error", "w-p2-terminal-error", Some("origin-editor"), 0.55, "medium"),
+            ],
+        ),
+        eval_case_with_model_output(
+            "p2_model_selects_unpromoted_branch_rejected",
+            "Model output tries to pick an unpromoted support branch",
+            "origin-editor",
+            Some("search-results"),
+            vec![
+                eval_candidate("c-origin-model-branch", "w-p2-model-branch", Some("origin-editor"), 0.74, "medium"),
+                branch_eval_candidate(
+                    "c-model-search-branch",
+                    "w-p2-model-branch",
+                    Some("search-results"),
+                    0.42,
+                    "medium",
+                    "search_branch",
+                    "unpromoted",
+                    false,
+                    Some("origin-editor"),
+                    false,
+                ),
+            ],
+            ContinueMicroInferenceOutput {
+                result: "selected_candidate".to_string(),
+                selected_candidate_id: Some("c-model-search-branch".to_string()),
+                selected_workstream_id: Some("w-p2-model-branch".to_string()),
+                intent_label: "Search branch".to_string(),
+                headline: "Continue the search result".to_string(),
+                return_line: "Continue from the search result".to_string(),
+                current_focus_line: "Current focus is search results".to_string(),
+                last_state_line: "Search result was visible".to_string(),
+                next_action: Some("Open the search result.".to_string()),
+                why_this: vec!["Model selected an unpromoted branch.".to_string()],
+                missing_evidence_line: None,
+                reason: "Model picked unpromoted support branch".to_string(),
+                confidence: "high".to_string(),
+                user_visible_uncertainty: None,
+                uncertainty_notes: None,
+                missing_evidence: Vec::new(),
+                recommended_local_capture: None,
+            },
+        ),
+        eval_case(
+            "p2_no_origin_support_branch_stays_thin",
+            "Search results appear without prior primary work -> stop",
+            "unknown",
+            Some("search-results"),
+            vec![
+                eval_candidate_with_missing(
+                    "c-no-origin-thin",
+                    "w-p2-no-origin",
+                    Some("unknown"),
+                    0.43,
+                    "thin",
+                    vec!["no_origin_for_support_branch", "no_clear_continuation"],
+                ),
+                branch_eval_candidate(
+                    "c-no-origin-search",
+                    "w-p2-no-origin",
+                    Some("search-results"),
+                    0.21,
+                    "medium",
+                    "search_branch",
+                    "unpromoted",
+                    false,
+                    None,
+                    false,
                 ),
             ],
         ),
@@ -19906,6 +21161,38 @@ fn feedback_eval_candidate(
     candidate
 }
 
+#[allow(clippy::too_many_arguments)]
+fn branch_eval_candidate(
+    id: &str,
+    workstream_id: &str,
+    target_artifact_id: Option<&str>,
+    score: f64,
+    evidence_quality: &str,
+    branch_kind: &str,
+    branch_promotion_state: &str,
+    branch_public_return_eligible: bool,
+    origin_artifact_id: Option<&str>,
+    expected_branch_promoted: bool,
+) -> ContinueEvalCandidateFixture {
+    let mut candidate = eval_candidate(
+        id,
+        workstream_id,
+        target_artifact_id,
+        score,
+        evidence_quality,
+    );
+    candidate.is_support_branch = Some(true);
+    candidate.branch_kind = Some(branch_kind.to_string());
+    candidate.branch_promotion_state = Some(branch_promotion_state.to_string());
+    candidate.branch_public_return_eligible = Some(branch_public_return_eligible);
+    candidate.origin_artifact_id = origin_artifact_id.map(str::to_string);
+    candidate.expected_branch_promoted = Some(expected_branch_promoted);
+    if !branch_public_return_eligible {
+        candidate.expected_output_mode = Some("thin_continue".to_string());
+    }
+    candidate
+}
+
 fn eval_case(
     name: &str,
     scenario: &str,
@@ -20007,6 +21294,11 @@ fn eval_candidate_with_missing(
         is_fresh_current_work: None,
         is_stale_return_target: None,
         is_support_branch: None,
+        branch_kind: None,
+        branch_promotion_state: None,
+        branch_public_return_eligible: None,
+        expected_branch_promoted: None,
+        origin_artifact_id: None,
         stale_target_suppressed: None,
         suppressed_target_open_attempted: None,
         feedback_suppression_state: None,
@@ -20054,6 +21346,11 @@ fn p0_eval_candidate(
         is_fresh_current_work: Some(flags.fresh_current_work),
         is_stale_return_target: Some(flags.stale_return_target),
         is_support_branch: Some(flags.support_branch),
+        branch_kind: None,
+        branch_promotion_state: None,
+        branch_public_return_eligible: None,
+        expected_branch_promoted: None,
+        origin_artifact_id: None,
         stale_target_suppressed: Some(flags.stale_target_suppressed),
         suppressed_target_open_attempted: Some(flags.suppressed_target_open_attempted),
         feedback_suppression_state: None,
@@ -20106,6 +21403,68 @@ fn summarize_continue_eval_fixture(
         .iter()
         .filter(|case| case.model_feedback_validation_failure)
         .count() as i64;
+    let unpromoted_branch_selected_count = reports
+        .iter()
+        .filter(|case| case.unpromoted_branch_selected)
+        .count() as i64;
+    let branch_case_count = reports
+        .iter()
+        .filter(|case| {
+            let scenario = case.scenario.to_ascii_lowercase();
+            scenario.contains("branch")
+                || scenario.contains("search")
+                || scenario.contains("docs")
+                || scenario.contains("gmail")
+                || scenario.contains("diagnostic")
+                || scenario.contains("terminal")
+                || scenario.contains("support")
+                || case.unpromoted_branch_selected
+                || case.model_branch_policy_violation
+                || !case.branch_origin_recalled
+        })
+        .count() as i64;
+    let branch_origin_recalled_count = reports
+        .iter()
+        .filter(|case| {
+            let scenario = case.scenario.to_ascii_lowercase();
+            (scenario.contains("branch")
+                || scenario.contains("search")
+                || scenario.contains("docs")
+                || scenario.contains("gmail")
+                || scenario.contains("diagnostic")
+                || scenario.contains("terminal")
+                || scenario.contains("support")
+                || case.unpromoted_branch_selected
+                || case.model_branch_policy_violation
+                || !case.branch_origin_recalled)
+                && case.branch_origin_recalled
+        })
+        .count() as i64;
+    let promoted_branch_selected_count = reports
+        .iter()
+        .filter(|case| {
+            case.selected_candidate_id
+                .as_deref()
+                .is_some_and(|id| id.contains("gmail-draft") || id.contains("terminal-error"))
+        })
+        .count() as i64;
+    let message_interrupt_case_count = reports
+        .iter()
+        .filter(|case| case.scenario.to_ascii_lowercase().contains("gmail"))
+        .count() as i64;
+    let promoted_branch_selection_correct_count = reports
+        .iter()
+        .filter(|case| {
+            case.selected_candidate_id
+                .as_deref()
+                .is_some_and(|id| id.contains("gmail-draft") || id.contains("terminal-error"))
+                && case.promoted_branch_selection_correct
+        })
+        .count() as i64;
+    let model_branch_policy_violation_count = reports
+        .iter()
+        .filter(|case| case.model_branch_policy_violation)
+        .count() as i64;
     let denom = if case_count == 0 {
         1.0
     } else {
@@ -20149,6 +21508,42 @@ fn summarize_continue_eval_fixture(
         support_branch_false_promotion_rate: metric_ratio(&reports, |case| {
             case.support_branch_false_promotion
         }),
+        support_branch_false_positive_rate: metric_ratio(&reports, |case| {
+            case.support_branch_false_positive
+        }),
+        unpromoted_branch_selected_count,
+        branch_origin_recall_rate: round_score(
+            branch_origin_recalled_count as f64
+                / if branch_case_count == 0 {
+                    1.0
+                } else {
+                    branch_case_count as f64
+                },
+        ),
+        promoted_branch_selection_precision: round_score(
+            promoted_branch_selection_correct_count as f64
+                / if promoted_branch_selected_count == 0 {
+                    1.0
+                } else {
+                    promoted_branch_selected_count as f64
+                },
+        ),
+        message_interrupt_false_positive_rate: round_score(
+            reports
+                .iter()
+                .filter(|case| case.message_interrupt_false_positive)
+                .count() as f64
+                / if message_interrupt_case_count == 0 {
+                    1.0
+                } else {
+                    message_interrupt_case_count as f64
+                },
+        ),
+        diagnostic_self_selected_count: reports
+            .iter()
+            .filter(|case| case.diagnostic_self_selected)
+            .count() as i64,
+        model_branch_policy_violation_count,
         truthful_thin_mode_rate: metric_ratio(&reports, |case| case.truthful_thin_mode),
         feedback_obedience_case_count,
         feedback_suppressed_target_exposed_count,
@@ -20638,6 +22033,59 @@ fn evaluate_continue_fixture_case(
         || validation_failures
             .iter()
             .any(|failure| failure.contains("feedback"));
+    let selected_branch_kind = selected.and_then(|candidate| candidate.branch_kind.as_deref());
+    let selected_branch_state = selected.and_then(|candidate| candidate.branch_promotion_state.as_deref());
+    let selected_public_branch_eligible =
+        selected.and_then(|candidate| candidate.branch_public_return_eligible);
+    let selected_is_unpromoted_branch = selected
+        .is_some_and(|candidate| candidate.is_support_branch.unwrap_or(false))
+        && selected_public_branch_eligible == Some(false)
+        && !matches!(
+            selected_branch_state,
+            Some(
+                "promoted_primary"
+                    | "promoted_blocker"
+                    | "promoted_user_corrected"
+                    | "promoted_user_accepted"
+                    | "promoted_sustained_work"
+            )
+        );
+    let branch_case = case
+        .candidates
+        .iter()
+        .any(|candidate| candidate.is_support_branch.unwrap_or(false));
+    let branch_origin_recalled = !branch_case
+        || case.candidates.iter().any(|candidate| {
+            candidate
+                .origin_artifact_id
+                .as_ref()
+                .is_some_and(|origin| origin == &expected)
+                || candidate.target_artifact_id.as_ref() == Some(&expected)
+        });
+    let branch_selected = selected
+        .is_some_and(|candidate| candidate.is_support_branch.unwrap_or(false));
+    let selected_branch_expected_promoted =
+        selected.and_then(|candidate| candidate.expected_branch_promoted).unwrap_or(false);
+    let promoted_branch_selection_correct = !branch_selected
+        || selected_public_branch_eligible != Some(true)
+        || selected_branch_expected_promoted;
+    let support_branch_false_positive = selected_is_unpromoted_branch && !target_correct;
+    let message_interrupt_false_positive = selected_branch_kind == Some("message_interrupt")
+        && selected_public_branch_eligible != Some(true)
+        && !target_correct;
+    let diagnostic_self_selected = selected_branch_kind == Some("diagnostic_self");
+    let model_branch_policy_violation = validation_failures
+        .iter()
+        .any(|failure| failure.contains("branch"))
+        || case
+            .model_output
+            .as_ref()
+            .and_then(|output| output.selected_candidate_id.as_deref())
+            .and_then(|selected_id| case.candidates.iter().find(|candidate| candidate.id == selected_id))
+            .is_some_and(|candidate| {
+                candidate.is_support_branch.unwrap_or(false)
+                    && candidate.branch_public_return_eligible == Some(false)
+            });
     let feedback_obedience_placeholder =
         case.expected_feedback_obedience_placeholder.unwrap_or(true);
     let selected_return_target_openable =
@@ -20718,6 +22166,13 @@ fn evaluate_continue_fixture_case(
         fresh_surface_retained,
         stale_target_suppressed,
         support_branch_false_promotion,
+        support_branch_false_positive,
+        unpromoted_branch_selected: selected_is_unpromoted_branch,
+        branch_origin_recalled,
+        promoted_branch_selection_correct,
+        message_interrupt_false_positive,
+        diagnostic_self_selected,
+        model_branch_policy_violation,
         truthful_thin_mode,
         feedback_obedience_case,
         feedback_suppressed_target_exposed,
@@ -20772,6 +22227,12 @@ fn validate_eval_model_output(
     }
     if unsupported_locator_in_model_output(output) {
         failures.push("unsupported_locator_in_model_output".to_string());
+    }
+    if candidate.is_support_branch.unwrap_or(false)
+        && candidate.branch_public_return_eligible == Some(false)
+    {
+        push_string_once(failures, "model_selected_unpromoted_branch");
+        push_string_once(failures, "model_ignored_branch_eligibility");
     }
     0
 }
@@ -21484,6 +22945,19 @@ fn candidate_summary(candidate: &ScoredContinueCandidate) -> ContinueCandidateSu
         feedback_last_reconfirming_evidence_ms: candidate.feedback_last_reconfirming_evidence_ms,
         feedback_score_cap: candidate.feedback_score_cap.map(round_score),
         feedback_reason_codes: candidate.feedback_reason_codes.clone(),
+        branch_promotion_state: candidate.branch_promotion_state.clone(),
+        branch_public_return_eligible: candidate.branch_public_return_eligible,
+        branch_promotion_reason: candidate.branch_promotion_reason.clone(),
+        branch_kind: if candidate_is_support_evidence_for_model(candidate)
+            || candidate.branch_promotion_state.is_some()
+        {
+            Some(support_branch_kind_for_candidate(candidate))
+        } else {
+            None
+        },
+        branch_eligibility_state: candidate_branch_eligibility_state(candidate),
+        public_return_eligible: candidate_public_return_eligible(candidate),
+        blocked_reason: candidate_blocked_reason(candidate),
         evidence_frame_id: candidate.evidence_frame_id.clone(),
         supporting_episode_id: candidate.supporting_episode_id.clone(),
         last_meaningful_action_id: candidate
@@ -21565,7 +23039,36 @@ fn candidate_exposes_public_return_target(
         ContinueOutputMode::StrongContinue | ContinueOutputMode::ThinContinue
     ) && candidate.eligible_for_primary_selection
         && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
+        && candidate_branch_public_return_gate(candidate)
         && candidate_has_human_return_target(candidate)
+}
+
+fn candidate_branch_public_return_gate(candidate: &ScoredContinueCandidate) -> bool {
+    let explicit_public_return = candidate.branch_public_return_eligible.or_else(|| {
+        candidate
+            .target_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.branch_public_return_eligible)
+    });
+    if explicit_public_return == Some(false) {
+        return false;
+    }
+    if explicit_public_return == Some(true) {
+        return true;
+    }
+    match candidate.branch_promotion_state.as_deref() {
+        Some("promoted_primary")
+        | Some("promoted_blocker")
+        | Some("promoted_user_corrected")
+        | Some("promoted_user_accepted")
+        | Some("promoted_sustained_work") => true,
+        Some("unpromoted")
+        | Some("blocked_diagnostic_self")
+        | Some("blocked_feedback_suppressed")
+        | Some("blocked_thin_current_focus") => false,
+        Some(_) => false,
+        None => true,
+    }
 }
 
 fn human_return_target_label(candidate: &ScoredContinueCandidate) -> Option<String> {
@@ -22758,6 +24261,7 @@ fn load_continue_action_records(
                    ta.collapse_count, ta.first_frame_id, ta.last_frame_id, ta.strongest_frame_id,
                    ta.semantic_delta_kind, ta.semantic_subject, ta.semantic_after_hint,
                    ta.semantic_evidence_quote, ta.semantic_delta_confidence, ta.semantic_moment_id,
+                   ta.branch_kind, ta.branch_action_role, ta.branch_confidence, ta.branch_reason_code,
                    a.id, a.artifact_kind, a.stable_key, a.app_name, a.display_title,
                    a.browser_url, a.document_path, a.evidence_quality,
                    sa.id, sa.artifact_kind, sa.stable_key, sa.app_name, sa.display_title,
@@ -22786,8 +24290,8 @@ fn load_continue_action_records(
                 limit,
             ],
             |row| {
-                let artifact = artifact_record_from_row(row, 20)?;
-                let secondary_artifact = artifact_record_from_row(row, 28)?;
+                let artifact = artifact_record_from_row(row, 24)?;
+                let secondary_artifact = artifact_record_from_row(row, 32)?;
                 Ok(ContinueActionRecord {
                     id: row.get(0)?,
                     frame_id: row.get(1)?,
@@ -22809,6 +24313,10 @@ fn load_continue_action_records(
                     semantic_evidence_quote: row.get(17)?,
                     semantic_delta_confidence: row.get(18)?,
                     semantic_moment_id: row.get(19)?,
+                    branch_kind: row.get(20)?,
+                    branch_action_role: row.get(21)?,
+                    branch_confidence: row.get(22)?,
+                    branch_reason_code: row.get(23)?,
                     artifact,
                     secondary_artifact,
                 })
@@ -23569,6 +25077,12 @@ fn event_backed_task_action_for_group(
             "event_backed_only".to_string(),
             "not_openable_without_url_or_path".to_string(),
         ],
+        branch_kind: Some("current_focus_only".to_string()),
+        branch_action_role: Some("unknown".to_string()),
+        branch_promotion_eligible_by_default: Some(false),
+        branch_public_return_eligible_by_default: Some(false),
+        branch_confidence: Some(confidence.min(0.54)),
+        branch_reason_code: Some("branch:current_focus_thin".to_string()),
     })
 }
 
@@ -24313,6 +25827,14 @@ fn collapse_repeated_task_actions(actions: Vec<ExtractedTaskAction>) -> Vec<Extr
                     previous.attribution_confidence = action.attribution_confidence;
                     previous.classifier_context_json = action.classifier_context_json.clone();
                     previous.quality_flags = action.quality_flags.clone();
+                    previous.branch_kind = action.branch_kind.clone();
+                    previous.branch_action_role = action.branch_action_role.clone();
+                    previous.branch_promotion_eligible_by_default =
+                        action.branch_promotion_eligible_by_default;
+                    previous.branch_public_return_eligible_by_default =
+                        action.branch_public_return_eligible_by_default;
+                    previous.branch_confidence = action.branch_confidence;
+                    previous.branch_reason_code = action.branch_reason_code.clone();
                 }
                 for event_id in action.evidence_event_ids {
                     if !previous.evidence_event_ids.contains(&event_id) {
@@ -24414,6 +25936,368 @@ struct ErrorClassification {
     attribution_confidence: Option<f64>,
     classifier_context_json: Option<String>,
     quality_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BranchClassificationInput<'a> {
+    frame: &'a EvidenceFrame,
+    artifact: &'a ResolvedArtifact,
+    previous_artifact: Option<&'a ResolvedArtifact>,
+    action_kind: &'a str,
+    action_role: &'a str,
+    trigger_type: Option<&'a str>,
+    transition_label: Option<&'a str>,
+    confidence: f64,
+    reason: &'a str,
+}
+
+fn classify_branch_context(input: BranchClassificationInput<'_>) -> BranchClassification {
+    if is_branch_diagnostic_self(input.frame, input.artifact) {
+        return BranchClassification::new(
+            BranchKind::DiagnosticSelf,
+            0.92,
+            "branch:smalltalk_self",
+        );
+    }
+
+    if primary_branch_action(&input) {
+        return BranchClassification::new(
+            BranchKind::PrimaryWork,
+            input.confidence.max(0.78),
+            primary_branch_reason_code(input.action_kind, input.reason),
+        );
+    }
+
+    if is_settings_or_admin_surface(input.frame, input.artifact) {
+        return BranchClassification::new(
+            BranchKind::SettingsOrAdmin,
+            0.78,
+            "branch:settings_or_admin",
+        );
+    }
+
+    if is_message_interrupt_context(&input) {
+        return BranchClassification::new(
+            BranchKind::MessageInterrupt,
+            input.confidence.max(0.72),
+            "branch:message_interrupt",
+        );
+    }
+
+    if is_search_branch_context(&input) {
+        return BranchClassification::new(
+            BranchKind::SearchBranch,
+            input.confidence.max(0.76),
+            "branch:search_results",
+        );
+    }
+
+    if is_current_focus_only_context(&input) {
+        return BranchClassification::new(
+            BranchKind::CurrentFocusOnly,
+            input.confidence.min(0.54),
+            "branch:current_focus_thin",
+        );
+    }
+
+    if is_terminal_support_output_context(&input) {
+        return BranchClassification::new(
+            BranchKind::TerminalSupportOutput,
+            input.confidence.max(0.76),
+            "branch:terminal_output_only",
+        );
+    }
+
+    if is_tool_or_agent_output_context(&input) {
+        return BranchClassification::new(
+            BranchKind::ToolOrAgentOutput,
+            input.confidence.max(0.70),
+            "branch:agent_output_only",
+        );
+    }
+
+    if is_documentation_reference_context(&input) {
+        return BranchClassification::new(
+            BranchKind::DocumentationReference,
+            input.confidence.max(0.72),
+            "branch:docs_reference",
+        );
+    }
+
+    if is_source_evidence_context(&input) {
+        return BranchClassification::new(
+            BranchKind::SourceEvidence,
+            input.confidence.max(0.72),
+            "branch:source_evidence_copy",
+        );
+    }
+
+    if is_verification_branch_context(&input) {
+        return BranchClassification::new(
+            BranchKind::VerificationBranch,
+            input.confidence.max(0.66),
+            "branch:verification_surface",
+        );
+    }
+
+    if is_new_current_task_context(&input) {
+        return BranchClassification::new(
+            BranchKind::NewCurrentTask,
+            input.confidence.max(0.68),
+            "branch:new_task_boundary",
+        );
+    }
+
+    if input.action_role == "primary" {
+        BranchClassification::new(
+            BranchKind::UnknownPrimary,
+            input.confidence.min(0.62),
+            "branch:unknown_primary_default",
+        )
+    } else {
+        BranchClassification::new(
+            BranchKind::UnknownSupport,
+            input.confidence.min(0.58),
+            "branch:unknown_support_default",
+        )
+    }
+}
+
+fn primary_branch_action(input: &BranchClassificationInput<'_>) -> bool {
+    matches!(
+        input.action_kind,
+        "editing" | "composing" | "running_command" | "returning_to_origin"
+    ) || (input.action_kind == "encountering_error" && input.action_role == "primary")
+}
+
+fn primary_branch_reason_code(action_kind: &str, reason: &str) -> &'static str {
+    match action_kind {
+        "editing" => "branch:primary_editing",
+        "composing" => "branch:primary_composing",
+        "running_command" => "branch:primary_command",
+        "encountering_error" => "branch:primary_unresolved_error",
+        "returning_to_origin" => "branch:primary_return",
+        _ if reason.contains("active_current_work_unresolved") => "branch:primary_current_work",
+        _ => "branch:primary_action",
+    }
+}
+
+fn branch_surface_haystack(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> String {
+    format!(
+        "{} {} {} {} {} {} {} {}",
+        frame.app_name.as_deref().unwrap_or(""),
+        frame.app_bundle_id.as_deref().unwrap_or(""),
+        frame.window_name.as_deref().unwrap_or(""),
+        frame.browser_url.as_deref().unwrap_or(""),
+        frame.document_path.as_deref().unwrap_or(""),
+        artifact.display_title.as_deref().unwrap_or(""),
+        artifact.browser_url.as_deref().unwrap_or(""),
+        artifact.document_path.as_deref().unwrap_or("")
+    )
+    .to_lowercase()
+}
+
+fn is_branch_diagnostic_self(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> bool {
+    is_smalltalk_self_surface(
+        frame.app_name.as_deref(),
+        frame.app_bundle_id.as_deref(),
+        frame.window_name.as_deref(),
+        frame
+            .browser_url
+            .as_deref()
+            .or(artifact.browser_url.as_deref()),
+        frame
+            .document_path
+            .as_deref()
+            .or(artifact.document_path.as_deref()),
+    ) || is_generated_debug_surface(
+        frame.app_name.as_deref(),
+        frame.window_name.as_deref(),
+        frame
+            .browser_url
+            .as_deref()
+            .or(artifact.browser_url.as_deref()),
+        frame
+            .document_path
+            .as_deref()
+            .or(artifact.document_path.as_deref()),
+    ) || contains_any(
+        &branch_surface_haystack(frame, artifact),
+        &[
+            "continue_outputs",
+            "resume_query_exports",
+            "cloud_resume_exports",
+            "sqlite_snapshot",
+            "final_decision.json",
+            "candidate_pack.json",
+            "micro_inference_request.json",
+            "continue_audit",
+            "audit_manifest",
+        ],
+    )
+}
+
+fn is_settings_or_admin_surface(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> bool {
+    contains_any(
+        &branch_surface_haystack(frame, artifact),
+        &[
+            "settings",
+            "preferences",
+            "account settings",
+            "admin",
+            "billing",
+            "security",
+            "login",
+            "sign in",
+        ],
+    )
+}
+
+fn is_search_branch_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.action_kind == "searching"
+        || input
+            .transition_label
+            .is_some_and(|label| contains_any(label, &["search", "branching_for_research"]))
+        || is_search_context(input.frame, input.artifact)
+}
+
+fn is_documentation_reference_context(input: &BranchClassificationInput<'_>) -> bool {
+    if !matches!(
+        input.action_kind,
+        "reading"
+            | "copying_evidence"
+            | "reviewing_output"
+            | "navigating"
+            | "switching_context"
+            | "branching_away"
+    ) {
+        return false;
+    }
+    let haystack = branch_surface_haystack(input.frame, input.artifact);
+    contains_any(
+        &haystack,
+        &[
+            "docs.",
+            "/docs",
+            "documentation",
+            "developer.",
+            "reference",
+            "readme",
+            "stackoverflow",
+            "stack overflow",
+            "mdn web docs",
+            "developer.mozilla",
+            "react.dev",
+            "docs.rs",
+            "help center",
+            "api reference",
+        ],
+    )
+}
+
+fn is_source_evidence_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.action_kind == "copying_evidence"
+        || input
+            .frame
+            .content_units
+            .iter()
+            .any(|unit| unit.semantic_role.as_deref() == Some("source_evidence"))
+}
+
+fn is_message_interrupt_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.artifact.kind == "messaging"
+        || input.action_kind == "messaging_interrupt"
+        || contains_any(
+            &branch_surface_haystack(input.frame, input.artifact),
+            &[
+                "gmail",
+                "mail.google",
+                "inbox",
+                "email",
+                "slack",
+                "discord",
+                "messages",
+                "whatsapp",
+                "telegram",
+            ],
+        )
+}
+
+fn is_verification_branch_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.action_kind == "verification_branch"
+        || input
+            .transition_label
+            .is_some_and(|label| contains_any(label, &["verification_branch", "verify"]))
+        || (input
+            .previous_artifact
+            .is_some_and(|artifact| is_primary_work_artifact(&artifact.kind))
+            && matches!(
+                input.artifact.kind.as_str(),
+                "browser_tab" | "terminal" | "chat_conversation"
+            )
+            && contains_any(
+                &branch_surface_haystack(input.frame, input.artifact),
+                &[
+                    " test",
+                    "/test",
+                    "tests",
+                    " build",
+                    "/build",
+                    " log",
+                    "/log",
+                    " result",
+                    "/result",
+                    "preview",
+                    "localhost",
+                ],
+            ))
+}
+
+fn is_terminal_support_output_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.artifact.kind == "terminal"
+        && matches!(
+            input.action_kind,
+            "observing_command_output" | "reviewing_output" | "reading"
+        )
+        && !terminal_has_enter_or_commit(input.frame)
+}
+
+fn is_tool_or_agent_output_context(input: &BranchClassificationInput<'_>) -> bool {
+    if !matches!(
+        input.artifact.kind.as_str(),
+        "chat_conversation" | "browser_tab"
+    ) {
+        return false;
+    }
+    if matches!(input.action_kind, "editing" | "composing") {
+        return false;
+    }
+    contains_any(
+        &branch_surface_haystack(input.frame, input.artifact),
+        &[
+            "codex",
+            "chatgpt",
+            "claude",
+            "gemini",
+            "agent",
+            "assistant",
+            "tool output",
+        ],
+    ) || has_content_role(input.frame, "chat_message")
+}
+
+fn is_new_current_task_context(input: &BranchClassificationInput<'_>) -> bool {
+    input
+        .transition_label
+        .is_some_and(|label| contains_any(label, &["new_task"]))
+        && input.action_role == "primary"
+}
+
+fn is_current_focus_only_context(input: &BranchClassificationInput<'_>) -> bool {
+    input.trigger_type == Some("event_backed_weak_surface")
+        || input.reason.contains("event_backed")
+        || (matches!(input.action_kind, "unknown" | "switching_context")
+            && input.confidence <= 0.50)
 }
 
 #[derive(Debug, Clone)]
@@ -25182,8 +27066,33 @@ fn classify_task_action(
         attribution_confidence: error_classification.attribution_confidence,
         classifier_context_json: error_classification.classifier_context_json.clone(),
         quality_flags: error_classification.quality_flags.clone(),
+        branch_kind: None,
+        branch_action_role: None,
+        branch_promotion_eligible_by_default: None,
+        branch_public_return_eligible_by_default: None,
+        branch_confidence: None,
+        branch_reason_code: None,
     };
     gate_task_action_attribution(&mut action, &error_classification);
+    let branch_classification = classify_branch_context(BranchClassificationInput {
+        frame,
+        artifact,
+        previous_artifact,
+        action_kind: &action.action_kind,
+        action_role: &action.action_role,
+        trigger_type: action.trigger_type.as_deref(),
+        transition_label: action.transition_label.as_deref(),
+        confidence: action.confidence,
+        reason: &action.reason,
+    });
+    action.branch_kind = Some(branch_classification.branch_kind.as_str().to_string());
+    action.branch_action_role = Some(branch_classification.action_role);
+    action.branch_promotion_eligible_by_default =
+        Some(branch_classification.promotion_eligible_by_default);
+    action.branch_public_return_eligible_by_default =
+        Some(branch_classification.public_return_eligible_by_default);
+    action.branch_confidence = Some(branch_classification.confidence);
+    action.branch_reason_code = Some(branch_classification.reason_code);
     action
 }
 
@@ -25205,10 +27114,12 @@ fn insert_continue_task_action(
             semantic_after_hint, semantic_evidence_quote, semantic_delta_confidence,
             semantic_moment_id, evidence_source_kind, evidence_span_ids_json,
             evidence_attribution_json, attribution_confidence, classifier_context_json,
-            quality_flags_json
+            quality_flags_json, branch_kind, branch_action_role,
+            branch_promotion_eligible_by_default, branch_public_return_eligible_by_default,
+            branch_confidence, branch_reason_code
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                   ?25, ?26, ?27, ?28, ?29, ?30)",
+                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
         params![
             action.id,
             action.frame_id,
@@ -25240,6 +27151,14 @@ fn insert_continue_task_action(
             action.attribution_confidence,
             action.classifier_context_json,
             quality_flags_json,
+            action.branch_kind,
+            action.branch_action_role,
+            action.branch_promotion_eligible_by_default.map(bool_to_i64),
+            action
+                .branch_public_return_eligible_by_default
+                .map(bool_to_i64),
+            action.branch_confidence,
+            action.branch_reason_code,
         ],
     )
     .map_err(to_string)?;
@@ -26081,6 +28000,204 @@ fn build_continue_episodes(actions: &[ContinueActionRecord]) -> Vec<BuiltEpisode
     episodes
 }
 
+fn segmentation_decision_for_action(action: &ContinueActionRecord) -> SegmentationDecision {
+    let confidence = action
+        .branch_confidence
+        .unwrap_or(action.confidence)
+        .clamp(0.05, 0.95);
+    match action.branch_kind.as_deref() {
+        Some("new_current_task") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::NewPrimaryEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::SplitNewWorkstream,
+            artifact_role_override: Some("primary_target"),
+            reason_code: "segmentation:new_current_task",
+            confidence,
+        },
+        Some("primary_work" | "unknown_primary") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SamePrimaryEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::SplitNewWorkstream,
+            artifact_role_override: None,
+            reason_code: "segmentation:primary_work",
+            confidence,
+        },
+        Some("search_branch" | "unknown_support") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SupportBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsSupportToOrigin,
+            artifact_role_override: Some("branch_support"),
+            reason_code: "segmentation:support_branch",
+            confidence,
+        },
+        Some("documentation_reference" | "source_evidence") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SupportBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsSupportToOrigin,
+            artifact_role_override: Some("source_evidence"),
+            reason_code: "segmentation:source_reference",
+            confidence,
+        },
+        Some("verification_branch") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::VerificationBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin,
+            artifact_role_override: Some("output_verification"),
+            reason_code: "segmentation:verification_branch",
+            confidence,
+        },
+        Some("terminal_support_output") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::VerificationBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin,
+            artifact_role_override: Some("output_verification"),
+            reason_code: "segmentation:terminal_support_output",
+            confidence,
+        },
+        Some("message_interrupt") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::InterruptEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsInterruptContext,
+            artifact_role_override: Some("interruption"),
+            reason_code: "segmentation:message_interrupt",
+            confidence,
+        },
+        Some("diagnostic_self" | "settings_or_admin") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::DiagnosticEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::IgnoreForPrimarySelection,
+            artifact_role_override: Some("current_focus_only"),
+            reason_code: "segmentation:diagnostic_self",
+            confidence,
+        },
+        Some("tool_or_agent_output" | "current_focus_only") => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::CurrentFocusOnlyEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::KeepCurrentFocusOnly,
+            artifact_role_override: Some("current_focus_only"),
+            reason_code: "segmentation:current_focus_only",
+            confidence,
+        },
+        _ => segmentation_decision_from_action_kind(action, confidence),
+    }
+}
+
+fn segmentation_decision_from_action_kind(
+    action: &ContinueActionRecord,
+    confidence: f64,
+) -> SegmentationDecision {
+    match action.action_kind.as_str() {
+        "branching_away" | "searching" => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SupportBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsSupportToOrigin,
+            artifact_role_override: Some("branch_support"),
+            reason_code: "segmentation:action_support_branch",
+            confidence,
+        },
+        "copying_evidence" => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SupportBranchEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsSupportToOrigin,
+            artifact_role_override: Some("source_evidence"),
+            reason_code: "segmentation:action_source_evidence",
+            confidence,
+        },
+        "verification_branch" | "observing_command_output" | "reviewing_output" => {
+            SegmentationDecision {
+                episode_policy: SegmentationEpisodePolicy::VerificationBranchEpisode,
+                workstream_policy: SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin,
+                artifact_role_override: Some("output_verification"),
+                reason_code: "segmentation:action_verification",
+                confidence,
+            }
+        }
+        "messaging_interrupt" => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::InterruptEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::AttachAsInterruptContext,
+            artifact_role_override: Some("interruption"),
+            reason_code: "segmentation:action_message_interrupt",
+            confidence,
+        },
+        _ if action.action_role == "support" || action.action_role == "branch" => {
+            SegmentationDecision {
+                episode_policy: SegmentationEpisodePolicy::SupportBranchEpisode,
+                workstream_policy: SegmentationWorkstreamPolicy::AttachAsSupportToOrigin,
+                artifact_role_override: Some("branch_support"),
+                reason_code: "segmentation:action_support_role",
+                confidence,
+            }
+        }
+        _ => SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SamePrimaryEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::SplitNewWorkstream,
+            artifact_role_override: None,
+            reason_code: "segmentation:default_primary",
+            confidence,
+        },
+    }
+}
+
+fn segmentation_decision_for_episode(episode: &BuiltEpisode) -> SegmentationDecision {
+    if let Some(decision) = episode
+        .actions
+        .iter()
+        .map(segmentation_decision_for_action)
+        .find(|decision| {
+            matches!(
+                decision.episode_policy,
+                SegmentationEpisodePolicy::NewPrimaryEpisode
+            )
+        })
+    {
+        return decision;
+    }
+    if episode.actions.iter().any(promoted_primary_action) {
+        return SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::SamePrimaryEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::SplitNewWorkstream,
+            artifact_role_override: None,
+            reason_code: "segmentation:episode_contains_primary_progress",
+            confidence: episode.confidence,
+        };
+    }
+    for policy in [
+        SegmentationEpisodePolicy::DiagnosticEpisode,
+        SegmentationEpisodePolicy::InterruptEpisode,
+        SegmentationEpisodePolicy::VerificationBranchEpisode,
+        SegmentationEpisodePolicy::SupportBranchEpisode,
+        SegmentationEpisodePolicy::CurrentFocusOnlyEpisode,
+    ] {
+        if let Some(decision) = episode
+            .actions
+            .iter()
+            .map(segmentation_decision_for_action)
+            .find(|decision| decision.episode_policy == policy)
+        {
+            return decision;
+        }
+    }
+    episode
+        .actions
+        .first()
+        .map(segmentation_decision_for_action)
+        .unwrap_or(SegmentationDecision {
+            episode_policy: SegmentationEpisodePolicy::CurrentFocusOnlyEpisode,
+            workstream_policy: SegmentationWorkstreamPolicy::KeepCurrentFocusOnly,
+            artifact_role_override: Some("current_focus_only"),
+            reason_code: "segmentation:empty_episode",
+            confidence: 0.05,
+        })
+}
+
+fn promoted_primary_action(action: &ContinueActionRecord) -> bool {
+    matches!(
+        action.branch_kind.as_deref(),
+        Some("primary_work" | "new_current_task" | "unknown_primary") | None
+    ) && action
+        .branch_action_role
+        .as_deref()
+        .unwrap_or(action.action_role.as_str())
+        == "primary"
+        && matches!(
+            action.action_kind.as_str(),
+            "editing"
+                | "composing"
+                | "running_command"
+                | "encountering_error"
+                | "returning_to_origin"
+        )
+}
+
 #[derive(Debug)]
 struct EpisodeBoundaryReason {
     start_reason: String,
@@ -26099,6 +28216,52 @@ fn episode_boundary_reason(
     let current_has_progress = current
         .iter()
         .any(|action| is_meaningful_action_kind(&action.action_kind));
+    let next_segmentation = segmentation_decision_for_action(next);
+
+    match next_segmentation.episode_policy {
+        SegmentationEpisodePolicy::NewPrimaryEpisode
+            if switched_artifact && current_has_progress =>
+        {
+            return Some(boundary("new_primary_episode", "split_new_primary_task"));
+        }
+        SegmentationEpisodePolicy::DiagnosticEpisode if switched_artifact => {
+            return Some(boundary(
+                "diagnostic_episode",
+                "left_primary_for_diagnostics",
+            ));
+        }
+        SegmentationEpisodePolicy::CurrentFocusOnlyEpisode
+            if switched_artifact && current_has_progress =>
+        {
+            return Some(boundary(
+                "current_focus_only_episode",
+                "left_primary_for_current_focus_only",
+            ));
+        }
+        SegmentationEpisodePolicy::SupportBranchEpisode
+            if switched_artifact && current_has_progress =>
+        {
+            return Some(boundary(
+                "support_branch_episode",
+                "left_primary_for_support",
+            ));
+        }
+        SegmentationEpisodePolicy::VerificationBranchEpisode
+            if switched_artifact && current_has_progress =>
+        {
+            return Some(boundary(
+                "verification_branch_episode",
+                "left_primary_for_verification",
+            ));
+        }
+        SegmentationEpisodePolicy::InterruptEpisode if switched_artifact => {
+            return Some(boundary(
+                "interrupt_episode",
+                "left_primary_for_interruption",
+            ));
+        }
+        _ => {}
+    }
 
     if next.action_kind == "returning_to_origin" {
         return Some(boundary("returning_to_origin", "branch_returned_to_origin"));
@@ -26179,6 +28342,15 @@ fn start_reason_for_action(
     action: &ContinueActionRecord,
     previous: Option<&ContinueActionRecord>,
 ) -> String {
+    let decision = segmentation_decision_for_action(action);
+    if previous.is_none()
+        && !matches!(
+            decision.episode_policy,
+            SegmentationEpisodePolicy::SamePrimaryEpisode
+        )
+    {
+        return decision.episode_policy.as_str().to_string();
+    }
     match action.action_kind.as_str() {
         "returning_to_origin" => "returning_to_origin".to_string(),
         "branching_away" | "searching" => "support_branch".to_string(),
@@ -26244,6 +28416,17 @@ fn finalize_episode(
 
 fn episode_primary_artifact_id(actions: &[ContinueActionRecord]) -> Option<String> {
     for action in actions {
+        let decision = segmentation_decision_for_action(action);
+        if matches!(
+            decision.workstream_policy,
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsInterruptContext
+                | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+                | SegmentationWorkstreamPolicy::KeepCurrentFocusOnly
+        ) {
+            continue;
+        }
         if matches!(
             action.action_kind.as_str(),
             "editing"
@@ -26260,6 +28443,14 @@ fn episode_primary_artifact_id(actions: &[ContinueActionRecord]) -> Option<Strin
         }
     }
     for action in actions {
+        let decision = segmentation_decision_for_action(action);
+        if !matches!(
+            decision.workstream_policy,
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+        ) {
+            continue;
+        }
         if matches!(
             action.action_kind.as_str(),
             "branching_away"
@@ -26272,6 +28463,19 @@ fn episode_primary_artifact_id(actions: &[ContinueActionRecord]) -> Option<Strin
                 return Some(artifact_id.clone());
             }
         }
+    }
+    if actions.iter().any(|action| {
+        let decision = segmentation_decision_for_action(action);
+        matches!(
+            decision.workstream_policy,
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsInterruptContext
+                | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+                | SegmentationWorkstreamPolicy::KeepCurrentFocusOnly
+        )
+    }) {
+        return None;
     }
     actions.iter().find_map(|action| action.artifact_id.clone())
 }
@@ -26338,21 +28542,27 @@ fn add_episode_artifact_roles(
 ) {
     if let Some(artifact) = &action.artifact {
         let role = episode_artifact_role(action, artifact.id.as_str(), episode_primary_artifact_id);
+        let segmentation = segmentation_decision_for_action(action);
         upsert_episode_artifact_role(
             artifacts,
             artifact.clone(),
             role,
             Some(action.frame_id.clone()),
-            action.confidence,
-            action
-                .reason
-                .clone()
-                .unwrap_or_else(|| action.action_kind.clone()),
+            action.confidence.max(segmentation.confidence),
+            format!(
+                "{}:{}",
+                segmentation.reason_code,
+                action
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| action.action_kind.clone())
+            ),
         );
     }
     if let Some(artifact) = &action.secondary_artifact {
         let role = secondary_episode_artifact_role(action);
         if role != "unknown" {
+            let segmentation = segmentation_decision_for_action(action);
             upsert_episode_artifact_role(
                 artifacts,
                 artifact.clone(),
@@ -26361,8 +28571,11 @@ fn add_episode_artifact_roles(
                     .previous_frame_id
                     .clone()
                     .or_else(|| Some(action.frame_id.clone())),
-                (action.confidence - 0.08).clamp(0.05, 0.9),
-                format!("secondary_artifact_for_{}", action.action_kind),
+                (action.confidence.max(segmentation.confidence) - 0.08).clamp(0.05, 0.9),
+                format!(
+                    "{}:secondary_artifact_for_{}",
+                    segmentation.reason_code, action.action_kind
+                ),
             );
         }
     }
@@ -26398,6 +28611,12 @@ fn episode_artifact_role(
     artifact_id: &str,
     episode_primary_artifact_id: Option<&str>,
 ) -> String {
+    let segmentation = segmentation_decision_for_action(action);
+    if let Some(role) = segmentation.artifact_role_override {
+        if role != "primary_target" || Some(artifact_id) == episode_primary_artifact_id {
+            return role.to_string();
+        }
+    }
     match action.action_kind.as_str() {
         "encountering_error" => "blocker".to_string(),
         "searching" | "branching_away" => "branch_support".to_string(),
@@ -26419,6 +28638,15 @@ fn episode_artifact_role(
 }
 
 fn secondary_episode_artifact_role(action: &ContinueActionRecord) -> String {
+    let segmentation = segmentation_decision_for_action(action);
+    if matches!(
+        segmentation.workstream_policy,
+        SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+            | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+    ) && action.secondary_artifact_id.is_some()
+    {
+        return "primary_target".to_string();
+    }
     match action.action_kind.as_str() {
         "branching_away"
         | "searching"
@@ -26475,6 +28703,36 @@ fn episode_summary_label(
 fn build_continue_workstreams(episodes: &[BuiltEpisode]) -> Vec<BuiltWorkstream> {
     let mut workstreams: Vec<BuiltWorkstream> = Vec::new();
     for episode in episodes {
+        let segmentation = segmentation_decision_for_episode(episode);
+        if let Some(index) =
+            segmentation_origin_workstream_index(episode, &workstreams, segmentation)
+        {
+            let score = match segmentation.workstream_policy {
+                SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin => 0.88,
+                SegmentationWorkstreamPolicy::AttachAsSupportToOrigin => 0.84,
+                SegmentationWorkstreamPolicy::IgnoreForPrimarySelection => 0.64,
+                _ => 0.0,
+            };
+            let reason = format!(
+                "segmentation:{}:{}",
+                segmentation.workstream_policy.as_str(),
+                segmentation.reason_code
+            );
+            attach_episode_to_workstream(&mut workstreams[index], episode.clone(), score, reason);
+            continue;
+        }
+        if matches!(
+            segmentation.workstream_policy,
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+                | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+                | SegmentationWorkstreamPolicy::KeepCurrentFocusOnly
+        ) && episode.primary_artifact_id.is_none()
+            && !episode_has_promoted_primary_artifact(episode)
+        {
+            workstreams.push(new_workstream_for_episode(episode.clone()));
+            continue;
+        }
         let best = workstreams
             .iter()
             .enumerate()
@@ -26495,6 +28753,81 @@ fn build_continue_workstreams(episodes: &[BuiltEpisode]) -> Vec<BuiltWorkstream>
     }
     finalize_workstream_states(&mut workstreams);
     workstreams
+}
+
+fn segmentation_origin_workstream_index(
+    episode: &BuiltEpisode,
+    workstreams: &[BuiltWorkstream],
+    segmentation: SegmentationDecision,
+) -> Option<usize> {
+    if !matches!(
+        segmentation.workstream_policy,
+        SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+            | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+            | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+    ) {
+        return None;
+    }
+    explicit_origin_artifact_for_episode(episode)
+        .as_deref()
+        .and_then(|origin| {
+            workstreams
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, workstream)| {
+                    workstream.primary_artifact_id.as_deref() == Some(origin)
+                        || workstream_primary_is_valid_origin(workstream, origin)
+                })
+                .map(|(index, _)| index)
+        })
+        .or_else(|| {
+            if matches!(
+                segmentation.workstream_policy,
+                SegmentationWorkstreamPolicy::AttachAsInterruptContext
+            ) {
+                return None;
+            }
+            recent_primary_workstream_index(workstreams, episode.start_timestamp_ms)
+        })
+}
+
+fn explicit_origin_artifact_for_episode(episode: &BuiltEpisode) -> Option<String> {
+    episode.actions.iter().find_map(|action| {
+        let segmentation = segmentation_decision_for_action(action);
+        if matches!(
+            segmentation.workstream_policy,
+            SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+        ) {
+            action.secondary_artifact_id.clone()
+        } else {
+            None
+        }
+    })
+}
+
+fn recent_primary_workstream_index(
+    workstreams: &[BuiltWorkstream],
+    episode_start_ms: i64,
+) -> Option<usize> {
+    workstreams
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, workstream)| workstream.last_active_timestamp_ms <= episode_start_ms)
+        .filter(|(_, workstream)| {
+            workstream.primary_artifact_id.is_some()
+                && episode_start_ms.saturating_sub(workstream.last_active_timestamp_ms)
+                    <= BRANCH_ORIGIN_DEFAULT_LOOKBACK_MS
+                && workstream.artifacts.values().any(|artifact| {
+                    matches!(
+                        artifact.durable_role.as_str(),
+                        "primary_target" | "blocker_surface"
+                    )
+                })
+        })
+        .map(|(index, _)| index)
 }
 
 fn score_episode_membership(episode: &BuiltEpisode, workstream: &BuiltWorkstream) -> (f64, String) {
@@ -26722,6 +29055,7 @@ fn attach_episode_to_workstream(
     score: f64,
     reason: String,
 ) {
+    let segmentation = segmentation_decision_for_episode(&episode);
     workstream.created_at_ms = workstream.created_at_ms.min(episode.start_timestamp_ms);
     workstream.last_active_timestamp_ms = workstream
         .last_active_timestamp_ms
@@ -26729,7 +29063,10 @@ fn attach_episode_to_workstream(
     if workstream.primary_artifact_id.is_none() {
         workstream.primary_artifact_id = workstream_primary_for_episode(&episode);
     } else if let Some(candidate_primary) = workstream_primary_for_episode(&episode) {
-        if stronger_primary_candidate(
+        if matches!(
+            segmentation.workstream_policy,
+            SegmentationWorkstreamPolicy::SplitNewWorkstream
+        ) && stronger_primary_candidate(
             &episode,
             &candidate_primary,
             workstream.primary_artifact_id.as_deref(),
@@ -26749,17 +29086,38 @@ fn attach_episode_to_workstream(
 }
 
 fn workstream_primary_for_episode(episode: &BuiltEpisode) -> Option<String> {
+    let segmentation = segmentation_decision_for_episode(episode);
+    if matches!(
+        segmentation.workstream_policy,
+        SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+            | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+            | SegmentationWorkstreamPolicy::AttachAsInterruptContext
+            | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+            | SegmentationWorkstreamPolicy::KeepCurrentFocusOnly
+    ) && !episode_has_promoted_primary_artifact(episode)
+    {
+        return explicit_origin_artifact_for_episode(episode);
+    }
     for artifact in episode.artifacts.values() {
-        if artifact.role == "primary_target"
-            && !matches!(
-                artifact.artifact.artifact_kind.as_str(),
-                "browser_tab" | "chat_conversation" | "messaging"
-            )
-        {
+        if artifact.role == "primary_target" && episode_primary_role_is_allowed(episode, artifact) {
             return Some(artifact.artifact.id.clone());
         }
     }
     episode.primary_artifact_id.clone()
+}
+
+fn episode_has_promoted_primary_artifact(episode: &BuiltEpisode) -> bool {
+    episode.actions.iter().any(promoted_primary_action)
+}
+
+fn episode_primary_role_is_allowed(episode: &BuiltEpisode, artifact: &BuiltArtifactRole) -> bool {
+    if episode_has_promoted_primary_artifact(episode) {
+        return true;
+    }
+    !matches!(
+        artifact.artifact.artifact_kind.as_str(),
+        "browser_tab" | "chat_conversation" | "messaging" | "terminal"
+    )
 }
 
 fn stronger_primary_candidate(
@@ -26772,6 +29130,7 @@ fn stronger_primary_candidate(
     }
     episode.actions.iter().any(|action| {
         action.artifact_id.as_deref() == Some(candidate_primary)
+            && promoted_primary_action(action)
             && matches!(
                 action.action_kind.as_str(),
                 "editing" | "composing" | "running_command" | "returning_to_origin"
@@ -27664,7 +30023,11 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
     let boundary_kind = resolved_boundary_kind
         .map(str::to_string)
         .unwrap_or_else(|| open_loop_boundary_kind(unresolved.as_deref(), boundary_action));
-    let primary_return_artifact_id = if boundary_kind == "error_without_resolution" {
+    let support_only_without_origin =
+        workstream_is_support_only(workstream) && origin_artifact_id.is_none();
+    let primary_return_artifact_id = if support_only_without_origin {
+        None
+    } else if boundary_kind == "error_without_resolution" {
         blocker_artifact_id
             .clone()
             .or_else(|| origin_artifact_id.clone())
@@ -27675,12 +30038,13 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
             .or_else(|| strongest_artifact_id_for_role(workstream, "primary_target"))
             .or_else(|| current_focus_artifact_id.clone())
     };
-    let resume_work_artifact_id =
-        if boundary_kind == "verification_without_return" && origin_artifact_id.is_some() {
-            origin_artifact_id.clone()
-        } else {
-            primary_return_artifact_id.clone()
-        };
+    let resume_work_artifact_id = if support_only_without_origin {
+        None
+    } else if boundary_kind == "verification_without_return" && origin_artifact_id.is_some() {
+        origin_artifact_id.clone()
+    } else {
+        primary_return_artifact_id.clone()
+    };
     let current_focus_relation = classify_current_focus_relation(
         workstream,
         current_focus_artifact_id.as_deref(),
@@ -28023,16 +30387,39 @@ fn earliest_primary_progress_artifact_id(actions: &[&ContinueActionRecord]) -> O
     actions
         .iter()
         .find(|action| {
-            matches!(
-                action.action_kind.as_str(),
-                "editing"
-                    | "composing"
-                    | "running_command"
-                    | "copying_evidence"
-                    | "returning_to_origin"
-            ) && action.action_role != "support"
+            promoted_primary_action(action)
+                && matches!(
+                    action.action_kind.as_str(),
+                    "editing"
+                        | "composing"
+                        | "running_command"
+                        | "copying_evidence"
+                        | "returning_to_origin"
+                )
         })
         .and_then(|action| action.artifact_id.clone())
+}
+
+fn workstream_is_support_only(workstream: &BuiltWorkstream) -> bool {
+    workstream.primary_artifact_id.is_none()
+        && !workstream
+            .artifacts
+            .values()
+            .any(|artifact| artifact.durable_role == "primary_target")
+        && workstream
+            .episodes
+            .iter()
+            .flat_map(|(episode, _, _)| episode.actions.iter())
+            .all(|action| {
+                matches!(
+                    segmentation_decision_for_action(action).workstream_policy,
+                    SegmentationWorkstreamPolicy::AttachAsSupportToOrigin
+                        | SegmentationWorkstreamPolicy::AttachAsVerificationToOrigin
+                        | SegmentationWorkstreamPolicy::AttachAsInterruptContext
+                        | SegmentationWorkstreamPolicy::IgnoreForPrimarySelection
+                        | SegmentationWorkstreamPolicy::KeepCurrentFocusOnly
+                )
+            })
 }
 
 fn return_to_origin_artifact_id(actions: &[&ContinueActionRecord]) -> Option<String> {
@@ -28644,6 +31031,671 @@ fn insert_continue_workstream(
         )
         .map_err(to_string)?;
     }
+    Ok(())
+}
+
+fn rebuild_continue_branch_contexts(
+    conn: &Connection,
+    actions: &[ContinueActionRecord],
+    workstreams: &[BuiltWorkstream],
+) -> Result<Vec<ContinueBranchContext>, String> {
+    let action_workstream_ids = action_workstream_index(workstreams);
+    let mut contexts = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        if !action_is_branch_context_subject(action) {
+            continue;
+        }
+        let Some(branch_artifact_id) = action.artifact_id.clone() else {
+            continue;
+        };
+        let origin = select_branch_origin(
+            &actions[..index],
+            action,
+            workstreams,
+            &action_workstream_ids,
+            &branch_artifact_id,
+        );
+        let returned = origin
+            .artifact_id
+            .as_deref()
+            .and_then(|origin_artifact_id| {
+                find_return_to_origin_action(&actions[index + 1..], origin_artifact_id)
+            });
+        let last_branch_seen_at_ms = last_branch_seen_at_ms(
+            &actions[index..],
+            &branch_artifact_id,
+            returned.map(|action| action.created_at_ms),
+        )
+        .unwrap_or(action.created_at_ms);
+        let mut evidence_action_ids = vec![action.id.clone()];
+        if let Some(origin_action_id) = origin.action_id.as_deref() {
+            push_string_once(&mut evidence_action_ids, origin_action_id);
+        }
+        if let Some(return_action) = returned {
+            push_string_once(&mut evidence_action_ids, &return_action.id);
+        }
+        let branch_kind = action
+            .branch_kind
+            .clone()
+            .unwrap_or_else(|| branch_kind_from_action(action).to_string());
+        let feedback_suppression_reason = continue_feedback_suppression_for_target(
+            conn,
+            None,
+            origin.workstream_id.as_deref(),
+            Some(&branch_artifact_id),
+        )?;
+        let feedback_positive_kind = latest_positive_feedback_kind_for_branch(
+            conn,
+            &branch_artifact_id,
+            origin.workstream_id.as_deref(),
+        )?;
+        let promotion_decision = evaluate_branch_promotion(BranchPromotionInput {
+            branch_kind: branch_kind.clone(),
+            branch_started_at_ms: action.created_at_ms,
+            returned_to_origin_at_ms: returned.map(|action| action.created_at_ms),
+            feedback_hard_suppressed: feedback_suppression_reason.is_some(),
+            feedback_positive_kind,
+            has_origin: origin.artifact_id.is_some(),
+            actions: branch_promotion_actions(
+                &actions[index + 1..],
+                &branch_artifact_id,
+                action.created_at_ms,
+                returned.map(|action| action.created_at_ms),
+            ),
+        });
+        for evidence_action_id in &promotion_decision.evidence_action_ids {
+            push_string_once(&mut evidence_action_ids, evidence_action_id);
+        }
+        let promotion_reason = if let Some(reason) = feedback_suppression_reason {
+            Some(format!(
+                "{}:{}",
+                promotion_decision.promotion_reason, reason
+            ))
+        } else {
+            Some(promotion_decision.promotion_reason.clone())
+        };
+        let reason_code = origin
+            .reason_code
+            .clone()
+            .or_else(|| action.branch_reason_code.clone())
+            .unwrap_or_else(|| "branch:no_origin".to_string());
+        let confidence = branch_context_confidence(
+            action,
+            origin.confidence,
+            returned,
+            Some(promotion_decision.confidence),
+        );
+        let now = current_time_millis();
+        let id_seed = format!(
+            "{}:{}:{}",
+            action.id,
+            branch_artifact_id,
+            origin.artifact_id.as_deref().unwrap_or("no-origin")
+        );
+        let context = ContinueBranchContext {
+            id: format!("branch-context-{}", stable_hash(id_seed.as_bytes())),
+            branch_action_id: action.id.clone(),
+            branch_artifact_id,
+            origin_artifact_id: origin.artifact_id,
+            origin_workstream_id: origin.workstream_id,
+            branch_kind,
+            branch_started_at_ms: action.created_at_ms,
+            last_branch_seen_at_ms,
+            returned_to_origin: returned.is_some(),
+            returned_to_origin_at_ms: returned.map(|action| action.created_at_ms),
+            promotion_state: promotion_decision.promotion_state.as_str().to_string(),
+            promotion_reason,
+            confidence,
+            reason_code: Some(reason_code),
+            evidence_action_ids,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        insert_continue_branch_context(conn, &context)?;
+        contexts.push(context);
+    }
+    Ok(contexts)
+}
+
+#[derive(Debug, Clone)]
+struct BranchOriginCandidate {
+    artifact_id: Option<String>,
+    workstream_id: Option<String>,
+    action_id: Option<String>,
+    confidence: Option<f64>,
+    reason_code: Option<String>,
+}
+
+fn action_workstream_index(workstreams: &[BuiltWorkstream]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    for workstream in workstreams {
+        for (episode, _, _) in &workstream.episodes {
+            for action in &episode.actions {
+                index.insert(action.id.clone(), workstream.id.clone());
+            }
+        }
+    }
+    index
+}
+
+fn action_is_branch_context_subject(action: &ContinueActionRecord) -> bool {
+    if action.artifact_id.is_none() {
+        return false;
+    }
+    if matches!(
+        action.branch_kind.as_deref(),
+        Some("primary_work" | "new_current_task" | "unknown_primary" | "current_focus_only")
+    ) {
+        return false;
+    }
+    matches!(
+        action
+            .branch_action_role
+            .as_deref()
+            .unwrap_or(action.action_role.as_str()),
+        "branch" | "support" | "interrupt"
+    ) || matches!(
+        action.action_kind.as_str(),
+        "branching_away"
+            | "searching"
+            | "messaging_interrupt"
+            | "verification_branch"
+            | "observing_command_output"
+            | "reviewing_output"
+            | "copying_evidence"
+    )
+}
+
+fn select_branch_origin(
+    previous_actions: &[ContinueActionRecord],
+    branch_action: &ContinueActionRecord,
+    workstreams: &[BuiltWorkstream],
+    action_workstream_ids: &HashMap<String, String>,
+    branch_artifact_id: &str,
+) -> BranchOriginCandidate {
+    for previous in previous_actions.iter().rev() {
+        if branch_action
+            .created_at_ms
+            .saturating_sub(previous.created_at_ms)
+            > BRANCH_ORIGIN_DEFAULT_LOOKBACK_MS
+        {
+            break;
+        }
+        if primary_origin_action(previous, branch_artifact_id) {
+            return BranchOriginCandidate {
+                artifact_id: previous.artifact_id.clone(),
+                workstream_id: action_workstream_ids.get(&previous.id).cloned(),
+                action_id: Some(previous.id.clone()),
+                confidence: Some(previous.confidence),
+                reason_code: Some("branch:origin_recent_primary".to_string()),
+            };
+        }
+    }
+
+    if let Some(workstream_id) = action_workstream_ids.get(&branch_action.id) {
+        if let Some(workstream) = workstreams
+            .iter()
+            .find(|workstream| &workstream.id == workstream_id)
+        {
+            if let Some(primary_artifact_id) = workstream.primary_artifact_id.as_deref() {
+                if primary_artifact_id != branch_artifact_id
+                    && workstream_primary_is_valid_origin(workstream, primary_artifact_id)
+                {
+                    return BranchOriginCandidate {
+                        artifact_id: Some(primary_artifact_id.to_string()),
+                        workstream_id: Some(workstream.id.clone()),
+                        action_id: None,
+                        confidence: Some(workstream.confidence),
+                        reason_code: Some("branch:origin_workstream_primary".to_string()),
+                    };
+                }
+            }
+        }
+    }
+
+    BranchOriginCandidate {
+        artifact_id: None,
+        workstream_id: action_workstream_ids.get(&branch_action.id).cloned(),
+        action_id: None,
+        confidence: None,
+        reason_code: Some("branch:no_origin".to_string()),
+    }
+}
+
+fn primary_origin_action(action: &ContinueActionRecord, branch_artifact_id: &str) -> bool {
+    if action.artifact_id.as_deref() == Some(branch_artifact_id) || action.artifact_id.is_none() {
+        return false;
+    }
+    if matches!(
+        action.branch_kind.as_deref(),
+        Some(
+            "diagnostic_self"
+                | "message_interrupt"
+                | "search_branch"
+                | "documentation_reference"
+                | "source_evidence"
+                | "terminal_support_output"
+                | "tool_or_agent_output"
+                | "settings_or_admin"
+                | "unknown_support"
+                | "current_focus_only"
+        )
+    ) {
+        return false;
+    }
+    let role = action
+        .branch_action_role
+        .as_deref()
+        .unwrap_or(action.action_role.as_str());
+    matches!(role, "primary")
+        && action.confidence >= 0.55
+        && matches!(
+            action.action_kind.as_str(),
+            "editing"
+                | "composing"
+                | "running_command"
+                | "encountering_error"
+                | "returning_to_origin"
+        )
+}
+
+fn workstream_primary_is_valid_origin(workstream: &BuiltWorkstream, artifact_id: &str) -> bool {
+    workstream
+        .artifacts
+        .get(artifact_id)
+        .map(|artifact| {
+            matches!(
+                artifact.durable_role.as_str(),
+                "primary_target" | "blocker_surface"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn find_return_to_origin_action<'a>(
+    later_actions: &'a [ContinueActionRecord],
+    origin_artifact_id: &str,
+) -> Option<&'a ContinueActionRecord> {
+    later_actions.iter().find(|action| {
+        action.artifact_id.as_deref() == Some(origin_artifact_id)
+            && meaningful_return_to_origin_action(action)
+    })
+}
+
+fn meaningful_return_to_origin_action(action: &ContinueActionRecord) -> bool {
+    action.action_kind == "returning_to_origin"
+        || matches!(
+            action.action_kind.as_str(),
+            "editing" | "composing" | "running_command" | "encountering_error"
+        )
+}
+
+fn last_branch_seen_at_ms(
+    actions: &[ContinueActionRecord],
+    branch_artifact_id: &str,
+    return_at_ms: Option<i64>,
+) -> Option<i64> {
+    actions
+        .iter()
+        .take_while(|action| {
+            return_at_ms
+                .map(|return_at_ms| action.created_at_ms < return_at_ms)
+                .unwrap_or(true)
+        })
+        .filter(|action| action.artifact_id.as_deref() == Some(branch_artifact_id))
+        .map(|action| action.created_at_ms)
+        .max()
+}
+
+fn evaluate_branch_promotion(input: BranchPromotionInput) -> BranchPromotionDecision {
+    let mut warnings = Vec::new();
+    let fresh_actions = input
+        .actions
+        .iter()
+        .filter(|action| action.created_at_ms > input.branch_started_at_ms)
+        .filter(|action| {
+            input
+                .returned_to_origin_at_ms
+                .map(|returned_at| action.created_at_ms < returned_at)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if input.feedback_hard_suppressed {
+        return branch_promotion_decision(
+            BranchPromotionState::BlockedFeedbackSuppressed,
+            None,
+            "feedback_hard_suppressed_without_fresh_reconfirmation",
+            0.12,
+            Vec::new(),
+            warnings,
+        );
+    }
+    if input.branch_kind == "current_focus_only" {
+        return branch_promotion_decision(
+            BranchPromotionState::BlockedThinCurrentFocus,
+            None,
+            "brief_current_focus_without_action_evidence",
+            0.18,
+            Vec::new(),
+            warnings,
+        );
+    }
+    if let Some(kind) = input.feedback_positive_kind.as_deref() {
+        let state = match kind {
+            "corrected" => BranchPromotionState::PromotedUserCorrected,
+            "accepted" | "auto_resumed" => BranchPromotionState::PromotedUserAccepted,
+            "user_next_step_note" => BranchPromotionState::PromotedPrimary,
+            _ => BranchPromotionState::PromotedPrimary,
+        };
+        return branch_promotion_decision(
+            state,
+            None,
+            "positive_feedback_targeted_branch",
+            0.88,
+            Vec::new(),
+            warnings,
+        );
+    }
+    if input.branch_kind == "diagnostic_self"
+        && !diagnostic_self_has_developer_task_promotion_evidence(&fresh_actions)
+    {
+        return branch_promotion_decision(
+            BranchPromotionState::BlockedDiagnosticSelf,
+            None,
+            "diagnostic_self_without_direct_developer_task_evidence",
+            0.16,
+            Vec::new(),
+            warnings,
+        );
+    }
+    if let Some(action) = fresh_actions
+        .iter()
+        .find(|action| action_is_branch_blocker_promotion(action))
+    {
+        return branch_promotion_decision(
+            BranchPromotionState::PromotedBlocker,
+            Some(action.created_at_ms),
+            "unresolved_blocker_on_branch_artifact",
+            action.confidence.max(PROMOTION_CONFIDENCE_MIN),
+            vec![action.action_id.clone()],
+            warnings,
+        );
+    }
+    if let Some(action) = fresh_actions
+        .iter()
+        .find(|action| action_is_direct_branch_work_promotion(action))
+    {
+        return branch_promotion_decision(
+            BranchPromotionState::PromotedPrimary,
+            Some(action.created_at_ms),
+            "direct_editing_or_composing_on_branch_artifact",
+            action.confidence.max(PROMOTION_CONFIDENCE_MIN),
+            vec![action.action_id.clone()],
+            warnings,
+        );
+    }
+    let meaningful_actions = fresh_actions
+        .iter()
+        .filter(|action| action_is_meaningful_branch_activity(action))
+        .collect::<Vec<_>>();
+    if let (Some(first), Some(last)) = (meaningful_actions.first(), meaningful_actions.last()) {
+        if meaningful_actions.len() >= SUSTAINED_BRANCH_MIN_ACTIONS
+            && last.created_at_ms.saturating_sub(first.created_at_ms) >= SUSTAINED_BRANCH_MIN_MS
+            && input.returned_to_origin_at_ms.is_none()
+        {
+            return branch_promotion_decision(
+                BranchPromotionState::PromotedSustainedWork,
+                Some(last.created_at_ms),
+                "sustained_branch_work_without_return_to_origin",
+                last.confidence.max(0.70),
+                meaningful_actions
+                    .iter()
+                    .map(|action| action.action_id.clone())
+                    .collect(),
+                warnings,
+            );
+        }
+    }
+    if !input.has_origin {
+        warnings.push("branch_promotion:no_origin".to_string());
+    }
+    if input.returned_to_origin_at_ms.is_some() {
+        warnings.push("branch_promotion:returned_to_origin".to_string());
+    }
+    if let (Some(first), Some(last)) = (fresh_actions.first(), fresh_actions.last()) {
+        if last.created_at_ms.saturating_sub(first.created_at_ms) <= BRIEF_INTERRUPT_MAX_MS {
+            warnings.push("branch_promotion:brief_interrupt".to_string());
+        }
+    }
+    branch_promotion_decision(
+        BranchPromotionState::Unpromoted,
+        None,
+        "no_strong_branch_promotion_evidence_after_start",
+        0.34,
+        Vec::new(),
+        warnings,
+    )
+}
+
+fn branch_promotion_decision(
+    promotion_state: BranchPromotionState,
+    promoted_at_ms: Option<i64>,
+    promotion_reason: &str,
+    confidence: f64,
+    evidence_action_ids: Vec<String>,
+    warnings: Vec<String>,
+) -> BranchPromotionDecision {
+    BranchPromotionDecision {
+        promotion_state,
+        public_return_eligible: promotion_state.public_return_eligible(),
+        promoted_at_ms,
+        promotion_reason: promotion_reason.to_string(),
+        confidence: confidence.clamp(0.05, 0.95),
+        evidence_action_ids,
+        warnings,
+    }
+}
+
+fn branch_promotion_actions(
+    later_actions: &[ContinueActionRecord],
+    branch_artifact_id: &str,
+    branch_started_at_ms: i64,
+    returned_to_origin_at_ms: Option<i64>,
+) -> Vec<BranchPromotionActionEvidence> {
+    later_actions
+        .iter()
+        .take_while(|action| {
+            returned_to_origin_at_ms
+                .map(|returned_at| action.created_at_ms < returned_at)
+                .unwrap_or(true)
+        })
+        .filter(|action| action.created_at_ms > branch_started_at_ms)
+        .filter(|action| action.artifact_id.as_deref() == Some(branch_artifact_id))
+        .map(|action| BranchPromotionActionEvidence {
+            action_id: action.id.clone(),
+            action_kind: action.action_kind.clone(),
+            action_role: action.action_role.clone(),
+            branch_kind: action.branch_kind.clone(),
+            branch_action_role: action.branch_action_role.clone(),
+            created_at_ms: action.created_at_ms,
+            confidence: action.branch_confidence.unwrap_or(action.confidence),
+            collapse_count: action.collapse_count,
+        })
+        .collect()
+}
+
+fn action_is_direct_branch_work_promotion(action: &BranchPromotionActionEvidence) -> bool {
+    matches!(
+        action.action_kind.as_str(),
+        "editing" | "composing" | "running_command"
+    ) && matches!(
+        action
+            .branch_action_role
+            .as_deref()
+            .unwrap_or(action.action_role.as_str()),
+        "primary" | "return"
+    ) && action.confidence >= 0.55
+}
+
+fn action_is_branch_blocker_promotion(action: &BranchPromotionActionEvidence) -> bool {
+    matches!(action.action_kind.as_str(), "encountering_error")
+        && action.confidence >= 0.55
+        && !matches!(
+            action.branch_kind.as_deref(),
+            Some("terminal_support_output" | "tool_or_agent_output")
+        )
+}
+
+fn action_is_meaningful_branch_activity(action: &BranchPromotionActionEvidence) -> bool {
+    matches!(
+        action.action_kind.as_str(),
+        "editing"
+            | "composing"
+            | "running_command"
+            | "encountering_error"
+            | "observing_command_output"
+            | "reviewing_output"
+    ) || action.collapse_count >= 2
+}
+
+fn diagnostic_self_has_developer_task_promotion_evidence(
+    actions: &[&BranchPromotionActionEvidence],
+) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action.action_kind.as_str(),
+            "editing" | "composing" | "running_command" | "encountering_error"
+        ) && matches!(
+            action
+                .branch_action_role
+                .as_deref()
+                .unwrap_or(action.action_role.as_str()),
+            "primary" | "return"
+        )
+    })
+}
+
+fn latest_positive_feedback_kind_for_branch(
+    conn: &Connection,
+    branch_artifact_id: &str,
+    origin_workstream_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let keys = feedback_keys_for_branch_target(conn, branch_artifact_id, origin_workstream_id)?;
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let target_key_set = keys.iter().collect::<HashSet<_>>();
+    let mut latest: Option<(i64, String)> = None;
+    for row in load_continue_feedback_event_rows_for_target_keys(conn, &keys, 500)? {
+        let targets = feedback_targets_for_feedback_event(&row);
+        if !feedback_positive_applies_to_candidate(&targets, &target_key_set) {
+            continue;
+        }
+        if feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or("")) <= 0 {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|(timestamp_ms, _)| row.timestamp_ms > *timestamp_ms)
+        {
+            latest = Some((row.timestamp_ms, row.event_kind));
+        }
+    }
+    Ok(latest.map(|(_, kind)| kind))
+}
+
+fn feedback_keys_for_branch_target(
+    conn: &Connection,
+    branch_artifact_id: &str,
+    origin_workstream_id: Option<&str>,
+) -> Result<Vec<FeedbackTargetKey>, String> {
+    let mut keys = Vec::new();
+    push_feedback_target(
+        &mut keys,
+        FeedbackTargetScope::TargetArtifact,
+        Some(branch_artifact_id),
+    );
+    push_feedback_target(
+        &mut keys,
+        FeedbackTargetScope::Workstream,
+        origin_workstream_id,
+    );
+    if let Some(stable_key) = load_artifact_stable_key(conn, Some(branch_artifact_id))? {
+        push_feedback_target(
+            &mut keys,
+            FeedbackTargetScope::ArtifactStableKey,
+            Some(stable_key.as_str()),
+        );
+    }
+    Ok(keys)
+}
+
+fn branch_context_confidence(
+    action: &ContinueActionRecord,
+    origin_confidence: Option<f64>,
+    returned: Option<&ContinueActionRecord>,
+    promotion_confidence: Option<f64>,
+) -> f64 {
+    let mut confidence = action.branch_confidence.unwrap_or(action.confidence);
+    if let Some(origin_confidence) = origin_confidence {
+        confidence = ((confidence + origin_confidence) / 2.0).max(confidence.min(0.72));
+    } else {
+        confidence = confidence.min(0.58);
+    }
+    if returned.is_some() {
+        confidence = (confidence + 0.08).min(0.94);
+    }
+    if let Some(promotion_confidence) = promotion_confidence {
+        confidence = confidence.max(promotion_confidence);
+    }
+    confidence.clamp(0.05, 0.95)
+}
+
+fn branch_kind_from_action(action: &ContinueActionRecord) -> &'static str {
+    match action.action_kind.as_str() {
+        "messaging_interrupt" => "message_interrupt",
+        "searching" | "branching_away" => "search_branch",
+        "verification_branch" | "observing_command_output" | "reviewing_output" => {
+            "verification_branch"
+        }
+        "copying_evidence" => "source_evidence",
+        _ => "unknown_support",
+    }
+}
+
+fn insert_continue_branch_context(
+    conn: &Connection,
+    context: &ContinueBranchContext,
+) -> Result<(), String> {
+    let evidence_action_ids_json =
+        serde_json::to_string(&context.evidence_action_ids).map_err(to_string)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_branch_contexts (
+            id, branch_action_id, origin_artifact_id, origin_workstream_id,
+            branch_artifact_id, branch_kind, branch_started_at_ms, last_branch_seen_at_ms,
+            returned_to_origin_at_ms, promotion_state, promotion_reason, confidence,
+            reason_code, evidence_action_ids_json, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            context.id,
+            context.branch_action_id,
+            context.origin_artifact_id,
+            context.origin_workstream_id,
+            context.branch_artifact_id,
+            context.branch_kind,
+            context.branch_started_at_ms,
+            context.last_branch_seen_at_ms,
+            context.returned_to_origin_at_ms,
+            context.promotion_state,
+            context.promotion_reason,
+            context.confidence,
+            context.reason_code,
+            evidence_action_ids_json,
+            context.created_at_ms,
+            context.updated_at_ms,
+        ],
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
@@ -30435,6 +33487,37 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_continue_workstream_edges_artifacts
           ON continue_workstream_edges(from_artifact_id, to_artifact_id, edge_kind);
 
+        CREATE TABLE IF NOT EXISTS continue_branch_contexts (
+          id TEXT PRIMARY KEY,
+          branch_action_id TEXT NOT NULL,
+          origin_artifact_id TEXT,
+          origin_workstream_id TEXT,
+          branch_artifact_id TEXT NOT NULL,
+          branch_kind TEXT NOT NULL,
+          branch_started_at_ms INTEGER NOT NULL,
+          last_branch_seen_at_ms INTEGER NOT NULL,
+          returned_to_origin_at_ms INTEGER,
+          promotion_state TEXT NOT NULL DEFAULT 'unpromoted',
+          promotion_reason TEXT,
+          confidence REAL NOT NULL DEFAULT 0.0,
+          reason_code TEXT,
+          evidence_action_ids_json TEXT NOT NULL DEFAULT '[]',
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          FOREIGN KEY(branch_action_id) REFERENCES continue_task_actions(id) ON DELETE CASCADE,
+          FOREIGN KEY(origin_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
+          FOREIGN KEY(origin_workstream_id) REFERENCES continue_workstreams(id) ON DELETE SET NULL,
+          FOREIGN KEY(branch_artifact_id) REFERENCES continue_artifacts(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_continue_branch_contexts_action
+          ON continue_branch_contexts(branch_action_id);
+        CREATE INDEX IF NOT EXISTS idx_continue_branch_contexts_branch_artifact
+          ON continue_branch_contexts(branch_artifact_id, last_branch_seen_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_continue_branch_contexts_origin_artifact
+          ON continue_branch_contexts(origin_artifact_id, last_branch_seen_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_continue_branch_contexts_origin_workstream
+          ON continue_branch_contexts(origin_workstream_id, last_branch_seen_at_ms);
+
         CREATE TABLE IF NOT EXISTS continue_open_loops (
           id TEXT PRIMARY KEY,
           workstream_id TEXT NOT NULL,
@@ -30942,6 +34025,22 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "quality_flags_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    ensure_column_exists(conn, "continue_task_actions", "branch_kind", "TEXT")?;
+    ensure_column_exists(conn, "continue_task_actions", "branch_action_role", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "branch_promotion_eligible_by_default",
+        "INTEGER",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_task_actions",
+        "branch_public_return_eligible_by_default",
+        "INTEGER",
+    )?;
+    ensure_column_exists(conn, "continue_task_actions", "branch_confidence", "REAL")?;
+    ensure_column_exists(conn, "continue_task_actions", "branch_reason_code", "TEXT")?;
     ensure_column_exists(
         conn,
         "continue_candidates",
@@ -31261,6 +34360,7 @@ pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
         DELETE FROM continue_open_loop_evidence;
         DELETE FROM continue_open_loop_artifacts;
         DELETE FROM continue_open_loops;
+        DELETE FROM continue_branch_contexts;
         DELETE FROM continue_workstream_edges;
         DELETE FROM continue_workstream_state_snapshots;
         DELETE FROM continue_workstream_artifacts;
@@ -33242,7 +36342,349 @@ mod tests {
             attribution_confidence: None,
             classifier_context_json: None,
             quality_flags: Vec::new(),
+            branch_kind: None,
+            branch_action_role: None,
+            branch_promotion_eligible_by_default: None,
+            branch_public_return_eligible_by_default: None,
+            branch_confidence: None,
+            branch_reason_code: None,
         }
+    }
+
+    fn branch_test_frame(
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        browser_url: Option<&str>,
+        document_path: Option<&str>,
+    ) -> EvidenceFrame {
+        EvidenceFrame {
+            id: "1".to_string(),
+            captured_at: 1_000,
+            app_name: app_name.map(str::to_string),
+            window_name: window_name.map(str::to_string),
+            browser_url: browser_url.map(str::to_string),
+            document_path: document_path.map(str::to_string),
+            capture_trigger: "manual".to_string(),
+            text_source: Some("accessibility".to_string()),
+            scope: Some("active_window".to_string()),
+            window_id: Some(1),
+            active_window_crop_path: None,
+            full_text: None,
+            active_text: None,
+            background_text: None,
+            full_text_quality: None,
+            text_quality_flags: Vec::new(),
+            content_hash: None,
+            image_hash: None,
+            privacy_status: None,
+            app_bundle_id: None,
+            previous_frame_id: None,
+            session_id: Some("session-a".to_string()),
+            app_contexts: Vec::new(),
+            content_units: Vec::new(),
+            ocr_spans: Vec::new(),
+            visible_windows: Vec::new(),
+            ui_events: Vec::new(),
+            trigger: None,
+            transition: None,
+            frame_diff: None,
+            typing_bursts: Vec::new(),
+            clipboard_events: Vec::new(),
+            focused_node_evidence: false,
+            selected_text_present: false,
+        }
+    }
+
+    fn branch_test_artifact(
+        kind: &str,
+        title: &str,
+        url: Option<&str>,
+        path: Option<&str>,
+    ) -> ResolvedArtifact {
+        ResolvedArtifact {
+            id: format!("artifact-{}", kind),
+            kind: kind.to_string(),
+            stable_key: format!("stable-{}", kind),
+            display_title: Some(title.to_string()),
+            browser_url: url.map(str::to_string),
+            document_path: path.map(str::to_string),
+            identity_confidence: 0.9,
+            evidence_quality: "strong".to_string(),
+            openability: "openable".to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    fn classify_branch_test(
+        frame: &EvidenceFrame,
+        artifact: &ResolvedArtifact,
+        action_kind: &str,
+        action_role: &str,
+        trigger_type: Option<&str>,
+        transition_label: Option<&str>,
+        confidence: f64,
+        reason: &str,
+    ) -> BranchClassification {
+        classify_branch_context(BranchClassificationInput {
+            frame,
+            artifact,
+            previous_artifact: None,
+            action_kind,
+            action_role,
+            trigger_type,
+            transition_label,
+            confidence,
+            reason,
+        })
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_search_results_as_non_public_branch() {
+        let mut frame = branch_test_frame(
+            Some("Chrome"),
+            Some("Google Search"),
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+        );
+        frame.content_units.push(EvidenceContentUnit {
+            id: "unit-search".to_string(),
+            source: "accessibility".to_string(),
+            unit_type: "result".to_string(),
+            semantic_role: Some("search_result".to_string()),
+            text: None,
+            text_hash: None,
+            confidence: Some(0.9),
+            ocr_span_ids: Vec::new(),
+            bounds: None,
+            source_scope: None,
+            ownership_kind: Some("ActiveWindowOwned".to_string()),
+            ownership_confidence: Some(0.9),
+            active_artifact_match_confidence: Some(0.9),
+            owner_window_id: None,
+            owner_bundle_id: None,
+            quality_flags: Vec::new(),
+        });
+        let artifact = branch_test_artifact(
+            "browser_tab",
+            "Google Search",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+        );
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "searching",
+            "support",
+            None,
+            None,
+            0.76,
+            "search_context",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::SearchBranch);
+        assert_eq!(classification.action_role, "branch");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:search_results");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_docs_reference_as_non_public_support() {
+        let frame = branch_test_frame(
+            Some("Chrome"),
+            Some("Rust docs"),
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+        );
+        let artifact = branch_test_artifact(
+            "browser_tab",
+            "rusqlite docs",
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+        );
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "reading",
+            "primary",
+            None,
+            None,
+            0.52,
+            "visible_content_without_edit_signal",
+        );
+
+        assert_eq!(
+            classification.branch_kind,
+            BranchKind::DocumentationReference
+        );
+        assert_eq!(classification.action_role, "support");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:docs_reference");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_message_read_as_interrupt() {
+        let frame = branch_test_frame(
+            Some("Chrome"),
+            Some("Gmail Inbox"),
+            Some("https://mail.google.com/mail/u/0/#inbox"),
+            None,
+        );
+        let artifact = branch_test_artifact(
+            "messaging",
+            "Gmail Inbox",
+            Some("https://mail.google.com/mail/u/0/#inbox"),
+            None,
+        );
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "reading",
+            "primary",
+            None,
+            None,
+            0.52,
+            "visible_content_without_edit_signal",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::MessageInterrupt);
+        assert_eq!(classification.action_role, "interrupt");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:message_interrupt");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_smalltalk_audit_path_as_diagnostic_self() {
+        let frame = branch_test_frame(
+            Some("Finder"),
+            Some("continue audit"),
+            None,
+            Some("/Users/me/project/continue_outputs/session-123/final_decision.json"),
+        );
+        let artifact = branch_test_artifact(
+            "finder",
+            "final_decision.json",
+            None,
+            Some("/Users/me/project/continue_outputs/session-123/final_decision.json"),
+        );
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "reading",
+            "primary",
+            None,
+            None,
+            0.52,
+            "visible_content_without_edit_signal",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::DiagnosticSelf);
+        assert_eq!(classification.action_role, "support");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:smalltalk_self");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_terminal_output_without_input_as_support_output() {
+        let mut frame = branch_test_frame(Some("Terminal"), Some("cargo test output"), None, None);
+        frame.frame_diff = Some(EvidenceFrameDiff {
+            diff_type: Some("text_added".to_string()),
+            added_text_hashes: Some("hash-a".to_string()),
+            removed_text_hashes: None,
+            summary: None,
+        });
+        let artifact = branch_test_artifact("terminal", "cargo test", None, None);
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "observing_command_output",
+            "support",
+            None,
+            None,
+            0.78,
+            "terminal_output_changed",
+        );
+
+        assert_eq!(
+            classification.branch_kind,
+            BranchKind::TerminalSupportOutput
+        );
+        assert_eq!(classification.action_role, "support");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:terminal_output_only");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_terminal_command_error_as_primary_work() {
+        let frame = branch_test_frame(Some("Terminal"), Some("cargo test"), None, None);
+        let artifact = branch_test_artifact("terminal", "cargo test", None, None);
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "encountering_error",
+            "primary",
+            None,
+            None,
+            0.86,
+            "artifact_attributed_error_signal",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::PrimaryWork);
+        assert_eq!(classification.action_role, "primary");
+        assert!(classification.public_return_eligible_by_default);
+        assert_eq!(
+            classification.reason_code,
+            "branch:primary_unresolved_error"
+        );
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_codex_composing_as_primary_work() {
+        let frame = branch_test_frame(Some("Codex"), Some("Codex"), None, None);
+        let artifact = branch_test_artifact("chat_conversation", "Codex", None, None);
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "composing",
+            "primary",
+            Some("typing_pause"),
+            None,
+            0.82,
+            "typing_in_composer",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::PrimaryWork);
+        assert_eq!(classification.action_role, "primary");
+        assert!(classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:primary_composing");
+    }
+
+    #[test]
+    fn branch_taxonomy_classifies_event_only_weak_codex_as_current_focus_only() {
+        let frame = branch_test_frame(Some("Codex"), Some("Codex"), None, None);
+        let artifact = branch_test_artifact("chat_conversation", "Codex", None, None);
+
+        let classification = classify_branch_test(
+            &frame,
+            &artifact,
+            "switching_context",
+            "unknown",
+            Some("event_backed_weak_surface"),
+            None,
+            0.48,
+            "event_backed_current_focus",
+        );
+
+        assert_eq!(classification.branch_kind, BranchKind::CurrentFocusOnly);
+        assert_eq!(classification.action_role, "unknown");
+        assert!(!classification.public_return_eligible_by_default);
+        assert_eq!(classification.reason_code, "branch:current_focus_thin");
     }
 
     #[test]
@@ -33277,6 +36719,9 @@ mod tests {
             openability: "frame_fallback".to_string(),
             last_seen_frame_id: Some("1".to_string()),
             last_seen_timestamp: 1_000,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
         };
         let mut unknown_candidate = ScoredContinueCandidate {
             id: "candidate-unknown".to_string(),
@@ -33334,6 +36779,9 @@ mod tests {
             feedback_reason_codes: Vec::new(),
             eligible_for_primary_selection: true,
             selection_demotion_reason: None,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
             resume_work_target: Some(unknown),
             open_loop: None,
         };
@@ -33366,6 +36814,9 @@ mod tests {
             openability: "openable".to_string(),
             last_seen_frame_id: Some("2".to_string()),
             last_seen_timestamp: 2_000,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
         };
         let mut smalltalk_candidate = unknown_candidate.clone();
         smalltalk_candidate.target_artifact = Some(smalltalk);
@@ -33406,6 +36857,9 @@ mod tests {
             openability: "openable".to_string(),
             last_seen_frame_id: Some("1".to_string()),
             last_seen_timestamp: 1_000,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
         }
     }
 
@@ -33556,6 +37010,15 @@ mod tests {
             feedback_reason_codes: Vec::new(),
             eligible_for_primary_selection: true,
             selection_demotion_reason: None,
+            branch_promotion_state: target
+                .as_ref()
+                .and_then(|artifact| artifact.branch_promotion_state.clone()),
+            branch_public_return_eligible: target
+                .as_ref()
+                .and_then(|artifact| artifact.branch_public_return_eligible),
+            branch_promotion_reason: target
+                .as_ref()
+                .and_then(|artifact| artifact.branch_promotion_reason.clone()),
             resume_work_target: target,
             open_loop,
         }
@@ -34036,6 +37499,138 @@ mod tests {
     }
 
     #[test]
+    fn unpromoted_branch_target_cannot_win_from_openability_recency_or_evidence_quality() {
+        let mut branch = test_artifact("artifact-branch", "browser_tab", "Search results");
+        branch.browser_url = Some("https://example.com/search?q=sqlite".to_string());
+        branch.document_path = None;
+        branch.openability = "openable".to_string();
+        branch.evidence_quality = "strong".to_string();
+        branch.last_seen_timestamp = 125_000;
+        branch.branch_promotion_state = Some("unpromoted".to_string());
+        branch.branch_public_return_eligible = Some(false);
+        branch.branch_promotion_reason =
+            Some("search branch was only support evidence".to_string());
+        let mut branch_action = test_action(&branch.id, "reading");
+        branch_action.created_at_ms = 125_000;
+        let mut branch_workstream = test_workstream(
+            branch.clone(),
+            "primary_target",
+            Some(branch_action.clone()),
+            None,
+        );
+        branch_workstream.id = "workstream-branch".to_string();
+        branch_workstream.last_active_timestamp_ms = 125_000;
+        branch_workstream.unresolved_signal = Some("branch_without_return".to_string());
+        let mut branch_candidate = test_candidate(
+            "finish_search",
+            Some(branch.clone()),
+            Some(branch_action),
+            None,
+        );
+        branch_candidate.id = "candidate-branch".to_string();
+        branch_candidate.workstream_id = branch_workstream.id.clone();
+
+        let mut origin = test_artifact("artifact-origin", "code_editor", "continuation.rs");
+        origin.last_seen_timestamp = 115_000;
+        origin.evidence_quality = "medium".to_string();
+        let mut origin_action = test_action(&origin.id, "editing");
+        origin_action.created_at_ms = 115_000;
+        let mut origin_workstream = test_workstream(
+            origin.clone(),
+            "primary_target",
+            Some(origin_action.clone()),
+            None,
+        );
+        origin_workstream.id = "workstream-origin".to_string();
+        origin_workstream.last_active_timestamp_ms = 115_000;
+        origin_workstream.unresolved_signal = Some("idle_after_progress".to_string());
+        let mut origin_candidate =
+            test_candidate("continue_edit", Some(origin), Some(origin_action), None);
+        origin_candidate.id = "candidate-origin".to_string();
+        origin_candidate.workstream_id = origin_workstream.id.clone();
+
+        let mut candidates = vec![branch_candidate, origin_candidate];
+        score_continue_candidates(
+            &mut candidates,
+            &[branch_workstream, origin_workstream],
+            None,
+            None,
+        );
+
+        let branch = candidates
+            .iter()
+            .find(|candidate| candidate.id == "candidate-branch")
+            .unwrap();
+        assert!(!branch.eligible_for_primary_selection, "{:?}", branch);
+        assert!(branch.score <= 0.42, "{:?}", branch);
+        assert!(branch
+            .score_caps_applied
+            .contains(&"score_capped:branch_support_unpromoted_public_return_gate".to_string()));
+        assert!(branch
+            .risk_flags
+            .contains(&"unpromoted_branch_support_target".to_string()));
+        assert!(!candidate_primary_eligible_after_feedback_gate(branch));
+
+        let winner = candidates
+            .iter()
+            .filter(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
+            .max_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+        assert_eq!(winner.id, "candidate-origin");
+        let selected = select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, "candidate-origin");
+    }
+
+    #[test]
+    fn promoted_branch_support_target_can_remain_primary_eligible() {
+        let mut target = test_artifact("artifact-promoted", "browser_tab", "Build failure");
+        target.browser_url = Some("https://example.com/build/failed".to_string());
+        target.document_path = None;
+        target.openability = "openable".to_string();
+        target.evidence_quality = "strong".to_string();
+        target.branch_promotion_state = Some("promoted_blocker".to_string());
+        target.branch_public_return_eligible = Some(true);
+        target.branch_promotion_reason = Some("branch contains the unresolved blocker".to_string());
+        let action = test_action(&target.id, "encountering_error");
+        let workstream =
+            test_workstream(target.clone(), "support_source", Some(action.clone()), None);
+        let mut candidates = vec![test_candidate(
+            "resolve_error",
+            Some(target),
+            Some(action),
+            None,
+        )];
+
+        score_continue_candidates(&mut candidates, &[workstream], None, None);
+
+        assert!(
+            candidates[0].eligible_for_primary_selection,
+            "{:?}",
+            candidates[0]
+        );
+        assert!(candidate_primary_eligible_after_feedback_gate(
+            &candidates[0]
+        ));
+        assert!(!candidates[0]
+            .score_caps_applied
+            .contains(&"score_capped:branch_support_unpromoted_public_return_gate".to_string()));
+        let selected = select_local_candidate_after_activity(
+            &candidates,
+            &ContinueAppActivityIntelligence::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, candidates[0].id);
+    }
+
+    #[test]
     fn fresh_current_work_boost_does_not_promote_support_surface() {
         let mut origin = test_artifact("artifact-origin", "code_editor", "lib.rs");
         origin.last_seen_timestamp = 120_000;
@@ -34346,6 +37941,12 @@ mod tests {
             feedback_last_reconfirming_evidence_ms: candidate
                 .feedback_last_reconfirming_evidence_ms,
             feedback_reason_codes: candidate.feedback_reason_codes.clone(),
+            branch_promotion_state: candidate.branch_promotion_state.clone(),
+            branch_public_return_eligible: candidate.branch_public_return_eligible,
+            branch_promotion_reason: candidate.branch_promotion_reason.clone(),
+            branch_eligibility_state: candidate_branch_eligibility_state(candidate),
+            public_return_eligible: candidate_public_return_eligible(candidate),
+            blocked_reason: candidate_blocked_reason(candidate),
             local_reason: candidate.reason.clone(),
         }
     }
@@ -34365,6 +37966,7 @@ mod tests {
             current_surface: None,
             workstreams: Vec::new(),
             candidates: candidates.iter().map(pack_candidate_for_test).collect(),
+            support_evidence: support_evidence_items_for_candidates(candidates),
             evidence_packs_v2: candidates
                 .iter()
                 .map(|candidate| build_candidate_evidence_pack_v2(candidate, None, None))
@@ -34445,6 +38047,7 @@ mod tests {
                 confidence_label: "Thin".to_string(),
                 user_visible_uncertainty: Some("Evidence is thin.".to_string()),
             },
+            support_evidence: Vec::new(),
             alternatives: vec![
                 p5_candidate_summary("candidate-old", "workstream-p5", Some("artifact-old"), 0.52),
                 p5_candidate_summary("candidate-current", "workstream-current", None, 0.46),
@@ -34459,6 +38062,11 @@ mod tests {
             eligible_candidate_count_after_feedback_gate: 2,
             model_candidate_count_before_feedback_filter: 2,
             model_candidate_count_after_feedback_filter: 2,
+            selectable_candidate_count_before_branch_filter: 2,
+            selectable_candidate_count_after_branch_filter: 2,
+            excluded_branch_candidate_ids: Vec::new(),
+            support_evidence_count: 0,
+            branch_validation_failures: Vec::new(),
             continue_output_mode: "thin_continue".to_string(),
             evidence_watermark_hash: "watermark-p5-thin".to_string(),
             latest_boundary_revision: None,
@@ -34529,6 +38137,13 @@ mod tests {
             feedback_last_reconfirming_evidence_ms: None,
             feedback_score_cap: None,
             feedback_reason_codes: Vec::new(),
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
+            branch_kind: None,
+            branch_eligibility_state: Some("eligible_primary_candidate".to_string()),
+            public_return_eligible: true,
+            blocked_reason: None,
             evidence_frame_id: Some("12".to_string()),
             supporting_episode_id: None,
             last_meaningful_action_id: None,
@@ -34787,6 +38402,9 @@ mod tests {
             openability: "openable".to_string(),
             last_seen_frame_id: Some("1664".to_string()),
             last_seen_timestamp: 1_000,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
         };
         let smalltalk = ScorerArtifact {
             id: "artifact-smalltalk-current".to_string(),
@@ -34799,6 +38417,9 @@ mod tests {
             openability: "frame_fallback".to_string(),
             last_seen_frame_id: Some("1667".to_string()),
             last_seen_timestamp: 2_000,
+            branch_promotion_state: None,
+            branch_public_return_eligible: None,
+            branch_promotion_reason: None,
         };
         let youtube_action = ScorerAction {
             id: "action-youtube".to_string(),
@@ -34956,6 +38577,9 @@ mod tests {
                 feedback_reason_codes: Vec::new(),
                 eligible_for_primary_selection: true,
                 selection_demotion_reason: None,
+                branch_promotion_state: None,
+                branch_public_return_eligible: None,
+                branch_promotion_reason: None,
                 resume_work_target: None,
                 open_loop: None,
             },
@@ -35015,6 +38639,9 @@ mod tests {
                 feedback_reason_codes: Vec::new(),
                 eligible_for_primary_selection: true,
                 selection_demotion_reason: None,
+                branch_promotion_state: None,
+                branch_public_return_eligible: None,
+                branch_promotion_reason: None,
                 resume_work_target: None,
                 open_loop: None,
             },
@@ -36069,6 +39696,7 @@ mod tests {
             current_surface: None,
             workstreams: Vec::new(),
             candidates: Vec::new(),
+            support_evidence: Vec::new(),
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
@@ -36221,8 +39849,17 @@ mod tests {
                 feedback_last_reconfirming_evidence_ms: candidate
                     .feedback_last_reconfirming_evidence_ms,
                 feedback_reason_codes: candidate.feedback_reason_codes.clone(),
+                branch_promotion_state: candidate.branch_promotion_state.clone(),
+                branch_public_return_eligible: candidate.branch_public_return_eligible,
+                branch_promotion_reason: candidate.branch_promotion_reason.clone(),
+                branch_eligibility_state: candidate_branch_eligibility_state(&candidate),
+                public_return_eligible: candidate_public_return_eligible(&candidate),
+                blocked_reason: candidate_blocked_reason(&candidate),
                 local_reason: candidate.reason.clone(),
             }],
+            support_evidence: support_evidence_items_for_candidates(std::slice::from_ref(
+                &candidate,
+            )),
             evidence_packs_v2: vec![build_candidate_evidence_pack_v2(&candidate, None, None)],
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
@@ -36252,6 +39889,105 @@ mod tests {
 
         assert!(failures
             .contains(&"branch_or_support_target_promoted_without_strong_local_score".to_string()));
+    }
+
+    #[test]
+    fn model_selected_unpromoted_branch_is_hard_rejected_even_if_pack_contains_it() {
+        let mut branch = test_artifact("artifact-support", "browser_tab", "Search results");
+        branch.browser_url = Some("https://example.com/search?q=rust".to_string());
+        let mut candidate = test_candidate("finish_search", Some(branch), None, None);
+        candidate.id = "continue-candidate-unpromoted-branch".to_string();
+        candidate.score = 0.84;
+        candidate.eligible_for_primary_selection = true;
+        candidate.branch_promotion_state = Some("unpromoted".to_string());
+        candidate.branch_public_return_eligible = Some(false);
+        candidate.branch_promotion_reason = Some("branch:search_without_origin".to_string());
+        let pack = micro_pack_for_candidate(&candidate);
+        let mut output = selected_candidate_model_output(&candidate);
+        output.headline = "Continue the search branch".to_string();
+        output.return_line = "Return to the support search.".to_string();
+        output.next_action = Some("Use the search branch as the continuation target.".to_string());
+
+        let failures = validate_micro_inference_output(&output, &[candidate], &pack)
+            .expect_err("unpromoted branch must be rejected even if present in pack");
+
+        assert!(failures.contains(&"model_selected_unpromoted_branch".to_string()));
+        assert!(failures.contains(&"model_ignored_branch_eligibility".to_string()));
+        assert!(failures.contains(&"model_promoted_support_without_local_evidence".to_string()));
+    }
+
+    #[test]
+    fn micro_pack_excludes_unpromoted_branch_and_keeps_support_evidence_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let mut branch = test_artifact("artifact-support", "browser_tab", "Search results");
+        branch.browser_url = Some("https://example.com/search?q=rust".to_string());
+        let mut candidate = test_candidate("finish_search", Some(branch), None, None);
+        candidate.id = "continue-candidate-support".to_string();
+        candidate.score = 0.88;
+        candidate.eligible_for_primary_selection = true;
+        candidate.branch_promotion_state = Some("unpromoted".to_string());
+        candidate.branch_public_return_eligible = Some(false);
+        candidate.branch_promotion_reason = Some("branch:search_without_origin".to_string());
+        candidate.selection_demotion_reason =
+            Some("Support branch lacked promotion evidence.".to_string());
+
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            current_time_millis(),
+            &[],
+            std::slice::from_ref(&candidate),
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(pack.candidates.is_empty());
+        assert_eq!(
+            pack.suppressed_candidate_ids_not_sent,
+            vec!["continue-candidate-support".to_string()]
+        );
+        assert_eq!(pack.support_evidence.len(), 1);
+        assert_eq!(
+            pack.support_evidence[0].artifact_id.as_deref(),
+            Some("artifact-support")
+        );
+        assert!(!pack.support_evidence[0].public_return_eligible);
+    }
+
+    #[test]
+    fn micro_pack_keeps_promoted_branch_selectable() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let mut branch = test_artifact("artifact-blocker", "browser_tab", "Failing preview");
+        branch.browser_url = Some("https://example.com/failure".to_string());
+        let mut candidate = test_candidate("resolve_error", Some(branch), None, None);
+        candidate.id = "continue-candidate-promoted-branch".to_string();
+        candidate.score = 0.82;
+        candidate.eligible_for_primary_selection = true;
+        candidate.branch_promotion_state = Some("promoted_blocker".to_string());
+        candidate.branch_public_return_eligible = Some(true);
+        candidate.branch_promotion_reason = Some("branch:unresolved_blocker".to_string());
+
+        let pack = build_micro_inference_pack(
+            &conn,
+            None,
+            None,
+            current_time_millis(),
+            &[],
+            std::slice::from_ref(&candidate),
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(pack.candidates.len(), 1);
+        assert_eq!(pack.candidates[0].id, "continue-candidate-promoted-branch");
+        assert!(pack.support_evidence.is_empty());
     }
 
     #[test]
@@ -36287,6 +40023,7 @@ mod tests {
             current_surface: None,
             workstreams: Vec::new(),
             candidates: Vec::new(),
+            support_evidence: Vec::new(),
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
@@ -36331,6 +40068,7 @@ mod tests {
             current_surface: None,
             workstreams: Vec::new(),
             candidates: Vec::new(),
+            support_evidence: Vec::new(),
             evidence_packs_v2: Vec::new(),
             artifact_roles: Vec::new(),
             breadcrumbs: Vec::new(),
@@ -36905,6 +40643,204 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn branch_context_for_kind(conn: &Connection, kind: &str) -> ContinueBranchContext {
+        let contexts = load_recent_branch_contexts(conn, Some(20)).unwrap();
+        contexts
+            .into_iter()
+            .find(|context| context.branch_kind == kind)
+            .unwrap_or_else(|| {
+                let observed = load_recent_branch_contexts(conn, Some(20))
+                    .unwrap()
+                    .into_iter()
+                    .map(|context| context.branch_kind)
+                    .collect::<Vec<_>>();
+                let action_rows = conn
+                    .prepare(
+                        "SELECT frame_id, action_kind, action_role, branch_kind, branch_action_role
+                         FROM continue_task_actions
+                         ORDER BY created_at_ms ASC",
+                    )
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                panic!(
+                    "missing branch context for kind {}; observed {:?}; actions {:?}",
+                    kind, observed, action_rows
+                )
+            })
+    }
+
+    fn promotion_action(
+        id: &str,
+        kind: &str,
+        role: &str,
+        created_at_ms: i64,
+    ) -> BranchPromotionActionEvidence {
+        BranchPromotionActionEvidence {
+            action_id: id.to_string(),
+            action_kind: kind.to_string(),
+            action_role: role.to_string(),
+            branch_kind: None,
+            branch_action_role: Some(role.to_string()),
+            created_at_ms,
+            confidence: 0.82,
+            collapse_count: 1,
+        }
+    }
+
+    fn branch_promotion_input(
+        branch_kind: &str,
+        actions: Vec<BranchPromotionActionEvidence>,
+    ) -> BranchPromotionInput {
+        BranchPromotionInput {
+            branch_kind: branch_kind.to_string(),
+            branch_started_at_ms: 1_000,
+            returned_to_origin_at_ms: None,
+            feedback_hard_suppressed: false,
+            feedback_positive_kind: None,
+            has_origin: true,
+            actions,
+        }
+    }
+
+    #[test]
+    fn branch_promotion_search_only_stays_unpromoted() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "search_branch",
+            vec![promotion_action("action-read", "reading", "support", 2_000)],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "unpromoted");
+        assert!(!decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_direct_editing_promotes_primary() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "documentation_reference",
+            vec![promotion_action("action-edit", "editing", "primary", 2_000)],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "promoted_primary");
+        assert!(decision.public_return_eligible);
+        assert_eq!(decision.evidence_action_ids, vec!["action-edit"]);
+    }
+
+    #[test]
+    fn branch_promotion_unresolved_branch_error_promotes_blocker() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "verification_branch",
+            vec![promotion_action(
+                "action-error",
+                "encountering_error",
+                "primary",
+                2_000,
+            )],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "promoted_blocker");
+        assert!(decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_passive_terminal_output_stays_unpromoted() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "terminal_support_output",
+            vec![promotion_action(
+                "action-terminal-output",
+                "observing_command_output",
+                "support",
+                2_000,
+            )],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "unpromoted");
+        assert!(!decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_sustained_work_promotes_without_return() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "message_interrupt",
+            vec![
+                promotion_action("action-1", "reviewing_output", "support", 2_000),
+                promotion_action("action-2", "reviewing_output", "support", 48_000),
+                promotion_action("action-3", "reviewing_output", "support", 94_000),
+            ],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "promoted_sustained_work");
+        assert!(decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_feedback_suppression_wins_over_editing() {
+        let mut input = branch_promotion_input(
+            "search_branch",
+            vec![promotion_action("action-edit", "editing", "primary", 2_000)],
+        );
+        input.feedback_hard_suppressed = true;
+
+        let decision = evaluate_branch_promotion(input);
+
+        assert_eq!(
+            decision.promotion_state.as_str(),
+            "blocked_feedback_suppressed"
+        );
+        assert!(!decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_positive_feedback_promotes_branch() {
+        let mut input = branch_promotion_input("search_branch", Vec::new());
+        input.feedback_positive_kind = Some("corrected".to_string());
+
+        let decision = evaluate_branch_promotion(input);
+
+        assert_eq!(decision.promotion_state.as_str(), "promoted_user_corrected");
+        assert!(decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_diagnostic_self_blocked_without_developer_task_evidence() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "diagnostic_self",
+            vec![promotion_action(
+                "action-read",
+                "reviewing_output",
+                "support",
+                2_000,
+            )],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "blocked_diagnostic_self");
+        assert!(!decision.public_return_eligible);
+    }
+
+    #[test]
+    fn branch_promotion_current_focus_only_is_not_public_return_target() {
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "current_focus_only",
+            vec![promotion_action("action-read", "reading", "unknown", 2_000)],
+        ));
+
+        assert_eq!(
+            decision.promotion_state.as_str(),
+            "blocked_thin_current_focus"
+        );
+        assert!(!decision.public_return_eligible);
     }
 
     fn generate_local_decision(conn: &Connection) -> ContinueDecisionResult {
@@ -37606,6 +41542,751 @@ mod tests {
         assert_ne!(action_kind, "encountering_error");
         assert_ne!(delta.as_deref(), Some("terminal_error"));
         assert_eq!(reason, "error_mention_without_executable_context");
+    }
+
+    #[test]
+    fn branch_context_links_editor_primary_to_search_branch_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Arc",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            "navigation",
+            "Search results for rust sqlite",
+            Some("company.thebrowser.Browser"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "browser_tab",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "search_result", "result", "rust sqlite");
+
+        rebuild_second_and_third(&conn);
+
+        let origin = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let context = branch_context_for_kind(&conn, "search_branch");
+        assert_eq!(context.origin_artifact_id.as_deref(), Some(origin.as_str()));
+        assert_eq!(context.promotion_state, "unpromoted");
+        assert_eq!(
+            context.reason_code.as_deref(),
+            Some("branch:origin_recent_primary")
+        );
+        assert!(!context.returned_to_origin);
+    }
+
+    #[test]
+    fn branch_context_links_docs_reference_to_editor_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Arc",
+            "rusqlite docs",
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+            "navigation",
+            "rusqlite documentation",
+            Some("company.thebrowser.Browser"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "browser_tab",
+            "rusqlite docs",
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "heading", "heading", "rusqlite documentation");
+
+        rebuild_second_and_third(&conn);
+
+        let origin = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let context = branch_context_for_kind(&conn, "documentation_reference");
+        assert_eq!(context.origin_artifact_id.as_deref(), Some(origin.as_str()));
+        assert_eq!(context.promotion_state, "unpromoted");
+    }
+
+    #[test]
+    fn branch_context_links_gmail_interrupt_to_editor_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Chrome",
+            "Gmail Inbox",
+            Some("https://mail.google.com/mail/u/0/#inbox"),
+            None,
+            "typing_pause",
+            "reply draft",
+            Some("com.google.Chrome"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "messaging",
+            "Gmail Inbox",
+            Some("https://mail.google.com/mail/u/0/#inbox"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "composer", "input", "reply draft");
+        insert_typing(&conn, 2, 0, 0);
+
+        rebuild_second_and_third(&conn);
+
+        let origin = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let context = branch_context_for_kind(&conn, "message_interrupt");
+        assert_eq!(context.origin_artifact_id.as_deref(), Some(origin.as_str()));
+        assert_eq!(context.promotion_state, "unpromoted");
+    }
+
+    #[test]
+    fn branch_context_marks_return_to_origin_only_after_meaningful_origin_activity() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Arc",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            "navigation",
+            "Search results for rust sqlite",
+            Some("company.thebrowser.Browser"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "browser_tab",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "search_result", "result", "rust sqlite");
+        insert_frame(
+            &conn,
+            3,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed_again(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            Some(2),
+        );
+        insert_context(
+            &conn,
+            3,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 3, 0, 0);
+
+        rebuild_second_and_third(&conn);
+
+        let context = branch_context_for_kind(&conn, "search_branch");
+        assert!(context.returned_to_origin);
+        assert_eq!(context.promotion_state, "unpromoted");
+        assert_eq!(context.returned_to_origin_at_ms, Some(3_000));
+        assert!(has_returned_to_origin(&conn, &context.branch_artifact_id).unwrap());
+    }
+
+    #[test]
+    fn branch_context_does_not_false_return_for_unrelated_primary_app() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Arc",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            "navigation",
+            "Search results for rust sqlite",
+            Some("company.thebrowser.Browser"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "browser_tab",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "search_result", "result", "rust sqlite");
+        insert_frame(
+            &conn,
+            3,
+            "Cursor",
+            "other.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/other.rs"),
+            "typing_pause",
+            "fn unrelated() {}",
+            Some("com.todesktop.230313mzl4w4u92"),
+            Some(2),
+        );
+        insert_context(
+            &conn,
+            3,
+            "code_editor",
+            "other.rs",
+            None,
+            Some("/Users/me/project/src/other.rs"),
+            None,
+        );
+        insert_typing(&conn, 3, 0, 0);
+
+        rebuild_second_and_third(&conn);
+
+        let context = branch_context_for_kind(&conn, "search_branch");
+        assert!(!context.returned_to_origin);
+        assert_eq!(context.promotion_state, "unpromoted");
+    }
+
+    #[test]
+    fn branch_context_records_diagnostic_self_without_using_it_as_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Finder",
+            "continue audit",
+            None,
+            Some("/Users/me/project/continue_outputs/session/final_decision.json"),
+            "manual",
+            "final decision audit",
+            Some("com.apple.finder"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "finder",
+            "final_decision.json",
+            None,
+            Some("/Users/me/project/continue_outputs/session/final_decision.json"),
+            None,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let origin = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let context = branch_context_for_kind(&conn, "diagnostic_self");
+        assert_eq!(context.origin_artifact_id.as_deref(), Some(origin.as_str()));
+        assert_ne!(
+            context.origin_artifact_id.as_deref(),
+            Some(context.branch_artifact_id.as_str())
+        );
+    }
+
+    #[test]
+    fn branch_context_without_prior_primary_stores_null_origin() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Arc",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            "navigation",
+            "Search results for rust sqlite",
+            Some("company.thebrowser.Browser"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "browser_tab",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 1, "search_result", "result", "rust sqlite");
+
+        rebuild_second_and_third(&conn);
+
+        let context = branch_context_for_kind(&conn, "search_branch");
+        assert!(context.origin_artifact_id.is_none());
+        assert_eq!(context.promotion_state, "unpromoted");
+        assert_eq!(context.reason_code.as_deref(), Some("branch:no_origin"));
+    }
+
+    #[test]
+    fn docs_reference_stays_support_and_editor_remains_primary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Arc",
+            "rusqlite docs",
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+            "navigation",
+            "rusqlite documentation",
+            Some("company.thebrowser.Browser"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "browser_tab",
+            "rusqlite docs",
+            Some("https://docs.rs/rusqlite/latest/rusqlite/"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 2, "heading", "heading", "rusqlite documentation");
+
+        rebuild_second_and_third(&conn);
+
+        let editor_artifact = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let docs_primary_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE a.browser_url = 'https://docs.rs/rusqlite/latest/rusqlite/'
+                   AND wa.durable_role = 'primary_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(docs_primary_roles, 0);
+        let editor_primary_workstreams: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstreams
+                 WHERE primary_artifact_id = ?1",
+                params![editor_artifact],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(editor_primary_workstreams, 1);
+        let docs_roles = conn
+            .prepare(
+                "SELECT a.stable_key, a.browser_url, wa.durable_role
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE a.stable_key LIKE '%docs.rs/rusqlite%'
+                    OR a.browser_url LIKE '%docs.rs/rusqlite%'
+                 ORDER BY wa.durable_role",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            docs_roles
+                .iter()
+                .any(|(_, _, role)| matches!(role.as_str(), "support_source" | "branch")),
+            "docs roles: {:?}",
+            docs_roles
+        );
+    }
+
+    #[test]
+    fn diagnostic_self_does_not_replace_origin_primary_workstream() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Finder",
+            "continue audit",
+            None,
+            Some("/Users/me/project/continue_outputs/session/final_decision.json"),
+            "manual",
+            "final decision audit",
+            Some("com.apple.finder"),
+            Some(1),
+        );
+        insert_context(
+            &conn,
+            2,
+            "finder",
+            "final_decision.json",
+            None,
+            Some("/Users/me/project/continue_outputs/session/final_decision.json"),
+            None,
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let editor_artifact = artifact_id_for_document(&conn, "/Users/me/project/src/lib.rs");
+        let diagnostic_primary_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE a.document_path LIKE '%continue_outputs/session/final_decision.json'
+                   AND wa.durable_role = 'primary_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(diagnostic_primary_roles, 0);
+        let selected_primary: String = conn
+            .query_row(
+                "SELECT primary_artifact_id
+                 FROM continue_workstreams
+                 WHERE primary_artifact_id IS NOT NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected_primary, editor_artifact);
+    }
+
+    #[test]
+    fn passive_terminal_output_is_verification_support_not_primary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+        insert_frame(
+            &conn,
+            2,
+            "Terminal",
+            "zsh",
+            None,
+            None,
+            "manual",
+            "cargo check finished successfully",
+            Some("com.apple.Terminal"),
+            Some(1),
+        );
+        insert_context(&conn, 2, "terminal", "zsh", None, None, None);
+        insert_unit(
+            &conn,
+            2,
+            "terminal_output",
+            "terminal_output",
+            "Finished dev profile",
+        );
+
+        rebuild_second_and_third(&conn);
+
+        let terminal_primary_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE a.artifact_kind = 'terminal'
+                   AND wa.durable_role = 'primary_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_primary_roles, 0);
+        let terminal_verification_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts wa
+                 JOIN continue_artifacts a ON a.id = wa.artifact_id
+                 WHERE a.artifact_kind = 'terminal'
+                   AND wa.durable_role = 'verification_surface'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_verification_roles, 1);
+    }
+
+    #[test]
+    fn search_branch_without_origin_has_no_primary_return_artifact() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Arc",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            "navigation",
+            "Search results for rust sqlite",
+            Some("company.thebrowser.Browser"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "browser_tab",
+            "Search results",
+            Some("https://www.google.com/search?q=rust+sqlite"),
+            None,
+            None,
+        );
+        insert_unit(&conn, 1, "search_result", "result", "rust sqlite");
+
+        rebuild_second_and_third(&conn);
+
+        let primary_workstreams: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstreams
+                 WHERE primary_artifact_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(primary_workstreams, 0);
+        let primary_roles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_workstream_artifacts
+                 WHERE durable_role = 'primary_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(primary_roles, 0);
+        let return_targets: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM continue_open_loops
+                 WHERE primary_return_artifact_id IS NOT NULL
+                    OR resume_work_artifact_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(return_targets, 0);
     }
 
     #[test]
@@ -39752,7 +44433,37 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unrelated_browser_workstreams, 2);
+        let unrelated_rows = conn
+            .prepare(
+                "SELECT ta.frame_id, ta.action_kind, ta.branch_kind, e.id, e.boundary_start_reason,
+                        e.primary_artifact_id, we.workstream_id, we.membership_reason,
+                        w.primary_artifact_id
+                 FROM continue_workstream_episodes we
+                 JOIN continue_workstreams w ON w.id = we.workstream_id
+                 JOIN continue_episodes e ON e.id = we.episode_id
+                 JOIN continue_episode_actions ea ON ea.episode_id = e.id
+                 JOIN continue_task_actions ta ON ta.id = ea.action_id
+                 WHERE ta.frame_id IN ('7', '8')
+                 ORDER BY ta.frame_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(unrelated_browser_workstreams, 2, "{:?}", unrelated_rows);
 
         let thin_episode_quality: String = conn
             .query_row(
@@ -40576,15 +45287,22 @@ mod tests {
         let report = run_continue_eval(None).unwrap();
 
         assert_eq!(report.schema, "smalltalk.continue_eval.v1");
-        assert_eq!(report.case_count, 37);
-        assert_eq!(report.target_artifact_correct, 37);
+        assert_eq!(report.case_count, 46);
+        assert_eq!(report.target_artifact_correct, 46);
         assert_eq!(report.recall_at_k, 1.0);
         assert_eq!(report.mrr, 1.0);
         assert_eq!(report.hallucinated_artifact_count, 1);
-        assert_eq!(report.model_validation_fallback_rate, 0.05);
+        assert_eq!(report.model_validation_fallback_rate, 0.07);
         assert_eq!(report.fresh_surface_retention_rate, 1.0);
         assert_eq!(report.stale_target_suppression_rate, 1.0);
         assert_eq!(report.support_branch_false_promotion_rate, 0.0);
+        assert_eq!(report.support_branch_false_positive_rate, 0.0);
+        assert_eq!(report.unpromoted_branch_selected_count, 0);
+        assert_eq!(report.branch_origin_recall_rate, 1.0);
+        assert_eq!(report.promoted_branch_selection_precision, 1.0);
+        assert_eq!(report.message_interrupt_false_positive_rate, 0.0);
+        assert_eq!(report.diagnostic_self_selected_count, 0);
+        assert_eq!(report.model_branch_policy_violation_count, 1);
         assert_eq!(report.truthful_thin_mode_rate, 1.0);
         assert_eq!(report.feedback_obedience_case_count, 7);
         assert_eq!(report.feedback_suppressed_target_exposed_count, 0);
@@ -40612,6 +45330,13 @@ mod tests {
         assert!(report.cases.iter().any(|case| case.name
             == "p1_micro_inference_fallback_invalid_candidate"
             && case.validation_status == "fallback"));
+        assert!(report.cases.iter().any(|case| case.name
+            == "p2_model_selects_unpromoted_branch_rejected"
+            && case.validation_status == "fallback"
+            && case.model_branch_policy_violation));
+        assert!(report.cases.iter().any(|case| case.name
+            == "p2_gmail_compose_promoted"
+            && case.promoted_branch_selection_correct));
     }
 
     #[test]
