@@ -56,6 +56,8 @@ pub fn run() {
             capture::run_continue_eval,
             capture::run_continue_replay_eval,
             capture::open_resume_point,
+            session_island::get_island_continue_state,
+            session_island::perform_island_continue_action,
             capture::get_native_storyboard_dossier,
             capture::classify_episode_transitions,
             capture::get_native_resume_card,

@@ -34,6 +34,7 @@ private struct IslandSnapshot: Decodable {
     var decisionUpdatedAtMs: Int64?
     var continueOpenable: Bool?
     var resumeWarning: String?
+    var islandContinueState: IslandContinueState?
     var privacyLabel: String?
     var isSensitive: Bool = false
 
@@ -65,8 +66,242 @@ private struct IslandSnapshot: Decodable {
         case decisionUpdatedAtMs = "decision_updated_at_ms"
         case continueOpenable = "continue_openable"
         case resumeWarning = "resume_warning"
+        case islandContinueState = "island_continue_state"
         case privacyLabel = "privacy_label"
         case isSensitive = "is_sensitive"
+    }
+
+    static func continueDecodeError() -> IslandSnapshot {
+        var snapshot = IslandSnapshot()
+        snapshot.state = "error"
+        snapshot.lastError = "Continue state could not be decoded."
+        snapshot.islandContinueState = IslandContinueState.errorFallback()
+        return snapshot
+    }
+}
+
+private struct IslandContinueState: Decodable, Equatable {
+    var schema: String
+    var displayState: IslandDisplayState
+    var decisionId: String?
+    var currentFocus: IslandFocusSummary?
+    var currentActivity: String?
+    var selectedWorkstreamTitle: String?
+    var returnTarget: IslandTargetSummary?
+    var resumeWorkTarget: IslandTargetSummary?
+    var nextAction: String?
+    var confidenceLabel: String?
+    var missingEvidence: [String]
+    var warnings: [String]
+    var suppressionReasons: [String]
+    var availableActions: [IslandAvailableAction]
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case displayState = "display_state"
+        case decisionId = "decision_id"
+        case currentFocus = "current_focus"
+        case currentActivity = "current_activity"
+        case selectedWorkstreamTitle = "selected_workstream_title"
+        case returnTarget = "return_target"
+        case resumeWorkTarget = "resume_work_target"
+        case nextAction = "next_action"
+        case confidenceLabel = "confidence_label"
+        case missingEvidence = "missing_evidence"
+        case warnings
+        case suppressionReasons = "suppression_reasons"
+        case availableActions = "available_actions"
+    }
+
+    init(
+        schema: String = "smalltalk.island_continue_state.v1",
+        displayState: IslandDisplayState,
+        decisionId: String? = nil,
+        currentFocus: IslandFocusSummary? = nil,
+        currentActivity: String? = nil,
+        selectedWorkstreamTitle: String? = nil,
+        returnTarget: IslandTargetSummary? = nil,
+        resumeWorkTarget: IslandTargetSummary? = nil,
+        nextAction: String? = nil,
+        confidenceLabel: String? = nil,
+        missingEvidence: [String] = [],
+        warnings: [String] = [],
+        suppressionReasons: [String] = [],
+        availableActions: [IslandAvailableAction] = []
+    ) {
+        self.schema = schema
+        self.displayState = displayState
+        self.decisionId = decisionId
+        self.currentFocus = currentFocus
+        self.currentActivity = currentActivity
+        self.selectedWorkstreamTitle = selectedWorkstreamTitle
+        self.returnTarget = returnTarget
+        self.resumeWorkTarget = resumeWorkTarget
+        self.nextAction = nextAction
+        self.confidenceLabel = confidenceLabel
+        self.missingEvidence = missingEvidence
+        self.warnings = warnings
+        self.suppressionReasons = suppressionReasons
+        self.availableActions = availableActions
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? "unknown"
+        displayState = try container.decodeIfPresent(IslandDisplayState.self, forKey: .displayState) ?? .error
+        decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
+        currentFocus = try container.decodeIfPresent(IslandFocusSummary.self, forKey: .currentFocus)
+        currentActivity = try container.decodeIfPresent(String.self, forKey: .currentActivity)
+        selectedWorkstreamTitle = try container.decodeIfPresent(String.self, forKey: .selectedWorkstreamTitle)
+        returnTarget = try container.decodeIfPresent(IslandTargetSummary.self, forKey: .returnTarget)
+        resumeWorkTarget = try container.decodeIfPresent(IslandTargetSummary.self, forKey: .resumeWorkTarget)
+        nextAction = try container.decodeIfPresent(String.self, forKey: .nextAction)
+        confidenceLabel = try container.decodeIfPresent(String.self, forKey: .confidenceLabel)
+        missingEvidence = try container.decodeIfPresent([String].self, forKey: .missingEvidence) ?? []
+        warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
+        suppressionReasons = try container.decodeIfPresent([String].self, forKey: .suppressionReasons) ?? []
+        availableActions = try container.decodeIfPresent([IslandAvailableAction].self, forKey: .availableActions) ?? []
+    }
+
+    static func errorFallback() -> IslandContinueState {
+        IslandContinueState(
+            displayState: .error,
+            nextAction: "Open Smalltalk to inspect local memory",
+            availableActions: [
+                IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
+            ]
+        )
+    }
+
+    static func fallback(from snapshot: IslandSnapshot) -> IslandContinueState {
+        if snapshot.lastError != nil || snapshot.state == "error" {
+            return errorFallback()
+        }
+        if snapshot.state == "starting" || snapshot.state == "processing" {
+            return IslandContinueState(
+                displayState: .checkingContinue,
+                nextAction: "Looking for the safest return point",
+                availableActions: [
+                    IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
+                ]
+            )
+        }
+        if snapshot.state == "recording_compact" || snapshot.state == "recording_expanded" {
+            return IslandContinueState(
+                displayState: .localMemoryWarming,
+                nextAction: "Collecting local evidence",
+                availableActions: [
+                    IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true),
+                    IslandAvailableAction(kind: .captureEvidenceNow, label: "Capture evidence", enabled: true),
+                ]
+            )
+        }
+        return IslandContinueState(
+            displayState: .noLocalMemory,
+            nextAction: "Local memory is off",
+            availableActions: [
+                IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true),
+                IslandAvailableAction(kind: .startLocalMemory, label: "Start local memory", enabled: true),
+            ]
+        )
+    }
+}
+
+private enum IslandDisplayState: String, Decodable, Equatable {
+    case noLocalMemory = "no_local_memory"
+    case localMemoryWarming = "local_memory_warming"
+    case checkingContinue = "checking_continue"
+    case continueReady = "continue_ready"
+    case thinCurrentWork = "thin_current_work"
+    case targetSuppressed = "target_suppressed"
+    case supportBlocked = "support_blocked"
+    case needsRefresh = "needs_refresh"
+    case inspectOnly = "inspect_only"
+    case noClearContinuation = "no_clear_continuation"
+    case error
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = IslandDisplayState(rawValue: value) ?? .error
+    }
+}
+
+private struct IslandFocusSummary: Decodable, Equatable {
+    var title: String
+    var subtitle: String?
+    var appName: String?
+    var windowTitle: String?
+    var openability: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case subtitle
+        case appName = "app_name"
+        case windowTitle = "window_title"
+        case openability
+    }
+}
+
+private struct IslandTargetSummary: Decodable, Equatable {
+    var title: String
+    var subtitle: String?
+    var artifactKind: String?
+    var openability: String
+    var openable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case subtitle
+        case artifactKind = "artifact_kind"
+        case openability
+        case openable
+    }
+}
+
+private struct IslandAvailableAction: Decodable, Equatable {
+    var kind: IslandActionKind
+    var label: String
+    var enabled: Bool
+    var reason: String?
+    var decisionId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case label
+        case enabled
+        case reason
+        case decisionId = "decision_id"
+    }
+
+    init(kind: IslandActionKind, label: String, enabled: Bool, reason: String? = nil, decisionId: String? = nil) {
+        self.kind = kind
+        self.label = label
+        self.enabled = enabled
+        self.reason = reason
+        self.decisionId = decisionId
+    }
+}
+
+private enum IslandActionKind: String, Decodable, Equatable {
+    case refreshContinue = "refresh_continue"
+    case openContinueTarget = "open_continue_target"
+    case markWrongTarget = "mark_wrong_target"
+    case markNotUseful = "mark_not_useful"
+    case inspectEvidence = "inspect_evidence"
+    case openSmalltalk = "open_smalltalk"
+    case startLocalMemory = "start_local_memory"
+    case captureEvidenceNow = "capture_evidence_now"
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = IslandActionKind(rawValue: value) ?? .unknown
+    }
+}
+
+private extension String {
+    var nonEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 
@@ -469,26 +704,13 @@ private enum IslandPresentation: Equatable {
     case expanded
 }
 
-private enum IslandProductState: Equatable {
-    case memoryOff
-    case memoryStarting
-    case memoryOn
-    case newEvidence
-    case continueUpdating
-    case continueReady
-    case thinEvidence
-    case needsEvidence
-    case pausedWithEvidence
-    case privateOrExcluded
-    case needsAttention
-}
-
 @available(macOS 13.0, *)
 private struct SessionIslandView: View {
     let snapshot: IslandSnapshot
     let metrics: OverlayMetrics
     let scale: CGFloat
     let onAction: (String) -> Void
+    let onContinueAction: (IslandAvailableAction) -> Void
     @Binding var presentation: IslandPresentation
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var anim = AnimationTick.shared
@@ -496,71 +718,48 @@ private struct SessionIslandView: View {
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
-    private var productState: IslandProductState {
-        if hasError {
-            return .needsAttention
-        }
-        if isPrivateOrExcluded {
-            return .privateOrExcluded
-        }
-        switch normalizedContinueFreshness {
-        case "new_evidence":
-            return .newEvidence
-        case "updating":
-            return .continueUpdating
-        case "current", "ready_to_continue":
-            return .continueReady
-        case "thin_evidence":
-            return .thinEvidence
-        case "needs_evidence", "needs_attention":
-            return .needsEvidence
-        default:
-            break
-        }
-        switch snapshot.state {
-        case "starting":
-            return .memoryStarting
-        case "recording_compact", "recording_expanded":
-            return .memoryOn
-        case "processing":
-            return .memoryOn
-        case "trail_reconstructing":
-            return .continueUpdating
-        case "resume_ready":
-            return resumeReadyIsThin ? .thinEvidence : .continueReady
-        default:
-            return hasMoments ? .pausedWithEvidence : .memoryOff
-        }
+    private var continueState: IslandContinueState {
+        snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
+    }
+
+    private var displayState: IslandDisplayState {
+        continueState.displayState
     }
 
     private var captureActive: Bool {
-        productState == .memoryStarting ||
-            productState == .memoryOn ||
-            productState == .newEvidence
+        snapshot.state == "starting" ||
+            snapshot.state == "recording_compact" ||
+            snapshot.state == "recording_expanded" ||
+            displayState == .localMemoryWarming
     }
 
     private var signalReady: Bool {
-        productState == .continueReady
+        displayState == .continueReady
     }
 
     private var signalThin: Bool {
-        productState == .thinEvidence || productState == .needsEvidence
+        displayState == .thinCurrentWork ||
+            displayState == .targetSuppressed ||
+            displayState == .supportBlocked ||
+            displayState == .inspectOnly ||
+            displayState == .noClearContinuation ||
+            displayState == .needsRefresh
     }
 
     private var signalPrivate: Bool {
-        productState == .privateOrExcluded
+        isPrivateOrExcluded
     }
 
     private var isBusy: Bool {
-        snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
+        displayState == .checkingContinue || snapshot.state == "starting" || snapshot.state == "processing"
     }
 
     private var isProcessing: Bool {
-        snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "trail_reconstructing"
+        isBusy
     }
 
     private var hasError: Bool {
-        snapshot.lastError != nil || snapshot.state == "error"
+        displayState == .error || snapshot.lastError != nil || snapshot.state == "error"
     }
 
     private var isPrivateOrExcluded: Bool {
@@ -568,172 +767,132 @@ private struct SessionIslandView: View {
     }
 
     private var primaryDisplayText: String {
-        switch productState {
-        case .needsAttention:
-            return "Needs attention"
-        case .privateOrExcluded:
-            return "Not observing this app"
-        case .memoryStarting:
-            return "Starting memory"
-        case .memoryOn:
-            return snapshot.state == "processing" ? "Pausing memory" : "Memory on"
-        case .newEvidence:
-            return "New evidence"
-        case .continueUpdating:
-            return "Finding continuation"
+        switch displayState {
+        case .noLocalMemory:
+            return "Smalltalk"
+        case .localMemoryWarming:
+            return "Smalltalk Continue"
+        case .checkingContinue:
+            return "Checking Continue"
         case .continueReady:
-            return resumeReadyTitle
-        case .thinEvidence:
-            return "Evidence is thin"
-        case .needsEvidence:
-            return "Needs evidence"
-        case .pausedWithEvidence:
-            return "Continue ready"
-        case .memoryOff:
-            return "Memory off"
+            return "Continue"
+        case .thinCurrentWork:
+            return "Recent work seen"
+        case .targetSuppressed:
+            return "Continue needs more evidence"
+        case .supportBlocked:
+            return "Support surface seen"
+        case .needsRefresh:
+            return "Continue needs refresh"
+        case .inspectOnly, .noClearContinuation:
+            return "No safe return target yet"
+        case .error:
+            return "Continue unavailable"
         }
     }
 
     private var secondaryDisplayText: String {
-        switch productState {
-        case .needsAttention:
-            return productizedErrorLine
-        case .privateOrExcluded:
-            return "Privacy boundary active"
-        case .memoryStarting:
-            return "Preparing local memory"
-        case .memoryOn:
-            return snapshot.state == "processing" ? "Keeping the last answer available" : "Ask Smalltalk where to continue"
-        case .newEvidence:
-            return "Refresh Continue"
-        case .continueUpdating:
-            return "Looking for your return point"
-        case .continueReady, .thinEvidence, .needsEvidence:
-            return resumePointLine
-        case .pausedWithEvidence:
-            return "Ask Continue from stored evidence"
-        case .memoryOff:
-            return "Turn on local memory"
+        switch displayState {
+        case .noLocalMemory:
+            return "Local memory is off"
+        case .localMemoryWarming:
+            return "Collecting local evidence"
+        case .checkingContinue:
+            return "Looking for the safest return point"
+        case .continueReady:
+            return shortTargetTitle
+        case .thinCurrentWork:
+            return "Exact return target is unclear"
+        case .targetSuppressed:
+            return "Previous target was suppressed"
+        case .supportBlocked:
+            return "Not enough evidence to return there"
+        case .needsRefresh:
+            return "Newer local evidence is available"
+        case .inspectOnly, .noClearContinuation:
+            return "Evidence is available to inspect"
+        case .error:
+            return "Open Smalltalk to inspect local memory"
         }
     }
 
     private var primaryActionLabel: String {
-        switch productState {
-        case .memoryOff:
-            return "Turn on local memory"
-        case .memoryStarting:
-            return "Starting"
-        case .memoryOn:
-            return snapshot.state == "processing" ? "Pausing" : "Find continuation"
-        case .newEvidence:
-            return "Refresh Continue"
-        case .continueUpdating:
-            return "Finding"
-        case .continueReady:
-            return "Continue here"
-        case .thinEvidence:
-            return "Why this?"
-        case .needsEvidence:
-            return "Why this?"
-        case .pausedWithEvidence:
-            return "Continue"
-        case .privateOrExcluded:
-            return "Privacy"
-        case .needsAttention:
-            return "Fix in Smalltalk"
-        }
+        actionLabel(primaryContinueAction, compact: false)
     }
 
     private var compactActionLabel: String {
-        switch productState {
-        case .continueReady:
-            return "Open"
-        case .thinEvidence:
-            return "Why"
-        case .memoryOff:
-            return "On"
-        case .memoryStarting:
-            return "..."
-        case .memoryOn, .pausedWithEvidence:
-            return "Ask"
-        case .newEvidence:
-            return "Refresh"
-        case .continueUpdating:
-            return "..."
-        case .needsEvidence:
-            return "Why"
-        case .privateOrExcluded:
-            return "Privacy"
-        case .needsAttention:
-            return "Fix"
-        }
+        actionLabel(primaryContinueAction, compact: true)
     }
 
     private var secondaryActionLabel: String {
-        switch productState {
-        case .memoryOn:
-            return snapshot.state == "processing" ? "Open Smalltalk" : "Pause memory"
-        case .continueReady:
-            return "Why this?"
-        case .thinEvidence, .needsEvidence:
-            return "Open Smalltalk"
-        case .newEvidence:
-            return "Open Smalltalk"
-        case .pausedWithEvidence, .memoryOff, .privateOrExcluded, .needsAttention:
-            return "Open Smalltalk"
-        case .memoryStarting, .continueUpdating:
-            return "Open Smalltalk"
-        }
+        secondaryContinueAction.map { actionLabel($0, compact: false) } ?? "Open Smalltalk"
     }
 
     private var primaryActionDisabled: Bool {
-        productState == .memoryStarting ||
-            productState == .continueUpdating ||
-            (productState == .memoryOn && snapshot.state == "processing")
+        !primaryContinueAction.enabled || primaryContinueAction.kind == .unknown
     }
 
     private var secondaryActionDisabled: Bool {
-        productState == .memoryStarting || productState == .continueUpdating
+        guard let action = secondaryContinueAction else { return true }
+        return !action.enabled || action.kind == .unknown
     }
 
-    private var primaryButtonAction: String {
-        switch productState {
-        case .memoryOff:
-            return "start_memory"
-        case .memoryOn, .pausedWithEvidence, .newEvidence:
-            return "continue"
-        case .continueReady:
-            return "open_resume_point"
-        case .thinEvidence, .needsEvidence:
-            return "show_trail"
-        case .privateOrExcluded, .needsAttention:
-            return "open_main_window"
-        case .memoryStarting, .continueUpdating:
-            return "open_main_window"
+    private var primaryContinueAction: IslandAvailableAction {
+        firstEnabledAction(in: [
+            .openContinueTarget,
+            .markWrongTarget,
+            .markNotUseful,
+            .refreshContinue,
+            .inspectEvidence,
+            .openSmalltalk,
+            .startLocalMemory,
+            .captureEvidenceNow,
+        ]) ?? IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
+    }
+
+    private var secondaryContinueAction: IslandAvailableAction? {
+        let primary = primaryContinueAction
+        return continueState.availableActions.first { action in
+            action.enabled &&
+                action.kind != .unknown &&
+                action.kind != primary.kind &&
+                actionLabel(action, compact: false) != actionLabel(primary, compact: false)
         }
     }
 
-    private var secondaryButtonAction: String {
-        switch productState {
-        case .memoryOn:
-            return snapshot.state == "processing" ? "open_main_window" : "pause_memory"
-        case .continueReady:
-            return "show_trail"
-        case .thinEvidence, .needsEvidence:
-            return "open_main_window"
-        case .newEvidence:
-            return "open_main_window"
-        default:
-            return "open_main_window"
+    private func firstEnabledAction(in kinds: [IslandActionKind]) -> IslandAvailableAction? {
+        for kind in kinds {
+            if let action = continueState.availableActions.first(where: { $0.enabled && $0.kind == kind }) {
+                if kind == .openContinueTarget && trimmed(action.decisionId ?? continueState.decisionId).isEmpty {
+                    continue
+                }
+                return action
+            }
         }
+        return nil
     }
 
-    private var normalizedContinueFreshness: String {
-        trimmed(snapshot.continueFreshness).lowercased()
-    }
-
-    private var hasMoments: Bool {
-        trailMomentCount > 0
+    private func actionLabel(_ action: IslandAvailableAction, compact: Bool) -> String {
+        switch action.kind {
+        case .openContinueTarget:
+            return compact ? "Open" : "Continue"
+        case .markWrongTarget:
+            return compact ? "Wrong" : "Wrong target"
+        case .markNotUseful:
+            return compact ? "Skip" : "Not useful"
+        case .refreshContinue:
+            return compact ? "Refresh" : "Refresh"
+        case .inspectEvidence:
+            return compact ? "Inspect" : "Inspect evidence"
+        case .openSmalltalk:
+            return compact ? "Open" : "Open Smalltalk"
+        case .startLocalMemory:
+            return compact ? "Start" : "Start local memory"
+        case .captureEvidenceNow:
+            return compact ? "Capture" : "Capture evidence"
+        case .unknown:
+            return compact ? "Open" : "Open Smalltalk"
+        }
     }
 
     private var trailMomentCount: Int64 {
@@ -745,110 +904,53 @@ private struct SessionIslandView: View {
     }
 
     private var signalEvidenceCount: Int64 {
-        switch productState {
-        case .newEvidence, .continueUpdating, .continueReady, .thinEvidence, .needsEvidence:
+        switch displayState {
+        case .checkingContinue, .continueReady, .thinCurrentWork, .targetSuppressed, .supportBlocked, .needsRefresh, .inspectOnly, .noClearContinuation:
             return trailMomentCount
         default:
             return 0
         }
     }
 
-    private var momentLabel: String {
-        "\(trailMomentCount) \(trailMomentCount == 1 ? "signal" : "signals")"
+    private var shortTargetTitle: String {
+        trimmed(continueState.resumeWorkTarget?.title)
+            .nonEmpty
+            ?? trimmed(continueState.returnTarget?.title).nonEmpty
+            ?? "Return target ready"
     }
 
-    private var resumePointLine: String {
-        let point = trimmed(snapshot.resumePoint)
-        guard !point.isEmpty else {
-            return resumeReadyIsThin ? "No reliable return target yet" : "Continue target ready"
-        }
-        return "Continue at \(point)"
+    private var currentFocusLine: String {
+        trimmed(continueState.currentFocus?.title)
+            .nonEmpty
+            ?? trimmed(continueState.currentActivity).nonEmpty
+            ?? "Current focus is unclear"
     }
 
-    private var resumeDetailEyebrow: String {
-        resumeReadyIsThin ? "Best available answer" : "Continue at"
+    private var returnTargetLine: String {
+        trimmed(continueState.returnTarget?.title)
+            .nonEmpty
+            ?? trimmed(continueState.resumeWorkTarget?.title).nonEmpty
+            ?? "No safe return target yet"
     }
 
-    private var resumeReadyTitle: String {
-        if trimmed(snapshot.resumeSource) == "continue" {
-            if resumeReadyIsThin {
-                return "Evidence is thin"
-            }
-            let headline = trimmed(snapshot.resumeHeadline)
-            return headline.isEmpty ? "Continue ready" : headline
-        }
-        if trimmed(snapshot.resumeSource) == "cloud" {
-            return "Continue ready"
-        }
-        let warning = trimmed(snapshot.resumeWarning).lowercased()
-        if warning.contains("openai_api_key") || warning.contains("key") {
-            return "OpenAI key missing"
-        }
-        return "OpenAI unavailable"
+    private var nextActionLine: String {
+        trimmed(continueState.nextAction).nonEmpty ?? secondaryDisplayText
     }
 
-    private var resumeReadyIsThin: Bool {
-        if normalizedContinueFreshness == "thin_evidence" || normalizedContinueFreshness == "needs_evidence" {
-            return true
-        }
-        let warning = trimmed(snapshot.resumeWarning).lowercased()
-        return warning.contains("thin") || warning.contains("missing") || warning.contains("no_")
+    private var confidenceLine: String? {
+        guard let confidence = trimmed(continueState.confidenceLabel).nonEmpty else { return nil }
+        return "\(confidence) confidence"
     }
 
-    private var resumeDetailLine: String {
-        let detail = trimmed(snapshot.resumeDetail)
-        if !detail.isEmpty {
-            return detail
-        }
-        let headline = trimmed(snapshot.resumeHeadline)
-        return headline.isEmpty ? "Smalltalk found a local continuation." : headline
-    }
-
-    private var resumeProvenanceLine: String {
-        if trimmed(snapshot.resumeSource) == "continue" {
-            let warning = trimmed(snapshot.resumeWarning)
-            return warning.isEmpty ? "Evidence-backed Continue" : productizedWarningLine(warning)
-        }
-        if trimmed(snapshot.resumeSource) == "cloud" {
-            return "AI-assisted Continue"
-        }
-        let warning = trimmed(snapshot.resumeWarning)
-        return warning.isEmpty ? "Local evidence" : productizedWarningLine(warning)
-    }
-
-    private var productizedErrorLine: String {
-        let error = trimmed(snapshot.lastError)
-        if error.isEmpty {
-            return "Open Smalltalk to fix local memory"
-        }
-        let lower = error.lowercased()
-        if lower.contains("permission") || lower.contains("denied") || lower.contains("not authorized") {
-            return "Memory needs permission"
-        }
-        if lower.contains("screen") || lower.contains("accessibility") || lower.contains("ax") {
-            return "Memory needs attention"
-        }
-        if lower.contains("no space") || lower.contains("disk") || lower.contains("storage") {
-            return "Local memory needs cleanup"
-        }
-        if lower.contains("privacy") || lower.contains("excluded") || lower.contains("never_send_to_ai") {
-            return "Privacy boundary active"
-        }
-        return "Open Smalltalk to inspect local evidence"
-    }
-
-    private func productizedWarningLine(_ value: String) -> String {
-        let warning = value.lowercased()
-        if warning.contains("thin") || warning.contains("missing") || warning.contains("no_") {
-            return "Evidence is thin"
-        }
-        if warning.contains("key") || warning.contains("openai") {
-            return "AI unavailable; using local evidence"
-        }
-        if warning.contains("privacy") || warning.contains("excluded") || warning.contains("redacted") {
-            return "Privacy boundary active"
-        }
-        return "Open Smalltalk to inspect local evidence"
+    private var missingEvidenceLine: String? {
+        continueState.missingEvidence
+            .map { trimmed($0) }
+            .first(where: { !$0.isEmpty })
+            .map { $0.hasSuffix(".") ? $0 : "\($0)." }
+            ?? continueState.warnings
+            .map { trimmed($0) }
+            .first(where: { !$0.isEmpty })
+            .map { $0.hasSuffix(".") ? $0 : "\($0)." }
     }
 
     private func trimmed(_ value: String?) -> String {
@@ -874,16 +976,18 @@ private struct SessionIslandView: View {
     }
 
     private var signalColor: Color {
-        switch productState {
-        case .needsAttention:
+        if hasError {
             return Color(red: 1.0, green: 0.36, blue: 0.28)
-        case .newEvidence, .thinEvidence, .needsEvidence, .continueUpdating:
-            return Color(red: 1.0, green: 0.68, blue: 0.28)
-        case .privateOrExcluded:
+        }
+        if isPrivateOrExcluded {
             return Color.white.opacity(0.64)
-        case .memoryOn, .memoryStarting, .continueReady:
+        }
+        switch displayState {
+        case .needsRefresh, .thinCurrentWork, .targetSuppressed, .supportBlocked, .checkingContinue:
+            return Color(red: 1.0, green: 0.68, blue: 0.28)
+        case .localMemoryWarming, .continueReady:
             return Color(red: 0.36, green: 0.84, blue: 0.68)
-        case .pausedWithEvidence, .memoryOff:
+        case .noLocalMemory, .inspectOnly, .noClearContinuation, .error:
             return Color.white.opacity(0.42)
         }
     }
@@ -913,27 +1017,30 @@ private struct SessionIslandView: View {
     }
 
     private var accessibilityLabel: String {
-        switch productState {
-        case .memoryOn:
-            return "Smalltalk local memory is on"
-        case .newEvidence:
-            return "Smalltalk noticed new evidence"
+        if isPrivateOrExcluded {
+            return "Smalltalk is not observing this app"
+        }
+        switch displayState {
+        case .noLocalMemory:
+            return "Smalltalk local memory is off"
+        case .localMemoryWarming:
+            return "Smalltalk is collecting local evidence"
+        case .checkingContinue:
+            return "Smalltalk is checking Continue"
         case .continueReady:
             return "Smalltalk Continue is ready"
-        case .thinEvidence, .needsEvidence:
-            return "Smalltalk evidence is thin"
-        case .privateOrExcluded:
-            return "Smalltalk is not observing this app"
-        case .needsAttention:
-            return "Smalltalk needs attention"
-        case .memoryStarting:
-            return "Smalltalk local memory is starting"
-        case .continueUpdating:
-            return "Smalltalk is finding a continuation"
-        case .pausedWithEvidence:
-            return "Smalltalk has local evidence ready"
-        case .memoryOff:
-            return "Smalltalk local memory is off"
+        case .thinCurrentWork:
+            return "Smalltalk saw recent work but the return target is unclear"
+        case .targetSuppressed:
+            return "Smalltalk needs more evidence before continuing"
+        case .supportBlocked:
+            return "Smalltalk saw a support surface but will not return there"
+        case .needsRefresh:
+            return "Smalltalk Continue needs refresh"
+        case .inspectOnly, .noClearContinuation:
+            return "Smalltalk has evidence to inspect but no safe return target"
+        case .error:
+            return "Smalltalk Continue is unavailable"
         }
     }
 
@@ -1014,7 +1121,7 @@ private struct SessionIslandView: View {
             Spacer(minLength: s(2))
 
             Button {
-                onAction(primaryButtonAction)
+                onContinueAction(primaryContinueAction)
             } label: {
                 Text(compactActionLabel)
                     .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
@@ -1145,40 +1252,29 @@ private struct SessionIslandView: View {
                 .frame(width: s(104), alignment: .trailing)
             }
 
-            if snapshot.state == "resume_ready" && productState != .privateOrExcluded {
-                VStack(alignment: .leading, spacing: s(7)) {
-                    Text(resumeDetailEyebrow)
-                        .font(Brand.swiftUIMonoFont(size: s(9), weight: .semibold))
-                        .foregroundColor(.white.opacity(0.50))
-                        .lineLimit(1)
-                    Text(resumeDetailLine)
-                        .font(Brand.swiftUIFont(size: s(12), weight: .medium))
-                        .foregroundColor(.white.opacity(0.74))
-                        .lineLimit(4)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Text(resumeProvenanceLine)
-                        .font(Brand.swiftUIMonoFont(size: s(10), weight: .semibold))
-                        .foregroundColor(.white.opacity(0.54))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: s(7)) {
+                ContinueDetailRow(label: "Current focus", value: currentFocusLine, scale: scale)
+                ContinueDetailRow(label: "Return target", value: returnTargetLine, scale: scale)
+                ContinueDetailRow(label: "Next action", value: nextActionLine, scale: scale)
+                if let confidenceLine {
+                    ContinueDetailRow(label: "Confidence", value: confidenceLine, scale: scale)
                 }
-                    .padding(.horizontal, s(10))
-                    .padding(.vertical, s(10))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                            .fill(Color.white.opacity(0.055))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                            .stroke(Color.white.opacity(0.075), lineWidth: 0.7)
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                if let missingEvidenceLine {
+                    ContinueDetailRow(label: "Evidence", value: missingEvidenceLine, scale: scale)
+                }
             }
+            .padding(.horizontal, s(10))
+            .padding(.vertical, s(10))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: s(11), style: .continuous)
+                    .fill(Color.white.opacity(0.055))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: s(11), style: .continuous)
+                    .stroke(Color.white.opacity(0.075), lineWidth: 0.7)
+            )
+            .transition(.opacity.combined(with: .move(edge: .top)))
 
             Rectangle()
                 .fill(
@@ -1198,7 +1294,7 @@ private struct SessionIslandView: View {
                     prominent: true,
                     disabled: primaryActionDisabled
                 ) {
-                    onAction(primaryButtonAction)
+                    onContinueAction(primaryContinueAction)
                 }
 
                 GlassActionButton(
@@ -1207,7 +1303,9 @@ private struct SessionIslandView: View {
                     prominent: false,
                     disabled: secondaryActionDisabled
                 ) {
-                    onAction(secondaryButtonAction)
+                    if let secondaryContinueAction {
+                        onContinueAction(secondaryContinueAction)
+                    }
                 }
             }
         }
@@ -1283,6 +1381,30 @@ private struct SessionIslandView: View {
                     .frame(height: kBaseExpandedH * scale)
                     .allowsHitTesting(false)
             }
+    }
+}
+
+@available(macOS 13.0, *)
+private struct ContinueDetailRow: View {
+    let label: String
+    let value: String
+    let scale: CGFloat
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
+            Text(label)
+                .font(Brand.swiftUIMonoFont(size: 8.5 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(0.48))
+                .lineLimit(1)
+                .frame(width: 82 * scale, alignment: .leading)
+
+            Text(value)
+                .font(Brand.swiftUIFont(size: 11 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.74))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -1570,9 +1692,13 @@ private final class SessionIslandController: NSObject {
     func update(json: String) {
         let wasMicroEligible = canUseMicro
 
-        if let data = json.data(using: .utf8),
-           let next = try? JSONDecoder().decode(IslandSnapshot.self, from: data) {
-            snapshot = next
+        if let data = json.data(using: .utf8) {
+            do {
+                snapshot = try JSONDecoder().decode(IslandSnapshot.self, from: data)
+            } catch {
+                NSLog("[smalltalk_island] failed to decode island snapshot: \(error)")
+                snapshot = IslandSnapshot.continueDecodeError()
+            }
         }
 
         if snapshot.state == "hidden" {
@@ -1873,6 +1999,9 @@ private final class SessionIslandController: NSObject {
             onAction: { [weak self] action in
                 self?.handle(action: action)
             },
+            onContinueAction: { [weak self] action in
+                self?.handle(continueAction: action)
+            },
             presentation: Binding(
                 get: { controller.presentation },
                 set: { controller.setPresentation($0) }
@@ -1917,7 +2046,7 @@ private final class SessionIslandController: NSObject {
         case "show_trail":
             sendAction("show_trail")
         case "open_resume_point":
-            sendAction("open_resume_point")
+            sendAction("open_resume_point", decisionId: snapshot.continueDecisionId)
         case "open_main_window":
             sendAction("open_main_window")
         case "open_expanded":
@@ -1936,6 +2065,25 @@ private final class SessionIslandController: NSObject {
         default:
             break
         }
+    }
+
+    private func handle(continueAction action: IslandAvailableAction) {
+        switch action.kind {
+        case .openContinueTarget:
+            setPresentation(.expanded, resetIdleTimer: false)
+        case .refreshContinue, .markWrongTarget, .markNotUseful, .startLocalMemory, .captureEvidenceNow:
+            revealCompact()
+        case .inspectEvidence, .openSmalltalk:
+            break
+        case .unknown:
+            sendAction("open_main_window")
+            return
+        }
+        sendAction(
+            "perform_continue_action",
+            decisionId: action.decisionId ?? snapshot.islandContinueState?.decisionId ?? snapshot.continueDecisionId,
+            continueActionKind: action.kind.rawValue
+        )
     }
 
     private func updateOutsideClickMonitors() {
@@ -1989,12 +2137,41 @@ private final class SessionIslandController: NSObject {
         }
     }
 
-    private func sendAction(_ action: String) {
+    private func sendAction(_ action: String, decisionId: String? = nil, continueActionKind: String? = nil) {
         guard let callback = gActionCallback else { return }
-        let json = "{\"action\":\"\(action)\"}"
+        var fields = ["\"action\":\"\(jsonEscaped(action))\""]
+        if let decisionId, !decisionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fields.append("\"decision_id\":\"\(jsonEscaped(decisionId))\"")
+        }
+        if let continueActionKind, !continueActionKind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fields.append("\"action_kind\":\"\(jsonEscaped(continueActionKind))\"")
+        }
+        fields.append("\"source\":\"native_island\"")
+        let json = "{\(fields.joined(separator: ","))}"
         json.withCString { pointer in
             callback(pointer)
         }
+    }
+
+    private func jsonEscaped(_ value: String) -> String {
+        var escaped = ""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\"":
+                escaped += "\\\""
+            case "\\":
+                escaped += "\\\\"
+            case "\n":
+                escaped += "\\n"
+            case "\r":
+                escaped += "\\r"
+            case "\t":
+                escaped += "\\t"
+            default:
+                escaped.unicodeScalars.append(scalar)
+            }
+        }
+        return escaped
     }
 }
 

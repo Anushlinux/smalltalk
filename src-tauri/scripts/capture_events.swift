@@ -33,7 +33,23 @@ encoder.outputFormatting = [.withoutEscapingSlashes]
 var lastClipboardChange = NSPasteboard.general.changeCount
 var activeObserver: AXObserver?
 var activeObserverRunLoopSource: CFRunLoopSource?
+var activeObservedPid: pid_t?
+var activeObservedBundleId: String?
 var unsupportedAxNotifications = Set<String>()
+var cachedFrontmostContext: FrontmostContext?
+var cachedFrontmostContextAtMs: Int64 = 0
+var lastAxEmitByKey: [String: Int64] = [:]
+var pendingScrollDx = 0.0
+var pendingScrollDy = 0.0
+var pendingScrollContext: FrontmostContext?
+var scrollFlushTimer: Timer?
+var lastScrollEmitAtMs: Int64 = 0
+
+let smalltalkBundleId = "com.smalltalk.app"
+let frontmostContextCacheMs: Int64 = 250
+let scrollCoalesceMs: Int64 = 650
+let axDefaultThrottleMs: Int64 = 900
+let axValueThrottleMs: Int64 = 1800
 
 func nowMs() -> Int64 {
   Int64(Date().timeIntervalSince1970 * 1000)
@@ -57,6 +73,18 @@ func clean(_ value: String?) -> String? {
   return trimmed.isEmpty ? nil : trimmed
 }
 
+func isSmalltalkBundle(_ bundleId: String?) -> Bool {
+  bundleId == smalltalkBundleId
+}
+
+func isSmalltalkAppName(_ appName: String?) -> Bool {
+  appName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "smalltalk"
+}
+
+func shouldSuppressContext(_ context: FrontmostContext) -> Bool {
+  isSmalltalkBundle(context.app_bundle_id) || isSmalltalkAppName(context.app_name)
+}
+
 func focusedWindowTitle(pid: pid_t) -> String? {
   let app = AXUIElementCreateApplication(pid)
   var focusedWindow: AnyObject?
@@ -78,15 +106,27 @@ func focusedWindowTitle(pid: pid_t) -> String? {
   return clean(title as? String)
 }
 
-func frontmostContext() -> FrontmostContext {
+func frontmostContext(forceRefresh: Bool = false) -> FrontmostContext {
+  let now = nowMs()
+  if !forceRefresh,
+     let cachedFrontmostContext,
+     now - cachedFrontmostContextAtMs < frontmostContextCacheMs {
+    return cachedFrontmostContext
+  }
+
   let app = NSWorkspace.shared.frontmostApplication
   let pid = app?.processIdentifier
-  return FrontmostContext(
+  let bundleId = clean(app?.bundleIdentifier)
+  let appName = clean(app?.localizedName)
+  let context = FrontmostContext(
     app_pid: pid.map(Int.init),
-    app_bundle_id: clean(app?.bundleIdentifier),
-    app_name: clean(app?.localizedName),
-    window_title: pid.flatMap { focusedWindowTitle(pid: $0) }
+    app_bundle_id: bundleId,
+    app_name: appName,
+    window_title: isSmalltalkBundle(bundleId) ? nil : pid.flatMap { focusedWindowTitle(pid: $0) }
   )
+  cachedFrontmostContext = context
+  cachedFrontmostContextAtMs = now
+  return context
 }
 
 func baseEvent(
@@ -99,9 +139,10 @@ func baseEvent(
   keyCategory: String? = nil,
   modifierFlags: String? = nil,
   isRepeat: Bool? = nil,
-  payload: [String: String]? = nil
+  payload: [String: String]? = nil,
+  context: FrontmostContext? = nil
 ) -> EventPayload {
-  let ctx = frontmostContext()
+  let ctx = context ?? frontmostContext()
   return EventPayload(
     ts_ms: nowMs(),
     event_type: type,
@@ -119,6 +160,13 @@ func baseEvent(
     is_repeat: isRepeat,
     payload: payload
   )
+}
+
+func emitObserved(_ payload: EventPayload) {
+  if isSmalltalkBundle(payload.app_bundle_id) || isSmalltalkAppName(payload.app_name) {
+    return
+  }
+  emit(payload)
 }
 
 func modifierDescription(_ flags: CGEventFlags) -> String? {
@@ -219,21 +267,65 @@ func clipboardMetadata() -> [String: String] {
 
 let axCallback: AXObserverCallback = { _, element, notification, _ in
   let name = notification as String
-  emit(baseEvent(
+  guard shouldEmitAxNotification(name) else {
+    return
+  }
+  emitObserved(baseEvent(
     type: "ax_notification",
     payload: [
-      "notification": name,
-      "element": "\(element)"
+      "notification": name
     ]
   ))
 }
 
-func installAxObserver(for pid: pid_t) {
+func axThrottleMs(for notification: String) -> Int64 {
+  switch notification {
+  case kAXValueChangedNotification,
+       kAXSelectedTextChangedNotification,
+       kAXWindowMovedNotification,
+       kAXWindowResizedNotification:
+    return axValueThrottleMs
+  default:
+    return axDefaultThrottleMs
+  }
+}
+
+func shouldEmitAxNotification(_ notification: String) -> Bool {
+  guard !isSmalltalkBundle(activeObservedBundleId) else {
+    return false
+  }
+  let now = nowMs()
+  let pidKey = activeObservedPid.map(String.init) ?? "unknown"
+  let key = "\(pidKey):\(notification)"
+  let throttleMs = axThrottleMs(for: notification)
+  if let last = lastAxEmitByKey[key], now - last < throttleMs {
+    return false
+  }
+  lastAxEmitByKey[key] = now
+  if lastAxEmitByKey.count > 256 {
+    lastAxEmitByKey = lastAxEmitByKey.filter { now - $0.value < 60_000 }
+  }
+  return true
+}
+
+func clearAxObserver() {
   if let source = activeObserverRunLoopSource {
     CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
   }
   activeObserver = nil
   activeObserverRunLoopSource = nil
+  activeObservedPid = nil
+  activeObservedBundleId = nil
+}
+
+func installAxObserver(for app: NSRunningApplication) {
+  clearAxObserver()
+
+  if isSmalltalkBundle(clean(app.bundleIdentifier)) {
+    return
+  }
+
+  let pid = app.processIdentifier
 
   var observer: AXObserver?
   guard AXObserverCreate(pid, axCallback, &observer) == .success, let observer else {
@@ -262,7 +354,7 @@ func installAxObserver(for pid: pid_t) {
     if result != .success {
       let key = "\(pid):\(notification)"
       if unsupportedAxNotifications.insert(key).inserted {
-        emit(baseEvent(
+        emitObserved(baseEvent(
           type: "ax_notification",
           payload: [
             "notification": notification,
@@ -277,6 +369,60 @@ func installAxObserver(for pid: pid_t) {
   CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
   activeObserver = observer
   activeObserverRunLoopSource = source
+  activeObservedPid = pid
+  activeObservedBundleId = clean(app.bundleIdentifier)
+}
+
+func flushPendingScroll() {
+  scrollFlushTimer?.invalidate()
+  scrollFlushTimer = nil
+
+  guard let context = pendingScrollContext else {
+    pendingScrollDx = 0
+    pendingScrollDy = 0
+    return
+  }
+
+  let dx = pendingScrollDx
+  let dy = pendingScrollDy
+  pendingScrollDx = 0
+  pendingScrollDy = 0
+  pendingScrollContext = nil
+
+  if abs(dx) < 0.01 && abs(dy) < 0.01 {
+    return
+  }
+
+  lastScrollEmitAtMs = nowMs()
+  emitObserved(baseEvent(type: "scroll", scrollDx: dx, scrollDy: dy, context: context))
+}
+
+func scheduleScrollFlush(after delayMs: Int64) {
+  if scrollFlushTimer != nil {
+    return
+  }
+  let interval = max(0.05, TimeInterval(delayMs) / 1000.0)
+  scrollFlushTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { _ in
+    flushPendingScroll()
+  }
+}
+
+func handleScroll(dx: Double, dy: Double) {
+  let context = frontmostContext()
+  if shouldSuppressContext(context) {
+    return
+  }
+
+  pendingScrollDx += dx
+  pendingScrollDy += dy
+  pendingScrollContext = context
+
+  let now = nowMs()
+  if lastScrollEmitAtMs == 0 || now - lastScrollEmitAtMs >= scrollCoalesceMs {
+    flushPendingScroll()
+    return
+  }
+  scheduleScrollFlush(after: scrollCoalesceMs - (now - lastScrollEmitAtMs))
 }
 
 NSWorkspace.shared.notificationCenter.addObserver(
@@ -285,9 +431,13 @@ NSWorkspace.shared.notificationCenter.addObserver(
   queue: .main
 ) { notification in
   if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-    installAxObserver(for: app.processIdentifier)
+    cachedFrontmostContext = nil
+    installAxObserver(for: app)
+    if isSmalltalkBundle(clean(app.bundleIdentifier)) {
+      return
+    }
   }
-  emit(baseEvent(type: "app_switch"))
+  emitObserved(baseEvent(type: "app_switch", context: frontmostContext(forceRefresh: true)))
 }
 
 Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { _ in
@@ -296,7 +446,7 @@ Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { _ in
     lastClipboardChange = pasteboard.changeCount
     var payload = clipboardMetadata()
     payload["change_count"] = "\(lastClipboardChange)"
-    emit(baseEvent(type: "clipboard", payload: payload))
+    emitObserved(baseEvent(type: "clipboard", payload: payload))
   }
 }
 
@@ -311,7 +461,7 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   switch type {
   case .leftMouseDown, .rightMouseDown, .otherMouseDown:
     let location = event.location
-    emit(baseEvent(
+    emitObserved(baseEvent(
       type: "click",
       x: location.x,
       y: location.y,
@@ -320,11 +470,11 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   case .scrollWheel:
     let dx = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
     let dy = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
-    emit(baseEvent(type: "scroll", scrollDx: dx, scrollDy: dy))
+    handleScroll(dx: dx, dy: dy)
   case .keyDown:
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
     let flags = event.flags
-    emit(baseEvent(
+    emitObserved(baseEvent(
       type: "key_down",
       keyCategory: keyCategory(keyCode: keyCode, flags: flags),
       modifierFlags: modifierDescription(flags),
@@ -338,7 +488,7 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
 }
 
 if let app = NSWorkspace.shared.frontmostApplication {
-  installAxObserver(for: app.processIdentifier)
+  installAxObserver(for: app)
 }
 
 guard let eventTap = CGEvent.tapCreate(

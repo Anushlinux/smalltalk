@@ -34,6 +34,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+static CONTINUE_DECISION_LOCK: Mutex<()> = Mutex::new(());
 const ACCESSIBILITY_SCRIPT: &str = r#"
 on replaceText(sourceText, oldText, newText)
   set oldDelims to AppleScript's text item delimiters
@@ -340,6 +341,7 @@ pub struct CaptureBudgetDiagnostics {
     pub max_screenshots_per_surface_without_change: i64,
     pub max_snapshot_dir_bytes: u64,
     pub max_retained_low_value_duplicate_frames: i64,
+    pub max_retained_low_value_ui_events: i64,
     pub max_diagnostic_rows_per_cleanup: i64,
 }
 
@@ -355,7 +357,9 @@ pub struct LocalMemoryDiagnostics {
     pub heavy_evidence_rows: LocalMemoryHeavyEvidenceRows,
     pub continue_object_counts: LocalMemoryContinueObjectCounts,
     pub low_value_duplicate_frames: i64,
+    pub excess_low_value_events: i64,
     pub self_capture_frames: i64,
+    pub self_capture_events: i64,
     pub decision_linked_frames: i64,
     pub estimated_cleanup_potential_bytes: u64,
     pub oldest_retained_frame_ms: Option<i64>,
@@ -388,6 +392,7 @@ pub struct LocalMemoryContinueObjectCounts {
     pub open_loops: i64,
     pub candidates: i64,
     pub decisions: i64,
+    pub open_events: i64,
     pub feedback_events: i64,
     pub breadcrumbs: i64,
 }
@@ -411,6 +416,7 @@ pub struct CleanupLocalMemoryResult {
     pub candidate_frames: i64,
     pub protected_frames: i64,
     pub deleted_frames: i64,
+    pub deleted_event_rows: i64,
     pub deleted_snapshot_files: i64,
     pub reclaimed_bytes: u64,
     pub summary: String,
@@ -651,10 +657,14 @@ const MAX_SCREENSHOT_FRAMES_PER_10_MINUTES: i64 = 24;
 const MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE: i64 = 3;
 const MAX_LOCAL_SNAPSHOT_DIR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES: i64 = 400;
+const MAX_RETAINED_LOW_VALUE_UI_EVENTS: i64 = 5_000;
 const MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP: i64 = 5_000;
 const MAX_RETAINED_FRAME_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_RETAINED_CONTINUE_DECISION_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 const SMALLTALK_BUNDLE_ID: &str = "com.smalltalk.app";
+const UI_EVENT_SCROLL_MIN_INTERVAL_MS: i64 = 650;
+const UI_EVENT_AX_DEFAULT_MIN_INTERVAL_MS: i64 = 900;
+const UI_EVENT_AX_VALUE_MIN_INTERVAL_MS: i64 = 1_800;
 const LOCAL_SIGNAL_BUCKET_WINDOW_MS: i64 = 30_000;
 const LOCAL_SIGNAL_RECENT_WINDOW_MS: i64 = 20 * 60 * 1000;
 const MAX_LOCAL_SIGNAL_EVENTS: i64 = 600;
@@ -873,6 +883,11 @@ struct TypingBurstState {
     id: Option<String>,
     started_at_ms: i64,
     ended_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventIngestGate {
+    last_persisted_by_key: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1161,8 +1176,20 @@ pub struct CloudResumeInput {
     pub allow_followup: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyResumePathAudit {
+    pub path: String,
+    pub legacy_path_used: bool,
+    pub source: String,
+    pub not_primary_continue: bool,
+    pub diagnostic_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ResumeQueryBundleResult {
+    pub legacy_path_audit: LegacyResumePathAudit,
     pub output_dir: String,
     pub bundle_path: String,
     #[allow(dead_code)]
@@ -1563,6 +1590,7 @@ pub struct ResumeQueryEpisodeEvents {
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudResumeResult {
     pub schema: String,
+    pub legacy_path_audit: LegacyResumePathAudit,
     pub request: CloudResumeRequestSummary,
     pub cached: bool,
     pub source: String,
@@ -1612,6 +1640,8 @@ pub struct OpenResumePointInput {
     pub session_id: Option<String>,
     pub continue_decision_id: Option<String>,
     pub target_artifact_id: Option<String>,
+    pub source: Option<String>,
+    pub diagnostic_allowed: Option<bool>,
     #[serde(default)]
     pub strict_continue_target: bool,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
@@ -1711,6 +1741,7 @@ pub struct NativeStoryboardInput {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeStoryboardDossier {
+    pub legacy_path_audit: LegacyResumePathAudit,
     pub generated_at_ms: i64,
     pub lookback_start_ms: i64,
     pub lookback_end_ms: i64,
@@ -1764,6 +1795,7 @@ pub struct TransitionClassifierInput {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassifiedTransition {
+    pub legacy_path_audit: LegacyResumePathAudit,
     pub id: String,
     pub transition_type: String,
     pub pre_frame_id: Option<String>,
@@ -1796,6 +1828,7 @@ pub struct NativeResumeInput {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeResumeCard {
+    pub legacy_path_audit: LegacyResumePathAudit,
     pub generated_at_ms: i64,
     pub lookback_minutes: i64,
     pub what_was_i_doing: String,
@@ -1812,6 +1845,17 @@ pub struct NativeResumeCard {
     pub evidence_frame_ids: Vec<String>,
     pub evidence_transition_ids: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+fn legacy_resume_path_audit(path: &str) -> LegacyResumePathAudit {
+    LegacyResumePathAudit {
+        path: path.to_string(),
+        legacy_path_used: true,
+        source: "developer_diagnostics".to_string(),
+        not_primary_continue: true,
+        diagnostic_only: true,
+        warning: Some("diagnostic_only:not_primary_continue".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3046,6 +3090,7 @@ pub fn run_cloud_resume(
 
     let result = CloudResumeResult {
         schema: "smalltalk.cloud_resume_result.v1".to_string(),
+        legacy_path_audit: legacy_resume_path_audit("cloud_resume"),
         request: request_summary,
         cached: false,
         source: "cloud".to_string(),
@@ -3168,8 +3213,11 @@ pub fn get_continue_decision(
     app: AppHandle,
     input: Option<crate::continuation::ContinueDecisionRequest>,
 ) -> Result<crate::continuation::ContinueDecisionResult, String> {
-    let conn = open_db(&app)?;
     let request = input.unwrap_or_default();
+    let _continue_guard = CONTINUE_DECISION_LOCK
+        .lock()
+        .map_err(|_| "continue decision lock poisoned".to_string())?;
+    let conn = open_db(&app)?;
     let effective_mode = crate::continuation::effective_continue_decision_mode(
         request.mode.as_deref(),
         request.rebuild_layers.unwrap_or(false),
@@ -3491,6 +3539,16 @@ pub fn record_continue_feedback(
 ) -> Result<crate::continuation::ContinueFeedbackEventResult, String> {
     let conn = open_db(&app)?;
     crate::continuation::record_continue_feedback(&conn, input)
+}
+
+pub fn latest_continue_feedback_or_open_watermark_ms(
+    app: &AppHandle,
+) -> Result<Option<i64>, String> {
+    let conn = match open_readonly_db(app) {
+        Ok(conn) => conn,
+        Err(_) => return Ok(None),
+    };
+    crate::continuation::latest_feedback_or_open_watermark_ms(&conn)
 }
 
 #[tauri::command]
@@ -4076,6 +4134,7 @@ fn build_resume_query_bundle_from_conn(
     let final_payload_path = final_output_dir.join("resume-query-bundle.json");
     let stats = directory_stats(&final_output_dir)?;
     Ok(ResumeQueryBundleResult {
+        legacy_path_audit: legacy_resume_path_audit("resume_query_bundle"),
         output_dir: final_output_dir.to_string_lossy().to_string(),
         bundle_path: final_payload_path.to_string_lossy().to_string(),
         payload_path: final_payload_path.to_string_lossy().to_string(),
@@ -5974,6 +6033,7 @@ impl CachedCloudResumeResult {
     ) -> CloudResumeResult {
         CloudResumeResult {
             schema: "smalltalk.cloud_resume_result.v1".to_string(),
+            legacy_path_audit: legacy_resume_path_audit("cloud_resume"),
             request,
             cached: true,
             source: "cloud".to_string(),
@@ -6076,6 +6136,7 @@ fn finalize_open_resume_point_result(
         opened_path: false,
         opened_frame_fallback: result.opened_url.is_none() && result.frame_id.is_some(),
         warnings: result.warnings.clone(),
+        source: input.source.clone(),
     };
     if let Err(error) = crate::continuation::record_continue_decision_open_event(conn, telemetry) {
         result.warnings.push(format!(
@@ -6091,8 +6152,17 @@ fn open_resume_point_impl(
     input: OpenResumePointInput,
 ) -> Result<OpenResumePointResult, String> {
     let conn = open_db(app)?;
-    let cloud_file = load_cloud_resume_file_for_open(&conn, &input)?;
     let mut warnings = Vec::new();
+    if let Some(blocked) = validate_open_resume_source_policy(&input, &mut warnings) {
+        focus_main_window_for_resume(app);
+        return Ok(finalize_open_resume_point_result(&conn, &input, blocked));
+    }
+
+    let cloud_file = if island_primary_open_source(&input) {
+        None
+    } else {
+        load_cloud_resume_file_for_open(&conn, &input)?
+    };
 
     if cloud_file.is_none()
         && input.continue_decision_id.is_none()
@@ -6191,6 +6261,83 @@ fn open_resume_point_impl(
             };
             Ok(finalize_open_resume_point_result(&conn, &input, result))
         }
+    }
+}
+
+fn validate_open_resume_source_policy(
+    input: &OpenResumePointInput,
+    warnings: &mut Vec<String>,
+) -> Option<OpenResumePointResult> {
+    let source = input.source.as_deref().unwrap_or_default();
+    let has_legacy_fallback_fields = input.output_path.is_some()
+        || input.session_id.is_some()
+        || input.current_frame_id.is_some()
+        || input.target_frame_id.is_some();
+    let has_island_forbidden_fields =
+        has_legacy_fallback_fields || input.target_artifact_id.is_some();
+
+    if island_primary_open_source(input) {
+        if !input.strict_continue_target {
+            warnings.push(
+                "blocked_by_continue_policy:island_primary_requires_strict_continue_target"
+                    .to_string(),
+            );
+            return Some(blocked_open_resume_point_result(warnings));
+        }
+        if input
+            .continue_decision_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            warnings.push(
+                "blocked_by_continue_policy:island_primary_requires_continue_decision_id"
+                    .to_string(),
+            );
+            return Some(blocked_open_resume_point_result(warnings));
+        }
+        if has_island_forbidden_fields {
+            warnings.push(
+                "blocked_by_continue_policy:island_primary_rejects_legacy_open_fields".to_string(),
+            );
+            return Some(blocked_open_resume_point_result(warnings));
+        }
+        return None;
+    }
+
+    if source == "diagnostics"
+        && has_legacy_fallback_fields
+        && input.diagnostic_allowed != Some(true)
+    {
+        warnings.push(
+            "blocked_by_continue_policy:diagnostic_legacy_open_requires_diagnostic_allowed"
+                .to_string(),
+        );
+        return Some(blocked_open_resume_point_result(warnings));
+    }
+
+    if source.is_empty() && has_legacy_fallback_fields {
+        warnings.push(
+            "legacy_open_fields_without_source:allowed_for_backward_compatibility".to_string(),
+        );
+    }
+
+    None
+}
+
+fn island_primary_open_source(input: &OpenResumePointInput) -> bool {
+    input.source.as_deref() == Some("island_primary")
+}
+
+fn blocked_open_resume_point_result(warnings: &[String]) -> OpenResumePointResult {
+    OpenResumePointResult {
+        strategy: "blocked_by_continue_policy".to_string(),
+        frame_id: None,
+        opened_url: None,
+        anchor_text: None,
+        confidence: 0.0,
+        warnings: warnings.to_vec(),
     }
 }
 
@@ -7560,6 +7707,7 @@ fn read_resume_query_bundle_result(bundle_path: &Path) -> Result<ResumeQueryBund
         }
     };
     Ok(ResumeQueryBundleResult {
+        legacy_path_audit: legacy_resume_path_audit("resume_query_bundle"),
         output_dir: output_dir.to_string_lossy().to_string(),
         bundle_path: bundle_path.to_string_lossy().to_string(),
         payload_path: bundle_path.to_string_lossy().to_string(),
@@ -8279,6 +8427,7 @@ fn local_fallback_cloud_resume_result(
     }
     CloudResumeResult {
         schema: "smalltalk.cloud_resume_result.v1".to_string(),
+        legacy_path_audit: legacy_resume_path_audit("cloud_resume"),
         request,
         cached: false,
         source: "local_fallback".to_string(),
@@ -12659,6 +12808,7 @@ fn build_storyboard_from_safe_export(
         classify_storyboard_transitions(&bundle.frames, &bundle.transitions);
     let dominant_surfaces = dominant_surfaces(&bundle.frames);
     NativeStoryboardDossier {
+        legacy_path_audit: legacy_resume_path_audit("native_storyboard_dossier"),
         generated_at_ms: bundle.generated_at_ms,
         lookback_start_ms: bundle.lookback_start_ms,
         lookback_end_ms: bundle.lookback_end_ms,
@@ -12791,6 +12941,7 @@ fn build_resume_card_from_storyboard(
         / dossier.keyframes.len().max(1) as f64)
         .min(0.86);
     NativeResumeCard {
+        legacy_path_audit: legacy_resume_path_audit("native_resume_card"),
         generated_at_ms: now_millis(),
         lookback_minutes,
         what_was_i_doing,
@@ -13662,6 +13813,7 @@ fn classify_safe_episode_transitions(
             let classified =
                 classify_transition_with_episode_context(base, pre, post, &chronological);
             ClassifiedTransition {
+                legacy_path_audit: legacy_resume_path_audit("classify_episode_transitions"),
                 id: transition.id.clone(),
                 transition_type: classified.transition_type,
                 pre_frame_id: transition.pre_frame_id.clone(),
@@ -14400,6 +14552,7 @@ fn capture_loop(
     let mut previous_semantic_fingerprint: Option<SemanticFingerprint> = None;
     let mut pending_trigger: Option<PendingTrigger> = None;
     let mut typing_burst = TypingBurstState::default();
+    let mut event_ingest_gate = EventIngestGate::default();
     let mut last_island_event_status_at: Option<Instant> = None;
     let mut event_source = match capture_paths(&app)
         .and_then(|paths| start_capture_event_source(&paths))
@@ -14438,6 +14591,7 @@ fn capture_loop(
                         &session_id,
                         &mut pending_trigger,
                         &mut typing_burst,
+                        &mut event_ingest_gate,
                         &raw_trigger,
                     ) {
                         update_error_and_island(&app, &state, error);
@@ -14462,6 +14616,7 @@ fn capture_loop(
                     &session_id,
                     &mut pending_trigger,
                     &mut typing_burst,
+                    &mut event_ingest_gate,
                     &raw_trigger,
                 ) {
                     update_error_and_island(&app, &state, error);
@@ -14646,6 +14801,7 @@ fn queue_event_trigger(
     session_id: &str,
     pending: &mut Option<PendingTrigger>,
     typing_burst: &mut TypingBurstState,
+    event_ingest_gate: &mut EventIngestGate,
     raw_event: &str,
 ) -> Result<(), String> {
     let Some(mut event) = parse_ui_event(raw_event) else {
@@ -14660,6 +14816,10 @@ fn queue_event_trigger(
         Some(value) => value,
         None => return Ok(()),
     };
+
+    if event_ingest_gate.should_drop(&event) {
+        return Ok(());
+    }
 
     let conn = open_db(app)?;
     if event.id.is_empty() {
@@ -14710,6 +14870,98 @@ fn queue_event_trigger(
     insert_capture_trigger(&conn, session_id, &trigger, now, false, "event_bucket")?;
     *pending = Some(trigger);
     Ok(())
+}
+
+impl EventIngestGate {
+    fn should_drop(&mut self, event: &UiEventRecord) -> bool {
+        if is_smalltalk_ui_event(event) {
+            return true;
+        }
+
+        let min_interval_ms = coalescing_interval_for_ui_event(event);
+        if min_interval_ms <= 0 {
+            return false;
+        }
+
+        let key = ui_event_coalescing_key(event);
+        if let Some(last_ts_ms) = self.last_persisted_by_key.get(&key) {
+            if event.ts_ms.saturating_sub(*last_ts_ms) < min_interval_ms {
+                return true;
+            }
+        }
+
+        self.last_persisted_by_key.insert(key, event.ts_ms);
+        if self.last_persisted_by_key.len() > 512 {
+            let cutoff = event.ts_ms.saturating_sub(60_000);
+            self.last_persisted_by_key
+                .retain(|_, last_ts_ms| *last_ts_ms >= cutoff);
+        }
+        false
+    }
+}
+
+fn is_smalltalk_ui_event(event: &UiEventRecord) -> bool {
+    event
+        .app_bundle_id
+        .as_deref()
+        .is_some_and(|bundle_id| bundle_id == SMALLTALK_BUNDLE_ID)
+        || event
+            .app_name
+            .as_deref()
+            .map(|name| name.trim().eq_ignore_ascii_case("smalltalk"))
+            .unwrap_or(false)
+}
+
+fn coalescing_interval_for_ui_event(event: &UiEventRecord) -> i64 {
+    match event.event_type.as_str() {
+        "scroll" => UI_EVENT_SCROLL_MIN_INTERVAL_MS,
+        "ax_notification" | "accessibility_change" => {
+            match ui_event_payload_string(event, "notification")
+                .as_deref()
+                .unwrap_or("")
+            {
+                "AXValueChanged"
+                | "AXSelectedTextChanged"
+                | "AXWindowMoved"
+                | "AXWindowResized" => UI_EVENT_AX_VALUE_MIN_INTERVAL_MS,
+                _ => UI_EVENT_AX_DEFAULT_MIN_INTERVAL_MS,
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn ui_event_coalescing_key(event: &UiEventRecord) -> String {
+    let app_key = event
+        .app_bundle_id
+        .as_deref()
+        .or(event.app_name.as_deref())
+        .unwrap_or("unknown_app")
+        .trim()
+        .to_lowercase();
+    let window_key = event
+        .window_title
+        .as_deref()
+        .unwrap_or("unknown_window")
+        .trim()
+        .to_lowercase();
+    let detail =
+        if event.event_type == "ax_notification" || event.event_type == "accessibility_change" {
+            ui_event_payload_string(event, "notification").unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "burst".to_string()
+        };
+    format!("{}:{}:{}:{}", event.event_type, app_key, window_key, detail)
+}
+
+fn ui_event_payload_string(event: &UiEventRecord, key: &str) -> Option<String> {
+    event
+        .payload
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|payload| payload.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn parse_ui_event(raw_event: &str) -> Option<UiEventRecord> {
@@ -19022,6 +19274,7 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
     "continue_app_activity_segments",
     "continue_activity_classifications",
     "continue_boundary_revisions",
+    "continue_decision_open_events",
     "continue_feedback_events",
     "continue_breadcrumbs",
 ];
@@ -23366,10 +23619,13 @@ fn cleanup_local_memory_impl(
     let dry_run = input.dry_run.unwrap_or(true);
     let protected_frame_ids = protected_cleanup_frame_ids(&conn)?;
     let mut frame_ids = cleanup_candidate_frame_ids(&conn)?;
+    let mut event_ids = cleanup_candidate_event_ids(&conn)?;
     let candidate_frames = frame_ids.len() as i64;
     frame_ids.retain(|frame_id| !protected_frame_ids.contains(frame_id));
     frame_ids.sort_unstable();
     frame_ids.dedup();
+    event_ids.sort();
+    event_ids.dedup();
 
     let mut reclaimed_bytes = 0_u64;
     let mut deleted_snapshot_files = 0_i64;
@@ -23398,8 +23654,9 @@ fn cleanup_local_memory_impl(
 
     if dry_run {
         let summary = format!(
-            "preview: {} eligible frame rows, {} protected frame rows, {} orphan snapshot files, about {} bytes reclaimable",
+            "preview: {} eligible frame rows, {} eligible event rows, {} protected frame rows, {} orphan snapshot files, about {} bytes reclaimable",
             frame_ids.len(),
+            event_ids.len(),
             protected_frame_ids.len(),
             orphan_paths.len(),
             reclaimed_bytes
@@ -23411,6 +23668,7 @@ fn cleanup_local_memory_impl(
             candidate_frames,
             protected_frames: protected_frame_ids.len() as i64,
             deleted_frames: 0,
+            deleted_event_rows: 0,
             deleted_snapshot_files: 0,
             reclaimed_bytes,
             summary,
@@ -23418,6 +23676,7 @@ fn cleanup_local_memory_impl(
     }
 
     let mut deleted_frame_count = 0_i64;
+    let deleted_event_rows = delete_ui_events(&conn, &event_ids)?;
     for frame_id in &frame_ids {
         for path in frame_asset_paths(&conn, *frame_id)? {
             if fs::remove_file(&path).is_ok() {
@@ -23446,8 +23705,8 @@ fn cleanup_local_memory_impl(
     }
 
     let summary = format!(
-        "deleted {} frame rows, {} snapshot files, reclaimed about {} bytes",
-        deleted_frame_count, deleted_snapshot_files, reclaimed_bytes
+        "deleted {} frame rows, {} event rows, {} snapshot files, reclaimed about {} bytes",
+        deleted_frame_count, deleted_event_rows, deleted_snapshot_files, reclaimed_bytes
     );
     record_maintenance_value(&conn, "cleanup_last_run_ms", &now_millis().to_string())?;
     record_maintenance_value(&conn, "cleanup_last_result", &summary)?;
@@ -23462,6 +23721,7 @@ fn cleanup_local_memory_impl(
         candidate_frames,
         protected_frames: protected_frame_ids.len() as i64,
         deleted_frames: deleted_frame_count,
+        deleted_event_rows,
         deleted_snapshot_files,
         reclaimed_bytes: measured_reclaimed.max(reclaimed_bytes),
         summary,
@@ -23506,7 +23766,9 @@ fn local_memory_diagnostics(app: &AppHandle) -> Result<LocalMemoryDiagnostics, S
         heavy_evidence_rows: heavy_evidence_rows(&conn),
         continue_object_counts: continue_object_counts(&conn),
         low_value_duplicate_frames: low_value_duplicate_frame_count(&conn)?,
+        excess_low_value_events: excess_low_value_event_count(&conn)?,
         self_capture_frames: self_capture_frame_count(&conn)?,
+        self_capture_events: self_capture_event_count(&conn)?,
         decision_linked_frames: protected_frame_ids.len() as i64,
         estimated_cleanup_potential_bytes,
         oldest_retained_frame_ms: min_i64(&conn, "frames", "captured_at").ok().flatten(),
@@ -23524,6 +23786,7 @@ fn local_memory_diagnostics(app: &AppHandle) -> Result<LocalMemoryDiagnostics, S
                 MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE,
             max_snapshot_dir_bytes: MAX_LOCAL_SNAPSHOT_DIR_BYTES,
             max_retained_low_value_duplicate_frames: MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES,
+            max_retained_low_value_ui_events: MAX_RETAINED_LOW_VALUE_UI_EVENTS,
             max_diagnostic_rows_per_cleanup: MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP,
         },
         runtime_diagnostics: runtime_diagnostics_from_conn(Some(&conn)),
@@ -23561,6 +23824,31 @@ fn cleanup_candidate_frame_ids(conn: &Connection) -> Result<Vec<i64>, String> {
     )?;
     ids.append(&mut self_capture_ids);
     ids.append(&mut duplicate_ids);
+    Ok(ids)
+}
+
+fn cleanup_candidate_event_ids(conn: &Connection) -> Result<Vec<String>, String> {
+    if !table_exists_in_capture(conn, "ui_events")? {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = query_string_rows(
+        conn,
+        "SELECT id FROM ui_events
+         WHERE lower(COALESCE(app_name, '')) = 'smalltalk'
+            OR lower(COALESCE(app_bundle_id, '')) LIKE '%com.smalltalk%'
+         LIMIT 5000",
+        &[],
+    )?;
+    let mut excess_low_value_ids = query_string_rows(
+        conn,
+        "SELECT id FROM ui_events
+         WHERE event_type IN ('scroll', 'ax_notification', 'accessibility_change')
+         ORDER BY ts_ms DESC, id DESC
+         LIMIT -1 OFFSET ?1",
+        &[&MAX_RETAINED_LOW_VALUE_UI_EVENTS as &dyn ToSql],
+    )?;
+    ids.append(&mut excess_low_value_ids);
     Ok(ids)
 }
 
@@ -23641,6 +23929,7 @@ fn continue_object_counts(conn: &Connection) -> LocalMemoryContinueObjectCounts 
         open_loops: count_if_present_capture(conn, "continue_open_loops"),
         candidates: count_if_present_capture(conn, "continue_candidates"),
         decisions: count_if_present_capture(conn, "continue_decisions"),
+        open_events: count_if_present_capture(conn, "continue_decision_open_events"),
         feedback_events: count_if_present_capture(conn, "continue_feedback_events"),
         breadcrumbs: count_if_present_capture(conn, "continue_breadcrumbs"),
     }
@@ -23669,6 +23958,21 @@ fn low_value_duplicate_frame_count(conn: &Connection) -> Result<i64, String> {
     .map_err(to_string)
 }
 
+fn excess_low_value_event_count(conn: &Connection) -> Result<i64, String> {
+    let offset = MAX_RETAINED_LOW_VALUE_UI_EVENTS.max(0);
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT id FROM ui_events
+            WHERE event_type IN ('scroll', 'ax_notification', 'accessibility_change')
+            ORDER BY ts_ms DESC, id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        params![offset],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
 fn self_capture_frame_count(conn: &Connection) -> Result<i64, String> {
     conn.query_row(
         "SELECT COUNT(*) FROM frames
@@ -23681,12 +23985,45 @@ fn self_capture_frame_count(conn: &Connection) -> Result<i64, String> {
     .map_err(to_string)
 }
 
+fn self_capture_event_count(conn: &Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM ui_events
+         WHERE lower(COALESCE(app_name, '')) = 'smalltalk'
+            OR lower(COALESCE(app_bundle_id, '')) LIKE '%com.smalltalk%'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(to_string)
+}
+
 fn query_i64_rows(conn: &Connection, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<i64>, String> {
     let mut stmt = conn.prepare(sql).map_err(to_string)?;
     let rows = stmt
         .query_map(params, |row| row.get::<_, i64>(0))
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn query_string_rows(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn.prepare(sql).map_err(to_string)?;
+    let rows = stmt
+        .query_map(params, |row| row.get::<_, String>(0))
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn delete_ui_events(conn: &Connection, event_ids: &[String]) -> Result<i64, String> {
+    let mut deleted = 0_i64;
+    for event_id in event_ids {
+        deleted += conn
+            .execute("DELETE FROM ui_events WHERE id = ?1", params![event_id])
+            .map_err(to_string)? as i64;
+    }
+    Ok(deleted)
 }
 
 fn frame_asset_paths(conn: &Connection, frame_id: i64) -> Result<Vec<PathBuf>, String> {
@@ -26440,6 +26777,119 @@ mod tests {
         assert_eq!(
             capture_interval_for_trigger("accessibility_change"),
             MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn event_ingest_gate_drops_smalltalk_self_events() {
+        let mut gate = EventIngestGate::default();
+        let event = UiEventRecord {
+            ts_ms: 1_000,
+            event_type: "scroll".to_string(),
+            app_bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+            app_name: Some("Smalltalk".to_string()),
+            window_title: Some("Continue".to_string()),
+            ..UiEventRecord::default()
+        };
+
+        assert!(gate.should_drop(&event));
+    }
+
+    #[test]
+    fn event_ingest_gate_coalesces_scroll_bursts_by_surface() {
+        let mut gate = EventIngestGate::default();
+        let base = UiEventRecord {
+            ts_ms: 1_000,
+            event_type: "scroll".to_string(),
+            app_bundle_id: Some("com.openai.chat".to_string()),
+            app_name: Some("ChatGPT".to_string()),
+            window_title: Some("Implementation notes".to_string()),
+            scroll_dy: Some(4.0),
+            ..UiEventRecord::default()
+        };
+
+        assert!(!gate.should_drop(&base));
+
+        let burst = UiEventRecord {
+            ts_ms: 1_000 + UI_EVENT_SCROLL_MIN_INTERVAL_MS - 1,
+            ..base.clone()
+        };
+        assert!(gate.should_drop(&burst));
+
+        let settled = UiEventRecord {
+            ts_ms: 1_000 + UI_EVENT_SCROLL_MIN_INTERVAL_MS,
+            ..base
+        };
+        assert!(!gate.should_drop(&settled));
+    }
+
+    #[test]
+    fn event_ingest_gate_coalesces_noisy_ax_notifications() {
+        let mut gate = EventIngestGate::default();
+        let event = UiEventRecord {
+            ts_ms: 2_000,
+            event_type: "ax_notification".to_string(),
+            app_bundle_id: Some("com.apple.Safari".to_string()),
+            app_name: Some("Safari".to_string()),
+            window_title: Some("Research".to_string()),
+            payload: Some(serde_json::json!({
+                "notification": "AXValueChanged"
+            })),
+            ..UiEventRecord::default()
+        };
+
+        assert!(!gate.should_drop(&event));
+
+        let burst = UiEventRecord {
+            ts_ms: 2_000 + UI_EVENT_AX_VALUE_MIN_INTERVAL_MS - 1,
+            ..event.clone()
+        };
+        assert!(gate.should_drop(&burst));
+
+        let settled = UiEventRecord {
+            ts_ms: 2_000 + UI_EVENT_AX_VALUE_MIN_INTERVAL_MS,
+            ..event
+        };
+        assert!(!gate.should_drop(&settled));
+    }
+
+    #[test]
+    fn cleanup_candidates_prune_excess_low_value_and_self_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for index in 0..(MAX_RETAINED_LOW_VALUE_UI_EVENTS + 2) {
+            conn.execute(
+                "INSERT INTO ui_events (
+                    id, session_id, ts_ms, event_type, app_name, created_at_ms
+                 ) VALUES (?1, 'session-events', ?2, 'scroll', 'Safari', ?2)",
+                params![format!("evt-scroll-{}", index), index],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO ui_events (
+                id, session_id, ts_ms, event_type, app_bundle_id, app_name, created_at_ms
+             ) VALUES (
+                'evt-self', 'session-events', 99, 'click', ?1, 'Smalltalk', 99
+             )",
+            params![SMALLTALK_BUNDLE_ID],
+        )
+        .unwrap();
+
+        assert_eq!(excess_low_value_event_count(&conn).unwrap(), 2);
+        assert_eq!(self_capture_event_count(&conn).unwrap(), 1);
+
+        let ids = cleanup_candidate_event_ids(&conn).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().any(|id| id == "evt-self"));
+
+        assert_eq!(delete_ui_events(&conn, &ids).unwrap(), 3);
+        assert_eq!(excess_low_value_event_count(&conn).unwrap(), 0);
+        assert_eq!(self_capture_event_count(&conn).unwrap(), 0);
+        assert_eq!(
+            row_count(&conn, "ui_events").unwrap(),
+            MAX_RETAINED_LOW_VALUE_UI_EVENTS
         );
     }
 
@@ -32632,7 +33082,7 @@ mod tests {
         );
         let input = OpenResumePointInput {
             continue_decision_id: Some("continue-decision-open-telemetry".to_string()),
-            target_artifact_id: Some("artifact-open-telemetry".to_string()),
+            source: Some("island_primary".to_string()),
             strict_continue_target: true,
             ..Default::default()
         };
@@ -32653,15 +33103,16 @@ mod tests {
             .warnings
             .iter()
             .all(|warning| !warning.contains("private-target")));
-        let (count, decision_id, target_artifact_id, opened_url, opened_path): (
+        let (count, decision_id, target_artifact_id, source, opened_url, opened_path): (
             i64,
+            String,
             String,
             String,
             i64,
             i64,
         ) = conn
             .query_row(
-                "SELECT COUNT(*), decision_id, target_artifact_id, opened_url, opened_path
+                "SELECT COUNT(*), decision_id, target_artifact_id, source, opened_url, opened_path
                  FROM continue_decision_open_events",
                 [],
                 |row| {
@@ -32671,6 +33122,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -32678,6 +33130,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(decision_id, "continue-decision-open-telemetry");
         assert_eq!(target_artifact_id, "artifact-open-telemetry");
+        assert_eq!(source, "island_primary");
         assert_eq!(opened_url, 1);
         assert_eq!(opened_path, 0);
 
@@ -32692,6 +33145,134 @@ mod tests {
             column.contains("url") && column != "opened_url"
                 || column.contains("path") && column != "opened_path"
         }));
+    }
+
+    #[test]
+    fn island_open_requires_decision_id() {
+        let input = OpenResumePointInput {
+            source: Some("island_primary".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_requires_continue_decision_id"
+        }));
+    }
+
+    #[test]
+    fn island_open_requires_strict_continue_target() {
+        let input = OpenResumePointInput {
+            continue_decision_id: Some("decision-island".to_string()),
+            source: Some("island_primary".to_string()),
+            strict_continue_target: false,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_requires_strict_continue_target"
+        }));
+    }
+
+    #[test]
+    fn island_open_rejects_cloud_resume_path() {
+        let input = OpenResumePointInput {
+            output_path: Some("/tmp/cloud-resume-result.json".to_string()),
+            continue_decision_id: Some("decision-island".to_string()),
+            source: Some("island_primary".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_rejects_legacy_open_fields"
+        }));
+    }
+
+    #[test]
+    fn island_open_rejects_session_target() {
+        let input = OpenResumePointInput {
+            session_id: Some("session-legacy".to_string()),
+            continue_decision_id: Some("decision-island".to_string()),
+            source: Some("island_primary".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_rejects_legacy_open_fields"
+        }));
+    }
+
+    #[test]
+    fn island_open_rejects_frame_fallback_without_diagnostic_flag() {
+        let input = OpenResumePointInput {
+            target_frame_id: Some(42),
+            continue_decision_id: Some("decision-island".to_string()),
+            source: Some("island_primary".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_rejects_legacy_open_fields"
+        }));
+    }
+
+    #[test]
+    fn island_open_rejects_target_artifact_field() {
+        let input = OpenResumePointInput {
+            continue_decision_id: Some("decision-island".to_string()),
+            target_artifact_id: Some("artifact-direct".to_string()),
+            source: Some("island_primary".to_string()),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings).unwrap();
+
+        assert_eq!(blocked.strategy, "blocked_by_continue_policy");
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:island_primary_rejects_legacy_open_fields"
+        }));
+    }
+
+    #[test]
+    fn island_open_valid_decision_id_only_policy_allows_open() {
+        let input = OpenResumePointInput {
+            continue_decision_id: Some("decision-island".to_string()),
+            source: Some("island_primary".to_string()),
+            diagnostic_allowed: Some(false),
+            strict_continue_target: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+
+        let blocked = validate_open_resume_source_policy(&input, &mut warnings);
+
+        assert!(blocked.is_none());
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -33246,6 +33827,7 @@ mod tests {
             },
         };
         ResumeQueryBundleResult {
+            legacy_path_audit: legacy_resume_path_audit("resume_query_bundle"),
             output_dir: "/tmp/smalltalk-test".to_string(),
             bundle_path: "/tmp/smalltalk-test/resume-query-bundle.json".to_string(),
             payload_path: "/tmp/smalltalk-test/resume-query-bundle.json".to_string(),

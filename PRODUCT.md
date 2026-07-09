@@ -1,12 +1,48 @@
 # Smalltalk Product And Technical Specification
 
-Last updated: 2026-07-04
+Last updated: 2026-07-10
+
+Implementation baseline: commits after `f241ceba` (`Refine Continue flow and evidence-backed continuation scoring`) through the current working tree. The repository is on a case-insensitive filesystem; `PRODUCT.md` is the canonical tracked filename even when tools display it as `product.md`.
 
 This document describes the current Smalltalk product as implemented in this repository. It is written for another engineer or LLM that needs to understand what the product is, how it works, which parts are active, which parts are diagnostic, and where the current architecture still leaks older recorder behavior.
 
 Smalltalk is a desktop-first, local-first continuation product built with Tauri, Rust, React, SQLite, macOS native capture APIs, Accessibility, OCR, and optional OpenAI calls. Its primary user-facing primitive is `Continue`: a single answer that separates what the user is looking at now from where they should return to continue meaningful work.
 
 The active product lane is the native desktop app in the repository root. The older WXT browser extension remains in `browser-extension/`, but it is not the MVP path and should not be revived unless a task explicitly asks for browser-extension work.
+
+## Changes Since The Previous Product Snapshot
+
+The previous product snapshot was last changed in commit `f241ceba` on 2026-07-05 and still described the implementation as of 2026-07-04. Ten subsequent commits, plus the current P4 working-tree changes, materially changed the product:
+
+- Capture is explicitly sparse and event-driven. Native app, focus, Accessibility, click, key-category, scroll, and clipboard signals are stored cheaply; screenshots, AX trees, OCR, window graphs, and normalized content are stored only for accepted heavy frames.
+- Long-running local memory now has concrete pressure controls: event coalescing, native scroll/AX throttling, 4-second important and 45-second low-value heavy-capture intervals, a 24-frame rolling screenshot budget for low-value captures, three unchanged heavy frames per surface, a 512 MB snapshot pressure gate, image-plus-content deduplication, Smalltalk self-capture suppression, and cleanup caps for low-value frames and events.
+- Text attribution now separates active owned text from background or display-only OCR through `frame_text_resolutions`. Mixed/background text can remain evidence without being trusted as primary task text.
+- Continue gained semantic moments, boundary revisions, app-activity segments, open loops, workstream state snapshots/edges, memory cells/edges, pairwise preferences, ranking priors, and decision-open telemetry.
+- Current focus is no longer equivalent to the latest screenshot. `resolve_current_surface` fuses frames, events, artifact observations, app contexts, window state, and typing activity; the evidence-freshness ledger then compares that current surface with the selected target.
+- Fresh non-openable current work can outrank a stale openable target. `active_current_work_unresolved` is a factual first-class result, while public `return_target` and `resume_work_target` stay null when the exact safe target is missing.
+- Repeated negative feedback is enforced before ranking, in alternatives, in the model candidate pack, during validation, during cache reuse, and again at strict open time. Fresh reconfirming local evidence is required before a suppressed target can return.
+- Search, docs, messages, diagnostics, terminal support output, and other branches are evidence-only by default. Explicit local branch-promotion state is required before a support branch can become a public return target.
+- Weak native/editor/terminal surfaces now have bounded enrichment attempts, normalized surface snapshots, stable hashed identities, evidence-quality grading, missing-evidence labels, and truthful thin-state handling.
+- Continue audits are opt-in per explicit Continue action, asynchronous, proof-first, and lean by default. Startup/background refreshes do not create bundles; full SQLite/table/frame archives require an explicit full-raw mode.
+- The floating island is now a Continue consumer instead of a legacy resume bypass. It renders the typed `IslandContinueState`, opens only through a persisted `continue_decision_id`, records source-aware feedback/open telemetry, and fails closed when the main Continue policy would suppress the target.
+- SQLite access is hardened for long-running capture and concurrent status/Continue work: writable connections use WAL and `synchronous=NORMAL`, all connections use a 30-second busy timeout, read-only polling uses read-only connections, and `get_continue_decision` is serialized by a process-level lock.
+
+Commit inventory reviewed for this update:
+
+| Commit | Date | Subject |
+| --- | --- | --- |
+| `2e48278d` | 2026-07-05 | Rework Continue surface and continuation flow |
+| `21843795` | 2026-07-07 | Refactor continuation flow and evidence rendering |
+| `978dfafd` | 2026-07-07 | Refactor continue flow and evidence handling |
+| `2273684d` | 2026-07-07 | Refactor continue evidence flow and UI state handling |
+| `4850dfdf` | 2026-07-07 | Refine continue evidence recovery and candidate scoring |
+| `9cf0e8b5` | 2026-07-07 | Refactor continue workflow and remove legacy resume code |
+| `58fb77c7` | 2026-07-08 | Refactor continue flow and evidence handling |
+| `2196cdc5` | 2026-07-08 | Refactor continuation flow and evidence handling |
+| `abeb3622` | 2026-07-08 | Refine continuation flow and evidence handling |
+| `b0e4d0a3` | 2026-07-08 | Refine continue flow and evidence scoring |
+
+Because those commit subjects are broad, the rest of this document describes the current code paths and persisted contracts rather than trying to infer behavior from commit titles alone.
 
 ## Product Doctrine
 
@@ -52,7 +88,8 @@ Smalltalk must not store raw typed characters or full clipboard text. Keyboard a
 | `src-tauri/src/capture.rs` | Active runtime facade for capture, storage, search, safe exports, cloud resume, local memory diagnostics, cleanup, and Tauri command wrappers. |
 | `src-tauri/src/continuation.rs` | Native Continue semantic memory, rebuild layers, scoring, decisions, feedback, breadcrumbs, eval, and default bounded micro-inference. |
 | `src-tauri/src/lib.rs` | Tauri builder and command registration. |
-| `src-tauri/src/session_island.rs` | macOS floating island bridge. Still speaks older session/resume language in several paths. |
+| `src-tauri/src/session_island.rs` | macOS floating-island Continue gateway, typed state contract, freshness memory, source-aware actions/feedback, and no-bypass audit hooks. |
+| `src-tauri/src/session_island/` | Island contract/gateway modules and tests extracted from the bridge. |
 | `src-tauri/macos/SessionIslandPanel.swift` | Native macOS panel UI. |
 | `src-tauri/scripts/` | Swift helper scripts for Accessibility, OCR, window capture, native event observation, and ScreenCaptureKit support. |
 | `src-tauri/src/capture_core/` | Newer modular capture-core code for event governance, quality, privacy, extraction, store behavior, episode policy, browser adapters, and resume dossier limits. The active facade remains `capture.rs`. |
@@ -124,6 +161,11 @@ The main first screen is the `ContinueDecisionCard`. Depending on evidence state
 - No-evidence state.
 - Local-memory-active state.
 - Continue decision state.
+- Fresh openable enriched work state.
+- Fresh enriched-but-not-openable state.
+- Truthful thin current-work state.
+- Older context with fresher thin current work.
+- No-clear-continuation state.
 - Inference provenance: `AI-assisted`, `Local fallback`, or `Local only`.
 - Current focus.
 - Return target or best available return point.
@@ -143,7 +185,8 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
-    max_candidates_for_model: 5
+    max_candidates_for_model: 5,
+    audit_output_enabled: options.writeAudit === true
   }
 });
 ```
@@ -157,10 +200,15 @@ The UI opens the selected target through:
 ```ts
 await invoke("open_resume_point", {
   input: {
-    continue_decision_id: continueDecision.decision_id
+    continue_decision_id: continueDecision.decision_id,
+    target_artifact_id: resumeTarget?.artifact_id || null,
+    source: "desktop_continue_card",
+    strict_continue_target: true
   }
 });
 ```
+
+`Continue here` is rendered only for `openable_return_target`. Fresh but non-openable work uses inspect-first copy such as `Most recent work seen`, `Fresh current work`, `Exact target missing`, or `No safe return target yet`; it does not quietly fall back to an old openable frame or generic `Continue here`.
 
 The UI records explicit correction feedback through:
 
@@ -201,8 +249,8 @@ The current repo has four overlapping paths:
 | --- | --- |
 | React Continue shell | Primary screen is Continue-first, but diagnostics still expose many internal layers. |
 | Continue backend | Real layered semantic memory and scoring engine. |
-| Capture/recorder backend | Still the operational evidence substrate and still heavy. |
-| Floating island | Still mostly wired to older session/cloud resume language in some paths. |
+| Capture/evidence backend | Operational evidence substrate with lightweight-first signals and sparse, budgeted heavy frames. |
+| Floating island | Typed Continue-first consumer using the same backend decision and strict-open policy as the main card; legacy session/cloud routes are diagnostic-only. |
 
 The correct product direction is to make `Continue` the only first-screen answer and keep diagnostic internals behind secondary surfaces.
 
@@ -223,6 +271,18 @@ The frontend receives exact live paths from `capture_status`:
 - `data_dir`
 - `database_path`
 
+Screenshot assets are partitioned by day under `snapshots/<day>/`. An accepted heavy capture can write a full-display JPEG named `<timestamp>_full.jpg` and, when a window id is available, an active-window JPEG named `<timestamp>_window.jpg`. The SQLite row stores the asset paths and capture provenance; the image bytes are not embedded in SQLite.
+
+SQLite sidecars can exist beside the main database while WAL is active:
+
+```text
+smalltalk-capture.sqlite
+smalltalk-capture.sqlite-wal
+smalltalk-capture.sqlite-shm
+```
+
+The database is the durable local evidence and semantic-memory store across capture sessions. A one-hour session does not produce a separate database or an hour-long video. It appends lightweight event rows and a bounded number of sparse heavy frames to the same database, all linked to a `capture_sessions.id`.
+
 Stop-time resume-query bundles are separate generated artifacts under the repo root:
 
 ```text
@@ -238,6 +298,8 @@ Developer reset can also clear generated repo debug output:
 - `continue_outputs/`
 
 Generated capture data, SQLite files, screenshots, safe exports, resume-query bundles, and Continue output audits must not be committed.
+
+`continue_outputs/` is not a live mirror of the database. It is written only when an explicit Continue action asks for an audit. The default bundle is a compact proof package built in a sibling `.building` directory and atomically renamed to its final session-readable folder after canonical proof files are complete. Background/startup decisions use `audit_output_enabled: false` and do not create output folders.
 
 ## Data Model Overview
 
@@ -267,8 +329,9 @@ Important substrate tables:
 | `exclusion_rules` | Privacy and exclusion rules. |
 | `sensitive_regions` | Sensitive visual/text regions and actions taken. |
 | `frame_quality_warnings` | Frame-level evidence warnings. |
+| `frame_text_resolutions` | Active/background text split, quality label, attribution flags, hashes, and the resolution payload used by Continue. |
 | `ai_export_audit` | Safe AI export audit rows. |
-| `maintenance_counters` | Runtime counters for storage, capture, and Continue diagnostics. |
+| `local_memory_maintenance` | Runtime counters and maintenance values for storage, capture, cleanup, enrichment, audit, and Continue diagnostics. |
 
 Continue tables created by `ensure_continue_schema`:
 
@@ -279,16 +342,33 @@ Continue tables created by `ensure_continue_schema`:
 | `continue_artifact_observations` | Per-frame or event-derived observations of artifacts. |
 | `continue_task_actions` | Derived local actions such as editing, searching, encountering an error, branching away, or returning to origin. |
 | `continue_task_action_events` | Join table from task actions to native UI events. |
+| `continue_semantic_moments` | Debounced meaningful changes and event/frame boundaries that can invalidate stale decisions. |
+| `continue_boundary_revisions` | Persisted semantic-boundary revisions used by cache freshness. |
 | `continue_episodes` | Adjacent task actions grouped into local episodes. |
 | `continue_episode_actions` | Episode-to-action join rows. |
 | `continue_episode_artifacts` | Artifact roles inside each episode. |
 | `continue_workstreams` | Durable clusters of related episodes and artifacts. |
 | `continue_workstream_episodes` | Workstream-to-episode join rows. |
 | `continue_workstream_artifacts` | Durable artifact roles inside a workstream. |
+| `continue_workstream_state_snapshots` | Historical workstream state/unresolved-state snapshots. |
+| `continue_workstream_edges` | Relationships among workstreams. |
+| `continue_branch_contexts` | Origin, branch, return, and explicit branch-promotion state for support surfaces. |
+| `continue_open_loops` | Evidence-backed unfinished, blocked, completed, or unclear work between workstreams and candidates. |
+| `continue_open_loop_artifacts` | Artifact roles inside an open loop. |
+| `continue_open_loop_evidence` | Evidence handles supporting an open loop. |
+| `continue_app_activity_segments` | Bounded app/surface activity segments used by scoring. |
+| `continue_activity_classifications` | Local activity classifications and provenance. |
 | `continue_candidates` | Scored continuation candidates. |
 | `continue_decisions` | Persisted Continue decisions and provenance. |
+| `continue_decision_open_events` | Privacy-preserving open attempts/outcomes keyed by decision and source; no raw URL/path payload. |
 | `continue_feedback_events` | Inferred and explicit feedback about a decision. |
 | `continue_breadcrumbs` | Manual local next-step notes attached to workstreams. |
+| `continue_evidence_probes` | Bounded requests/attempts to acquire missing evidence. |
+| `continue_memory_cells` / `continue_memory_edges` | Durable support/contradiction memory used during retrieval and ranking. |
+| `continue_pairwise_preferences` / `continue_ranking_priors` | Learned local preference and ranking features derived from feedback/evidence. |
+| `continue_surface_enrichment_attempts` | Normalized bounded weak-surface enrichment attempts. |
+| `continue_surface_snapshots` | Normalized weak-surface state, identity, quality, openability, and missing-evidence snapshots. |
+| `continue_eval_fixtures` | Local deterministic eval fixture storage. |
 
 The Continue schema name is:
 
@@ -333,7 +413,14 @@ Main Tauri commands:
 | `build_session_index` | Build stop/session index metadata. |
 | `run_cloud_resume` | Stop/resume-query OpenAI path. Separate from Continue. |
 | `get_cloud_resume_status` | Report OpenAI key presence and model for cloud resume. |
-| `open_resume_point` | Open a Continue, cloud resume, native resume, session, or frame target. |
+| `get_continue_decision` | Core product decision; optionally schedules an explicit lean audit. |
+| `get_continue_decision_trace` | Inspect the persisted decision pipeline without dumping broad unsafe history. |
+| `get_continue_memory_status` | Return semantic-memory counts and layer state. |
+| `assess_continue_evidence_sufficiency` / `request_more_continue_evidence` | Evaluate missing evidence and perform bounded probe requests. |
+| `record_continue_feedback` / `infer_continue_feedback` | Persist explicit feedback or infer it from later local activity/open lifecycle. |
+| `run_continue_eval` / `run_continue_replay_eval` | Deterministic fixture and replay evaluation. |
+| `get_island_continue_state` / `perform_island_continue_action` | Typed island state gateway and source-aware action dispatch. |
+| `open_resume_point` | Strict product open by persisted decision id plus explicitly gated diagnostic compatibility opens. |
 
 `start_native_capture`, `stop_native_capture`, `capture_once_v2`, and `get_frame_v2` are compatibility wrappers over the active capture implementation.
 
@@ -379,6 +466,8 @@ Main Tauri commands:
 - `continue_normal_calls`
 - `continue_rebuild_calls`
 - `decision_cache_hits`
+- weak-surface enrichment attempt/success/skip/failure counters
+- latest weak-surface attempt and snapshot ids when present
 
 These fields matter because the current product should not measure memory only by screenshot frames. It also has lightweight local signals and Continue objects.
 
@@ -396,7 +485,9 @@ These fields matter because the current product should not measure memory only b
 - `heavy_evidence_rows`
 - `continue_object_counts`
 - `low_value_duplicate_frames`
+- `excess_low_value_events`
 - `self_capture_frames`
+- `self_capture_events`
 - `decision_linked_frames`
 - `estimated_cleanup_potential_bytes`
 - `oldest_retained_frame_ms`
@@ -420,11 +511,14 @@ These fields matter because the current product should not measure memory only b
 
 - `artifacts`
 - `artifact_observations`
+- `semantic_moments`
 - `task_actions`
 - `episodes`
 - `workstreams`
+- `open_loops`
 - `candidates`
 - `decisions`
+- `open_events`
 - `feedback_events`
 - `breadcrumbs`
 
@@ -438,6 +532,7 @@ These fields matter because the current product should not measure memory only b
 - `max_screenshots_per_surface_without_change`
 - `max_snapshot_dir_bytes`
 - `max_retained_low_value_duplicate_frames`
+- `max_retained_low_value_ui_events`
 - `max_diagnostic_rows_per_cleanup`
 
 Current budget constants in `capture.rs`:
@@ -452,6 +547,7 @@ Current budget constants in `capture.rs`:
 | `MAX_SCREENSHOT_FRAMES_PER_SURFACE_WITHOUT_CHANGE` | 3 | Maximum retained heavy frames for unchanged surface. |
 | `MAX_LOCAL_SNAPSHOT_DIR_BYTES` | 512 MB | Target local snapshot directory budget. |
 | `MAX_RETAINED_LOW_VALUE_DUPLICATE_FRAMES` | 400 | Duplicate cleanup threshold. |
+| `MAX_RETAINED_LOW_VALUE_UI_EVENTS` | 5,000 | Retain the newest low-value scroll/AX event rows before older rows become cleanup candidates. |
 | `MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP` | 5,000 | Cleanup diagnostic cap. |
 | `MAX_RETAINED_FRAME_AGE_MS` | 7 days | Retention age for frame cleanup candidates. |
 | `MAX_RETAINED_CONTINUE_DECISION_AGE_MS` | 24 hours | Retention age used to protect recent Continue decisions. |
@@ -461,9 +557,53 @@ Current budget constants in `capture.rs`:
 | `MAX_VISIBLE_SIGNAL_MOMENTS` | 48 | Product-facing cap for bucketed signal moments. |
 | `ISLAND_EVENT_STATUS_INTERVAL` | 900 ms | Minimum interval for refreshing island/status after native events. |
 
+These are pressure controls, not a promise that every hour stores exactly the same amount. Important triggers such as app/window changes, clipboard activity, explicit captures, session start, and error-bearing surfaces can exceed the low-value screenshot cadence. Conversely, unchanged surfaces can produce many lightweight events and very few heavy frames.
+
+For an hour of sustained low-value activity, the 45-second spacing permits at most about 80 heavy-capture attempts before same-surface dedupe and storage pressure reduce it further. The 24-frame rolling count can be more restrictive when important frames also occurred in the preceding 10 minutes, because those frames count toward the observed total even though important/manual/error captures themselves bypass the low-value rejection. This is not a global frame maximum. The event stream is also not capped at 5,000 during capture; 5,000 is the retention threshold used by cleanup for low-value scroll/AX rows.
+
+## What Happens During An Hour-Long Session
+
+There is no special one-hour mode and no hour-boundary rollover. A long session follows the same event-driven lifecycle continuously:
+
+1. `start_capture` creates a `capture_sessions` row, starts the Rust worker and native Swift event source, and attempts a `session_start` heavy frame.
+2. Native events append lightweight `ui_events`, typing-burst, clipboard, trigger, and transition evidence linked to the active session.
+3. Events are throttled/coalesced. They can update freshness and semantic memory without a screenshot.
+4. When a trigger settles, the worker decides whether heavy evidence is valuable. Important/manual/error triggers are favored; low-value/unchanged/self/private activity is skipped or deduped.
+5. Accepted heavy evidence writes day-partitioned JPEG assets and normalized SQLite rows. AX is preferred; OCR runs only when AX is missing/thin; active/background attribution is persisted.
+6. Weak surfaces can create bounded enrichment attempts/snapshots from already persisted local evidence.
+7. Continue can run at any time without stopping the session. It incrementally rebuilds semantic rows, reuses a cache only when the full watermark is unchanged, and persists the exact decision.
+8. Status/diagnostic polling uses short read-only connections where possible. Writes use WAL plus a busy timeout; decision work is serialized so the island and main card do not run conflicting rebuilds.
+9. No `continue_outputs/` folder is produced merely because capture is running. Only an explicit audit-enabled Continue schedules a compact asynchronous bundle.
+10. `stop_capture` stops the event source/worker, finalizes the session row/counts, and can build the older bounded stop-time `resume_query_exports` diagnostic bundle. Stop is not required for Continue.
+11. Historical data remains in the shared local database after stop. Cleanup is user-triggered and evidence-aware; it is not tied to session duration.
+
+The main growth sources are JPEG assets and heavy AX/OCR/window/content rows, not the small event metadata alone. The product exposes database bytes, snapshot bytes, row counts, skip counters, excess low-value rows, cleanup potential, and oldest/latest retained evidence so an hour-long session can be evaluated from measured local state rather than estimated from duration.
+
+## SQLite Concurrency And Durability
+
+All database access goes through shared helpers:
+
+- writable opens configure `journal_mode = WAL` and `synchronous = NORMAL`;
+- writable and read-only opens set a 30-second SQLite busy timeout;
+- polling/watermark paths use `SQLITE_OPEN_READ_ONLY` where they do not need schema mutation;
+- `CONTINUE_DECISION_LOCK` permits one in-process `get_continue_decision` at a time;
+- cleanup checkpoints the WAL and can optionally run `VACUUM`;
+- background audit export reuses the configured connection helpers instead of ad hoc SQLite opens.
+
+These changes address the observed `Continue failed: database is locked` class of failure during active sessions. They reduce lock contention but do not turn SQLite into a multi-process server: another process holding an exclusive write or an unexpected crash can still produce an error, which must remain visible rather than being silently treated as a valid Continue result.
+
 ## Capture Trigger Model
 
 Smalltalk uses lightweight native events to decide when heavy evidence is worth storing.
+
+On macOS, `src-tauri/scripts/capture_events.swift` is compiled into the app-data `helpers/` directory and runs as a child process. It combines:
+
+- `NSWorkspace.didActivateApplicationNotification` for app changes.
+- `AXObserver` notifications for focused-window, focused-element, value, selected-text, window, and title changes.
+- A `CGEvent` tap for mouse-down, categorized key-down, and scroll-wheel activity.
+- Pasteboard change polling for clipboard metadata.
+
+The helper caches frontmost app/window lookup for 250 ms, coalesces scroll emission to roughly one row per 650 ms, and applies notification-specific AX throttles. Rust applies a second storage throttle: scroll rows are retained no faster than 650 ms, generic AX rows no faster than 900 ms, and AX value-change rows no faster than 1.8 seconds for the same surface. This keeps long sessions from turning native notification churn into an unbounded database write stream.
 
 Heavy captures are expensive because they can include screenshots, AX snapshots, window graphs, OCR, content-unit extraction, and SQLite writes. The product should therefore treat heavy frames as bounded evidence, not as the only memory.
 
@@ -489,30 +629,36 @@ Visible local signal counts are intentionally bounded. The status path looks at 
 
 Native event ingestion can refresh `capture-status` and the floating island even when no heavy frame is stored. This keeps local-memory state alive during event-only periods without requiring continuous screenshots.
 
+Trigger coalescing keeps one pending bucket. Key activity settles into `typing_pause` after about 850 ms; scrolling settles into `scroll_stop` after about 500 ms. More events arriving before the deadline extend the bucket, and mixed trigger types become `event_burst`. The event rows remain evidence even if the eventual heavy capture is skipped.
+
 ## Native Capture Pipeline
 
 A stored heavy frame follows this pipeline:
 
-1. Resolve local capture paths.
-2. Read macOS Accessibility context.
-3. Apply privacy and exclusion rules.
-4. Skip the frame when privacy says `skip_capture`.
-5. Collect a window graph snapshot.
-6. Capture full-screen or scoped screenshot evidence.
-7. Attempt active-window capture when a window id is available.
-8. Hash image bytes into `image_hash`.
-9. Determine whether Accessibility text is strong or thin.
-10. Run OCR only when Accessibility is missing or thin.
-11. Resolve one `full_text` value and one `text_source`.
-12. Compute `content_hash`.
-13. Apply duplicate and budget checks.
-14. Insert the frame row into SQLite.
-15. Insert OCR rows, AX rows, content units, app contexts, sensitive regions, presence sample, frame diff, trigger finalization, and transition rows.
-16. Emit `capture-frame` to the React UI.
+1. Resolve app-data paths, ensure the database/schema, and create the day-partitioned snapshot directory.
+2. Reuse pre-collected Accessibility context when the trigger already has it, otherwise collect foreground app, window, URL/path, selected/focused state, nodes, and text.
+3. Compute a semantic fingerprint from the foreground context.
+4. Apply privacy and exclusion rules before image capture; return a privacy skip without writing a frame when capture is disallowed.
+5. Apply the pre-capture pressure gate. Manual/session-start and visible-error captures bypass the low-value gate; Smalltalk self-observation, exhausted rolling/snapshot budgets, or too many unchanged frames can skip heavy capture.
+6. Collect the macOS window graph when available.
+7. Capture a full-display JPEG with ScreenCaptureKit first and `/usr/sbin/screencapture` as fallback.
+8. Attempt a ScreenCaptureKit active-window JPEG when a window id is known.
+9. Hash the screenshot and record dimensions/provider/scope/SCK provenance.
+10. Determine whether Accessibility text is strong or thin.
+11. Run OCR against the active-window crop when present, otherwise the full display, only when Accessibility is missing or thin.
+12. Attribute OCR spans to windows/surfaces, separate active owned text from background/display-only text, and persist the resolution quality/flags.
+13. Resolve `text_source`, `full_text`, active `content_hash`, and image hash.
+14. Apply final image-plus-content deduplication. A frame is skipped only when both image and content match; skipped temporary JPEGs are deleted.
+15. Insert the frame and FTS row in SQLite.
+16. Persist OCR text/spans, AX nodes, window graph, app contexts, content units, sensitive regions, presence, frame text resolution, quality warnings, frame diff, capture-trigger result, and transition rows.
+17. Run bounded weak-surface enrichment over the persisted frame and store an attempt/snapshot when applicable.
+18. Increment runtime counters and emit `capture-frame` to React.
 
 Manual captures bypass normal duplicate suppression because the user explicitly requested evidence.
 
 Event and idle captures can be skipped for budget, duplicate, privacy, cancellation, or Smalltalk self-observation reasons. These skips increment runtime counters.
+
+Important trigger types are `manual`, `session_start`, `app_switch`, `window_focus`, and `clipboard`. They are not rejected by the 24-per-10-minute low-value budget. Non-important captures are skipped when the rolling frame count is already 24, the snapshot directory is over 512 MB, or an unchanged semantic surface already has three recent frames. Any surface with a locally detected error signal bypasses those low-value pressure gates so blocker evidence is not discarded merely to save space.
 
 ## Screenshot Capture
 
@@ -528,6 +674,8 @@ The current code has ScreenCaptureKit metadata fields on `frames`:
 - `sck_audio_policy`
 
 The UI displays capture provider and SCK scope in diagnostics.
+
+ScreenCaptureKit is the preferred live provider, implemented by `src-tauri/scripts/sck_screenshot.swift` through `SCScreenshotManager.captureImage`. The provider is still-image capture inside the event-driven scheduler, not continuous screen recording. A successful primary-path frame reports `capture_provider = screen_capture_kit`; an active-window capture uses `scope = active_window` and normally has a `_window.jpg` asset. If the helper fails, Smalltalk can fall back to the command-line screenshot path and records that provider instead of pretending SCK was used.
 
 The older command-line screenshot fallback is:
 
@@ -675,7 +823,7 @@ OCR spans preserve text, confidence, block/line/word indexes, pixel bounds, norm
 
 ### Text Source Resolution
 
-The backend resolves one `text_source` and one `full_text`.
+The backend preserves the legacy `text_source`/`full_text` view for search and inspection, but Continue uses the newer `frame_text_resolutions` attribution when available. That row contains active text, background text, diagnostic text, `full_text_quality`, quality flags, resolution JSON, and active-content hash.
 
 | Evidence state | `text_source` | `full_text` |
 | --- | --- | --- |
@@ -685,6 +833,8 @@ The backend resolves one `text_source` and one `full_text`.
 | Neither source available | `null` | `null`. |
 
 `full_text` powers FTS search, frame inspection, content-unit extraction, and downstream Continue evidence.
+
+For Continue, `active_frame_text_for_continue` prefers attributed active text. Raw `full_text` is blocked as primary task evidence when quality is `mixed_active_and_background`, `background_only`, `display_only_unattributed`, or `unknown`. Background OCR can therefore remain locally inspectable without being allowed to invent the current task, error, or return target.
 
 ## Content Units
 
@@ -862,13 +1012,15 @@ Native Continue is implemented in `src-tauri/src/continuation.rs` and exposed th
 
 Continue is additive on top of the local capture store. It does not require Stop Session. It does not use the browser extension. It does not send broad raw history to a model.
 
-The pipeline has five layers:
+The implementation is easiest to understand as seven stages:
 
 1. Evidence substrate.
-2. Semantic memory layer.
-3. Workstream layer.
-4. Local decision layer.
-5. Default bounded micro-inference layer with local validation and fallback.
+2. Text attribution and weak-surface enrichment.
+3. Semantic memory: artifacts, observations, actions, semantic moments, and boundary revisions.
+4. Episodes, workstreams, branch contexts, state snapshots, and open loops.
+5. Current-surface resolution, freshness, candidate generation, retrieval, scoring, feedback, and quality gates.
+6. Optional bounded micro-inference over locally supplied candidates, with local validation and fallback.
+7. Persisted decision consumed by React, the native island, strict open, feedback, trace, eval, and optional audit output.
 
 ### Layer 1: Evidence Substrate
 
@@ -888,6 +1040,8 @@ The substrate is local SQLite evidence from capture:
 - window graph rows
 - OCR rows
 - AX rows
+- frame text resolutions
+- weak-surface enrichment attempts and snapshots
 
 This layer is factual. It should not infer broad intent.
 
@@ -903,13 +1057,14 @@ It performs:
 
 1. Load evidence frames for a session/lookback/limit.
 2. Clear second-layer rows for those frames.
-3. Resolve a stable artifact for each frame or event-backed evidence item.
-4. Upsert `continue_artifacts`.
-5. Upsert `continue_artifact_observations`.
-6. Extract task actions.
-7. Collapse repeated task actions.
-8. Insert `continue_task_actions`.
-9. Insert task-action event links.
+3. Load normalized weak-surface snapshots and event-only surface evidence in addition to frames.
+4. Resolve a stable artifact for each frame, snapshot, or event-backed evidence item.
+5. Upsert `continue_artifacts` and link snapshots back to resolved artifacts.
+6. Upsert `continue_artifact_observations`.
+7. Extract task actions and classify conservative branch roles.
+8. Collapse repeated task actions.
+9. Insert `continue_task_actions` and task-action event links.
+10. Build semantic moments and boundary revisions from meaningful frame/event deltas.
 
 Result fields include:
 
@@ -943,6 +1098,8 @@ Artifact identity prefers durable keys. The priority is:
 3. App-context object id.
 4. App plus window title.
 5. Stable hash fallback.
+
+Weak editor/terminal/native-agent surfaces use privacy-safe identity adapters when a direct URL/path is not available. For example, code-editor identity can combine a hashed repository root with a hashed relative file identity. Missing identity fields and merge keys are persisted for auditability; raw selected text is hashed rather than stored by the enrichment layer.
 
 Artifacts store:
 
@@ -1040,6 +1197,25 @@ Task actions store:
 
 The classifier is intentionally conservative. Search branches, verification tabs, and messaging surfaces should usually become support evidence, not the default return target.
 
+Each branch action can carry a deterministic taxonomy and promotion state. Origin -> branch -> return relationships are persisted in `continue_branch_contexts`. Openability, a good title, recency, or the model's preference are not promotion evidence. Public promotion requires newer local proof such as direct editing/composing, a visible unresolved blocker, sustained work after abandoning the origin, explicit correction/acceptance, a fresh breadcrumb, or a confident primary action on the branch.
+
+### Weak-Surface Enrichment
+
+Weak surfaces are screens where a normal URL/path/title is missing or insufficient, especially code editors, terminals, Codex/native agent windows, and custom-rendered tools. The enrichment subsystem lives in `src-tauri/src/continuation/enrichment.rs`.
+
+It is bounded and metadata-driven; it is not another capture loop. Focus/event triggers can schedule an attempt, and `get_continue_decision` can perform a bounded synchronous fallback before deciding. Adapters read already persisted frames, AX/OCR/content units, app contexts, recent events, typing summaries, clipboard metadata, and window state.
+
+Normalized rows are stored in:
+
+- `continue_surface_enrichment_attempts`: reason, domain/adapter, budget/privacy/outcome, timestamps, missing evidence, and optional snapshot link.
+- `continue_surface_snapshots`: stable surface key, app/window identity, hashed repo/file/conversation hints, task/activity state, bounded visible sample, quality, identity confidence, openability, privacy, missing evidence, and artifact link.
+
+`evaluate_surface_snapshot_quality` deterministically produces evidence quality, identity confidence, candidate eligibility, stale-target suppression strength, openability, missing-evidence labels, and warnings. Thin/unknown snapshots may describe fresh current work but cannot become primary return targets merely because they are recent.
+
+### Semantic Moments And Boundary Revisions
+
+Raw event/frame sequences are converted into meaningful moments such as content change, progress, event-only activity, task/surface transition, and invalidating evidence. `continue_semantic_moments` stores the evidence-backed delta; `continue_boundary_revisions` stores revisions that invalidate stale decisions. This lets a meaningful event change Continue freshness even when the screenshot count did not change.
+
 ### Event-Only Continue Evidence
 
 The current code includes regression coverage for Continue using event-only moments without new screenshot frames. This matters because the product no longer wants to depend on a constant stream of screenshots.
@@ -1070,8 +1246,10 @@ It performs:
 4. Assign artifact roles inside episodes.
 5. Cluster episodes into workstreams.
 6. Assign durable artifact roles inside workstreams.
-7. Store unresolved state.
-8. Insert episode/workstream join rows.
+7. Store unresolved state and historical workstream state snapshots.
+8. Build workstream relationships and branch origin/return context.
+9. Build evidence-backed open loops between workstreams and candidates.
+10. Insert episode/workstream/artifact join rows.
 
 Result fields include:
 
@@ -1142,6 +1320,8 @@ Examples of unresolved states:
 - search branch without return
 - copied evidence not yet applied
 
+Open loops summarize the actual continuation boundary: last concrete progress, unfinished/blocked/completed state, next evidence-backed action when known, current-focus relation, artifact roles, quality, and supporting evidence. Candidate generation uses open loops rather than treating every recent surface as equally resumable.
+
 ### Layer 4: Local Continue Decision
 
 The main command is:
@@ -1158,6 +1338,7 @@ Default backend request values:
 - `rebuild_layers`: false
 - `micro_inference_enabled`: true
 - `max_candidates_for_model`: 5
+- `audit_output_enabled`: false
 
 The frontend normal path sends:
 
@@ -1167,7 +1348,8 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
-    max_candidates_for_model: 5
+    max_candidates_for_model: 5,
+    audit_output_enabled: options.writeAudit === true
   }
 });
 ```
@@ -1180,7 +1362,8 @@ await invoke("get_continue_decision", {
     mode: "rebuild",
     rebuild_layers: true,
     micro_inference_enabled: true,
-    max_candidates_for_model: 5
+    max_candidates_for_model: 5,
+    audit_output_enabled: true
   }
 });
 ```
@@ -1189,34 +1372,38 @@ await invoke("get_continue_decision", {
 
 Normal mode can reuse a cached decision when no newer local evidence exists. Cache hits increment `decision_cache_hits`. Normal calls increment `continue_normal_calls`. Rebuild calls increment `continue_rebuild_calls`.
 
+The Tauri wrapper serializes `get_continue_decision` with `CONTINUE_DECISION_LOCK`. This avoids two overlapping main-card/island decision rebuilds fighting over the same SQLite writer. Watermark/status reads use read-only connections, and React's post-decision island sync passes `allow_refresh: false` so it does not immediately launch a second decision.
+
 `get_continue_decision` does this:
 
 1. Ensure Continue schema.
 2. Normalize request defaults.
 3. Determine normal versus rebuild mode.
-4. Try to load a fresh cached decision when not rebuilding and the cached decision matches the requested inference policy.
-5. Infer pending feedback for previous decisions when no cache is used.
-6. Check whether semantic layers need rebuild.
-7. Rebuild second layer incrementally when needed.
-8. Rebuild third layer when needed.
-9. Load current focus from latest frame and artifact observation.
-10. Load active, suspended, or unresolved workstreams.
-11. Fall back to any recent workstream if no active/suspended workstreams exist.
-12. Generate local continuation candidates.
-13. Score candidates.
-14. Persist candidates when not using cached decision metadata.
-15. Select the highest local candidate.
-16. Add warnings such as current focus differing from return target.
-17. Run bounded micro-inference by default when candidates exist and `micro_inference_enabled` is not explicitly false.
-18. Validate any model result.
-19. Build a stable decision id.
-20. Persist a `continue_decisions` row when no cached decision was used.
-21. Best-effort write a full generated audit folder under `continue_outputs/`, named with the resolved capture session label first.
-22. Return the decision, anchors, missing evidence, warnings, alternatives, provenance, and optional audit path.
+4. Build an evidence watermark from frames, events, semantic moments, boundary revisions, feedback, opens, and surface snapshots.
+5. Try a cached decision only when inference policy, watermark, boundary state, feedback/open watermarks, and freshness still match.
+6. Infer matured pending feedback for prior open events when no cache is reused.
+7. Run bounded pre-decision weak-surface enrichment when current evidence needs it.
+8. Rebuild semantic layer 2 and workstream layer 3 incrementally when needed.
+9. Resolve current surface by fusing frames, events, artifact observations, app contexts, window state, typing activity, and enriched snapshots.
+10. Derive `active_current_work_unresolved` separately from any return target.
+11. Load workstreams, state snapshots, graph relationships, and open loops.
+12. Generate candidates, including fresh non-openable `continue_current_work` candidates.
+13. Apply app-activity features and retrieve local memory support/contradiction cells.
+14. Apply ranking priors, feedback aggregation, hard suppression, branch-promotion eligibility, scoring, and risk caps.
+15. Persist locally generated candidates and select the best eligible local candidate.
+16. Evaluate the quality gate and initial output mode: `strong_continue`, `thin_continue`, or `no_clear_continuation`.
+17. Build a candidate-bounded model pack after removing feedback-suppressed and unpromoted branch candidates.
+18. Run micro-inference when enabled and eligible candidates exist, then validate the selected ids, semantics, evidence quality, feedback state, branch state, and public copy.
+19. Build the evidence-freshness ledger and suppress stale target revival when fresher current work exists.
+20. Compose locally governed handoff copy and gate public `return_target` / `resume_work_target` independently from diagnostic candidates.
+21. Build a stable decision id and persist `continue_decisions` when appropriate.
+22. Return the decision, current-work fact, quality signals, anchors, support evidence, alternatives, freshness, retrieval, provenance, warnings, and optional audit path.
+23. If and only if `audit_output_enabled` is true, schedule the lean proof-first audit asynchronously after the decision is ready.
 
 Candidate kinds:
 
 - `continue_edit`
+- `continue_current_work`
 - `return_to_primary_artifact`
 - `resolve_error`
 - `verify_output`
@@ -1237,6 +1424,7 @@ Scoring components:
 - `recency_score`
 - `openability_score`
 - `privacy_safety_score`
+- app-activity, memory support/contradiction, feedback-prior, work-value, resume-likelihood, divergence, objective-relation, interaction-depth, and evidence-sufficiency features
 
 A candidate stores:
 
@@ -1256,6 +1444,8 @@ A candidate stores:
 
 Branch and support targets can be evidence without being default return targets.
 
+Hard suppression is applied before sorting/selection. Candidates rejected by feedback or blocked branch-promotion state are excluded from public alternatives and from the model pack, and a live suppression check runs again in `open_resume_point` so an old persisted decision cannot reopen a newly rejected target.
+
 ### Continue Decision Result
 
 `ContinueDecisionResult` includes:
@@ -1263,10 +1453,13 @@ Branch and support targets can be evidence without being default return targets.
 - `decision_id`
 - `mode`
 - `cache_hit`
+- `cache_bypass_reasons`
 - `source`
 - `model`
 - `response_id`
 - `current_focus`
+- `active_current_work_unresolved`
+- `p0_quality_signals`
 - `current_activity`
 - `selected_workstream`
 - `return_target`
@@ -1284,6 +1477,19 @@ Branch and support targets can be evidence without being default return targets.
 - `alternatives`
 - `generated_candidates`
 - `validation_status`
+- `handoff`
+- `support_evidence`
+- feedback/open watermarks and suppression/filter counters
+- branch-selection/filter counters and validation failures
+- `continue_output_mode`
+- evidence watermark and latest boundary revision
+- `current_surface_resolution`
+- `evidence_freshness_ledger`
+- Continue dossier and memory-retrieval report
+- observe-before-decide and weak-surface enrichment diagnostics
+- app-activity summary and quality gate
+- micro-inference requested/attempted/result-kind fields
+- optional `continue_output_path`
 
 Decision sources:
 
@@ -1357,6 +1563,10 @@ The model receives a compact candidate pack only. It contains:
 - missing evidence notes
 - artifact role map
 - short manual breadcrumbs
+- factual unresolved current-work state when present
+- bounded current-surface/enrichment quality and freshness facts
+- support evidence that is visible to reasoning but not selectable as a return target
+- feedback policy and branch-promotion eligibility already computed locally
 
 The model does not receive:
 
@@ -1389,12 +1599,16 @@ The model output is validated locally. The validator rejects output when:
 - `next_action` is empty, too long, or incompatible with candidate semantics
 - high confidence is returned for thin evidence
 - a branch/support target is promoted without a strong local candidate
+- the candidate was suppressed by feedback, excluded by branch policy, or omitted from the filtered model pack
+- a stale target is selected over fresh strong/medium current work
 
 If the API fails, the key is missing, parsing fails, or validation fails, the decision source becomes `local_fallback` and the local scorer result is returned.
 
 Fallback decisions are still cached when their evidence watermark and inference policy match the next normal request. This matters because default micro-inference should not repeatedly attempt network/model work when the same local evidence already produced a validated local fallback.
 
 The decision layer also refuses to present a selected candidate as a clear continuation when there is no human-readable return target. In that case it adds `thin_evidence:no_human_return_target`, lowers confidence, suppresses model handoff output, and returns no-clear-continuation copy rather than exposing internal target metadata.
+
+Micro-inference cannot override the local safety gates. A model choice does not create promotion evidence, restore a feedback-suppressed candidate, make a thin snapshot openable, or turn diagnostic/support evidence into a public target.
 
 ## Feedback And Breadcrumbs
 
@@ -1434,6 +1648,12 @@ It supports:
 - `user_next_step_note`
 
 Explicit feedback is deduped through deterministic ids. Notes are capped at 500 characters in the backend. The frontend currently caps breadcrumb text to 240 characters before sending.
+
+Feedback is aggregated through the versioned `feedback_obedience.v1` policy rather than a count-only rule. The reducer weighs explicit and inferred events, distinguishes soft score caps from hard suppression, records the last negative event, and looks for fresh reconfirming evidence after that event. Repeated rejection/ignore signals can make a target ineligible for primary selection; `artifact_only_evidence` keeps an artifact as evidence while suppressing public promotion.
+
+`continue_decision_open_events` records the lifecycle needed to infer feedback and invalidate caches: decision/candidate/workstream/artifact ids, source, whether an open was attempted/allowed/succeeded, strategy, timestamp, and bounded warnings. It intentionally does not store raw URL or path text. A matured open without confirming activity, or new explicit feedback, changes the feedback/open watermark and prevents a stale cached decision from being reused.
+
+Negative feedback from the main card or island triggers a rebuilt Continue answer instead of leaving the rejected target visible. The same live feedback state is checked again during strict open.
 
 Breadcrumbs are stored through:
 
@@ -1503,6 +1723,15 @@ Eval report fields:
 - current-focus false-positive rate
 - hallucinated artifact count
 - model validation fallback rate
+- last-state and next-action specificity
+- support-branch handling, false-promotion rate, origin recall, and promoted-branch precision
+- thin-evidence honesty, truthful thin-mode rate, and no-clear-continuation correctness
+- current-focus/return clarity, open-loop recovery, source provenance, and quality-gate correctness
+- cache freshness, fresh-current-work retention, and stale-target suppression
+- feedback suppression exposure, corrected-artifact preference, stale feedback-cache hits, model feedback violations, and suppressed-target open attempts
+- weak-surface enrichment attempt/success/quality, truthful thin rendering, candidate recall, stale-URL false positives, fake-open targets, missing-evidence rendering, and privacy violations
+- P1 feedback-gate and P2 support-gate regression counters
+- island bypass, legacy-primary-route, missing-decision-id open, suppressed-target open, main-card disagreement, and valid-open success counters
 - per-case results
 
 Eval belongs in Developer diagnostics.
@@ -1570,7 +1799,7 @@ The user has previously treated fake cloud success as a correctness failure, so 
 
 ## Open Resume Point
 
-`open_resume_point` is the compatibility opener. It can open targets from several sources:
+`open_resume_point` still supports diagnostic compatibility inputs, but product opens are now source-aware and policy-gated. It can resolve targets from:
 
 - Continue decision id
 - cloud resume output path
@@ -1578,13 +1807,13 @@ The user has previously treated fake cloud success as a correctness failure, so 
 - current frame id
 - target frame id
 
-The primary Continue UI now sends `continue_decision_id`.
+The primary React card sends `continue_decision_id`, optional displayed `target_artifact_id`, `source: "desktop_continue_card"`, and `strict_continue_target: true`. The island sends `source: "island_primary"`, `strict_continue_target: true`, and only a persisted decision id.
 
 Opening can use:
 
 - browser URL when allowed and openable
 - document path when allowed and openable
-- frame fallback when no direct target is safe
+- diagnostic frame fallback only when the caller explicitly uses a diagnostic source with `diagnostic_allowed: true`
 - Smalltalk focus fallback when opening is blocked
 
 Open result includes:
@@ -1594,6 +1823,8 @@ Open result includes:
 - warnings
 
 The UI should not fabricate targets. If the backend only provides a frame anchor, the UI should inspect that frame rather than inventing a URL or path.
+
+Strict Continue open resolves the exact target associated with the persisted decision, proves that artifact belongs to the decision/workstream, rechecks current feedback suppression, requires a real direct locator for public opening, and refuses stale legacy fallback fields. `island_primary` fails closed unless all strict conditions hold. Every attempt is recorded best-effort in `continue_decision_open_events` without raw URL/path text.
 
 ## Privacy And Security
 
@@ -1613,7 +1844,9 @@ Privacy boundaries:
 
 Safe AI export means derived/redacted evidence plus audit rows, not raw screenshot dumps.
 
-`continue_outputs/` is different. It is an explicit full developer audit requested for understanding how raw local evidence becomes a Continue decision. It can include raw SQLite snapshots, screenshots, OCR text, Accessibility text/tree data, content units, URLs, file paths, events, semantic layers, candidate scoring, model request JSON, raw model response JSON, validation results, final handoff copy, and an `explain.md` walkthrough. It is private generated output and must not be committed.
+`continue_outputs/` is different. It is a private developer proof bundle created only for explicit Continue actions. The default audit is lean and includes the decision trace, final decision/handoff, quality and freshness gates, candidate/feedback/branch state, current-surface and weak-surface diagnostics, model/cache/copy validation, selected evidence closure, manifest, integrity metadata, and `explain.md`. It does not copy the whole SQLite database, every table, or every frame by default.
+
+Full SQLite snapshots, streaming raw-table NDJSON, schema dumps, and all-frame capture archives are opt-in through `SMALLTALK_CONTINUE_AUDIT_FULL_RAW=1` or an effective mode containing `full_raw`. Audit output may still contain sensitive local evidence and paths; it is generated private output and must never be committed or uploaded accidentally.
 
 ## Cleanup And Retention
 
@@ -1636,11 +1869,27 @@ It returns:
 - candidate frame count
 - protected frame count
 - deleted frame count
+- deleted event-row count
 - deleted snapshot file count
 - reclaimed bytes
 - summary
 
-Cleanup should protect decision-linked frames and recent Continue evidence. Low-value duplicates, stale frames, Smalltalk self-captures, old snapshots, and oversized local evidence are cleanup candidates.
+Cleanup is explicit; the capture worker does not silently delete history merely because a session reaches one hour. Preview is the default.
+
+Frame cleanup candidates are:
+
+- frames older than seven days, in bounded batches;
+- old Smalltalk self-captures;
+- low-value `typing_pause`, `scroll_stop`, `click`, `accessibility_change`, `event_burst`, and `idle` frames beyond the newest 400.
+
+Event cleanup candidates are:
+
+- Smalltalk self-events;
+- low-value scroll/AX/accessibility rows beyond the newest 5,000.
+
+Cleanup protects frame ids referenced by candidates, task-action first/last/strongest evidence, semantic moments, episodes, artifact observations, explicit/manual/hotkey evidence, and decision/high-value privacy markers. It deletes dependent relational rows and JPEG assets, removes orphan snapshots, prunes old unreferenced decisions/candidates, checkpoints the WAL, and optionally vacuums. Recent decisions keep at least the newest 100 decision rows even beyond the 24-hour age boundary; selected candidates and feedback links are preserved consistently.
+
+The 512 MB snapshot constant is a pressure gate for new non-important heavy captures, not automatic deletion. If the directory is over budget, important/manual/error evidence can still be accepted and the user can preview/apply cleanup later.
 
 `dev_reset_local_memory` is stronger. It stops runtime, clears live frames/events/derived Continue rows/snapshots, and can clear debug exports.
 
@@ -1690,6 +1939,10 @@ The frontend auto-runs Continue once when:
 
 The UI marks a decision stale when the live frame count exceeds the frame count used when the decision was made. This is only a freshness hint; event-only evidence can also affect backend cache decisions.
 
+The production freshness path is broader than frame count. React maintains a `ContinueEvidenceSnapshot`/`ContinueFreshness` signature covering frames, events/signals, Continue-memory counts, and island/backend update information. Refreshes are debounced, guarded against overlap, and avoid recomputing the same stale signature. The backend remains authoritative through its evidence watermark, boundary revisions, surface snapshots, feedback watermark, and open watermark.
+
+Startup/background Continue calls use `writeAudit: false`. Main Continue, Refresh Continue, diagnostic Rebuild Continue, and explicit island Continue can request `writeAudit: true`. After the main card receives a decision, it synchronizes the island using the existing decision id with `allow_refresh: false` rather than launching duplicate work.
+
 ## Diagnostics UI
 
 Developer diagnostics include:
@@ -1714,23 +1967,22 @@ Diagnostics are intentionally detailed but should not be mistaken for the first-
 
 ## Session Island
 
-The macOS floating island still contains older session vocabulary:
+The macOS floating island is now a typed Continue-first consumer. Rust exposes `IslandContinueState` (`smalltalk.island_continue_state.v1`) with:
 
-- recording compact/expanded states
-- processing state
-- stopped toast
-- trail reconstructing
-- resume ready
-- reconstruct trail action
-- resume me action
+- display state;
+- decision id;
+- current focus/activity;
+- selected workstream title;
+- return and resume-work target summaries;
+- next action and confidence label;
+- missing evidence, warnings, and suppression reasons;
+- typed `available_actions`.
 
-The island currently still has paths that call `run_cloud_resume` or `open_resume_point` without passing a Continue decision id. That means it is not yet fully aligned with the new Continue architecture.
+Swift decodes this nested DTO and dispatches typed actions such as `refresh_continue`, `open_continue_target`, `mark_wrong_target`, `mark_not_useful`, `inspect_evidence`, `open_smalltalk`, `start_local_memory`, and `capture_evidence_now`. Legacy cloud/session/trail/native-resume routes remain diagnostic-only and cannot supply the island's primary target/open behavior.
 
-Correct future direction:
+The island obtains state from the same `get_continue_decision` backend contract as the main card or from a fresh remembered decision. Its primary open requires `source = island_primary`, `strict_continue_target = true`, and a non-empty `continue_decision_id`; legacy path/session/frame fallbacks are rejected before resolution. Feedback uses existing feedback kinds with `source = island_primary`. Frame/event, feedback, and open watermarks invalidate remembered island state.
 
-- Island should display a compact Continue cue, not recorder status.
-- Island should route primary action through `get_continue_decision` or an existing `continue_decision_id`.
-- Trail reconstruction/cloud resume should remain diagnostic or secondary.
+P4 no-bypass coverage writes sanitized `decision/island_continue_audit.json` metadata and tracks island bypass, legacy primary route, open-without-decision-id, suppressed-target open, main-card disagreement, and valid-open counters. The repeatable manual checklist is `docs/p4-island-no-bypass-manual-qa.md`.
 
 ## Current Implementation Truth
 
@@ -1738,24 +1990,28 @@ What is real now:
 
 - Native desktop app is the active lane.
 - Continue schema exists in SQLite.
-- Artifacts/actions/episodes/workstreams/candidates/decisions are persisted.
+- Capture events, sparse heavy frames, attributed text, weak-surface snapshots, artifacts/actions/semantic moments/episodes/workstreams/open loops/branches/candidates/decisions/opens/feedback are persisted locally.
 - Continue can run without stopping local memory.
 - Normal Continue mode can reuse cached decisions.
 - Default micro-inference can fall back locally and reuse that cached fallback when evidence has not changed.
 - Continue handoff copy is persisted and filtered so internal candidate/workstream/artifact/frame ids do not become user-facing product text.
-- Every `get_continue_decision` call best-effort writes a full audit folder under `continue_outputs/`, including cache hits and island-triggered Continue calls. Folder names begin with the resolved capture session label so audits can be matched back to a session without opening the manifest.
+- Only explicit audit-enabled Continue actions schedule a `continue_outputs/` bundle. Startup/background calls do not write one. Folder names begin with the resolved capture session label.
+- Audit generation runs asynchronously and is lean/proof-first by default; full raw archives are opt-in.
 - Continue micro-inference audit events record the candidate pack, OpenAI request body without secrets, raw response, parsed output, validation result, failures, and fallback reason.
 - Diagnostic rebuild can force semantic layer rebuild.
 - The UI opens Continue targets by `continue_decision_id`.
 - Correction feedback and next-step breadcrumbs are persisted.
 - Local memory diagnostics expose storage size, row counts, budgets, skip counters, and cache counters.
 - Heavy capture budgets and duplicate/self-capture skipping exist.
-- Event-only evidence is part of the Continue recovery direction.
+- Long sessions retain lightweight event-only evidence without forcing a screenshot per event, and cleanup can prune excess low-value event rows while preserving semantic/decision evidence.
+- Event-only evidence is a first-class part of current-surface resolution, semantic moments, cache freshness, and weak-surface recovery.
 - Visible local signal counts are recent-windowed and capped.
 - Stop-time resume-query preserves rejected browser tab-strip titles as context-only evidence.
 - Stop-time resume-query bundles still exist and are generated artifacts.
 - Cloud resume is distinct from Continue.
-- The floating island is not fully migrated to Continue.
+- Support branches, stale openable targets, feedback-suppressed targets, and thin weak surfaces are hard-gated before public selection/open.
+- The floating island is aligned to the backend Continue contract and fails closed on legacy primary-open bypasses.
+- SQLite uses WAL, a 30-second busy timeout, read-only polling connections, and serialized Continue decision work to reduce long-session lock contention.
 - The diagnostics panel still exposes too much internal architecture when opened.
 
 What should not be claimed:
@@ -1766,7 +2022,9 @@ What should not be claimed:
 - Do not claim screenshots are the only memory.
 - Do not claim model output is trusted without validation.
 - Do not claim storage is lightweight unless diagnostics prove it.
-- Do not claim the island is fully Continue-first yet.
+- Do not claim a one-hour session stores a continuous replay, a fixed frame count, or automatic hour-boundary cleanup.
+- Do not claim the 512 MB snapshot budget is a hard disk cap; it gates new non-important heavy captures and requires explicit cleanup to reclaim space.
+- Do not claim the island can open a legacy session/frame/path target as a primary Continue action.
 
 ## Product Copy Rules For Future LLMs
 

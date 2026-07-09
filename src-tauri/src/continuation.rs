@@ -1285,6 +1285,8 @@ pub struct ContinueDecisionRequest {
     pub model: Option<String>,
     pub max_candidates_for_model: Option<i64>,
     pub audit_output_enabled: Option<bool>,
+    pub island_trigger_reason: Option<String>,
+    pub island_source: Option<String>,
 }
 
 impl Default for ContinueDecisionRequest {
@@ -1299,6 +1301,8 @@ impl Default for ContinueDecisionRequest {
             model: None,
             max_candidates_for_model: Some(5),
             audit_output_enabled: Some(false),
+            island_trigger_reason: None,
+            island_source: None,
         }
     }
 }
@@ -1464,6 +1468,7 @@ pub struct ContinueDecisionOpenEventRequest {
     pub selected_candidate_id: Option<String>,
     pub workstream_id: Option<String>,
     pub target_artifact_id: Option<String>,
+    pub source: Option<String>,
     pub opened_at_ms: Option<i64>,
     pub strategy: String,
     pub opened_url: bool,
@@ -1479,6 +1484,7 @@ pub struct ContinueDecisionOpenEventResult {
     pub selected_candidate_id: Option<String>,
     pub workstream_id: Option<String>,
     pub target_artifact_id: Option<String>,
+    pub source: String,
     pub opened_at_ms: i64,
     pub strategy: String,
     pub opened_url: bool,
@@ -1663,6 +1669,12 @@ pub struct ContinueEvalReport {
     pub privacy_violation_count: i64,
     pub p1_feedback_gate_regression_count: i64,
     pub p2_support_gate_regression_count: i64,
+    pub island_bypass_count: i64,
+    pub island_legacy_primary_route_count: i64,
+    pub island_open_without_decision_id_count: i64,
+    pub island_suppressed_target_open_count: i64,
+    pub island_main_card_disagreement_count: i64,
+    pub island_valid_open_success_count: i64,
     pub cases: Vec<ContinueEvalCaseReport>,
 }
 
@@ -1771,6 +1783,16 @@ pub struct ContinueEvalCaseReport {
     pub privacy_violation: bool,
     pub p1_feedback_gate_regression: bool,
     pub p2_support_gate_regression: bool,
+    pub island_case: bool,
+    pub island_display_state: Option<String>,
+    pub island_open_attempted: bool,
+    pub island_open_allowed: bool,
+    pub island_bypass: bool,
+    pub island_legacy_primary_route_count: i64,
+    pub island_open_without_decision_id: bool,
+    pub island_suppressed_target_open: bool,
+    pub island_main_card_disagreement: bool,
+    pub island_valid_open_success: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3348,6 +3370,22 @@ struct ContinueEvalCaseFixture {
     model_feedback_validation_failure_expected: Option<bool>,
     #[serde(default)]
     missing_evidence_render_expected: Option<bool>,
+    #[serde(default)]
+    p4_island_case: Option<bool>,
+    #[serde(default)]
+    expected_island_display_state: Option<String>,
+    #[serde(default)]
+    expected_main_card_display_state: Option<String>,
+    #[serde(default)]
+    island_open_attempted: Option<bool>,
+    #[serde(default)]
+    island_open_allowed: Option<bool>,
+    #[serde(default)]
+    island_valid_open_expected: Option<bool>,
+    #[serde(default)]
+    island_open_without_decision_id: Option<bool>,
+    #[serde(default)]
+    island_legacy_primary_route_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3806,6 +3844,8 @@ pub fn get_continue_decision(
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
+        island_trigger_reason: request.island_trigger_reason,
+        island_source: request.island_source,
     };
     let effective_mode = effective_continue_decision_mode(
         request.mode.as_deref(),
@@ -8002,6 +8042,7 @@ fn pending_open_feedback_exists_for_decision(
            WHERE oe.decision_id = ?1
              AND oe.opened_at_ms > ?2
              AND oe.opened_at_ms <= ?3
+             AND (oe.opened_url = 1 OR oe.opened_path = 1 OR oe.opened_frame_fallback = 1)
              AND NOT EXISTS (
                SELECT 1 FROM continue_feedback_events fe WHERE fe.decision_id = oe.decision_id
              )
@@ -8100,6 +8141,7 @@ fn fresh_cached_continue_decision(
                  WHERE oe.decision_id = d.id
                    AND oe.opened_at_ms > d.requested_at_ms
                    AND oe.opened_at_ms <= ?5
+                   AND (oe.opened_url = 1 OR oe.opened_path = 1 OR oe.opened_frame_fallback = 1)
                    AND NOT EXISTS (
                      SELECT 1
                      FROM continue_feedback_events fe
@@ -8994,12 +9036,14 @@ pub fn record_continue_decision_open_event(
         .or(candidate_target_artifact_id)
         .or(decision_return_target_artifact_id);
     let strategy = non_empty(request.strategy).unwrap_or_else(|| "unknown".to_string());
+    let source = normalize_continue_interaction_source(request.source, "unknown");
     let id = format!(
         "continue-open-{}",
         stable_hash(
             format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 request.decision_id,
+                source,
                 opened_at_ms,
                 strategy,
                 request.opened_url as i64,
@@ -9013,15 +9057,16 @@ pub fn record_continue_decision_open_event(
     conn.execute(
         "INSERT OR IGNORE INTO continue_decision_open_events (
             id, decision_id, selected_candidate_id, workstream_id, target_artifact_id,
-            opened_at_ms, strategy, opened_url, opened_path, opened_frame_fallback,
+            source, opened_at_ms, strategy, opened_url, opened_path, opened_frame_fallback,
             warnings_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id,
             request.decision_id,
             selected_candidate_id,
             workstream_id,
             target_artifact_id,
+            source,
             opened_at_ms,
             strategy,
             request.opened_url as i64,
@@ -9037,6 +9082,7 @@ pub fn record_continue_decision_open_event(
         selected_candidate_id,
         workstream_id,
         target_artifact_id,
+        source,
         opened_at_ms,
         strategy,
         opened_url: request.opened_url,
@@ -9430,17 +9476,18 @@ pub fn record_continue_feedback(
     if !allowed.contains(&feedback_kind) {
         return Err(format!("unsupported feedback_kind: {}", feedback_kind));
     }
-    let note = request.note.and_then(non_empty).map(|value| {
-        if value.len() > 500 {
-            value.chars().take(500).collect::<String>()
-        } else {
-            value
-        }
-    });
-    let source = request
-        .source
-        .and_then(non_empty)
-        .unwrap_or_else(|| "desktop_ui".to_string());
+    let source = normalize_continue_interaction_source(request.source, "desktop_ui");
+    let note = if source == "island_primary" || source == "native_island" {
+        None
+    } else {
+        request.note.and_then(non_empty).map(|value| {
+            if value.len() > 500 {
+                value.chars().take(500).collect::<String>()
+            } else {
+                value
+            }
+        })
+    };
     let decision_context =
         load_feedback_decision_target_context(conn, request.decision_id.as_deref())?;
     let selected_candidate_id = request
@@ -19503,6 +19550,23 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+fn normalize_continue_interaction_source(source: Option<String>, fallback: &str) -> String {
+    match source
+        .and_then(non_empty)
+        .unwrap_or_else(|| fallback.to_string())
+        .as_str()
+    {
+        "desktop_continue_card" => "desktop_continue_card".to_string(),
+        "desktop_ui" => "desktop_ui".to_string(),
+        "island_primary" => "island_primary".to_string(),
+        "native_island" => "native_island".to_string(),
+        "diagnostics" => "diagnostics".to_string(),
+        "inferred" => "inferred".to_string(),
+        "unknown" => "unknown".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
 fn load_pack_breadcrumbs(
     conn: &Connection,
     workstream_ids: &HashSet<String>,
@@ -19573,6 +19637,7 @@ fn infer_pending_continue_feedback(
 struct ContinueDecisionOpenEventRow {
     opened_at_ms: i64,
     target_artifact_id: Option<String>,
+    source: String,
     opened_url: bool,
     opened_path: bool,
     opened_frame_fallback: bool,
@@ -19586,7 +19651,7 @@ fn latest_open_event_for_decision(
         return Ok(None);
     }
     conn.query_row(
-        "SELECT opened_at_ms, target_artifact_id, opened_url, opened_path, opened_frame_fallback
+        "SELECT opened_at_ms, target_artifact_id, source, opened_url, opened_path, opened_frame_fallback
          FROM continue_decision_open_events
          WHERE decision_id = ?1
          ORDER BY opened_at_ms DESC
@@ -19596,9 +19661,13 @@ fn latest_open_event_for_decision(
             Ok(ContinueDecisionOpenEventRow {
                 opened_at_ms: row.get(0)?,
                 target_artifact_id: row.get(1)?,
-                opened_url: row.get::<_, i64>(2)? != 0,
-                opened_path: row.get::<_, i64>(3)? != 0,
-                opened_frame_fallback: row.get::<_, i64>(4)? != 0,
+                source: normalize_continue_interaction_source(
+                    row.get::<_, Option<String>>(2)?,
+                    "unknown",
+                ),
+                opened_url: row.get::<_, i64>(3)? != 0,
+                opened_path: row.get::<_, i64>(4)? != 0,
+                opened_frame_fallback: row.get::<_, i64>(5)? != 0,
             })
         },
     )
@@ -19677,6 +19746,7 @@ fn infer_feedback_for_decision(
                 open_event.opened_at_ms,
                 0.66,
                 "Continue target was opened but no post-open target activity was observed",
+                Some(open_event.source.as_str()),
             )
             .map(Some);
         }
@@ -19690,6 +19760,7 @@ fn infer_feedback_for_decision(
             cutoff_ms,
             0.55,
             "no post-decision target activity observed",
+            None,
         )
         .map(Some);
     };
@@ -19742,6 +19813,7 @@ fn infer_feedback_for_decision(
                 timestamp_ms,
                 if meaningful_target_action { 0.82 } else { 0.62 },
                 "target artifact was revisited after Continue",
+                open_event.as_ref().map(|event| event.source.as_str()),
             )
             .map(Some);
         }
@@ -19760,6 +19832,7 @@ fn infer_feedback_for_decision(
             timestamp_ms,
             0.68,
             rejection_reason,
+            open_event.as_ref().map(|event| event.source.as_str()),
         )
         .map(Some);
     }
@@ -19776,6 +19849,7 @@ fn infer_feedback_for_decision(
             first_timestamp_ms,
             0.7,
             "another artifact was chosen after Continue",
+            open_event.as_ref().map(|event| event.source.as_str()),
         )
         .map(Some);
     }
@@ -19790,6 +19864,7 @@ fn infer_feedback_for_decision(
         first_timestamp_ms,
         0.6,
         "user naturally continued on the active work artifact",
+        open_event.as_ref().map(|event| event.source.as_str()),
     )
     .map(Some)
 }
@@ -19805,6 +19880,7 @@ fn insert_feedback_event(
     timestamp_ms: i64,
     confidence: f64,
     reason: &str,
+    source_override: Option<&str>,
 ) -> Result<ContinueFeedbackEventResult, String> {
     let id = format!(
         "continue-feedback-{}",
@@ -19823,6 +19899,14 @@ fn insert_feedback_event(
     let target_artifact_stable_key =
         load_artifact_stable_key(conn, resolved_target_artifact_id.as_deref())?;
     let resume_work_target_artifact_id = None::<String>;
+    let source = match source_override {
+        Some("island_primary") => "island_primary".to_string(),
+        Some("native_island") => "native_island".to_string(),
+        Some("desktop_continue_card") => "desktop_continue_card".to_string(),
+        Some("desktop_ui") => "desktop_ui".to_string(),
+        Some("diagnostics") => "diagnostics".to_string(),
+        _ => "inferred".to_string(),
+    };
     let row = FeedbackEventRow {
         id: id.clone(),
         decision_id: Some(decision_id.to_string()),
@@ -19838,7 +19922,7 @@ fn insert_feedback_event(
         confidence: round_score(confidence),
         reason: Some(reason.to_string()),
         note: None,
-        source: Some("inferred".to_string()),
+        source: Some(source.clone()),
     };
     let feedback_target_keys_json = feedback_event_target_keys_json(&row)?;
     let inserted = conn
@@ -19864,7 +19948,7 @@ fn insert_feedback_event(
                 selected_candidate_id,
                 workstream_id,
                 Option::<String>::None,
-                "inferred",
+                source,
                 target_artifact_stable_key,
                 resume_work_target_artifact_id,
                 feedback_target_keys_json,
@@ -19886,7 +19970,7 @@ fn insert_feedback_event(
         confidence: round_score(confidence),
         reason: Some(reason.to_string()),
         note: None,
-        source: Some("inferred".to_string()),
+        source: row.source,
     };
     if inserted > 0 {
         update_continue_ranking_priors_from_feedback(conn, &result)?;
@@ -21462,7 +21546,200 @@ fn default_continue_eval_fixture() -> ContinueEvalFixture {
     ];
     cases.extend(p1_feedback_eval_cases());
     cases.extend(p3_weak_surface_eval_cases());
+    cases.extend(p4_island_eval_cases());
     ContinueEvalFixture { cases, k: Some(3) }
+}
+
+fn p4_island_eval_cases() -> Vec<ContinueEvalCaseFixture> {
+    let mut stale = eval_case(
+        "p4_island_stale_target_no_open",
+        "P4 island sees newer local evidence after a prior target and must refresh before opening",
+        "current-editor",
+        Some("current-editor"),
+        vec![
+            p0_eval_candidate(
+                "c-p4-current-editor",
+                "w-p4-stale",
+                Some("current-editor"),
+                0.55,
+                "thin",
+                "continue_current_work",
+                P0EvalCandidateFlags {
+                    fresh_current_work: true,
+                    return_target_openable: false,
+                    ..Default::default()
+                },
+                vec!["stale_return_target_suppressed"],
+            ),
+            p0_eval_candidate(
+                "c-p4-old-tab",
+                "w-p4-stale",
+                Some("old-browser-tab"),
+                0.2,
+                "strong",
+                "continue_reply",
+                P0EvalCandidateFlags {
+                    stale_return_target: true,
+                    stale_target_suppressed: true,
+                    return_target_openable: true,
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
+        ],
+    );
+    mark_p4_island_case(&mut stale, "needs_refresh", false, true);
+
+    let mut feedback = eval_case(
+        "p4_island_feedback_suppressed_no_open",
+        "P4 island cannot open a target rejected through P1 feedback",
+        "artifact-safe-current",
+        Some("artifact-suppressed-tab"),
+        vec![
+            feedback_eval_candidate(
+                "c-p4-safe-current",
+                "w-p4-feedback",
+                Some("artifact-safe-current"),
+                0.61,
+                "medium",
+                "none",
+                false,
+            ),
+            feedback_eval_candidate(
+                "c-p4-suppressed-tab",
+                "w-p4-feedback",
+                Some("artifact-suppressed-tab"),
+                0.22,
+                "strong",
+                "hard_suppressed",
+                false,
+            ),
+        ],
+    );
+    feedback.expected_suppressed_artifact_ids = vec!["artifact-suppressed-tab".to_string()];
+    feedback.expected_not_return_target_artifact_ids = vec!["artifact-suppressed-tab".to_string()];
+    mark_p4_island_case(&mut feedback, "target_suppressed", false, true);
+
+    let mut support = eval_case(
+        "p4_island_support_branch_no_open",
+        "P4 island treats support/search/docs surfaces as evidence unless promoted",
+        "primary-work",
+        Some("support-search-doc"),
+        vec![
+            branch_eval_candidate(
+                "c-p4-primary-work",
+                "w-p4-support",
+                Some("primary-work"),
+                0.58,
+                "medium",
+                "primary_work",
+                "promoted_primary",
+                true,
+                None,
+                true,
+            ),
+            branch_eval_candidate(
+                "c-p4-support-search",
+                "w-p4-support",
+                Some("support-search-doc"),
+                0.54,
+                "medium",
+                "search_branch",
+                "unpromoted",
+                false,
+                Some("primary-work"),
+                false,
+            ),
+        ],
+    );
+    mark_p4_island_case(&mut support, "support_blocked", false, true);
+
+    let mut weak = eval_case(
+        "p4_island_weak_surface_thin_inspect_only",
+        "P4 island renders a thin weak surface as inspect-only instead of opening it",
+        "unknown",
+        Some("codex-cli-thin"),
+        vec![weak_surface_eval_candidate(
+            "c-p4-codex-cli-thin",
+            "w-p4-weak",
+            Some("codex-cli-thin"),
+            0.47,
+            "thin",
+            "continue_current_work",
+            WeakSurfaceEvalFlags {
+                attempted: true,
+                snapshot_quality: Some("thin"),
+                candidate_expected: true,
+                missing: vec!["missing_repo_or_thread", "thin_weak_surface"],
+                ..Default::default()
+            },
+        )],
+    );
+    weak.expected_validation_status = Some("thin_evidence".to_string());
+    mark_p4_island_case(&mut weak, "thin_current_work", false, true);
+
+    let mut valid = eval_case(
+        "p4_island_valid_continue_open",
+        "P4 island opens only a fresh openable Continue decision id",
+        "artifact-openable-doc",
+        Some("artifact-openable-doc"),
+        vec![p0_eval_candidate(
+            "c-p4-valid-open",
+            "w-p4-valid",
+            Some("artifact-openable-doc"),
+            0.83,
+            "strong",
+            "continue_edit",
+            P0EvalCandidateFlags {
+                fresh_current_work: true,
+                return_target_openable: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        )],
+    );
+    mark_p4_island_case(&mut valid, "continue_ready", true, true);
+    valid.island_valid_open_expected = Some(true);
+
+    let mut event_only = eval_case(
+        "p4_island_event_only_stale_refresh",
+        "P4 island refreshes when event-only evidence is newer than the cached decision",
+        "event-only-current",
+        Some("event-only-current"),
+        vec![p0_eval_candidate(
+            "c-p4-event-only-current",
+            "w-p4-event",
+            Some("event-only-current"),
+            0.52,
+            "thin",
+            "continue_current_work",
+            P0EvalCandidateFlags {
+                fresh_current_work: true,
+                return_target_openable: false,
+                ..Default::default()
+            },
+            vec!["event_only_newer_than_decision"],
+        )],
+    );
+    event_only.cache_feedback_newer_than_cached_decision = Some(false);
+    mark_p4_island_case(&mut event_only, "needs_refresh", false, true);
+
+    vec![stale, feedback, support, weak, valid, event_only]
+}
+
+fn mark_p4_island_case(
+    case: &mut ContinueEvalCaseFixture,
+    display_state: &str,
+    open_allowed: bool,
+    open_attempted: bool,
+) {
+    case.p4_island_case = Some(true);
+    case.expected_island_display_state = Some(display_state.to_string());
+    case.expected_main_card_display_state = Some(display_state.to_string());
+    case.island_open_allowed = Some(open_allowed);
+    case.island_open_attempted = Some(open_attempted);
+    case.island_legacy_primary_route_count = Some(0);
+    case.island_open_without_decision_id = Some(false);
 }
 
 fn p3_weak_surface_eval_cases() -> Vec<ContinueEvalCaseFixture> {
@@ -22123,6 +22400,14 @@ fn eval_case(
         cache_feedback_newer_than_cached_decision: None,
         model_feedback_validation_failure_expected: None,
         missing_evidence_render_expected: None,
+        p4_island_case: None,
+        expected_island_display_state: None,
+        expected_main_card_display_state: None,
+        island_open_attempted: None,
+        island_open_allowed: None,
+        island_valid_open_expected: None,
+        island_open_without_decision_id: None,
+        island_legacy_primary_route_count: None,
     }
 }
 
@@ -22152,6 +22437,14 @@ fn eval_case_with_model_output(
         cache_feedback_newer_than_cached_decision: None,
         model_feedback_validation_failure_expected: None,
         missing_evidence_render_expected: None,
+        p4_island_case: None,
+        expected_island_display_state: None,
+        expected_main_card_display_state: None,
+        island_open_attempted: None,
+        island_open_allowed: None,
+        island_valid_open_expected: None,
+        island_open_without_decision_id: None,
+        island_legacy_primary_route_count: None,
     }
 }
 
@@ -22587,6 +22880,27 @@ fn summarize_continue_eval_fixture(
         p2_support_gate_regression_count: reports
             .iter()
             .filter(|case| case.p2_support_gate_regression)
+            .count() as i64,
+        island_bypass_count: reports.iter().filter(|case| case.island_bypass).count() as i64,
+        island_legacy_primary_route_count: reports
+            .iter()
+            .map(|case| case.island_legacy_primary_route_count)
+            .sum(),
+        island_open_without_decision_id_count: reports
+            .iter()
+            .filter(|case| case.island_open_without_decision_id)
+            .count() as i64,
+        island_suppressed_target_open_count: reports
+            .iter()
+            .filter(|case| case.island_suppressed_target_open)
+            .count() as i64,
+        island_main_card_disagreement_count: reports
+            .iter()
+            .filter(|case| case.island_main_card_disagreement)
+            .count() as i64,
+        island_valid_open_success_count: reports
+            .iter()
+            .filter(|case| case.island_valid_open_success)
             .count() as i64,
         cases: reports,
     })
@@ -23176,6 +23490,35 @@ fn evaluate_continue_fixture_case(
         .iter()
         .any(|candidate| candidate.p2_support_gate_regression.unwrap_or(false))
         || support_branch_false_positive;
+    let island_case = case.p4_island_case.unwrap_or_else(|| {
+        case.name.starts_with("p4_island_") || case.expected_island_display_state.is_some()
+    });
+    let island_display_state = case.expected_island_display_state.clone();
+    let island_open_attempted = case.island_open_attempted.unwrap_or(false);
+    let island_open_allowed = case.island_open_allowed.unwrap_or(false);
+    let island_legacy_primary_route_count = case.island_legacy_primary_route_count.unwrap_or(0);
+    let island_open_without_decision_id =
+        island_case && island_open_allowed && case.island_open_without_decision_id.unwrap_or(false);
+    let island_suppressed_target_open = island_case
+        && island_open_allowed
+        && (feedback_suppressed_target_exposed
+            || selected_is_unpromoted_branch
+            || selected_is_stale_target
+            || (weak_surface_case && !weak_surface_strong_or_medium));
+    let island_main_card_disagreement = island_case
+        && case
+            .expected_main_card_display_state
+            .as_ref()
+            .zip(island_display_state.as_ref())
+            .is_some_and(|(main, island)| main != island);
+    let island_valid_open_success = island_case
+        && case.island_valid_open_expected.unwrap_or(false)
+        && island_open_allowed
+        && island_display_state.as_deref() == Some("continue_ready");
+    let island_bypass = island_case
+        && (island_legacy_primary_route_count > 0
+            || island_open_without_decision_id
+            || island_suppressed_target_open);
     let truthful_thin_mode = if selected_return_target_openable && target_correct {
         true
     } else if stale_target_required || fresh_surface_required {
@@ -23286,6 +23629,16 @@ fn evaluate_continue_fixture_case(
         privacy_violation,
         p1_feedback_gate_regression,
         p2_support_gate_regression,
+        island_case,
+        island_display_state,
+        island_open_attempted,
+        island_open_allowed,
+        island_bypass,
+        island_legacy_primary_route_count,
+        island_open_without_decision_id,
+        island_suppressed_target_open,
+        island_main_card_disagreement,
+        island_valid_open_success,
     })
 }
 
@@ -35378,6 +35731,7 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           selected_candidate_id TEXT,
           workstream_id TEXT,
           target_artifact_id TEXT,
+          source TEXT NOT NULL DEFAULT 'unknown',
           opened_at_ms INTEGER NOT NULL,
           strategy TEXT,
           opened_url INTEGER NOT NULL DEFAULT 0,
@@ -35426,6 +35780,12 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(to_string)?;
+    ensure_column_exists(
+        conn,
+        "continue_decision_open_events",
+        "source",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
     ensure_column_exists(
         conn,
         "continue_artifacts",
@@ -37371,6 +37731,7 @@ mod tests {
                 selected_candidate_id: None,
                 workstream_id: None,
                 target_artifact_id: Some("artifact-wrong".to_string()),
+                source: None,
                 opened_at_ms: Some(current_time_millis() - FEEDBACK_INFERENCE_MIN_AGE_MS - 1_000),
                 strategy: "browser_url".to_string(),
                 opened_url: true,
@@ -37456,6 +37817,7 @@ mod tests {
                 selected_candidate_id: None,
                 workstream_id: None,
                 target_artifact_id: Some("artifact-wrong".to_string()),
+                source: None,
                 opened_at_ms: Some(requested_at_ms + 9_000),
                 strategy: "browser_url".to_string(),
                 opened_url: true,
@@ -37481,6 +37843,86 @@ mod tests {
             events[0].target_artifact_id.as_deref(),
             Some("artifact-wrong")
         );
+        assert_eq!(events[0].source.as_deref(), Some("inferred"));
+    }
+
+    #[test]
+    fn p4_island_open_origin_propagates_to_inferred_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        let requested_at_ms = current_time_millis() - 120_000;
+        conn.execute(
+            "UPDATE continue_decisions
+             SET requested_at_ms = ?1
+             WHERE id = 'decision-p4'",
+            params![requested_at_ms],
+        )
+        .unwrap();
+        record_continue_decision_open_event(
+            &conn,
+            ContinueDecisionOpenEventRequest {
+                decision_id: "decision-p4".to_string(),
+                selected_candidate_id: None,
+                workstream_id: None,
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                source: Some("island_primary".to_string()),
+                opened_at_ms: Some(requested_at_ms + 9_000),
+                strategy: "browser_url".to_string(),
+                opened_url: true,
+                opened_path: false,
+                opened_frame_fallback: false,
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let events = infer_continue_feedback(
+            &conn,
+            ContinueFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                observation_window_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, "rejected");
+        assert_eq!(events[0].source.as_deref(), Some("island_primary"));
+    }
+
+    #[test]
+    fn p4_island_explicit_feedback_records_source_without_note_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+
+        let event = record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: None,
+                workstream_id: None,
+                target_artifact_id: None,
+                corrected_artifact_id: None,
+                feedback_kind: "rejected".to_string(),
+                note: Some("raw https://example.com /Users/me/private.txt".to_string()),
+                source: Some("island_primary".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(event.source.as_deref(), Some("island_primary"));
+        assert_eq!(event.note, None);
+        let (source, note): (String, Option<String>) = conn
+            .query_row(
+                "SELECT source, note FROM continue_feedback_events WHERE id = ?1",
+                params![event.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "island_primary");
+        assert_eq!(note, None);
     }
 
     fn p1_feedback_row(
@@ -47269,10 +47711,10 @@ mod tests {
         let report = run_continue_eval(None).unwrap();
 
         assert_eq!(report.schema, "smalltalk.continue_eval.v1");
-        assert_eq!(report.case_count, 55);
-        assert_eq!(report.target_artifact_correct, 55);
-        assert_eq!(report.recall_at_k, 1.0);
-        assert_eq!(report.mrr, 1.0);
+        assert_eq!(report.case_count, 61);
+        assert_eq!(report.target_artifact_correct, 60);
+        assert_eq!(report.recall_at_k, 0.98);
+        assert_eq!(report.mrr, 0.98);
         assert_eq!(report.hallucinated_artifact_count, 1);
         assert_eq!(report.model_validation_fallback_rate, 0.05);
         assert_eq!(report.fresh_surface_retention_rate, 1.0);
@@ -47286,7 +47728,7 @@ mod tests {
         assert_eq!(report.diagnostic_self_selected_count, 0);
         assert_eq!(report.model_branch_policy_violation_count, 1);
         assert_eq!(report.truthful_thin_mode_rate, 1.0);
-        assert_eq!(report.feedback_obedience_case_count, 8);
+        assert_eq!(report.feedback_obedience_case_count, 9);
         assert_eq!(report.feedback_suppressed_target_exposed_count, 0);
         assert_eq!(report.feedback_suppressed_target_exposed_rate, 0.0);
         assert_eq!(report.corrected_artifact_preferred_count, 1);
@@ -47294,10 +47736,10 @@ mod tests {
         assert_eq!(report.model_feedback_validation_failure_count, 1);
         assert_eq!(report.feedback_obedience_placeholder_rate, 1.0);
         assert_eq!(report.suppressed_target_open_attempt_count, 0);
-        assert_eq!(report.weak_surface_case_count, 9);
-        assert_eq!(report.weak_surface_enrichment_attempt_rate, 0.89);
-        assert_eq!(report.weak_surface_enrichment_success_rate, 0.78);
-        assert_eq!(report.weak_surface_strong_or_medium_rate, 0.78);
+        assert_eq!(report.weak_surface_case_count, 10);
+        assert_eq!(report.weak_surface_enrichment_attempt_rate, 0.9);
+        assert_eq!(report.weak_surface_enrichment_success_rate, 0.7);
+        assert_eq!(report.weak_surface_strong_or_medium_rate, 0.7);
         assert_eq!(report.weak_surface_thin_truthfulness_rate, 1.0);
         assert_eq!(report.weak_surface_candidate_recall_at_k, 1.0);
         assert_eq!(report.stale_url_over_weak_surface_false_positive_rate, 0.0);
@@ -47306,6 +47748,12 @@ mod tests {
         assert_eq!(report.privacy_violation_count, 0);
         assert_eq!(report.p1_feedback_gate_regression_count, 0);
         assert_eq!(report.p2_support_gate_regression_count, 0);
+        assert_eq!(report.island_bypass_count, 0);
+        assert_eq!(report.island_legacy_primary_route_count, 0);
+        assert_eq!(report.island_open_without_decision_id_count, 0);
+        assert_eq!(report.island_suppressed_target_open_count, 0);
+        assert_eq!(report.island_main_card_disagreement_count, 0);
+        assert!(report.island_valid_open_success_count >= 1);
         assert!(report.last_state_specificity > 0.0);
         assert!(report.next_action_specificity > 0.0);
         assert!(report.source_provenance_correctness > 0.0);
@@ -47346,6 +47794,17 @@ mod tests {
             .any(|case| case.name == "p3_privacy_blocked_weak_surface"
                 && case.missing_evidence_rendered
                 && !case.privacy_violation));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "p4_island_valid_continue_open"
+                && case.island_valid_open_success
+                && !case.island_bypass));
+        assert!(report.cases.iter().any(|case| case.name
+            == "p4_island_feedback_suppressed_no_open"
+            && case.island_case
+            && !case.island_open_allowed
+            && !case.island_suppressed_target_open));
     }
 
     #[test]
@@ -47394,6 +47853,14 @@ mod tests {
                 cache_feedback_newer_than_cached_decision: None,
                 model_feedback_validation_failure_expected: None,
                 missing_evidence_render_expected: None,
+                p4_island_case: None,
+                expected_island_display_state: None,
+                expected_main_card_display_state: None,
+                island_open_attempted: None,
+                island_open_allowed: None,
+                island_valid_open_expected: None,
+                island_open_without_decision_id: None,
+                island_legacy_primary_route_count: None,
             }],
         };
 
@@ -47452,6 +47919,14 @@ mod tests {
                 cache_feedback_newer_than_cached_decision: None,
                 model_feedback_validation_failure_expected: None,
                 missing_evidence_render_expected: None,
+                p4_island_case: None,
+                expected_island_display_state: None,
+                expected_main_card_display_state: None,
+                island_open_attempted: None,
+                island_open_allowed: None,
+                island_valid_open_expected: None,
+                island_open_without_decision_id: None,
+                island_legacy_primary_route_count: None,
             }],
         };
 

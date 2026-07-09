@@ -179,11 +179,14 @@ type LocalMemoryDiagnostics = {
     open_loops: number;
     candidates: number;
     decisions: number;
+    open_events: number;
     feedback_events: number;
     breadcrumbs: number;
   };
   low_value_duplicate_frames: number;
+  excess_low_value_events: number;
   self_capture_frames: number;
+  self_capture_events: number;
   decision_linked_frames: number;
   estimated_cleanup_potential_bytes: number;
   oldest_retained_frame_ms?: number | null;
@@ -199,6 +202,7 @@ type LocalMemoryDiagnostics = {
     max_screenshots_per_surface_without_change: number;
     max_snapshot_dir_bytes: number;
     max_retained_low_value_duplicate_frames: number;
+    max_retained_low_value_ui_events: number;
     max_diagnostic_rows_per_cleanup: number;
   };
   runtime_diagnostics: RuntimeDiagnostics;
@@ -210,6 +214,7 @@ type CleanupLocalMemoryResult = {
   candidate_frames: number;
   protected_frames: number;
   deleted_frames: number;
+  deleted_event_rows: number;
   deleted_snapshot_files: number;
   reclaimed_bytes: number;
   summary: string;
@@ -389,6 +394,7 @@ type ContinueMemoryStatus = {
     open_loop_evidence: number;
     candidates: number;
     decisions: number;
+    open_events: number;
     feedback_events: number;
     breadcrumbs: number;
   };
@@ -1307,6 +1313,15 @@ function App() {
         },
       });
       await applyContinueDecision(decision);
+      await invoke("get_island_continue_state", {
+        input: {
+          reason: "main_card_decision_updated",
+          existing_decision_id: decision.decision_id,
+          allow_refresh: false,
+          force_refresh: false,
+          source: "desktop_continue_card",
+        },
+      }).catch(() => null);
       if (diagnosticsOpen) {
         await refreshWorkstreams();
       }
@@ -1358,6 +1373,7 @@ function App() {
         input: {
           continue_decision_id: continueDecision.decision_id,
           target_artifact_id: resumeTarget?.artifact_id || null,
+          source: "desktop_continue_card",
           strict_continue_target: true,
         },
       });
@@ -1515,11 +1531,21 @@ function App() {
         note: candidate.reason || "Selected alternative continuation target.",
       });
       setSelectedWorkstreamId(candidate.workstream_id);
+      if (!diagnosticsOpen) {
+        setContinueOpenResult(null);
+        setFeedbackStatus("Alternative noted. Refreshing Continue with that correction.");
+        await runContinueDecision({ forceRebuild: true, trigger: "manual" });
+        return;
+      }
       const frameId = Number(candidate.evidence_frame_id);
       if (Number.isFinite(frameId)) {
         try {
           const result = await invoke<OpenResumePointResult>("open_resume_point", {
-            input: { target_frame_id: frameId },
+            input: {
+              target_frame_id: frameId,
+              source: "diagnostics",
+              diagnostic_allowed: true,
+            },
           });
           setContinueOpenResult(result);
         } catch (err) {
@@ -1527,7 +1553,14 @@ function App() {
         }
       }
     },
-    [continueDecision, recordContinueFeedback, selectedWorkstreamId, workstreamDetail],
+    [
+      continueDecision,
+      diagnosticsOpen,
+      recordContinueFeedback,
+      runContinueDecision,
+      selectedWorkstreamId,
+      workstreamDetail,
+    ],
   );
 
   const runContinueEval = useCallback(async () => {
@@ -2696,7 +2729,7 @@ function App() {
                 <div>
                   <dt>Heavy capture budget</dt>
                   <dd>
-                    {memoryDiagnostics.budgets.max_screenshots_per_10_minutes} screenshots per 10 minutes; low-value interval {Math.round(memoryDiagnostics.budgets.min_low_value_capture_interval_ms / 1000)}s
+                    {memoryDiagnostics.budgets.max_screenshots_per_10_minutes} screenshots per 10 minutes; low-value interval {Math.round(memoryDiagnostics.budgets.min_low_value_capture_interval_ms / 1000)}s; {memoryDiagnostics.budgets.max_retained_low_value_ui_events} retained low-value events
                   </dd>
                 </div>
                 <div>
@@ -2715,6 +2748,12 @@ function App() {
                   <dt>Runtime diet counters</dt>
                   <dd>
                     {memoryDiagnostics.runtime_diagnostics.heavy_captures_skipped_budget} budget skips; {memoryDiagnostics.runtime_diagnostics.heavy_captures_skipped_dedupe} dedupe skips; {memoryDiagnostics.runtime_diagnostics.heavy_captures_skipped_smalltalk_self} Smalltalk self skips; {memoryDiagnostics.runtime_diagnostics.ocr_runs} OCR runs; {memoryDiagnostics.runtime_diagnostics.ax_snapshots} AX snapshots
+                  </dd>
+                </div>
+                <div>
+                  <dt>Event pressure</dt>
+                  <dd>
+                    {memoryDiagnostics.event_count} stored events; {memoryDiagnostics.excess_low_value_events} excess scroll/AX rows; {memoryDiagnostics.self_capture_events} Smalltalk self rows
                   </dd>
                 </div>
                 <div>
