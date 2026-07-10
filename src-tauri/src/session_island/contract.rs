@@ -107,6 +107,13 @@ pub struct IslandContinueState {
 
     pub current_focus: Option<IslandFocusSummary>,
     pub current_activity: Option<String>,
+    pub activity_label: Option<String>,
+    pub activity_summary: Option<String>,
+    pub activity_where: Option<String>,
+    pub activity_state: Option<String>,
+    pub activity_confidence_label: Option<String>,
+    pub target_confidence_label: Option<String>,
+    pub recent_context_summary: Option<String>,
     pub selected_workstream_title: Option<String>,
     pub return_target: Option<IslandTargetSummary>,
     pub resume_work_target: Option<IslandTargetSummary>,
@@ -163,6 +170,13 @@ impl IslandContinueState {
             decision_stale: freshness.decision_stale,
             current_focus: None,
             current_activity: None,
+            activity_label: None,
+            activity_summary: None,
+            activity_where: None,
+            activity_state: None,
+            activity_confidence_label: None,
+            target_confidence_label: None,
+            recent_context_summary: None,
             selected_workstream_title: None,
             return_target: None,
             resume_work_target: None,
@@ -195,6 +209,13 @@ impl IslandContinueState {
             decision_stale: true,
             current_focus: None,
             current_activity: None,
+            activity_label: None,
+            activity_summary: None,
+            activity_where: None,
+            activity_state: None,
+            activity_confidence_label: None,
+            target_confidence_label: None,
+            recent_context_summary: None,
             selected_workstream_title: None,
             return_target: None,
             resume_work_target: None,
@@ -243,6 +264,13 @@ impl IslandContinueState {
             decision_stale: false,
             current_focus: None,
             current_activity: None,
+            activity_label: None,
+            activity_summary: None,
+            activity_where: None,
+            activity_state: None,
+            activity_confidence_label: None,
+            target_confidence_label: None,
+            recent_context_summary: None,
             selected_workstream_title: None,
             return_target: None,
             resume_work_target: None,
@@ -295,17 +323,38 @@ pub fn island_state_from_continue_decision(
         .is_some_and(|target| target.openable);
     let has_any_target = return_target.is_some() || resume_work_target.is_some();
     let validation_rejected = validation_rejected(&decision.validation_status);
+    let no_clear_output = decision.continue_output_mode == "no_clear_continuation";
     let decision_stale = freshness.decision_stale
         || freshness
             .newest_evidence_ms
             .zip(freshness.decision_updated_at_ms)
             .is_some_and(|(newest, decision_at)| newest > decision_at);
+    let recap = &decision.activity_recap;
+    let recent_context_summary = recap
+        .recent_detours
+        .first()
+        .and_then(|detour| safe_text(Some(&detour.reason)))
+        .or_else(|| {
+            recap
+                .supporting_context
+                .first()
+                .and_then(|support| safe_text(Some(&support.summary)))
+        });
+    let recap_has_useful_copy = safe_text(recap.primary_work_summary.as_deref()).is_some()
+        || safe_text(recap.primary_work_label.as_deref()).is_some()
+        || safe_text(recap.primary_where_summary.as_deref()).is_some()
+        || safe_text(recap.last_meaningful_state.as_deref()).is_some()
+        || safe_text(recap.unfinished_state.as_deref()).is_some()
+        || recent_context_summary.is_some();
+    let missing_evidence = merge_safe_notes(&recap.missing_evidence, &decision.missing_evidence);
+    let warnings = merge_safe_notes(&recap.warnings, &decision.warnings);
 
     let can_open = !decision_stale
         && !target_suppressed
         && !support_blocked
         && !thin
         && !validation_rejected
+        && !no_clear_output
         && has_openable_target
         && !decision.decision_id.trim().is_empty();
 
@@ -315,6 +364,8 @@ pub fn island_state_from_continue_decision(
         IslandDisplayState::SupportBlocked
     } else if target_suppressed {
         IslandDisplayState::TargetSuppressed
+    } else if no_clear_output {
+        IslandDisplayState::NoClearContinuation
     } else if can_open {
         IslandDisplayState::ContinueReady
     } else if decision.current_focus.is_some() && !has_any_target {
@@ -404,6 +455,21 @@ pub fn island_state_from_continue_decision(
         decision_stale,
         current_focus,
         current_activity: safe_text(decision.current_activity.as_deref()),
+        activity_label: safe_text(recap.primary_work_label.as_deref()),
+        activity_summary: safe_text(recap.primary_work_summary.as_deref()),
+        activity_where: safe_text(recap.primary_where_summary.as_deref()),
+        activity_state: safe_text(
+            recap
+                .last_meaningful_state
+                .as_deref()
+                .or(recap.unfinished_state.as_deref())
+                .or_else(|| activity_state_label(recap.current_state)),
+        ),
+        activity_confidence_label: recap_has_useful_copy
+            .then(|| activity_confidence_label(recap.activity_confidence).to_string()),
+        target_confidence_label: recap_has_useful_copy
+            .then(|| activity_confidence_label(recap.target_confidence).to_string()),
+        recent_context_summary,
         selected_workstream_title: decision
             .selected_workstream
             .as_ref()
@@ -411,28 +477,46 @@ pub fn island_state_from_continue_decision(
         return_target,
         resume_work_target,
         next_action: safe_text(
-            decision
+            recap.next_action_summary.as_deref().or(decision
                 .next_action
                 .as_deref()
-                .or(Some(decision.handoff.next_action.as_str())),
+                .or(Some(decision.handoff.next_action.as_str()))),
         ),
         confidence_label: safe_text(Some(&decision.confidence_label)),
         validation_status: safe_text(Some(&decision.validation_status)),
         provenance_label: safe_text(Some(&decision.source)),
-        missing_evidence: decision
-            .missing_evidence
-            .iter()
-            .filter_map(|value| safe_code_or_note(value))
-            .collect(),
-        warnings: decision
-            .warnings
-            .iter()
-            .filter_map(|value| safe_code_or_note(value))
-            .collect(),
+        missing_evidence,
+        warnings,
         suppression_reasons,
         available_actions,
         inspect_anchor_count,
         audit_path: None,
+    }
+}
+
+fn activity_state_label(
+    state: crate::continuation::activity_recap::ActivityCurrentState,
+) -> Option<&'static str> {
+    use crate::continuation::activity_recap::ActivityCurrentState;
+    match state {
+        ActivityCurrentState::ActivelyWorking => Some("Actively working"),
+        ActivityCurrentState::RecentlyDetoured => Some("Recently detoured"),
+        ActivityCurrentState::PausedAfterProgress => Some("Paused after progress"),
+        ActivityCurrentState::Blocked => Some("Blocked"),
+        ActivityCurrentState::CompleteOrIdle => Some("Complete or idle"),
+        ActivityCurrentState::Unclear => None,
+    }
+}
+
+fn activity_confidence_label(
+    confidence: crate::continuation::activity_recap::ActivityConfidence,
+) -> &'static str {
+    use crate::continuation::activity_recap::ActivityConfidence;
+    match confidence {
+        ActivityConfidence::High => "high",
+        ActivityConfidence::Medium => "medium",
+        ActivityConfidence::Low => "low",
+        ActivityConfidence::None => "none",
     }
 }
 
@@ -554,10 +638,22 @@ fn safe_text(value: Option<&str>) -> Option<String> {
         .join(" ")
         .trim()
         .to_string();
-    if text.is_empty() || looks_like_raw_locator(&text) {
+    if text.is_empty() || looks_like_raw_locator(&text) || looks_like_internal_text(&text) {
         return None;
     }
     Some(text.chars().take(160).collect())
+}
+
+fn merge_safe_notes(primary: &[String], secondary: &[String]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for value in primary.iter().chain(secondary) {
+        if let Some(value) = safe_code_or_note(value) {
+            if !notes.contains(&value) {
+                notes.push(value);
+            }
+        }
+    }
+    notes
 }
 
 fn safe_code_or_note(value: &str) -> Option<String> {
@@ -568,6 +664,7 @@ fn safe_code_or_note(value: &str) -> Option<String> {
 fn looks_like_raw_locator(value: &str) -> bool {
     let lower = value.to_lowercase();
     lower.contains("://")
+        || lower.contains("www.")
         || lower.starts_with("file:")
         || lower.starts_with("/users/")
         || lower.starts_with("/private/")
@@ -575,6 +672,41 @@ fn looks_like_raw_locator(value: &str) -> bool {
         || lower.contains("\\")
         || lower.contains("/users/")
         || lower.contains("/private/")
+        || lower.split_whitespace().any(|token| {
+            token
+                .trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']' | ',' | '.'))
+                .starts_with('/')
+        })
+}
+
+fn looks_like_internal_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("continue-candidate-")
+        || lower.contains("continue-decision-")
+        || lower.contains("candidate-")
+        || lower.contains("workstream-")
+        || lower.contains("artifact-")
+        || lower.contains("task-action-")
+        || lower.contains("action-")
+        || lower.contains("episode-")
+        || lower.contains("open-loop-")
+        || lower.contains("frame-fallback")
+        || lower.contains("frame_fallback")
+        || lower.contains("frame_id")
+        || lower.contains("frame id")
+        || lower.contains("semantic moment")
+        || lower.contains("open loop")
+        || lower.contains("sqlite")
+        || contains_adjacent_words(&lower, "resume", "query")
+        || contains_adjacent_words(&lower, "cloud", "resume")
+        || lower.contains("scorer")
+}
+
+fn contains_adjacent_words(value: &str, first: &str, second: &str) -> bool {
+    value
+        .split_whitespace()
+        .zip(value.split_whitespace().skip(1))
+        .any(|(left, right)| left == first && right == second)
 }
 
 #[cfg(test)]
@@ -693,6 +825,10 @@ mod tests {
             weak_surface_enrichment: WeakSurfaceEnrichmentDiagnostics::default(),
             app_activity: None,
             activity_summary: None,
+            activity_recap: crate::continuation::ContinueActivityRecap::default(),
+            activity_recap_watermark_hash: String::new(),
+            activity_recap_synthesis_audit: Default::default(),
+            activity_recap_proof: Default::default(),
             quality_gate: None,
             evidence_pack_v2_used: false,
             micro_inference_requested: false,
@@ -734,6 +870,9 @@ mod tests {
             action.kind == IslandActionKind::OpenContinueTarget
                 && action.decision_id.as_deref() == Some("continue-test")
         }));
+        assert!(state.activity_summary.is_none());
+        assert!(state.activity_confidence_label.is_none());
+        assert!(state.target_confidence_label.is_none());
     }
 
     #[test]
@@ -743,6 +882,12 @@ mod tests {
         decision.confidence_label = "Thin".to_string();
         decision.validation_status = "thin_evidence".to_string();
         decision.missing_evidence = vec!["missing_fresh_heavy_frame_for_current_focus".to_string()];
+        decision.activity_recap.primary_work_summary =
+            Some("Writing the P5 activity-memory card".to_string());
+        decision.activity_recap.activity_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::Medium;
+        decision.activity_recap.target_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::Low;
 
         let state = mapped(&decision);
 
@@ -752,6 +897,12 @@ mod tests {
             .available_actions
             .iter()
             .any(|action| action.kind == IslandActionKind::InspectEvidence));
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            Some("Writing the P5 activity-memory card")
+        );
+        assert_eq!(state.activity_confidence_label.as_deref(), Some("medium"));
+        assert_eq!(state.target_confidence_label.as_deref(), Some("low"));
     }
 
     #[test]
@@ -845,6 +996,21 @@ mod tests {
     }
 
     #[test]
+    fn island_no_clear_output_never_reopens_a_leaked_target() {
+        let mut decision = base_decision();
+        decision.continue_output_mode = "no_clear_continuation".to_string();
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::NoClearContinuation);
+        assert!(!state.allows_open_continue_target());
+        assert!(state
+            .available_actions
+            .iter()
+            .all(|action| action.kind != IslandActionKind::OpenContinueTarget));
+    }
+
+    #[test]
     fn island_state_p3_weak_surface_inspect_only_has_no_open_continue_action() {
         let mut decision = base_decision();
         decision.current_focus = None;
@@ -905,5 +1071,120 @@ mod tests {
                 .map(|focus| focus.title.as_str()),
             Some("Safe focus title")
         );
+    }
+
+    #[test]
+    fn island_compact_recap_matches_main_decision_without_exposing_proof_ids() {
+        let mut decision = base_decision();
+        decision.activity_recap.primary_work_summary =
+            Some("Integrating P5 into the Continue lifecycle".to_string());
+        decision.activity_recap.primary_work_label = Some("Integrating P5".to_string());
+        decision.activity_recap.primary_where_summary = Some("Smalltalk codebase".to_string());
+        decision.activity_recap.last_meaningful_state =
+            Some("The recap pipeline was connected to the decision.".to_string());
+        decision.activity_recap.activity_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::High;
+        decision.activity_recap.target_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::Medium;
+        decision.activity_recap.next_action_summary =
+            Some("Verify the Continue card and island together.".to_string());
+        decision.activity_recap.missing_evidence =
+            vec!["The exact active file was not visible.".to_string()];
+        decision.activity_recap.recent_detours.push(
+            crate::continuation::activity_recap::ActivityDetourSummary {
+                surface_title: Some("Finder".to_string()),
+                app_name: Some("Finder".to_string()),
+                role: crate::continuation::activity_recap::ActivityDetourRole::Detour,
+                activity_label: Some("File browsing".to_string()),
+                reason: "Finder was a brief detour from the primary work.".to_string(),
+                start_ms: Some(1_000),
+                end_ms: Some(1_100),
+                confidence: crate::continuation::activity_recap::ActivityEvidenceConfidence::Medium,
+                evidence_anchor_ids: vec!["frame-secret-anchor".to_string()],
+            },
+        );
+
+        let state = mapped(&decision);
+        let payload = serde_json::to_string(&state).unwrap();
+
+        assert_eq!(state.display_state, IslandDisplayState::ContinueReady);
+        assert!(state.allows_open_continue_target());
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            decision.activity_recap.primary_work_summary.as_deref()
+        );
+        assert_eq!(state.activity_where.as_deref(), Some("Smalltalk codebase"));
+        assert_eq!(state.activity_label.as_deref(), Some("Integrating P5"));
+        assert_eq!(
+            state.activity_state.as_deref(),
+            Some("The recap pipeline was connected to the decision.")
+        );
+        assert_eq!(state.activity_confidence_label.as_deref(), Some("high"));
+        assert_eq!(state.target_confidence_label.as_deref(), Some("medium"));
+        assert_eq!(
+            state.next_action.as_deref(),
+            Some("Verify the Continue card and island together.")
+        );
+        assert_eq!(
+            state.missing_evidence.first().map(String::as_str),
+            Some("The exact active file was not visible.")
+        );
+        assert_eq!(
+            state.recent_context_summary.as_deref(),
+            Some("Finder was a brief detour from the primary work.")
+        );
+        assert!(!payload.contains("activity_recap"));
+        assert!(!payload.contains("frame-secret-anchor"));
+        assert!(!payload.contains("/Users/"));
+        assert!(!payload.contains("://"));
+    }
+
+    #[test]
+    fn island_keeps_useful_activity_when_there_is_no_safe_target() {
+        let mut decision = base_decision();
+        decision.return_target = None;
+        decision.resume_work_target = None;
+        decision.activity_recap.primary_work_summary =
+            Some("Planning the P5 activity-memory UI".to_string());
+        decision.activity_recap.primary_work_label = Some("Planning P5 UI".to_string());
+        decision.activity_recap.primary_where_summary = Some("Smalltalk project".to_string());
+        decision.activity_recap.activity_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::High;
+        decision.activity_recap.target_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::None;
+        decision.activity_recap.why_no_safe_target =
+            Some("The exact thread was not visible.".to_string());
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::NoClearContinuation);
+        assert!(!state.allows_open_continue_target());
+        assert!(state
+            .available_actions
+            .iter()
+            .any(|action| action.kind == IslandActionKind::InspectEvidence));
+        assert_eq!(state.activity_label.as_deref(), Some("Planning P5 UI"));
+        assert_eq!(state.activity_confidence_label.as_deref(), Some("high"));
+        assert_eq!(state.target_confidence_label.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn island_filters_internal_looking_activity_copy() {
+        let mut decision = base_decision();
+        decision.activity_recap.primary_work_summary =
+            Some("Review candidate-secret before opening".to_string());
+        decision.activity_recap.primary_work_label = Some("artifact-secret".to_string());
+        decision.activity_recap.primary_where_summary = Some("workstream-secret".to_string());
+        decision.activity_recap.last_meaningful_state =
+            Some("frame-fallback remained visible".to_string());
+
+        let state = mapped(&decision);
+
+        assert!(state.activity_summary.is_none());
+        assert!(state.activity_label.is_none());
+        assert!(state.activity_where.is_none());
+        assert!(state.activity_state.is_none());
+        assert!(state.activity_confidence_label.is_none());
+        assert!(state.target_confidence_label.is_none());
     }
 }

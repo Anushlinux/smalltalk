@@ -1,6 +1,17 @@
 #![allow(dead_code)]
 
+pub(crate) mod activity_recap;
+pub(crate) mod activity_recap_detours;
+pub(crate) mod activity_recap_inputs;
+pub(crate) mod activity_recap_integration;
+pub(crate) mod activity_recap_model;
+pub(crate) mod activity_recap_objective;
+pub(crate) mod activity_recap_open_loop;
+pub(crate) mod activity_recap_segments;
+pub(crate) mod activity_recap_validation;
 pub(crate) mod enrichment;
+
+pub use self::activity_recap::ContinueActivityRecap;
 
 use self::enrichment::{
     classify_weak_surface, domain_app_family, domain_artifact_kind,
@@ -1282,6 +1293,7 @@ pub struct ContinueDecisionRequest {
     pub mode: Option<String>,
     pub rebuild_layers: Option<bool>,
     pub micro_inference_enabled: Option<bool>,
+    pub activity_recap_model_enabled: Option<bool>,
     pub model: Option<String>,
     pub max_candidates_for_model: Option<i64>,
     pub audit_output_enabled: Option<bool>,
@@ -1298,6 +1310,7 @@ impl Default for ContinueDecisionRequest {
             mode: Some("normal".to_string()),
             rebuild_layers: Some(false),
             micro_inference_enabled: Some(true),
+            activity_recap_model_enabled: Some(false),
             model: None,
             max_candidates_for_model: Some(5),
             audit_output_enabled: Some(false),
@@ -1363,6 +1376,12 @@ pub struct ContinueDecisionResult {
     pub weak_surface_enrichment: WeakSurfaceEnrichmentDiagnostics,
     pub app_activity: Option<ContinueAppActivityIntelligence>,
     pub activity_summary: Option<ContinueActivitySummary>,
+    pub activity_recap: ContinueActivityRecap,
+    pub activity_recap_watermark_hash: String,
+    #[serde(skip_serializing)]
+    pub(crate) activity_recap_synthesis_audit: activity_recap_model::ActivityRecapSynthesisAudit,
+    #[serde(skip_serializing)]
+    pub(crate) activity_recap_proof: activity_recap_integration::ActivityRecapDecisionProof,
     pub quality_gate: Option<ContinueDecisionQualityGate>,
     pub evidence_pack_v2_used: bool,
     pub micro_inference_requested: bool,
@@ -1838,6 +1857,26 @@ pub struct ContinueEvidenceWatermark {
     pub latest_activity_classification_id: Option<String>,
     #[serde(default)]
     pub latest_activity_classification_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_branch_context_id: Option<String>,
+    #[serde(default)]
+    pub latest_branch_context_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_surface_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub latest_surface_snapshot_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_breadcrumb_id: Option<String>,
+    #[serde(default)]
+    pub latest_breadcrumb_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_feedback_id: Option<String>,
+    #[serde(default)]
+    pub latest_feedback_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_open_event_id: Option<String>,
+    #[serde(default)]
+    pub latest_open_event_at_ms: Option<i64>,
     pub hash: String,
 }
 
@@ -1868,6 +1907,7 @@ pub struct ContinueDecisionTrace {
     pub scoring: Vec<TraceScoringSummary>,
     pub quality_gate: Option<ContinueDecisionQualityGate>,
     pub micro_inference: TraceMicroInferenceSummary,
+    pub activity_recap: activity_recap_integration::ActivityRecapDecisionProof,
     pub final_handoff: ContinueHandoff,
     pub warnings: Vec<String>,
     pub missing_evidence: Vec<String>,
@@ -3139,6 +3179,8 @@ pub struct ContinueSupportEvidenceItem {
     pub role: String,
     pub public_return_eligible: bool,
     pub reason: String,
+    #[serde(default)]
+    pub evidence_anchor_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3332,6 +3374,9 @@ struct CachedContinueDecisionMeta {
     micro_inference_requested: bool,
     micro_inference_attempted: bool,
     micro_inference_result_kind: Option<String>,
+    activity_recap: ContinueActivityRecap,
+    activity_recap_proof: activity_recap_integration::ActivityRecapDecisionProof,
+    activity_recap_watermark_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3841,6 +3886,7 @@ pub fn get_continue_decision(
         mode: request.mode.or(Some("normal".to_string())),
         rebuild_layers: request.rebuild_layers.or(Some(false)),
         micro_inference_enabled: request.micro_inference_enabled.or(Some(true)),
+        activity_recap_model_enabled: request.activity_recap_model_enabled.or(Some(false)),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
@@ -3853,6 +3899,23 @@ pub fn get_continue_decision(
     );
     let force_rebuild = effective_mode == "rebuild";
     let micro_inference_enabled = request.micro_inference_enabled.unwrap_or(false);
+    let activity_recap_model_enabled = request.activity_recap_model_enabled.unwrap_or(false);
+    let activity_recap_effective_model = if activity_recap_model_enabled {
+        activity_recap_model::effective_activity_recap_model(request.model.as_deref())
+            .unwrap_or_else(|_| {
+                request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string())
+            })
+    } else {
+        "disabled".to_string()
+    };
+    let activity_recap_policy_fingerprint =
+        activity_recap_integration::activity_recap_policy_fingerprint(
+            activity_recap_model_enabled,
+            Some(&activity_recap_effective_model),
+        );
     let requested_at_ms = current_time_millis();
     let pre_decision_enrichment = run_continue_request_weak_surface_enrichment(
         conn,
@@ -3862,6 +3925,11 @@ pub fn get_continue_decision(
     infer_pending_continue_feedback(conn, FEEDBACK_INFERENCE_MIN_AGE_MS)?;
     let mut current_watermark =
         build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
+    let mut current_activity_recap_watermark_hash =
+        activity_recap_integration::activity_recap_watermark_hash(
+            &current_watermark,
+            &activity_recap_policy_fingerprint,
+        );
     let mut cache_bypass_reasons = if force_rebuild {
         Vec::new()
     } else {
@@ -3873,11 +3941,14 @@ pub fn get_continue_decision(
         )?
     };
     let mut cached_meta = if !force_rebuild {
-        fresh_cached_continue_decision(
+        fresh_cached_continue_decision_for_recap(
             conn,
             request.session_id.as_deref(),
             &current_watermark,
             micro_inference_enabled,
+            &current_activity_recap_watermark_hash,
+            &activity_recap_policy_fingerprint,
+            activity_recap_model_enabled,
         )?
     } else {
         None
@@ -3957,6 +4028,11 @@ pub fn get_continue_decision(
         requested_at_ms,
     );
     current_watermark = build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
+    current_activity_recap_watermark_hash =
+        activity_recap_integration::activity_recap_watermark_hash(
+            &current_watermark,
+            &activity_recap_policy_fingerprint,
+        );
     let mut candidates = generate_continue_candidates(&CandidateGenerationContext {
         now_ms: requested_at_ms,
         workstreams: &workstreams,
@@ -5142,6 +5218,135 @@ pub fn get_continue_decision(
         &warnings,
     );
     let weak_surface_enrichment = weak_surface_enrichment_diagnostics(conn)?;
+    let activity_recap_inputs = activity_recap_inputs::build_activity_recap_inputs(
+        conn,
+        activity_recap_inputs::ActivityRecapBuildContext {
+            decision_id_seed: Some(&decision_id),
+            session_id: request.session_id.as_deref(),
+            mode: effective_mode,
+            lookback_ms,
+            evidence_watermark: Some(&current_watermark.hash),
+            output_mode: Some(continue_output_mode.as_str()),
+            requested_at_ms,
+            current_surface: Some(&current_surface_resolution.selected),
+            current_surface_resolution: Some(&current_surface_resolution),
+            selected_workstream: selected_workstream.as_ref(),
+            selected_candidate: selected.as_ref(),
+            public_return_candidate,
+            app_activity: &app_activity,
+            support_evidence: &support_evidence,
+            memory_retrieval: &memory_retrieval,
+            p0_quality_signals: Some(&p0_quality_signals),
+            evidence_freshness_ledger: Some(&evidence_freshness_ledger),
+            app_activity_summary: Some(&app_activity.summary),
+            quality_gate: quality_gate.as_ref(),
+            caps: activity_recap_inputs::ActivityRecapInputCaps::default(),
+        },
+    );
+    let stitched_activity_timeline =
+        activity_recap_segments::stitch_activity_segments(&activity_recap_inputs);
+    let activity_work_label = activity_recap_objective::infer_activity_work_labels(
+        &activity_recap_inputs,
+        &stitched_activity_timeline,
+    );
+    let activity_detour_recap = activity_recap_detours::summarize_activity_detours(
+        &activity_recap_inputs,
+        &stitched_activity_timeline,
+    );
+    let last_state_recap = activity_recap_open_loop::synthesize_last_state(
+        &activity_recap_inputs,
+        &stitched_activity_timeline,
+        &activity_work_label,
+        &activity_detour_recap,
+    );
+    let local_activity_recap = activity_recap_open_loop::apply_last_state_recap(
+        activity_recap_detours::apply_activity_detour_recap(
+            activity_recap_objective::recap_with_activity_work_label(activity_work_label.clone()),
+            activity_detour_recap.clone(),
+        ),
+        last_state_recap.clone(),
+    );
+    let local_activity_recap = activity_recap_integration::apply_prior_activity_memory(
+        local_activity_recap,
+        &activity_recap_inputs,
+    );
+    let (mut activity_recap, activity_recap_synthesis_audit, mut activity_recap_proof) =
+        if let Some(cached) = cached_meta.as_ref() {
+            (
+                cached.activity_recap.clone(),
+                activity_recap_model::ActivityRecapSynthesisAudit::default(),
+                cached.activity_recap_proof.clone(),
+            )
+        } else {
+            let synthesis = activity_recap_model::maybe_run_activity_recap_model_synthesis(
+                activity_recap_model::ActivityRecapSynthesisContext {
+                    enabled: activity_recap_model_enabled,
+                    model_override: request.model.as_deref(),
+                    retain_audit_payloads: request.audit_output_enabled.unwrap_or(false),
+                    inputs: &activity_recap_inputs,
+                    timeline: &stitched_activity_timeline,
+                    work_label: &activity_work_label,
+                    local_recap: &local_activity_recap,
+                },
+            );
+            let proof = activity_recap_integration::build_activity_recap_proof(
+                &activity_recap_inputs,
+                &stitched_activity_timeline,
+                &activity_work_label,
+                &activity_detour_recap,
+                &last_state_recap,
+                &synthesis.audit,
+                &synthesis.recap,
+            );
+            (synthesis.recap, synthesis.audit, proof)
+        };
+
+    if cached_meta.is_none() {
+        let memory_artifact_id = selected
+            .as_ref()
+            .and_then(|candidate| candidate.target_artifact.as_ref())
+            .map(|artifact| artifact.id.as_str())
+            .or_else(|| {
+                selected_workstream
+                    .as_ref()
+                    .and_then(|workstream| workstream.primary_artifact_id.as_deref())
+            });
+        if activity_recap_integration::promote_validated_activity_recap_memory(
+            conn,
+            &decision_id,
+            selected.as_ref().map(|candidate| candidate.id.as_str()),
+            selected_workstream
+                .as_ref()
+                .map(|workstream| workstream.id.as_str()),
+            memory_artifact_id,
+            &activity_recap,
+            requested_at_ms,
+        )
+        .is_err()
+        {
+            push_string_once(
+                &mut activity_recap.warnings,
+                "activity_recap:memory_promotion_failed",
+            );
+            activity_recap_proof.final_recap = activity_recap.clone();
+        }
+        current_watermark = build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
+        current_activity_recap_watermark_hash =
+            activity_recap_integration::activity_recap_watermark_hash(
+                &current_watermark,
+                &activity_recap_policy_fingerprint,
+            );
+        persist_continue_decision_activity_recap(
+            conn,
+            &decision_id,
+            &activity_recap,
+            &activity_recap_proof,
+            &current_watermark,
+            &current_activity_recap_watermark_hash,
+            &activity_recap_policy_fingerprint,
+            activity_recap_model_enabled,
+        )?;
+    }
 
     Ok(ContinueDecisionResult {
         decision_id,
@@ -5230,6 +5435,13 @@ pub fn get_continue_decision(
         weak_surface_enrichment,
         app_activity: Some(app_activity.clone()),
         activity_summary: Some(app_activity.summary.clone()),
+        activity_recap,
+        activity_recap_watermark_hash: cached_meta
+            .as_ref()
+            .map(|cached| cached.activity_recap_watermark_hash.clone())
+            .unwrap_or_else(|| current_activity_recap_watermark_hash.clone()),
+        activity_recap_synthesis_audit,
+        activity_recap_proof,
         quality_gate,
         evidence_pack_v2_used,
         micro_inference_requested,
@@ -8064,6 +8276,46 @@ fn fresh_cached_continue_decision(
     current_watermark: &ContinueEvidenceWatermark,
     micro_inference_requested: bool,
 ) -> Result<Option<CachedContinueDecisionMeta>, String> {
+    fresh_cached_continue_decision_internal(
+        conn,
+        session_id,
+        current_watermark,
+        micro_inference_requested,
+        None,
+        None,
+        None,
+    )
+}
+
+fn fresh_cached_continue_decision_for_recap(
+    conn: &Connection,
+    session_id: Option<&str>,
+    current_watermark: &ContinueEvidenceWatermark,
+    micro_inference_requested: bool,
+    activity_recap_watermark_hash: &str,
+    activity_recap_policy_fingerprint: &str,
+    activity_recap_model_requested: bool,
+) -> Result<Option<CachedContinueDecisionMeta>, String> {
+    fresh_cached_continue_decision_internal(
+        conn,
+        session_id,
+        current_watermark,
+        micro_inference_requested,
+        Some(activity_recap_watermark_hash),
+        Some(activity_recap_policy_fingerprint),
+        Some(activity_recap_model_requested),
+    )
+}
+
+fn fresh_cached_continue_decision_internal(
+    conn: &Connection,
+    session_id: Option<&str>,
+    current_watermark: &ContinueEvidenceWatermark,
+    micro_inference_requested: bool,
+    activity_recap_watermark_hash: Option<&str>,
+    activity_recap_policy_fingerprint: Option<&str>,
+    activity_recap_model_requested: Option<bool>,
+) -> Result<Option<CachedContinueDecisionMeta>, String> {
     if !table_exists(conn, "continue_decisions")? {
         return Ok(None);
     }
@@ -8079,7 +8331,9 @@ fn fresh_cached_continue_decision(
                     d.continue_output_mode, d.continue_decision_quality_json,
                     d.evidence_pack_v2_used, d.micro_inference_result_kind,
                     d.evidence_watermark_hash, d.latest_boundary_revision,
-                    d.micro_inference_requested, d.micro_inference_attempted
+                    d.micro_inference_requested, d.micro_inference_attempted,
+                    d.activity_recap_json, d.activity_recap_detail_json,
+                    d.activity_recap_watermark_hash
              FROM continue_decisions d
              LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
              LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
@@ -8087,6 +8341,12 @@ fn fresh_cached_continue_decision(
                AND (?2 IS NULL OR f.session_id = ?2 OR d.current_focus_frame_id IS NULL)
                AND COALESCE(d.latest_boundary_revision, 0) = ?3
                AND COALESCE(d.micro_inference_requested, 0) = ?4
+               AND (?5 IS NULL OR (
+                 d.activity_recap_json IS NOT NULL
+                 AND d.activity_recap_watermark_hash = ?5
+                 AND d.activity_recap_policy_fingerprint = ?6
+                 AND COALESCE(d.activity_recap_model_requested, 0) = ?7
+               ))
                AND NOT (
                  d.source = 'local_fallback'
                  AND d.validation_status = 'fallback'
@@ -8140,7 +8400,7 @@ fn fresh_cached_continue_decision(
                  FROM continue_decision_open_events oe
                  WHERE oe.decision_id = d.id
                    AND oe.opened_at_ms > d.requested_at_ms
-                   AND oe.opened_at_ms <= ?5
+                   AND oe.opened_at_ms <= ?8
                    AND (oe.opened_url = 1 OR oe.opened_path = 1 OR oe.opened_frame_fallback = 1)
                    AND NOT EXISTS (
                      SELECT 1
@@ -8168,6 +8428,9 @@ fn fresh_cached_continue_decision(
             } else {
                 0_i64
             },
+            activity_recap_watermark_hash,
+            activity_recap_policy_fingerprint,
+            activity_recap_model_requested.map(|requested| if requested { 1_i64 } else { 0_i64 }),
             current_time_millis().saturating_sub(FEEDBACK_INFERENCE_MIN_AGE_MS),
         ],
         |row| {
@@ -8177,6 +8440,25 @@ fn fresh_cached_continue_decision(
             let quality_gate = quality_json
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<ContinueDecisionQualityGate>(value).ok());
+            let recap_json: Option<String> = row.get(27)?;
+            let activity_recap = recap_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<ContinueActivityRecap>(value).ok())
+                .unwrap_or_default();
+            let proof_json: Option<String> = row.get(28)?;
+            let activity_recap_proof = proof_json
+                .as_deref()
+                .and_then(|value| {
+                    serde_json::from_str::<activity_recap_integration::ActivityRecapDecisionProof>(
+                        value,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| {
+                    activity_recap_integration::ActivityRecapDecisionProof::from_recap(
+                        activity_recap.clone(),
+                    )
+                });
             Ok(CachedContinueDecisionMeta {
                 decision_id: row.get(0)?,
                 source: row.get(1)?,
@@ -8199,6 +8481,11 @@ fn fresh_cached_continue_decision(
                 latest_boundary_revision: row.get(24)?,
                 micro_inference_requested: row.get::<_, Option<i64>>(25)?.unwrap_or(0) != 0,
                 micro_inference_attempted: row.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
+                activity_recap,
+                activity_recap_proof,
+                activity_recap_watermark_hash: row
+                    .get::<_, Option<String>>(29)?
+                    .unwrap_or_default(),
             })
         },
     )
@@ -8245,16 +8532,23 @@ fn build_continue_evidence_watermark(
     let (latest_evidence_probe_id, latest_evidence_probe_at_ms) =
         latest_string_marker(conn, "continue_evidence_probes", "id", "completed_at_ms")?;
     let (latest_surface_snapshot_id, latest_surface_snapshot_at_ms) =
-        latest_string_marker(conn, "continue_surface_snapshots", "id", "updated_at_ms")?;
+        latest_string_marker(conn, "continue_surface_snapshots", "id", "observed_at_ms")?;
     let (latest_app_activity_segment_id, latest_app_activity_segment_at_ms) =
-        latest_string_marker(conn, "continue_app_activity_segments", "id", "ended_at_ms")?;
+        latest_grounded_app_activity_segment_marker(conn)?;
     let (latest_activity_classification_id, latest_activity_classification_at_ms) =
-        latest_string_marker(
-            conn,
-            "continue_activity_classifications",
-            "id",
-            "updated_at_ms",
-        )?;
+        latest_grounded_activity_classification_marker(conn)?;
+    let (latest_branch_context_id, latest_branch_context_at_ms) = latest_string_marker(
+        conn,
+        "continue_branch_contexts",
+        "id",
+        "last_branch_seen_at_ms",
+    )?;
+    let (latest_breadcrumb_id, latest_breadcrumb_at_ms) =
+        latest_string_marker(conn, "continue_breadcrumbs", "id", "created_at_ms")?;
+    let (latest_feedback_id, latest_feedback_at_ms) =
+        latest_string_marker(conn, "continue_feedback_events", "id", "timestamp_ms")?;
+    let (latest_open_event_id, latest_open_event_at_ms) =
+        latest_string_marker(conn, "continue_decision_open_events", "id", "opened_at_ms")?;
     let hash_seed = serde_json::json!({
         "continue_schema_version": CONTINUE_SCHEMA_VERSION,
         "p8_router_version": 1,
@@ -8287,6 +8581,14 @@ fn build_continue_evidence_watermark(
         "latest_app_activity_segment_at_ms": latest_app_activity_segment_at_ms,
         "latest_activity_classification_id": latest_activity_classification_id,
         "latest_activity_classification_at_ms": latest_activity_classification_at_ms,
+        "latest_branch_context_id": latest_branch_context_id,
+        "latest_branch_context_at_ms": latest_branch_context_at_ms,
+        "latest_breadcrumb_id": latest_breadcrumb_id,
+        "latest_breadcrumb_at_ms": latest_breadcrumb_at_ms,
+        "latest_feedback_id": latest_feedback_id,
+        "latest_feedback_at_ms": latest_feedback_at_ms,
+        "latest_open_event_id": latest_open_event_id,
+        "latest_open_event_at_ms": latest_open_event_at_ms,
     });
     let hash = stable_hash(hash_seed.to_string().as_bytes());
     Ok(ContinueEvidenceWatermark {
@@ -8317,6 +8619,16 @@ fn build_continue_evidence_watermark(
         latest_app_activity_segment_at_ms,
         latest_activity_classification_id,
         latest_activity_classification_at_ms,
+        latest_branch_context_id,
+        latest_branch_context_at_ms,
+        latest_surface_snapshot_id,
+        latest_surface_snapshot_at_ms,
+        latest_breadcrumb_id,
+        latest_breadcrumb_at_ms,
+        latest_feedback_id,
+        latest_feedback_at_ms,
+        latest_open_event_id,
+        latest_open_event_at_ms,
         hash,
     })
 }
@@ -8486,6 +8798,49 @@ fn latest_string_marker(
             "SELECT {}, {} FROM {} ORDER BY {} DESC, {} DESC LIMIT 1",
             id_column, ts_column, table, ts_column, id_column
         ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(to_string)
+    .map(|value| value.unwrap_or((None, None)))
+}
+
+fn latest_grounded_app_activity_segment_marker(
+    conn: &Connection,
+) -> Result<(Option<String>, Option<i64>), String> {
+    if !table_exists(conn, "continue_app_activity_segments")? {
+        return Ok((None, None));
+    }
+    conn.query_row(
+        "SELECT id, ended_at_ms
+         FROM continue_app_activity_segments
+         WHERE evidence_anchor_json NOT LIKE '%no-clear-current-surface%'
+         ORDER BY ended_at_ms DESC, id DESC
+         LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(to_string)
+    .map(|value| value.unwrap_or((None, None)))
+}
+
+fn latest_grounded_activity_classification_marker(
+    conn: &Connection,
+) -> Result<(Option<String>, Option<i64>), String> {
+    if !table_exists(conn, "continue_activity_classifications")?
+        || !table_exists(conn, "continue_app_activity_segments")?
+    {
+        return Ok((None, None));
+    }
+    conn.query_row(
+        "SELECT c.id, s.ended_at_ms
+         FROM continue_activity_classifications c
+         JOIN continue_app_activity_segments s ON s.id = c.segment_id
+         WHERE s.evidence_anchor_json NOT LIKE '%no-clear-current-surface%'
+         ORDER BY s.ended_at_ms DESC, c.id DESC
+         LIMIT 1",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -9605,6 +9960,16 @@ pub fn record_continue_feedback(
             timestamp_ms,
         )?;
     }
+    if inserted > 0 {
+        activity_recap_integration::apply_activity_recap_feedback_to_memory(
+            conn,
+            feedback_kind,
+            row.workstream_id.as_deref(),
+            row.target_artifact_id.as_deref(),
+            row.chosen_artifact_id.as_deref(),
+            timestamp_ms,
+        )?;
+    }
     let result = ContinueFeedbackEventResult {
         id: row.id,
         decision_id: row.decision_id,
@@ -9701,6 +10066,7 @@ pub fn get_continue_decision_trace(
                 Some(validation_failures.join(";"))
             },
         },
+        activity_recap: decision.activity_recap_proof,
         final_handoff,
         warnings,
         missing_evidence,
@@ -9721,6 +10087,7 @@ struct TraceDecisionRow {
     micro_inference_result_kind: Option<String>,
     quality_gate: Option<ContinueDecisionQualityGate>,
     handoff: Option<ContinueHandoff>,
+    activity_recap_proof: activity_recap_integration::ActivityRecapDecisionProof,
 }
 
 fn load_trace_decision(
@@ -9735,7 +10102,8 @@ fn load_trace_decision(
                 handoff_headline, handoff_return_line, handoff_current_focus_line,
                 handoff_last_state_line, handoff_next_action, handoff_why_this,
                 handoff_missing_evidence_line, handoff_confidence_label,
-                handoff_user_visible_uncertainty
+                handoff_user_visible_uncertainty, activity_recap_json,
+                activity_recap_detail_json
          FROM continue_decisions
          WHERE id = ?1
          LIMIT 1",
@@ -9770,6 +10138,23 @@ fn load_trace_decision(
             } else {
                 None
             };
+            let recap_json: Option<String> = row.get(21)?;
+            let recap = recap_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<ContinueActivityRecap>(raw).ok())
+                .unwrap_or_default();
+            let proof_json: Option<String> = row.get(22)?;
+            let activity_recap_proof = proof_json
+                .as_deref()
+                .and_then(|raw| {
+                    serde_json::from_str::<activity_recap_integration::ActivityRecapDecisionProof>(
+                        raw,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| {
+                    activity_recap_integration::ActivityRecapDecisionProof::from_recap(recap)
+                });
             Ok(TraceDecisionRow {
                 source: row.get(0)?,
                 model: row.get(1)?,
@@ -9784,6 +10169,7 @@ fn load_trace_decision(
                 micro_inference_result_kind: row.get(10)?,
                 quality_gate,
                 handoff,
+                activity_recap_proof,
             })
         },
     )
@@ -12304,11 +12690,20 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
             confidence,
             source,
         ) = row.map_err(to_string)?;
-        let memory_type = match event_kind.as_str() {
-            "accepted" | "inferred_acceptance" => "feedback_acceptance",
-            "corrected" | "explicit_correction" => "feedback_correction",
-            "rejected" | "ignored" | "inferred_rejection" => "feedback_rejection",
-            _ => "feedback_rejection",
+        let Some(memory_type) = (match event_kind.as_str() {
+            "accepted" | "inferred_acceptance" => Some("feedback_acceptance"),
+            "corrected" | "explicit_correction" => Some("feedback_correction"),
+            "rejected"
+            | "ignored"
+            | "inferred_rejection"
+            | "artifact_only_evidence"
+            | "ignored_workstream" => Some("feedback_rejection"),
+            // A user-authored next-step note is context, not evidence that the
+            // selected continuation was wrong. Unknown future kinds stay neutral.
+            "user_next_step_note" => None,
+            _ => None,
+        }) else {
+            continue;
         };
         let artifact_id = chosen_artifact_id.as_ref().or(target_artifact_id.as_ref());
         let feedback_score = match memory_type {
@@ -12614,6 +13009,7 @@ fn retrieve_continue_memory_cells(
     let candidate_workstreams = query
         .candidate_workstream_ids
         .iter()
+        .chain(query.active_workstream_ids.iter())
         .cloned()
         .collect::<HashSet<_>>();
     let candidate_artifacts = query
@@ -13147,6 +13543,11 @@ fn memory_candidate_links(
     cell: &ContinueMemoryCellRecord,
     candidates: &[ScoredContinueCandidate],
 ) -> (Vec<String>, Vec<String>) {
+    if activity_recap_integration::narrative_memory_type(&cell.memory_type) {
+        // P5 narrative memory may explain a recap, but cannot influence ranking,
+        // candidate eligibility, target selection, openability, or strict open.
+        return (Vec::new(), Vec::new());
+    }
     let mut supports = Vec::new();
     let mut contradicts = Vec::new();
     for candidate in candidates {
@@ -13232,7 +13633,10 @@ fn memory_cell_model_visible(cell: &ContinueMemoryCellRecord) -> bool {
 fn memory_type_is_counter_evidence(memory_type: &str) -> bool {
     matches!(
         memory_type,
-        "feedback_rejection" | "abandoned_or_done" | "low_confidence_no_clear_target"
+        "feedback_rejection"
+            | "abandoned_or_done"
+            | "low_confidence_no_clear_target"
+            | "activity_recap_rejected"
     )
 }
 
@@ -13334,7 +13738,12 @@ fn build_continue_app_activity_intelligence(
     let objective_tokens = objective_tokens_for_workstreams(workstreams);
     let classifications = segments
         .iter()
-        .map(|segment| classify_app_activity_segment(segment, &objective_tokens, now_ms))
+        .map(|segment| {
+            // Classification identity is derived from the segment evidence. Keeping its
+            // revision tied to the segment prevents unchanged Continue calls from
+            // invalidating their own cache merely because they were recomputed.
+            classify_app_activity_segment(segment, &objective_tokens, segment.ended_at_ms)
+        })
         .collect::<Vec<_>>();
     persist_app_activity_intelligence(conn, session_id, since_ms, &segments, &classifications)?;
     let summary = summarize_app_activity(&segments, &classifications);
@@ -18136,6 +18545,37 @@ fn support_evidence_item_for_candidate(
                 .as_ref()
                 .and_then(|open_loop| open_loop.origin_artifact_id.clone())
         });
+    let mut evidence_anchor_ids = Vec::new();
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate
+            .last_meaningful_action
+            .as_ref()
+            .map(|action| action.id.as_str()),
+    );
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate.evidence_frame_id.as_deref(),
+    );
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate.supporting_episode_id.as_deref(),
+    );
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate.app_activity_segment_id.as_deref(),
+    );
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate.app_activity_classification_id.as_deref(),
+    );
+    push_unique_optional(
+        &mut evidence_anchor_ids,
+        candidate
+            .open_loop
+            .as_ref()
+            .map(|open_loop| open_loop.id.as_str()),
+    );
     ContinueSupportEvidenceItem {
         artifact_id: target.map(|artifact| artifact.id.clone()),
         artifact_kind: target.map(|artifact| artifact.artifact_kind.clone()),
@@ -18147,6 +18587,16 @@ fn support_evidence_item_for_candidate(
         role: support_role_for_candidate(candidate),
         public_return_eligible: false,
         reason: support_reason_for_candidate(candidate),
+        evidence_anchor_ids,
+    }
+}
+
+fn push_unique_optional(values: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
     }
 }
 
@@ -19409,6 +19859,15 @@ fn confidence_from_micro_output(label: &str, local_score: f64) -> f64 {
 }
 
 fn call_openai_responses(api_key: &str, request: &Value) -> Result<Value, String> {
+    call_openai_responses_with_timeout(api_key, request, 90, 1)
+}
+
+fn call_openai_responses_with_timeout(
+    api_key: &str,
+    request: &Value,
+    max_time_seconds: u64,
+    retries: u32,
+) -> Result<Value, String> {
     let temp_dir = std::env::temp_dir().join(format!(
         "smalltalk-continue-openai-{}",
         current_time_millis()
@@ -19424,7 +19883,9 @@ fn call_openai_responses(api_key: &str, request: &Value) -> Result<Value, String
         &serde_json::to_vec(request).map_err(to_string)?,
     )?;
     let config = format!(
-        "url = \"https://api.openai.com/v1/responses\"\nrequest = \"POST\"\nsilent\nshow-error\nfail-with-body\nconnect-timeout = 20\nmax-time = 90\nretry = 1\nretry-delay = 1\nretry-all-errors\nheader = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer {}\"\n",
+        "url = \"https://api.openai.com/v1/responses\"\nrequest = \"POST\"\nsilent\nshow-error\nfail-with-body\nconnect-timeout = 20\nmax-time = {}\nretry = {}\nretry-delay = 1\nretry-all-errors\nheader = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer {}\"\n",
+        max_time_seconds.clamp(5, 120),
+        retries.min(2),
         curl_config_escape(api_key)
     );
     write_private_file(&config_path, config.as_bytes())?;
@@ -33731,6 +34192,51 @@ fn insert_continue_decision(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn persist_continue_decision_activity_recap(
+    conn: &Connection,
+    decision_id: &str,
+    recap: &ContinueActivityRecap,
+    proof: &activity_recap_integration::ActivityRecapDecisionProof,
+    evidence_watermark: &ContinueEvidenceWatermark,
+    activity_recap_watermark_hash: &str,
+    activity_recap_policy_fingerprint: &str,
+    activity_recap_model_requested: bool,
+) -> Result<(), String> {
+    let recap_json = serde_json::to_string(recap).map_err(to_string)?;
+    let proof_json = serde_json::to_string(proof).map_err(to_string)?;
+    let evidence_watermark_json = serde_json::to_string(evidence_watermark).map_err(to_string)?;
+    conn.execute(
+        "UPDATE continue_decisions
+         SET activity_recap_json = ?2,
+             activity_recap_detail_json = ?3,
+             activity_recap_watermark_hash = ?4,
+             activity_recap_policy_fingerprint = ?5,
+             activity_recap_model_requested = ?6,
+             evidence_watermark_json = ?7,
+             evidence_watermark_hash = ?8,
+             latest_boundary_revision = ?9
+         WHERE id = ?1",
+        params![
+            decision_id,
+            recap_json,
+            proof_json,
+            activity_recap_watermark_hash,
+            activity_recap_policy_fingerprint,
+            if activity_recap_model_requested {
+                1_i64
+            } else {
+                0_i64
+            },
+            evidence_watermark_json,
+            evidence_watermark.hash,
+            evidence_watermark.latest_boundary_revision,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
 fn recent_episode_actions(
     conn: &Connection,
     episode_id: &str,
@@ -36132,6 +36638,31 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "micro_inference_attempted",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column_exists(conn, "continue_decisions", "activity_recap_json", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "activity_recap_detail_json",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "activity_recap_watermark_hash",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "activity_recap_policy_fingerprint",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "activity_recap_model_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column_exists(
         conn,
         "continue_feedback_events",
@@ -36406,6 +36937,23 @@ mod tests {
         .unwrap();
 
         assert!(result.validation_status == "no_candidates" || result.confidence <= 0.45);
+        assert_eq!(
+            result.activity_recap.current_state,
+            activity_recap::ActivityCurrentState::Unclear
+        );
+        assert_eq!(
+            result.activity_recap.why_no_safe_target.as_deref(),
+            Some("Recent activity is visible, but no safely openable return target is grounded.")
+        );
+        assert!(result
+            .activity_recap
+            .evidence_spans
+            .iter()
+            .any(|span| { span.claim_key == "why_no_safe_target" && !span.anchor_ids.is_empty() }));
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["activity_recap"],
+            serde_json::to_value(&result.activity_recap).unwrap()
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM continue_surface_snapshots",
@@ -38181,6 +38729,16 @@ mod tests {
             latest_app_activity_segment_at_ms: None,
             latest_activity_classification_id: None,
             latest_activity_classification_at_ms: None,
+            latest_branch_context_id: None,
+            latest_branch_context_at_ms: None,
+            latest_surface_snapshot_id: None,
+            latest_surface_snapshot_at_ms: None,
+            latest_breadcrumb_id: None,
+            latest_breadcrumb_at_ms: None,
+            latest_feedback_id: None,
+            latest_feedback_at_ms: None,
+            latest_open_event_id: None,
+            latest_open_event_at_ms: None,
             hash: "p1-cache-watermark".to_string(),
         }
     }
@@ -40132,6 +40690,10 @@ mod tests {
             weak_surface_enrichment: WeakSurfaceEnrichmentDiagnostics::default(),
             app_activity: None,
             activity_summary: None,
+            activity_recap: ContinueActivityRecap::default(),
+            activity_recap_watermark_hash: String::new(),
+            activity_recap_synthesis_audit: Default::default(),
+            activity_recap_proof: Default::default(),
             quality_gate: None,
             evidence_pack_v2_used: false,
             micro_inference_requested: false,
@@ -47000,6 +47562,7 @@ mod tests {
     fn continue_decision_defaults_to_bounded_micro_inference() {
         let request = ContinueDecisionRequest::default();
         assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.activity_recap_model_enabled, Some(false));
         assert_eq!(request.max_candidates_for_model, Some(5));
     }
 
@@ -47059,6 +47622,60 @@ mod tests {
         assert_eq!(normal.mode, "normal");
         assert!(normal.cache_hit);
         assert_eq!(normal.decision_id, rebuild.decision_id);
+        assert_eq!(normal.activity_recap, rebuild.activity_recap);
+        assert!(normal.activity_recap.next_action_summary.is_some());
+        assert!(normal.activity_recap.why_this_target.is_some());
+        assert!(normal
+            .activity_recap
+            .evidence_spans
+            .iter()
+            .any(|span| { span.claim_key == "why_this_target" && !span.anchor_ids.is_empty() }));
+
+        let third = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("normal".to_string()),
+                rebuild_layers: Some(false),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            third.cache_hit,
+            "third_hash={} first_hash={} current={:?} bypass={:?}",
+            third.evidence_watermark_hash,
+            rebuild.evidence_watermark_hash,
+            build_continue_evidence_watermark(&conn, Some("session-a")).unwrap(),
+            third.cache_bypass_reasons,
+        );
+        assert_eq!(third.decision_id, rebuild.decision_id);
+        assert_eq!(third.activity_recap, rebuild.activity_recap);
+        assert_eq!(
+            third.activity_recap_watermark_hash,
+            rebuild.activity_recap_watermark_hash
+        );
+        let stable_watermark = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+        let different_policy = activity_recap_integration::activity_recap_policy_fingerprint(
+            true,
+            Some("different-recap-model"),
+        );
+        let different_recap_watermark = activity_recap_integration::activity_recap_watermark_hash(
+            &stable_watermark,
+            &different_policy,
+        );
+        assert!(fresh_cached_continue_decision_for_recap(
+            &conn,
+            Some("session-a"),
+            &stable_watermark,
+            false,
+            &different_recap_watermark,
+            &different_policy,
+            true,
+        )
+        .unwrap()
+        .is_none());
 
         let persisted: i64 = conn
             .query_row("SELECT COUNT(*) FROM continue_decisions", [], |row| {
@@ -47315,7 +47932,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(cached.cache_hit);
+        assert!(
+            cached.cache_hit,
+            "first={} current={:?}",
+            rebuild.evidence_watermark_hash,
+            build_continue_evidence_watermark(&conn, Some("session-a")).unwrap(),
+        );
         assert_eq!(cached.decision_id, rebuild.decision_id);
     }
 
@@ -47395,6 +48017,99 @@ mod tests {
     }
 
     #[test]
+    fn p5_08_new_finder_detour_invalidates_cached_activity_recap() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        let initial_frame_id = current_time_millis() / 1_000 - 2;
+        let finder_frame_id = initial_frame_id + 1;
+        insert_frame(
+            &conn,
+            initial_frame_id,
+            "Cursor",
+            "lib.rs - smalltalk",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            "typing_pause",
+            "fn continue_work() { changed(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            initial_frame_id,
+            "code_editor",
+            "lib.rs",
+            None,
+            Some("/Users/me/project/src/lib.rs"),
+            None,
+        );
+        insert_typing(&conn, initial_frame_id, 1, 0);
+        let first = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("rebuild".to_string()),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        insert_frame(
+            &conn,
+            finder_frame_id,
+            "Finder",
+            "Photos",
+            None,
+            Some("/Users/me/Pictures"),
+            "manual",
+            "Photos",
+            Some("com.apple.finder"),
+            Some(initial_frame_id),
+        );
+        insert_context(
+            &conn,
+            finder_frame_id,
+            "finder",
+            "Photos",
+            None,
+            Some("/Users/me/Pictures"),
+            None,
+        );
+
+        let after_detour = get_continue_decision(
+            &conn,
+            ContinueDecisionRequest {
+                session_id: Some("session-a".to_string()),
+                mode: Some("normal".to_string()),
+                micro_inference_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!after_detour.cache_hit);
+        assert_ne!(
+            after_detour.activity_recap_watermark_hash,
+            first.activity_recap_watermark_hash
+        );
+        assert!(
+            after_detour
+                .activity_recap_proof
+                .stitched_timeline
+                .recent_detours
+                .iter()
+                .any(|segment| segment.app_name.as_deref() == Some("Finder")),
+            "{:?}",
+            after_detour.activity_recap_proof.stitched_timeline
+        );
+        assert!(after_detour
+            .activity_recap
+            .recent_detours
+            .iter()
+            .any(|detour| detour.app_name.as_deref() == Some("Finder")));
+    }
+
+    #[test]
     fn continue_decision_trace_is_bounded_and_redacted() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
@@ -47442,6 +48157,11 @@ mod tests {
         assert!(!trace.latest_frames.is_empty());
         assert!(!trace.task_actions.is_empty());
         assert_eq!(trace.micro_inference.source, "local_scorer");
+        assert_eq!(trace.activity_recap.final_recap, decision.activity_recap);
+        assert_eq!(
+            trace.activity_recap.schema,
+            activity_recap_integration::ACTIVITY_RECAP_PROOF_SCHEMA
+        );
         let serialized = serde_json::to_string(&trace).unwrap();
         assert!(!serialized.contains("sk-should-not-leak"));
         assert!(!serialized.contains("raw typed secret"));
@@ -47575,6 +48295,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn p5_08_rejected_feedback_downgrades_related_activity_memory() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_p4_learning_rows(&conn);
+        let recap = ContinueActivityRecap {
+            primary_work_summary: Some(
+                "Implementing the activity recap decision integration".to_string(),
+            ),
+            primary_work_label: Some("Implementing the decision integration".to_string()),
+            activity_confidence: activity_recap::ActivityConfidence::High,
+            validation_status: activity_recap::ActivityRecapValidationStatus::Valid,
+            evidence_spans: vec![activity_recap::ActivityEvidenceSpan {
+                claim_key: "primary_work_summary".to_string(),
+                claim_text: "Implementing the activity recap decision integration".to_string(),
+                anchor_type: activity_recap::ActivityEvidenceAnchorType::Action,
+                anchor_ids: vec!["action-grounded".to_string()],
+                confidence: activity_recap::ActivityEvidenceConfidence::High,
+                source: activity_recap::ActivityEvidenceSource::Local,
+            }],
+            ..ContinueActivityRecap::default()
+        };
+        activity_recap_integration::promote_validated_activity_recap_memory(
+            &conn,
+            "decision-p4",
+            Some("candidate-wrong"),
+            Some("workstream-p4"),
+            Some("artifact-wrong"),
+            &recap,
+            2_000,
+        )
+        .unwrap();
+        let promoted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_memory_cells
+                 WHERE created_by = 'p5_activity_recap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(promoted > 0);
+
+        record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: Some("candidate-wrong".to_string()),
+                workstream_id: Some("workstream-p4".to_string()),
+                target_artifact_id: Some("artifact-wrong".to_string()),
+                corrected_artifact_id: None,
+                feedback_kind: "rejected".to_string(),
+                note: None,
+                source: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let downgraded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_memory_cells
+                 WHERE created_by = 'p5_activity_recap'
+                   AND memory_type = 'activity_recap_rejected'
+                   AND feedback_score < 0
+                   AND rejected_count > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(downgraded, promoted);
     }
 
     #[test]

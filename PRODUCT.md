@@ -2,17 +2,17 @@
 
 Last updated: 2026-07-10
 
-Implementation baseline: commits after `f241ceba` (`Refine Continue flow and evidence-backed continuation scoring`) through the current working tree. The repository is on a case-insensitive filesystem; `PRODUCT.md` is the canonical tracked filename even when tools display it as `product.md`.
+Implementation baseline: `ab37fa0b` (`Refactor Continue decision flow and island audit checks`) plus the current P5 activity-memory working tree. The repository is on a case-insensitive filesystem; `PRODUCT.md` is the canonical tracked filename even when tools display it as `product.md`.
 
 This document describes the current Smalltalk product as implemented in this repository. It is written for another engineer or LLM that needs to understand what the product is, how it works, which parts are active, which parts are diagnostic, and where the current architecture still leaks older recorder behavior.
 
-Smalltalk is a desktop-first, local-first continuation product built with Tauri, Rust, React, SQLite, macOS native capture APIs, Accessibility, OCR, and optional OpenAI calls. Its primary user-facing primitive is `Continue`: a single answer that separates what the user is looking at now from where they should return to continue meaningful work.
+Smalltalk is a desktop-first, local-first continuation product built with Tauri, Rust, React, SQLite, macOS native capture APIs, Accessibility, OCR, and optional OpenAI calls. Its primary user-facing primitive is `Continue`: a single evidence-backed answer that explains what the user was doing, where they were doing it, what state was left behind, what should happen next, and whether an exact safe return target exists. The latest factual screen and the recommended return target remain separate facts.
 
 The active product lane is the native desktop app in the repository root. The older WXT browser extension remains in `browser-extension/`, but it is not the MVP path and should not be revived unless a task explicitly asks for browser-extension work.
 
 ## Changes Since The Previous Product Snapshot
 
-The previous product snapshot was last changed in commit `f241ceba` on 2026-07-05 and still described the implementation as of 2026-07-04. Ten subsequent commits, plus the current P4 working-tree changes, materially changed the product:
+The previous product snapshot covered the committed P1-P4 Continue hardening through the island no-bypass work. `ab37fa0b` and the current P5 activity-memory working tree materially extend that baseline:
 
 - Capture is explicitly sparse and event-driven. Native app, focus, Accessibility, click, key-category, scroll, and clipboard signals are stored cheaply; screenshots, AX trees, OCR, window graphs, and normalized content are stored only for accepted heavy frames.
 - Long-running local memory now has concrete pressure controls: event coalescing, native scroll/AX throttling, 4-second important and 45-second low-value heavy-capture intervals, a 24-frame rolling screenshot budget for low-value captures, three unchanged heavy frames per surface, a 512 MB snapshot pressure gate, image-plus-content deduplication, Smalltalk self-capture suppression, and cleanup caps for low-value frames and events.
@@ -26,6 +26,12 @@ The previous product snapshot was last changed in commit `f241ceba` on 2026-07-0
 - Continue audits are opt-in per explicit Continue action, asynchronous, proof-first, and lean by default. Startup/background refreshes do not create bundles; full SQLite/table/frame archives require an explicit full-raw mode.
 - The floating island is now a Continue consumer instead of a legacy resume bypass. It renders the typed `IslandContinueState`, opens only through a persisted `continue_decision_id`, records source-aware feedback/open telemetry, and fails closed when the main Continue policy would suppress the target.
 - SQLite access is hardened for long-running capture and concurrent status/Continue work: writable connections use WAL and `synchronous=NORMAL`, all connections use a 30-second busy timeout, read-only polling uses read-only connections, and `get_continue_decision` is serialized by a process-level lock.
+- P5 adds `smalltalk.activity_recap.v1`, an explanatory activity-memory contract on top of the existing decision engine. It distinguishes the inferred primary activity from target selection and carries separate activity and target confidence.
+- P5 builds a bounded, privacy-filtered input pack from current-surface facts, activity segments, actions, semantic moments, open loops, workstream state, branch contexts, surface snapshots, support evidence, and safe memory cells. It does not fall back to sending broad raw history.
+- P5 stitches those facts into a compact activity timeline, infers grounded work labels and where the work happened, distinguishes support/detours/interruptions from primary work, and synthesizes the last meaningful, unfinished, blocked, complete, idle, or unclear state plus a safe next action.
+- Optional recap model phrasing is disabled by default through `activity_recap_model_enabled`. When enabled, it can rewrite only a bounded local fact pack; local validation rejects unsupported claims and falls back to the deterministic recap.
+- Recap validity participates in decision cache identity through a recap watermark and policy fingerprint. Cache hits reuse the exact persisted recap, meaningful evidence or feedback invalidates it, and recap memory is explicitly prevented from influencing ranking, target eligibility, openability, or strict opening.
+- React and the native island now present the compact activity memory: what the work was, where, recent context, state left behind, next action, safe target, separate activity/target confidence, and missing evidence.
 
 Commit inventory reviewed for this update:
 
@@ -41,6 +47,7 @@ Commit inventory reviewed for this update:
 | `2196cdc5` | 2026-07-08 | Refactor continuation flow and evidence handling |
 | `abeb3622` | 2026-07-08 | Refine continuation flow and evidence handling |
 | `b0e4d0a3` | 2026-07-08 | Refine continue flow and evidence scoring |
+| `ab37fa0b` | 2026-07-10 | Refactor Continue decision flow and island audit checks |
 
 Because those commit subjects are broad, the rest of this document describes the current code paths and persisted contracts rather than trying to infer behavior from commit titles alone.
 
@@ -51,12 +58,14 @@ Smalltalk is continuation-first, not session-recorder-first.
 The first product screen should answer:
 
 1. What is the factual current focus?
-2. What workstream was the user probably trying to continue?
-3. What is the actionable return target?
-4. What was the last meaningful state?
-5. What should the user do next?
-6. What evidence supports this answer?
-7. What evidence is missing or thin?
+2. What was the user actually trying to do?
+3. In which app, page, conversation, file, or surface were they doing it?
+4. Which recent surfaces were primary work, support, detours, or interruptions?
+5. What meaningful, unfinished, blocked, complete, or unclear state was left behind?
+6. What should the user do next?
+7. Is there an actionable, safely openable return target?
+8. What evidence supports each claim?
+9. What evidence is missing or thin?
 
 Sessions, screenshots, timelines, raw events, frame inspectors, cloud resume bundles, native resume cards, search, evals, candidate score components, artifact-role tables, and raw database ids are support infrastructure. They are useful for evidence inspection and developer diagnostics, but they are not the default product.
 
@@ -66,6 +75,7 @@ The product must keep these concepts separate:
 | --- | --- | --- |
 | `current_focus` | The latest factual screen or artifact observed locally. | No. It may be a distraction, support page, diagnostic surface, or current app. |
 | `current_activity` | A local read of what appears to be happening now. | No. It explains current behavior only. |
+| `activity_recap` | Evidence-backed explanation of the primary work, where it happened, detours/support, state left behind, next action, and uncertainty. | No. It explains the decision and cannot create target eligibility. |
 | `selected_workstream` | The durable cluster of actions and artifacts Smalltalk thinks the user was working on. | Sometimes. It is the context for the decision. |
 | `return_target` | The artifact Smalltalk thinks the user should go back to. | Yes, when evidence quality is sufficient. |
 | `resume_work_target` | The actionable target inside the workstream, kept separate from support or branch evidence. | Yes. This is the preferred product target when present. |
@@ -87,6 +97,7 @@ Smalltalk must not store raw typed characters or full clipboard text. Keyboard a
 | `src-tauri/` | Rust/Tauri backend, command registration, capture runtime, SQLite store, Continue engine, macOS island integration. |
 | `src-tauri/src/capture.rs` | Active runtime facade for capture, storage, search, safe exports, cloud resume, local memory diagnostics, cleanup, and Tauri command wrappers. |
 | `src-tauri/src/continuation.rs` | Native Continue semantic memory, rebuild layers, scoring, decisions, feedback, breadcrumbs, eval, and default bounded micro-inference. |
+| `src-tauri/src/continuation/activity_recap*.rs` | P5 recap contract, bounded inputs, segment stitching, grounded work labels, detour/branch recap, last-state synthesis, optional model phrasing, validation, cache/memory integration, and deterministic tests. |
 | `src-tauri/src/lib.rs` | Tauri builder and command registration. |
 | `src-tauri/src/session_island.rs` | macOS floating-island Continue gateway, typed state contract, freshness memory, source-aware actions/feedback, and no-bypass audit hooks. |
 | `src-tauri/src/session_island/` | Island contract/gateway modules and tests extracted from the bridge. |
@@ -167,17 +178,19 @@ The main first screen is the `ContinueDecisionCard`. Depending on evidence state
 - Older context with fresher thin current work.
 - No-clear-continuation state.
 - Inference provenance: `AI-assisted`, `Local fallback`, or `Local only`.
-- Current focus.
-- Return target or best available return point.
-- Last meaningful state.
-- Next action.
-- Confidence and evidence notes.
+- Evidence-backed activity summary.
+- Where the activity happened when safely grounded.
+- Recent support, detour, or interruption context.
+- State left behind and next action.
+- Current focus as a separate factual surface.
+- Return target or honest no-safe-target state.
+- Separate activity and target confidence plus missing-evidence notes.
 - Primary `Continue here` action.
 - `Inspect evidence` action.
 - Alternative continuation targets when present.
 - Collapsed correction controls behind `Wrong target?`.
 
-The product card invokes bounded AI Continue by default:
+The product card always enables candidate-bounded target inference. It enables recap model phrasing only for an explicit manual Continue/Refresh/Rebuild action; startup and background refreshes keep recap synthesis local:
 
 ```ts
 await invoke("get_continue_decision", {
@@ -185,6 +198,7 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
+    activity_recap_model_enabled: trigger === "manual",
     max_candidates_for_model: 5,
     audit_output_enabled: options.writeAudit === true
   }
@@ -241,14 +255,17 @@ The frontend also has a developer diagnostics `<details>` panel. It contains wor
 
 ## Current Product Failure Boundary
 
-The backend now has a real Continue/workstream architecture, but the visible product can still feel like an old recorder/debug dashboard when diagnostics are open. This is not just visual polish. It is a product-boundary issue.
+The backend now has a real Continue/workstream architecture and an evidence-backed activity recap. The product can explain a dominant activity even when the exact page or target is missing, but it still cannot claim details that local evidence did not capture. A correct answer may therefore be: the work and app are understood, a brief Finder/search/message surface was a detour, the state left behind is only partially known, and no exact safe target can be reopened.
 
-The current repo has four overlapping paths:
+The visible product can still feel like an old recorder/debug dashboard when diagnostics are open. This is not just visual polish. It is a product-boundary issue.
+
+The current repo has five overlapping paths:
 
 | Path | Current state |
 | --- | --- |
 | React Continue shell | Primary screen is Continue-first, but diagnostics still expose many internal layers. |
 | Continue backend | Real layered semantic memory and scoring engine. |
+| P5 activity memory | Evidence-backed explanatory recap over the decision; it cannot override target policy or compensate for missing page/file identity. |
 | Capture/evidence backend | Operational evidence substrate with lightweight-first signals and sparse, budgeted heavy frames. |
 | Floating island | Typed Continue-first consumer using the same backend decision and strict-open policy as the main card; legacy session/cloud routes are diagnostic-only. |
 
@@ -1012,7 +1029,7 @@ Native Continue is implemented in `src-tauri/src/continuation.rs` and exposed th
 
 Continue is additive on top of the local capture store. It does not require Stop Session. It does not use the browser extension. It does not send broad raw history to a model.
 
-The implementation is easiest to understand as seven stages:
+The implementation is easiest to understand as eight stages:
 
 1. Evidence substrate.
 2. Text attribution and weak-surface enrichment.
@@ -1020,7 +1037,8 @@ The implementation is easiest to understand as seven stages:
 4. Episodes, workstreams, branch contexts, state snapshots, and open loops.
 5. Current-surface resolution, freshness, candidate generation, retrieval, scoring, feedback, and quality gates.
 6. Optional bounded micro-inference over locally supplied candidates, with local validation and fallback.
-7. Persisted decision consumed by React, the native island, strict open, feedback, trace, eval, and optional audit output.
+7. P5 activity recap over bounded decision/evidence facts: timeline stitching, grounded work and location labels, detours, state left behind, next action, optional validated phrasing, and narrative memory.
+8. Persisted decision consumed by React, the native island, strict open, feedback, trace, eval, and optional audit output.
 
 ### Layer 1: Evidence Substrate
 
@@ -1337,6 +1355,7 @@ Default backend request values:
 - `mode`: `normal`
 - `rebuild_layers`: false
 - `micro_inference_enabled`: true
+- `activity_recap_model_enabled`: false
 - `max_candidates_for_model`: 5
 - `audit_output_enabled`: false
 
@@ -1348,6 +1367,7 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
+    activity_recap_model_enabled: trigger === "manual",
     max_candidates_for_model: 5,
     audit_output_enabled: options.writeAudit === true
   }
@@ -1362,6 +1382,7 @@ await invoke("get_continue_decision", {
     mode: "rebuild",
     rebuild_layers: true,
     micro_inference_enabled: true,
+    activity_recap_model_enabled: true,
     max_candidates_for_model: 5,
     audit_output_enabled: true
   }
@@ -1380,7 +1401,7 @@ The Tauri wrapper serializes `get_continue_decision` with `CONTINUE_DECISION_LOC
 2. Normalize request defaults.
 3. Determine normal versus rebuild mode.
 4. Build an evidence watermark from frames, events, semantic moments, boundary revisions, feedback, opens, and surface snapshots.
-5. Try a cached decision only when inference policy, watermark, boundary state, feedback/open watermarks, and freshness still match.
+5. Try a cached decision only when inference policy, evidence and recap watermarks, recap policy fingerprint, boundary state, feedback/open watermarks, and freshness still match.
 6. Infer matured pending feedback for prior open events when no cache is reused.
 7. Run bounded pre-decision weak-surface enrichment when current evidence needs it.
 8. Rebuild semantic layer 2 and workstream layer 3 incrementally when needed.
@@ -1396,9 +1417,12 @@ The Tauri wrapper serializes `get_continue_decision` with `CONTINUE_DECISION_LOC
 18. Run micro-inference when enabled and eligible candidates exist, then validate the selected ids, semantics, evidence quality, feedback state, branch state, and public copy.
 19. Build the evidence-freshness ledger and suppress stale target revival when fresher current work exists.
 20. Compose locally governed handoff copy and gate public `return_target` / `resume_work_target` independently from diagnostic candidates.
-21. Build a stable decision id and persist `continue_decisions` when appropriate.
-22. Return the decision, current-work fact, quality signals, anchors, support evidence, alternatives, freshness, retrieval, provenance, warnings, and optional audit path.
-23. If and only if `audit_output_enabled` is true, schedule the lean proof-first audit asynchronously after the decision is ready.
+21. Build a stable decision id and persist the target-selection part of `continue_decisions` when appropriate.
+22. Build the bounded P5 recap inputs, stitch recent activity, infer grounded work/location labels, classify detours/support, and synthesize last/unfinished state and next action.
+23. Optionally run bounded recap phrasing when `activity_recap_model_enabled` is true, then validate every rewritten claim against supplied terms, evidence handles, confidence, detour identity, and target policy.
+24. Reuse or persist the exact recap, decision proof, recap watermark, and recap policy fingerprint; promote only validated medium/high-confidence narrative memory with stable non-memory anchors.
+25. Return the decision, activity recap, current-work fact, quality signals, anchors, support evidence, alternatives, freshness, retrieval, provenance, warnings, and optional audit path.
+26. If and only if `audit_output_enabled` is true, schedule the lean proof-first audit asynchronously after the decision is ready.
 
 Candidate kinds:
 
@@ -1488,6 +1512,8 @@ Hard suppression is applied before sorting/selection. Candidates rejected by fee
 - Continue dossier and memory-retrieval report
 - observe-before-decide and weak-surface enrichment diagnostics
 - app-activity summary and quality gate
+- `activity_recap`
+- `activity_recap_watermark_hash`
 - micro-inference requested/attempted/result-kind fields
 - optional `continue_output_path`
 
@@ -1511,15 +1537,134 @@ Confidence labels are derived from numeric confidence. Low confidence should be 
 A Continue answer must be explainable through anchors:
 
 - frame ids
+- event ids
 - action ids
 - episode ids
 - artifact ids
+- workstream ids
+- open-loop ids
+- branch-context ids
+- surface-snapshot ids
+- safe narrative-memory ids when prior context is explicitly used
 
-The UI should productize these into evidence previews and concise explanations. Raw ids belong in diagnostics.
+The core decision keeps its frame/action/episode/artifact closure, while P5 `evidence_spans` can use the broader typed anchor set above for individual narrative claims. The UI should productize these into evidence previews and concise explanations. Raw ids belong in diagnostics.
+
+## P5 Activity Memory And Recap
+
+P5 is an explanatory layer over the existing P1-P4 Continue decision. It does not replace candidate generation, scoring, branch policy, feedback suppression, quality gates, target validation, or strict open. Its job is to answer the part target selection alone cannot answer: what the user was doing, where they were doing it, what happened around that work, what state was left behind, and what can safely be suggested next.
+
+### Public Recap Contract
+
+`ContinueDecisionResult.activity_recap` uses `smalltalk.activity_recap.v1`. Its public fields include:
+
+- `primary_work_summary`: concise evidence-backed description of the main activity.
+- `primary_work_label`: grounded activity label such as writing, planning, debugging, reviewing, reading documentation, or browsing files.
+- `primary_where_summary`: app, page, conversation, file, repository, or other surface label only when safely grounded.
+- `activity_confidence`: confidence in the activity narrative, independent of target availability.
+- `target_confidence`: confidence in the actionable return target, independent of activity understanding.
+- `current_state`: `actively_working`, `recently_detoured`, `paused_after_progress`, `blocked`, `complete_or_idle`, or `unclear`.
+- `last_meaningful_state`, `unfinished_state`, and `next_action_summary`.
+- `recent_detours` and `supporting_context`, each with typed roles, confidence, and evidence anchors.
+- `why_this_target` or `why_no_safe_target`.
+- `missing_evidence`, `warnings`, and per-claim `evidence_spans`.
+- `generated_by`: `local`, `model_assisted`, or `fallback`.
+- `validation_status`: `valid`, `thin`, `rejected`, or `fallback`.
+
+Every public recap claim is sanitized, length-bounded, and required to retain an evidence span. Private locators, raw paths, URLs, internal ids, unsupported opaque handles, and ungrounded claims are removed rather than converted into plausible copy. A recap may confidently describe recent activity while keeping `target_confidence` low and both public target fields null.
+
+### Bounded Evidence Inputs
+
+`build_activity_recap_inputs` runs after current-surface resolution and target selection. It creates `smalltalk.activity_recap_inputs.v1` from already governed local facts:
+
+- current surface and its evidence quality, identity confidence, openability, and missing evidence;
+- selected workstream, selected candidate, `return_target`, and `resume_work_target`;
+- recent app-activity segments and classifications;
+- task actions and semantic moments;
+- open loops and workstream state snapshots;
+- branch contexts and promotion state;
+- weak-surface snapshots;
+- support evidence with explicit evidence-anchor ids;
+- bounded safe memory facts;
+- existing quality-gate, freshness, unresolved-current-work, and app-activity summaries.
+
+Default caps are 12 activity segments, 40 actions, 30 semantic moments, 8 open loops, 8 workstream states, 8 branch contexts, 8 surface snapshots, 12 memory cells, and 12 support items. Selected-candidate relevance is bounded to seven days. Privacy-blocked, self/debug, unsafe-path, and non-claim-eligible facts are filtered or reduced to safe metadata. This layer does not make write-side capture calls and does not use raw-history fallback as its normal path.
+
+### Activity Timeline And Primary Work
+
+`stitch_activity_segments` compresses graph evidence into at most six relevant segments. A segment can be classified as primary work, supporting work, detour, interruption, returned work, current-focus-only, or unclear. Adjacent evidence is merged only when identity and semantic boundaries agree; content changes, meaningful actions, returns, and branch transitions preserve boundaries.
+
+Primary selection favors direct primary actions, selected-workstream continuity, stable work value, strong evidence, and explicit return evidence. A latest screen does not automatically become primary work. Brief Finder, Photos, search, documentation, terminal-output, messaging, and diagnostic surfaces remain detours or support unless fresh local promotion evidence shows that the branch became the unfinished task.
+
+The grounded objective layer derives the activity kind and safe object/location terms from primary actions, snapshots, workstream evidence, and the stitched timeline. Browser chrome, generic app-only titles, sensitive fields, private locators, support/interrupt actions, and contradictory branch evidence are rejected as label sources. Where evidence supports only an app or broad surface, the recap stays broad instead of inventing a page, conversation, repository, or file.
+
+### Detours, State Left Behind, And Next Action
+
+Detour recap keeps at most three public detours and three supporting-context items. Typed roles distinguish support, detour, interrupt, current-focus-only, promoted-primary, and unclear surfaces. Search/docs/messages/terminal/diagnostic branches can explain how the user got context or verified work without becoming the public return target.
+
+Last-state synthesis combines grounded actions, open loops, workstream state, current-versus-primary continuity, snapshots, completion evidence, and blocker evidence. It can describe progress, an unfinished step, an unresolved blocker, completion/idle state, or uncertainty. `why_this_target` is emitted only for a locally eligible target; otherwise `why_no_safe_target` explains that activity may be understood even though no exact URL, path, page, thread, file, or other safely openable target is grounded.
+
+The next action is constrained to evidence-backed continuation state. It cannot tell the user to open a target that local policy suppressed, promote a support branch, restore a rejected target, or manufacture a missing locator.
+
+### Optional Bounded Recap Phrasing
+
+`ContinueDecisionRequest.activity_recap_model_enabled` defaults to `false`. When false, the deterministic local recap is returned without a recap model call. The React startup/background paths send false; explicit manual Continue, Refresh Continue, diagnostic rebuild, and explicit island Continue actions send true. This flag is separate from `micro_inference_enabled`, which controls candidate-bounded target inference.
+
+When recap phrasing is explicitly enabled, the model receives `smalltalk.activity_recap_model_pack.v1`, containing only bounded current-surface facts, a primary segment, typed detours/support, the local recap seed, objective terms, safe next-action candidates, target policy, missing evidence, allowed term banks, and opaque evidence handles. The request uses Structured Outputs and a shorter bounded transport path. Raw screenshots, raw timelines, database dumps, typed characters, full clipboard text, private locators, and unfiltered history are excluded.
+
+Local validation rejects or repairs output that:
+
+- uses unsupported terms or evidence handles;
+- changes activity or target confidence beyond local evidence;
+- describes an unknown detour or changes its role into primary work;
+- claims an openable target when local target policy says none exists;
+- emits a page, path, URL, id, state, next action, or target explanation not present in the bounded facts;
+- leaks internal/private text or exceeds public-copy limits.
+
+Configuration, transport, parsing, or validation failure returns the local recap with explicit fallback/rejected status and warnings. Model-assisted phrasing never changes candidate identity, ranking, eligibility, openability, branch promotion, feedback suppression, `return_target`, or `resume_work_target`.
+
+### Cache, Persistence, Trace, Feedback, And Memory
+
+Recap cache identity combines pipeline version, recap schema, model-enabled policy, effective model, and the full Continue evidence watermark. The evidence watermark covers meaningful frames/segments/classifications, branch contexts, surface snapshots, breadcrumbs, feedback, and decision-open events. Stable recomputation does not rewrite activity-classification identity merely to invalidate its own cache, and low-value mouse noise is not treated as a semantic recap change.
+
+`continue_decisions` persists:
+
+- `activity_recap_json`;
+- `activity_recap_detail_json` containing `smalltalk.activity_recap_decision_proof.v1`;
+- `activity_recap_watermark_hash`;
+- `activity_recap_policy_fingerprint`;
+- `activity_recap_model_requested`.
+
+A matching cache hit loads the exact stored recap and proof without rerunning synthesis. `ContinueDecisionTrace.activity_recap` exposes the same proof: bounded input summary, stitched timeline, work labels, detours, last-state derivation, model/fallback status, validation failures, and final recap.
+
+Only valid medium/high-confidence recaps with a safe workstream or artifact scope and stable non-memory anchors can promote narrative cells: `activity_workstream_summary`, `activity_primary_label`, and `activity_last_good_recap`. Prior narrative memory may provide clearly labeled low-confidence context when fresh activity detail is thin, but it cannot create a target claim. Rejected, ignored, corrected, artifact-only, or ignored-workstream feedback downgrades matching recap memory into `activity_recap_rejected`; accepted feedback can strengthen matching narrative memory. A user next-step note stays neutral.
+
+Narrative memory is hard-isolated from target selection. `memory_candidate_links` returns no candidate support/contradiction links for narrative memory types, so recap memory cannot affect ranking priors, candidate eligibility, target choice, alternatives, model candidate packs, openability, or strict open.
+
+### Audit Proof
+
+Only explicit audit-enabled Continue actions write recap proof files. The asynchronous lean audit adds `activity_recap/` with:
+
+- `inputs_summary.json`
+- `stitched_timeline.json`
+- `work_labels.json`
+- `detours.json`
+- `last_state.json`
+- `final_recap.json`
+- `validation.json`
+- `model_pack.json`
+- `openai_request.redacted.json`
+- `raw_response.json`
+- `parsed_output.json`
+- `model_validation.json`
+- `fallback.json`
+
+When recap model phrasing was disabled or explicit audit retention was not requested, model-related files contain honest skipped/not-retained status rather than invented request or response data. This is implemented proof export, not a claim that every future P5 audit/eval roadmap metric already exists.
 
 ## Default Bounded Micro-Inference
 
 OpenAI micro-inference is the default Continue path. It is still bounded to local candidate ids, locally validated, and cache-aware. It does not receive broad raw history.
+
+This target-selection inference is separate from P5 recap phrasing. `micro_inference_enabled: true` may choose among locally eligible candidates. Recap phrasing defaults off in the backend and stays local for startup/background refreshes, while the React manual Continue path explicitly enables it. Neither model path can override hard local safety gates.
 
 The normal request is:
 
@@ -1529,6 +1674,7 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
+    activity_recap_model_enabled: false,
     max_candidates_for_model: 5
   }
 });
@@ -1916,6 +2062,8 @@ Important frontend state includes:
 - `evidenceOpen`
 - `diagnosticsOpen`
 
+The P5 recap is carried inside `continueDecision.activity_recap`; React does not run a separate narrative request. `usableActivityRecap` accepts only `smalltalk.activity_recap.v1`, and product-copy filters reject private locators, URLs, paths, internal ids, semantic/debug labels, and scorer terminology before rendering.
+
 The app refreshes status immediately on mount and then polls:
 
 - every 1.5 seconds while local memory is running
@@ -1942,6 +2090,19 @@ The UI marks a decision stale when the live frame count exceeds the frame count 
 The production freshness path is broader than frame count. React maintains a `ContinueEvidenceSnapshot`/`ContinueFreshness` signature covering frames, events/signals, Continue-memory counts, and island/backend update information. Refreshes are debounced, guarded against overlap, and avoid recomputing the same stale signature. The backend remains authoritative through its evidence watermark, boundary revisions, surface snapshots, feedback watermark, and open watermark.
 
 Startup/background Continue calls use `writeAudit: false`. Main Continue, Refresh Continue, diagnostic Rebuild Continue, and explicit island Continue can request `writeAudit: true`. After the main card receives a decision, it synchronizes the island using the existing decision id with `allow_refresh: false` rather than launching duplicate work.
+
+When a usable recap exists, the primary card presents:
+
+1. `You were working on` plus the grounded activity summary.
+2. `Where` when the app/page/file/conversation surface is safe and supported.
+3. `Recent context` for bounded detour or support summaries.
+4. `State left behind`.
+5. `Next`.
+6. The separate safe return-target block or `Exact return target missing`.
+7. Independent activity and target confidence.
+8. Why-this-target/no-safe-target reasoning and missing evidence.
+
+The recap may improve the headline and state explanation in openable, thin-current-work, enriched-but-not-openable, older-context, and no-clear-continuation modes. It does not change whether `Continue here` is available. That action still requires a non-empty decision id, non-`no_clear_continuation` output, an openable non-support target, and the backend's strict-open policy.
 
 ## Diagnostics UI
 
@@ -1972,6 +2133,9 @@ The macOS floating island is now a typed Continue-first consumer. Rust exposes `
 - display state;
 - decision id;
 - current focus/activity;
+- activity label, summary, where, and state;
+- separate activity and target confidence labels;
+- bounded recent-context summary;
 - selected workstream title;
 - return and resume-work target summaries;
 - next action and confidence label;
@@ -1981,6 +2145,8 @@ The macOS floating island is now a typed Continue-first consumer. Rust exposes `
 Swift decodes this nested DTO and dispatches typed actions such as `refresh_continue`, `open_continue_target`, `mark_wrong_target`, `mark_not_useful`, `inspect_evidence`, `open_smalltalk`, `start_local_memory`, and `capture_evidence_now`. Legacy cloud/session/trail/native-resume routes remain diagnostic-only and cannot supply the island's primary target/open behavior.
 
 The island obtains state from the same `get_continue_decision` backend contract as the main card or from a fresh remembered decision. Its primary open requires `source = island_primary`, `strict_continue_target = true`, and a non-empty `continue_decision_id`; legacy path/session/frame fallbacks are rejected before resolution. Feedback uses existing feedback kinds with `source = island_primary`. Frame/event, feedback, and open watermarks invalidate remembered island state.
+
+Rust maps the same persisted recap into island fields; Swift displays the compact hierarchy without recomputing or widening claims. Thin or no-clear states can still show useful activity memory, state, context, and missing evidence, but they cannot expose the primary open action unless the same decision is currently safe and openable in the main Continue contract.
 
 P4 no-bypass coverage writes sanitized `decision/island_continue_audit.json` metadata and tracks island bypass, legacy primary route, open-without-decision-id, suppressed-target open, main-card disagreement, and valid-open counters. The repeatable manual checklist is `docs/p4-island-no-bypass-manual-qa.md`.
 
@@ -1994,6 +2160,16 @@ What is real now:
 - Continue can run without stopping local memory.
 - Normal Continue mode can reuse cached decisions.
 - Default micro-inference can fall back locally and reuse that cached fallback when evidence has not changed.
+- Every new Continue result carries `smalltalk.activity_recap.v1`, including independent activity/target confidence, current state, evidence-backed narrative fields, detours/support, missing evidence, and per-claim anchors.
+- Activity recap inputs are bounded and privacy-filtered; recap generation does not send broad raw history or use raw-history fallback as the normal path.
+- Deterministic P5 stitching distinguishes primary work, support, detours, interruptions, returns, and current-focus-only surfaces before inferring a work label or state.
+- Activity/location labels are grounded in eligible actions, snapshots, segments, workstream evidence, and evidence spans. Generic chrome, private locators, support-only actions, and unsafe internal labels are rejected.
+- Last-state synthesis can distinguish active work, recent detour, pause after progress, blocker, complete/idle, and unclear state while keeping no-safe-target copy honest.
+- Recap model phrasing exists and defaults off in the backend. React manual Continue/Refresh/Rebuild and explicit island Continue actions enable it; startup/background recaps stay local. When enabled it uses a bounded Structured Outputs pack, local term/handle/target-policy validation, and deterministic fallback.
+- Recap cache identity includes evidence plus recap/model policy. Matching cache hits reuse the exact stored recap and proof without rerunning synthesis.
+- Valid grounded recap memory can be promoted and adjusted by feedback, but narrative memory is isolated from candidate ranking, target eligibility, alternatives, openability, and strict open.
+- React and the native island consume the same persisted recap and display compact activity, location, context, state, next action, confidence, and missing-evidence copy.
+- Explicit audit-enabled Continue outputs include an `activity_recap/` proof directory; background/startup decisions still do not create audit bundles.
 - Continue handoff copy is persisted and filtered so internal candidate/workstream/artifact/frame ids do not become user-facing product text.
 - Only explicit audit-enabled Continue actions schedule a `continue_outputs/` bundle. Startup/background calls do not write one. Folder names begin with the resolved capture session label.
 - Audit generation runs asynchronously and is lean/proof-first by default; full raw archives are opt-in.
@@ -2021,6 +2197,11 @@ What should not be claimed:
 - Do not claim cloud resume is the primary product engine.
 - Do not claim screenshots are the only memory.
 - Do not claim model output is trusted without validation.
+- Do not claim recap model phrasing runs by default; `activity_recap_model_enabled` defaults to false.
+- Do not claim activity confidence implies target confidence or openability.
+- Do not claim P5 activity memory changes candidate ranking or can restore/promote a target.
+- Do not claim a page, thread, file, repository, or URL is known when only an app or broad surface is grounded.
+- Do not claim a brief latest detour is the primary task merely because it is the current focus.
 - Do not claim storage is lightweight unless diagnostics prove it.
 - Do not claim a one-hour session stores a continuous replay, a fixed frame count, or automatic hour-boundary cleanup.
 - Do not claim the 512 MB snapshot budget is a hard disk cap; it gates new non-important heavy captures and requires explicit cleanup to reclaim space.
@@ -2033,8 +2214,14 @@ Use these product words:
 - Continue
 - local memory
 - current focus
+- what you were working on
+- where
+- recent context
+- state left behind
 - return target
 - workstream
+- activity confidence
+- target confidence
 - evidence
 - next action
 - confidence
@@ -2066,7 +2253,7 @@ When changing Smalltalk, check these boundaries:
 
 1. Does the primary screen still produce one continuation answer?
 2. Does Continue work without Stop Session?
-3. Are `current_focus`, `return_target`, and `resume_work_target` still separate?
+3. Are `current_focus`, `activity_recap`, `return_target`, and `resume_work_target` still separate?
 4. Are branch/support surfaces prevented from becoming default return targets unless evidence supports it?
 5. Does every answer have frame/action/episode/artifact anchors?
 6. Does thin evidence remain explicit?
@@ -2076,6 +2263,9 @@ When changing Smalltalk, check these boundaries:
 10. Are diagnostics kept out of the first-run product surface?
 11. Are storage budgets, cleanup, and skip counters preserved?
 12. Are tests added for deterministic classifier/scoring/storage changes?
+13. Does every public activity-recap claim retain a valid evidence span?
+14. Can activity memory still explain thin work without creating an openable target?
+15. Are recap memory and optional model phrasing still unable to affect ranking, eligibility, promotion, or strict open?
 
 ## Recommended Verification For A Product Change
 
@@ -2104,6 +2294,10 @@ Manual QA should verify:
 - Continue runs while local memory is active.
 - Continue also returns a thin-evidence answer when evidence is insufficient.
 - Current focus and return target are visibly separate.
+- Activity summary, location, recent context, state left behind, and next action are shown only when grounded.
+- Activity and target confidence can differ without collapsing into one confidence claim.
+- A brief Finder/search/docs/messages/terminal detour remains context unless local evidence promotes it.
+- Useful activity memory can appear when the exact safe target is missing, without showing `Continue here`.
 - The primary target can be opened or falls back to evidence inspection.
 - Wrong-target correction records feedback.
 - Alternatives can be selected without inventing missing URLs.
@@ -2127,6 +2321,12 @@ Manual QA should verify:
 | Candidate | A scored possible continuation target. |
 | Decision | Persisted Continue answer with source, confidence, validation, warnings, and anchors. |
 | Current focus | Latest factual observed screen/artifact. |
+| Activity recap | Evidence-backed explanation of the primary work, where it happened, recent context, state left behind, next action, uncertainty, and target rationale. |
+| Activity confidence | Confidence that Smalltalk understands what the user was doing; it does not imply a safe return target. |
+| Target confidence | Confidence in the exact actionable return target; it can remain low or none even when activity confidence is higher. |
+| Activity segment | Bounded interval of related app/surface evidence used to distinguish primary work, support, detours, interruptions, returns, and current-focus-only activity. |
+| Detour | Recent surface that explains context switching but is not primary work unless fresh local promotion evidence says otherwise. |
+| Supporting context | Search, docs, terminal output, messages, diagnostics, or other evidence used around the primary work without becoming its default target. |
 | Return target | Where Smalltalk thinks the user should go back. |
 | Resume work target | The actionable target inside the workstream. |
 | Breadcrumb | Manual local next-step note attached to a workstream. |
@@ -2134,4 +2334,6 @@ Manual QA should verify:
 | Resume-query bundle | Stop-time bounded export for cloud resume, separate from native Continue. |
 | Cloud resume | Older OpenAI path over resume-query bundles. |
 | Micro-inference | Optional candidate-bounded OpenAI ranking/phrasing layer for Continue. |
+| Recap model phrasing | Separately gated, disabled-by-default model rewrite of bounded local recap facts; locally validated and unable to alter target policy. |
 | Evidence anchor | Frame/action/episode/artifact id that explains a Continue result. |
+| Evidence span | Per-claim mapping from public recap copy to bounded local frame, event, action, episode, workstream, open-loop, branch, snapshot, or memory anchors. |

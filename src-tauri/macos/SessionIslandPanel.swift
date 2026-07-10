@@ -86,6 +86,13 @@ private struct IslandContinueState: Decodable, Equatable {
     var decisionId: String?
     var currentFocus: IslandFocusSummary?
     var currentActivity: String?
+    var activityLabel: String?
+    var activitySummary: String?
+    var activityWhere: String?
+    var activityState: String?
+    var activityConfidenceLabel: String?
+    var targetConfidenceLabel: String?
+    var recentContextSummary: String?
     var selectedWorkstreamTitle: String?
     var returnTarget: IslandTargetSummary?
     var resumeWorkTarget: IslandTargetSummary?
@@ -102,6 +109,13 @@ private struct IslandContinueState: Decodable, Equatable {
         case decisionId = "decision_id"
         case currentFocus = "current_focus"
         case currentActivity = "current_activity"
+        case activityLabel = "activity_label"
+        case activitySummary = "activity_summary"
+        case activityWhere = "activity_where"
+        case activityState = "activity_state"
+        case activityConfidenceLabel = "activity_confidence_label"
+        case targetConfidenceLabel = "target_confidence_label"
+        case recentContextSummary = "recent_context_summary"
         case selectedWorkstreamTitle = "selected_workstream_title"
         case returnTarget = "return_target"
         case resumeWorkTarget = "resume_work_target"
@@ -119,6 +133,13 @@ private struct IslandContinueState: Decodable, Equatable {
         decisionId: String? = nil,
         currentFocus: IslandFocusSummary? = nil,
         currentActivity: String? = nil,
+        activityLabel: String? = nil,
+        activitySummary: String? = nil,
+        activityWhere: String? = nil,
+        activityState: String? = nil,
+        activityConfidenceLabel: String? = nil,
+        targetConfidenceLabel: String? = nil,
+        recentContextSummary: String? = nil,
         selectedWorkstreamTitle: String? = nil,
         returnTarget: IslandTargetSummary? = nil,
         resumeWorkTarget: IslandTargetSummary? = nil,
@@ -134,6 +155,13 @@ private struct IslandContinueState: Decodable, Equatable {
         self.decisionId = decisionId
         self.currentFocus = currentFocus
         self.currentActivity = currentActivity
+        self.activityLabel = activityLabel
+        self.activitySummary = activitySummary
+        self.activityWhere = activityWhere
+        self.activityState = activityState
+        self.activityConfidenceLabel = activityConfidenceLabel
+        self.targetConfidenceLabel = targetConfidenceLabel
+        self.recentContextSummary = recentContextSummary
         self.selectedWorkstreamTitle = selectedWorkstreamTitle
         self.returnTarget = returnTarget
         self.resumeWorkTarget = resumeWorkTarget
@@ -152,6 +180,13 @@ private struct IslandContinueState: Decodable, Equatable {
         decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
         currentFocus = try container.decodeIfPresent(IslandFocusSummary.self, forKey: .currentFocus)
         currentActivity = try container.decodeIfPresent(String.self, forKey: .currentActivity)
+        activityLabel = try container.decodeIfPresent(String.self, forKey: .activityLabel)
+        activitySummary = try container.decodeIfPresent(String.self, forKey: .activitySummary)
+        activityWhere = try container.decodeIfPresent(String.self, forKey: .activityWhere)
+        activityState = try container.decodeIfPresent(String.self, forKey: .activityState)
+        activityConfidenceLabel = try container.decodeIfPresent(String.self, forKey: .activityConfidenceLabel)
+        targetConfidenceLabel = try container.decodeIfPresent(String.self, forKey: .targetConfidenceLabel)
+        recentContextSummary = try container.decodeIfPresent(String.self, forKey: .recentContextSummary)
         selectedWorkstreamTitle = try container.decodeIfPresent(String.self, forKey: .selectedWorkstreamTitle)
         returnTarget = try container.decodeIfPresent(IslandTargetSummary.self, forKey: .returnTarget)
         resumeWorkTarget = try container.decodeIfPresent(IslandTargetSummary.self, forKey: .resumeWorkTarget)
@@ -693,7 +728,7 @@ private let kBaseMicroHitH: CGFloat = 24
 private let kBaseMicroVisualW: CGFloat = 58
 private let kBaseMicroVisualH: CGFloat = 10
 private let kBaseExpandedW: CGFloat = 520
-private let kBaseExpandedH: CGFloat = 268
+private let kBaseExpandedH: CGFloat = 304
 private let kAnimDur = 0.2
 private let kIdleMicroDelay: TimeInterval = 5.0
 private let kPanelFrameAnimDur = 0.32
@@ -800,17 +835,13 @@ private struct SessionIslandView: View {
         case .checkingContinue:
             return "Looking for the safest return point"
         case .continueReady:
-            return shortTargetTitle
-        case .thinCurrentWork:
-            return "Exact return target is unclear"
-        case .targetSuppressed:
-            return "Previous target was suppressed"
-        case .supportBlocked:
-            return "Not enough evidence to return there"
+            return compactActivityLine ?? shortTargetTitle
+        case .thinCurrentWork, .targetSuppressed, .supportBlocked:
+            return compactUncertainActivityLine ?? "Exact return target is unclear"
         case .needsRefresh:
             return "Newer local evidence is available"
         case .inspectOnly, .noClearContinuation:
-            return "Evidence is available to inspect"
+            return compactUncertainActivityLine ?? "Evidence is available to inspect"
         case .error:
             return "Open Smalltalk to inspect local memory"
         }
@@ -838,16 +869,21 @@ private struct SessionIslandView: View {
     }
 
     private var primaryContinueAction: IslandAvailableAction {
-        firstEnabledAction(in: [
-            .openContinueTarget,
-            .markWrongTarget,
-            .markNotUseful,
-            .refreshContinue,
-            .inspectEvidence,
-            .openSmalltalk,
-            .startLocalMemory,
-            .captureEvidenceNow,
-        ]) ?? IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
+        let priority: [IslandActionKind]
+        switch displayState {
+        case .continueReady:
+            priority = [.openContinueTarget, .inspectEvidence, .openSmalltalk, .refreshContinue]
+        case .needsRefresh, .checkingContinue:
+            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk]
+        case .thinCurrentWork, .targetSuppressed, .supportBlocked, .inspectOnly, .noClearContinuation:
+            priority = [.inspectEvidence, .openSmalltalk, .captureEvidenceNow, .refreshContinue]
+        case .noLocalMemory, .localMemoryWarming:
+            priority = [.startLocalMemory, .captureEvidenceNow, .openSmalltalk]
+        case .error:
+            priority = [.openSmalltalk]
+        }
+        return firstEnabledAction(in: priority)
+            ?? IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
     }
 
     private var secondaryContinueAction: IslandAvailableAction? {
@@ -926,6 +962,49 @@ private struct SessionIslandView: View {
             ?? "Current focus is unclear"
     }
 
+    private var activitySummaryLine: String? {
+        trimmed(continueState.activitySummary).nonEmpty
+    }
+
+    private var compactActivityLine: String? {
+        trimmed(continueState.activityLabel).nonEmpty
+            ?? trimmed(continueState.activitySummary).nonEmpty
+    }
+
+    private var compactUncertainActivityLine: String? {
+        if let activity = compactActivityLine {
+            return activity
+        }
+        let whereLine = trimmed(continueState.activityWhere).nonEmpty
+        let contextLine = trimmed(continueState.recentContextSummary).nonEmpty
+        if let whereLine, let contextLine {
+            return "\(whereLine) · \(contextLine)"
+        }
+        return whereLine ?? contextLine
+    }
+
+    private var activityWhereLine: String? {
+        trimmed(continueState.activityWhere).nonEmpty
+    }
+
+    private var activityStateLine: String? {
+        trimmed(continueState.activityState).nonEmpty
+    }
+
+    private var activityConfidenceLine: String? {
+        guard let confidence = trimmed(continueState.activityConfidenceLabel).nonEmpty else { return nil }
+        return confidence.capitalized
+    }
+
+    private var targetConfidenceLine: String? {
+        guard let confidence = trimmed(continueState.targetConfidenceLabel).nonEmpty else { return nil }
+        return confidence.capitalized
+    }
+
+    private var recentContextLine: String? {
+        trimmed(continueState.recentContextSummary).nonEmpty
+    }
+
     private var returnTargetLine: String {
         trimmed(continueState.returnTarget?.title)
             .nonEmpty
@@ -939,7 +1018,21 @@ private struct SessionIslandView: View {
 
     private var confidenceLine: String? {
         guard let confidence = trimmed(continueState.confidenceLabel).nonEmpty else { return nil }
-        return "\(confidence) confidence"
+        return confidence.capitalized
+    }
+
+    private var combinedConfidenceLine: String? {
+        var parts: [String] = []
+        if let activityConfidenceLine {
+            parts.append("Activity \(activityConfidenceLine)")
+        }
+        if let targetConfidenceLine {
+            parts.append("Target \(targetConfidenceLine)")
+        }
+        if !parts.isEmpty {
+            return parts.joined(separator: " · ")
+        }
+        return confidenceLine.map { "Overall \($0)" }
     }
 
     private var missingEvidenceLine: String? {
@@ -1252,12 +1345,19 @@ private struct SessionIslandView: View {
                 .frame(width: s(104), alignment: .trailing)
             }
 
-            VStack(alignment: .leading, spacing: s(7)) {
-                ContinueDetailRow(label: "Current focus", value: currentFocusLine, scale: scale)
-                ContinueDetailRow(label: "Return target", value: returnTargetLine, scale: scale)
-                ContinueDetailRow(label: "Next action", value: nextActionLine, scale: scale)
-                if let confidenceLine {
-                    ContinueDetailRow(label: "Confidence", value: confidenceLine, scale: scale)
+            VStack(alignment: .leading, spacing: s(6)) {
+                ContinueDetailRow(label: "What", value: activitySummaryLine ?? secondaryDisplayText, scale: scale)
+                ContinueDetailRow(label: "Where", value: activityWhereLine ?? currentFocusLine, scale: scale)
+                if let recentContextLine {
+                    ContinueDetailRow(label: "Context", value: recentContextLine, scale: scale)
+                }
+                if let activityStateLine {
+                    ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)
+                }
+                ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
+                ContinueDetailRow(label: "Target", value: returnTargetLine, scale: scale)
+                if let combinedConfidenceLine {
+                    ContinueDetailRow(label: "Confidence", value: combinedConfidenceLine, scale: scale)
                 }
                 if let missingEvidenceLine {
                     ContinueDetailRow(label: "Evidence", value: missingEvidenceLine, scale: scale)

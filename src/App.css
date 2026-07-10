@@ -674,7 +674,9 @@ h3 {
 
 .answer-hero p,
 .answer-target span,
-.answer-state span {
+.answer-state span,
+.answer-section-label,
+.answer-where > span {
   color: var(--muted);
   font-size: 13px;
   font-weight: 760;
@@ -691,12 +693,26 @@ h3 {
   text-wrap: balance;
 }
 
-.answer-hero > span {
+.answer-hero > span,
+.answer-where strong {
   max-width: 58ch;
   color: var(--ink-soft);
   font-size: 14px;
   line-height: 1.55;
   text-wrap: pretty;
+}
+
+.answer-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 9px;
+  min-width: 0;
+}
+
+.answer-where strong {
+  font-weight: 720;
+  overflow-wrap: anywhere;
 }
 
 .answer-target {
@@ -756,6 +772,55 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.answer-memory-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.answer-context-list {
+  display: grid;
+  gap: 7px;
+  max-width: 72ch;
+}
+
+.answer-context-list p {
+  position: relative;
+  margin: 0;
+  padding-left: 15px;
+  color: var(--ink-soft);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+.answer-context-list p::before {
+  position: absolute;
+  top: 0.66em;
+  left: 1px;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--violet);
+  content: "";
+}
+
+.answer-confidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.answer-confidence strong {
+  color: var(--ink-soft);
+  font-weight: 760;
+}
+
 .answer-context,
 .answer-uncertainty {
   max-width: 68ch;
@@ -802,6 +867,12 @@ h3 {
   font-size: 12px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.answer-missing-evidence .answer-why-strip span {
+  border-color: rgba(138, 90, 19, 0.2);
+  color: #6d4308;
+  background: var(--warn-soft);
 }
 
 .answer-actions {

@@ -1024,6 +1024,7 @@ fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRe
         mode: Some("normal".to_string()),
         rebuild_layers: Some(false),
         micro_inference_enabled: Some(true),
+        activity_recap_model_enabled: Some(true),
         max_candidates_for_model: Some(5),
         audit_output_enabled: Some(true),
         ..Default::default()
@@ -1917,6 +1918,7 @@ mod tests {
         assert_eq!(request.mode.as_deref(), Some("normal"));
         assert_eq!(request.rebuild_layers, Some(false));
         assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.activity_recap_model_enabled, Some(true));
         assert_eq!(request.max_candidates_for_model, Some(5));
         assert_eq!(request.audit_output_enabled, Some(true));
     }

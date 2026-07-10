@@ -3258,7 +3258,7 @@ pub fn get_continue_decision(
     if result.cache_hit {
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
     }
-    if request.audit_output_enabled.unwrap_or(false) {
+    if continue_output_audit_enabled(&request) {
         match schedule_continue_output_audit(&conn, &app, &request, effective_mode, &mut result) {
             Ok(summary) => {
                 result.continue_output_path = Some(summary.path);
@@ -3272,6 +3272,10 @@ pub fn get_continue_decision(
         }
     }
     Ok(result)
+}
+
+fn continue_output_audit_enabled(request: &crate::continuation::ContinueDecisionRequest) -> bool {
+    request.audit_output_enabled.unwrap_or(false)
 }
 
 fn run_continue_evidence_probes(
@@ -19490,6 +19494,7 @@ fn export_continue_output_audit_to_plan(
     let evidence_frames_dir = evidence_dir.join("frames");
     let cache_dir = output_dir.join("cache");
     let model_dir = output_dir.join("model");
+    let activity_recap_dir = output_dir.join("activity_recap");
     let logs_dir = output_dir.join("logs");
     for dir in [
         &raw_dir,
@@ -19504,6 +19509,7 @@ fn export_continue_output_audit_to_plan(
         &evidence_frames_dir,
         &cache_dir,
         &model_dir,
+        &activity_recap_dir,
         &logs_dir,
     ] {
         fs::create_dir_all(dir).map_err(to_string)?;
@@ -19542,6 +19548,7 @@ fn export_continue_output_audit_to_plan(
                 "mode": request.mode.as_deref().unwrap_or("normal"),
                 "rebuild_layers": request.rebuild_layers.unwrap_or(false),
                 "micro_inference_enabled": request.micro_inference_enabled.unwrap_or(true),
+                "activity_recap_model_enabled": request.activity_recap_model_enabled.unwrap_or(false),
                 "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
             }
         }),
@@ -19866,6 +19873,7 @@ fn export_continue_output_audit_to_plan(
     let cache_decision = continue_cache_decision_json(result);
     write_json_pretty(&cache_dir.join("cache_decision.json"), &cache_decision)?;
     let model_summary = export_continue_model_audit(&model_dir, result, &inference_manifest)?;
+    export_activity_recap_model_audit(&activity_recap_dir, result)?;
     let mut evidence_closure = continue_evidence_closure_from_result(result, &selected_candidate);
     export_selected_evidence_frames(
         conn,
@@ -20758,6 +20766,11 @@ fn continue_cache_decision_json(result: &crate::continuation::ContinueDecisionRe
         "evidence_watermark_hash": result.evidence_watermark_hash,
         "evidence_watermark_match": result.cache_hit,
         "inference_policy_match": result.cache_hit,
+        "activity_recap_watermark_hash": result.activity_recap_watermark_hash,
+        "activity_recap_watermark_match": result.cache_hit,
+        "activity_recap_schema": result.activity_recap.schema,
+        "activity_recap_generated_by": result.activity_recap.generated_by,
+        "activity_recap_validation_status": result.activity_recap.validation_status,
         "risk_cache_policy": {
             "risky_fallback": risky_fallback,
             "short_ttl_applied": risky_fallback,
@@ -20886,6 +20899,73 @@ fn export_continue_model_audit(
     });
     write_json_pretty(&model_dir.join("summary.json"), &summary)?;
     Ok(summary)
+}
+
+fn export_activity_recap_model_audit(
+    activity_recap_dir: &Path,
+    result: &crate::continuation::ContinueDecisionResult,
+) -> Result<(), String> {
+    fs::create_dir_all(activity_recap_dir).map_err(to_string)?;
+    let audit = &result.activity_recap_synthesis_audit;
+    let proof = &result.activity_recap_proof;
+    write_json_pretty(
+        &activity_recap_dir.join("inputs_summary.json"),
+        &serde_json::to_value(&proof.input_summary).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("stitched_timeline.json"),
+        &serde_json::to_value(&proof.stitched_timeline).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("work_labels.json"),
+        &serde_json::to_value(&proof.work_labels).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("detours.json"),
+        &serde_json::to_value(&proof.detours).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("last_state.json"),
+        &serde_json::to_value(&proof.last_state).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("final_recap.json"),
+        &serde_json::to_value(&proof.final_recap).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("validation.json"),
+        &serde_json::json!({
+            "schema": "smalltalk.activity_recap_validation_audit.v1",
+            "status": proof.final_recap.validation_status,
+            "generated_by": proof.final_recap.generated_by,
+            "activity_confidence": proof.final_recap.activity_confidence,
+            "target_confidence": proof.final_recap.target_confidence,
+            "failures": proof.validation_failures,
+            "model_status": proof.model_status,
+        }),
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("model_pack.json"),
+        &audit.model_pack,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("openai_request.redacted.json"),
+        &audit.openai_request,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("raw_response.json"),
+        &audit.raw_response,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("parsed_output.json"),
+        &audit.parsed_output,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("model_validation.json"),
+        &audit.validation,
+    )?;
+    write_json_pretty(&activity_recap_dir.join("fallback.json"), &audit.fallback)?;
+    Ok(())
 }
 
 fn continue_evidence_closure_from_result(
@@ -21606,6 +21686,7 @@ fn continue_decision_trace_json(
         "mode": effective_mode,
         "rebuild_layers": request.rebuild_layers.unwrap_or(false),
         "micro_inference_enabled": request.micro_inference_enabled.unwrap_or(true),
+        "activity_recap_model_enabled": request.activity_recap_model_enabled.unwrap_or(false),
         "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
     }));
     events.push(serde_json::json!({
@@ -21640,6 +21721,20 @@ fn continue_decision_trace_json(
         "attempted": result.micro_inference_attempted,
         "result_kind": result.micro_inference_result_kind,
         "summary": model_summary,
+    }));
+    events.push(serde_json::json!({
+        "phase": "activity_recap_synthesis",
+        "enabled": request.activity_recap_model_enabled.unwrap_or(false),
+        "generated_by": result.activity_recap.generated_by,
+        "validation_status": result.activity_recap.validation_status,
+        "input_summary": result.activity_recap_proof.input_summary,
+        "stitched_timeline": result.activity_recap_proof.stitched_timeline,
+        "work_labels": result.activity_recap_proof.work_labels,
+        "detours": result.activity_recap_proof.detours,
+        "last_state": result.activity_recap_proof.last_state,
+        "model_status": result.activity_recap_proof.model_status,
+        "validation_failures": result.activity_recap_proof.validation_failures,
+        "final_recap": result.activity_recap_proof.final_recap,
     }));
     events.push(serde_json::json!({
         "phase": "copy_gate",
@@ -34405,6 +34500,18 @@ mod tests {
     }
 
     #[test]
+    fn p5_08_continue_audit_is_enabled_only_by_explicit_request() {
+        let background = crate::continuation::ContinueDecisionRequest::default();
+        assert!(!continue_output_audit_enabled(&background));
+
+        let explicit = crate::continuation::ContinueDecisionRequest {
+            audit_output_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(continue_output_audit_enabled(&explicit));
+    }
+
+    #[test]
     fn continue_output_audit_writes_full_decision_folder() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -34454,6 +34561,45 @@ mod tests {
         assert!(audit_dir.join("decision/copy_gate.json").exists());
         assert!(audit_dir.join("cache/cache_decision.json").exists());
         assert!(audit_dir.join("model/model_skipped.json").exists());
+        for file in [
+            "inputs_summary.json",
+            "stitched_timeline.json",
+            "work_labels.json",
+            "detours.json",
+            "last_state.json",
+            "final_recap.json",
+            "model_pack.json",
+            "openai_request.redacted.json",
+            "raw_response.json",
+            "parsed_output.json",
+            "validation.json",
+            "model_validation.json",
+            "fallback.json",
+        ] {
+            assert!(
+                audit_dir.join("activity_recap").join(file).exists(),
+                "missing activity recap audit file: {file}"
+            );
+        }
+        let activity_request =
+            fs::read_to_string(audit_dir.join("activity_recap/openai_request.redacted.json"))
+                .unwrap();
+        assert!(!activity_request.contains("Authorization"));
+        assert!(!activity_request.contains("Bearer "));
+        assert!(!activity_request.contains("sk-"));
+        let activity_pack =
+            fs::read_to_string(audit_dir.join("activity_recap/model_pack.json")).unwrap();
+        assert!(activity_pack.contains("smalltalk.activity_recap_model_pack.v1"));
+        assert!(!activity_pack.contains("/Users/"));
+        assert!(!activity_pack.contains("file://"));
+        assert!(!activity_pack.contains("candidate-"));
+        assert!(!activity_pack.contains("artifact-"));
+        assert!(!activity_pack.contains("workstream-"));
+        let final_recap =
+            fs::read_to_string(audit_dir.join("activity_recap/final_recap.json")).unwrap();
+        assert!(final_recap.contains("smalltalk.activity_recap.v1"));
+        assert!(!final_recap.contains("/Users/"));
+        assert!(!final_recap.contains("file://"));
         assert!(audit_dir.join("evidence/evidence_closure.json").exists());
         assert!(audit_dir
             .join("evidence/frames/frame-000001/frame.json")
