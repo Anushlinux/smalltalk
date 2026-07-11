@@ -21,10 +21,13 @@ target/
 
 reference/
 
+docs/
+
 
 cloud_resume_exports/
 continue_outputs/
 resume_query_exports/
+private_task_truth_corpus/
 
 # Editor directories and files
 .vscode/*

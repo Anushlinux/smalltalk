@@ -1,8 +1,8 @@
 # Smalltalk Product And Technical Specification
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
-Implementation baseline: `ab37fa0b` (`Refactor Continue decision flow and island audit checks`) plus the current P5 activity-memory working tree. The repository is on a case-insensitive filesystem; `PRODUCT.md` is the canonical tracked filename even when tools display it as `product.md`.
+Implementation baseline: the live checkout and current dirty working tree through P6.09, including the July 11 legacy-schema migration repair and live Codex output audit. `ab37fa0b` remains the last reviewed orientation commit, not the implementation boundary or a reset target. The repository is on a case-insensitive filesystem; `PRODUCT.md` is the canonical tracked filename even when tools display it as `product.md`.
 
 This document describes the current Smalltalk product as implemented in this repository. It is written for another engineer or LLM that needs to understand what the product is, how it works, which parts are active, which parts are diagnostic, and where the current architecture still leaks older recorder behavior.
 
@@ -12,7 +12,7 @@ The active product lane is the native desktop app in the repository root. The ol
 
 ## Changes Since The Previous Product Snapshot
 
-The previous product snapshot covered the committed P1-P4 Continue hardening through the island no-bypass work. `ab37fa0b` and the current P5 activity-memory working tree materially extend that baseline:
+The previous product snapshot was centered on the committed P1-P4 Continue hardening plus the then-current P5 activity-recap working tree. The live checkout and current P6 working tree materially extend that baseline:
 
 - Capture is explicitly sparse and event-driven. Native app, focus, Accessibility, click, key-category, scroll, and clipboard signals are stored cheaply; screenshots, AX trees, OCR, window graphs, and normalized content are stored only for accepted heavy frames.
 - Long-running local memory now has concrete pressure controls: event coalescing, native scroll/AX throttling, 4-second important and 45-second low-value heavy-capture intervals, a 24-frame rolling screenshot budget for low-value captures, three unchanged heavy frames per surface, a 512 MB snapshot pressure gate, image-plus-content deduplication, Smalltalk self-capture suppression, and cleanup caps for low-value frames and events.
@@ -32,6 +32,16 @@ The previous product snapshot covered the committed P1-P4 Continue hardening thr
 - Optional recap model phrasing is disabled by default through `activity_recap_model_enabled`. When enabled, it can rewrite only a bounded local fact pack; local validation rejects unsupported claims and falls back to the deterministic recap.
 - Recap validity participates in decision cache identity through a recap watermark and policy fingerprint. Cache hits reuse the exact persisted recap, meaningful evidence or feedback invalidates it, and recap memory is explicitly prevented from influencing ranking, target eligibility, openability, or strict opening.
 - React and the native island now present the compact activity memory: what the work was, where, recent context, state left behind, next action, safe target, separate activity/target confidence, and missing evidence.
+- P6.01 adds the versioned privacy-safe accuracy-fixture contract, frozen evaluation policy, first-divergence replay, known-failure milestones, default-denied locked-holdout access, privacy lint, deterministic replay checks, and a machine-readable accuracy report.
+- P6.02 persists ordered evidence spans derived from AX, OCR, content units, and bounded fallback text. It records source ownership, pane/order geometry, region role, conversational role, confidence, reason codes, and selected/rejected salient user, agent, and prior-boundary evidence.
+- P6.03 persists a first-class current task turn with separate execution state, current actor, waiting-on state, relation to prior, evidence links, revision, and task-turn-scoped actions/semantic deltas. Task-turn changes participate in decision cache identity.
+- P6.04 evaluates feedback through explicit provenance, task/session/workstream/target scope, freshness/decay, allowed effects, and per-target polarity. Stale inferred navigation cannot promote a support branch.
+- P6.05 adds task-turn/workstream membership, semantic eligibility, cross-layer consistency, and a strict direct-target policy that keeps frame previews and support surfaces out of public return targets.
+- P6.06 adds an evidence-linked confidence vector and bounded observe-before-decide outcomes for success, no change, timeout, failure, privacy block, and stale result. A strong surface cannot raise an unsupported task or target claim.
+- P6.07 rebases deterministic recap and optional model phrasing on a task-truth pack with claim evidence, confidence caps, workstream consistency, and target policy. Semantic model failures fall back locally rather than overriding task identity.
+- P6.08 adds typed target truth, evidence preview, the interruption-recovery answer, React presentation helpers, native-island parity, and strict decision-id-only opening. A known task may be useful even when no direct target exists.
+- P6.09 adds explicit release-level corpus, calibration, privacy, performance, model-parity, replay, and manual-QA gates. `release_gate.passed` is distinct from the narrower phase milestone result.
+- The legacy SQLite migration now adds `continue_task_actions.task_turn_id` before creating `idx_continue_task_actions_task_turn`, allowing pre-P6 databases to upgrade instead of failing schema initialization.
 
 Commit inventory reviewed for this update:
 
@@ -98,6 +108,10 @@ Smalltalk must not store raw typed characters or full clipboard text. Keyboard a
 | `src-tauri/src/capture.rs` | Active runtime facade for capture, storage, search, safe exports, cloud resume, local memory diagnostics, cleanup, and Tauri command wrappers. |
 | `src-tauri/src/continuation.rs` | Native Continue semantic memory, rebuild layers, scoring, decisions, feedback, breadcrumbs, eval, and default bounded micro-inference. |
 | `src-tauri/src/continuation/activity_recap*.rs` | P5 recap contract, bounded inputs, segment stitching, grounded work labels, detour/branch recap, last-state synthesis, optional model phrasing, validation, cache/memory integration, and deterministic tests. |
+| `src-tauri/src/continuation/task_turn_evidence.rs` | P6 ordered AX/OCR/content evidence, pane/order resolution, region and conversational roles, salient latest-turn selection, privacy-safe samples, and audit persistence. |
+| `src-tauri/src/continuation/task_turn.rs` | P6 current-task-turn persistence, lifecycle axes, prior-turn relations, task-scoped action finalization, workstream membership, revisions, and cache markers. |
+| `src-tauri/src/continuation/{feedback_policy,semantic_consistency,confidence,activity_recap_truth}.rs` | P6 feedback applicability, semantic-center and target policy, split confidence/probe behavior, and the canonical recap truth/guard pack. |
+| `src-tauri/src/continuation/{accuracy_fixture,accuracy_eval}.rs` and `src-tauri/src/bin/continue_accuracy_eval.rs` | Privacy-safe P6 full-pipeline replay, metrics/calibration, deterministic/model checks, release verdict, report writer, and CLI. |
 | `src-tauri/src/lib.rs` | Tauri builder and command registration. |
 | `src-tauri/src/session_island.rs` | macOS floating-island Continue gateway, typed state contract, freshness memory, source-aware actions/feedback, and no-bypass audit hooks. |
 | `src-tauri/src/session_island/` | Island contract/gateway modules and tests extracted from the bridge. |
@@ -177,18 +191,18 @@ The main first screen is the `ContinueDecisionCard`. Depending on evidence state
 - Truthful thin current-work state.
 - Older context with fresher thin current work.
 - No-clear-continuation state.
-- Inference provenance: `AI-assisted`, `Local fallback`, or `Local only`.
-- Evidence-backed activity summary.
-- Where the activity happened when safely grounded.
-- Recent support, detour, or interruption context.
-- State left behind and next action.
-- Current focus as a separate factual surface.
-- Return target or honest no-safe-target state.
-- Separate activity and target confidence plus missing-evidence notes.
+- `You were`: the supported task and work object.
+- `State`: last meaningful progress plus unfinished, waiting, or blocked state.
+- `Next`: one supported action when available; it is omitted when unsupported.
+- `Where`: app plus document, thread, or page identity at the supported precision.
+- Direct return target, inspectable evidence preview, or `Exact location unavailable`.
+- Answer freshness independently from task or target confidence.
 - Primary `Continue here` action.
 - `Inspect evidence` action.
-- Alternative continuation targets when present.
-- Collapsed correction controls behind `Wrong target?`.
+- Two bounded task choices only when two verified hypotheses are genuinely close.
+- `Not right` feedback scoped to the exact TaskSnapshot revision and affected field or hypothesis.
+
+Candidate, workstream, detour, provenance, confidence, and evidence-strength details are diagnostics under `Why this answer?`; they are not first-screen content.
 
 The product card always enables candidate-bounded target inference. It enables recap model phrasing only for an explicit manual Continue/Refresh/Rebuild action; startup and background refreshes keep recap synthesis local:
 
@@ -205,7 +219,9 @@ await invoke("get_continue_decision", {
 });
 ```
 
-The UI treats provenance as product-visible state. A cloud micro-inference result with a real `response_id` is shown as `AI-assisted`; a failed or unavailable model path is shown as `Local fallback`; local scorer-only output is shown as `Local only`.
+The UI currently treats decision-source provenance as product-visible state. A `cloud_micro_inference` result with a real `response_id` is shown as `AI-assisted`; a failed or unavailable candidate-model path is shown as `Local fallback`; local scorer-only output is shown as `Local only`. This label describes the bounded candidate-routing path, not necessarily the wording shown on the card. The candidate model may validly return `need_more_evidence`, while `activity_recap.generated_by` independently remains `local` or `fallback`. Therefore the current `AI-assisted` badge does not prove that a model selected the task or wrote the displayed recap. This is a known provenance-presentation defect, documented in the P6 limitations below.
+
+Manual Continue/Refresh/Rebuild requests enable optional recap-model phrasing. Startup and background requests keep recap synthesis local. React and the native island now apply a quality-dominant adoption policy: a background result may replace a stronger manual result only when its evidence is causally newer and it does not downgrade task identity, revision, confidence, supported task/state/next/where coverage, target safety, or wording provenance. Rejected background results are retained as bounded diagnostics instead of replacing the displayed answer.
 
 The UI also filters user-facing handoff copy. If a backend or model handoff leaks internal ids or implementation labels such as candidate ids, workstream ids, artifact ids, frame fallback text, or target-metadata placeholders, the card falls back to honest thin-evidence copy instead of displaying those internals as product language.
 
@@ -255,17 +271,19 @@ The frontend also has a developer diagnostics `<details>` panel. It contains wor
 
 ## Current Product Failure Boundary
 
-The backend now has a real Continue/workstream architecture and an evidence-backed activity recap. The product can explain a dominant activity even when the exact page or target is missing, but it still cannot claim details that local evidence did not capture. A correct answer may therefore be: the work and app are understood, a brief Finder/search/message surface was a detour, the state left behind is only partially known, and no exact safe target can be reopened.
+The backend now has a real Continue/workstream/task-turn architecture, bounded recap truth, and target-safe answer composition. In the covered deterministic cases it can explain an activity while refusing to invent an exact page or target. The live Codex audit establishes the harder boundary: if pane, speaker, and current-user evidence resolution fail, later semantic consistency, model validation, and direct-target safety can prevent a fabricated open but cannot recover the user's real task. The product may then produce an honest target-null answer whose task summary is still irrelevant or wrong.
 
 The visible product can still feel like an old recorder/debug dashboard when diagnostics are open. This is not just visual polish. It is a product-boundary issue.
 
-The current repo has five overlapping paths:
+The current repo has seven overlapping paths:
 
 | Path | Current state |
 | --- | --- |
 | React Continue shell | Primary screen is Continue-first, but diagnostics still expose many internal layers. |
 | Continue backend | Real layered semantic memory and scoring engine. |
 | P5 activity memory | Evidence-backed explanatory recap over the decision; it cannot override target policy or compensate for missing page/file identity. |
+| P6 task-turn truth | Integrated ordered evidence, current task turn, semantic consistency, split confidence, target truth, and answer contract; deterministic coverage passes, but live Codex speaker recovery is not reliable enough for release. |
+| P6 release evaluator | Produces a machine-readable longitudinal verdict; the release gate is currently closed because corpus, holdout, calibration, performance, and native QA requirements remain incomplete. |
 | Capture/evidence backend | Operational evidence substrate with lightweight-first signals and sparse, budgeted heavy frames. |
 | Floating island | Typed Continue-first consumer using the same backend decision and strict-open policy as the main card; legacy session/cloud routes are diagnostic-only. |
 
@@ -318,6 +336,20 @@ Generated capture data, SQLite files, screenshots, safe exports, resume-query bu
 
 `continue_outputs/` is not a live mirror of the database. It is written only when an explicit Continue action asks for an audit. The default bundle is a compact proof package built in a sibling `.building` directory and atomically renamed to its final session-readable folder after canonical proof files are complete. Background/startup decisions use `audit_output_enabled: false` and do not create output folders.
 
+When debugging what the running app actually decided, first use the `database_path` returned by `capture_status`. On the default macOS bundle it is usually `~/Library/Application Support/com.smalltalk.app/capture/smalltalk-capture.sqlite`. Inspect it independently of `continue_outputs/`, preferably read-only:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/com.smalltalk.app/capture/smalltalk-capture.sqlite" \
+  "SELECT id, datetime(requested_at_ms / 1000, 'unixepoch', 'localtime'), source, response_id, validation_status, current_task_turn_id, activity_recap_model_requested, micro_inference_result_kind FROM continue_decisions ORDER BY requested_at_ms DESC LIMIT 20;"
+```
+
+The recap wording provenance is stored inside `activity_recap_json`; it is not equivalent to the decision `source`:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/com.smalltalk.app/capture/smalltalk-capture.sqlite" \
+  "SELECT id, json_extract(activity_recap_json, '$.generated_by'), json_extract(activity_recap_json, '$.validation_status'), json_extract(activity_recap_json, '$.primary_work_summary') FROM continue_decisions ORDER BY requested_at_ms DESC LIMIT 20;"
+```
+
 ## Data Model Overview
 
 The core local database is `smalltalk-capture.sqlite`.
@@ -357,8 +389,14 @@ Continue tables created by `ensure_continue_schema`:
 | `continue_schema_migrations` | Continue schema version marker. |
 | `continue_artifacts` | Stable work objects such as browser tabs, conversations, code editors, terminals, PDFs, messages, and docs. |
 | `continue_artifact_observations` | Per-frame or event-derived observations of artifacts. |
-| `continue_task_actions` | Derived local actions such as editing, searching, encountering an error, branching away, or returning to origin. |
+| `continue_task_actions` | Derived local actions such as editing, searching, encountering an error, branching away, or returning to origin, including P6 task-turn scope and semantic-delta fields. |
 | `continue_task_action_events` | Join table from task actions to native UI events. |
+| `continue_ordered_evidence_spans` | P6.02 reading-order evidence spans with AX/OCR/content provenance, region and conversational roles, ownership, geometry, confidence, and rejection reasons. |
+| `continue_salient_turn_evidence` | P6.02 selected and rejected user, agent, and prior-boundary evidence for each observed frame. |
+| `continue_task_turns` | P6.03 current and historical task-turn identity, summary, revision, lifecycle axes, prior relation, and material fingerprint. |
+| `continue_task_turn_evidence` | Field-level task-turn claims linked back to ordered evidence spans and source frames. |
+| `continue_task_turn_relations` | Prior, parent, supersession, and other evidence-backed relationships among task turns. |
+| `continue_task_turn_lifecycle` | Revision-by-revision changes to execution state, current actor, and waiting-on state. |
 | `continue_semantic_moments` | Debounced meaningful changes and event/frame boundaries that can invalidate stale decisions. |
 | `continue_boundary_revisions` | Persisted semantic-boundary revisions used by cache freshness. |
 | `continue_episodes` | Adjacent task actions grouped into local episodes. |
@@ -369,8 +407,10 @@ Continue tables created by `ensure_continue_schema`:
 | `continue_workstream_artifacts` | Durable artifact roles inside a workstream. |
 | `continue_workstream_state_snapshots` | Historical workstream state/unresolved-state snapshots. |
 | `continue_workstream_edges` | Relationships among workstreams. |
+| `continue_task_turn_workstream_memberships` | P6.05 task-turn/workstream membership, relation, confidence, selected state, and consistency evidence. |
 | `continue_branch_contexts` | Origin, branch, return, and explicit branch-promotion state for support surfaces. |
 | `continue_open_loops` | Evidence-backed unfinished, blocked, completed, or unclear work between workstreams and candidates. |
+| `continue_open_loop_lifecycle_events` | P6.05 task-turn-scoped open-loop creation, state-transition, reparenting, and closure history. |
 | `continue_open_loop_artifacts` | Artifact roles inside an open loop. |
 | `continue_open_loop_evidence` | Evidence handles supporting an open loop. |
 | `continue_app_activity_segments` | Bounded app/surface activity segments used by scoring. |
@@ -379,12 +419,15 @@ Continue tables created by `ensure_continue_schema`:
 | `continue_decisions` | Persisted Continue decisions and provenance. |
 | `continue_decision_open_events` | Privacy-preserving open attempts/outcomes keyed by decision and source; no raw URL/path payload. |
 | `continue_feedback_events` | Inferred and explicit feedback about a decision. |
+| `continue_feedback_policy_evaluations` | P6.04 provenance, scope, decay, polarity, and allowed-effect decisions for each feedback event and context. |
 | `continue_breadcrumbs` | Manual local next-step notes attached to workstreams. |
 | `continue_evidence_probes` | Bounded requests/attempts to acquire missing evidence. |
 | `continue_memory_cells` / `continue_memory_edges` | Durable support/contradiction memory used during retrieval and ranking. |
 | `continue_pairwise_preferences` / `continue_ranking_priors` | Learned local preference and ranking features derived from feedback/evidence. |
 | `continue_surface_enrichment_attempts` | Normalized bounded weak-surface enrichment attempts. |
 | `continue_surface_snapshots` | Normalized weak-surface state, identity, quality, openability, and missing-evidence snapshots. |
+| `continue_semantic_eligibility_evaluations` | P6.05 current-task relation, freshness, provenance, and primary/support/target eligibility decisions. |
+| `continue_semantic_consistency_evaluations` | P6.05 persisted agreement or conflict across task turn, workstream, open loop, branch, recap, and target layers. |
 | `continue_eval_fixtures` | Local deterministic eval fixture storage. |
 
 The Continue schema name is:
@@ -608,6 +651,8 @@ All database access goes through shared helpers:
 - background audit export reuses the configured connection helpers instead of ad hoc SQLite opens.
 
 These changes address the observed `Continue failed: database is locked` class of failure during active sessions. They reduce lock contention but do not turn SQLite into a multi-process server: another process holding an exclusive write or an unexpected crash can still produce an error, which must remain visible rather than being silently treated as a valid Continue result.
+
+The July 11 legacy-schema repair fixes a separate startup failure. `ensure_continue_schema` now adds the nullable `continue_task_actions.task_turn_id` column before it creates `idx_continue_task_actions_task_turn`. Existing pre-P6 databases can therefore migrate in order instead of failing with `no such column: task_turn_id`. The React error productizer also treats missing-column, missing-table, malformed-schema, and database-schema failures as a local database update problem. The earlier on-screen Accessibility warning was a UI classification error caused by schema SQL that happened to contain Accessibility-related text; it was not evidence that macOS Accessibility permission had failed.
 
 ## Capture Trigger Model
 
@@ -1485,7 +1530,16 @@ Hard suppression is applied before sorting/selection. Candidates rejected by fee
 - `active_current_work_unresolved`
 - `p0_quality_signals`
 - `current_activity`
+- `current_task_turn`
 - `selected_workstream`
+- `semantic_graph_policy_version`
+- `cross_layer_consistency`
+- `direct_target_policy`
+- `target_truth`
+- `evidence_preview`
+- `confidence_vector`
+- `confidence_summary`
+- `legacy_confidence_derivation`
 - `return_target`
 - `resume_work_target`
 - `candidate_kind`
@@ -1513,6 +1567,7 @@ Hard suppression is applied before sorting/selection. Candidates rejected by fee
 - observe-before-decide and weak-surface enrichment diagnostics
 - app-activity summary and quality gate
 - `activity_recap`
+- `answer`
 - `activity_recap_watermark_hash`
 - micro-inference requested/attempted/result-kind fields
 - optional `continue_output_path`
@@ -1532,7 +1587,91 @@ Validation statuses:
 
 Confidence labels are derived from numeric confidence. Low confidence should be presented as best available evidence, not as certainty.
 
-### Evidence Anchors
+P6.06 adds the internal `smalltalk.continue_confidence.v2` contract. It keeps surface identity, active-window ownership, region/speaker/turn attribution, latest goal and task object, execution/current-actor/waiting-on state, prior relation, workstream/branch/open-loop alignment, recap support, and direct-target identity/openability/policy as separate evidence-linked dimensions. Claim confidence is the minimum of its critical dimensions, never an average that lets a strong app identity hide a missing task or target fact.
+
+Compatibility fields are explicit derivations: legacy `confidence` and `confidence_label` describe the bounded activity-recap claim; `activity_confidence` derives from that same recap claim; `target_confidence` derives independently from the direct-target claim. A useful task recap may therefore coexist with `target_confidence = none` and null public target fields. Observe-before-decide targets a missing critical dimension, records per-probe outcomes, and reruns only after non-stale material evidence changes that dimension. Timeout, privacy block, failure, and successful-no-change outcomes retain the missing evidence and do not emit an evidence-refreshed warning.
+
+P6.07 makes `smalltalk.activity_recap_task_truth.v1` the canonical semantic input to both local recap composition and optional model phrasing. The truth pack fixes the current task-turn id/revision, bounded task identity, execution/current-actor/waiting-on axes, prior relation, selected workstream/segment/loop consistency, claim confidence caps, task-turn evidence handles, and the direct-target policy. Historical/support/detour material remains role-labeled context; superseded, unrelated, feedback-rejected, and otherwise ineligible wording is retained only in the local validator as hashes/reason codes and is not sent to the model.
+
+The deterministic local recap is implemented to start from the latest user goal/task object, preserve task and target confidence separately, treat prior completion as history rather than current state, and emit `why_no_safe_target` instead of target-shaped frame-fallback copy. The optional model must copy the task identity and target policy exactly and provide per-claim evidence handles and confidence at or below local caps. Validation distinguishes copy-only repair from temporal, workstream, ineligible-source, unsupported-claim, and target-policy rejection; every semantic rejection falls back to the local task-truth recap. This is an architectural safety guarantee, not proof that the fallback is useful: when upstream real-surface role resolution chooses the wrong task turn, the local recap faithfully phrases the wrong or empty truth. The July 11 live Codex audit below demonstrates that remaining failure.
+
+Recap proof/cache policy is versioned as P6.07. Proof output includes task truth, eligible/rejected semantic-source diagnostics, the deterministic local recap, claim-to-evidence mapping, model/local identity parity, validation/fallback details, and the available quality-gate result. Promoted recap memory is keyed and tagged with task-turn identity/revision, semantic-consistency provenance, and validator policy; legacy or incompatible recap memory is ignored conservatively and cannot replace a thin current task.
+
+P6.09 adds an explicit release verdict to the accuracy report. A green phase milestone is not a release claim: `release_gate.passed` also requires the frozen broad-corpus, human-review, partition/holdout, zero-tolerance, calibration, performance, privacy, and manual macOS gates. The current seven synthetic Capture-button cases pass their deterministic semantic checks, but P6 remains release-incomplete because the repository lacks the required 100 independently human-reviewed cases and locked holdout, several required metrics have no positive labeled samples, calibration is undersized, the latest debug replay exceeded the frozen p95 regression budget, and native interruption-recovery QA is not complete. The authoritative current audit is `docs/phases/p6-task-turn-accuracy/p6-09-completion-audit.md`; the machine-readable verdict is `src-tauri/tests/fixtures/continue_accuracy/release-report.json`.
+
+## P6 Evidence-To-Answer Architecture
+
+The implemented P6 production chain is:
+
+```text
+AX/OCR/content/events
+→ ordered evidence spans
+→ salient user/agent/prior evidence
+→ current task turn
+→ scoped actions and semantic deltas
+→ feedback/branch/workstream/open-loop eligibility
+→ confidence and observation policy
+→ local recap and optional validated model phrasing
+→ target truth and evidence preview
+→ interruption-recovery answer
+→ React card and native island
+```
+
+The chain intentionally separates evidence extraction, semantic truth, wording, and opening policy. P6.02 emits `smalltalk.task_turn_evidence.v1`; P6.03 emits `smalltalk.current_task_turn.v1` and persists task-turn evidence, relations, revisions, scoped actions, and semantic deltas. A task turn does not collapse lifecycle into one label: `execution_state`, `current_actor`, and `waiting_on` remain independent axes, with a separate relation to the prior task turn.
+
+P6.04 persists feedback-policy evaluations rather than treating every old click or navigation as timeless approval. Provenance, task/session/workstream/target scope, freshness, decay, allowed effects, and per-target polarity constrain how feedback can suppress, cap, or support a candidate. P6.05 joins task turns to workstreams and evaluates semantic sources through `smalltalk.semantic_eligibility.v1` and `smalltalk.cross_layer_consistency.v1`. The same semantic center must agree across the task turn, actions, workstream, open loop, branch, recap, and target; support or detour evidence does not silently become the primary task.
+
+P6.06 produces `smalltalk.continue_confidence.v2` and the compact `smalltalk.continue_confidence_summary.v1`. Surface identity, speaker/turn attribution, task identity, lifecycle state, semantic alignment, recap support, and target identity/openability/policy remain independently evidence-linked. Observation probes target a missing critical dimension and record success, successful-no-change, timeout, failure, privacy-blocked, or stale outcomes rather than manufacturing confidence.
+
+P6.07 builds `smalltalk.activity_recap_task_truth.v1` from `smalltalk.activity_recap_inputs.v2`. Deterministic local wording and the optional bounded model use the same task identity, lifecycle axes, semantic eligibility, claim-confidence caps, evidence handles, and target policy. Model wording is accepted only after local identity, temporal, workstream, source-eligibility, support, and target-policy validation; rejection returns a local fallback and cannot change candidate ranking or opening authority.
+
+P6.08 applies `smalltalk.direct_target_policy.v1` and emits `smalltalk.continue_target_truth.v1`, optional `smalltalk.continue_evidence_preview.v1`, and `smalltalk.interruption_recovery_answer.v1`. A direct target is an eligible, identified, policy-allowed, openable work object. An evidence preview is inspectable proof and must not masquerade as an open target. React presentation helpers and `smalltalk.island_continue_state.v1` consume the same persisted decision semantics; native opening remains decision-id-only and runs strict live policy checks.
+
+P6.01 and P6.09 provide the verification envelope through `smalltalk.continue_accuracy_fixture.v1`, `smalltalk.continue_accuracy_report.v2`, the frozen evaluation policy, deterministic first-divergence replay, privacy lint, corpus partitions, calibration/performance/model-parity results, and the explicit release gate. These contracts prove only the cases and denominators actually present in the report.
+
+## P6 Current Limitations And Release Status
+
+P6 is implemented but is not release-complete. The important distinction is:
+
+- **Implemented architecture:** ordered role-aware evidence, first-class task turns, scoped feedback, semantic consistency, split confidence, bounded recap truth/model validation, target truth, evidence preview, a shared React/island answer contract, and the longitudinal evaluator are wired into the native Continue path.
+- **Deterministically proven behavior:** all seven committed synthetic Capture-button cases currently pass their P6 semantic checkpoints, presentation helpers have automated coverage, model validation preserves local identity in the covered fixtures, and frame fallback is not exposed as a public direct target in those cases.
+- **Observed live behavior:** the July 11 running app used the new P6 pipeline and persisted its new fields. This was not a stale frontend or stale backend build.
+- **Release verdict:** `release_gate.passed` is false. `milestone_contract_passed` describes the phase manifest only and is not authority to claim P6 ready.
+
+The July 11 live Codex audit exposed the following primary-surface failures:
+
+- The captured Codex accessibility evidence contained the user's current draft, but the conversation-role resolver classified it as assistant history.
+- When no valid user span survived, the geometry fallback selected model-picker text as a user candidate. Its confidence was too low, after which the prior-boundary fallback promoted `Approve for me`.
+- The current task-turn resolver can use `prior_boundary_sample` as the provisional goal when no valid current user span exists. In this live case that turned old UI/history text into the apparent task.
+- Manual recap-model attempts correctly rejected packs that were inconsistent with the locally fixed task truth. That prevented an unsupported model rewrite, but the remaining local fallback was still unhelpful because its upstream task truth was wrong.
+- React currently accepts thin, fallback, or rejected recap content too readily for the primary headline instead of requiring a sufficiently supported current-task claim.
+- Surface quality and task/action quality are independently computed but insufficiently labeled in the card, so the first screen can show apparently contradictory `Strong evidence` and `Thin evidence` pills.
+- Generic detour and support explanations can dominate the first-screen answer even when they do not explain the user's actual current task.
+- The seven committed fixtures are synthetic and contain explicit role identifiers such as `conversation-user-message` and `conversation-assistant-message`. The live Codex accessibility tree did not expose those identifiers, so passing those fixtures does not demonstrate robust live Codex speaker recovery.
+
+`cloud_micro_inference` means the bounded candidate router was used; it may merely return `need_more_evidence`. Wording provenance is therefore carried separately as `wording_source`, while `task_understanding_source` and `target_selection_source` describe their own stages. Manual Continue enables recap-model phrasing and startup/background refreshes keep recap phrasing local. The UI badge follows wording provenance, and React plus the island reject a weaker background result instead of allowing request source or completion order to overwrite a stronger manual answer.
+
+The current machine-readable report remains intentionally closed because:
+
+- only seven synthetic cases exist, while release requires at least 100 independently human-reviewed cases;
+- the locked holdout is empty and locked-holdout evaluation has not been completed;
+- required calibration sample minimums are not met;
+- positive direct-target, no-clear-continuation, and supported-next-action denominators are missing or inadequate;
+- the measured model-off p95 in the latest completion audit exceeds the frozen regression budget;
+- manual native macOS interruption/recovery, direct-open, stale-open, and React/island parity QA is incomplete;
+- privacy and corpus review need the required independent human sign-off at release scale.
+
+P6 therefore improves target safety and auditability, but it is not yet reliable enough at current-task recovery on the primary live Codex surface. A wrong or missing task must not be described as a P6 success merely because the direct target stayed null.
+
+Task Truth v2.01 implements causal committed-typing attribution, shared control exclusion, history-only prior boundaries, a typed `no_clear_current_task` state through backend/React/island contracts, split task/wording/target provenance, and quality-dominant manual/background result adoption. Its live-shaped session-013 fixture intentionally omits synthetic conversation-role identifiers and proves that `Approve for me` cannot become the current task.
+
+Task Truth v2.02 adds the privacy-safe live-corpus contract, local fixture builder, frozen evaluation policy, and three-path shadow evaluator. Task Truth v2.03 adds deterministic `smalltalk.observation_packet.v2` packets, `smalltalk.task_snapshot.v2`, bounded checkpoints, task-only selection, and explicit-Continue shadow audits. Task Truth v2.04 adds the provider-neutral multimodal resolver, local claim verifier, conflict-only second pass, and deterministic answer wording.
+
+Task Truth v2.05 adds the production authority policy (`off`, `shadow`, `eligible`, `authoritative`, `rollback`) and the versioned one-snapshot public answer. Target attachment remains subordinate to snapshot identity and strict-open policy. The authoritative React card, native island, adoption comparison, feedback path, and open command all use the same snapshot revision without filling missing fields from legacy P6. The direct target is persisted as a decision-scoped Task Truth contract, so a null public target cannot be revived by a legacy database target or open-time fallback. Exact-revision task feedback is isolated from global artifact/workstream feedback; it can remove a rejected field or promote a user-selected hypothesis without poisoning unrelated URLs, branches, or workstreams.
+
+React and the island consume Task Truth only when the locked final report is configured and passes independent runtime validation. The runtime requires the exact schema and frozen policy, release-eligible corpus and holdout minimums, all semantic and per-surface metrics with non-zero denominators, Wilson confidence intervals, required slices, all 14 manual scenarios, a separate baseline-linked budget policy, performance/privacy evidence, and zero-tolerance counts. The pre-holdout baseline and holdout-enabled release evaluator are separate artifacts, and the budget policy must bind to the baseline's SHA-256 content identity. A hand-authored `passed: true` is insufficient. An attempted authoritative switch is reduced to `eligible` while the gate is closed, and every effective-state change is audited. The current final report remains false: there are five pending live-redacted development cases, zero independently reviewed release cases, zero locked holdout cases, and no frozen release-budget, performance/privacy, or manual macOS manifests. Production semantic authority therefore remains legacy P6 with Task Truth v2 shadow/eligible, not authoritative.
+
+## Evidence Anchors
 
 A Continue answer must be explainable through anchors:
 
@@ -1574,7 +1713,7 @@ Every public recap claim is sanitized, length-bounded, and required to retain an
 
 ### Bounded Evidence Inputs
 
-`build_activity_recap_inputs` runs after current-surface resolution and target selection. It creates `smalltalk.activity_recap_inputs.v1` from already governed local facts:
+`build_activity_recap_inputs` runs after current-surface resolution and target selection. It creates `smalltalk.activity_recap_inputs.v2` from already governed local facts:
 
 - current surface and its evidence quality, identity confidence, openability, and missing evidence;
 - selected workstream, selected candidate, `return_target`, and `resume_work_target`;
@@ -1609,7 +1748,7 @@ The next action is constrained to evidence-backed continuation state. It cannot 
 
 `ContinueDecisionRequest.activity_recap_model_enabled` defaults to `false`. When false, the deterministic local recap is returned without a recap model call. The React startup/background paths send false; explicit manual Continue, Refresh Continue, diagnostic rebuild, and explicit island Continue actions send true. This flag is separate from `micro_inference_enabled`, which controls candidate-bounded target inference.
 
-When recap phrasing is explicitly enabled, the model receives `smalltalk.activity_recap_model_pack.v1`, containing only bounded current-surface facts, a primary segment, typed detours/support, the local recap seed, objective terms, safe next-action candidates, target policy, missing evidence, allowed term banks, and opaque evidence handles. The request uses Structured Outputs and a shorter bounded transport path. Raw screenshots, raw timelines, database dumps, typed characters, full clipboard text, private locators, and unfiltered history are excluded.
+When recap phrasing is explicitly enabled, the model receives `smalltalk.activity_recap_model_pack.v2`, containing only bounded current-surface facts, a primary segment, typed detours/support, the local recap seed, objective terms, safe next-action candidates, target policy, missing evidence, allowed term banks, and opaque evidence handles. The request uses Structured Outputs and a shorter bounded transport path. Raw screenshots, raw timelines, database dumps, typed characters, full clipboard text, private locators, and unfiltered history are excluded.
 
 Local validation rejects or repairs output that:
 
@@ -1629,7 +1768,7 @@ Recap cache identity combines pipeline version, recap schema, model-enabled poli
 `continue_decisions` persists:
 
 - `activity_recap_json`;
-- `activity_recap_detail_json` containing `smalltalk.activity_recap_decision_proof.v1`;
+- `activity_recap_detail_json` containing `smalltalk.activity_recap_decision_proof.v2`;
 - `activity_recap_watermark_hash`;
 - `activity_recap_policy_fingerprint`;
 - `activity_recap_model_requested`.
@@ -2155,7 +2294,10 @@ P4 no-bypass coverage writes sanitized `decision/island_continue_audit.json` met
 What is real now:
 
 - Native desktop app is the active lane.
-- Continue schema exists in SQLite.
+- Continue schema version 9 exists in SQLite, including ordered evidence, salient turn evidence, task turns and lifecycle, scoped feedback evaluations, task/workstream membership, semantic eligibility/consistency, and persisted decision truth/proof fields.
+- P6.02-P6.08 are integrated into the production `get_continue_decision` chain, not only into an offline evaluator.
+- `ContinueDecisionResult` carries `current_task_turn`, semantic consistency and direct-target policy, target truth, evidence preview, split confidence, the recap, and the final interruption-recovery answer.
+- The longitudinal accuracy evaluator, privacy lint, release report, and explicit P6 release verdict are implemented. The authoritative verdict is currently false.
 - Capture events, sparse heavy frames, attributed text, weak-surface snapshots, artifacts/actions/semantic moments/episodes/workstreams/open loops/branches/candidates/decisions/opens/feedback are persisted locally.
 - Continue can run without stopping local memory.
 - Normal Continue mode can reuse cached decisions.
@@ -2163,7 +2305,7 @@ What is real now:
 - Every new Continue result carries `smalltalk.activity_recap.v1`, including independent activity/target confidence, current state, evidence-backed narrative fields, detours/support, missing evidence, and per-claim anchors.
 - Activity recap inputs are bounded and privacy-filtered; recap generation does not send broad raw history or use raw-history fallback as the normal path.
 - Deterministic P5 stitching distinguishes primary work, support, detours, interruptions, returns, and current-focus-only surfaces before inferring a work label or state.
-- Activity/location labels are grounded in eligible actions, snapshots, segments, workstream evidence, and evidence spans. Generic chrome, private locators, support-only actions, and unsafe internal labels are rejected.
+- Activity/location labels are designed and deterministically tested to use eligible actions, snapshots, segments, workstream evidence, and evidence spans. Generic chrome, private locators, support-only actions, and unsafe internal labels have rejection paths. The live Codex audit proves that role/region resolution can still feed the wrong upstream task truth, so this must not be generalized into a real-surface accuracy claim.
 - Last-state synthesis can distinguish active work, recent detour, pause after progress, blocker, complete/idle, and unclear state while keeping no-safe-target copy honest.
 - Recap model phrasing exists and defaults off in the backend. React manual Continue/Refresh/Rebuild and explicit island Continue actions enable it; startup/background recaps stay local. When enabled it uses a bounded Structured Outputs pack, local term/handle/target-policy validation, and deterministic fallback.
 - Recap cache identity includes evidence plus recap/model policy. Matching cache hits reuse the exact stored recap and proof without rerunning synthesis.
@@ -2188,6 +2330,7 @@ What is real now:
 - Support branches, stale openable targets, feedback-suppressed targets, and thin weak surfaces are hard-gated before public selection/open.
 - The floating island is aligned to the backend Continue contract and fails closed on legacy primary-open bypasses.
 - SQLite uses WAL, a 30-second busy timeout, read-only polling connections, and serialized Continue decision work to reduce long-session lock contention.
+- Legacy database migration now adds `continue_task_actions.task_turn_id` before creating its index, and the UI no longer reports that SQLite schema failure as an Accessibility permission problem.
 - The diagnostics panel still exposes too much internal architecture when opened.
 
 What should not be claimed:
@@ -2206,6 +2349,11 @@ What should not be claimed:
 - Do not claim a one-hour session stores a continuous replay, a fixed frame count, or automatic hour-boundary cleanup.
 - Do not claim the 512 MB snapshot budget is a hard disk cap; it gates new non-important heavy captures and requires explicit cleanup to reclaim space.
 - Do not claim the island can open a legacy session/frame/path target as a primary Continue action.
+- Do not claim P6 is release-ready because seven synthetic cases pass or because `milestone_contract_passed` is true; only `release_gate.passed` is authoritative.
+- Do not claim current-task recovery is reliable on real Codex accessibility evidence; the July 11 audit demonstrated a speaker/region fallback failure.
+- Do not claim `AI-assisted` proves the visible recap was model-written; candidate micro-inference and recap wording have separate provenance.
+- Do not claim local fallback is necessarily useful when upstream task-turn extraction is wrong.
+- Background refresh preserves a stronger manual answer unless the challenger has causally newer evidence without a task, state, target, confidence, or wording-provenance downgrade.
 
 ## Product Copy Rules For Future LLMs
 
@@ -2266,26 +2414,65 @@ When changing Smalltalk, check these boundaries:
 13. Does every public activity-recap claim retain a valid evidence span?
 14. Can activity memory still explain thin work without creating an openable target?
 15. Are recap memory and optional model phrasing still unable to affect ranking, eligibility, promotion, or strict open?
+16. Does the current task turn come from valid current-user evidence rather than a control label or unsupported prior boundary?
+17. Are execution state, current actor, and waiting-on kept separate?
+18. Do task, surface, and target confidence remain separately labeled and separately capped?
+19. Does the React card distinguish decision routing provenance from recap wording provenance?
+20. Can a startup/background refresh replace a manual answer only when it is semantically at least as strong?
+21. Is `release_gate.passed`, rather than a phase milestone flag or synthetic-case count, used for the P6 release claim?
 
 ## Recommended Verification For A Product Change
 
-For frontend-only changes:
+Run Rust formatting, compile checks, and the full deterministic suite:
 
 ```bash
+cd src-tauri
+cargo fmt --check
+cargo check
+cargo test
+```
+
+Run the React build and presentation-contract tests:
+
+```bash
+cd /Users/bhaskarpandit/Documents/smalltalk
 npm run build
+npm run test:continue-presentation
 ```
 
-For backend command, schema, capture, storage, or Continue changes:
+Regenerate the P6 accuracy report without unlocking the holdout:
 
 ```bash
-cd src-tauri && cargo check
-cd src-tauri && cargo test
+cd /Users/bhaskarpandit/Documents/smalltalk/src-tauri
+cargo run --bin continue_accuracy_eval -- \
+  --output tests/fixtures/continue_accuracy/release-report.json \
+  --repeat 3
 ```
 
-For UI/product behavior:
+Run the committed-fixture contract and privacy-lint checks explicitly when editing the corpus or fixture schema:
 
 ```bash
+cd /Users/bhaskarpandit/Documents/smalltalk/src-tauri
+cargo test continuation::accuracy_fixture::tests
+cargo test continuation::accuracy_eval::tests
+```
+
+Do not add `--allow-locked-holdout` during normal development or threshold tuning. The locked holdout is release evidence, not a debugging set.
+
+For live interruption-recovery behavior:
+
+```bash
+cd /Users/bhaskarpandit/Documents/smalltalk
 npm run tauri dev
+```
+
+Follow `docs/phases/p6-task-turn-accuracy/p6-08-manual-qa-results.md` and record the native results rather than inferring them from unit tests. Exercise manual Continue, startup/background refresh, interruption and return, no-safe-target evidence preview, positive direct open, stale/suppressed open, model-on/model-off identity, and React/island parity. During the run, inspect the live SQLite database with the read-only queries in the storage section; an empty or old `continue_outputs/` folder does not mean the app made no decisions.
+
+For a documentation-only refresh, also run:
+
+```bash
+cd /Users/bhaskarpandit/Documents/smalltalk
+git diff --check
 ```
 
 Manual QA should verify:
@@ -2296,6 +2483,10 @@ Manual QA should verify:
 - Current focus and return target are visibly separate.
 - Activity summary, location, recent context, state left behind, and next action are shown only when grounded.
 - Activity and target confidence can differ without collapsing into one confidence claim.
+- Surface, task, and target quality do not appear as contradictory unlabeled confidence claims.
+- The displayed task is supported by current user/task-turn evidence, including on the real Codex accessibility shape.
+- The provenance display distinguishes candidate-routing AI from recap-wording AI.
+- A background result does not silently downgrade a stronger manual result.
 - A brief Finder/search/docs/messages/terminal detour remains context unless local evidence promotes it.
 - Useful activity memory can appear when the exact safe target is missing, without showing `Continue here`.
 - The primary target can be opened or falls back to evidence inspection.
@@ -2304,6 +2495,7 @@ Manual QA should verify:
 - Diagnostics are hidden until opened.
 - Memory cleanup preview does not delete protected decision-linked frames.
 - Delete/reset clears live UI state after clearing backend state.
+- The P6 release label remains closed unless the generated report has `release_gate.passed: true` and all manual evidence is complete.
 
 ## Glossary
 

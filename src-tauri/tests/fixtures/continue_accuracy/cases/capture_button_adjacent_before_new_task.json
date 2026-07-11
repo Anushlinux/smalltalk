@@ -1,0 +1,25 @@
+{
+  "schema": "smalltalk.continue_accuracy_fixture.v1",
+  "case_id": "capture_button_adjacent_before_new_task",
+  "scenario": "adjacent_5318852",
+  "description": "Synthetic adjacent-before window containing only the completed Continue-card copy task.",
+  "privacy_review": { "status": "approved", "reviewed_at_ms": 1783640000000, "reviewer_role": "p6_fixture_owner" },
+  "fixture_partition": "validation",
+  "injection_boundary": "capture_records",
+  "redacted_source_records": {
+    "frames": [ { "record_id": "frame-prior", "frame_id": "frame-prior", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": null, "owner_id_hash": null, "confidence": 1.0, "text": { "text": "The Continue-card copy update is complete.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "session_id": { "kind": "label", "value": "fixture-session" }, "app_name": { "kind": "label", "value": "AgentChat" }, "window_title": { "kind": "label", "value": "Smalltalk task" }, "focused": { "kind": "boolean", "value": true }, "capture_trigger": { "kind": "label", "value": "manual" }, "previous_frame_id": { "kind": "null" } } } ],
+    "ax_nodes": [ { "record_id": "ax-prior", "frame_id": "frame-prior", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "static_text", "source_order": 1, "bounds": null, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "The Continue-card copy update is complete.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": {} } ],
+    "ocr_spans": [], "content_units": [], "frame_text_resolution": [], "app_window_context": [], "ui_events": [], "transitions": [], "typing_metadata": []
+  },
+  "injected_historical_state": { "feedback_events": [], "branch_contexts": [], "workstreams": [], "open_loops": [], "memory_cells": [] },
+  "expected_checkpoints": [
+    { "checkpoint": "resolved_text", "status": "expected", "slots": { "active_text_contains": { "kind": "text", "value": { "text": "The Continue-card copy update is complete.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } } } },
+    { "checkpoint": "region_roles", "status": "expected", "slots": { "latest_result_region": { "kind": "label", "value": "conversation_history" } } },
+    { "checkpoint": "latest_task_turn", "status": "expected_abstention", "slots": { "latest_user_goal": { "kind": "null" } } },
+    { "checkpoint": "public_target", "status": "expected_abstention", "slots": { "return_target": { "kind": "null" }, "resume_work_target": { "kind": "null" } } },
+    { "checkpoint": "product_answer", "status": "expected_abstention", "slots": { "task_resolution_status": { "kind": "label", "value": "no_clear_current_task" }, "task_identity": { "kind": "null" }, "what_you_were_doing": { "kind": "null" }, "public_target_honest": { "kind": "boolean", "value": true } } }
+  ],
+  "forbidden_claims": [ { "term": { "text": "The Continue-card copy update is complete.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null }, "checkpoints": ["latest_task_turn", "product_answer"], "primary_only": true } ],
+  "allowed_uncertainty": [ { "checkpoint": "latest_task_turn", "slot": "next_action", "allowed_labels": ["none", "unclear"] } ],
+  "expected_model_parity": { "required": false, "identity_slots": [] }
+}

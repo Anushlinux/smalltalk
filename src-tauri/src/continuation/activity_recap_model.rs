@@ -6,12 +6,15 @@ use super::activity_recap::{
 use super::activity_recap_inputs::ActivityRecapInputs;
 use super::activity_recap_objective::ActivityWorkLabelResult;
 use super::activity_recap_segments::StitchedActivityTimeline;
+use super::activity_recap_truth::{
+    ActivityRecapLocalGuard, ActivityRecapTaskIdentity, ActivityRecapTaskTruth,
+};
 use super::activity_recap_validation::validate_activity_recap_model_output;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-pub(crate) const ACTIVITY_RECAP_MODEL_PACK_SCHEMA: &str = "smalltalk.activity_recap_model_pack.v1";
+pub(crate) const ACTIVITY_RECAP_MODEL_PACK_SCHEMA: &str = "smalltalk.activity_recap_model_pack.v2";
 const MAX_OBJECTIVE_TERMS: usize = 8;
 const MAX_MISSING_EVIDENCE: usize = 8;
 const MAX_TERM_BANK: usize = 64;
@@ -24,6 +27,8 @@ pub(crate) struct ActivityRecapSynthesisContext<'a> {
     pub timeline: &'a StitchedActivityTimeline,
     pub work_label: &'a ActivityWorkLabelResult,
     pub local_recap: &'a ContinueActivityRecap,
+    pub task_truth: &'a ActivityRecapTaskTruth,
+    pub local_guard: &'a ActivityRecapLocalGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +55,7 @@ impl Default for ActivityRecapSynthesisAudit {
             raw_response: json!({"status": "not_received"}),
             parsed_output: json!({"status": "not_parsed"}),
             validation: json!({
-                "schema": "smalltalk.activity_recap_model_validation.v1",
+                "schema": "smalltalk.activity_recap_model_validation.v2",
                 "outcome": "not_attempted",
                 "failures": [],
                 "repairs": []
@@ -64,10 +69,12 @@ impl Default for ActivityRecapSynthesisAudit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelPack {
     pub schema: String,
     pub instructions: String,
+    pub task_truth: ActivityRecapTaskTruth,
     pub current_surface: Option<ActivityRecapModelSurface>,
     pub primary_segment: Option<ActivityRecapModelPrimarySegment>,
     pub detours: Vec<ActivityRecapModelDetour>,
@@ -83,9 +90,12 @@ pub(crate) struct ActivityRecapModelPack {
     pub allowed_state_terms: Vec<String>,
     pub allowed_next_action_terms: Vec<String>,
     pub allowed_target_terms: Vec<String>,
+    #[serde(skip, default)]
+    pub local_guard: ActivityRecapLocalGuard,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelSurface {
     pub app_name: Option<String>,
     pub display_title: Option<String>,
@@ -97,7 +107,8 @@ pub(crate) struct ActivityRecapModelSurface {
     pub evidence_handle: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelPrimarySegment {
     pub app_name: Option<String>,
     pub surface_title: Option<String>,
@@ -107,7 +118,8 @@ pub(crate) struct ActivityRecapModelPrimarySegment {
     pub evidence_handle: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelDetour {
     pub source_detour_id: String,
     pub surface_title: Option<String>,
@@ -119,7 +131,8 @@ pub(crate) struct ActivityRecapModelDetour {
     pub evidence_handle: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelSupport {
     pub source_support_id: String,
     pub local_summary: String,
@@ -128,7 +141,8 @@ pub(crate) struct ActivityRecapModelSupport {
     pub evidence_handle: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelLocalSeed {
     pub primary_work_summary: Option<String>,
     pub primary_work_label: Option<String>,
@@ -144,7 +158,8 @@ pub(crate) struct ActivityRecapModelLocalSeed {
     pub validation_status: ActivityRecapValidationStatus,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelTargetPolicy {
     pub has_safe_target: bool,
     pub openability: String,
@@ -152,16 +167,19 @@ pub(crate) struct ActivityRecapModelTargetPolicy {
     pub must_explain_no_safe_target: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelEvidenceHandle {
     pub handle: String,
     pub role: String,
     pub confidence: ActivityEvidenceConfidence,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ActivityRecapModelOutput {
+    pub identity: ActivityRecapTaskIdentity,
+    pub target_policy: ActivityRecapModelTargetPolicy,
     pub primary_work_summary: Option<String>,
     pub primary_where_summary: Option<String>,
     pub last_meaningful_state: Option<String>,
@@ -173,6 +191,15 @@ pub(crate) struct ActivityRecapModelOutput {
     pub confidence: String,
     pub uncertainty_notes: Vec<String>,
     pub used_evidence_handles: Vec<String>,
+    pub claim_proofs: Vec<ActivityRecapModelClaimProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActivityRecapModelClaimProof {
+    pub claim_key: String,
+    pub evidence_handles: Vec<String>,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +223,8 @@ pub(crate) fn maybe_run_activity_recap_model_synthesis(
         context.timeline,
         context.work_label,
         context.local_recap,
+        context.task_truth,
+        context.local_guard,
     );
     let mut audit = ActivityRecapSynthesisAudit {
         model_pack: serde_json::to_value(&pack)
@@ -322,7 +351,7 @@ fn finish_activity_recap_synthesis(
     let validation = validate_activity_recap_model_output(local_recap, pack, &output);
     audit.validation = serde_json::to_value(&validation.report)
         .unwrap_or_else(|_| json!({"outcome": "audit_serialization_failed"}));
-    if validation.report.outcome == "rejected" {
+    if validation.report.outcome.starts_with("rejected_") {
         audit.fallback = fallback_audit(true, Some("validation_rejected"));
     } else {
         audit.fallback = fallback_audit(false, None);
@@ -347,12 +376,8 @@ fn fallback_result(
         format!("activity_recap_model_fallback:{reason}"),
     );
     audit.validation = json!({
-        "schema": "smalltalk.activity_recap_model_validation.v1",
-        "outcome": if validation_status == ActivityRecapValidationStatus::Rejected {
-            "rejected"
-        } else {
-            "fallback"
-        },
+        "schema": "smalltalk.activity_recap_model_validation.v2",
+        "outcome": "fallback_local",
         "failures": [reason],
         "repairs": []
     });
@@ -373,11 +398,16 @@ pub(crate) fn build_activity_recap_model_pack(
     timeline: &StitchedActivityTimeline,
     work_label: &ActivityWorkLabelResult,
     local_recap: &ContinueActivityRecap,
+    task_truth: &ActivityRecapTaskTruth,
+    local_guard: &ActivityRecapLocalGuard,
 ) -> ActivityRecapModelPack {
     let recap = local_recap.clone().sanitized();
-    let primary_anchor_ids = timeline
-        .primary_segment
-        .as_ref()
+    let eligible_primary_segment = timeline.primary_segment.as_ref().filter(|segment| {
+        task_truth.consistency_status != "conflicting"
+            && task_truth.selected_primary_segment_id.as_deref()
+                == Some(segment.segment_id.as_str())
+    });
+    let primary_anchor_ids = eligible_primary_segment
         .map(|segment| segment.evidence_anchor_ids.as_slice())
         .unwrap_or(&[]);
     let primary_handle = (!primary_anchor_ids.is_empty()).then(|| "e1".to_string());
@@ -402,21 +432,14 @@ pub(crate) fn build_activity_recap_model_pack(
                 evidence_handle: current_surface_handle.clone(),
             });
     let primary_segment =
-        timeline
-            .primary_segment
-            .as_ref()
-            .map(|segment| ActivityRecapModelPrimarySegment {
-                app_name: clean_optional(segment.app_name.as_deref(), 80),
-                surface_title: clean_optional(segment.surface_title.as_deref(), 160),
-                role: enum_name(&segment.role),
-                activity_kinds: clean_list(
-                    segment.activity_kinds.iter().map(String::as_str),
-                    8,
-                    100,
-                ),
-                confidence: segment.confidence,
-                evidence_handle: primary_handle.clone(),
-            });
+        eligible_primary_segment.map(|segment| ActivityRecapModelPrimarySegment {
+            app_name: clean_optional(segment.app_name.as_deref(), 80),
+            surface_title: clean_optional(segment.surface_title.as_deref(), 160),
+            role: enum_name(&segment.role),
+            activity_kinds: clean_list(segment.activity_kinds.iter().map(String::as_str), 8, 100),
+            confidence: segment.confidence,
+            evidence_handle: primary_handle.clone(),
+        });
 
     let mut evidence_handles = Vec::new();
     if let Some(handle) = primary_handle.as_deref() {
@@ -441,6 +464,23 @@ pub(crate) fn build_activity_recap_model_pack(
                     .map(|surface| surface.evidence_quality.as_str()),
             ),
         });
+    }
+    for handles in task_truth.claim_evidence_handles.values() {
+        for handle in handles {
+            if !evidence_handles.iter().any(|item| item.handle == *handle) {
+                evidence_handles.push(ActivityRecapModelEvidenceHandle {
+                    handle: handle.clone(),
+                    role: "current_task_truth".to_string(),
+                    confidence: confidence_from_score(
+                        task_truth
+                            .claim_confidence_caps
+                            .get("primary_work_summary")
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                });
+            }
+        }
     }
 
     let mut detours = Vec::new();
@@ -491,12 +531,7 @@ pub(crate) fn build_activity_recap_model_pack(
         .return_target
         .as_ref()
         .or(inputs.resume_work_target.as_ref());
-    let has_safe_target = target.is_some()
-        && recap.why_this_target.is_some()
-        && !matches!(
-            recap.target_confidence,
-            ActivityConfidence::None | ActivityConfidence::Low
-        );
+    let has_safe_target = task_truth.direct_target_allowed;
     let target_openability = if has_safe_target {
         target
             .map(|target| safe_enum_text(&target.openability, "unknown"))
@@ -506,7 +541,11 @@ pub(crate) fn build_activity_recap_model_pack(
     };
 
     let mut objective_terms = clean_list(
-        work_label.objective_terms.iter().map(String::as_str),
+        task_truth
+            .latest_user_goal
+            .iter()
+            .chain(task_truth.task_object.iter())
+            .map(String::as_str),
         MAX_OBJECTIVE_TERMS,
         100,
     );
@@ -530,11 +569,16 @@ pub(crate) fn build_activity_recap_model_pack(
     let mut allowed_primary_sources = vec![
         recap.primary_work_summary.as_deref(),
         recap.primary_work_label.as_deref(),
-        work_label.object_label.as_deref(),
-        work_label.primary_work_summary_seed.as_deref(),
+        task_truth.latest_user_goal.as_deref(),
+        task_truth.task_object.as_deref(),
+        task_truth.identity.bounded_semantic_label.as_deref(),
     ];
     allowed_primary_sources.extend(objective_terms.iter().map(|value| Some(value.as_str())));
-    if let Some(primary) = primary_segment.as_ref() {
+    if let Some(primary) = primary_segment.as_ref().filter(|_| {
+        timeline.primary_segment.as_ref().is_some_and(|segment| {
+            task_truth.selected_primary_segment_id.as_deref() == Some(segment.segment_id.as_str())
+        })
+    }) {
         allowed_primary_sources.push(primary.app_name.as_deref());
         allowed_primary_sources.push(primary.surface_title.as_deref());
         allowed_primary_sources.extend(
@@ -561,7 +605,8 @@ pub(crate) fn build_activity_recap_model_pack(
 
     ActivityRecapModelPack {
         schema: ACTIVITY_RECAP_MODEL_PACK_SCHEMA.to_string(),
-        instructions: "Rewrite only supplied recap phrasing. Do not select or open targets, promote detours, infer new tasks, or add facts. Use opaque handles only in used_evidence_handles and never in user copy. Preserve uncertainty when evidence is thin.".to_string(),
+        instructions: "Rewrite only supplied recap phrasing. Copy identity and target_policy exactly. Every material claim needs an allowed evidence handle and confidence at or below its local cap. Do not select or open targets, promote detours, infer new tasks, alter lifecycle state, or add facts. Use opaque handles only in proof fields and never in user copy. Preserve uncertainty when evidence is thin.".to_string(),
+        task_truth: task_truth.clone(),
         current_surface,
         primary_segment,
         detours,
@@ -595,6 +640,7 @@ pub(crate) fn build_activity_recap_model_pack(
         allowed_state_terms,
         allowed_next_action_terms,
         allowed_target_terms,
+        local_guard: local_guard.clone(),
     }
 }
 
@@ -677,6 +723,8 @@ fn activity_recap_model_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
+            "identity",
+            "target_policy",
             "primary_work_summary",
             "primary_where_summary",
             "last_meaningful_state",
@@ -687,9 +735,37 @@ fn activity_recap_model_schema() -> Value {
             "detour_summaries",
             "confidence",
             "uncertainty_notes",
-            "used_evidence_handles"
+            "used_evidence_handles",
+            "claim_proofs"
         ],
         "properties": {
+            "identity": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["task_turn_id", "task_turn_revision", "task_identity_key", "bounded_semantic_label", "execution_state", "current_actor", "waiting_on", "relation_to_prior", "workstream_id"],
+                "properties": {
+                    "task_turn_id": {"type": "string"},
+                    "task_turn_revision": {"type": "integer"},
+                    "task_identity_key": {"type": "string"},
+                    "bounded_semantic_label": nullable_string(),
+                    "execution_state": {"type": "string"},
+                    "current_actor": {"type": "string"},
+                    "waiting_on": {"type": "string"},
+                    "relation_to_prior": {"type": "string"},
+                    "workstream_id": nullable_string()
+                }
+            },
+            "target_policy": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["has_safe_target", "openability", "may_explain_target", "must_explain_no_safe_target"],
+                "properties": {
+                    "has_safe_target": {"type": "boolean"},
+                    "openability": {"type": "string"},
+                    "may_explain_target": {"type": "boolean"},
+                    "must_explain_no_safe_target": {"type": "boolean"}
+                }
+            },
             "primary_work_summary": nullable_string(),
             "primary_where_summary": nullable_string(),
             "last_meaningful_state": nullable_string(),
@@ -720,6 +796,20 @@ fn activity_recap_model_schema() -> Value {
                 "type": "array",
                 "maxItems": 8,
                 "items": {"type": "string"}
+            },
+            "claim_proofs": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["claim_key", "evidence_handles", "confidence"],
+                    "properties": {
+                        "claim_key": {"type": "string"},
+                        "evidence_handles": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                    }
+                }
             }
         }
     })
@@ -837,6 +927,16 @@ fn confidence_from_quality(value: Option<&str>) -> ActivityEvidenceConfidence {
     }
 }
 
+fn confidence_from_score(value: f64) -> ActivityEvidenceConfidence {
+    if value >= 0.75 {
+        ActivityEvidenceConfidence::High
+    } else if value >= 0.5 {
+        ActivityEvidenceConfidence::Medium
+    } else {
+        ActivityEvidenceConfidence::Low
+    }
+}
+
 fn term_bank(values: Vec<Option<&str>>) -> Vec<String> {
     let mut terms = HashSet::new();
     for value in values.into_iter().flatten() {
@@ -875,7 +975,6 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn synthesize_activity_recap_with_fixture_response(
     local_recap: &ContinueActivityRecap,
     pack: &ActivityRecapModelPack,
@@ -903,6 +1002,23 @@ mod tests {
 
     fn valid_output_json() -> Value {
         json!({
+            "identity": {
+                "task_turn_id": "turn-current",
+                "task_turn_revision": 1,
+                "task_identity_key": "identity-current",
+                "bounded_semantic_label": "Smalltalk recap",
+                "execution_state": "active",
+                "current_actor": "assistant_or_agent",
+                "waiting_on": "agent",
+                "relation_to_prior": "new_task",
+                "workstream_id": "smalltalk"
+            },
+            "target_policy": {
+                "has_safe_target": false,
+                "openability": "none_or_thin",
+                "may_explain_target": false,
+                "must_explain_no_safe_target": true
+            },
             "primary_work_summary": "Planning the Smalltalk recap",
             "primary_where_summary": null,
             "last_meaningful_state": null,
@@ -913,7 +1029,12 @@ mod tests {
             "detour_summaries": [],
             "confidence": "medium",
             "uncertainty_notes": [],
-            "used_evidence_handles": ["e1"]
+            "used_evidence_handles": ["e1"],
+            "claim_proofs": [{
+                "claim_key": "primary_work_summary",
+                "evidence_handles": ["e1"],
+                "confidence": 0.7
+            }]
         })
     }
 

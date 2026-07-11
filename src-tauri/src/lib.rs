@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod capture;
 mod capture_core;
 mod continuation;
@@ -55,6 +57,7 @@ pub fn run() {
             capture::record_continue_feedback,
             capture::run_continue_eval,
             capture::run_continue_replay_eval,
+            capture::run_continue_accuracy_eval,
             capture::open_resume_point,
             session_island::get_island_continue_state,
             session_island::perform_island_continue_action,
@@ -71,4 +74,68 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Public, side-effect-bounded entry point used by the repository accuracy CLI.
+pub fn run_continue_accuracy_eval_cli(
+    fixture_root: Option<String>,
+    output_path: Option<String>,
+    allow_locked_holdout: bool,
+    repeat_count: usize,
+) -> Result<serde_json::Value, String> {
+    let report = continuation::accuracy_eval::run_committed_continue_accuracy_eval(
+        continuation::accuracy_eval::ContinueAccuracyEvalOptions {
+            fixture_root,
+            allow_locked_holdout,
+            repeat_count,
+        },
+    )?;
+    if let Some(output_path) = output_path {
+        continuation::accuracy_eval::write_accuracy_report(
+            &report,
+            std::path::Path::new(&output_path),
+        )?;
+    }
+    serde_json::to_value(report).map_err(|error| error.to_string())
+}
+
+/// Local-only Task Truth v2.02 evaluator. This is deliberately separate from the P6 report.
+pub fn run_task_truth_v2_eval_cli(
+    fixture_root: Option<String>,
+    output_path: Option<String>,
+    allow_locked_holdout: bool,
+) -> Result<serde_json::Value, String> {
+    let root = fixture_root
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/continue_accuracy/task_truth_v2")
+        });
+    let report = continuation::task_truth_v2::evaluate(&root, allow_locked_holdout)?;
+    if let Some(output_path) = output_path {
+        continuation::task_truth_v2::write_report(&report, std::path::Path::new(&output_path))?;
+    }
+    serde_json::to_value(report).map_err(|error| error.to_string())
+}
+
+/// Stable content identity used to bind TT2-05 budgets to the frozen baseline bytes.
+pub fn task_truth_v2_baseline_sha256(bytes: &[u8]) -> String {
+    format!(
+        "sha256:{}",
+        continuation::accuracy_fixture::sha256_hex(bytes)
+    )
+}
+
+/// Local-only, default-deny corpus builder used before any candidate is reviewed for commit.
+pub fn build_task_truth_v2_candidate_cli(
+    input_path: String,
+    output_path: Option<String>,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
+    let manifest = continuation::task_truth_v2::build_review_candidate(
+        std::path::Path::new(&input_path),
+        output_path.as_deref().map(std::path::Path::new),
+        dry_run,
+    )?;
+    serde_json::to_value(manifest).map_err(|error| error.to_string())
 }

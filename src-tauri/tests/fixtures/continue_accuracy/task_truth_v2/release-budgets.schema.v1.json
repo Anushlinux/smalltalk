@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smalltalk.task_truth_v2.release_budgets.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "policy_version",
+    "baseline_report_id",
+    "frozen_before_holdout_access",
+    "holdout_accessed_at_freeze",
+    "budgets"
+  ],
+  "properties": {
+    "schema": {"const": "smalltalk.task_truth_v2.release_budgets.v1"},
+    "policy_version": {"const": "tt2.05-budgets-v1"},
+    "baseline_report_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "frozen_before_holdout_access": {"const": true},
+    "holdout_accessed_at_freeze": {"const": false},
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manual_continue_p50_ms_max",
+        "manual_continue_p95_ms_max",
+        "local_packet_checkpoint_p50_ms_max",
+        "local_packet_checkpoint_p95_ms_max",
+        "model_request_max_images",
+        "model_request_max_bytes",
+        "model_request_max_tokens",
+        "semantic_checkpoint_writes_per_minute_max",
+        "semantic_checkpoint_retention_count_max",
+        "provider_failure_rate_max",
+        "safe_fallback_rate_min"
+      ],
+      "properties": {
+        "manual_continue_p50_ms_max": {"type": "number", "minimum": 0},
+        "manual_continue_p95_ms_max": {"type": "number", "minimum": 0},
+        "local_packet_checkpoint_p50_ms_max": {"type": "number", "minimum": 0},
+        "local_packet_checkpoint_p95_ms_max": {"type": "number", "minimum": 0},
+        "model_request_max_images": {"type": "number", "minimum": 0, "maximum": 4},
+        "model_request_max_bytes": {"type": "number", "minimum": 0, "maximum": 12582912},
+        "model_request_max_tokens": {"type": "number", "minimum": 0},
+        "semantic_checkpoint_writes_per_minute_max": {"type": "number", "minimum": 0},
+        "semantic_checkpoint_retention_count_max": {"type": "number", "minimum": 0, "maximum": 500},
+        "provider_failure_rate_max": {"type": "number", "minimum": 0, "maximum": 1},
+        "safe_fallback_rate_min": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

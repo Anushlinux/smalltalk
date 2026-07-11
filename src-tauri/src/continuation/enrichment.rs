@@ -4496,13 +4496,32 @@ fn hash_sensitive_value(domain: &str, value: &str) -> String {
 
 fn visible_text_sources(input: &SurfaceEnrichmentInput) -> Vec<String> {
     let mut sources = Vec::new();
-    for unit in input.content_units.iter().take(8) {
+    // Prefer typed task-turn hints before any positional fallback. The durable
+    // task-turn companion replaces this sample during Continue rebuild; this
+    // adapter remains the bounded pre-rebuild path for thin/older databases.
+    for unit in input.content_units.iter().rev().filter(|unit| {
+        unit.semantic_role.as_deref().is_some_and(|role| {
+            matches!(
+                role,
+                "user_message"
+                    | "agent_message"
+                    | "agent_status"
+                    | "chat_message"
+                    | "composer"
+                    | "editor_content"
+                    | "terminal_input"
+            )
+        })
+    }) {
         if let Some(text) = unit
             .text
             .as_deref()
             .and_then(|text| clean_string(Some(text), 280))
         {
-            sources.push(text);
+            push_unique(&mut sources, text);
+        }
+        if sources.len() >= 4 {
+            break;
         }
     }
     for node in input
@@ -4516,23 +4535,40 @@ fn visible_text_sources(input: &SurfaceEnrichmentInput) -> Vec<String> {
             .as_deref()
             .and_then(|text| clean_string(Some(text), 280))
         {
-            sources.push(text);
+            push_unique(&mut sources, text);
         }
     }
-    for span in input.ocr_spans.iter().take(6) {
+    for unit in input.content_units.iter().rev().take(8) {
+        if let Some(text) = unit
+            .text
+            .as_deref()
+            .and_then(|text| clean_string(Some(text), 280))
+        {
+            push_unique(&mut sources, text);
+        }
+    }
+    for span in input.ocr_spans.iter().rev().take(6) {
         if let Some(text) = clean_string(Some(&span.text), 220) {
-            sources.push(text);
+            push_unique(&mut sources, text);
         }
     }
-    if let Some(text) = input
-        .frame
-        .as_ref()
-        .and_then(|frame| frame.full_text.as_deref())
-        .and_then(|text| clean_string(Some(text), 600))
-    {
-        sources.push(text);
+    if sources.is_empty() {
+        if let Some(text) = input
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.full_text.as_deref())
+            .and_then(|text| clean_string(Some(text), 600))
+        {
+            sources.push(text);
+        }
     }
     sources
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 fn input_privacy_status(input: &SurfaceEnrichmentInput) -> Option<String> {

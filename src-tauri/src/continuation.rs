@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub(crate) mod accuracy_eval;
+pub(crate) mod accuracy_fixture;
 pub(crate) mod activity_recap;
 pub(crate) mod activity_recap_detours;
 pub(crate) mod activity_recap_inputs;
@@ -8,10 +10,24 @@ pub(crate) mod activity_recap_model;
 pub(crate) mod activity_recap_objective;
 pub(crate) mod activity_recap_open_loop;
 pub(crate) mod activity_recap_segments;
+pub(crate) mod activity_recap_truth;
 pub(crate) mod activity_recap_validation;
+pub(crate) mod confidence;
 pub(crate) mod enrichment;
+pub(crate) mod feedback_policy;
+pub(crate) mod semantic_consistency;
+pub(crate) mod task_truth_v2;
+pub(crate) mod task_turn;
+pub(crate) mod task_turn_evidence;
 
 pub use self::activity_recap::ContinueActivityRecap;
+pub use self::confidence::{
+    CompactConfidenceSummary, ConfidenceClaim, ConfidenceDimension, ConfidenceLabel,
+    ContinueConfidenceVector, LegacyConfidenceDerivation,
+};
+pub(crate) use self::feedback_policy::FEEDBACK_POLICY_VERSION;
+pub use self::semantic_consistency::{CrossLayerConsistencyResult, DirectTargetPolicyResult};
+pub use self::task_turn::CurrentTaskTurn;
 
 use self::enrichment::{
     classify_weak_surface, domain_app_family, domain_artifact_kind,
@@ -22,6 +38,18 @@ use self::enrichment::{
     weak_surface_identity_from_snapshot, EvidenceQuality, StaleSuppressionStrength,
     WeakSurfaceClassification, WeakSurfaceClassificationInput, WeakSurfaceDomain,
     WeakSurfaceEnrichmentDiagnostics, WeakSurfaceIdentity,
+};
+use self::feedback_policy::{
+    default_expiry_ms, evaluate_feedback_applicability, feedback_policy_config,
+    normalize_feedback_targets, provenance_for_explicit_kind, provenance_for_inferred_kind,
+    FeedbackApplicabilityContext, FeedbackApplicabilityResult, FeedbackEffect, FeedbackPolarity,
+    FeedbackPolicyEvent, FeedbackProvenance, NormalizedFeedbackTarget,
+    FEEDBACK_MIGRATION_POLICY_VERSION, FEEDBACK_POLICY_FINGERPRINT,
+};
+use self::semantic_consistency::{
+    evaluate_cross_layer_consistency, evaluate_direct_target_policy, evaluate_semantic_eligibility,
+    CrossLayerConsistencyInput, DirectTargetPolicyInput, RelationToCurrentTask,
+    SemanticEligibilityInput, SEMANTIC_GRAPH_POLICY_FINGERPRINT, SEMANTIC_GRAPH_POLICY_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -34,12 +62,11 @@ use std::path::Path;
 use std::process::Command;
 
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
-pub const CONTINUE_SCHEMA_VERSION: i64 = 5;
+pub const CONTINUE_SCHEMA_VERSION: i64 = 9;
 
 const FEEDBACK_INFERENCE_MIN_AGE_MS: i64 = 2 * 60 * 1000;
 const FEEDBACK_ACCEPTED_MIN_DWELL_MS: i64 = 30 * 1000;
 const FEEDBACK_REJECTED_MAX_DWELL_MS: i64 = 20 * 1000;
-pub(crate) const FEEDBACK_POLICY_VERSION: &str = "feedback_obedience.v1";
 const FEEDBACK_NEGATIVE_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const FEEDBACK_HARD_NEGATIVE_RECENT_MS: i64 = 48 * 60 * 60 * 1000;
 const FEEDBACK_SCORE_CAP_AFTER_SOFT_NEGATIVE: f64 = 0.44;
@@ -55,6 +82,10 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_artifacts",
     "continue_artifact_observations",
     "continue_semantic_moments",
+    "continue_task_turns",
+    "continue_task_turn_evidence",
+    "continue_task_turn_relations",
+    "continue_task_turn_lifecycle",
     "continue_task_actions",
     "continue_task_action_events",
     "continue_episodes",
@@ -65,10 +96,14 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_workstream_artifacts",
     "continue_workstream_state_snapshots",
     "continue_workstream_edges",
+    "continue_task_turn_workstream_memberships",
     "continue_branch_contexts",
     "continue_open_loops",
+    "continue_open_loop_lifecycle_events",
     "continue_open_loop_artifacts",
     "continue_open_loop_evidence",
+    "continue_semantic_eligibility_evaluations",
+    "continue_semantic_consistency_evaluations",
     "continue_boundary_revisions",
     "continue_memory_cells",
     "continue_memory_edges",
@@ -79,13 +114,23 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_weak_surface_enrichment_attempts",
     "continue_surface_enrichment_attempts",
     "continue_surface_snapshots",
+    "continue_ordered_evidence_spans",
+    "continue_salient_turn_evidence",
     "continue_app_activity_segments",
     "continue_activity_classifications",
     "continue_candidates",
     "continue_decisions",
     "continue_decision_open_events",
     "continue_feedback_events",
+    "continue_feedback_policy_evaluations",
     "continue_breadcrumbs",
+    "task_truth_v2_observation_packets",
+    "task_truth_v2_snapshots",
+    "task_truth_v2_checkpoints",
+    "task_truth_v2_shadow_audits",
+    "task_truth_v2_authority_audits",
+    "task_truth_v2_feedback_events",
+    "task_truth_v2_decision_contracts",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +177,7 @@ pub enum ContinueTextSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinueActionKind {
+    Investigating,
     Reading,
     Editing,
     Composing,
@@ -488,6 +534,51 @@ pub enum PrivacyMode {
     LocalPrivate,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceProbeStatus {
+    SucceededChangedEvidence,
+    SucceededNoChange,
+    TimedOut,
+    PrivacyBlocked,
+    PermissionBlocked,
+    Cancelled,
+    Failed,
+    NotApplicable,
+    BudgetExhausted,
+}
+
+impl EvidenceProbeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SucceededChangedEvidence => "succeeded_changed_evidence",
+            Self::SucceededNoChange => "succeeded_no_change",
+            Self::TimedOut => "timed_out",
+            Self::PrivacyBlocked => "privacy_blocked",
+            Self::PermissionBlocked => "permission_blocked",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::NotApplicable => "not_applicable",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceProbeOutcome {
+    pub probe_kind: EvidenceProbeKind,
+    pub requested_dimension: ConfidenceDimension,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub deadline_at_ms: i64,
+    pub status: EvidenceProbeStatus,
+    pub success_criteria: String,
+    pub evidence_record_ids: Vec<String>,
+    pub dimensions_changed: Vec<ConfidenceDimension>,
+    pub failure_reason: Option<String>,
+    pub stale_result: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceSufficiencyDecision {
     pub status: EvidenceSufficiencyStatus,
@@ -498,6 +589,12 @@ pub struct EvidenceSufficiencyDecision {
     pub candidate_margin: Option<f64>,
     pub allow_heavy_capture: bool,
     pub max_probe_ms: i64,
+    pub desired_claim: Option<ConfidenceClaim>,
+    pub below_threshold_dimensions: Vec<ConfidenceDimension>,
+    pub selected_probe: Option<EvidenceProbeKind>,
+    pub candidate_evidence_source: Option<String>,
+    pub probe_likely_to_help: bool,
+    pub failure_behavior: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +611,14 @@ pub struct NeedMoreEvidenceRequest {
     pub source_decision_id: String,
     pub source_evidence_watermark_hash: String,
     pub created_at_ms: i64,
+    pub desired_claim: ConfidenceClaim,
+    pub requested_dimensions: Vec<ConfidenceDimension>,
+    pub selected_probe: EvidenceProbeKind,
+    pub surface_key: String,
+    pub deadline_at_ms: i64,
+    pub success_criteria: String,
+    pub failure_behavior: String,
+    pub source_surface_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +641,14 @@ pub struct NeedMoreEvidenceProbeResult {
     pub privacy_status: Option<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+    pub deadline_at_ms: i64,
+    pub status: EvidenceProbeStatus,
+    pub per_probe_outcomes: Vec<EvidenceProbeOutcome>,
+    pub evidence_record_ids: Vec<String>,
+    pub dimensions_changed: Vec<ConfidenceDimension>,
+    pub stale_result: bool,
+    pub material_evidence_hash_before: String,
+    pub material_evidence_hash_after: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,6 +658,10 @@ pub struct ObserveBeforeDecideTrace {
     pub sufficiency: EvidenceSufficiencyDecision,
     pub probe_result: NeedMoreEvidenceProbeResult,
     pub reran_decision: bool,
+    pub rerun_reason: String,
+    pub confidence_before: CompactConfidenceSummary,
+    pub confidence_after: CompactConfidenceSummary,
+    pub stale_or_cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -806,6 +923,66 @@ pub struct ActiveCurrentWorkUnresolved {
     pub warnings: Vec<String>,
 }
 
+pub const CONTINUE_WORK_TRUTH_SCHEMA: &str = "smalltalk.continue_work_truth.v1";
+pub const CONTINUE_WORK_TRUTH_POLICY_VERSION: &str =
+    "smalltalk.continue_work_truth.general_activity.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContinueWorkTruth {
+    pub schema: String,
+    pub policy_version: String,
+    pub resolution_status: String,
+    pub activity_kind: String,
+    pub activity_summary: Option<String>,
+    pub work_object: Option<String>,
+    pub where_summary: Option<String>,
+    pub app_name: Option<String>,
+    pub artifact_id: Option<String>,
+    pub observed_at_ms: i64,
+    pub confidence: f64,
+    pub evidence_ids: Vec<String>,
+    pub source: String,
+    pub broader_goal_known: bool,
+    pub primary_relation: String,
+    pub reason_codes: Vec<String>,
+}
+
+impl ContinueWorkTruth {
+    pub(crate) fn unresolved(observed_at_ms: i64, reason: &str) -> Self {
+        Self {
+            schema: CONTINUE_WORK_TRUTH_SCHEMA.to_string(),
+            policy_version: CONTINUE_WORK_TRUTH_POLICY_VERSION.to_string(),
+            resolution_status: "unresolved".to_string(),
+            activity_kind: "unknown".to_string(),
+            activity_summary: None,
+            work_object: None,
+            where_summary: None,
+            app_name: None,
+            artifact_id: None,
+            observed_at_ms,
+            confidence: 0.0,
+            evidence_ids: Vec::new(),
+            source: "unresolved".to_string(),
+            broader_goal_known: false,
+            primary_relation: "unknown".to_string(),
+            reason_codes: vec![reason.to_string()],
+        }
+    }
+
+    fn supports_primary_activity(&self) -> bool {
+        matches!(
+            self.resolution_status.as_str(),
+            "task_supported" | "activity_supported"
+        )
+    }
+
+    fn supports_direct_target(&self) -> bool {
+        self.supports_primary_activity()
+            && self.artifact_id.is_some()
+            && self.primary_relation == "primary"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueArtifact {
     pub id: String,
@@ -849,6 +1026,8 @@ pub struct ContinueArtifactObservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueTaskAction {
     pub id: String,
+    #[serde(default)]
+    pub task_turn_id: Option<String>,
     pub frame_id: String,
     pub previous_frame_id: Option<String>,
     pub artifact_id: Option<String>,
@@ -951,6 +1130,9 @@ pub struct ContinueEvidenceSpan {
 pub struct ContinueOpenLoop {
     pub id: String,
     pub workstream_id: String,
+    pub task_turn_id: Option<String>,
+    pub parent_task_turn_id: Option<String>,
+    pub origin_task_turn_id: Option<String>,
     pub state: String,
     pub boundary_kind: String,
     pub quality: String,
@@ -966,18 +1148,26 @@ pub struct ContinueOpenLoop {
     pub unfinished_state: Option<String>,
     pub next_evidence_backed_action: Option<String>,
     pub current_focus_relation: Option<String>,
+    pub relation_to_current_task: String,
+    pub freshness: String,
+    pub eligible_for_primary: bool,
+    pub eligible_for_objective: bool,
+    pub eligible_for_last_state: bool,
+    pub eligibility_reason_codes: Vec<String>,
     pub missing_fields: Vec<String>,
     pub evidence_spans: Vec<ContinueEvidenceSpan>,
     pub local_reason: Option<String>,
     pub first_seen_at_ms: Option<i64>,
     pub last_updated_at_ms: i64,
     pub revision: i64,
+    pub ownership_revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContinueWorkstreamStateSnapshot {
     pub id: String,
     pub workstream_id: String,
+    pub task_turn_id: Option<String>,
     pub observed_at_ms: i64,
     pub state: String,
     pub previous_state: Option<String>,
@@ -999,6 +1189,7 @@ pub struct ContinueWorkstreamStateSnapshot {
 pub struct ContinueWorkstreamEdge {
     pub id: String,
     pub workstream_id: String,
+    pub task_turn_id: Option<String>,
     pub from_artifact_id: String,
     pub to_artifact_id: String,
     pub edge_kind: String,
@@ -1012,6 +1203,10 @@ pub struct ContinueWorkstreamEdge {
 pub struct ContinueBranchContext {
     pub id: String,
     pub branch_action_id: String,
+    pub task_turn_id: Option<String>,
+    pub origin_task_turn_id: Option<String>,
+    pub promotion_task_turn_id: Option<String>,
+    pub promoted_at_ms: Option<i64>,
     pub branch_artifact_id: String,
     pub origin_artifact_id: Option<String>,
     pub origin_workstream_id: Option<String>,
@@ -1025,6 +1220,11 @@ pub struct ContinueBranchContext {
     pub confidence: f64,
     pub reason_code: Option<String>,
     pub evidence_action_ids: Vec<String>,
+    pub promotion_evidence_action_ids: Vec<String>,
+    pub eligible_feedback_event_ids: Vec<String>,
+    pub feedback_rejection_reasons: Vec<String>,
+    pub feedback_policy_version: String,
+    pub feedback_policy_fingerprint: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -1067,11 +1267,16 @@ impl BranchPromotionState {
                 | BranchPromotionState::PromotedSustainedWork
         )
     }
+
+    fn is_promoted(self) -> bool {
+        self.public_return_eligible()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct BranchPromotionActionEvidence {
     action_id: String,
+    task_turn_id: Option<String>,
     action_kind: String,
     action_role: String,
     branch_kind: Option<String>,
@@ -1087,7 +1292,9 @@ struct BranchPromotionInput {
     branch_started_at_ms: i64,
     returned_to_origin_at_ms: Option<i64>,
     feedback_hard_suppressed: bool,
-    feedback_positive_kind: Option<String>,
+    current_task_turn_id: Option<String>,
+    eligible_feedback: Option<BranchEligibleFeedback>,
+    rejected_feedback: Vec<FeedbackApplicabilityResult>,
     has_origin: bool,
     actions: Vec<BranchPromotionActionEvidence>,
 }
@@ -1100,7 +1307,18 @@ struct BranchPromotionDecision {
     promotion_reason: String,
     confidence: f64,
     evidence_action_ids: Vec<String>,
+    eligible_feedback_event_ids: Vec<String>,
+    feedback_rejection_reasons: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BranchEligibleFeedback {
+    event_id: String,
+    event_kind: String,
+    provenance: FeedbackProvenance,
+    occurred_at_ms: i64,
+    confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1387,10 @@ pub struct ContinueMemoryCounts {
     pub artifacts: i64,
     pub artifact_observations: i64,
     pub semantic_moments: i64,
+    pub task_turns: i64,
+    pub task_turn_evidence: i64,
+    pub task_turn_relations: i64,
+    pub task_turn_lifecycle: i64,
     pub task_actions: i64,
     pub task_action_events: i64,
     pub episodes: i64,
@@ -1232,6 +1454,7 @@ pub struct ContinueSecondLayerRebuildResult {
     pub artifact_count: i64,
     pub observation_count: i64,
     pub semantic_moment_count: i64,
+    pub task_turn_count: i64,
     pub task_action_count: i64,
     pub event_backed_promotions: Vec<EventBackedPromotionSummary>,
     pub start_frame_id: Option<String>,
@@ -1299,6 +1522,7 @@ pub struct ContinueDecisionRequest {
     pub audit_output_enabled: Option<bool>,
     pub island_trigger_reason: Option<String>,
     pub island_source: Option<String>,
+    pub request_trigger: Option<String>,
 }
 
 impl Default for ContinueDecisionRequest {
@@ -1316,6 +1540,7 @@ impl Default for ContinueDecisionRequest {
             audit_output_enabled: Some(false),
             island_trigger_reason: None,
             island_source: None,
+            request_trigger: None,
         }
     }
 }
@@ -1332,8 +1557,27 @@ pub struct ContinueDecisionResult {
     pub current_focus: Option<ContinueFocusSummary>,
     pub active_current_work_unresolved: Option<ActiveCurrentWorkUnresolved>,
     pub p0_quality_signals: P0QualitySignals,
+    pub work_truth: ContinueWorkTruth,
     pub current_activity: Option<String>,
+    pub current_task_turn: Option<CurrentTaskTurn>,
+    pub task_resolution_status: String,
+    pub task_resolution_reason_codes: Vec<String>,
+    pub supported_surface: Option<String>,
+    pub alternative_hypotheses: Vec<String>,
+    pub request_trigger: String,
+    pub task_understanding_source: String,
+    pub wording_source: String,
+    pub target_selection_source: String,
+    pub task_truth_v2: task_truth_v2::production::TaskTruthProductionDecisionV1,
     pub selected_workstream: Option<ContinueSelectedWorkstream>,
+    pub semantic_graph_policy_version: String,
+    pub cross_layer_consistency: CrossLayerConsistencyResult,
+    pub direct_target_policy: DirectTargetPolicyResult,
+    pub target_truth: ContinueTargetTruth,
+    pub evidence_preview: Option<ContinueEvidencePreview>,
+    pub confidence_vector: ContinueConfidenceVector,
+    pub confidence_summary: CompactConfidenceSummary,
+    pub legacy_confidence_derivation: LegacyConfidenceDerivation,
     pub selected_candidate_id: Option<String>,
     pub return_target: Option<ContinueReturnTarget>,
     pub resume_work_target: Option<ContinueReturnTarget>,
@@ -1353,6 +1597,8 @@ pub struct ContinueDecisionResult {
     pub generated_candidates: i64,
     pub validation_status: String,
     pub feedback_policy_version: String,
+    pub feedback_policy_fingerprint: String,
+    pub next_feedback_transition_at_ms: Option<i64>,
     pub feedback_watermark_ms: Option<i64>,
     pub open_watermark_ms: Option<i64>,
     pub feedback_suppressed_candidate_count: usize,
@@ -1377,6 +1623,7 @@ pub struct ContinueDecisionResult {
     pub app_activity: Option<ContinueAppActivityIntelligence>,
     pub activity_summary: Option<ContinueActivitySummary>,
     pub activity_recap: ContinueActivityRecap,
+    pub answer: ContinueInterruptionRecoveryAnswer,
     pub activity_recap_watermark_hash: String,
     #[serde(skip_serializing)]
     pub(crate) activity_recap_synthesis_audit: activity_recap_model::ActivityRecapSynthesisAudit,
@@ -1467,6 +1714,14 @@ pub struct ContinueFeedbackEventResult {
     pub reason: Option<String>,
     pub note: Option<String>,
     pub source: Option<String>,
+    pub provenance: String,
+    pub task_turn_id: Option<String>,
+    pub session_id: Option<String>,
+    pub branch_context_id: Option<String>,
+    pub applies_from_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub normalized_targets: Vec<NormalizedFeedbackTarget>,
+    pub feedback_policy_version: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1479,6 +1734,10 @@ pub struct ContinueExplicitFeedbackRequest {
     pub feedback_kind: String,
     pub note: Option<String>,
     pub source: Option<String>,
+    pub task_snapshot_id: Option<String>,
+    pub task_snapshot_revision: Option<i64>,
+    pub affected_task_field: Option<String>,
+    pub task_hypothesis_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1545,12 +1804,20 @@ struct FeedbackEventRow {
     target_artifact_id: Option<String>,
     chosen_artifact_id: Option<String>,
     target_artifact_stable_key: Option<String>,
+    chosen_artifact_stable_key: Option<String>,
     resume_work_target_artifact_id: Option<String>,
     timestamp_ms: i64,
     confidence: f64,
     reason: Option<String>,
     note: Option<String>,
     source: Option<String>,
+    provenance: Option<String>,
+    task_turn_id: Option<String>,
+    session_id: Option<String>,
+    branch_context_id: Option<String>,
+    applies_from_ms: Option<i64>,
+    expires_at_ms: Option<i64>,
+    evidence_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1840,6 +2107,16 @@ pub struct ContinueEvidenceWatermark {
     pub latest_semantic_moment_at_ms: Option<i64>,
     pub latest_task_action_id: Option<String>,
     pub latest_task_action_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_task_turn_id: Option<String>,
+    #[serde(default)]
+    pub latest_task_turn_revision: Option<i64>,
+    #[serde(default)]
+    pub latest_task_turn_updated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub semantic_graph_policy_fingerprint: Option<String>,
+    #[serde(default)]
+    pub semantic_graph_material_fingerprint: Option<String>,
     pub latest_workstream_revision: Option<i64>,
     pub latest_open_loop_revision: Option<i64>,
     pub latest_boundary_revision: Option<i64>,
@@ -1895,6 +2172,7 @@ pub struct ContinueDecisionTrace {
     pub latest_frames: Vec<TraceFrameSummary>,
     pub latest_events: Vec<TraceEventSummary>,
     pub semantic_moments: Vec<ContinueSemanticMoment>,
+    pub current_task_turn: Option<CurrentTaskTurn>,
     pub artifacts: Vec<ArtifactIdentityAudit>,
     pub task_actions: Vec<TraceTaskActionSummary>,
     pub episodes: Vec<TraceEpisodeSummary>,
@@ -1902,6 +2180,13 @@ pub struct ContinueDecisionTrace {
     pub workstream_state_snapshots: Vec<ContinueWorkstreamStateSnapshot>,
     pub workstream_edges: Vec<ContinueWorkstreamEdge>,
     pub branch_contexts: Vec<ContinueBranchContext>,
+    pub semantic_graph_policy_version: String,
+    pub cross_layer_consistency: Option<CrossLayerConsistencyResult>,
+    pub direct_target_policy: Option<DirectTargetPolicyResult>,
+    pub feedback_policy_version: String,
+    pub feedback_policy_fingerprint: String,
+    pub feedback_policy_config: feedback_policy::FeedbackPolicyConfig,
+    pub feedback_policy_evaluations: Vec<Value>,
     pub open_loops: Vec<ContinueOpenLoop>,
     pub candidates: Vec<TraceCandidateSummary>,
     pub scoring: Vec<TraceScoringSummary>,
@@ -1938,6 +2223,7 @@ pub struct TraceEventSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceTaskActionSummary {
     pub action_id: String,
+    pub task_turn_id: Option<String>,
     pub frame_id: String,
     pub artifact_id: Option<String>,
     pub secondary_artifact_id: Option<String>,
@@ -2237,6 +2523,10 @@ struct ResolvedCurrentSurface {
 struct CurrentSurfaceResolutionAudit {
     schema: String,
     selected: ResolvedCurrentSurface,
+    relation_to_current_task: semantic_consistency::RelationToCurrentTask,
+    surface_relation: String,
+    task_identity_may_change: bool,
+    relation_reason_codes: Vec<String>,
     top_rejected: Vec<ResolvedCurrentSurface>,
     row_count: usize,
     excluded_self_or_debug: Vec<String>,
@@ -2290,6 +2580,7 @@ struct EventBackedCurrentWorkLinks {
 struct CandidateGenerationContext<'a> {
     now_ms: i64,
     workstreams: &'a [ScorerWorkstream],
+    current_task_turn: Option<&'a CurrentTaskTurn>,
     current_focus: Option<&'a ContinueFocusSummary>,
     active_current_work_unresolved: Option<&'a ActiveCurrentWorkUnresolved>,
 }
@@ -2330,6 +2621,9 @@ struct ActiveCurrentWorkUnresolvedForModel {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContinueSelectedWorkstream {
     pub workstream_id: String,
+    pub selected_by_task_turn_id: Option<String>,
+    pub relation_to_current_task: String,
+    pub selection_reason_codes: Vec<String>,
     pub state: String,
     pub title_candidate: Option<String>,
     pub primary_artifact_id: Option<String>,
@@ -2337,7 +2631,7 @@ pub struct ContinueSelectedWorkstream {
     pub unresolved_signal: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinueReturnTarget {
     pub artifact_id: Option<String>,
     pub artifact_kind: Option<String>,
@@ -2346,6 +2640,51 @@ pub struct ContinueReturnTarget {
     pub document_path: Option<String>,
     pub openability: String,
     pub fallback_frame_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContinueInterruptionRecoveryAnswer {
+    pub schema: String,
+    pub what_you_were_doing: Option<String>,
+    pub where_label: Option<String>,
+    pub where_you_left_off: Option<String>,
+    pub next: String,
+    pub action: String,
+    pub target_note: Option<String>,
+    pub task_confidence_label: String,
+    pub target_confidence_label: String,
+}
+
+impl Default for ContinueInterruptionRecoveryAnswer {
+    fn default() -> Self {
+        Self {
+            schema: "smalltalk.interruption_recovery_answer.v1".to_string(),
+            what_you_were_doing: None,
+            where_label: None,
+            where_you_left_off: None,
+            next: "The next action is not clear from the current evidence.".to_string(),
+            action: "view_summary".to_string(),
+            target_note: Some(
+                "The exact task location is unavailable from the current evidence.".to_string(),
+            ),
+            task_confidence_label: "none".to_string(),
+            target_confidence_label: "none".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinueEvidencePreview {
+    pub schema: String,
+    pub preview_kind: String,
+    pub frame_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinueTargetTruth {
+    pub schema: String,
+    pub state: String,
+    pub reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2476,6 +2815,7 @@ pub struct RecentContinueArtifact {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecentContinueTaskAction {
     pub id: String,
+    pub task_turn_id: Option<String>,
     pub frame_id: String,
     pub previous_frame_id: Option<String>,
     pub artifact_id: Option<String>,
@@ -2634,6 +2974,7 @@ struct EvidenceFrame {
     background_text: Option<String>,
     full_text_quality: Option<String>,
     text_quality_flags: Vec<String>,
+    structured_semantic_text: Option<String>,
     content_hash: Option<String>,
     image_hash: Option<String>,
     privacy_status: Option<String>,
@@ -2796,6 +3137,7 @@ struct ResolvedArtifact {
 #[derive(Debug, Clone)]
 struct ExtractedTaskAction {
     id: String,
+    task_turn_id: Option<String>,
     frame_id: String,
     previous_frame_id: Option<String>,
     artifact_id: Option<String>,
@@ -2853,6 +3195,7 @@ struct SemanticDelta {
 #[derive(Debug, Clone)]
 struct ContinueActionRecord {
     id: String,
+    task_turn_id: Option<String>,
     frame_id: String,
     previous_frame_id: Option<String>,
     artifact_id: Option<String>,
@@ -2987,6 +3330,7 @@ struct ScorerEpisode {
 #[derive(Debug, Clone)]
 struct ScorerAction {
     id: String,
+    task_turn_id: Option<String>,
     frame_id: String,
     artifact_id: Option<String>,
     secondary_artifact_id: Option<String>,
@@ -3024,6 +3368,9 @@ struct ScorerWorkstream {
 struct ScorerOpenLoop {
     id: String,
     workstream_id: String,
+    task_turn_id: Option<String>,
+    parent_task_turn_id: Option<String>,
+    origin_task_turn_id: Option<String>,
     state: String,
     boundary_kind: String,
     quality: String,
@@ -3039,6 +3386,12 @@ struct ScorerOpenLoop {
     unfinished_state: Option<String>,
     next_evidence_backed_action: Option<String>,
     current_focus_relation: Option<String>,
+    relation_to_current_task: String,
+    freshness: String,
+    eligible_for_primary: bool,
+    eligible_for_objective: bool,
+    eligible_for_last_state: bool,
+    eligibility_reason_codes: Vec<String>,
     missing_fields: Vec<String>,
     evidence_spans: Vec<ContinueEvidenceSpan>,
     local_reason: Option<String>,
@@ -3377,6 +3730,7 @@ struct CachedContinueDecisionMeta {
     activity_recap: ContinueActivityRecap,
     activity_recap_proof: activity_recap_integration::ActivityRecapDecisionProof,
     activity_recap_watermark_hash: String,
+    work_truth_policy_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3506,7 +3860,7 @@ pub fn rebuild_continue_second_layer(
     request: ContinueSecondLayerRebuildRequest,
 ) -> Result<ContinueSecondLayerRebuildResult, String> {
     ensure_continue_schema(conn)?;
-    let frames = load_evidence_frames(conn, &request)?;
+    let mut frames = load_evidence_frames(conn, &request)?;
     let frame_ids = frames
         .iter()
         .map(|frame| frame.id.clone())
@@ -3524,6 +3878,22 @@ pub fn rebuild_continue_second_layer(
         frame_artifacts.insert(frame.id.clone(), artifact);
     }
 
+    let task_turn_build = task_turn_evidence::rebuild_task_turn_evidence(conn, &frame_ids)?;
+    let provisional_task_turns = task_turn::resolve_provisional_task_turns(conn, &frame_ids)?;
+    for frame in &mut frames {
+        frame.structured_semantic_text = provisional_task_turns
+            .frame_scopes
+            .get(&frame.id)
+            .map(|scope| scope.current_semantic_text.clone())
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                task_turn_build
+                    .semantic_text_by_frame
+                    .get(&frame.id)
+                    .cloned()
+            });
+    }
+
     let semantic_moments = rebuild_continue_semantic_moments(conn, &frames, &frame_artifacts)?;
     let semantic_moment_by_frame = semantic_moments
         .iter()
@@ -3538,10 +3908,22 @@ pub fn rebuild_continue_second_layer(
         &frames,
         &frame_artifacts,
         &semantic_moment_by_frame,
+        &provisional_task_turns.frame_scopes,
     ));
     for action in &actions {
         insert_continue_task_action(conn, action)?;
     }
+    let resolved_turn_ids = provisional_task_turns
+        .frame_scopes
+        .values()
+        .map(|scope| scope.task_turn_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    task_turn::finalize_task_turns(conn, &resolved_turn_ids)?;
+    let task_truth_watermark =
+        build_continue_evidence_watermark(conn, request.session_id.as_deref())?;
+    task_truth_v2::checkpoint_observation_frames(conn, &frames, &task_truth_watermark.hash)?;
     let event_backed_promotions = promote_event_backed_weak_surfaces(conn, &request, &frames)?;
     let snapshot_backed_promotions = promote_snapshot_backed_weak_surfaces(conn, &request)?;
     let mut event_backed_promotions = event_backed_promotions;
@@ -3552,6 +3934,7 @@ pub fn rebuild_continue_second_layer(
         artifact_count: count_if_present(conn, "continue_artifacts")?,
         observation_count: count_if_present(conn, "continue_artifact_observations")?,
         semantic_moment_count: count_if_present(conn, "continue_semantic_moments")?,
+        task_turn_count: count_if_present(conn, "continue_task_turns")?,
         task_action_count: count_if_present(conn, "continue_task_actions")?,
         event_backed_promotions,
         start_frame_id: frames.first().map(|frame| frame.id.clone()),
@@ -3622,7 +4005,7 @@ pub fn recent_continue_task_actions(
                     quality_flags_json, branch_kind, branch_action_role,
                     branch_promotion_eligible_by_default,
                     branch_public_return_eligible_by_default,
-                    branch_confidence, branch_reason_code
+                    branch_confidence, branch_reason_code, task_turn_id
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -3635,6 +4018,7 @@ pub fn recent_continue_task_actions(
             let quality_flags_json: String = row.get(29)?;
             Ok(RecentContinueTaskAction {
                 id: row.get(0)?,
+                task_turn_id: row.get(36)?,
                 frame_id: row.get(1)?,
                 previous_frame_id: row.get(2)?,
                 artifact_id: row.get(3)?,
@@ -3741,7 +4125,11 @@ pub fn load_branch_context_for_artifact(
                 branch_artifact_id, branch_kind, branch_started_at_ms,
                 last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
                 promotion_reason, confidence, reason_code, evidence_action_ids_json,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, task_turn_id,
+                eligible_feedback_event_ids_json, feedback_rejection_reasons_json,
+                feedback_policy_version, feedback_policy_fingerprint,
+                origin_task_turn_id, promotion_task_turn_id, promoted_at_ms,
+                promotion_evidence_action_ids_json
          FROM continue_branch_contexts
          WHERE branch_artifact_id = ?1 OR origin_artifact_id = ?1
          ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC
@@ -3764,7 +4152,11 @@ pub fn load_branch_context_for_action(
                 branch_artifact_id, branch_kind, branch_started_at_ms,
                 last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
                 promotion_reason, confidence, reason_code, evidence_action_ids_json,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, task_turn_id,
+                eligible_feedback_event_ids_json, feedback_rejection_reasons_json,
+                feedback_policy_version, feedback_policy_fingerprint,
+                origin_task_turn_id, promotion_task_turn_id, promoted_at_ms,
+                promotion_evidence_action_ids_json
          FROM continue_branch_contexts
          WHERE branch_action_id = ?1
             OR evidence_action_ids_json LIKE ?2
@@ -3789,7 +4181,11 @@ pub fn load_recent_branch_contexts(
                     branch_artifact_id, branch_kind, branch_started_at_ms,
                     last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
                     promotion_reason, confidence, reason_code, evidence_action_ids_json,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, task_turn_id,
+                    eligible_feedback_event_ids_json, feedback_rejection_reasons_json,
+                    feedback_policy_version, feedback_policy_fingerprint,
+                    origin_task_turn_id, promotion_task_turn_id, promoted_at_ms,
+                    promotion_evidence_action_ids_json
              FROM continue_branch_contexts
              ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC
              LIMIT ?1",
@@ -3818,10 +4214,17 @@ pub fn has_returned_to_origin(conn: &Connection, branch_artifact_id: &str) -> Re
 
 fn branch_context_from_row(row: &Row<'_>) -> rusqlite::Result<ContinueBranchContext> {
     let evidence_action_ids_json: String = row.get(13)?;
+    let eligible_feedback_event_ids_json: String = row.get(17)?;
+    let feedback_rejection_reasons_json: String = row.get(18)?;
+    let promotion_evidence_action_ids_json: String = row.get(24)?;
     let returned_to_origin_at_ms: Option<i64> = row.get(8)?;
     Ok(ContinueBranchContext {
         id: row.get(0)?,
         branch_action_id: row.get(1)?,
+        task_turn_id: row.get(16)?,
+        origin_task_turn_id: row.get(21)?,
+        promotion_task_turn_id: row.get(22)?,
+        promoted_at_ms: row.get(23)?,
         origin_artifact_id: row.get(2)?,
         origin_workstream_id: row.get(3)?,
         branch_artifact_id: row.get(4)?,
@@ -3835,6 +4238,11 @@ fn branch_context_from_row(row: &Row<'_>) -> rusqlite::Result<ContinueBranchCont
         confidence: row.get(11)?,
         reason_code: row.get(12)?,
         evidence_action_ids: parse_string_array(&evidence_action_ids_json),
+        promotion_evidence_action_ids: parse_string_array(&promotion_evidence_action_ids_json),
+        eligible_feedback_event_ids: parse_string_array(&eligible_feedback_event_ids_json),
+        feedback_rejection_reasons: parse_string_array(&feedback_rejection_reasons_json),
+        feedback_policy_version: row.get(19)?,
+        feedback_policy_fingerprint: row.get(20)?,
         created_at_ms: row.get(14)?,
         updated_at_ms: row.get(15)?,
     })
@@ -3855,6 +4263,7 @@ pub fn rebuild_continue_third_layer(
     for workstream in &workstreams {
         insert_continue_workstream(conn, workstream)?;
     }
+    task_turn::link_task_turn_workstreams(conn)?;
     rebuild_continue_branch_contexts(conn, &actions, &workstreams)?;
     rebuild_continue_workstream_state_memory(conn, &workstreams)?;
     rebuild_continue_open_loops(conn, &workstreams)?;
@@ -3892,6 +4301,7 @@ pub fn get_continue_decision(
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
         island_trigger_reason: request.island_trigger_reason,
         island_source: request.island_source,
+        request_trigger: request.request_trigger,
     };
     let effective_mode = effective_continue_decision_mode(
         request.mode.as_deref(),
@@ -3966,11 +4376,13 @@ pub fn get_continue_decision(
 
     let semantic_rebuild_needed = cached_meta.is_none()
         && (force_rebuild || continue_layers_need_rebuild(conn, request.session_id.as_deref())?);
+    let task_turn_backfill_needed = count_if_present(conn, "continue_task_turns")? == 0
+        && count_if_present(conn, "frames")? > 0;
     let enrichment_rebuild_needed = pre_decision_enrichment
         .as_ref()
         .is_some_and(|attempt| attempt.produced_snapshot());
     if semantic_rebuild_needed || enrichment_rebuild_needed {
-        let start_frame_id = if force_rebuild {
+        let start_frame_id = if force_rebuild || task_turn_backfill_needed {
             None
         } else {
             latest_continue_processed_frame_id(conn)?.map(|id| id + 1)
@@ -3993,7 +4405,7 @@ pub fn get_continue_decision(
     }
 
     let lookback_ms = request.lookback_ms.unwrap_or(45 * 60 * 1000);
-    let current_surface_resolution = resolve_current_surface(
+    let mut current_surface_resolution = resolve_current_surface(
         conn,
         request.session_id.as_deref(),
         requested_at_ms,
@@ -4005,6 +4417,62 @@ pub fn get_continue_decision(
                 .ok()
                 .flatten()
         });
+    let current_task_turn = task_turn::selected_current_task_turn(conn)?;
+    let task_supported = current_task_turn.as_ref().is_some_and(|turn| {
+        !turn.latest_user_span_ids.is_empty()
+            && turn
+                .latest_user_goal_summary
+                .as_deref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+            && turn.goal_confidence > 0.0
+    });
+    let task_resolution_status = if task_supported {
+        "current_task_supported".to_string()
+    } else {
+        "no_clear_current_task".to_string()
+    };
+    let mut task_resolution_reason_codes = if task_supported {
+        vec!["eligible_current_user_goal_evidence".to_string()]
+    } else {
+        vec![
+            "no_eligible_current_user_goal".to_string(),
+            "history_controls_navigation_ineligible_by_policy".to_string(),
+        ]
+    };
+    if !task_supported && current_task_turn.is_some() {
+        task_resolution_reason_codes.push("unsupported_task_turn_suppressed".to_string());
+    }
+    let supported_surface = current_focus.as_ref().and_then(|focus| {
+        focus
+            .display_title
+            .as_deref()
+            .or(focus.app_name.as_deref())
+            .and_then(|value| clean_user_handoff_line(value.to_string(), 120))
+    });
+    // Task identity is selected before workstreams, open loops, candidates, or
+    // target features are considered. In shadow/eligible modes this is audited
+    // without changing legacy authority; in authoritative mode it is the only
+    // semantic source allowed to reach the public answer.
+    let mut task_truth_v2 =
+        task_truth_v2::production::production_decision(conn, request.session_id.as_deref())?;
+    let task_truth_snapshot_id = task_truth_v2
+        .answer
+        .as_ref()
+        .map(|answer| answer.snapshot_id.as_str());
+    let snapshot_legacy_turn_id = task_truth_v2::production::selected_snapshot_legacy_turn_id(
+        conn,
+        request.session_id.as_deref(),
+        task_truth_snapshot_id,
+    )?;
+    let request_trigger = request
+        .request_trigger
+        .clone()
+        .or_else(|| request.island_source.as_ref().map(|_| "island".to_string()))
+        .unwrap_or_else(|| "startup".to_string());
+    annotate_current_surface_task_relation(
+        &mut current_surface_resolution,
+        current_task_turn.as_ref(),
+    );
     let mut workstreams = load_scorer_workstreams(conn, request.limit.unwrap_or(24))?;
     if workstreams.is_empty() {
         workstreams = load_any_recent_scorer_workstreams(conn, request.limit.unwrap_or(24))?;
@@ -4017,6 +4485,27 @@ pub fn get_continue_decision(
         Some(&current_surface_resolution.selected),
         &workstreams,
     )?;
+    let work_truth = derive_continue_work_truth(
+        current_task_turn.as_ref(),
+        task_supported,
+        current_focus.as_ref(),
+        &current_surface_resolution.selected,
+        &app_activity,
+        requested_at_ms,
+    );
+    let work_supported = task_supported || work_truth.supports_primary_activity();
+    if !task_supported
+        && work_truth.supports_primary_activity()
+        && cached_meta.as_ref().is_some_and(|cached| {
+            cached.work_truth_policy_version.as_deref() != Some(CONTINUE_WORK_TRUTH_POLICY_VERSION)
+        })
+    {
+        cached_meta = None;
+        push_string_once(
+            &mut cache_bypass_reasons,
+            "continue_work_truth_policy_changed",
+        );
+    }
     let event_backed_current_work_links =
         event_backed_current_work_links(conn, &current_surface_resolution.selected)?;
     let active_current_work_unresolved = derive_active_current_work_unresolved(
@@ -4036,9 +4525,24 @@ pub fn get_continue_decision(
     let mut candidates = generate_continue_candidates(&CandidateGenerationContext {
         now_ms: requested_at_ms,
         workstreams: &workstreams,
+        current_task_turn: current_task_turn.as_ref(),
         current_focus: current_focus.as_ref(),
         active_current_work_unresolved: active_current_work_unresolved.as_ref(),
     });
+    if let Some(candidate) = generate_current_activity_candidate(
+        &work_truth,
+        &workstreams,
+        &candidates,
+        current_focus.as_ref(),
+    ) {
+        candidates.push(candidate);
+    }
+    apply_current_task_candidate_eligibility(
+        &mut candidates,
+        task_supported
+            .then_some(current_task_turn.as_ref())
+            .flatten(),
+    );
     apply_app_activity_to_candidates(&mut candidates, &app_activity);
     let memory_query = build_continue_memory_retrieval_query(
         &current_surface_resolution.selected,
@@ -4084,14 +4588,41 @@ pub fn get_continue_decision(
         }
     }
 
-    let local_selected = select_local_candidate_after_activity(&candidates, &app_activity);
+    let activity_selected = (!task_supported && work_truth.supports_primary_activity())
+        .then(|| {
+            candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.candidate_kind == "continue_current_activity"
+                        && candidate.eligible_for_primary_selection
+                        && !candidate_feedback_hard_suppressed(candidate)
+                        && candidate.target_artifact.as_ref().is_some_and(|artifact| {
+                            work_truth.artifact_id.as_deref() == Some(artifact.id.as_str())
+                        })
+                })
+                .cloned()
+        })
+        .flatten();
+    let local_selected = activity_selected
+        .or_else(|| select_local_candidate_after_activity(&candidates, &app_activity));
     let mut selected = local_selected.clone();
-    let mut selected_workstream = selected.as_ref().and_then(|candidate| {
-        workstreams
-            .iter()
-            .find(|workstream| workstream.id == candidate.workstream_id)
-            .cloned()
-    });
+    let mut selected_workstream = current_task_turn
+        .as_ref()
+        .and_then(|turn| turn.workstream_id.as_deref())
+        .and_then(|workstream_id| {
+            workstreams
+                .iter()
+                .find(|workstream| workstream.id == workstream_id)
+                .cloned()
+        })
+        .or_else(|| {
+            selected.as_ref().and_then(|candidate| {
+                workstreams
+                    .iter()
+                    .find(|workstream| workstream.id == candidate.workstream_id)
+                    .cloned()
+            })
+        });
     let all_candidates_hard_suppressed =
         !candidates.is_empty() && candidates.iter().all(candidate_feedback_hard_suppressed);
     let primary_eligible_candidates_after_feedback_gate = candidates
@@ -4230,7 +4761,8 @@ pub fn get_continue_decision(
         warnings.push("feedback:fresh_reconfirmation_required_before_target_reuse".to_string());
     }
 
-    let has_model_eligible_candidate = primary_eligible_candidates_after_feedback_gate > 0;
+    let has_model_eligible_candidate =
+        task_supported && primary_eligible_candidates_after_feedback_gate > 0;
     if micro_inference_enabled && !has_model_eligible_candidate && !candidates.is_empty() {
         let excluded_branch_candidate_ids = branch_filter_excluded_candidate_ids(&candidates);
         let branch_validation_failures =
@@ -5075,6 +5607,24 @@ pub fn get_continue_decision(
     } else {
         Some(validation_failures.join(";"))
     };
+    if !task_supported && work_supported {
+        continue_output_mode = ContinueOutputMode::ThinContinue;
+        confidence = round_score(work_truth.confidence.max(0.55));
+        validation_status = "activity_supported".to_string();
+        next_action = None;
+        model_handoff_output = None;
+        push_string_once(&mut warnings, "work_truth:activity_supported");
+    }
+    if !work_supported {
+        continue_output_mode = ContinueOutputMode::NoClearContinuation;
+        confidence = round_score(f64::min(confidence, 0.20));
+        next_action = Some(
+            "Inspect the recent evidence or capture again so the exact current task can be identified."
+                .to_string(),
+        );
+        model_handoff_output = None;
+        push_string_once(&mut warnings, "task_resolution:no_clear_current_task");
+    }
     let mut handoff = cached_meta
         .as_ref()
         .and_then(|cached| cached.handoff.clone())
@@ -5113,17 +5663,75 @@ pub fn get_continue_decision(
             Some(&app_activity.summary),
         );
     }
+    if !work_supported {
+        handoff = no_clear_current_task_handoff(supported_surface.as_deref());
+    } else if !task_supported {
+        handoff = activity_supported_handoff(&work_truth);
+    }
 
+    let mut direct_target_policy = direct_target_policy_for_candidate(
+        selected.as_ref(),
+        task_supported
+            .then_some(current_task_turn.as_ref())
+            .flatten(),
+    );
+    let activity_authority_matches = task_supported
+        || (work_truth.supports_direct_target()
+            && selected.as_ref().is_some_and(|candidate| {
+                candidate.target_artifact.as_ref().is_some_and(|artifact| {
+                    work_truth.artifact_id.as_deref() == Some(artifact.id.as_str())
+                })
+            }));
+    push_string_once(
+        &mut direct_target_policy.reason_codes,
+        if task_supported {
+            "authority:task_turn"
+        } else {
+            "authority:direct_activity"
+        },
+    );
     let public_return_candidate = selected.as_ref().filter(|candidate| {
-        !suppress_public_return_target
+        work_supported
+            && activity_authority_matches
+            && !suppress_public_return_target
+            && direct_target_policy.direct_target_allowed
             && candidate_exposes_public_return_target(candidate, &continue_output_mode)
     });
+    let evidence_preview = evidence_preview_for_candidate(selected.as_ref());
+    let mut target_truth = target_truth_for_decision(
+        selected.as_ref(),
+        task_supported
+            .then_some(current_task_turn.as_ref())
+            .flatten(),
+        current_focus.as_ref(),
+        &direct_target_policy,
+        public_return_candidate,
+        evidence_preview.as_ref(),
+    );
+    if !work_supported {
+        target_truth.state = "no_clear_task".to_string();
+        target_truth.reason_codes = task_resolution_reason_codes.clone();
+    } else if !task_supported && public_return_candidate.is_none() {
+        target_truth.state = "activity_known_target_unknown".to_string();
+        target_truth
+            .reason_codes
+            .retain(|reason| reason != "no_clear_task_or_target");
+        push_string_once(
+            &mut target_truth.reason_codes,
+            "activity_known_target_unknown",
+        );
+    }
+    if public_return_candidate.is_none() {
+        handoff.return_line = "Exact location unavailable.".to_string();
+        handoff.user_visible_uncertainty = Some(why_no_safe_target_for_truth(&target_truth));
+    }
 
     if cached_meta.is_none() {
         insert_continue_decision(
             conn,
             &decision_id,
             requested_at_ms,
+            request.session_id.as_deref(),
             current_focus.as_ref(),
             selected_workstream.as_ref(),
             selected.as_ref(),
@@ -5145,9 +5753,20 @@ pub fn get_continue_decision(
             micro_inference_requested,
             micro_inference_attempted,
             micro_inference_result_kind.as_deref(),
+            &work_truth,
             Some(&continue_dossier),
             Some(&memory_retrieval),
         )?;
+    }
+    if request_trigger == "manual" {
+        if let Err(error) = task_truth_v2::record_manual_continue_shadow(
+            conn,
+            &decision_id,
+            request.session_id.as_deref(),
+            selected.as_ref().map(|candidate| candidate.id.as_str()),
+        ) {
+            warnings.push(format!("task_truth_v2_shadow_audit_failed:{error}"));
+        }
     }
 
     let evidence_anchors = evidence_anchors_for_decision(
@@ -5228,6 +5847,7 @@ pub fn get_continue_decision(
             evidence_watermark: Some(&current_watermark.hash),
             output_mode: Some(continue_output_mode.as_str()),
             requested_at_ms,
+            current_task_turn: current_task_turn.as_ref(),
             current_surface: Some(&current_surface_resolution.selected),
             current_surface_resolution: Some(&current_surface_resolution),
             selected_workstream: selected_workstream.as_ref(),
@@ -5266,9 +5886,173 @@ pub fn get_continue_decision(
         ),
         last_state_recap.clone(),
     );
+    let primary_segment_relation =
+        stitched_activity_timeline
+            .primary_segment
+            .as_ref()
+            .map(|segment| {
+                if current_task_turn
+                    .as_ref()
+                    .and_then(|turn| turn.workstream_id.as_deref())
+                    == segment.workstream_id.as_deref()
+                {
+                    RelationToCurrentTask::SameTask
+                } else {
+                    match segment.role {
+                        activity_recap_segments::ActivitySegmentRole::Support => {
+                            RelationToCurrentTask::ChildSupport
+                        }
+                        activity_recap_segments::ActivitySegmentRole::Detour => {
+                            RelationToCurrentTask::Detour
+                        }
+                        activity_recap_segments::ActivitySegmentRole::Interrupt => {
+                            RelationToCurrentTask::Interruption
+                        }
+                        activity_recap_segments::ActivitySegmentRole::Return => {
+                            RelationToCurrentTask::ReturnedSupport
+                        }
+                        _ => RelationToCurrentTask::Unrelated,
+                    }
+                }
+            });
+    let selected_objective_source =
+        activity_work_label
+            .selected_objective_source
+            .as_ref()
+            .map(|source| {
+                format!(
+                    "{}:{}",
+                    source.source_kind,
+                    source.source_id.as_deref().unwrap_or("none")
+                )
+            });
+    let selected_open_loop_id = activity_work_label
+        .selected_objective_source
+        .as_ref()
+        .filter(|source| source.source_kind == "open_loop")
+        .and_then(|source| source.source_id.clone());
+    let selected_open_loop_eligible = selected_open_loop_id.as_deref().and_then(|open_loop_id| {
+        activity_recap_inputs
+            .open_loops
+            .iter()
+            .find(|open_loop| open_loop.open_loop_id == open_loop_id)
+            .map(|open_loop| open_loop.eligible_for_objective)
+    });
+    let branch_feedback_applicable = stitched_activity_timeline
+        .primary_segment
+        .as_ref()
+        .and_then(|segment| segment.artifact_id.as_deref())
+        .and_then(|artifact_id| {
+            activity_recap_inputs
+                .branch_contexts
+                .iter()
+                .find(|branch| branch.branch_artifact_id == artifact_id)
+        })
+        .filter(|branch| branch.promotion_state.starts_with("promoted_"))
+        .map(|branch| {
+            current_task_turn.as_ref().is_some_and(|turn| {
+                branch.task_turn_id.as_deref() == Some(turn.task_turn_id.as_str())
+                    && branch.feedback_rejection_reasons.is_empty()
+                    && branch.returned_to_origin_at_ms.is_none()
+            })
+        });
+    let cross_layer_consistency = evaluate_cross_layer_consistency(&CrossLayerConsistencyInput {
+        current_task_turn_id: current_task_turn
+            .as_ref()
+            .map(|turn| turn.task_turn_id.clone()),
+        current_task_high_confidence: current_task_turn
+            .as_ref()
+            .is_some_and(|turn| turn.goal_confidence >= 0.70),
+        selected_workstream_id: selected_workstream
+            .as_ref()
+            .map(|workstream| workstream.id.clone()),
+        current_task_workstream_id: current_task_turn
+            .as_ref()
+            .and_then(|turn| turn.workstream_id.clone()),
+        primary_segment_id: stitched_activity_timeline
+            .primary_segment
+            .as_ref()
+            .map(|segment| segment.segment_id.clone()),
+        primary_segment_relation,
+        selected_open_loop_id,
+        selected_open_loop_eligible,
+        selected_objective_source,
+        selected_objective_eligible: activity_work_label
+            .selected_objective_source
+            .as_ref()
+            .map(|source| source.eligible),
+        selected_candidate_id: selected.as_ref().map(|candidate| candidate.id.clone()),
+        selected_candidate_workstream_id: selected
+            .as_ref()
+            .map(|candidate| candidate.workstream_id.clone()),
+        public_target_artifact_id: public_return_candidate
+            .and_then(candidate_public_target_artifact)
+            .map(|artifact| artifact.id.clone()),
+        public_target_eligible: public_return_candidate
+            .map(|_| direct_target_policy.direct_target_allowed),
+        branch_feedback_applicable,
+        last_state_from_completed_prior_task: false,
+        target_explanation_matches_current_task: selected.as_ref().map(|candidate| {
+            current_task_turn
+                .as_ref()
+                .and_then(|turn| turn.workstream_id.as_deref())
+                .is_none_or(|workstream_id| candidate.workstream_id == workstream_id)
+        }),
+        missing_evidence: current_task_turn
+            .as_ref()
+            .map(|turn| turn.missing_evidence.clone())
+            .unwrap_or_else(|| vec!["current_task_turn_missing".to_string()]),
+    });
+    if !cross_layer_consistency.conflicts.is_empty() {
+        push_string_once(&mut warnings, "semantic_center:cross_layer_conflict");
+    }
+    let surface_identity_score = current_surface_resolution
+        .selected
+        .identity_confidence
+        .unwrap_or(current_surface_resolution.selected.focus_confidence);
+    let confidence_vector = confidence::build_confidence_vector(confidence::ConfidenceBuildInput {
+        current_task_turn: current_task_turn.as_ref(),
+        cross_layer_consistency: &cross_layer_consistency,
+        direct_target_policy: &direct_target_policy,
+        surface_identity_score,
+        surface_evidence_ids: current_surface_resolution.selected.evidence_ids.clone(),
+        surface_missing_evidence: current_surface_resolution.selected.missing_fields.clone(),
+        recap_support_score: match local_activity_recap.activity_confidence {
+            activity_recap::ActivityConfidence::None
+                if local_activity_recap.primary_work_summary.is_some() =>
+            {
+                0.75
+            }
+            activity_recap::ActivityConfidence::None => 0.0,
+            activity_recap::ActivityConfidence::Low => 0.35,
+            activity_recap::ActivityConfidence::Medium => 0.65,
+            activity_recap::ActivityConfidence::High => 0.85,
+        },
+    });
+    let activity_recap_truth = activity_recap_truth::build_activity_recap_truth_bundle(
+        &activity_recap_inputs,
+        &stitched_activity_timeline,
+        &cross_layer_consistency,
+        &confidence_vector,
+        &direct_target_policy,
+    );
+    let local_activity_recap = activity_recap_truth
+        .as_ref()
+        .map(|truth| {
+            activity_recap_truth::rebase_local_recap_on_task_truth(
+                local_activity_recap.clone(),
+                &truth.model_truth,
+                &activity_recap_inputs,
+            )
+        })
+        .unwrap_or(local_activity_recap);
     let local_activity_recap = activity_recap_integration::apply_prior_activity_memory(
+        conn,
         local_activity_recap,
         &activity_recap_inputs,
+        activity_recap_truth
+            .as_ref()
+            .map(|truth| &truth.model_truth),
     );
     let (mut activity_recap, activity_recap_synthesis_audit, mut activity_recap_proof) =
         if let Some(cached) = cached_meta.as_ref() {
@@ -5278,17 +6062,32 @@ pub fn get_continue_decision(
                 cached.activity_recap_proof.clone(),
             )
         } else {
-            let synthesis = activity_recap_model::maybe_run_activity_recap_model_synthesis(
-                activity_recap_model::ActivityRecapSynthesisContext {
-                    enabled: activity_recap_model_enabled,
-                    model_override: request.model.as_deref(),
-                    retain_audit_payloads: request.audit_output_enabled.unwrap_or(false),
-                    inputs: &activity_recap_inputs,
-                    timeline: &stitched_activity_timeline,
-                    work_label: &activity_work_label,
-                    local_recap: &local_activity_recap,
-                },
-            );
+            let synthesis = if let Some(truth) = activity_recap_truth.as_ref() {
+                activity_recap_model::maybe_run_activity_recap_model_synthesis(
+                    activity_recap_model::ActivityRecapSynthesisContext {
+                        enabled: activity_recap_model_enabled,
+                        model_override: request.model.as_deref(),
+                        retain_audit_payloads: request.audit_output_enabled.unwrap_or(false),
+                        inputs: &activity_recap_inputs,
+                        timeline: &stitched_activity_timeline,
+                        work_label: &activity_work_label,
+                        local_recap: &local_activity_recap,
+                        task_truth: &truth.model_truth,
+                        local_guard: &truth.local_guard,
+                    },
+                )
+            } else {
+                let mut audit = activity_recap_model::ActivityRecapSynthesisAudit::default();
+                audit.model_pack = serde_json::json!({
+                    "schema": activity_recap_model::ACTIVITY_RECAP_MODEL_PACK_SCHEMA,
+                    "status": "not_built",
+                    "reason": "task_truth_unavailable",
+                });
+                activity_recap_model::ActivityRecapSynthesisResult {
+                    recap: local_activity_recap.clone(),
+                    audit,
+                }
+            };
             let proof = activity_recap_integration::build_activity_recap_proof(
                 &activity_recap_inputs,
                 &stitched_activity_timeline,
@@ -5296,10 +6095,139 @@ pub fn get_continue_decision(
                 &activity_detour_recap,
                 &last_state_recap,
                 &synthesis.audit,
+                activity_recap_truth.as_ref(),
+                &local_activity_recap,
                 &synthesis.recap,
             );
             (synthesis.recap, synthesis.audit, proof)
         };
+
+    if public_return_candidate.is_none() {
+        activity_recap.why_this_target = None;
+        let why_no_safe_target = why_no_safe_target_for_truth(&target_truth);
+        activity_recap.why_no_safe_target = Some(why_no_safe_target.clone());
+        activity_recap
+            .evidence_spans
+            .retain(|span| span.claim_key != "why_this_target");
+        for span in activity_recap
+            .evidence_spans
+            .iter_mut()
+            .filter(|span| span.claim_key == "why_no_safe_target")
+        {
+            span.claim_text = why_no_safe_target.clone();
+        }
+    } else {
+        activity_recap.why_no_safe_target = None;
+    }
+    if !work_supported {
+        activity_recap.primary_work_summary = None;
+        activity_recap.primary_work_label = None;
+        activity_recap.primary_where_summary = None;
+        activity_recap.current_state = activity_recap::ActivityCurrentState::Unclear;
+        activity_recap.last_meaningful_state = None;
+        activity_recap.unfinished_state = None;
+        activity_recap.next_action_summary = Some(
+            "Inspect the recent evidence or capture again to identify the exact current task."
+                .to_string(),
+        );
+        activity_recap.recent_detours.clear();
+        activity_recap.supporting_context.clear();
+        activity_recap.why_this_target = None;
+        activity_recap.why_no_safe_target = Some(
+            "Recent activity was captured, but the exact current task could not be determined."
+                .to_string(),
+        );
+        activity_recap.evidence_spans.retain(|span| {
+            matches!(
+                span.claim_key.as_str(),
+                "why_no_safe_target" | "missing_evidence"
+            )
+        });
+        push_string_once(
+            &mut activity_recap.missing_evidence,
+            "current_user_goal_evidence",
+        );
+        push_string_once(
+            &mut activity_recap.warnings,
+            "task_resolution:no_clear_current_task",
+        );
+        activity_recap.generated_by = activity_recap::ActivityRecapGeneratedBy::Fallback;
+        activity_recap.validation_status = activity_recap::ActivityRecapValidationStatus::Thin;
+    }
+    if !task_supported && work_truth.supports_primary_activity() {
+        activity_recap.primary_work_summary = work_truth.activity_summary.clone();
+        activity_recap.primary_work_label = Some(work_truth.activity_kind.clone());
+        activity_recap.primary_where_summary = work_truth.where_summary.clone();
+        activity_recap.next_action_summary = None;
+        activity_recap.why_no_safe_target = public_return_candidate.is_none().then(|| {
+            "The activity is clear, but no strictly validated return location is available."
+                .to_string()
+        });
+        activity_recap
+            .missing_evidence
+            .retain(|item| item != "current_user_goal_evidence");
+        push_string_once(
+            &mut activity_recap.warnings,
+            "work_truth:broader_goal_not_captured",
+        );
+    }
+    let legacy_confidence_derivation = confidence_vector.legacy_derivation();
+    activity_recap.activity_confidence = if work_supported {
+        legacy_confidence_derivation.activity_confidence
+    } else {
+        activity_recap::ActivityConfidence::None
+    };
+    activity_recap.target_confidence = if public_return_candidate.is_some() {
+        legacy_confidence_derivation.target_confidence
+    } else {
+        activity_recap::ActivityConfidence::None
+    };
+    activity_recap_proof.final_recap = activity_recap.clone();
+    let confidence_summary = confidence_vector.compact_summary();
+    let mut answer = compose_interruption_recovery_answer(
+        task_supported
+            .then_some(current_task_turn.as_ref())
+            .flatten(),
+        current_focus.as_ref(),
+        &activity_recap,
+        public_return_candidate,
+        evidence_preview.as_ref(),
+        &target_truth,
+        &confidence_summary,
+    );
+    if !work_supported {
+        answer.what_you_were_doing = None;
+        answer.where_label = supported_surface.clone();
+        answer.where_you_left_off = None;
+        answer.next =
+            "Inspect the recent evidence or capture again to identify the exact current task."
+                .to_string();
+        answer.action = if evidence_preview.is_some() {
+            "inspect_evidence".to_string()
+        } else {
+            "view_summary".to_string()
+        };
+        answer.target_note = Some(
+            "Recent activity was captured, but the exact current task could not be determined."
+                .to_string(),
+        );
+        answer.task_confidence_label = "none".to_string();
+        answer.target_confidence_label = "none".to_string();
+    } else if !task_supported {
+        answer.what_you_were_doing = work_truth.activity_summary.clone();
+        answer.where_label = work_truth.where_summary.clone();
+        answer.where_you_left_off = work_truth.activity_summary.clone();
+        answer.next = String::new();
+        answer.action = if public_return_candidate.is_some() {
+            "continue_here".to_string()
+        } else if evidence_preview.is_some() {
+            "inspect_evidence".to_string()
+        } else {
+            "view_summary".to_string()
+        };
+        answer.target_note = Some("Broader goal not captured.".to_string());
+        answer.task_confidence_label = "observed_activity".to_string();
+    }
 
     if cached_meta.is_none() {
         let memory_artifact_id = selected
@@ -5311,18 +6239,22 @@ pub fn get_continue_decision(
                     .as_ref()
                     .and_then(|workstream| workstream.primary_artifact_id.as_deref())
             });
-        if activity_recap_integration::promote_validated_activity_recap_memory(
-            conn,
-            &decision_id,
-            selected.as_ref().map(|candidate| candidate.id.as_str()),
-            selected_workstream
-                .as_ref()
-                .map(|workstream| workstream.id.as_str()),
-            memory_artifact_id,
-            &activity_recap,
-            requested_at_ms,
-        )
-        .is_err()
+        if task_supported
+            && activity_recap_integration::promote_validated_activity_recap_memory(
+                conn,
+                &decision_id,
+                selected.as_ref().map(|candidate| candidate.id.as_str()),
+                selected_workstream
+                    .as_ref()
+                    .map(|workstream| workstream.id.as_str()),
+                memory_artifact_id,
+                activity_recap_truth
+                    .as_ref()
+                    .map(|truth| &truth.model_truth),
+                &activity_recap,
+                requested_at_ms,
+            )
+            .is_err()
         {
             push_string_once(
                 &mut activity_recap.warnings,
@@ -5346,7 +6278,49 @@ pub fn get_continue_decision(
             &activity_recap_policy_fingerprint,
             activity_recap_model_enabled,
         )?;
+        persist_semantic_consistency_evaluation(
+            conn,
+            &decision_id,
+            &cross_layer_consistency,
+            &direct_target_policy,
+            &activity_recap_inputs,
+            requested_at_ms,
+        )?;
     }
+
+    let wording_source = match activity_recap.generated_by {
+        activity_recap::ActivityRecapGeneratedBy::ModelAssisted => "model_assisted",
+        activity_recap::ActivityRecapGeneratedBy::Fallback => "local_fallback",
+        activity_recap::ActivityRecapGeneratedBy::Local => "local_deterministic",
+    }
+    .to_string();
+    let task_understanding_source = if task_supported {
+        "local_task_turn_evidence"
+    } else if work_truth.supports_primary_activity() {
+        "local_direct_activity"
+    } else {
+        "abstained_no_clear_current_task"
+    }
+    .to_string();
+    let target_selection_source = if public_return_candidate.is_some() {
+        "local_validated_target_policy"
+    } else {
+        "abstained_no_direct_target"
+    }
+    .to_string();
+    task_truth_v2::production::attach_observed_activity(&mut task_truth_v2, &work_truth);
+    task_truth_v2::production::attach_strict_target(
+        &mut task_truth_v2,
+        snapshot_legacy_turn_id.as_deref(),
+        current_task_turn
+            .as_ref()
+            .map(|turn| turn.task_turn_id.as_str()),
+        direct_target_policy.direct_target_allowed,
+        public_return_candidate.map(|candidate| {
+            return_target_summary(candidate_public_target_artifact(candidate), None)
+        }),
+    );
+    task_truth_v2::production::persist_decision_contract(conn, &decision_id, &task_truth_v2)?;
 
     Ok(ContinueDecisionResult {
         decision_id,
@@ -5359,52 +6333,98 @@ pub fn get_continue_decision(
         current_focus: current_focus.clone(),
         active_current_work_unresolved,
         p0_quality_signals,
-        current_activity: current_activity_summary(
-            selected
-                .as_ref()
-                .and_then(|candidate| candidate.last_meaningful_action.as_ref()),
-            current_focus.as_ref(),
-        ),
-        selected_workstream: selected_workstream.as_ref().map(workstream_summary),
-        selected_candidate_id: selected.as_ref().map(|candidate| candidate.id.clone()),
+        work_truth: work_truth.clone(),
+        current_activity: if work_truth.supports_primary_activity() {
+            work_truth.activity_summary.clone()
+        } else {
+            task_supported
+                .then(|| {
+                    current_activity_summary(
+                        selected
+                            .as_ref()
+                            .and_then(|candidate| candidate.last_meaningful_action.as_ref()),
+                        current_focus.as_ref(),
+                    )
+                })
+                .flatten()
+        },
+        current_task_turn: task_supported
+            .then_some(current_task_turn.clone())
+            .flatten(),
+        task_resolution_status,
+        task_resolution_reason_codes,
+        supported_surface,
+        alternative_hypotheses: Vec::new(),
+        request_trigger,
+        task_understanding_source,
+        wording_source,
+        target_selection_source,
+        task_truth_v2,
+        selected_workstream: work_supported
+            .then(|| {
+                selected_workstream
+                    .as_ref()
+                    .map(|workstream| workstream_summary(workstream, current_task_turn.as_ref()))
+            })
+            .flatten(),
+        semantic_graph_policy_version: SEMANTIC_GRAPH_POLICY_VERSION.to_string(),
+        cross_layer_consistency,
+        direct_target_policy,
+        target_truth,
+        evidence_preview,
+        confidence_vector,
+        confidence_summary,
+        legacy_confidence_derivation: legacy_confidence_derivation.clone(),
+        selected_candidate_id: work_supported
+            .then(|| selected.as_ref().map(|candidate| candidate.id.clone()))
+            .flatten(),
         return_target: public_return_candidate.map(|candidate| {
-            return_target_summary(
-                candidate.target_artifact.as_ref(),
-                candidate.evidence_frame_id.clone(),
-            )
+            return_target_summary(candidate_public_target_artifact(candidate), None)
         }),
         resume_work_target: public_return_candidate.map(|candidate| {
-            return_target_summary(
-                candidate
-                    .resume_work_target
+            return_target_summary(candidate_public_target_artifact(candidate), None)
+        }),
+        candidate_kind: work_supported
+            .then(|| {
+                selected
                     .as_ref()
-                    .or(candidate.target_artifact.as_ref()),
-                candidate.evidence_frame_id.clone(),
-            )
-        }),
-        candidate_kind: selected
-            .as_ref()
-            .map(|candidate| candidate.candidate_kind.clone()),
-        last_meaningful_action: selected
-            .as_ref()
-            .and_then(|candidate| candidate.last_meaningful_action.as_ref())
-            .map(action_summary),
-        unresolved_state: selected_workstream.as_ref().and_then(|workstream| {
-            unresolved_state_description(workstream.unresolved_signal.as_deref())
-        }),
+                    .map(|candidate| candidate.candidate_kind.clone())
+            })
+            .flatten(),
+        last_meaningful_action: work_supported
+            .then(|| {
+                selected
+                    .as_ref()
+                    .and_then(|candidate| candidate.last_meaningful_action.as_ref())
+                    .map(action_summary)
+            })
+            .flatten(),
+        unresolved_state: work_supported
+            .then(|| {
+                selected_workstream.as_ref().and_then(|workstream| {
+                    unresolved_state_description(workstream.unresolved_signal.as_deref())
+                })
+            })
+            .flatten(),
         next_action,
-        confidence: round_score(confidence),
-        confidence_label: confidence_label(confidence).to_string(),
+        confidence: legacy_confidence_derivation.confidence,
+        confidence_label: legacy_confidence_derivation.confidence_label,
         evidence_anchors,
         missing_evidence,
         warnings,
         validation_failures,
         handoff,
         support_evidence,
-        alternatives,
+        alternatives: if task_supported {
+            alternatives
+        } else {
+            Vec::new()
+        },
         generated_candidates: candidates.len() as i64,
         validation_status,
         feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+        feedback_policy_fingerprint: FEEDBACK_POLICY_FINGERPRINT.to_string(),
+        next_feedback_transition_at_ms: next_feedback_policy_transition_ms(conn, requested_at_ms)?,
         feedback_watermark_ms,
         open_watermark_ms,
         feedback_suppressed_candidate_count,
@@ -5436,6 +6456,7 @@ pub fn get_continue_decision(
         app_activity: Some(app_activity.clone()),
         activity_summary: Some(app_activity.summary.clone()),
         activity_recap,
+        answer,
         activity_recap_watermark_hash: cached_meta
             .as_ref()
             .map(|cached| cached.activity_recap_watermark_hash.clone())
@@ -5455,166 +6476,48 @@ pub fn get_continue_decision(
 pub fn assess_continue_evidence_sufficiency(
     result: &ContinueDecisionResult,
 ) -> EvidenceSufficiencyDecision {
-    let mut reasons = Vec::new();
-    let mut requested_probes = Vec::new();
-    let now_ms = current_time_millis();
     let candidate_margin = result
         .alternatives
         .first()
         .zip(result.alternatives.get(1))
         .map(|(top, next)| round_score((top.score - next.score).abs()));
-
-    let target_openability = result
-        .return_target
-        .as_ref()
-        .map(|target| target.openability.as_str())
-        .unwrap_or("unknown");
-    if matches!(target_openability, "unknown" | "frame_fallback") && result.confidence < 0.65 {
-        let reason = if target_openability == "frame_fallback" {
-            NeedMoreEvidenceReason::FrameFallbackOnly
-        } else {
-            NeedMoreEvidenceReason::TargetOpenabilityUnknown
-        };
-        push_reason_once(&mut reasons, reason);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
-    }
-
-    let selected_surface = result
-        .current_surface_resolution
-        .as_ref()
-        .and_then(|value| value.get("selected"));
-    let surface_observed_at = selected_surface
-        .and_then(|surface| surface.get("observed_at_ms"))
-        .and_then(Value::as_i64);
-    if surface_observed_at.is_some_and(|ts| now_ms.saturating_sub(ts) > 10 * 60 * 1000) {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CurrentSurfaceStale);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
-    }
-
-    let surface_warnings = selected_surface
-        .and_then(|surface| surface.get("warnings"))
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let all_warnings = result
-        .warnings
+    let task_claim = result.confidence_vector.claim(ConfidenceClaim::CurrentTask);
+    let recap_claim = result
+        .confidence_vector
+        .claim(ConfidenceClaim::ActivityRecap);
+    let desired_claim =
+        (recap_claim.label < ConfidenceLabel::Medium).then_some(ConfidenceClaim::ActivityRecap);
+    let below_threshold_dimensions = desired_claim
+        .map(confidence::claim_dependencies)
+        .unwrap_or_default()
         .iter()
-        .map(String::as_str)
-        .chain(surface_warnings.iter().copied())
-        .collect::<Vec<_>>();
-    if all_warnings
-        .iter()
-        .any(|warning| warning.contains("current_surface:no_direct_url_or_path"))
-    {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::MissingUrlOrPath);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
-    }
-    if all_warnings
-        .iter()
-        .any(|warning| warning.contains("current_surface:event_backed_no_screenshot"))
-    {
-        push_reason_once(
-            &mut reasons,
-            NeedMoreEvidenceReason::EventOnlyNeedsAppContext,
-        );
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::WindowGraphProbe);
-        push_probe_once(
-            &mut requested_probes,
-            EvidenceProbeKind::AccessibilityTextProbe,
-        );
-    }
-    if all_warnings
-        .iter()
-        .any(|warning| warning.contains("p8_activity:high_value_surface_needs_fresh_capture"))
-        || result.app_activity.as_ref().is_some_and(|activity| {
-            activity.classifications.iter().any(|classification| {
-                classification.continuation_role == "needs_fresh_capture"
-                    && classification.work_value_score >= 0.60
-                    && classification.evidence_sufficiency_score < 0.50
-            })
+        .filter(|dimension| {
+            result
+                .confidence_vector
+                .dimensions
+                .get(dimension)
+                .is_none_or(|value| value.label < ConfidenceLabel::Medium)
         })
-    {
-        push_reason_once(
-            &mut reasons,
-            NeedMoreEvidenceReason::EventOnlyNeedsAppContext,
-        );
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
-        push_probe_once(
-            &mut requested_probes,
-            EvidenceProbeKind::AccessibilityTextProbe,
-        );
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::DocumentPathProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
-    }
-    if all_warnings.iter().any(|warning| {
-        warning.contains("evidence_freshness:stale_frame_fallback_selected_target")
-            || warning.contains("evidence_freshness:strong_continue_blocked_for_stale_target")
-    }) {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CurrentSurfaceStale);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::BrowserUrlProbe);
-    }
-    if all_warnings
+        .copied()
+        .collect::<Vec<_>>();
+    let selected_probe = below_threshold_dimensions
         .iter()
-        .any(|warning| warning.contains("current_surface:latest_surface_is_self_or_debug"))
-    {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::SelfCaptureRecent);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::ActiveWindowProbe);
-    }
-
-    if candidate_margin.is_some_and(|margin| margin < 0.12)
-        && current_focus_differs_from_return_target(result)
-    {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::CandidateMarginLow);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::FrontmostAppProbe);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
-    }
-
-    if result.micro_inference_result_kind.as_deref() == Some("need_more_evidence") {
-        push_reason_once(
-            &mut reasons,
-            NeedMoreEvidenceReason::ModelRequestedMoreEvidence,
-        );
-        push_probe_once(
-            &mut requested_probes,
-            EvidenceProbeKind::AccessibilityTextProbe,
-        );
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::WindowGraphProbe);
-    }
-
-    if result
-        .memory_retrieval
-        .as_ref()
-        .is_some_and(|retrieval| !retrieval.counter_evidence.is_empty())
-    {
-        push_reason_once(&mut reasons, NeedMoreEvidenceReason::MemoryContradiction);
-        push_probe_once(&mut requested_probes, EvidenceProbeKind::AppContextProbe);
-    }
-
-    if requested_probes.is_empty() {
-        requested_probes = vec![
-            EvidenceProbeKind::FrontmostAppProbe,
-            EvidenceProbeKind::ActiveWindowProbe,
-        ];
-    }
-
-    let status = if !reasons.is_empty() {
-        EvidenceSufficiencyStatus::NeedsProbe
-    } else if result.continue_output_mode == ContinueOutputMode::StrongContinue.as_str() {
-        EvidenceSufficiencyStatus::Sufficient
-    } else if result.generated_candidates == 0 {
-        EvidenceSufficiencyStatus::NoClearWithoutProbe
+        .find_map(|dimension| probe_for_missing_dimension(*dimension, result));
+    let probe_likely_to_help = selected_probe.is_some();
+    let requested_probes = selected_probe.clone().into_iter().collect::<Vec<_>>();
+    let reasons = if desired_claim.is_some() && probe_likely_to_help {
+        vec![NeedMoreEvidenceReason::CurrentSurfaceAmbiguous]
     } else {
+        Vec::new()
+    };
+    let status = if desired_claim.is_some() && probe_likely_to_help {
+        EvidenceSufficiencyStatus::NeedsProbe
+    } else if recap_claim.label >= ConfidenceLabel::Medium {
+        EvidenceSufficiencyStatus::Sufficient
+    } else if task_claim.label >= ConfidenceLabel::Low || result.generated_candidates > 0 {
         EvidenceSufficiencyStatus::ThinButUsable
+    } else {
+        EvidenceSufficiencyStatus::NoClearWithoutProbe
     };
 
     EvidenceSufficiencyDecision {
@@ -5626,6 +6529,47 @@ pub fn assess_continue_evidence_sufficiency(
         candidate_margin,
         allow_heavy_capture: false,
         max_probe_ms: 1_500,
+        desired_claim,
+        below_threshold_dimensions,
+        selected_probe,
+        candidate_evidence_source: probe_likely_to_help
+            .then(|| "bounded_active_surface_observation".to_string()),
+        probe_likely_to_help,
+        failure_behavior: "retain missing evidence, cap dependent claims, and do not rerun"
+            .to_string(),
+    }
+}
+
+fn probe_for_missing_dimension(
+    dimension: ConfidenceDimension,
+    result: &ContinueDecisionResult,
+) -> Option<EvidenceProbeKind> {
+    use ConfidenceDimension as D;
+    match dimension {
+        D::SpeakerAttribution
+        | D::TurnOrder
+        | D::LatestUserGoal
+        | D::TaskObject
+        | D::CurrentActorState
+        | D::ExecutionState
+        | D::CurrentActor
+        | D::WaitingOn
+        | D::RelationToPrior
+        | D::RegionSegmentation => Some(EvidenceProbeKind::AccessibilityTextProbe),
+        D::SurfaceIdentity | D::ActiveWindowOwnership => Some(EvidenceProbeKind::ActiveWindowProbe),
+        D::TargetIdentity | D::TargetOpenability | D::DirectTargetPolicy => {
+            // A high-confidence task with no locator is already a valid result. Do not spend
+            // observation budget trying to manufacture a target from a frame fallback.
+            (result
+                .confidence_vector
+                .claim(ConfidenceClaim::CurrentTask)
+                .label
+                < ConfidenceLabel::Medium)
+                .then_some(EvidenceProbeKind::AppContextProbe)
+        }
+        D::WorkstreamAlignment | D::BranchRole | D::OpenLoopRelevance | D::RecapClaimSupport => {
+            None
+        }
     }
 }
 
@@ -5641,7 +6585,46 @@ pub fn build_need_more_evidence_request_from_decision(
     let Some(reason) = sufficiency.primary_reason.clone() else {
         return Ok(None);
     };
-    if recent_matching_probe_exists(conn, &reason, &result.evidence_watermark_hash)? {
+    let Some(desired_claim) = sufficiency.desired_claim else {
+        return Ok(None);
+    };
+    let Some(selected_probe) = sufficiency.selected_probe.clone() else {
+        return Ok(None);
+    };
+    let surface_key = result
+        .current_surface_resolution
+        .as_ref()
+        .and_then(|value| value.get("selected"))
+        .and_then(|value| value.get("surface_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_surface")
+        .to_string();
+    let source_surface_fingerprint = result
+        .current_surface_resolution
+        .as_ref()
+        .and_then(|value| value.get("selected"))
+        .map(|selected| {
+            stable_hash(
+                serde_json::to_string(&serde_json::json!({
+                    "app_name": selected.get("app_name"),
+                    "app_bundle_id": selected.get("bundle_id"),
+                    "window_title": selected.get("window_title"),
+                    "browser_url": selected.get("browser_url"),
+                    "document_path": selected.get("document_path"),
+                }))
+                .unwrap_or_default()
+                .as_bytes(),
+            )
+        })
+        .unwrap_or_else(|| stable_hash(b"unknown_surface"));
+    if recent_matching_probe_exists(
+        conn,
+        &reason,
+        &result.evidence_watermark_hash,
+        &surface_key,
+        &selected_probe,
+        sufficiency.below_threshold_dimensions.first().copied(),
+    )? {
         return Ok(None);
     }
     let created_at_ms = current_time_millis();
@@ -5711,6 +6694,14 @@ pub fn build_need_more_evidence_request_from_decision(
             source_decision_id: result.decision_id.clone(),
             source_evidence_watermark_hash: result.evidence_watermark_hash.clone(),
             created_at_ms,
+            desired_claim,
+            requested_dimensions: sufficiency.below_threshold_dimensions.clone(),
+            selected_probe: selected_probe.clone(),
+            surface_key,
+            deadline_at_ms: created_at_ms.saturating_add(sufficiency.max_probe_ms),
+            success_criteria: probe_success_criteria(&selected_probe).to_string(),
+            failure_behavior: sufficiency.failure_behavior.clone(),
+            source_surface_fingerprint,
         },
         sufficiency,
     )))
@@ -5731,6 +6722,18 @@ pub fn record_continue_evidence_probe_result(
         serde_json::to_string(&result.probes_succeeded).map_err(to_string)?;
     let warnings_json = serde_json::to_string(&result.warnings).map_err(to_string)?;
     let errors_json = serde_json::to_string(&result.errors).map_err(to_string)?;
+    let requested_dimensions_json =
+        serde_json::to_string(&request.requested_dimensions).map_err(to_string)?;
+    let per_probe_outcomes_json =
+        serde_json::to_string(&result.per_probe_outcomes).map_err(to_string)?;
+    let evidence_record_ids_json =
+        serde_json::to_string(&result.evidence_record_ids).map_err(to_string)?;
+    let dimensions_changed_json =
+        serde_json::to_string(&result.dimensions_changed).map_err(to_string)?;
+    let selected_probe = serde_json::to_value(&request.selected_probe)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
     let result_json = serde_json::to_string(result).map_err(to_string)?;
     conn.execute(
         "INSERT OR REPLACE INTO continue_evidence_probes (
@@ -5740,10 +6743,15 @@ pub fn record_continue_evidence_probe_result(
             allow_heavy_capture, privacy_mode, privacy_status, privacy_blocked,
             app_name, app_bundle_id, window_title, browser_url, document_path,
             accessibility_text_char_count, window_count, evidence_changed,
-            probes_succeeded_json, warnings_json, errors_json, result_json
+            probes_succeeded_json, warnings_json, errors_json, result_json,
+            requested_dimensions_json, per_probe_outcomes_json, deadline_at_ms,
+            status, evidence_record_ids_json, dimensions_changed_json, stale_result,
+            material_evidence_hash_before, material_evidence_hash_after,
+            cooldown_surface_key, selected_probe
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                   ?25, ?26, ?27)",
+                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
+                   ?36, ?37, ?38)",
         params![
             result.observation_id.as_deref().unwrap_or(&request.id),
             request.source_decision_id,
@@ -5775,6 +6783,17 @@ pub fn record_continue_evidence_probe_result(
             warnings_json,
             errors_json,
             result_json,
+            requested_dimensions_json,
+            per_probe_outcomes_json,
+            result.deadline_at_ms,
+            result.status.as_str(),
+            evidence_record_ids_json,
+            dimensions_changed_json,
+            result.stale_result as i64,
+            result.material_evidence_hash_before,
+            result.material_evidence_hash_after,
+            request.surface_key,
+            selected_probe,
         ],
     )
     .map_err(to_string)?;
@@ -5803,6 +6822,9 @@ fn recent_matching_probe_exists(
     conn: &Connection,
     reason: &NeedMoreEvidenceReason,
     watermark_hash: &str,
+    surface_key: &str,
+    probe_kind: &EvidenceProbeKind,
+    dimension: Option<ConfidenceDimension>,
 ) -> Result<bool, String> {
     if !table_exists(conn, "continue_evidence_probes")? {
         return Ok(false);
@@ -5814,12 +6836,46 @@ fn recent_matching_probe_exists(
              FROM continue_evidence_probes
              WHERE reason = ?1
                AND completed_at_ms >= ?2
-               AND (source_evidence_watermark_hash = ?3 OR evidence_changed = 0)",
-            params![reason.as_str(), cutoff_ms, watermark_hash],
+               AND (source_evidence_watermark_hash = ?3 OR evidence_changed = 0)
+               AND cooldown_surface_key = ?4
+               AND selected_probe = ?5
+               AND requested_dimensions_json LIKE ?6",
+            params![
+                reason.as_str(),
+                cutoff_ms,
+                watermark_hash,
+                surface_key,
+                serde_json::to_value(probe_kind)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                format!(
+                    "%{}%",
+                    dimension.map(|value| value.as_str()).unwrap_or("none")
+                ),
+            ],
             |row| row.get(0),
         )
         .map_err(to_string)?;
     Ok(count > 0)
+}
+
+fn probe_success_criteria(probe: &EvidenceProbeKind) -> &'static str {
+    match probe {
+        EvidenceProbeKind::AccessibilityTextProbe | EvidenceProbeKind::OcrIfAxThin => {
+            "new attributed ordered text evidence changes a requested task dimension"
+        }
+        EvidenceProbeKind::BrowserUrlProbe => "a validated browser URL is newly resolved",
+        EvidenceProbeKind::DocumentPathProbe => "a validated document path is newly resolved",
+        EvidenceProbeKind::ActiveWindowProbe
+        | EvidenceProbeKind::FrontmostAppProbe
+        | EvidenceProbeKind::WindowGraphProbe
+        | EvidenceProbeKind::AppContextProbe
+        | EvidenceProbeKind::ActiveElementProbe
+        | EvidenceProbeKind::ScopedActiveWindowCapture => {
+            "new active-surface evidence materially changes a requested dimension"
+        }
+    }
 }
 
 fn push_reason_once(values: &mut Vec<NeedMoreEvidenceReason>, value: NeedMoreEvidenceReason) {
@@ -6114,6 +7170,10 @@ fn resolve_current_surface(
     Ok(CurrentSurfaceResolutionAudit {
         schema: "smalltalk.continue_current_surface_resolution.v1".to_string(),
         selected,
+        relation_to_current_task: semantic_consistency::RelationToCurrentTask::Unknown,
+        surface_relation: "unknown".to_string(),
+        task_identity_may_change: true,
+        relation_reason_codes: vec!["current_task_not_evaluated".to_string()],
         top_rejected,
         row_count: rows.len(),
         excluded_self_or_debug,
@@ -6123,6 +7183,88 @@ fn resolve_current_surface(
         latest_event_ms,
         warnings,
     })
+}
+
+fn annotate_current_surface_task_relation(
+    resolution: &mut CurrentSurfaceResolutionAudit,
+    current_task_turn: Option<&CurrentTaskTurn>,
+) {
+    let Some(turn) = current_task_turn else {
+        resolution.relation_reason_codes = vec!["current_task_missing".to_string()];
+        return;
+    };
+
+    let selected = &resolution.selected;
+    let artifact_match = turn.artifact_id.is_some()
+        && turn.artifact_id.as_deref() == selected.artifact_id.as_deref();
+    let evidence_match = selected.evidence_ids.iter().any(|evidence_id| {
+        turn.latest_user_span_ids.contains(evidence_id)
+            || turn.current_state_span_ids.contains(evidence_id)
+            || turn.supporting_event_ids.contains(evidence_id)
+    });
+    let current_task_is_clear = turn.attribution_confidence >= 0.70
+        && turn.goal_confidence >= 0.60
+        && !matches!(turn.execution_state, task_turn::TaskExecutionState::Unclear);
+    let task_resolver_preserved_identity_across_support_detour = turn
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "same_task_reobserved_after_support_detour");
+    let newer_distinct_surface_exists = resolution.top_rejected.iter().any(|surface| {
+        surface.observed_at_ms > selected.observed_at_ms
+            && surface.surface_id != "no-clear-current-surface"
+            && (surface.artifact_id != turn.artifact_id
+                || surface.app_name != selected.app_name
+                || surface.bundle_id != selected.bundle_id)
+    });
+
+    if selected.surface_id == "no-clear-current-surface" {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::Unknown;
+        resolution.surface_relation = "unknown".to_string();
+        resolution.task_identity_may_change = !current_task_is_clear;
+        resolution.relation_reason_codes = vec!["current_surface_missing".to_string()];
+    } else if task_resolver_preserved_identity_across_support_detour {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::Detour;
+        resolution.surface_relation = "support_detour".to_string();
+        resolution.task_identity_may_change = false;
+        resolution.relation_reason_codes = vec![
+            "task_resolver_preserved_identity_across_support_detour".to_string(),
+            "current_task_identity_preserved".to_string(),
+        ];
+    } else if current_task_is_clear && newer_distinct_surface_exists {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::Detour;
+        resolution.surface_relation = "support_detour".to_string();
+        resolution.task_identity_may_change = false;
+        resolution.relation_reason_codes = vec![
+            "newer_distinct_support_surface_observed".to_string(),
+            "current_task_identity_preserved".to_string(),
+        ];
+    } else if artifact_match || evidence_match {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::SameTask;
+        resolution.surface_relation = "same_task".to_string();
+        resolution.task_identity_may_change = false;
+        resolution.relation_reason_codes = vec![if artifact_match {
+            "current_surface_artifact_matches_task"
+        } else {
+            "current_surface_evidence_matches_task"
+        }
+        .to_string()];
+    } else if current_task_is_clear {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::Detour;
+        resolution.surface_relation = "support_detour".to_string();
+        resolution.task_identity_may_change = false;
+        resolution.relation_reason_codes = vec![
+            "newer_surface_without_new_task_turn".to_string(),
+            "current_task_identity_preserved".to_string(),
+        ];
+    } else {
+        resolution.relation_to_current_task = semantic_consistency::RelationToCurrentTask::Unknown;
+        resolution.surface_relation = "unknown".to_string();
+        resolution.task_identity_may_change = true;
+        resolution.relation_reason_codes = vec![
+            "newer_surface_task_relation_uncertain".to_string(),
+            "current_task_attribution_below_threshold".to_string(),
+        ];
+    }
 }
 
 fn load_recent_focus_evidence(
@@ -6567,6 +7709,8 @@ fn load_recent_probe_focus_evidence(
                     privacy_blocked, warnings_json
              FROM continue_evidence_probes
              WHERE completed_at_ms >= ?1
+               AND status = 'succeeded_changed_evidence'
+               AND stale_result = 0
              ORDER BY completed_at_ms DESC, id DESC
              LIMIT ?2",
         )
@@ -7785,9 +8929,336 @@ fn selected_candidate_target_evidence_timestamp(candidate: &ScoredContinueCandid
 }
 
 fn candidate_target_is_directly_openable(target: &ScorerArtifact) -> bool {
-    target.browser_url.is_some()
-        || target.document_path.is_some()
-        || target.openability == "openable"
+    target
+        .browser_url
+        .as_deref()
+        .is_some_and(|url| url.starts_with("https://") || url.starts_with("http://"))
+        || target
+            .document_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with('/') && path.len() > 1)
+}
+
+fn direct_target_policy_for_candidate(
+    candidate: Option<&ScoredContinueCandidate>,
+    current_task_turn: Option<&CurrentTaskTurn>,
+) -> DirectTargetPolicyResult {
+    let target = candidate.and_then(candidate_public_target_artifact);
+    let task_turn_eligible = candidate.is_some_and(|candidate| {
+        current_task_turn.is_none_or(|turn| {
+            candidate
+                .last_meaningful_action
+                .as_ref()
+                .and_then(|action| action.task_turn_id.as_deref())
+                .is_none_or(|task_turn_id| task_turn_id == turn.task_turn_id)
+        })
+    });
+    let workstream_eligible = candidate.is_some_and(|candidate| {
+        current_task_turn
+            .and_then(|turn| turn.workstream_id.as_deref())
+            .is_none_or(|workstream_id| candidate.workstream_id == workstream_id)
+    });
+    let freshness_eligible = candidate.is_some_and(|candidate| {
+        current_task_turn.is_none_or(|turn| {
+            candidate
+                .last_meaningful_action
+                .as_ref()
+                .is_some_and(|action| {
+                    action.task_turn_id.as_deref() == Some(turn.task_turn_id.as_str())
+                        || action.created_at_ms >= turn.started_at_ms
+                })
+                || target.is_some_and(|target| target.last_seen_timestamp >= turn.started_at_ms)
+        })
+    });
+    let mut evidence_ids = Vec::new();
+    if let Some(candidate) = candidate {
+        if let Some(action) = &candidate.last_meaningful_action {
+            evidence_ids.push(action.id.clone());
+        }
+        if let Some(frame_id) = &candidate.evidence_frame_id {
+            if !evidence_ids.contains(frame_id) {
+                evidence_ids.push(frame_id.clone());
+            }
+        }
+    }
+    evaluate_direct_target_policy(&DirectTargetPolicyInput {
+        candidate_id: candidate.map(|candidate| candidate.id.clone()),
+        artifact_id: target.map(|target| target.id.clone()),
+        task_turn_eligible,
+        workstream_eligible,
+        feedback_eligible: candidate
+            .is_some_and(|candidate| candidate_primary_eligible_after_feedback_gate(candidate)),
+        branch_eligible: candidate.is_some_and(candidate_branch_public_return_gate),
+        freshness_eligible,
+        target_identity_confidence: target.map(|target| target.identity_confidence),
+        openability: target.map(|target| target.openability.clone()),
+        browser_url: target.and_then(|target| target.browser_url.clone()),
+        document_path: target.and_then(|target| target.document_path.clone()),
+        evidence_preview_id: candidate.and_then(|candidate| candidate.evidence_frame_id.clone()),
+        supporting_evidence_ids: evidence_ids,
+    })
+}
+
+fn evidence_preview_for_candidate(
+    candidate: Option<&ScoredContinueCandidate>,
+) -> Option<ContinueEvidencePreview> {
+    candidate
+        .and_then(|candidate| candidate.evidence_frame_id.as_deref())
+        .and_then(|frame_id| non_empty(frame_id.to_string()))
+        .map(|frame_id| ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".to_string(),
+            preview_kind: "frame".to_string(),
+            frame_id,
+        })
+}
+
+fn target_truth_for_decision(
+    candidate: Option<&ScoredContinueCandidate>,
+    current_task_turn: Option<&CurrentTaskTurn>,
+    current_focus: Option<&ContinueFocusSummary>,
+    direct_target_policy: &DirectTargetPolicyResult,
+    public_return_candidate: Option<&ScoredContinueCandidate>,
+    evidence_preview: Option<&ContinueEvidencePreview>,
+) -> ContinueTargetTruth {
+    let task_known = current_task_turn.is_some_and(|turn| {
+        turn.goal_confidence >= 0.55
+            && first_non_empty([
+                turn.latest_user_goal_summary.as_deref(),
+                turn.task_object.as_deref(),
+            ])
+            .is_some()
+    });
+    let mut reason_codes = Vec::new();
+    if public_return_candidate.is_some() && direct_target_policy.direct_target_allowed {
+        reason_codes.push("direct_target_available".to_string());
+        return ContinueTargetTruth {
+            schema: "smalltalk.continue_target_truth.v1".to_string(),
+            state: "direct_continue_ready".to_string(),
+            reason_codes,
+        };
+    }
+
+    if candidate.is_some() && !direct_target_policy.feedback_eligible {
+        reason_codes.push("target_feedback_suppressed".to_string());
+    }
+    if candidate.is_some() && !direct_target_policy.branch_eligible {
+        reason_codes.push("target_support_only".to_string());
+    }
+    if candidate.is_some() && !direct_target_policy.freshness_eligible {
+        reason_codes.push("target_stale".to_string());
+    }
+    if !direct_target_policy.validated_direct_locator_present {
+        reason_codes.push("missing_url_or_path".to_string());
+    }
+    if candidate
+        .and_then(candidate_public_target_artifact)
+        .is_some()
+        && !direct_target_policy.validated_direct_locator_present
+    {
+        reason_codes.push("target_identity_thin".to_string());
+    }
+    if current_focus
+        .and_then(|focus| focus.openability.as_deref())
+        .is_some_and(|openability| openability == "app_focus_only")
+    {
+        reason_codes.push("app_focus_only".to_string());
+    }
+    if evidence_preview.is_some() {
+        reason_codes.push("frame_preview_only".to_string());
+    }
+    reason_codes.push(
+        if task_known {
+            "task_known_target_unknown"
+        } else {
+            "no_clear_task_or_target"
+        }
+        .to_string(),
+    );
+    reason_codes.sort();
+    reason_codes.dedup();
+
+    let state = if reason_codes
+        .iter()
+        .any(|reason| reason == "target_feedback_suppressed")
+    {
+        "target_suppressed"
+    } else if reason_codes
+        .iter()
+        .any(|reason| reason == "target_support_only")
+    {
+        "support_only"
+    } else if reason_codes.iter().any(|reason| reason == "target_stale") {
+        "stale_decision"
+    } else if task_known {
+        "task_known_target_unknown"
+    } else if evidence_preview.is_some() {
+        "thin_task_seen"
+    } else {
+        "no_clear_task"
+    };
+
+    ContinueTargetTruth {
+        schema: "smalltalk.continue_target_truth.v1".to_string(),
+        state: state.to_string(),
+        reason_codes,
+    }
+}
+
+fn why_no_safe_target_for_truth(target_truth: &ContinueTargetTruth) -> String {
+    if target_truth
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "target_feedback_suppressed")
+    {
+        return "The possible location is suppressed by your feedback, so it will not be opened."
+            .to_string();
+    }
+    if target_truth
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "target_support_only")
+    {
+        return "The visible location is supporting evidence, not the current task location."
+            .to_string();
+    }
+    if target_truth
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "target_stale")
+    {
+        return "The possible location is older than the current task evidence and must be refreshed."
+            .to_string();
+    }
+    if target_truth
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "app_focus_only")
+    {
+        return "I know the app, but I do not have the exact page, conversation, or file locator."
+            .to_string();
+    }
+    if target_truth.state == "task_known_target_unknown" {
+        return "I know the task, but I do not have a direct page or file locator.".to_string();
+    }
+    "The exact task location is unavailable from the current evidence.".to_string()
+}
+
+fn compose_interruption_recovery_answer(
+    current_task_turn: Option<&CurrentTaskTurn>,
+    current_focus: Option<&ContinueFocusSummary>,
+    recap: &ContinueActivityRecap,
+    public_return_candidate: Option<&ScoredContinueCandidate>,
+    evidence_preview: Option<&ContinueEvidencePreview>,
+    target_truth: &ContinueTargetTruth,
+    confidence_summary: &CompactConfidenceSummary,
+) -> ContinueInterruptionRecoveryAnswer {
+    let what_you_were_doing = first_non_empty([
+        recap.primary_work_summary.as_deref(),
+        current_task_turn.and_then(|turn| turn.latest_user_goal_summary.as_deref()),
+        current_task_turn.and_then(|turn| turn.task_object.as_deref()),
+    ])
+    .and_then(|value| clean_user_handoff_line(value.to_string(), 220));
+    let direct_target_label = public_return_candidate
+        .and_then(candidate_public_target_artifact)
+        .and_then(human_artifact_label);
+    let where_label = first_non_empty([
+        direct_target_label.as_deref(),
+        recap.primary_where_summary.as_deref(),
+        current_focus.and_then(|focus| focus.display_title.as_deref()),
+        current_focus.and_then(|focus| focus.app_name.as_deref()),
+    ])
+    .and_then(|value| clean_user_handoff_line(value.to_string(), 140));
+    let where_you_left_off = first_non_empty([
+        recap.last_meaningful_state.as_deref(),
+        recap.unfinished_state.as_deref(),
+        current_task_turn.and_then(|turn| turn.actor_activity_state.as_deref()),
+    ])
+    .and_then(|value| clean_user_handoff_line(value.to_string(), 240));
+    let next = recap
+        .next_action_summary
+        .as_deref()
+        .and_then(|value| clean_user_handoff_line(value.to_string(), 220))
+        .unwrap_or_else(|| "The next action is not clear from the current evidence.".to_string());
+    let action = if target_truth.state == "direct_continue_ready" {
+        "continue_here"
+    } else if evidence_preview.is_some() {
+        "inspect_evidence"
+    } else {
+        "view_summary"
+    };
+    let target_note = if target_truth.state == "direct_continue_ready" {
+        direct_target_label.map(|label| format!("A direct location is available for {}.", label))
+    } else {
+        Some(why_no_safe_target_for_truth(target_truth))
+    };
+
+    ContinueInterruptionRecoveryAnswer {
+        schema: "smalltalk.interruption_recovery_answer.v1".to_string(),
+        what_you_were_doing,
+        where_label,
+        where_you_left_off,
+        next,
+        action: action.to_string(),
+        target_note,
+        task_confidence_label: confidence_summary.task.label.as_str().to_string(),
+        target_confidence_label: confidence_summary.target.label.as_str().to_string(),
+    }
+}
+
+fn no_clear_current_task_handoff(supported_surface: Option<&str>) -> ContinueHandoff {
+    ContinueHandoff {
+        headline: "Recent activity was captured, but the exact current task is unclear."
+            .to_string(),
+        return_line: "No task or return location was selected.".to_string(),
+        current_focus_line: supported_surface
+            .map(|surface| format!("Recent activity was visible in {surface}."))
+            .unwrap_or_else(|| "Recent local activity is available to inspect.".to_string()),
+        last_state_line: "No current task state is supported by the available evidence."
+            .to_string(),
+        next_action: "Inspect the recent evidence or capture again to identify the exact task."
+            .to_string(),
+        why_this: vec!["No eligible current user-authored goal was found.".to_string()],
+        missing_evidence_line: Some(
+            "A current user-authored task message or equivalent causal evidence is missing."
+                .to_string(),
+        ),
+        confidence_label: "none".to_string(),
+        user_visible_uncertainty: Some(
+            "Smalltalk will not reuse historical text or controls as the current task.".to_string(),
+        ),
+    }
+}
+
+fn activity_supported_handoff(work_truth: &ContinueWorkTruth) -> ContinueHandoff {
+    let summary = work_truth
+        .activity_summary
+        .clone()
+        .unwrap_or_else(|| "Recent activity is supported".to_string());
+    let location = work_truth
+        .where_summary
+        .clone()
+        .unwrap_or_else(|| "The exact location is not available.".to_string());
+    ContinueHandoff {
+        headline: summary.clone(),
+        return_line: location.clone(),
+        current_focus_line: location,
+        last_state_line: summary,
+        next_action: String::new(),
+        why_this: vec![
+            "Recent direct interaction supports this activity and work object.".to_string(),
+            "The broader goal was not inferred without evidence.".to_string(),
+        ],
+        missing_evidence_line: Some("The broader goal was not captured.".to_string()),
+        confidence_label: if work_truth.confidence >= 0.75 {
+            "high"
+        } else if work_truth.confidence >= 0.55 {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_string(),
+        user_visible_uncertainty: Some("Broader goal not captured.".to_string()),
+    }
 }
 
 fn current_surface_differs_from_selected_target(
@@ -8158,7 +9629,8 @@ fn continue_cache_bypass_reasons(
     }
     let candidate = conn
         .query_row(
-            "SELECT d.id, d.requested_at_ms
+            "SELECT d.id, d.requested_at_ms, d.feedback_policy_fingerprint,
+                    d.next_feedback_transition_at_ms
              FROM continue_decisions d
              LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
              WHERE d.evidence_watermark_hash = ?1
@@ -8177,15 +9649,29 @@ fn continue_cache_bypass_reasons(
                     0_i64
                 }
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
         )
         .optional()
         .map_err(to_string)?;
-    let Some((decision_id, requested_at_ms)) = candidate else {
+    let Some((decision_id, requested_at_ms, policy_fingerprint, next_transition_at_ms)) = candidate
+    else {
         return Ok(Vec::new());
     };
 
     let mut reasons = Vec::new();
+    if policy_fingerprint.as_deref() != Some(FEEDBACK_POLICY_FINGERPRINT) {
+        reasons.push("feedback_policy_version_changed".to_string());
+    }
+    if next_transition_at_ms.is_some_and(|expires_at_ms| current_time_millis() >= expires_at_ms) {
+        reasons.push("feedback_policy_transition_elapsed".to_string());
+    }
     let latest_feedback_ms = latest_continue_feedback_watermark_ms(conn)?;
     if latest_feedback_ms.is_some_and(|timestamp| timestamp > requested_at_ms) {
         reasons.push("feedback_newer_than_cached_decision".to_string());
@@ -8217,7 +9703,32 @@ fn continue_cache_bypass_reasons(
 }
 
 pub fn latest_continue_feedback_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
-    max_i64_if_present(conn, "continue_feedback_events", "timestamp_ms")
+    let legacy = max_i64_if_present(conn, "continue_feedback_events", "timestamp_ms")?;
+    let task_truth = max_i64_if_present(conn, "task_truth_v2_feedback_events", "observed_at_ms")?;
+    Ok(match (legacy, task_truth) {
+        (Some(legacy), Some(task_truth)) => Some(legacy.max(task_truth)),
+        (Some(legacy), None) => Some(legacy),
+        (None, Some(task_truth)) => Some(task_truth),
+        (None, None) => None,
+    })
+}
+
+fn next_feedback_policy_transition_ms(
+    conn: &Connection,
+    after_ms: i64,
+) -> Result<Option<i64>, String> {
+    if !table_exists(conn, "continue_feedback_events")?
+        || !column_exists(conn, "continue_feedback_events", "expires_at_ms")?
+    {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT MIN(expires_at_ms) FROM continue_feedback_events
+         WHERE expires_at_ms IS NOT NULL AND expires_at_ms > ?1",
+        params![after_ms],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map_err(to_string)
 }
 
 pub fn latest_continue_open_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
@@ -8333,7 +9844,7 @@ fn fresh_cached_continue_decision_internal(
                     d.evidence_watermark_hash, d.latest_boundary_revision,
                     d.micro_inference_requested, d.micro_inference_attempted,
                     d.activity_recap_json, d.activity_recap_detail_json,
-                    d.activity_recap_watermark_hash
+                    d.activity_recap_watermark_hash, d.work_truth_json
              FROM continue_decisions d
              LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
              LEFT JOIN frames f ON CAST(f.id AS TEXT) = d.current_focus_frame_id
@@ -8341,6 +9852,10 @@ fn fresh_cached_continue_decision_internal(
                AND (?2 IS NULL OR f.session_id = ?2 OR d.current_focus_frame_id IS NULL)
                AND COALESCE(d.latest_boundary_revision, 0) = ?3
                AND COALESCE(d.micro_inference_requested, 0) = ?4
+               AND d.feedback_policy_fingerprint = ?8
+               AND d.semantic_graph_policy_fingerprint = ?11
+               AND (d.next_feedback_transition_at_ms IS NULL
+                    OR d.next_feedback_transition_at_ms > ?9)
                AND (?5 IS NULL OR (
                  d.activity_recap_json IS NOT NULL
                  AND d.activity_recap_watermark_hash = ?5
@@ -8400,7 +9915,7 @@ fn fresh_cached_continue_decision_internal(
                  FROM continue_decision_open_events oe
                  WHERE oe.decision_id = d.id
                    AND oe.opened_at_ms > d.requested_at_ms
-                   AND oe.opened_at_ms <= ?8
+                   AND oe.opened_at_ms <= ?10
                    AND (oe.opened_url = 1 OR oe.opened_path = 1 OR oe.opened_frame_fallback = 1)
                    AND NOT EXISTS (
                      SELECT 1
@@ -8431,7 +9946,10 @@ fn fresh_cached_continue_decision_internal(
             activity_recap_watermark_hash,
             activity_recap_policy_fingerprint,
             activity_recap_model_requested.map(|requested| if requested { 1_i64 } else { 0_i64 }),
+            FEEDBACK_POLICY_FINGERPRINT,
+            current_time_millis(),
             current_time_millis().saturating_sub(FEEDBACK_INFERENCE_MIN_AGE_MS),
+            SEMANTIC_GRAPH_POLICY_FINGERPRINT,
         ],
         |row| {
             let warnings: Option<String> = row.get(6)?;
@@ -8459,6 +9977,11 @@ fn fresh_cached_continue_decision_internal(
                         activity_recap.clone(),
                     )
                 });
+            let work_truth_policy_version = row
+                .get::<_, Option<String>>(30)?
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<ContinueWorkTruth>(value).ok())
+                .map(|truth| truth.policy_version);
             Ok(CachedContinueDecisionMeta {
                 decision_id: row.get(0)?,
                 source: row.get(1)?,
@@ -8486,6 +10009,7 @@ fn fresh_cached_continue_decision_internal(
                 activity_recap_watermark_hash: row
                     .get::<_, Option<String>>(29)?
                     .unwrap_or_default(),
+                work_truth_policy_version,
             })
         },
     )
@@ -8519,6 +10043,9 @@ fn build_continue_evidence_watermark(
         latest_string_marker(conn, "continue_semantic_moments", "id", "ended_at_ms")?;
     let (latest_task_action_id, latest_task_action_at_ms) =
         latest_string_marker(conn, "continue_task_actions", "id", "created_at_ms")?;
+    let (latest_task_turn_id, latest_task_turn_revision, latest_task_turn_updated_at_ms) =
+        task_turn::latest_task_turn_marker(conn)?;
+    let semantic_graph_material_fingerprint = semantic_graph_material_fingerprint(conn)?;
     let latest_workstream_revision =
         max_i64_if_present(conn, "continue_workstreams", "last_active_timestamp_ms")?;
     let latest_open_loop_revision =
@@ -8530,7 +10057,7 @@ fn build_continue_evidence_watermark(
     let latest_memory_edge_at_ms =
         max_i64_if_present(conn, "continue_memory_edges", "updated_at_ms")?;
     let (latest_evidence_probe_id, latest_evidence_probe_at_ms) =
-        latest_string_marker(conn, "continue_evidence_probes", "id", "completed_at_ms")?;
+        latest_material_evidence_probe_marker(conn)?;
     let (latest_surface_snapshot_id, latest_surface_snapshot_at_ms) =
         latest_string_marker(conn, "continue_surface_snapshots", "id", "observed_at_ms")?;
     let (latest_app_activity_segment_id, latest_app_activity_segment_at_ms) =
@@ -8547,10 +10074,27 @@ fn build_continue_evidence_watermark(
         latest_string_marker(conn, "continue_breadcrumbs", "id", "created_at_ms")?;
     let (latest_feedback_id, latest_feedback_at_ms) =
         latest_string_marker(conn, "continue_feedback_events", "id", "timestamp_ms")?;
+    let (latest_task_truth_feedback_id, latest_task_truth_feedback_at_ms) = latest_string_marker(
+        conn,
+        "task_truth_v2_feedback_events",
+        "feedback_id",
+        "observed_at_ms",
+    )?;
+    let task_truth_feedback_count = count_if_present(conn, "task_truth_v2_feedback_events")?;
     let (latest_open_event_id, latest_open_event_at_ms) =
         latest_string_marker(conn, "continue_decision_open_events", "id", "opened_at_ms")?;
     let hash_seed = serde_json::json!({
         "continue_schema_version": CONTINUE_SCHEMA_VERSION,
+        "feedback_policy_fingerprint": FEEDBACK_POLICY_FINGERPRINT,
+        "semantic_graph_policy_fingerprint": SEMANTIC_GRAPH_POLICY_FINGERPRINT,
+        "confidence_policy_version": confidence::CONTINUE_CONFIDENCE_POLICY_VERSION,
+        "task_truth_snapshot_schema": task_truth_v2::task_snapshot::TASK_SNAPSHOT_SCHEMA_V2,
+        "task_truth_selection_policy": task_truth_v2::selection::SNAPSHOT_SELECTION_POLICY_V1,
+        "task_truth_resolver_version": task_truth_v2::model::TASK_TRUTH_RESOLVER_VERSION,
+        "task_truth_verifier_version": task_truth_v2::verifier::TASK_TRUTH_VERIFIER_VERSION,
+        "task_truth_authority_policy": task_truth_v2::production::TASK_TRUTH_AUTHORITY_POLICY_V1,
+        "task_truth_public_answer_schema": task_truth_v2::production::TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1,
+        "semantic_graph_material_fingerprint": semantic_graph_material_fingerprint.clone(),
         "p8_router_version": 1,
         "latest_frame_id": latest_frame_id,
         "latest_frame_at_ms": latest_frame_at_ms,
@@ -8568,13 +10112,16 @@ fn build_continue_evidence_watermark(
         "latest_semantic_moment_at_ms": latest_semantic_moment_at_ms,
         "latest_task_action_id": latest_task_action_id,
         "latest_task_action_at_ms": latest_task_action_at_ms,
+        "latest_task_turn_id": latest_task_turn_id,
+        "latest_task_turn_revision": latest_task_turn_revision,
+        "latest_task_turn_updated_at_ms": latest_task_turn_updated_at_ms,
         "latest_workstream_revision": latest_workstream_revision,
         "latest_open_loop_revision": latest_open_loop_revision,
+        "latest_material_evidence_probe_id": latest_evidence_probe_id,
+        "latest_material_evidence_probe_at_ms": latest_evidence_probe_at_ms,
         "latest_boundary_revision": latest_boundary_revision,
         "latest_memory_cell_at_ms": latest_memory_cell_at_ms,
         "latest_memory_edge_at_ms": latest_memory_edge_at_ms,
-        "latest_evidence_probe_id": latest_evidence_probe_id,
-        "latest_evidence_probe_at_ms": latest_evidence_probe_at_ms,
         "latest_surface_snapshot_id": latest_surface_snapshot_id,
         "latest_surface_snapshot_at_ms": latest_surface_snapshot_at_ms,
         "latest_app_activity_segment_id": latest_app_activity_segment_id,
@@ -8587,6 +10134,9 @@ fn build_continue_evidence_watermark(
         "latest_breadcrumb_at_ms": latest_breadcrumb_at_ms,
         "latest_feedback_id": latest_feedback_id,
         "latest_feedback_at_ms": latest_feedback_at_ms,
+        "latest_task_truth_feedback_id": latest_task_truth_feedback_id,
+        "latest_task_truth_feedback_at_ms": latest_task_truth_feedback_at_ms,
+        "task_truth_feedback_count": task_truth_feedback_count,
         "latest_open_event_id": latest_open_event_id,
         "latest_open_event_at_ms": latest_open_event_at_ms,
     });
@@ -8608,6 +10158,11 @@ fn build_continue_evidence_watermark(
         latest_semantic_moment_at_ms,
         latest_task_action_id,
         latest_task_action_at_ms,
+        latest_task_turn_id,
+        latest_task_turn_revision,
+        latest_task_turn_updated_at_ms,
+        semantic_graph_policy_fingerprint: Some(SEMANTIC_GRAPH_POLICY_FINGERPRINT.to_string()),
+        semantic_graph_material_fingerprint: Some(semantic_graph_material_fingerprint),
         latest_workstream_revision,
         latest_open_loop_revision,
         latest_boundary_revision,
@@ -8631,6 +10186,73 @@ fn build_continue_evidence_watermark(
         latest_open_event_at_ms,
         hash,
     })
+}
+
+pub fn current_continue_evidence_watermark_hash(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<String, String> {
+    build_continue_evidence_watermark(conn, session_id).map(|watermark| watermark.hash)
+}
+
+pub fn probe_result_allows_rerun(result: &NeedMoreEvidenceProbeResult) -> bool {
+    !result.stale_result
+        && result.evidence_changed
+        && result.status == EvidenceProbeStatus::SucceededChangedEvidence
+        && !result.dimensions_changed.is_empty()
+}
+
+fn semantic_graph_material_fingerprint(conn: &Connection) -> Result<String, String> {
+    let memberships = if table_exists(conn, "continue_task_turn_workstream_memberships")? {
+        conn.query_row(
+            "SELECT COALESCE(GROUP_CONCAT(value, '|'), '') FROM (
+               SELECT task_turn_id || ':' || workstream_id || ':' || revision || ':' || selected AS value
+               FROM continue_task_turn_workstream_memberships
+               ORDER BY task_turn_id, workstream_id
+             )",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(to_string)?
+    } else {
+        String::new()
+    };
+    let loops = if table_exists(conn, "continue_open_loops")?
+        && column_exists(conn, "continue_open_loops", "ownership_revision")?
+    {
+        conn.query_row(
+            "SELECT COALESCE(GROUP_CONCAT(value, '|'), '') FROM (
+               SELECT id || ':' || COALESCE(task_turn_id, '') || ':' || state || ':' ||
+                      ownership_revision AS value
+               FROM continue_open_loops ORDER BY id
+             )",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(to_string)?
+    } else {
+        String::new()
+    };
+    let branches = if table_exists(conn, "continue_branch_contexts")?
+        && column_exists(conn, "continue_branch_contexts", "promotion_task_turn_id")?
+    {
+        conn.query_row(
+            "SELECT COALESCE(GROUP_CONCAT(value, '|'), '') FROM (
+               SELECT id || ':' || COALESCE(task_turn_id, '') || ':' ||
+                      COALESCE(promotion_task_turn_id, '') || ':' || promotion_state || ':' ||
+                      COALESCE(returned_to_origin_at_ms, 0) AS value
+               FROM continue_branch_contexts ORDER BY id
+             )",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(to_string)?
+    } else {
+        String::new()
+    };
+    Ok(stable_hash(
+        format!("{memberships}\n{loops}\n{branches}").as_bytes(),
+    ))
 }
 
 fn latest_frame_marker(
@@ -8806,6 +10428,24 @@ fn latest_string_marker(
     .map(|value| value.unwrap_or((None, None)))
 }
 
+fn latest_material_evidence_probe_marker(
+    conn: &Connection,
+) -> Result<(Option<String>, Option<i64>), String> {
+    if !table_exists(conn, "continue_evidence_probes")? {
+        return Ok((None, None));
+    }
+    conn.query_row(
+        "SELECT id, completed_at_ms FROM continue_evidence_probes
+         WHERE status='succeeded_changed_evidence' AND stale_result=0
+         ORDER BY completed_at_ms DESC, id DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map(|row| row.unwrap_or((None, None)))
+    .map_err(to_string)
+}
+
 fn latest_grounded_app_activity_segment_marker(
     conn: &Connection,
 ) -> Result<(Option<String>, Option<i64>), String> {
@@ -8950,6 +10590,11 @@ fn continue_layers_need_rebuild(
     };
     if !table_exists(conn, "continue_workstreams")?
         || count_if_present(conn, "continue_workstreams")? == 0
+    {
+        return Ok(true);
+    }
+    if !table_exists(conn, "continue_task_turns")?
+        || count_if_present(conn, "continue_task_turns")? == 0
     {
         return Ok(true);
     }
@@ -9153,47 +10798,60 @@ fn load_scorer_open_loops(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT id, workstream_id, state, boundary_kind, quality, confidence,
+            "SELECT id, workstream_id, task_turn_id, parent_task_turn_id,
+                    origin_task_turn_id, state, boundary_kind, quality, confidence,
                     origin_artifact_id, current_focus_artifact_id,
                     primary_return_artifact_id, resume_work_artifact_id,
                     blocker_artifact_id, verification_artifact_id,
                     objective_hint, last_concrete_progress, unfinished_state,
                     next_evidence_backed_action, current_focus_relation,
-                    missing_fields_json, evidence_spans_json, local_reason,
-                    last_updated_at_ms
+                    relation_to_current_task, freshness, eligible_for_primary,
+                    eligible_for_objective, eligible_for_last_state,
+                    eligibility_reason_codes_json, missing_fields_json,
+                    evidence_spans_json, local_reason, last_updated_at_ms
              FROM continue_open_loops
              WHERE workstream_id = ?1
-               AND (state = 'open' OR boundary_kind = 'completed_progress')
              ORDER BY last_updated_at_ms DESC, confidence DESC
-             LIMIT 4",
+             LIMIT 8",
         )
         .map_err(to_string)?;
     let rows = stmt
         .query_map(params![workstream_id], |row| {
-            let missing_fields_json: String = row.get(17)?;
-            let evidence_spans_json: String = row.get(18)?;
+            let eligibility_reason_codes_json: String = row.get(25)?;
+            let missing_fields_json: String = row.get(26)?;
+            let evidence_spans_json: String = row.get(27)?;
             Ok(ScorerOpenLoop {
                 id: row.get(0)?,
                 workstream_id: row.get(1)?,
-                state: row.get(2)?,
-                boundary_kind: row.get(3)?,
-                quality: row.get(4)?,
-                confidence: row.get(5)?,
-                origin_artifact_id: row.get(6)?,
-                current_focus_artifact_id: row.get(7)?,
-                primary_return_artifact_id: row.get(8)?,
-                resume_work_artifact_id: row.get(9)?,
-                blocker_artifact_id: row.get(10)?,
-                verification_artifact_id: row.get(11)?,
-                objective_hint: row.get(12)?,
-                last_concrete_progress: row.get(13)?,
-                unfinished_state: row.get(14)?,
-                next_evidence_backed_action: row.get(15)?,
-                current_focus_relation: row.get(16)?,
+                task_turn_id: row.get(2)?,
+                parent_task_turn_id: row.get(3)?,
+                origin_task_turn_id: row.get(4)?,
+                state: row.get(5)?,
+                boundary_kind: row.get(6)?,
+                quality: row.get(7)?,
+                confidence: row.get(8)?,
+                origin_artifact_id: row.get(9)?,
+                current_focus_artifact_id: row.get(10)?,
+                primary_return_artifact_id: row.get(11)?,
+                resume_work_artifact_id: row.get(12)?,
+                blocker_artifact_id: row.get(13)?,
+                verification_artifact_id: row.get(14)?,
+                objective_hint: row.get(15)?,
+                last_concrete_progress: row.get(16)?,
+                unfinished_state: row.get(17)?,
+                next_evidence_backed_action: row.get(18)?,
+                current_focus_relation: row.get(19)?,
+                relation_to_current_task: row.get(20)?,
+                freshness: row.get(21)?,
+                eligible_for_primary: row.get::<_, i64>(22)? != 0,
+                eligible_for_objective: row.get::<_, i64>(23)? != 0,
+                eligible_for_last_state: row.get::<_, i64>(24)? != 0,
+                eligibility_reason_codes: serde_json::from_str(&eligibility_reason_codes_json)
+                    .unwrap_or_default(),
                 missing_fields: serde_json::from_str(&missing_fields_json).unwrap_or_default(),
                 evidence_spans: serde_json::from_str(&evidence_spans_json).unwrap_or_default(),
-                local_reason: row.get(19)?,
-                last_updated_at_ms: row.get(20)?,
+                local_reason: row.get(28)?,
+                last_updated_at_ms: row.get(29)?,
             })
         })
         .map_err(to_string)?;
@@ -9530,12 +11188,17 @@ fn feedback_targets_for_decision(
 
 fn feedback_targets_for_feedback_event(row: &FeedbackEventRow) -> FeedbackEventTargets {
     let selected_targets = feedback_targets_from_row(row);
-    let chosen_targets = feedback_targets_from_parts(
+    let mut chosen_targets = feedback_targets_from_parts(
         None,
         None,
         row.chosen_artifact_id.as_deref(),
         None,
         &HashMap::new(),
+    );
+    push_feedback_target(
+        &mut chosen_targets,
+        FeedbackTargetScope::ArtifactStableKey,
+        row.chosen_artifact_stable_key.as_deref(),
     );
     match row.event_kind.as_str() {
         "accepted" | "auto_resumed" => FeedbackEventTargets {
@@ -9595,14 +11258,16 @@ fn feedback_targets_from_row(row: &FeedbackEventRow) -> Vec<FeedbackTargetKey> {
     );
     push_feedback_target(
         &mut targets,
-        FeedbackTargetScope::Workstream,
-        row.workstream_id.as_deref(),
-    );
-    push_feedback_target(
-        &mut targets,
         FeedbackTargetScope::ArtifactStableKey,
         row.target_artifact_stable_key.as_deref(),
     );
+    if targets.is_empty() {
+        push_feedback_target(
+            &mut targets,
+            FeedbackTargetScope::Workstream,
+            row.workstream_id.as_deref(),
+        );
+    }
     targets
 }
 
@@ -9684,6 +11349,73 @@ fn feedback_event_target_keys_json(row: &FeedbackEventRow) -> Result<String, Str
     serde_json::to_string(&keys).map_err(to_string)
 }
 
+fn normalized_provenance_for_feedback_row(row: &FeedbackEventRow) -> FeedbackProvenance {
+    let stored = FeedbackProvenance::parse(row.provenance.as_deref());
+    if stored != FeedbackProvenance::Unknown {
+        return stored;
+    }
+    match row.source.as_deref().unwrap_or_default().trim() {
+        "inferred" | "auto" => provenance_for_inferred_kind(&row.event_kind),
+        "system" => FeedbackProvenance::SystemMigration,
+        _ => FeedbackProvenance::Unknown,
+    }
+}
+
+fn feedback_policy_event_from_row(row: &FeedbackEventRow) -> FeedbackPolicyEvent {
+    let provenance = normalized_provenance_for_feedback_row(row);
+    let target_artifact_stable_key = row
+        .target_artifact_stable_key
+        .as_deref()
+        .and_then(feedback_policy_safe_stable_key);
+    let chosen_artifact_stable_key = row
+        .chosen_artifact_stable_key
+        .as_deref()
+        .and_then(feedback_policy_safe_stable_key);
+    let targets = normalize_feedback_targets(
+        &row.event_kind,
+        provenance,
+        row.selected_candidate_id.as_deref(),
+        row.target_artifact_id.as_deref(),
+        target_artifact_stable_key.as_deref(),
+        row.chosen_artifact_id.as_deref(),
+        chosen_artifact_stable_key.as_deref(),
+        row.workstream_id.as_deref(),
+    );
+    FeedbackPolicyEvent {
+        event_id: row.id.clone(),
+        event_kind: row.event_kind.clone(),
+        provenance,
+        decision_id: row.decision_id.clone(),
+        selected_candidate_id: row.selected_candidate_id.clone(),
+        target_artifact_id: row.target_artifact_id.clone(),
+        chosen_artifact_id: row.chosen_artifact_id.clone(),
+        target_artifact_stable_key,
+        chosen_artifact_stable_key,
+        workstream_id: row.workstream_id.clone(),
+        task_turn_id: row.task_turn_id.clone(),
+        session_id: row.session_id.clone(),
+        branch_context_id: row.branch_context_id.clone(),
+        occurred_at_ms: row.timestamp_ms,
+        applies_from_ms: row.applies_from_ms.unwrap_or(row.timestamp_ms),
+        expires_at_ms: row
+            .expires_at_ms
+            .or_else(|| default_expiry_ms(provenance, row.timestamp_ms)),
+        confidence: row.confidence,
+        reason: row.reason.clone(),
+        evidence_ids: row.evidence_ids.clone(),
+        targets,
+    }
+}
+
+fn feedback_policy_safe_stable_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(format!("stable-key-hash-{}", stable_hash(value.as_bytes())))
+    }
+}
+
 fn load_artifact_stable_key(
     conn: &Connection,
     artifact_id: Option<&str>,
@@ -9700,12 +11432,35 @@ fn load_artifact_stable_key(
     .map_err(to_string)
 }
 
+fn load_feedback_branch_context_id(
+    conn: &Connection,
+    artifact_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(None);
+    };
+    if !table_exists(conn, "continue_branch_contexts")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id FROM continue_branch_contexts
+         WHERE branch_artifact_id=?1 OR origin_artifact_id=?1
+         ORDER BY last_branch_seen_at_ms DESC, updated_at_ms DESC LIMIT 1",
+        params![artifact_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
 #[derive(Debug, Clone, Default)]
 struct FeedbackDecisionTargetContext {
     selected_candidate_id: Option<String>,
     workstream_id: Option<String>,
     selected_target_artifact_id: Option<String>,
     return_target_artifact_id: Option<String>,
+    task_turn_id: Option<String>,
+    session_id: Option<String>,
 }
 
 fn load_feedback_decision_target_context(
@@ -9717,7 +11472,8 @@ fn load_feedback_decision_target_context(
     };
     conn.query_row(
         "SELECT d.selected_candidate_id, d.selected_workstream_id,
-                c.target_artifact_id, d.return_target_artifact_id
+                c.target_artifact_id, d.return_target_artifact_id,
+                d.current_task_turn_id, d.session_id
          FROM continue_decisions d
          LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
          WHERE d.id = ?1",
@@ -9728,6 +11484,8 @@ fn load_feedback_decision_target_context(
                 workstream_id: row.get(1)?,
                 selected_target_artifact_id: row.get(2)?,
                 return_target_artifact_id: row.get(3)?,
+                task_turn_id: row.get(4)?,
+                session_id: row.get(5)?,
             })
         },
     )
@@ -9818,6 +11576,7 @@ pub fn record_continue_feedback(
     request: ContinueExplicitFeedbackRequest,
 ) -> Result<ContinueFeedbackEventResult, String> {
     ensure_continue_schema(conn)?;
+    task_truth_v2::checkpoint::ensure_schema(conn)?;
     let feedback_kind = request.feedback_kind.trim();
     let allowed = [
         "accepted",
@@ -9843,6 +11602,99 @@ pub fn record_continue_feedback(
             }
         })
     };
+    let has_any_task_scope = request.task_snapshot_id.is_some()
+        || request.task_snapshot_revision.is_some()
+        || request.affected_task_field.is_some()
+        || request.task_hypothesis_id.is_some();
+    let has_complete_task_scope = request.task_snapshot_id.is_some()
+        && request.task_snapshot_revision.is_some()
+        && request.affected_task_field.is_some();
+    if has_any_task_scope && !has_complete_task_scope {
+        return Err(
+            "task feedback scope requires snapshot id, revision, and affected field".into(),
+        );
+    }
+    if let Some(affected_field) = request.affected_task_field.as_deref() {
+        let allowed_fields = [
+            "task_summary",
+            "task_object",
+            "state",
+            "next_action",
+            "where",
+            "hypothesis",
+        ];
+        if !allowed_fields.contains(&affected_field) {
+            return Err(format!("unsupported affected_task_field: {affected_field}"));
+        }
+        if affected_field == "hypothesis" && request.task_hypothesis_id.is_none() {
+            return Err("hypothesis feedback requires a hypothesis id".into());
+        }
+        if affected_field != "hypothesis" && request.task_hypothesis_id.is_some() {
+            return Err("hypothesis id is valid only for hypothesis feedback".into());
+        }
+    }
+    if has_complete_task_scope {
+        let snapshot_id = request.task_snapshot_id.as_deref().unwrap_or_default();
+        let snapshot_revision = request.task_snapshot_revision.unwrap_or_default();
+        let affected_field = request.affected_task_field.as_deref().unwrap_or_default();
+        let timestamp_ms = current_time_millis();
+        let id = format!(
+            "task-truth-feedback-{}",
+            stable_hash(
+                format!(
+                    "{}:{}:{}:{}:{}:{}:{}",
+                    request.decision_id.as_deref().unwrap_or("none"),
+                    snapshot_id,
+                    snapshot_revision,
+                    affected_field,
+                    request.task_hypothesis_id.as_deref().unwrap_or("none"),
+                    feedback_kind,
+                    source,
+                )
+                .as_bytes(),
+            )
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO task_truth_v2_feedback_events (
+               feedback_id, task_snapshot_id, task_snapshot_revision, affected_field,
+               hypothesis_id, feedback_kind, decision_id, observed_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                id,
+                snapshot_id,
+                snapshot_revision,
+                affected_field,
+                request.task_hypothesis_id,
+                feedback_kind,
+                request.decision_id,
+                timestamp_ms,
+            ],
+        )
+        .map_err(to_string)?;
+        return Ok(ContinueFeedbackEventResult {
+            id,
+            decision_id: request.decision_id,
+            selected_candidate_id: None,
+            workstream_id: None,
+            event_kind: feedback_kind.to_string(),
+            observed_frame_id: None,
+            target_artifact_id: None,
+            chosen_artifact_id: None,
+            timestamp_ms,
+            confidence: 1.0,
+            reason: Some("user corrected the exact Task Truth snapshot field".into()),
+            note,
+            source: Some(source),
+            provenance: "task_truth_scoped_feedback.v1".into(),
+            task_turn_id: None,
+            session_id: None,
+            branch_context_id: None,
+            applies_from_ms: timestamp_ms,
+            expires_at_ms: None,
+            normalized_targets: Vec::new(),
+            feedback_policy_version: "task_truth_scoped_feedback.v1".into(),
+        });
+    }
     let decision_context =
         load_feedback_decision_target_context(conn, request.decision_id.as_deref())?;
     let selected_candidate_id = request
@@ -9863,8 +11715,19 @@ pub fn record_continue_feedback(
         .or(decision_context.selected_target_artifact_id.clone())
         .or(decision_context.return_target_artifact_id.clone());
     let target_artifact_stable_key = load_artifact_stable_key(conn, target_artifact_id.as_deref())?;
+    let chosen_artifact_stable_key =
+        load_artifact_stable_key(conn, request.corrected_artifact_id.as_deref())?;
+    let branch_context_id = load_feedback_branch_context_id(
+        conn,
+        request
+            .corrected_artifact_id
+            .as_deref()
+            .or(target_artifact_id.as_deref()),
+    )?;
     let resume_work_target_artifact_id = None::<String>;
     let timestamp_ms = current_time_millis();
+    let provenance = provenance_for_explicit_kind(feedback_kind);
+    let expires_at_ms = default_expiry_ms(provenance, timestamp_ms);
     let reason = match feedback_kind {
         "accepted" => "user marked the Continue target useful",
         "rejected" => "user marked the Continue target wrong",
@@ -9900,14 +11763,24 @@ pub fn record_continue_feedback(
         target_artifact_id: target_artifact_id.clone(),
         chosen_artifact_id: request.corrected_artifact_id.clone(),
         target_artifact_stable_key: target_artifact_stable_key.clone(),
+        chosen_artifact_stable_key: chosen_artifact_stable_key.clone(),
         resume_work_target_artifact_id: resume_work_target_artifact_id.clone(),
         timestamp_ms,
         confidence: 1.0,
         reason: Some(reason.to_string()),
         note: note.clone(),
         source: Some(source.clone()),
+        provenance: Some(provenance.as_str().to_string()),
+        task_turn_id: decision_context.task_turn_id.clone(),
+        session_id: decision_context.session_id.clone(),
+        branch_context_id: branch_context_id.clone(),
+        applies_from_ms: Some(timestamp_ms),
+        expires_at_ms,
+        evidence_ids: Vec::new(),
     };
     let feedback_target_keys_json = feedback_event_target_keys_json(&row)?;
+    let normalized_targets_json =
+        serde_json::to_string(&feedback_policy_event_from_row(&row).targets).map_err(to_string)?;
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO continue_feedback_events (
@@ -9915,9 +11788,13 @@ pub fn record_continue_feedback(
             chosen_artifact_id, timestamp_ms, confidence, reason,
             selected_candidate_id, workstream_id, note, source,
             target_artifact_stable_key, resume_work_target_artifact_id,
-            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal
+            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal,
+            provenance, task_turn_id, session_id, branch_context_id, applies_from_ms,
+            expires_at_ms, feedback_policy_version, migration_policy_version,
+            evidence_ids_json, normalized_targets_json, chosen_artifact_stable_key
          ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                   ?13, ?14, ?15, ?16, ?17)",
+                   ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                   ?24, ?25, ?26, ?27, ?28)",
             params![
                 id,
                 request.decision_id,
@@ -9936,6 +11813,17 @@ pub fn record_continue_feedback(
                 feedback_target_keys_json,
                 feedback_event_is_positive_reconfirmation(feedback_kind) as i64,
                 feedback_event_is_negative_signal(feedback_kind) as i64,
+                provenance.as_str(),
+                decision_context.task_turn_id,
+                decision_context.session_id,
+                branch_context_id,
+                timestamp_ms,
+                expires_at_ms,
+                FEEDBACK_POLICY_VERSION,
+                FEEDBACK_MIGRATION_POLICY_VERSION,
+                "[]",
+                normalized_targets_json,
+                chosen_artifact_stable_key,
             ],
         )
         .map_err(to_string)?;
@@ -9970,6 +11858,7 @@ pub fn record_continue_feedback(
             timestamp_ms,
         )?;
     }
+    let normalized_targets = feedback_policy_event_from_row(&row).targets;
     let result = ContinueFeedbackEventResult {
         id: row.id,
         decision_id: row.decision_id,
@@ -9984,6 +11873,14 @@ pub fn record_continue_feedback(
         reason: Some(reason.to_string()),
         note: row.note,
         source: row.source,
+        provenance: provenance.as_str().to_string(),
+        task_turn_id: row.task_turn_id,
+        session_id: row.session_id,
+        branch_context_id: row.branch_context_id,
+        applies_from_ms: timestamp_ms,
+        expires_at_ms,
+        normalized_targets,
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
     };
     if inserted > 0 {
         update_continue_ranking_priors_from_feedback(conn, &result)?;
@@ -10041,6 +11938,7 @@ pub fn get_continue_decision_trace(
         latest_frames: load_trace_frames(conn, limit, include_snippets)?,
         latest_events: load_trace_events(conn, limit)?,
         semantic_moments: load_trace_semantic_moments(conn, limit)?,
+        current_task_turn: task_turn::selected_current_task_turn(conn)?,
         artifacts: load_trace_artifact_audits(conn, limit)?,
         task_actions: load_trace_task_actions(conn, limit)?,
         episodes: load_trace_episodes(conn, limit)?,
@@ -10048,6 +11946,13 @@ pub fn get_continue_decision_trace(
         workstream_state_snapshots: load_trace_workstream_state_snapshots(conn, limit)?,
         workstream_edges: load_trace_workstream_edges(conn, limit)?,
         branch_contexts: load_trace_branch_contexts(conn, limit)?,
+        semantic_graph_policy_version: SEMANTIC_GRAPH_POLICY_VERSION.to_string(),
+        cross_layer_consistency: decision.cross_layer_consistency,
+        direct_target_policy: decision.direct_target_policy,
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+        feedback_policy_fingerprint: FEEDBACK_POLICY_FINGERPRINT.to_string(),
+        feedback_policy_config: feedback_policy_config(),
+        feedback_policy_evaluations: load_trace_feedback_policy_evaluations(conn, limit)?,
         open_loops: load_trace_open_loops(conn, limit)?,
         candidates: load_trace_candidates(conn, limit)?,
         scoring: load_trace_scoring(conn, limit)?,
@@ -10088,6 +11993,8 @@ struct TraceDecisionRow {
     quality_gate: Option<ContinueDecisionQualityGate>,
     handoff: Option<ContinueHandoff>,
     activity_recap_proof: activity_recap_integration::ActivityRecapDecisionProof,
+    cross_layer_consistency: Option<CrossLayerConsistencyResult>,
+    direct_target_policy: Option<DirectTargetPolicyResult>,
 }
 
 fn load_trace_decision(
@@ -10103,7 +12010,8 @@ fn load_trace_decision(
                 handoff_last_state_line, handoff_next_action, handoff_why_this,
                 handoff_missing_evidence_line, handoff_confidence_label,
                 handoff_user_visible_uncertainty, activity_recap_json,
-                activity_recap_detail_json
+                activity_recap_detail_json, cross_layer_consistency_json,
+                direct_target_policy_json
          FROM continue_decisions
          WHERE id = ?1
          LIMIT 1",
@@ -10155,6 +12063,12 @@ fn load_trace_decision(
                 .unwrap_or_else(|| {
                     activity_recap_integration::ActivityRecapDecisionProof::from_recap(recap)
                 });
+            let cross_layer_consistency = row
+                .get::<_, Option<String>>(23)?
+                .and_then(|raw| serde_json::from_str(&raw).ok());
+            let direct_target_policy = row
+                .get::<_, Option<String>>(24)?
+                .and_then(|raw| serde_json::from_str(&raw).ok());
             Ok(TraceDecisionRow {
                 source: row.get(0)?,
                 model: row.get(1)?,
@@ -10170,6 +12084,8 @@ fn load_trace_decision(
                 quality_gate,
                 handoff,
                 activity_recap_proof,
+                cross_layer_consistency,
+                direct_target_policy,
             })
         },
     )
@@ -10386,7 +12302,7 @@ fn load_trace_task_actions(
                     branch_kind, branch_action_role,
                     branch_promotion_eligible_by_default,
                     branch_public_return_eligible_by_default,
-                    branch_confidence, branch_reason_code
+                    branch_confidence, branch_reason_code, task_turn_id
              FROM continue_task_actions
              ORDER BY created_at_ms DESC, frame_id DESC
              LIMIT ?1",
@@ -10398,6 +12314,7 @@ fn load_trace_task_actions(
             let quality_flags_json: String = row.get(17)?;
             Ok(TraceTaskActionSummary {
                 action_id: row.get(0)?,
+                task_turn_id: row.get(24)?,
                 frame_id: row.get(1)?,
                 artifact_id: row.get(2)?,
                 secondary_artifact_id: row.get(3)?,
@@ -10517,7 +12434,7 @@ fn load_trace_workstream_state_snapshots(
                     last_support_artifact_id, blocker_artifact_id, confidence,
                     transition_reason, evidence_action_ids_json,
                     evidence_artifact_ids_json, missing_evidence_json,
-                    warnings_json, created_at_ms
+                    warnings_json, created_at_ms, task_turn_id
              FROM continue_workstream_state_snapshots
              ORDER BY observed_at_ms DESC, confidence DESC
              LIMIT ?1",
@@ -10532,6 +12449,7 @@ fn load_trace_workstream_state_snapshots(
             Ok(ContinueWorkstreamStateSnapshot {
                 id: row.get(0)?,
                 workstream_id: row.get(1)?,
+                task_turn_id: row.get(17)?,
                 observed_at_ms: row.get(2)?,
                 state: row.get(3)?,
                 previous_state: row.get(4)?,
@@ -10564,7 +12482,7 @@ fn load_trace_workstream_edges(
         .prepare(
             "SELECT id, workstream_id, from_artifact_id, to_artifact_id,
                     edge_kind, first_seen_ms, last_seen_ms,
-                    evidence_action_ids_json, confidence
+                    evidence_action_ids_json, confidence, task_turn_id
              FROM continue_workstream_edges
              ORDER BY last_seen_ms DESC, confidence DESC
              LIMIT ?1",
@@ -10576,6 +12494,7 @@ fn load_trace_workstream_edges(
             Ok(ContinueWorkstreamEdge {
                 id: row.get(0)?,
                 workstream_id: row.get(1)?,
+                task_turn_id: row.get(9)?,
                 from_artifact_id: row.get(2)?,
                 to_artifact_id: row.get(3)?,
                 edge_kind: row.get(4)?,
@@ -10602,7 +12521,11 @@ fn load_trace_branch_contexts(
                     branch_artifact_id, branch_kind, branch_started_at_ms,
                     last_branch_seen_at_ms, returned_to_origin_at_ms, promotion_state,
                     promotion_reason, confidence, reason_code, evidence_action_ids_json,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, task_turn_id,
+                    eligible_feedback_event_ids_json, feedback_rejection_reasons_json,
+                    feedback_policy_version, feedback_policy_fingerprint,
+                    origin_task_turn_id, promotion_task_turn_id, promoted_at_ms,
+                    promotion_evidence_action_ids_json
              FROM continue_branch_contexts
              ORDER BY last_branch_seen_at_ms DESC, confidence DESC
              LIMIT ?1",
@@ -10610,6 +12533,66 @@ fn load_trace_branch_contexts(
         .map_err(to_string)?;
     let rows = stmt
         .query_map(params![limit as i64], branch_context_from_row)
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn load_trace_feedback_policy_evaluations(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    if !table_exists(conn, "continue_feedback_policy_evaluations")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT event_id, context_kind, context_id, requested_effect, provenance,
+                    target_scope, target_key, polarity, eligible, event_age_ms,
+                    cutoff_at_ms, axes_json, allowed_effects_json,
+                    rejection_reason_codes_json, confidence_contribution,
+                    policy_version, policy_fingerprint, evaluated_at_ms
+             FROM continue_feedback_policy_evaluations
+             ORDER BY evaluated_at_ms DESC, event_id ASC LIMIT ?1",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            let axes = row
+                .get::<_, String>(11)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let effects = row
+                .get::<_, String>(12)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let reasons = row
+                .get::<_, String>(13)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or_else(|| serde_json::json!([]));
+            Ok(serde_json::json!({
+                "event_id": row.get::<_, String>(0)?,
+                "context_kind": row.get::<_, String>(1)?,
+                "context_id": row.get::<_, Option<String>>(2)?,
+                "requested_effect": row.get::<_, String>(3)?,
+                "provenance": row.get::<_, String>(4)?,
+                "target_scope": row.get::<_, String>(5)?,
+                "target_key": row.get::<_, String>(6)?,
+                "polarity": row.get::<_, String>(7)?,
+                "eligible": row.get::<_, i64>(8)? != 0,
+                "event_age_ms": row.get::<_, i64>(9)?,
+                "cutoff_at_ms": row.get::<_, Option<i64>>(10)?,
+                "axes": axes,
+                "allowed_effects": effects,
+                "rejection_reason_codes": reasons,
+                "confidence_contribution": row.get::<_, f64>(14)?,
+                "policy_version": row.get::<_, String>(15)?,
+                "policy_fingerprint": row.get::<_, String>(16)?,
+                "evaluated_at_ms": row.get::<_, i64>(17)?,
+            }))
+        })
         .map_err(to_string)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
 }
@@ -10627,7 +12610,11 @@ fn load_trace_open_loops(conn: &Connection, limit: usize) -> Result<Vec<Continue
                     last_concrete_progress, unfinished_state,
                     next_evidence_backed_action, current_focus_relation,
                     missing_fields_json, evidence_spans_json, local_reason,
-                    first_seen_at_ms, last_updated_at_ms, revision
+                    first_seen_at_ms, last_updated_at_ms, revision, task_turn_id,
+                    parent_task_turn_id, origin_task_turn_id,
+                    relation_to_current_task, freshness, eligible_for_primary,
+                    eligible_for_objective, eligible_for_last_state,
+                    eligibility_reason_codes_json, ownership_revision
              FROM continue_open_loops
              ORDER BY last_updated_at_ms DESC, confidence DESC
              LIMIT ?1",
@@ -10640,6 +12627,9 @@ fn load_trace_open_loops(conn: &Connection, limit: usize) -> Result<Vec<Continue
             Ok(ContinueOpenLoop {
                 id: row.get(0)?,
                 workstream_id: row.get(1)?,
+                task_turn_id: row.get(23)?,
+                parent_task_turn_id: row.get(24)?,
+                origin_task_turn_id: row.get(25)?,
                 state: row.get(2)?,
                 boundary_kind: row.get(3)?,
                 quality: row.get(4)?,
@@ -10663,6 +12653,12 @@ fn load_trace_open_loops(conn: &Connection, limit: usize) -> Result<Vec<Continue
                     .get::<_, Option<String>>(15)?
                     .and_then(|value| clean_handoff_line(value, 120)),
                 current_focus_relation: row.get(16)?,
+                relation_to_current_task: row.get(26)?,
+                freshness: row.get(27)?,
+                eligible_for_primary: row.get::<_, i64>(28)? != 0,
+                eligible_for_objective: row.get::<_, i64>(29)? != 0,
+                eligible_for_last_state: row.get::<_, i64>(30)? != 0,
+                eligibility_reason_codes: parse_string_array(&row.get::<_, String>(31)?),
                 missing_fields: serde_json::from_str(&missing_json).unwrap_or_default(),
                 evidence_spans: serde_json::from_str(&evidence_json).unwrap_or_default(),
                 local_reason: row
@@ -10671,6 +12667,7 @@ fn load_trace_open_loops(conn: &Connection, limit: usize) -> Result<Vec<Continue
                 first_seen_at_ms: row.get(20)?,
                 last_updated_at_ms: row.get(21)?,
                 revision: row.get(22)?,
+                ownership_revision: row.get(32)?,
             })
         })
         .map_err(to_string)?;
@@ -11113,7 +13110,9 @@ fn load_continue_feedback_events(
             "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
                     observed_frame_id, target_artifact_id, chosen_artifact_id,
                     target_artifact_stable_key, resume_work_target_artifact_id,
-                    timestamp_ms, confidence, reason, note, source
+                    timestamp_ms, confidence, reason, note, source, provenance,
+                    task_turn_id, session_id, branch_context_id, applies_from_ms,
+                    expires_at_ms, evidence_ids_json, chosen_artifact_stable_key
              FROM continue_feedback_events
              WHERE (?1 IS NOT NULL AND decision_id = ?1)
                 OR (?2 IS NOT NULL AND workstream_id = ?2)
@@ -11139,6 +13138,14 @@ fn load_continue_feedback_events(
                 reason: row.get(12)?,
                 note: row.get(13)?,
                 source: row.get(14)?,
+                provenance: row.get(15)?,
+                task_turn_id: row.get(16)?,
+                session_id: row.get(17)?,
+                branch_context_id: row.get(18)?,
+                applies_from_ms: row.get(19)?,
+                expires_at_ms: row.get(20)?,
+                evidence_ids: parse_string_array(&row.get::<_, String>(21)?),
+                chosen_artifact_stable_key: row.get(22)?,
             };
             Ok(feedback_event_result_from_row(feedback_row))
         })
@@ -11172,7 +13179,9 @@ fn load_continue_feedback_event_rows_for_target_keys(
             "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
                     observed_frame_id, target_artifact_id, chosen_artifact_id,
                     target_artifact_stable_key, resume_work_target_artifact_id,
-                    timestamp_ms, confidence, reason, note, source
+                    timestamp_ms, confidence, reason, note, source, provenance,
+                    task_turn_id, session_id, branch_context_id, applies_from_ms,
+                    expires_at_ms, evidence_ids_json, chosen_artifact_stable_key
              FROM continue_feedback_events
              ORDER BY timestamp_ms DESC
              LIMIT ?1",
@@ -11196,6 +13205,14 @@ fn load_continue_feedback_event_rows_for_target_keys(
                 reason: row.get(12)?,
                 note: row.get(13)?,
                 source: row.get(14)?,
+                provenance: row.get(15)?,
+                task_turn_id: row.get(16)?,
+                session_id: row.get(17)?,
+                branch_context_id: row.get(18)?,
+                applies_from_ms: row.get(19)?,
+                expires_at_ms: row.get(20)?,
+                evidence_ids: parse_string_array(&row.get::<_, String>(21)?),
+                chosen_artifact_stable_key: row.get(22)?,
             })
         })
         .map_err(to_string)?;
@@ -11219,7 +13236,109 @@ fn load_continue_feedback_event_rows_for_target_keys(
     Ok(matched)
 }
 
+fn load_continue_feedback_event_row_by_id(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<FeedbackEventRow>, String> {
+    conn.query_row(
+        "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
+                observed_frame_id, target_artifact_id, chosen_artifact_id,
+                target_artifact_stable_key, resume_work_target_artifact_id,
+                timestamp_ms, confidence, reason, note, source, provenance,
+                task_turn_id, session_id, branch_context_id, applies_from_ms,
+                expires_at_ms, evidence_ids_json, chosen_artifact_stable_key
+         FROM continue_feedback_events WHERE id=?1",
+        params![event_id],
+        |row| {
+            Ok(FeedbackEventRow {
+                id: row.get(0)?,
+                decision_id: row.get(1)?,
+                selected_candidate_id: row.get(2)?,
+                workstream_id: row.get(3)?,
+                event_kind: row.get(4)?,
+                observed_frame_id: row.get(5)?,
+                target_artifact_id: row.get(6)?,
+                chosen_artifact_id: row.get(7)?,
+                target_artifact_stable_key: row.get(8)?,
+                resume_work_target_artifact_id: row.get(9)?,
+                timestamp_ms: row.get(10)?,
+                confidence: row.get(11)?,
+                reason: row.get(12)?,
+                note: row.get(13)?,
+                source: row.get(14)?,
+                provenance: row.get(15)?,
+                task_turn_id: row.get(16)?,
+                session_id: row.get(17)?,
+                branch_context_id: row.get(18)?,
+                applies_from_ms: row.get(19)?,
+                expires_at_ms: row.get(20)?,
+                evidence_ids: parse_string_array(&row.get::<_, String>(21)?),
+                chosen_artifact_stable_key: row.get(22)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+pub(crate) fn audit_feedback_event_against_current_task(
+    conn: &Connection,
+    event_id: &str,
+    now_ms: i64,
+) -> Result<Vec<FeedbackApplicabilityResult>, String> {
+    ensure_continue_schema(conn)?;
+    let Some(row) = load_continue_feedback_event_row_by_id(conn, event_id)? else {
+        return Ok(Vec::new());
+    };
+    let event = feedback_policy_event_from_row(&row);
+    let current_turn = task_turn::selected_current_task_turn(conn)?;
+    let target_artifact_id = event
+        .chosen_artifact_id
+        .clone()
+        .or_else(|| event.target_artifact_id.clone());
+    let stable_key = event
+        .chosen_artifact_stable_key
+        .clone()
+        .or_else(|| event.target_artifact_stable_key.clone());
+    let context = FeedbackApplicabilityContext {
+        decision_id: None,
+        candidate_id: None,
+        target_artifact_id,
+        artifact_stable_key: stable_key,
+        workstream_id: current_turn
+            .as_ref()
+            .and_then(|turn| turn.workstream_id.clone()),
+        task_turn_id: current_turn.as_ref().map(|turn| turn.task_turn_id.clone()),
+        session_id: current_turn
+            .as_ref()
+            .and_then(|turn| turn.session_id.clone()),
+        branch_context_id: None,
+        branch_started_at_ms: current_turn.as_ref().map(|turn| turn.started_at_ms),
+        now_ms,
+        requested_effect: FeedbackEffect::Promote,
+        contradicted_by_current_evidence: false,
+    };
+    let mut results = Vec::new();
+    for target in event
+        .targets
+        .iter()
+        .filter(|target| target.polarity == FeedbackPolarity::Positive)
+    {
+        let result = evaluate_feedback_applicability(&event, target, &context);
+        persist_feedback_policy_evaluation(
+            conn,
+            "current_task_influence",
+            current_turn.as_ref().map(|turn| turn.task_turn_id.as_str()),
+            now_ms,
+            &result,
+        )?;
+        results.push(result);
+    }
+    Ok(results)
+}
+
 fn feedback_event_result_from_row(row: FeedbackEventRow) -> ContinueFeedbackEventResult {
+    let policy_event = feedback_policy_event_from_row(&row);
     ContinueFeedbackEventResult {
         id: row.id,
         decision_id: row.decision_id,
@@ -11234,6 +13353,14 @@ fn feedback_event_result_from_row(row: FeedbackEventRow) -> ContinueFeedbackEven
         reason: row.reason,
         note: row.note,
         source: row.source,
+        provenance: policy_event.provenance.as_str().to_string(),
+        task_turn_id: row.task_turn_id,
+        session_id: row.session_id,
+        branch_context_id: row.branch_context_id,
+        applies_from_ms: policy_event.applies_from_ms,
+        expires_at_ms: policy_event.expires_at_ms,
+        normalized_targets: policy_event.targets,
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
     }
 }
 
@@ -11479,8 +13606,10 @@ fn feedback_aggregate_for_target_keys_at(
         }
         let positive_applies = feedback_positive_applies_to_candidate(&targets, &target_key_set);
         if positive_applies {
-            let weight =
-                feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+            let weight = feedback_positive_weight(
+                &row.event_kind,
+                normalized_provenance_for_feedback_row(&row),
+            );
             if weight > 0 {
                 aggregate.positive_count += 1;
                 aggregate.last_positive_ms = Some(
@@ -11511,8 +13640,10 @@ fn feedback_aggregate_for_target_keys_at(
             let reconfirmed_after_row = aggregate
                 .last_reconfirming_evidence_ms
                 .is_some_and(|last_reconfirming_ms| last_reconfirming_ms > row.timestamp_ms);
-            let weight =
-                feedback_negative_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+            let weight = feedback_negative_weight(
+                &row.event_kind,
+                normalized_provenance_for_feedback_row(&row),
+            );
             if weight <= 0 || reconfirmed_after_row {
                 continue;
             }
@@ -11565,12 +13696,8 @@ fn feedback_aggregate_for_target_keys_at(
     Ok(aggregate)
 }
 
-fn feedback_source_is_explicit(source: &str) -> bool {
-    !matches!(source.trim(), "" | "inferred" | "auto" | "system")
-}
-
-fn feedback_negative_weight(kind: &str, source: &str) -> i32 {
-    let explicit = feedback_source_is_explicit(source);
+fn feedback_negative_weight(kind: &str, provenance: FeedbackProvenance) -> i32 {
+    let explicit = provenance.explicit_user();
     match kind {
         "rejected" | "corrected" | "artifact_only_evidence" => {
             if explicit {
@@ -11598,8 +13725,14 @@ fn feedback_negative_weight(kind: &str, source: &str) -> i32 {
     }
 }
 
-fn feedback_positive_weight(kind: &str, source: &str) -> i32 {
-    let explicit = feedback_source_is_explicit(source);
+fn feedback_positive_weight(kind: &str, provenance: FeedbackProvenance) -> i32 {
+    if matches!(
+        provenance,
+        FeedbackProvenance::Unknown | FeedbackProvenance::SystemMigration
+    ) {
+        return 0;
+    }
+    let explicit = provenance.explicit_user();
     match kind {
         "accepted" | "corrected" => {
             if explicit {
@@ -11656,7 +13789,10 @@ fn find_reconfirming_evidence_after(
         if !feedback_positive_applies_to_candidate(&targets, &target_key_set) {
             continue;
         }
-        let weight = feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or(""));
+        let weight = feedback_positive_weight(
+            &row.event_kind,
+            normalized_provenance_for_feedback_row(&row),
+        );
         if weight <= 0 {
             continue;
         }
@@ -11813,7 +13949,8 @@ fn latest_meaningful_action_reconfirmation_after(
 fn action_kind_is_reconfirming(action_kind: &str, collapse_count: i64) -> bool {
     matches!(
         action_kind,
-        "editing"
+        "investigating"
+            | "editing"
             | "composing"
             | "running_command"
             | "observing_command_output"
@@ -12293,7 +14430,7 @@ fn load_last_meaningful_action(
                 ta.action_kind, ta.action_role, ta.confidence, ta.reason, ta.created_at_ms,
                 ta.collapse_count, ta.first_frame_id, ta.last_frame_id, ta.strongest_frame_id,
                 ta.semantic_delta_kind, ta.semantic_subject, ta.semantic_after_hint,
-                ta.semantic_evidence_quote
+                ta.semantic_evidence_quote, ta.task_turn_id
          FROM continue_workstream_episodes we
          JOIN continue_episode_actions ea ON ea.episode_id = we.episode_id
          JOIN continue_task_actions ta ON ta.id = ea.action_id
@@ -12301,7 +14438,8 @@ fn load_last_meaningful_action(
            AND ta.action_kind IN (
              'editing', 'composing', 'copying_evidence', 'running_command',
              'observing_command_output', 'reviewing_output', 'encountering_error',
-             'returning_to_origin', 'branching_away', 'searching', 'idle_after_progress'
+             'returning_to_origin', 'branching_away', 'searching', 'idle_after_progress',
+             'investigating'
            )
          ORDER BY ta.created_at_ms DESC, CAST(ta.frame_id AS INTEGER) DESC
          LIMIT 1",
@@ -12309,6 +14447,7 @@ fn load_last_meaningful_action(
         |row| {
             Ok(ScorerAction {
                 id: row.get(0)?,
+                task_turn_id: row.get(17)?,
                 frame_id: row.get(1)?,
                 artifact_id: row.get(2)?,
                 secondary_artifact_id: row.get(3)?,
@@ -12654,7 +14793,8 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
     let mut stmt = conn
         .prepare(
             "SELECT id, decision_id, selected_candidate_id, workstream_id, event_kind,
-                    target_artifact_id, chosen_artifact_id, timestamp_ms, confidence, source
+                    target_artifact_id, chosen_artifact_id, timestamp_ms, confidence, source,
+                    provenance
              FROM continue_feedback_events
              ORDER BY timestamp_ms DESC
              LIMIT 300",
@@ -12673,6 +14813,7 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
                 row.get::<_, i64>(7)?,
                 row.get::<_, f64>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })
         .map_err(to_string)?;
@@ -12689,7 +14830,9 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
             timestamp_ms,
             confidence,
             source,
+            stored_provenance,
         ) = row.map_err(to_string)?;
+        let provenance = FeedbackProvenance::parse(stored_provenance.as_deref());
         let Some(memory_type) = (match event_kind.as_str() {
             "accepted" | "inferred_acceptance" => Some("feedback_acceptance"),
             "corrected" | "explicit_correction" => Some("feedback_correction"),
@@ -12705,6 +14848,11 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
         }) else {
             continue;
         };
+        if matches!(memory_type, "feedback_acceptance" | "feedback_correction")
+            && !provenance.explicit_user()
+        {
+            continue;
+        }
         let artifact_id = chosen_artifact_id.as_ref().or(target_artifact_id.as_ref());
         let feedback_score = match memory_type {
             "feedback_acceptance" => 0.55,
@@ -12735,6 +14883,8 @@ fn promote_feedback_memory_cells(conn: &Connection, now_ms: i64) -> Result<usize
             "target_artifact_id": target_artifact_id,
             "chosen_artifact_id": chosen_artifact_id,
             "source": source,
+            "provenance": provenance.as_str(),
+            "feedback_policy_version": FEEDBACK_POLICY_VERSION,
         });
         let id = format!(
             "continue-memory-{}",
@@ -13390,6 +15540,75 @@ fn apply_feedback_ranking_priors_to_candidates(
                 (candidate.feedback_prior_score + structured).clamp(-0.25, 0.25),
             );
         }
+        apply_scoped_feedback_event_prior(conn, candidate)?;
+    }
+    Ok(())
+}
+
+fn apply_scoped_feedback_event_prior(
+    conn: &Connection,
+    candidate: &mut ScoredContinueCandidate,
+) -> Result<(), String> {
+    let target_keys = feedback_targets_for_scored_candidate_from_db(conn, candidate)?;
+    if target_keys.is_empty() {
+        return Ok(());
+    }
+    let current_turn = task_turn::selected_current_task_turn(conn)?;
+    let now_ms = current_time_millis();
+    let target_artifact_id = candidate
+        .target_artifact
+        .as_ref()
+        .map(|artifact| artifact.id.clone());
+    let stable_key = target_artifact_id
+        .as_deref()
+        .map(|artifact_id| load_artifact_stable_key(conn, Some(artifact_id)))
+        .transpose()?
+        .flatten()
+        .as_deref()
+        .and_then(feedback_policy_safe_stable_key);
+    let context = FeedbackApplicabilityContext {
+        decision_id: None,
+        candidate_id: Some(candidate.id.clone()),
+        target_artifact_id,
+        artifact_stable_key: stable_key,
+        workstream_id: Some(candidate.workstream_id.clone()),
+        task_turn_id: current_turn.as_ref().map(|turn| turn.task_turn_id.clone()),
+        session_id: current_turn.and_then(|turn| turn.session_id),
+        branch_context_id: None,
+        branch_started_at_ms: None,
+        now_ms,
+        requested_effect: FeedbackEffect::Rank,
+        contradicted_by_current_evidence: false,
+    };
+    let mut contribution = 0.0_f64;
+    for row in load_continue_feedback_event_rows_for_target_keys(conn, &target_keys, 500)? {
+        let event = feedback_policy_event_from_row(&row);
+        let mut event_contribution = 0.0_f64;
+        for target in event
+            .targets
+            .iter()
+            .filter(|target| target.polarity == FeedbackPolarity::Positive)
+        {
+            let result = evaluate_feedback_applicability(&event, target, &context);
+            persist_feedback_policy_evaluation(
+                conn,
+                "candidate_ranking",
+                Some(candidate.id.as_str()),
+                now_ms,
+                &result,
+            )?;
+            event_contribution = event_contribution.max(result.confidence_contribution);
+        }
+        contribution += event_contribution;
+    }
+    if contribution > 0.0 {
+        candidate.feedback_prior_score = round_signed_score(
+            (candidate.feedback_prior_score + contribution.min(0.20)).clamp(-0.25, 0.25),
+        );
+        push_string_once(
+            &mut candidate.feedback_reason_codes,
+            "feedback:scoped_positive_prior_applied",
+        );
     }
     Ok(())
 }
@@ -15340,7 +17559,8 @@ fn generate_continue_candidates(
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     for workstream in ctx.workstreams {
-        if let Some(open_loop) = best_open_loop_for_workstream(workstream) {
+        let selected_open_loop = best_open_loop_for_workstream(workstream, ctx.current_task_turn);
+        if let Some(open_loop) = selected_open_loop {
             push_candidate_for_open_loop(
                 &mut candidates,
                 &mut seen,
@@ -15348,6 +17568,9 @@ fn generate_continue_candidates(
                 open_loop,
                 latest_episode_id(workstream),
             );
+            if open_loop.boundary_kind == "completed_progress" {
+                continue;
+            }
         }
 
         let primary = primary_artifact_for_workstream(workstream);
@@ -15575,6 +17798,47 @@ fn generate_continue_candidates(
     candidates
 }
 
+fn apply_current_task_candidate_eligibility(
+    candidates: &mut [ScoredContinueCandidate],
+    current_task_turn: Option<&CurrentTaskTurn>,
+) {
+    let Some(current_task_turn) = current_task_turn else {
+        return;
+    };
+    for candidate in candidates {
+        let wrong_workstream = current_task_turn
+            .workstream_id
+            .as_deref()
+            .is_some_and(|workstream_id| candidate.workstream_id != workstream_id);
+        let wrong_action_turn = candidate
+            .last_meaningful_action
+            .as_ref()
+            .and_then(|action| action.task_turn_id.as_deref())
+            .is_some_and(|task_turn_id| task_turn_id != current_task_turn.task_turn_id);
+        let ineligible_loop = candidate.open_loop.as_ref().is_some_and(|open_loop| {
+            !evaluate_open_loop_eligibility(open_loop, &candidate.workstream_id, current_task_turn)
+                .eligible_for_primary
+        });
+        if wrong_workstream || wrong_action_turn || ineligible_loop {
+            candidate.eligible_for_primary_selection = false;
+            candidate.selection_demotion_reason = Some(
+                if wrong_workstream {
+                    "semantic_center:workstream_not_owned_by_current_task"
+                } else if wrong_action_turn {
+                    "semantic_center:action_owned_by_prior_task_turn"
+                } else {
+                    "semantic_center:open_loop_ineligible_for_current_task"
+                }
+                .to_string(),
+            );
+            push_string_once(
+                &mut candidate.risk_flags,
+                "semantic_center:not_current_task_authority",
+            );
+        }
+    }
+}
+
 fn generate_active_current_work_candidate(
     ctx: &CandidateGenerationContext<'_>,
     existing_candidates: &[ScoredContinueCandidate],
@@ -15664,6 +17928,63 @@ fn generate_active_current_work_candidate(
     Some(candidate)
 }
 
+fn generate_current_activity_candidate(
+    work_truth: &ContinueWorkTruth,
+    workstreams: &[ScorerWorkstream],
+    existing_candidates: &[ScoredContinueCandidate],
+    current_focus: Option<&ContinueFocusSummary>,
+) -> Option<ScoredContinueCandidate> {
+    if !work_truth.supports_direct_target() {
+        return None;
+    }
+    let artifact_id = work_truth.artifact_id.as_deref()?;
+    if existing_candidates.iter().any(|candidate| {
+        candidate.candidate_kind == "continue_current_activity"
+            && candidate
+                .target_artifact
+                .as_ref()
+                .is_some_and(|artifact| artifact.id == artifact_id)
+    }) {
+        return None;
+    }
+    let (workstream, target) = workstreams.iter().find_map(|workstream| {
+        artifact_by_id(workstream, artifact_id).map(|artifact| (workstream, artifact))
+    })?;
+    let last_action = workstream.last_meaningful_action.clone().filter(|action| {
+        action.artifact_id.as_deref() == Some(artifact_id)
+            || action.secondary_artifact_id.as_deref() == Some(artifact_id)
+    });
+    let mut candidate = build_scored_candidate(
+        workstream,
+        Some(target.clone()),
+        Some(target.clone()),
+        "continue_current_activity",
+        last_action,
+        latest_episode_id(workstream),
+        "general_activity_truth_current_surface",
+        None,
+    );
+    candidate.evidence_frame_id = current_focus
+        .map(|focus| focus.frame_id.clone())
+        .or(candidate.evidence_frame_id);
+    candidate.activity_intent = Some(work_truth.activity_kind.clone());
+    candidate.continuation_role = Some("resume_target".to_string());
+    candidate.task_phase = Some("in_progress".to_string());
+    candidate.evidence_sufficiency_score = work_truth.confidence.max(0.55);
+    candidate.objective_relation_score = work_truth.confidence.max(0.55);
+    candidate.interaction_depth_score = work_truth.confidence.max(0.55);
+    candidate.work_value_score = work_truth.confidence.max(0.62);
+    candidate.resume_likelihood_score = work_truth.confidence.max(0.68);
+    candidate.eligible_for_primary_selection = true;
+    candidate.selection_demotion_reason = None;
+    candidate.why_not_primary = None;
+    push_string_once(
+        &mut candidate.warnings,
+        "work_truth:direct_activity_authority",
+    );
+    Some(candidate)
+}
+
 fn active_current_work_has_meaningful_signal(fact: &ActiveCurrentWorkUnresolved) -> bool {
     !fact.task_action_ids.is_empty()
         || fact.activity_hint.as_deref().is_some_and(|hint| {
@@ -15684,6 +18005,7 @@ fn apply_app_activity_to_candidates(
     app_activity: &ContinueAppActivityIntelligence,
 ) {
     for candidate in candidates {
+        let completed_progress = candidate_is_completed_progress(candidate);
         let classification =
             match_activity_classification_for_candidate(candidate, &app_activity.classifications);
         if let Some(classification) = classification {
@@ -15706,7 +18028,9 @@ fn apply_app_activity_to_candidates(
             for missing in &classification.missing_evidence {
                 push_string_once(&mut candidate.missing_evidence, missing);
             }
-            if !activity_role_can_be_primary(&classification.continuation_role) {
+            if !completed_progress
+                && !activity_role_can_be_primary(&classification.continuation_role)
+            {
                 candidate.eligible_for_primary_selection = false;
                 candidate.selection_demotion_reason = classification
                     .why_not_primary
@@ -15729,6 +18053,10 @@ fn apply_app_activity_to_candidates(
             }
         } else {
             apply_fallback_activity_labels_to_candidate(candidate);
+        }
+        if completed_progress && candidate.eligible_for_primary_selection {
+            candidate.continuation_role = Some("resume_target".to_string());
+            candidate.why_not_primary = None;
         }
     }
 }
@@ -15926,7 +18254,7 @@ fn select_local_candidate_after_activity(
         .iter()
         .find(|candidate| {
             !activity_role_is_suppressed(candidate.continuation_role.as_deref())
-                && candidate_available_after_feedback_gate(candidate)
+                && candidate_primary_eligible_after_feedback_gate(candidate)
         })
         .cloned()
         .or_else(|| {
@@ -15935,7 +18263,7 @@ fn select_local_candidate_after_activity(
             } else {
                 candidates
                     .iter()
-                    .find(|candidate| candidate_available_after_feedback_gate(candidate))
+                    .find(|candidate| candidate_primary_eligible_after_feedback_gate(candidate))
                     .cloned()
             }
         })
@@ -16113,16 +18441,64 @@ fn build_scored_candidate(
     }
 }
 
-fn best_open_loop_for_workstream(workstream: &ScorerWorkstream) -> Option<&ScorerOpenLoop> {
-    workstream.open_loops.iter().max_by(|left, right| {
-        open_loop_quality_rank(&left.quality)
-            .cmp(&open_loop_quality_rank(&right.quality))
-            .then_with(|| {
-                left.confidence
-                    .partial_cmp(&right.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| left.last_updated_at_ms.cmp(&right.last_updated_at_ms))
+fn best_open_loop_for_workstream<'a>(
+    workstream: &'a ScorerWorkstream,
+    current_task_turn: Option<&CurrentTaskTurn>,
+) -> Option<&'a ScorerOpenLoop> {
+    workstream
+        .open_loops
+        .iter()
+        .filter(|open_loop| {
+            let Some(current_task_turn) = current_task_turn else {
+                return open_loop.eligible_for_primary || open_loop.eligible_for_objective;
+            };
+            if current_task_turn.latest_user_goal_summary.is_none() {
+                return open_loop.eligible_for_primary || open_loop.eligible_for_objective;
+            }
+            evaluate_open_loop_eligibility(open_loop, &workstream.id, current_task_turn)
+                .eligible_for_primary
+        })
+        .max_by(|left, right| {
+            open_loop_quality_rank(&left.quality)
+                .cmp(&open_loop_quality_rank(&right.quality))
+                .then_with(|| {
+                    left.confidence
+                        .partial_cmp(&right.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.last_updated_at_ms.cmp(&right.last_updated_at_ms))
+        })
+}
+
+fn evaluate_open_loop_eligibility(
+    open_loop: &ScorerOpenLoop,
+    workstream_id: &str,
+    current_task_turn: &CurrentTaskTurn,
+) -> semantic_consistency::SemanticEligibilityDecision {
+    evaluate_semantic_eligibility(&SemanticEligibilityInput {
+        entity_kind: "open_loop".to_string(),
+        entity_id: open_loop.id.clone(),
+        current_task_turn_id: Some(current_task_turn.task_turn_id.clone()),
+        current_workstream_id: current_task_turn.workstream_id.clone(),
+        owner_task_turn_id: open_loop.task_turn_id.clone(),
+        owner_workstream_id: Some(workstream_id.to_string()),
+        parent_task_turn_id: open_loop.parent_task_turn_id.clone(),
+        origin_task_turn_id: open_loop.origin_task_turn_id.clone(),
+        relation_hint: match open_loop.relation_to_current_task.as_str() {
+            "child_support" => Some(RelationToCurrentTask::ChildSupport),
+            "detour" => Some(RelationToCurrentTask::Detour),
+            "interruption" => Some(RelationToCurrentTask::Interruption),
+            "returned_support" => Some(RelationToCurrentTask::ReturnedSupport),
+            _ => None,
+        },
+        lifecycle_state: Some(open_loop.state.clone()),
+        current_task_started_at_ms: Some(current_task_turn.started_at_ms),
+        entity_updated_at_ms: Some(open_loop.last_updated_at_ms),
+        supporting_evidence_ids: open_loop
+            .evidence_spans
+            .iter()
+            .map(|span| span.evidence_id.clone())
+            .collect(),
     })
 }
 
@@ -16143,12 +18519,19 @@ fn push_candidate_for_open_loop(
     open_loop: &ScorerOpenLoop,
     supporting_episode_id: Option<String>,
 ) {
-    let target_id = open_loop
-        .primary_return_artifact_id
-        .as_deref()
-        .or(open_loop.resume_work_artifact_id.as_deref())
-        .or(open_loop.blocker_artifact_id.as_deref())
-        .or(open_loop.current_focus_artifact_id.as_deref());
+    let target_id = if open_loop.boundary_kind == "completed_progress" {
+        open_loop
+            .resume_work_artifact_id
+            .as_deref()
+            .or(open_loop.primary_return_artifact_id.as_deref())
+    } else {
+        open_loop
+            .primary_return_artifact_id
+            .as_deref()
+            .or(open_loop.resume_work_artifact_id.as_deref())
+            .or(open_loop.blocker_artifact_id.as_deref())
+            .or(open_loop.current_focus_artifact_id.as_deref())
+    };
     let target = target_id.and_then(|artifact_id| artifact_by_id(workstream, artifact_id));
     let resume_work_target = open_loop
         .resume_work_artifact_id
@@ -16276,8 +18659,6 @@ fn apply_candidate_risk_caps(
 ) {
     candidate.risk_flags.clear();
     candidate.score_caps_applied.clear();
-    candidate.eligible_for_primary_selection = true;
-    candidate.selection_demotion_reason = None;
 
     if candidate.candidate_kind == "evidence_only" {
         cap_candidate_score(candidate, 0.42, "evidence_only_candidate");
@@ -17508,6 +19889,7 @@ fn candidate_kind_for_action(
             ("verify_output", "last_meaningful_output_review")
         }
         "searching" => ("finish_search", "last_meaningful_search"),
+        "investigating" => ("resume_chat_reasoning", "active_agent_investigation"),
         "branching_away" => (
             "return_to_primary_artifact",
             "last_meaningful_support_branch",
@@ -20359,6 +22741,11 @@ fn insert_feedback_event(
     let workstream_id = candidate_workstream_id.or(decision_context.workstream_id.clone());
     let target_artifact_stable_key =
         load_artifact_stable_key(conn, resolved_target_artifact_id.as_deref())?;
+    let chosen_artifact_stable_key = load_artifact_stable_key(conn, chosen_artifact_id)?;
+    let branch_context_id = load_feedback_branch_context_id(
+        conn,
+        chosen_artifact_id.or(resolved_target_artifact_id.as_deref()),
+    )?;
     let resume_work_target_artifact_id = None::<String>;
     let source = match source_override {
         Some("island_primary") => "island_primary".to_string(),
@@ -20368,6 +22755,8 @@ fn insert_feedback_event(
         Some("diagnostics") => "diagnostics".to_string(),
         _ => "inferred".to_string(),
     };
+    let provenance = provenance_for_inferred_kind(event_kind);
+    let expires_at_ms = default_expiry_ms(provenance, timestamp_ms);
     let row = FeedbackEventRow {
         id: id.clone(),
         decision_id: Some(decision_id.to_string()),
@@ -20378,14 +22767,28 @@ fn insert_feedback_event(
         target_artifact_id: resolved_target_artifact_id.clone(),
         chosen_artifact_id: chosen_artifact_id.map(str::to_string),
         target_artifact_stable_key: target_artifact_stable_key.clone(),
+        chosen_artifact_stable_key: chosen_artifact_stable_key.clone(),
         resume_work_target_artifact_id: resume_work_target_artifact_id.clone(),
         timestamp_ms,
         confidence: round_score(confidence),
         reason: Some(reason.to_string()),
         note: None,
         source: Some(source.clone()),
+        provenance: Some(provenance.as_str().to_string()),
+        task_turn_id: decision_context.task_turn_id.clone(),
+        session_id: decision_context.session_id.clone(),
+        branch_context_id: branch_context_id.clone(),
+        applies_from_ms: Some(timestamp_ms),
+        expires_at_ms,
+        evidence_ids: observed_frame_id
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
     };
     let feedback_target_keys_json = feedback_event_target_keys_json(&row)?;
+    let policy_event = feedback_policy_event_from_row(&row);
+    let normalized_targets_json =
+        serde_json::to_string(&policy_event.targets).map_err(to_string)?;
+    let evidence_ids_json = serde_json::to_string(&row.evidence_ids).map_err(to_string)?;
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO continue_feedback_events (
@@ -20393,9 +22796,13 @@ fn insert_feedback_event(
             chosen_artifact_id, timestamp_ms, confidence, reason,
             selected_candidate_id, workstream_id, note, source,
             target_artifact_stable_key, resume_work_target_artifact_id,
-            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal
+            feedback_target_keys_json, is_positive_reconfirmation, is_negative_signal,
+            provenance, task_turn_id, session_id, branch_context_id, applies_from_ms,
+            expires_at_ms, feedback_policy_version, migration_policy_version,
+            evidence_ids_json, normalized_targets_json, chosen_artifact_stable_key
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   ?14, ?15, ?16, ?17, ?18)",
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                   ?25, ?26, ?27, ?28, ?29)",
             params![
                 id,
                 decision_id,
@@ -20408,16 +22815,28 @@ fn insert_feedback_event(
                 reason,
                 selected_candidate_id,
                 workstream_id,
-                Option::<String>::None,
+                branch_context_id,
                 source,
                 target_artifact_stable_key,
                 resume_work_target_artifact_id,
                 feedback_target_keys_json,
                 feedback_event_is_positive_reconfirmation(event_kind) as i64,
                 feedback_event_is_negative_signal(event_kind) as i64,
+                provenance.as_str(),
+                decision_context.task_turn_id,
+                decision_context.session_id,
+                Option::<String>::None,
+                timestamp_ms,
+                expires_at_ms,
+                FEEDBACK_POLICY_VERSION,
+                FEEDBACK_MIGRATION_POLICY_VERSION,
+                evidence_ids_json,
+                normalized_targets_json,
+                chosen_artifact_stable_key,
             ],
         )
         .map_err(to_string)?;
+    let normalized_targets = policy_event.targets;
     let result = ContinueFeedbackEventResult {
         id: row.id,
         decision_id: row.decision_id,
@@ -20432,8 +22851,16 @@ fn insert_feedback_event(
         reason: Some(reason.to_string()),
         note: None,
         source: row.source,
+        provenance: provenance.as_str().to_string(),
+        task_turn_id: row.task_turn_id,
+        session_id: row.session_id,
+        branch_context_id: row.branch_context_id,
+        applies_from_ms: timestamp_ms,
+        expires_at_ms,
+        normalized_targets,
+        feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
     };
-    if inserted > 0 {
+    if inserted > 0 && provenance.explicit_user() {
         update_continue_ranking_priors_from_feedback(conn, &result)?;
     }
     Ok(result)
@@ -24241,6 +26668,288 @@ fn current_activity_summary(
     Some(format!("{} {}", activity, surface))
 }
 
+fn derive_continue_work_truth(
+    current_task_turn: Option<&CurrentTaskTurn>,
+    task_supported: bool,
+    current_focus: Option<&ContinueFocusSummary>,
+    current_surface: &ResolvedCurrentSurface,
+    app_activity: &ContinueAppActivityIntelligence,
+    now_ms: i64,
+) -> ContinueWorkTruth {
+    if task_supported {
+        if let Some(turn) = current_task_turn {
+            let summary = first_non_empty([
+                turn.latest_user_goal_summary.as_deref(),
+                turn.task_object.as_deref(),
+            ])
+            .and_then(|value| clean_user_handoff_line(value.to_string(), 220));
+            let mut evidence_ids = turn.latest_user_span_ids.clone();
+            for id in &turn.supporting_event_ids {
+                push_string_once(&mut evidence_ids, id);
+            }
+            return ContinueWorkTruth {
+                schema: CONTINUE_WORK_TRUTH_SCHEMA.to_string(),
+                policy_version: CONTINUE_WORK_TRUTH_POLICY_VERSION.to_string(),
+                resolution_status: "task_supported".to_string(),
+                activity_kind: work_truth_activity_kind(
+                    current_focus,
+                    app_activity,
+                    current_surface.artifact_id.as_deref(),
+                ),
+                activity_summary: summary,
+                work_object: turn.task_object.clone(),
+                where_summary: current_focus.and_then(work_truth_where_summary),
+                app_name: current_focus.and_then(|focus| focus.app_name.clone()),
+                artifact_id: current_focus
+                    .and_then(|focus| focus.artifact_id.clone())
+                    .or_else(|| turn.artifact_id.clone()),
+                observed_at_ms: turn.last_observed_at_ms,
+                confidence: round_score(turn.goal_confidence),
+                evidence_ids,
+                source: "local_task_turn_evidence".to_string(),
+                broader_goal_known: true,
+                primary_relation: "primary".to_string(),
+                reason_codes: vec!["eligible_current_user_goal_evidence".to_string()],
+            };
+        }
+    }
+
+    let Some(focus) = current_focus else {
+        return ContinueWorkTruth::unresolved(now_ms, "current_surface_missing");
+    };
+    if current_surface.is_self_surface
+        || current_surface.is_generated_debug_surface
+        || is_smalltalk_self_surface(
+            current_surface.app_name.as_deref(),
+            current_surface.bundle_id.as_deref(),
+            current_surface.window_title.as_deref(),
+            current_surface.browser_url.as_deref(),
+            current_surface.document_path.as_deref(),
+        )
+        || now_ms.saturating_sub(current_surface.observed_at_ms) > CURRENT_FOCUS_RECENT_WINDOW_MS
+    {
+        return ContinueWorkTruth::unresolved(now_ms, "current_surface_ineligible");
+    }
+
+    let classification = activity_classification_for_current_surface(current_surface, app_activity);
+    let segment = classification.and_then(|classification| {
+        app_activity
+            .segments
+            .iter()
+            .find(|segment| segment.id == classification.segment_id)
+    });
+    let activity_kind = work_truth_activity_kind(
+        Some(focus),
+        app_activity,
+        current_surface.artifact_id.as_deref(),
+    );
+    let direct_activity = matches!(
+        activity_kind.as_str(),
+        "editing" | "composing" | "running_command" | "reviewing_output" | "messaging"
+    );
+    let stable_observation = segment.is_some_and(|segment| {
+        segment.features.duration_ms >= 60_000
+            && segment.features.frame_count >= 2
+            && segment.features.event_count > 0
+    });
+    let meaningful_actions = segment
+        .map(|segment| {
+            segment.features.editing_action_count
+                + segment.features.composing_action_count
+                + segment.features.running_command_count
+                + segment.features.reading_action_count
+                + segment.features.navigating_action_count
+                + segment.features.click_count
+                + segment.features.scroll_count
+        })
+        .unwrap_or_default();
+    let sustained_observation = segment.is_some_and(|segment| {
+        segment.features.duration_ms >= SUSTAINED_BRANCH_MIN_MS
+            && meaningful_actions >= SUSTAINED_BRANCH_MIN_ACTIONS
+    });
+    let another_primary_exists = classification.is_some_and(|current| {
+        app_activity.classifications.iter().any(|candidate| {
+            candidate.id != current.id
+                && activity_role_can_be_primary(&candidate.continuation_role)
+                && candidate.work_value_score >= 0.55
+                && candidate.updated_at_ms >= current.updated_at_ms.saturating_sub(45 * 60 * 1000)
+        })
+    });
+    let classified_relation = classification
+        .map(
+            |classification| match classification.continuation_role.as_str() {
+                "resume_target" | "resume_target_if_unfinished" => "primary",
+                "support_context" => "support",
+                "divergence" | "interruption" | "background_consumption" => "detour",
+                _ => "recent_only",
+            },
+        )
+        .unwrap_or("recent_only");
+    let primary = direct_activity
+        || classified_relation == "primary"
+        || sustained_observation
+        || (stable_observation && !another_primary_exists);
+    let primary_relation = if primary {
+        "primary"
+    } else {
+        classified_relation
+    };
+    let work_object = work_truth_object_label(focus);
+    let activity_summary = work_object.as_deref().and_then(|label| {
+        let verb = match activity_kind.as_str() {
+            "editing" => "Editing",
+            "composing" => "Composing in",
+            "browsing" => "Browsing",
+            "searching" => "Searching in",
+            "running_command" => "Running a command in",
+            "reviewing_output" => "Reviewing output in",
+            "file_browsing" => "Browsing files in",
+            "messaging" => "Writing in",
+            _ => "Viewing",
+        };
+        clean_user_handoff_line(format!("{verb} {label}"), 220)
+    });
+    if activity_summary.is_none() {
+        return ContinueWorkTruth::unresolved(now_ms, "activity_object_missing");
+    }
+    let evidence_quality: f64 = match focus.evidence_quality.as_deref() {
+        Some("strong") => 0.88,
+        Some("medium") => 0.68,
+        _ => 0.45,
+    };
+    let classification_confidence = classification
+        .map(|classification| {
+            classification
+                .evidence_sufficiency_score
+                .max(classification.interaction_depth_score)
+        })
+        .unwrap_or(if direct_activity { 0.68 } else { 0.48 });
+    let mut evidence_ids = current_surface.evidence_ids.clone();
+    push_string_once(&mut evidence_ids, &focus.frame_id);
+    let mut reason_codes = vec![if primary {
+        "direct_activity_supported"
+    } else {
+        "recent_activity_not_primary"
+    }
+    .to_string()];
+    if direct_activity {
+        push_string_once(&mut reason_codes, "direct_production_action");
+    }
+    if stable_observation {
+        push_string_once(&mut reason_codes, "stable_observation");
+    }
+    if sustained_observation {
+        push_string_once(&mut reason_codes, "sustained_activity_promoted");
+    }
+    ContinueWorkTruth {
+        schema: CONTINUE_WORK_TRUTH_SCHEMA.to_string(),
+        policy_version: CONTINUE_WORK_TRUTH_POLICY_VERSION.to_string(),
+        resolution_status: if primary {
+            "activity_supported"
+        } else {
+            "recent_activity_only"
+        }
+        .to_string(),
+        activity_kind,
+        activity_summary,
+        work_object,
+        where_summary: work_truth_where_summary(focus),
+        app_name: focus.app_name.clone(),
+        artifact_id: focus
+            .artifact_id
+            .clone()
+            .or_else(|| current_surface.artifact_id.clone()),
+        observed_at_ms: current_surface.observed_at_ms,
+        confidence: round_score(
+            evidence_quality
+                .min(focus.identity_confidence.unwrap_or(evidence_quality))
+                .min(classification_confidence.max(if direct_activity { 0.62 } else { 0.45 })),
+        ),
+        evidence_ids,
+        source: "local_direct_activity".to_string(),
+        broader_goal_known: false,
+        primary_relation: primary_relation.to_string(),
+        reason_codes,
+    }
+}
+
+fn work_truth_activity_kind(
+    current_focus: Option<&ContinueFocusSummary>,
+    app_activity: &ContinueAppActivityIntelligence,
+    artifact_id: Option<&str>,
+) -> String {
+    let state = current_focus
+        .and_then(|focus| {
+            focus
+                .activity_state
+                .as_deref()
+                .or(focus.task_state.as_deref())
+        })
+        .unwrap_or_default();
+    let from_state = match state {
+        "actively_editing" | "editing_file" => Some("editing"),
+        "composing_prompt" | "composing" => Some("composing"),
+        "running_command" | "command_running" => Some("running_command"),
+        "observing_output" | "command_completed" | "reviewing_diff" => Some("reviewing_output"),
+        "reading" => Some("viewing"),
+        _ => None,
+    };
+    if let Some(kind) = from_state {
+        return kind.to_string();
+    }
+    let intent = artifact_id
+        .and_then(|artifact_id| {
+            app_activity
+                .classifications
+                .iter()
+                .find(|classification| classification.artifact_id.as_deref() == Some(artifact_id))
+        })
+        .or_else(|| app_activity.classifications.first())
+        .map(|classification| classification.activity_intent.as_str())
+        .unwrap_or_default();
+    match intent {
+        "editing" | "editing_code" | "implementing" | "filling_form" => "editing",
+        "composing" => "composing",
+        "searching_reference" => "searching",
+        "running_command" | "running_tests" => "running_command",
+        "reviewing_output" | "observing_command_output" => "reviewing_output",
+        "file_browsing" => "file_browsing",
+        "replying_message" | "chat_reasoning" => "messaging",
+        "reading_docs" | "social_browsing" | "media_consumption" => "browsing",
+        _ => current_focus
+            .and_then(|focus| focus.browser_url.as_ref())
+            .map(|_| "browsing")
+            .unwrap_or("viewing"),
+    }
+    .to_string()
+}
+
+fn work_truth_object_label(focus: &ContinueFocusSummary) -> Option<String> {
+    let raw = first_non_empty([
+        focus.display_title.as_deref(),
+        focus.title.as_deref(),
+        focus
+            .document_path
+            .as_deref()
+            .and_then(|path| Path::new(path).file_name().and_then(|value| value.to_str())),
+        focus.window_title.as_deref(),
+        focus.app_name.as_deref(),
+    ])?;
+    clean_user_handoff_line(raw.to_string(), 160)
+}
+
+fn work_truth_where_summary(focus: &ContinueFocusSummary) -> Option<String> {
+    let object = work_truth_object_label(focus);
+    match (object, focus.app_name.as_deref()) {
+        (Some(object), Some(app)) if !object.eq_ignore_ascii_case(app) => {
+            clean_user_handoff_line(format!("{object} in {app}"), 180)
+        }
+        (Some(object), _) => Some(object),
+        (None, Some(app)) => clean_user_handoff_line(app.to_string(), 120),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compose_continue_handoff(
     current_focus: Option<&ContinueFocusSummary>,
@@ -24786,9 +27495,26 @@ fn visible_missing_evidence_line(
     clean_handoff_line(format!("Missing or weak evidence: {}", first), 180)
 }
 
-fn workstream_summary(workstream: &ScorerWorkstream) -> ContinueSelectedWorkstream {
+fn workstream_summary(
+    workstream: &ScorerWorkstream,
+    current_task_turn: Option<&CurrentTaskTurn>,
+) -> ContinueSelectedWorkstream {
+    let selected_by_task_turn_id = current_task_turn
+        .filter(|turn| turn.workstream_id.as_deref() == Some(workstream.id.as_str()))
+        .map(|turn| turn.task_turn_id.clone());
     ContinueSelectedWorkstream {
         workstream_id: workstream.id.clone(),
+        relation_to_current_task: if selected_by_task_turn_id.is_some() {
+            "same_task".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        selection_reason_codes: if selected_by_task_turn_id.is_some() {
+            vec!["current_task_turn_justifies_selection".to_string()]
+        } else {
+            vec!["candidate_fallback_selection".to_string()]
+        },
+        selected_by_task_turn_id,
         state: workstream.state.clone(),
         title_candidate: workstream.title_candidate.clone(),
         primary_artifact_id: workstream.primary_artifact_id.clone(),
@@ -24959,6 +27685,8 @@ fn candidate_exposes_public_return_target(
     ) && candidate.eligible_for_primary_selection
         && !activity_role_is_suppressed(candidate.continuation_role.as_deref())
         && candidate_branch_public_return_gate(candidate)
+        && candidate_public_target_artifact(candidate)
+            .is_some_and(candidate_target_is_directly_openable)
         && candidate_has_human_return_target(candidate)
 }
 
@@ -25322,6 +28050,7 @@ fn event_rows_to_evidence_frames(
             background_text: None,
             full_text_quality: None,
             text_quality_flags: Vec::new(),
+            structured_semantic_text: None,
             content_hash: Some(content_hash),
             image_hash: None,
             privacy_status: None,
@@ -25445,6 +28174,7 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         background_text: None,
         full_text_quality: None,
         text_quality_flags: Vec::new(),
+        structured_semantic_text: None,
         content_hash: row.get(9)?,
         image_hash: row.get(10)?,
         privacy_status: row.get(11)?,
@@ -26088,7 +28818,18 @@ fn clear_second_layer_rows_for_frames(
     if frame_ids.is_empty() {
         return Ok(());
     }
+    task_turn::clear_task_turns_for_frames(conn, frame_ids)?;
     for frame_id in frame_ids {
+        conn.execute(
+            "DELETE FROM continue_salient_turn_evidence WHERE frame_id = ?1",
+            params![frame_id],
+        )
+        .map_err(to_string)?;
+        conn.execute(
+            "DELETE FROM continue_ordered_evidence_spans WHERE frame_id = ?1",
+            params![frame_id],
+        )
+        .map_err(to_string)?;
         let action_ids = {
             let mut stmt = conn
                 .prepare("SELECT id FROM continue_task_actions WHERE frame_id = ?1")
@@ -26132,6 +28873,24 @@ fn clear_second_layer_rows_for_frames(
 }
 
 fn clear_third_layer_rows(conn: &Connection) -> Result<(), String> {
+    if table_exists(conn, "continue_open_loop_lifecycle_events")?
+        && table_exists(conn, "continue_open_loops")?
+    {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO continue_open_loop_lifecycle_events (
+               id, open_loop_id, workstream_id, task_turn_id, previous_state, state,
+               boundary_kind, transition_reason, ownership_revision, evidence_ids_json,
+               observed_at_ms, created_at_ms
+             )
+             SELECT 'loop-history:' || id || ':' || ownership_revision || ':' || state,
+                    id, workstream_id, task_turn_id, NULL, state, boundary_kind,
+                    'third_layer_projection_archive', ownership_revision,
+                    evidence_spans_json, last_updated_at_ms,
+                    CAST(strftime('%s','now') AS INTEGER) * 1000
+             FROM continue_open_loops;",
+        )
+        .map_err(to_string)?;
+    }
     conn.execute_batch(
         "
         DELETE FROM continue_candidates;
@@ -26143,6 +28902,7 @@ fn clear_third_layer_rows(conn: &Connection) -> Result<(), String> {
         DELETE FROM continue_open_loops;
         DELETE FROM continue_workstream_artifacts;
         DELETE FROM continue_workstream_episodes;
+        DELETE FROM continue_task_turn_workstream_memberships;
         DELETE FROM continue_workstreams;
         DELETE FROM continue_episode_artifacts;
         DELETE FROM continue_episode_actions;
@@ -26184,7 +28944,8 @@ fn load_continue_action_records(
                    a.id, a.artifact_kind, a.stable_key, a.app_name, a.display_title,
                    a.browser_url, a.document_path, a.evidence_quality,
                    sa.id, sa.artifact_kind, sa.stable_key, sa.app_name, sa.display_title,
-                   sa.browser_url, sa.document_path, sa.evidence_quality
+                   sa.browser_url, sa.document_path, sa.evidence_quality,
+                   ta.task_turn_id
             FROM continue_task_actions ta
             LEFT JOIN continue_artifacts a ON a.id = ta.artifact_id
             LEFT JOIN continue_artifacts sa ON sa.id = ta.secondary_artifact_id
@@ -26213,6 +28974,7 @@ fn load_continue_action_records(
                 let secondary_artifact = artifact_record_from_row(row, 32)?;
                 Ok(ContinueActionRecord {
                     id: row.get(0)?,
+                    task_turn_id: row.get(40)?,
                     frame_id: row.get(1)?,
                     previous_frame_id: row.get(2)?,
                     artifact_id: row.get(3)?,
@@ -27216,6 +29978,7 @@ fn event_backed_task_action_for_group(
     );
     Some(ExtractedTaskAction {
         id,
+        task_turn_id: None,
         frame_id: frame_id.clone(),
         previous_frame_id: None,
         artifact_id: Some(group.artifact.id.clone()),
@@ -27262,6 +30025,7 @@ fn event_backed_task_action_for_group(
         quality_flags: vec![
             "event_backed_only".to_string(),
             "not_openable_without_url_or_path".to_string(),
+            "task_turn_unknown_event_only".to_string(),
         ],
         branch_kind: Some("current_focus_only".to_string()),
         branch_action_role: Some("unknown".to_string()),
@@ -28017,6 +30781,7 @@ fn extract_task_actions(
     frames: &[EvidenceFrame],
     artifacts: &HashMap<String, ResolvedArtifact>,
     semantic_moment_by_frame: &HashMap<String, String>,
+    task_turn_scopes: &HashMap<String, task_turn::TaskTurnScope>,
 ) -> Vec<ExtractedTaskAction> {
     let mut actions = Vec::with_capacity(frames.len());
     let mut recent_primary = VecDeque::<String>::new();
@@ -28029,6 +30794,7 @@ fn extract_task_actions(
         };
         let previous_frame = index.checked_sub(1).and_then(|idx| frames.get(idx));
         let previous_artifact = previous_frame.and_then(|prev| artifacts.get(&prev.id));
+        let task_turn_scope = task_turn_scopes.get(&frame.id);
         let mut extracted = classify_task_action(
             frame,
             previous_frame,
@@ -28036,8 +30802,11 @@ fn extract_task_actions(
             previous_artifact,
             &recent_primary,
             last_meaningful.as_ref(),
+            task_turn_scope,
         );
-        if let Some(delta) = derive_semantic_delta(frame, previous_frame, artifact, &extracted) {
+        if let Some(delta) =
+            derive_semantic_delta(frame, previous_frame, artifact, &extracted, task_turn_scope)
+        {
             extracted.semantic_delta_kind = Some(delta.kind);
             extracted.semantic_subject = delta.subject;
             extracted.semantic_before_hint = delta.before_hint;
@@ -28145,7 +30914,10 @@ fn repeated_task_action(previous: &ExtractedTaskAction, next: &ExtractedTaskActi
     ) {
         return false;
     }
-    if previous.action_kind != next.action_kind
+    if previous.task_turn_id.is_none()
+        || next.task_turn_id.is_none()
+        || previous.task_turn_id != next.task_turn_id
+        || previous.action_kind != next.action_kind
         || previous.artifact_id != next.artifact_id
         || previous.secondary_artifact_id != next.secondary_artifact_id
     {
@@ -28183,7 +30955,8 @@ fn semantic_base_reason(reason: &str) -> String {
 
 fn semantic_action_id(action: &ExtractedTaskAction) -> String {
     let id_seed = format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
+        action.task_turn_id.as_deref().unwrap_or(""),
         action.previous_frame_id.as_deref().unwrap_or(""),
         action
             .first_frame_id
@@ -28546,7 +31319,7 @@ fn is_tool_or_agent_output_context(input: &BranchClassificationInput<'_>) -> boo
     ) {
         return false;
     }
-    if matches!(input.action_kind, "editing" | "composing") {
+    if matches!(input.action_kind, "investigating" | "editing" | "composing") {
         return false;
     }
     contains_any(
@@ -28597,7 +31370,25 @@ fn classify_error_context(
     frame: &EvidenceFrame,
     artifact: &ResolvedArtifact,
 ) -> ErrorClassification {
+    classify_error_context_with_scope(frame, artifact, None)
+}
+
+fn classify_error_context_with_scope(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+    task_turn_scope: Option<&task_turn::TaskTurnScope>,
+) -> ErrorClassification {
     let mut spans = attributed_evidence_spans_for_frame(frame, artifact);
+    if let Some(scope) = task_turn_scope.filter(|scope| scope.typed_boundary_confident) {
+        let scoped = spans
+            .iter()
+            .filter(|span| scope.current_source_record_ids.contains(&span.source_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !scoped.is_empty() {
+            spans = scoped;
+        }
+    }
     if spans.is_empty() {
         spans.push(frame_full_text_fallback_span(frame, artifact));
     }
@@ -29161,6 +31952,7 @@ fn classify_task_action(
     previous_artifact: Option<&ResolvedArtifact>,
     recent_primary: &VecDeque<String>,
     last_meaningful: Option<&(String, String)>,
+    task_turn_scope: Option<&task_turn::TaskTurnScope>,
 ) -> ExtractedTaskAction {
     let previous_artifact_id = previous_artifact.map(|artifact| artifact.id.clone());
     let switched_artifact = previous_artifact
@@ -29176,9 +31968,20 @@ fn classify_task_action(
         .transition
         .as_ref()
         .and_then(|transition| transition.transition_type.clone());
-    let error_classification = classify_error_context(frame, artifact);
+    let error_classification = classify_error_context_with_scope(frame, artifact, task_turn_scope);
 
-    let (kind, role, confidence, reason) = if has_clipboard_transfer(frame) {
+    let (kind, role, confidence, reason) = if task_turn_scope.is_some_and(|scope| {
+        scope.execution_state == "active"
+            && scope.current_actor == task_turn::TaskTurnActor::AssistantOrAgent
+            && scope.has_current_agent_state
+    }) {
+        (
+            "investigating",
+            "primary",
+            0.90,
+            "turn_scoped_agent_working_status",
+        )
+    } else if has_clipboard_transfer(frame) {
         ("copying_evidence", "support", 0.82, "clipboard_transfer")
     } else if switched_artifact
         && recent_primary.contains(&artifact.id)
@@ -29304,14 +32107,18 @@ fn classify_task_action(
     };
 
     let id_seed = format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         frame.id,
         artifact.id,
         kind,
-        previous_artifact_id.as_deref().unwrap_or("")
+        previous_artifact_id.as_deref().unwrap_or(""),
+        task_turn_scope
+            .map(|scope| scope.task_turn_id.as_str())
+            .unwrap_or("")
     );
     let mut action = ExtractedTaskAction {
         id: format!("task-action-{}", stable_hash(id_seed.as_bytes())),
+        task_turn_id: task_turn_scope.map(|scope| scope.task_turn_id.clone()),
         frame_id: frame.id.clone(),
         previous_frame_id: previous_frame
             .and_then(|previous| Some(previous.id.clone()))
@@ -29350,6 +32157,23 @@ fn classify_task_action(
         branch_confidence: None,
         branch_reason_code: None,
     };
+    if let Some(scope) = task_turn_scope {
+        for span_id in &scope.current_span_ids {
+            push_string_once(&mut action.evidence_span_ids, span_id);
+        }
+        for flag in &scope.quality_flags {
+            push_string_once(&mut action.quality_flags, flag);
+        }
+        action.attribution_confidence = Some(
+            action
+                .attribution_confidence
+                .unwrap_or(scope.attribution_confidence)
+                .min(scope.attribution_confidence),
+        );
+        if action.evidence_source_kind.is_none() {
+            action.evidence_source_kind = Some("task_turn_scoped_spans".to_string());
+        }
+    }
     gate_task_action_attribution(&mut action, &error_classification);
     let branch_classification = classify_branch_context(BranchClassificationInput {
         frame,
@@ -29383,7 +32207,7 @@ fn insert_continue_task_action(
     let quality_flags_json = serde_json::to_string(&action.quality_flags).map_err(to_string)?;
     conn.execute(
         "INSERT INTO continue_task_actions (
-            id, frame_id, previous_frame_id, artifact_id, secondary_artifact_id,
+            id, task_turn_id, frame_id, previous_frame_id, artifact_id, secondary_artifact_id,
             action_kind, action_role, trigger_type, transition_label,
             evidence_event_ids_json, confidence, reason, created_at_ms,
             collapse_count, first_frame_id, last_frame_id, strongest_frame_id,
@@ -29396,9 +32220,10 @@ fn insert_continue_task_action(
             branch_confidence, branch_reason_code
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
+                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
         params![
             action.id,
+            action.task_turn_id,
             action.frame_id,
             action.previous_frame_id,
             action.artifact_id,
@@ -29605,6 +32430,7 @@ fn derive_semantic_delta(
     previous_frame: Option<&EvidenceFrame>,
     artifact: &ResolvedArtifact,
     action: &ExtractedTaskAction,
+    task_turn_scope: Option<&task_turn::TaskTurnScope>,
 ) -> Option<SemanticDelta> {
     let subject = semantic_subject(frame, artifact);
     if matches!(
@@ -29615,7 +32441,7 @@ fn derive_semantic_delta(
             | "reviewing_output"
             | "reading"
     ) {
-        if let Some(hint) = dev_completion_hint_for_frame(frame, artifact) {
+        if let Some(hint) = dev_completion_hint_for_task_turn(frame, artifact, task_turn_scope) {
             return Some(SemanticDelta {
                 kind: "completed_successfully".to_string(),
                 subject: subject.or_else(|| Some("verification".to_string())),
@@ -29627,6 +32453,16 @@ fn derive_semantic_delta(
         }
     }
     match action.action_kind.as_str() {
+        "investigating" => Some(SemanticDelta {
+            kind: "investigation_in_progress".to_string(),
+            subject: task_turn_scope
+                .and_then(|scope| scope.task_object.clone())
+                .or(subject),
+            before_hint: None,
+            after_hint: task_turn_scope.map(|scope| scope.current_semantic_text.clone()),
+            evidence_quote: None,
+            confidence: action.confidence.min(0.90),
+        }),
         "editing" => Some(SemanticDelta {
             kind: if artifact.kind == "notes_doc" {
                 "doc_edit".to_string()
@@ -29656,7 +32492,10 @@ fn derive_semantic_delta(
             subject: Some("terminal_output".to_string()),
             before_hint: None,
             after_hint: safe_diff_hint(frame),
-            evidence_quote: safe_evidence_quote(frame, &["terminal_output"]),
+            evidence_quote: scoped_semantic_evidence_quote(
+                task_turn_scope,
+                safe_evidence_quote(frame, &["terminal_output"]),
+            ),
             confidence: 0.72,
         }),
         "encountering_error" if action_error_delta_has_runtime_source(action, artifact) => {
@@ -29665,7 +32504,10 @@ fn derive_semantic_delta(
                 subject,
                 before_hint: None,
                 after_hint: None,
-                evidence_quote: safe_evidence_quote(frame, &["error"]),
+                evidence_quote: scoped_semantic_evidence_quote(
+                    task_turn_scope,
+                    safe_evidence_quote(frame, &["error"]),
+                ),
                 confidence: action.confidence.min(0.90),
             })
         }
@@ -29675,7 +32517,10 @@ fn derive_semantic_delta(
             subject: safe_browser_subject(frame, artifact),
             before_hint: None,
             after_hint: None,
-            evidence_quote: safe_evidence_quote(frame, &["search_result"]),
+            evidence_quote: scoped_semantic_evidence_quote(
+                task_turn_scope,
+                safe_evidence_quote(frame, &["search_result"]),
+            ),
             confidence: 0.72,
         }),
         "reading" => Some(SemanticDelta {
@@ -29687,7 +32532,10 @@ fn derive_semantic_delta(
             subject,
             before_hint: None,
             after_hint: None,
-            evidence_quote: safe_evidence_quote(frame, &["heading", "title"]),
+            evidence_quote: scoped_semantic_evidence_quote(
+                task_turn_scope,
+                safe_evidence_quote(frame, &["heading", "title"]),
+            ),
             confidence: 0.54,
         }),
         "composing" => Some(SemanticDelta {
@@ -29715,7 +32563,10 @@ fn derive_semantic_delta(
             subject: safe_browser_subject(frame, artifact).or(subject),
             before_hint: action.secondary_artifact_id.clone(),
             after_hint: None,
-            evidence_quote: safe_evidence_quote(frame, &["search_result", "terminal_output"]),
+            evidence_quote: scoped_semantic_evidence_quote(
+                task_turn_scope,
+                safe_evidence_quote(frame, &["search_result", "terminal_output"]),
+            ),
             confidence: 0.7,
         }),
         "returning_to_origin" => Some(SemanticDelta {
@@ -29736,6 +32587,19 @@ fn derive_semantic_delta(
         }),
         _ => None,
     }
+}
+
+fn scoped_semantic_evidence_quote(
+    task_turn_scope: Option<&task_turn::TaskTurnScope>,
+    legacy_quote: Option<String>,
+) -> Option<String> {
+    let Some(scope) = task_turn_scope.filter(|scope| scope.typed_boundary_confident) else {
+        return legacy_quote;
+    };
+    scope.current_semantic_text.lines().rev().find_map(|line| {
+        let line = safe_label(line);
+        (!line.is_empty()).then_some(line.chars().take(180).collect())
+    })
 }
 
 fn ordered_evidence_event_ids(frame: &EvidenceFrame) -> Vec<String> {
@@ -29969,6 +32833,20 @@ fn dev_completion_hint_for_frame(
         return None;
     }
     dev_completion_hint_from_text(&frame_text_lower(frame))
+}
+
+fn dev_completion_hint_for_task_turn(
+    frame: &EvidenceFrame,
+    artifact: &ResolvedArtifact,
+    task_turn_scope: Option<&task_turn::TaskTurnScope>,
+) -> Option<String> {
+    if !frame_is_dev_or_agent_surface(frame, artifact) {
+        return None;
+    }
+    if let Some(scope) = task_turn_scope.filter(|scope| scope.typed_boundary_confident) {
+        return dev_completion_hint_from_text(&scope.completion_evidence_text.to_ascii_lowercase());
+    }
+    dev_completion_hint_for_frame(frame, artifact)
 }
 
 fn frame_is_dev_or_agent_surface(frame: &EvidenceFrame, artifact: &ResolvedArtifact) -> bool {
@@ -30467,7 +33345,8 @@ fn promoted_primary_action(action: &ContinueActionRecord) -> bool {
         == "primary"
         && matches!(
             action.action_kind.as_str(),
-            "editing"
+            "investigating"
+                | "editing"
                 | "composing"
                 | "running_command"
                 | "encountering_error"
@@ -30486,6 +33365,12 @@ fn episode_boundary_reason(
     next: &ContinueActionRecord,
     current: &[ContinueActionRecord],
 ) -> Option<EpisodeBoundaryReason> {
+    if previous.task_turn_id.is_some()
+        && next.task_turn_id.is_some()
+        && previous.task_turn_id != next.task_turn_id
+    {
+        return Some(boundary("task_turn_boundary", "new_task_turn"));
+    }
     let previous_artifact = previous.artifact_id.as_deref();
     let next_artifact = next.artifact_id.as_deref();
     let switched_artifact = previous_artifact != next_artifact;
@@ -31775,6 +34660,10 @@ fn build_workstream_state_snapshot(
     ContinueWorkstreamStateSnapshot {
         id: format!("workstream-state-{}", stable_hash(id_seed.as_bytes())),
         workstream_id: workstream.id.clone(),
+        task_turn_id: actions
+            .iter()
+            .rev()
+            .find_map(|action| action.task_turn_id.clone()),
         observed_at_ms,
         state,
         previous_state: None,
@@ -32018,6 +34907,7 @@ fn upsert_workstream_edge(
         .or_insert_with(|| ContinueWorkstreamEdge {
             id: format!("workstream-edge-{}", stable_hash(key.as_bytes())),
             workstream_id: workstream.id.clone(),
+            task_turn_id: action.task_turn_id.clone(),
             from_artifact_id: from_artifact_id.to_string(),
             to_artifact_id: to_artifact_id.to_string(),
             edge_kind: edge_kind.to_string(),
@@ -32045,9 +34935,9 @@ fn insert_continue_workstream_state_snapshot(
             origin_artifact_id, active_artifact_id, resume_work_target_artifact_id,
             last_support_artifact_id, blocker_artifact_id, confidence,
             transition_reason, evidence_action_ids_json, evidence_artifact_ids_json,
-            missing_evidence_json, warnings_json, created_at_ms
+            missing_evidence_json, warnings_json, created_at_ms, task_turn_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                   ?15, ?16, ?17)",
+                   ?15, ?16, ?17, ?18)",
         params![
             snapshot.id,
             snapshot.workstream_id,
@@ -32066,6 +34956,7 @@ fn insert_continue_workstream_state_snapshot(
             missing_evidence_json,
             warnings_json,
             snapshot.created_at_ms,
+            snapshot.task_turn_id,
         ],
     )
     .map_err(to_string)?;
@@ -32081,8 +34972,9 @@ fn insert_continue_workstream_edge(
     conn.execute(
         "INSERT OR REPLACE INTO continue_workstream_edges (
             id, workstream_id, from_artifact_id, to_artifact_id, edge_kind,
-            first_seen_ms, last_seen_ms, evidence_action_ids_json, confidence
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            first_seen_ms, last_seen_ms, evidence_action_ids_json, confidence,
+            task_turn_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             edge.id,
             edge.workstream_id,
@@ -32093,6 +34985,7 @@ fn insert_continue_workstream_edge(
             edge.last_seen_ms,
             evidence_action_ids_json,
             edge.confidence,
+            edge.task_turn_id,
         ],
     )
     .map_err(to_string)?;
@@ -32144,7 +35037,7 @@ fn resolved_lifecycle_boundary_kind(
                     | "returning_to_origin"
             )
         }) {
-            return Some("error_without_resolution");
+            return Some("resolved_error");
         }
     }
 
@@ -32160,7 +35053,7 @@ fn resolved_lifecycle_boundary_kind(
                         .map(|(origin, artifact)| origin == artifact)
                         .unwrap_or(false))
         }) {
-            return Some("search_branch_without_return");
+            return Some("returned_from_search");
         }
     }
 
@@ -32182,7 +35075,7 @@ fn resolved_lifecycle_boundary_kind(
                         .map(|(origin, artifact)| origin == artifact)
                         .unwrap_or(false))
         }) {
-            return Some("verification_without_return");
+            return Some("returned_from_verification");
         }
     }
     None
@@ -32224,7 +35117,21 @@ fn workstream_has_resolved_lifecycle(workstream: &BuiltWorkstream) -> bool {
 }
 
 fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<ContinueOpenLoop> {
-    let actions = workstream_actions(workstream);
+    let all_actions = workstream_actions(workstream);
+    let task_turn_id = all_actions
+        .iter()
+        .rev()
+        .find_map(|action| action.task_turn_id.clone());
+    let actions = task_turn_id.as_deref().map_or_else(
+        || all_actions.clone(),
+        |task_turn_id| {
+            all_actions
+                .iter()
+                .copied()
+                .filter(|action| action.task_turn_id.as_deref() == Some(task_turn_id))
+                .collect::<Vec<_>>()
+        },
+    );
     if actions.is_empty() && workstream.artifacts.is_empty() {
         return None;
     }
@@ -32339,15 +35246,19 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
     let last_concrete_progress = last_progress
         .or(semantic_delta_action)
         .map(open_loop_last_progress_text);
-    let lifecycle_state = if resolved_boundary_kind.is_some() {
-        "resolved"
+    let lifecycle_state = if resolved_boundary_kind == Some("completed_progress") {
+        "completed"
+    } else if resolved_boundary_kind.is_some() {
+        "closed"
+    } else if boundary_kind == "error_without_resolution" {
+        "blocked"
     } else if boundary_kind == "unknown" {
-        "unknown"
+        "unclear"
     } else {
         "open"
     };
-    let unfinished_state = Some(if lifecycle_state == "resolved" {
-        "Open loop was resolved by later local evidence".to_string()
+    let unfinished_state = Some(if matches!(lifecycle_state, "completed" | "closed") {
+        "Open loop was completed by turn-scoped local evidence".to_string()
     } else {
         open_loop_unfinished_state(
             &boundary_kind,
@@ -32355,7 +35266,7 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
             workstream.unresolved_signal.as_deref(),
         )
     });
-    let next_evidence_backed_action = Some(if lifecycle_state == "resolved" {
+    let next_evidence_backed_action = Some(if matches!(lifecycle_state, "completed" | "closed") {
         "No unresolved return action remains for this loop".to_string()
     } else {
         open_loop_next_action(
@@ -32408,13 +35319,17 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
         .first()
         .map(|(episode, _, _)| episode.start_timestamp_ms);
     let last_updated_at_ms = workstream.last_active_timestamp_ms;
-    let id_seed = format!(
-        "{}:{}:{}:{}:{}",
-        workstream.id,
-        boundary_kind,
-        primary_return_artifact_id.as_deref().unwrap_or("none"),
-        resume_work_artifact_id.as_deref().unwrap_or("none"),
-        last_updated_at_ms
+    let id_seed = task_turn_id.as_ref().map_or_else(
+        || {
+            format!(
+                "{}:{}:{}:{}",
+                workstream.id,
+                boundary_kind,
+                primary_return_artifact_id.as_deref().unwrap_or("none"),
+                resume_work_artifact_id.as_deref().unwrap_or("none")
+            )
+        },
+        |task_turn_id| format!("{}:{}", workstream.id, task_turn_id),
     );
     let evidence_spans = open_loop_evidence_spans(
         workstream,
@@ -32430,9 +35345,32 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
         open_loop_local_reason(&graph)
     };
 
+    let eligibility = evaluate_semantic_eligibility(&SemanticEligibilityInput {
+        entity_kind: "open_loop".to_string(),
+        entity_id: format!("open-loop-{}", stable_hash(id_seed.as_bytes())),
+        current_task_turn_id: task_turn_id.clone(),
+        current_workstream_id: Some(workstream.id.clone()),
+        owner_task_turn_id: task_turn_id.clone(),
+        owner_workstream_id: Some(workstream.id.clone()),
+        parent_task_turn_id: None,
+        origin_task_turn_id: None,
+        relation_hint: task_turn_id
+            .as_ref()
+            .map(|_| RelationToCurrentTask::SameTask),
+        lifecycle_state: Some(lifecycle_state.to_string()),
+        current_task_started_at_ms: first_seen_at_ms,
+        entity_updated_at_ms: Some(last_updated_at_ms),
+        supporting_evidence_ids: evidence_spans
+            .iter()
+            .map(|span| span.evidence_id.clone())
+            .collect(),
+    });
     Some(ContinueOpenLoop {
         id: format!("open-loop-{}", stable_hash(id_seed.as_bytes())),
         workstream_id: workstream.id.clone(),
+        task_turn_id,
+        parent_task_turn_id: None,
+        origin_task_turn_id: None,
         state: lifecycle_state.to_string(),
         boundary_kind,
         quality,
@@ -32448,12 +35386,19 @@ fn build_open_loop_for_workstream(workstream: &BuiltWorkstream) -> Option<Contin
         unfinished_state,
         next_evidence_backed_action,
         current_focus_relation,
+        relation_to_current_task: eligibility.relation_to_current_task.as_str().to_string(),
+        freshness: eligibility.freshness.as_str().to_string(),
+        eligible_for_primary: eligibility.eligible_for_primary,
+        eligible_for_objective: eligibility.eligible_for_objective,
+        eligible_for_last_state: eligibility.eligible_for_last_state,
+        eligibility_reason_codes: eligibility.reason_codes,
         missing_fields,
         evidence_spans,
         local_reason: Some(local_reason),
         first_seen_at_ms,
         last_updated_at_ms,
         revision: 1,
+        ownership_revision: 1,
     })
 }
 
@@ -33037,19 +35982,30 @@ fn insert_continue_open_loop(
         serde_json::to_string(&open_loop.missing_fields).map_err(to_string)?;
     let evidence_spans_json =
         serde_json::to_string(&open_loop.evidence_spans).map_err(to_string)?;
+    let eligibility_reason_codes_json =
+        serde_json::to_string(&open_loop.eligibility_reason_codes).map_err(to_string)?;
     conn.execute(
         "INSERT OR REPLACE INTO continue_open_loops (
-            id, workstream_id, state, boundary_kind, quality, confidence,
+            id, workstream_id, task_turn_id, parent_task_turn_id,
+            origin_task_turn_id, state, boundary_kind, quality, confidence,
             origin_artifact_id, current_focus_artifact_id, primary_return_artifact_id,
             resume_work_artifact_id, blocker_artifact_id, verification_artifact_id,
             objective_hint, last_concrete_progress, unfinished_state,
-            next_evidence_backed_action, current_focus_relation, missing_fields_json,
-            evidence_spans_json, local_reason, first_seen_at_ms, last_updated_at_ms, revision
+            next_evidence_backed_action, current_focus_relation,
+            relation_to_current_task, freshness, eligible_for_primary,
+            eligible_for_objective, eligible_for_last_state,
+            eligibility_reason_codes_json, missing_fields_json,
+            evidence_spans_json, local_reason, first_seen_at_ms, last_updated_at_ms,
+            revision, ownership_revision
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         params![
             open_loop.id,
             open_loop.workstream_id,
+            open_loop.task_turn_id,
+            open_loop.parent_task_turn_id,
+            open_loop.origin_task_turn_id,
             open_loop.state,
             open_loop.boundary_kind,
             open_loop.quality,
@@ -33065,15 +36021,49 @@ fn insert_continue_open_loop(
             open_loop.unfinished_state,
             open_loop.next_evidence_backed_action,
             open_loop.current_focus_relation,
+            open_loop.relation_to_current_task,
+            open_loop.freshness,
+            bool_to_i64(open_loop.eligible_for_primary),
+            bool_to_i64(open_loop.eligible_for_objective),
+            bool_to_i64(open_loop.eligible_for_last_state),
+            eligibility_reason_codes_json,
             missing_fields_json,
             evidence_spans_json,
             open_loop.local_reason,
             open_loop.first_seen_at_ms,
             open_loop.last_updated_at_ms,
             open_loop.revision,
+            open_loop.ownership_revision,
         ],
     )
     .map_err(to_string)?;
+    if table_exists(conn, "continue_open_loop_lifecycle_events")? {
+        let lifecycle_event_id = format!(
+            "loop-lifecycle:{}:{}:{}",
+            open_loop.id, open_loop.ownership_revision, open_loop.state
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO continue_open_loop_lifecycle_events (
+               id, open_loop_id, workstream_id, task_turn_id, previous_state, state,
+               boundary_kind, transition_reason, ownership_revision, evidence_ids_json,
+               observed_at_ms, created_at_ms
+             ) VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                lifecycle_event_id,
+                open_loop.id,
+                open_loop.workstream_id,
+                open_loop.task_turn_id,
+                open_loop.state,
+                open_loop.boundary_kind,
+                open_loop.local_reason,
+                open_loop.ownership_revision,
+                evidence_spans_json,
+                open_loop.last_updated_at_ms,
+                current_time_millis(),
+            ],
+        )
+        .map_err(to_string)?;
+    }
     insert_continue_open_loop_artifact_roles(conn, open_loop)?;
     insert_continue_open_loop_evidence(conn, open_loop)?;
     Ok(())
@@ -33355,23 +36345,41 @@ fn rebuild_continue_branch_contexts(
             .branch_kind
             .clone()
             .unwrap_or_else(|| branch_kind_from_action(action).to_string());
+        let now = current_time_millis();
+        let id_seed = format!(
+            "{}:{}:{}",
+            action.id,
+            branch_artifact_id,
+            origin.artifact_id.as_deref().unwrap_or("no-origin")
+        );
+        let branch_context_id = format!("branch-context-{}", stable_hash(id_seed.as_bytes()));
+        let task_turn_id = action.task_turn_id.clone();
+        let session_id = load_branch_task_turn_session_id(conn, task_turn_id.as_deref())?;
         let feedback_suppression_reason = continue_feedback_suppression_for_target(
             conn,
             None,
             origin.workstream_id.as_deref(),
             Some(&branch_artifact_id),
         )?;
-        let feedback_positive_kind = latest_positive_feedback_kind_for_branch(
+        let feedback_evaluation = evaluate_feedback_for_branch_promotion(
             conn,
+            &branch_context_id,
             &branch_artifact_id,
             origin.workstream_id.as_deref(),
+            task_turn_id.as_deref(),
+            session_id.as_deref(),
+            action.created_at_ms,
+            now,
+            feedback_suppression_reason.is_some(),
         )?;
-        let promotion_decision = evaluate_branch_promotion(BranchPromotionInput {
+        let mut promotion_decision = evaluate_branch_promotion(BranchPromotionInput {
             branch_kind: branch_kind.clone(),
             branch_started_at_ms: action.created_at_ms,
             returned_to_origin_at_ms: returned.map(|action| action.created_at_ms),
             feedback_hard_suppressed: feedback_suppression_reason.is_some(),
-            feedback_positive_kind,
+            current_task_turn_id: task_turn_id.clone(),
+            eligible_feedback: feedback_evaluation.eligible.clone(),
+            rejected_feedback: feedback_evaluation.rejected.clone(),
             has_origin: origin.artifact_id.is_some(),
             actions: branch_promotion_actions(
                 &actions[index + 1..],
@@ -33380,10 +36388,16 @@ fn rebuild_continue_branch_contexts(
                 returned.map(|action| action.created_at_ms),
             ),
         });
+        promotion_decision.eligible_feedback_event_ids = feedback_evaluation
+            .eligible
+            .iter()
+            .map(|feedback| feedback.event_id.clone())
+            .collect();
+        promotion_decision.feedback_rejection_reasons = feedback_evaluation.rejection_reasons();
         for evidence_action_id in &promotion_decision.evidence_action_ids {
             push_string_once(&mut evidence_action_ids, evidence_action_id);
         }
-        let promotion_reason = if let Some(reason) = feedback_suppression_reason {
+        let promotion_reason = if let Some(reason) = feedback_suppression_reason.as_deref() {
             Some(format!(
                 "{}:{}",
                 promotion_decision.promotion_reason, reason
@@ -33396,22 +36410,34 @@ fn rebuild_continue_branch_contexts(
             .clone()
             .or_else(|| action.branch_reason_code.clone())
             .unwrap_or_else(|| "branch:no_origin".to_string());
+        let origin_task_turn_id = origin
+            .action_id
+            .as_deref()
+            .and_then(|origin_action_id| {
+                actions
+                    .iter()
+                    .find(|candidate| candidate.id == origin_action_id)
+            })
+            .and_then(|origin_action| origin_action.task_turn_id.clone());
+        let promotion_task_turn_id = promotion_decision
+            .promotion_state
+            .is_promoted()
+            .then(|| task_turn_id.clone())
+            .flatten();
+        let promotion_evidence_action_ids = promotion_decision.evidence_action_ids.clone();
         let confidence = branch_context_confidence(
             action,
             origin.confidence,
             returned,
             Some(promotion_decision.confidence),
         );
-        let now = current_time_millis();
-        let id_seed = format!(
-            "{}:{}:{}",
-            action.id,
-            branch_artifact_id,
-            origin.artifact_id.as_deref().unwrap_or("no-origin")
-        );
         let context = ContinueBranchContext {
-            id: format!("branch-context-{}", stable_hash(id_seed.as_bytes())),
+            id: branch_context_id,
             branch_action_id: action.id.clone(),
+            task_turn_id,
+            origin_task_turn_id,
+            promotion_task_turn_id,
+            promoted_at_ms: promotion_decision.promoted_at_ms,
             branch_artifact_id,
             origin_artifact_id: origin.artifact_id,
             origin_workstream_id: origin.workstream_id,
@@ -33425,6 +36451,11 @@ fn rebuild_continue_branch_contexts(
             confidence,
             reason_code: Some(reason_code),
             evidence_action_ids,
+            promotion_evidence_action_ids,
+            eligible_feedback_event_ids: promotion_decision.eligible_feedback_event_ids,
+            feedback_rejection_reasons: promotion_decision.feedback_rejection_reasons,
+            feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            feedback_policy_fingerprint: FEEDBACK_POLICY_FINGERPRINT.to_string(),
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -33631,6 +36662,10 @@ fn evaluate_branch_promotion(input: BranchPromotionInput) -> BranchPromotionDeci
         .iter()
         .filter(|action| action.created_at_ms > input.branch_started_at_ms)
         .filter(|action| {
+            input.current_task_turn_id.is_none()
+                || action.task_turn_id.as_deref() == input.current_task_turn_id.as_deref()
+        })
+        .filter(|action| {
             input
                 .returned_to_origin_at_ms
                 .map(|returned_at| action.created_at_ms < returned_at)
@@ -33657,8 +36692,19 @@ fn evaluate_branch_promotion(input: BranchPromotionInput) -> BranchPromotionDeci
             warnings,
         );
     }
-    if let Some(kind) = input.feedback_positive_kind.as_deref() {
-        let state = match kind {
+    if input.returned_to_origin_at_ms.is_some() {
+        warnings.push("branch_promotion:returned_to_origin".to_string());
+        return branch_promotion_decision(
+            BranchPromotionState::Unpromoted,
+            None,
+            "returned_to_origin_clears_branch_primacy",
+            0.72,
+            Vec::new(),
+            warnings,
+        );
+    }
+    if let Some(feedback) = input.eligible_feedback.as_ref() {
+        let state = match feedback.event_kind.as_str() {
             "corrected" => BranchPromotionState::PromotedUserCorrected,
             "accepted" | "auto_resumed" => BranchPromotionState::PromotedUserAccepted,
             "user_next_step_note" => BranchPromotionState::PromotedPrimary,
@@ -33666,9 +36712,9 @@ fn evaluate_branch_promotion(input: BranchPromotionInput) -> BranchPromotionDeci
         };
         return branch_promotion_decision(
             state,
-            None,
+            Some(feedback.occurred_at_ms),
             "positive_feedback_targeted_branch",
-            0.88,
+            feedback.confidence.max(0.72),
             Vec::new(),
             warnings,
         );
@@ -33769,6 +36815,8 @@ fn branch_promotion_decision(
         promotion_reason: promotion_reason.to_string(),
         confidence: confidence.clamp(0.05, 0.95),
         evidence_action_ids,
+        eligible_feedback_event_ids: Vec::new(),
+        feedback_rejection_reasons: Vec::new(),
         warnings,
     }
 }
@@ -33790,6 +36838,7 @@ fn branch_promotion_actions(
         .filter(|action| action.artifact_id.as_deref() == Some(branch_artifact_id))
         .map(|action| BranchPromotionActionEvidence {
             action_id: action.id.clone(),
+            task_turn_id: action.task_turn_id.clone(),
             action_kind: action.action_kind.clone(),
             action_role: action.action_role.clone(),
             branch_kind: action.branch_kind.clone(),
@@ -33852,33 +36901,214 @@ fn diagnostic_self_has_developer_task_promotion_evidence(
     })
 }
 
-fn latest_positive_feedback_kind_for_branch(
+#[derive(Debug, Clone, Default)]
+struct BranchFeedbackEvaluation {
+    eligible: Option<BranchEligibleFeedback>,
+    rejected: Vec<FeedbackApplicabilityResult>,
+}
+
+impl BranchFeedbackEvaluation {
+    fn rejection_reasons(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        for result in &self.rejected {
+            for reason in &result.rejection_reason_codes {
+                push_string_once(&mut values, &format!("{}:{}", result.event_id, reason));
+            }
+        }
+        values
+    }
+}
+
+fn load_branch_task_turn_session_id(
     conn: &Connection,
+    task_turn_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(task_turn_id) = task_turn_id else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT session_id FROM continue_task_turns WHERE task_turn_id=?1",
+        params![task_turn_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|value| value.flatten())
+    .map_err(to_string)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_feedback_for_branch_promotion(
+    conn: &Connection,
+    branch_context_id: &str,
     branch_artifact_id: &str,
     origin_workstream_id: Option<&str>,
-) -> Result<Option<String>, String> {
+    task_turn_id: Option<&str>,
+    session_id: Option<&str>,
+    branch_started_at_ms: i64,
+    now_ms: i64,
+    contradicted_by_current_evidence: bool,
+) -> Result<BranchFeedbackEvaluation, String> {
     let keys = feedback_keys_for_branch_target(conn, branch_artifact_id, origin_workstream_id)?;
     if keys.is_empty() {
-        return Ok(None);
+        return Ok(BranchFeedbackEvaluation::default());
     }
-    let target_key_set = keys.iter().collect::<HashSet<_>>();
-    let mut latest: Option<(i64, String)> = None;
-    for row in load_continue_feedback_event_rows_for_target_keys(conn, &keys, 500)? {
-        let targets = feedback_targets_for_feedback_event(&row);
-        if !feedback_positive_applies_to_candidate(&targets, &target_key_set) {
-            continue;
-        }
-        if feedback_positive_weight(&row.event_kind, row.source.as_deref().unwrap_or("")) <= 0 {
-            continue;
-        }
-        if latest
-            .as_ref()
-            .is_none_or(|(timestamp_ms, _)| row.timestamp_ms > *timestamp_ms)
+    let stable_key = load_artifact_stable_key(conn, Some(branch_artifact_id))?
+        .as_deref()
+        .and_then(feedback_policy_safe_stable_key);
+    let rows = load_continue_feedback_event_rows_for_target_keys(conn, &keys, 500)?;
+    let events = rows
+        .iter()
+        .map(feedback_policy_event_from_row)
+        .collect::<Vec<_>>();
+    let base_context = FeedbackApplicabilityContext {
+        decision_id: None,
+        candidate_id: None,
+        target_artifact_id: Some(branch_artifact_id.to_string()),
+        artifact_stable_key: stable_key,
+        workstream_id: origin_workstream_id.map(str::to_string),
+        task_turn_id: task_turn_id.map(str::to_string),
+        session_id: session_id.map(str::to_string),
+        branch_context_id: Some(branch_context_id.to_string()),
+        branch_started_at_ms: Some(branch_started_at_ms),
+        now_ms,
+        requested_effect: FeedbackEffect::Promote,
+        contradicted_by_current_evidence,
+    };
+
+    let mut newest_applicable_negative_ms: Option<i64> = None;
+    for event in &events {
+        for target in event
+            .targets
+            .iter()
+            .filter(|target| target.polarity == FeedbackPolarity::Negative)
         {
-            latest = Some((row.timestamp_ms, row.event_kind));
+            let mut context = base_context.clone();
+            context.requested_effect = FeedbackEffect::Suppress;
+            context.contradicted_by_current_evidence = false;
+            let result = evaluate_feedback_applicability(event, target, &context);
+            persist_feedback_policy_evaluation(
+                conn,
+                "branch_promotion",
+                Some(branch_context_id),
+                now_ms,
+                &result,
+            )?;
+            if result.eligible {
+                newest_applicable_negative_ms = Some(
+                    newest_applicable_negative_ms
+                        .unwrap_or_default()
+                        .max(event.occurred_at_ms),
+                );
+            }
         }
     }
-    Ok(latest.map(|(_, kind)| kind))
+
+    let mut evaluation = BranchFeedbackEvaluation::default();
+    let mut latest_eligible_at_ms = i64::MIN;
+    for event in &events {
+        for target in event
+            .targets
+            .iter()
+            .filter(|target| target.polarity == FeedbackPolarity::Positive)
+        {
+            let mut result = evaluate_feedback_applicability(event, target, &base_context);
+            if result.eligible
+                && newest_applicable_negative_ms
+                    .is_some_and(|negative_ms| negative_ms > event.occurred_at_ms)
+            {
+                result.eligible = false;
+                result.confidence_contribution = 0.0;
+                push_string_once(
+                    &mut result.rejection_reason_codes,
+                    "superseded_by_newer_feedback",
+                );
+            }
+            persist_feedback_policy_evaluation(
+                conn,
+                "branch_promotion",
+                Some(branch_context_id),
+                now_ms,
+                &result,
+            )?;
+            if result.eligible && event.occurred_at_ms > latest_eligible_at_ms {
+                latest_eligible_at_ms = event.occurred_at_ms;
+                evaluation.eligible = Some(BranchEligibleFeedback {
+                    event_id: event.event_id.clone(),
+                    event_kind: event.event_kind.clone(),
+                    provenance: event.provenance,
+                    occurred_at_ms: event.occurred_at_ms,
+                    confidence: event.confidence,
+                });
+            } else if !result.eligible {
+                evaluation.rejected.push(result);
+            }
+        }
+    }
+    Ok(evaluation)
+}
+
+fn persist_feedback_policy_evaluation(
+    conn: &Connection,
+    context_kind: &str,
+    context_id: Option<&str>,
+    evaluated_at_ms: i64,
+    result: &FeedbackApplicabilityResult,
+) -> Result<(), String> {
+    let id = format!(
+        "feedback-eval-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{:?}:{:?}",
+                context_kind,
+                context_id.unwrap_or("none"),
+                result.event_id,
+                result.target.scope,
+                result.requested_effect
+            )
+            .as_bytes()
+        )
+    );
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_feedback_policy_evaluations (
+            id, event_id, context_kind, context_id, requested_effect, provenance,
+            target_scope, target_key, polarity, eligible, event_age_ms, cutoff_at_ms,
+            axes_json, allowed_effects_json, rejection_reason_codes_json,
+            confidence_contribution, policy_version, policy_fingerprint, evaluated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            id,
+            result.event_id,
+            context_kind,
+            context_id,
+            serde_json::to_value(result.requested_effect)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            result.provenance.as_str(),
+            serde_json::to_value(result.target.scope)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            result.target.id_or_key,
+            serde_json::to_value(result.target.polarity)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            result.eligible as i64,
+            result.event_age_ms,
+            result.cutoff_at_ms,
+            serde_json::to_string(&result.axes).map_err(to_string)?,
+            serde_json::to_string(&result.target.allowed_effects).map_err(to_string)?,
+            serde_json::to_string(&result.rejection_reason_codes).map_err(to_string)?,
+            result.confidence_contribution,
+            result.policy_version,
+            result.policy_fingerprint,
+            evaluated_at_ms,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
 }
 
 fn feedback_keys_for_branch_target(
@@ -33946,13 +37176,25 @@ fn insert_continue_branch_context(
 ) -> Result<(), String> {
     let evidence_action_ids_json =
         serde_json::to_string(&context.evidence_action_ids).map_err(to_string)?;
+    let promotion_evidence_action_ids_json =
+        serde_json::to_string(&context.promotion_evidence_action_ids).map_err(to_string)?;
+    let eligible_feedback_event_ids_json =
+        serde_json::to_string(&context.eligible_feedback_event_ids).map_err(to_string)?;
+    let feedback_rejection_reasons_json =
+        serde_json::to_string(&context.feedback_rejection_reasons).map_err(to_string)?;
     conn.execute(
         "INSERT OR REPLACE INTO continue_branch_contexts (
             id, branch_action_id, origin_artifact_id, origin_workstream_id,
             branch_artifact_id, branch_kind, branch_started_at_ms, last_branch_seen_at_ms,
             returned_to_origin_at_ms, promotion_state, promotion_reason, confidence,
-            reason_code, evidence_action_ids_json, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            reason_code, evidence_action_ids_json, created_at_ms, updated_at_ms,
+            task_turn_id, eligible_feedback_event_ids_json,
+            feedback_rejection_reasons_json, feedback_policy_version,
+            feedback_policy_fingerprint, origin_task_turn_id,
+            promotion_task_turn_id, promoted_at_ms,
+            promotion_evidence_action_ids_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             context.id,
             context.branch_action_id,
@@ -33970,6 +37212,15 @@ fn insert_continue_branch_context(
             evidence_action_ids_json,
             context.created_at_ms,
             context.updated_at_ms,
+            context.task_turn_id,
+            eligible_feedback_event_ids_json,
+            feedback_rejection_reasons_json,
+            context.feedback_policy_version,
+            context.feedback_policy_fingerprint,
+            context.origin_task_turn_id,
+            context.promotion_task_turn_id,
+            context.promoted_at_ms,
+            promotion_evidence_action_ids_json,
         ],
     )
     .map_err(to_string)?;
@@ -34075,6 +37326,7 @@ fn insert_continue_decision(
     conn: &Connection,
     decision_id: &str,
     requested_at_ms: i64,
+    session_id: Option<&str>,
     current_focus: Option<&ContinueFocusSummary>,
     selected_workstream: Option<&ScorerWorkstream>,
     selected: Option<&ScoredContinueCandidate>,
@@ -34096,9 +37348,13 @@ fn insert_continue_decision(
     micro_inference_requested: bool,
     micro_inference_attempted: bool,
     micro_inference_result_kind: Option<&str>,
+    work_truth: &ContinueWorkTruth,
     continue_dossier: Option<&ContinueDossierV1>,
     memory_retrieval: Option<&ContinueMemoryRetrievalReport>,
 ) -> Result<(), String> {
+    let current_task_turn_id =
+        task_turn::selected_current_task_turn(conn)?.map(|turn| turn.task_turn_id);
+    let next_feedback_transition_at_ms = next_feedback_policy_transition_ms(conn, requested_at_ms)?;
     let quality_gate_json = quality_gate
         .map(serde_json::to_string)
         .transpose()
@@ -34112,6 +37368,7 @@ fn insert_continue_decision(
         .map(serde_json::to_string)
         .transpose()
         .map_err(to_string)?;
+    let work_truth_json = serde_json::to_string(work_truth).map_err(to_string)?;
     conn.execute(
         "INSERT OR REPLACE INTO continue_decisions (
             id, requested_at_ms, source, current_focus_frame_id,
@@ -34126,11 +37383,14 @@ fn insert_continue_decision(
             evidence_watermark_hash, latest_boundary_revision,
             micro_inference_requested, micro_inference_attempted,
             micro_inference_result_kind, continue_dossier_json,
-            memory_retrieval_summary_json
+            memory_retrieval_summary_json, session_id, current_task_turn_id,
+            feedback_policy_fingerprint, next_feedback_transition_at_ms,
+            semantic_graph_policy_version, semantic_graph_policy_fingerprint,
+            work_truth_json
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30, ?31, ?32, ?33, ?34, ?35, ?36
+            ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43
          )",
         params![
             decision_id,
@@ -34186,6 +37446,13 @@ fn insert_continue_decision(
             micro_inference_result_kind,
             continue_dossier_json,
             memory_retrieval_json,
+            session_id,
+            current_task_turn_id,
+            FEEDBACK_POLICY_FINGERPRINT,
+            next_feedback_transition_at_ms,
+            SEMANTIC_GRAPH_POLICY_VERSION,
+            SEMANTIC_GRAPH_POLICY_FINGERPRINT,
+            work_truth_json,
         ],
     )
     .map_err(to_string)?;
@@ -34231,6 +37498,153 @@ fn persist_continue_decision_activity_recap(
             evidence_watermark_json,
             evidence_watermark.hash,
             evidence_watermark.latest_boundary_revision,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+fn persist_semantic_consistency_evaluation(
+    conn: &Connection,
+    decision_id: &str,
+    consistency: &CrossLayerConsistencyResult,
+    direct_target_policy: &DirectTargetPolicyResult,
+    inputs: &activity_recap_inputs::ActivityRecapInputs,
+    evaluated_at_ms: i64,
+) -> Result<(), String> {
+    let consistency_json = serde_json::to_string(consistency).map_err(to_string)?;
+    let direct_target_policy_json =
+        serde_json::to_string(direct_target_policy).map_err(to_string)?;
+    conn.execute(
+        "UPDATE continue_decisions
+         SET semantic_graph_policy_version=?2,
+             semantic_graph_policy_fingerprint=?3,
+             cross_layer_consistency_json=?4,
+             direct_target_policy_json=?5
+         WHERE id=?1",
+        params![
+            decision_id,
+            SEMANTIC_GRAPH_POLICY_VERSION,
+            SEMANTIC_GRAPH_POLICY_FINGERPRINT,
+            consistency_json,
+            direct_target_policy_json,
+        ],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_semantic_consistency_evaluations (
+           decision_id, current_task_turn_id, selected_workstream_id,
+           agreement_status, consistency_json, direct_target_policy_json,
+           policy_version, policy_fingerprint, evaluated_at_ms
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            decision_id,
+            consistency.current_task_turn_id,
+            consistency.selected_workstream_id,
+            serde_json::to_value(consistency.agreement_status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unresolved".to_string()),
+            consistency_json,
+            direct_target_policy_json,
+            SEMANTIC_GRAPH_POLICY_VERSION,
+            SEMANTIC_GRAPH_POLICY_FINGERPRINT,
+            evaluated_at_ms,
+        ],
+    )
+    .map_err(to_string)?;
+
+    for open_loop in &inputs.open_loops {
+        let decision = semantic_consistency::SemanticEligibilityDecision {
+            schema: "smalltalk.semantic_eligibility.v1".to_string(),
+            policy_version: SEMANTIC_GRAPH_POLICY_VERSION.to_string(),
+            entity_kind: "open_loop".to_string(),
+            entity_id: open_loop.open_loop_id.clone(),
+            current_task_turn_id: inputs
+                .current_task_turn
+                .as_ref()
+                .map(|turn| turn.task_turn_id.clone()),
+            current_workstream_id: inputs
+                .current_task_turn
+                .as_ref()
+                .and_then(|turn| turn.workstream_id.clone()),
+            owner_task_turn_id: open_loop.task_turn_id.clone(),
+            owner_workstream_id: Some(open_loop.workstream_id.clone()),
+            parent_task_turn_id: open_loop.parent_task_turn_id.clone(),
+            origin_task_turn_id: open_loop.origin_task_turn_id.clone(),
+            relation_to_current_task: match open_loop.relation_to_current_task.as_str() {
+                "same_task" => RelationToCurrentTask::SameTask,
+                "same_workstream_prior_turn" => RelationToCurrentTask::SameWorkstreamPriorTurn,
+                "child_support" => RelationToCurrentTask::ChildSupport,
+                "detour" => RelationToCurrentTask::Detour,
+                "interruption" => RelationToCurrentTask::Interruption,
+                "returned_support" => RelationToCurrentTask::ReturnedSupport,
+                "superseded_task" => RelationToCurrentTask::SupersededTask,
+                "unrelated" => RelationToCurrentTask::Unrelated,
+                _ => RelationToCurrentTask::Unknown,
+            },
+            freshness: match open_loop.freshness.as_str() {
+                "current_turn" => semantic_consistency::SemanticFreshness::CurrentTurn,
+                "recent_prior_turn" => semantic_consistency::SemanticFreshness::RecentPriorTurn,
+                "historical" => semantic_consistency::SemanticFreshness::Historical,
+                _ => semantic_consistency::SemanticFreshness::Unknown,
+            },
+            eligible_for_primary: open_loop.eligible_for_primary,
+            eligible_for_objective: open_loop.eligible_for_objective,
+            eligible_for_last_state: open_loop.eligible_for_last_state,
+            eligible_as_support_evidence: matches!(
+                open_loop.relation_to_current_task.as_str(),
+                "same_task"
+                    | "same_workstream_prior_turn"
+                    | "child_support"
+                    | "detour"
+                    | "returned_support"
+            ),
+            reason_codes: open_loop.eligibility_reason_codes.clone(),
+            supporting_evidence_ids: open_loop
+                .evidence_spans
+                .iter()
+                .map(|span| span.evidence_id.clone())
+                .collect(),
+        };
+        persist_semantic_eligibility(conn, decision_id, &decision, evaluated_at_ms)?;
+    }
+    Ok(())
+}
+
+fn persist_semantic_eligibility(
+    conn: &Connection,
+    decision_id: &str,
+    decision: &semantic_consistency::SemanticEligibilityDecision,
+    evaluated_at_ms: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO continue_semantic_eligibility_evaluations (
+           decision_id, entity_kind, entity_id, current_task_turn_id,
+           current_workstream_id, owner_task_turn_id, owner_workstream_id,
+           relation_to_current_task, freshness, eligible_for_primary,
+           eligible_for_objective, eligible_for_last_state,
+           eligible_as_support_evidence, reason_codes_json, evidence_ids_json,
+           policy_version, evaluated_at_ms
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![
+            decision_id,
+            decision.entity_kind,
+            decision.entity_id,
+            decision.current_task_turn_id,
+            decision.current_workstream_id,
+            decision.owner_task_turn_id,
+            decision.owner_workstream_id,
+            decision.relation_to_current_task.as_str(),
+            decision.freshness.as_str(),
+            bool_to_i64(decision.eligible_for_primary),
+            bool_to_i64(decision.eligible_for_objective),
+            bool_to_i64(decision.eligible_for_last_state),
+            bool_to_i64(decision.eligible_as_support_evidence),
+            serde_json::to_string(&decision.reason_codes).map_err(to_string)?,
+            serde_json::to_string(&decision.supporting_evidence_ids).map_err(to_string)?,
+            decision.policy_version,
+            evaluated_at_ms,
         ],
     )
     .map_err(to_string)?;
@@ -34575,6 +37989,14 @@ fn has_content_role(frame: &EvidenceFrame, role: &str) -> bool {
 }
 
 fn frame_text_lower(frame: &EvidenceFrame) -> String {
+    if let Some(text) = frame
+        .structured_semantic_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return text.to_lowercase();
+    }
     let mut text = active_frame_text_for_continue(frame).unwrap_or_default();
     for unit in &frame.content_units {
         if content_unit_is_active_evidence(unit) {
@@ -35560,6 +38982,15 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
         VALUES (5, 'continue_surface_snapshot_schema_store', CAST(strftime('%s','now') AS INTEGER) * 1000);
 
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (6, 'continue_task_turn_evidence_v1', CAST(strftime('%s','now') AS INTEGER) * 1000);
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (7, 'continue_current_task_turn_v1', CAST(strftime('%s','now') AS INTEGER) * 1000);
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (8, 'continue_feedback_scope_provenance_decay_v2', CAST(strftime('%s','now') AS INTEGER) * 1000);
+        INSERT OR IGNORE INTO continue_schema_migrations (version, name, applied_at_ms)
+        VALUES (9, 'continue_workstream_open_loop_consistency_v1', CAST(strftime('%s','now') AS INTEGER) * 1000);
+
         CREATE TABLE IF NOT EXISTS continue_artifacts (
           id TEXT PRIMARY KEY,
           artifact_kind TEXT NOT NULL,
@@ -35643,6 +39074,7 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE TABLE IF NOT EXISTS continue_task_actions (
           id TEXT PRIMARY KEY,
+          task_turn_id TEXT,
           frame_id TEXT NOT NULL,
           previous_frame_id TEXT,
           artifact_id TEXT,
@@ -35903,6 +39335,74 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_continue_open_loop_evidence_lookup
           ON continue_open_loop_evidence(evidence_kind, evidence_id);
 
+        CREATE TABLE IF NOT EXISTS continue_task_turn_workstream_memberships (
+          task_turn_id TEXT NOT NULL,
+          workstream_id TEXT NOT NULL,
+          relation_to_current_task TEXT NOT NULL DEFAULT 'unknown',
+          membership_score REAL NOT NULL DEFAULT 0.0,
+          selected INTEGER NOT NULL DEFAULT 0,
+          evidence_action_ids_json TEXT NOT NULL DEFAULT '[]',
+          reason_codes_json TEXT NOT NULL DEFAULT '[]',
+          revision INTEGER NOT NULL DEFAULT 1,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          PRIMARY KEY(task_turn_id, workstream_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_task_turn_workstream_selected
+          ON continue_task_turn_workstream_memberships(selected, updated_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_open_loop_lifecycle_events (
+          id TEXT PRIMARY KEY,
+          open_loop_id TEXT NOT NULL,
+          workstream_id TEXT NOT NULL,
+          task_turn_id TEXT,
+          previous_state TEXT,
+          state TEXT NOT NULL,
+          boundary_kind TEXT NOT NULL,
+          transition_reason TEXT NOT NULL,
+          ownership_revision INTEGER NOT NULL DEFAULT 1,
+          evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+          observed_at_ms INTEGER NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_open_loop_lifecycle_owner
+          ON continue_open_loop_lifecycle_events(task_turn_id, observed_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_semantic_eligibility_evaluations (
+          decision_id TEXT NOT NULL,
+          entity_kind TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          current_task_turn_id TEXT,
+          current_workstream_id TEXT,
+          owner_task_turn_id TEXT,
+          owner_workstream_id TEXT,
+          relation_to_current_task TEXT NOT NULL,
+          freshness TEXT NOT NULL,
+          eligible_for_primary INTEGER NOT NULL DEFAULT 0,
+          eligible_for_objective INTEGER NOT NULL DEFAULT 0,
+          eligible_for_last_state INTEGER NOT NULL DEFAULT 0,
+          eligible_as_support_evidence INTEGER NOT NULL DEFAULT 0,
+          reason_codes_json TEXT NOT NULL DEFAULT '[]',
+          evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+          policy_version TEXT NOT NULL,
+          evaluated_at_ms INTEGER NOT NULL,
+          PRIMARY KEY(decision_id, entity_kind, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_continue_semantic_eligibility_current_task
+          ON continue_semantic_eligibility_evaluations(current_task_turn_id, evaluated_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS continue_semantic_consistency_evaluations (
+          decision_id TEXT PRIMARY KEY,
+          current_task_turn_id TEXT,
+          selected_workstream_id TEXT,
+          agreement_status TEXT NOT NULL,
+          consistency_json TEXT NOT NULL,
+          direct_target_policy_json TEXT NOT NULL,
+          policy_version TEXT NOT NULL,
+          policy_fingerprint TEXT NOT NULL,
+          evaluated_at_ms INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS continue_memory_cells (
           id TEXT PRIMARY KEY,
           workstream_id TEXT,
@@ -36126,7 +39626,18 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           probes_succeeded_json TEXT NOT NULL DEFAULT '[]',
           warnings_json TEXT NOT NULL DEFAULT '[]',
           errors_json TEXT NOT NULL DEFAULT '[]',
-          result_json TEXT NOT NULL
+          result_json TEXT NOT NULL,
+          requested_dimensions_json TEXT NOT NULL DEFAULT '[]',
+          per_probe_outcomes_json TEXT NOT NULL DEFAULT '[]',
+          deadline_at_ms INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'failed',
+          evidence_record_ids_json TEXT NOT NULL DEFAULT '[]',
+          dimensions_changed_json TEXT NOT NULL DEFAULT '[]',
+          stale_result INTEGER NOT NULL DEFAULT 0,
+          material_evidence_hash_before TEXT NOT NULL DEFAULT '',
+          material_evidence_hash_after TEXT NOT NULL DEFAULT '',
+          cooldown_surface_key TEXT NOT NULL DEFAULT 'unknown_surface',
+          selected_probe TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_continue_evidence_probes_completed
           ON continue_evidence_probes(completed_at_ms DESC);
@@ -36220,6 +39731,7 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
           evidence_pack_v2_used INTEGER NOT NULL DEFAULT 0,
           micro_inference_result_kind TEXT,
           continue_dossier_json TEXT,
+          work_truth_json TEXT,
           memory_retrieval_summary_json TEXT,
           FOREIGN KEY(current_focus_artifact_id) REFERENCES continue_artifacts(id) ON DELETE SET NULL,
           FOREIGN KEY(selected_workstream_id) REFERENCES continue_workstreams(id) ON DELETE SET NULL,
@@ -36273,6 +39785,32 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_continue_feedback_events_timestamp
           ON continue_feedback_events(timestamp_ms DESC);
 
+        CREATE TABLE IF NOT EXISTS continue_feedback_policy_evaluations (
+          id TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          context_kind TEXT NOT NULL,
+          context_id TEXT,
+          requested_effect TEXT NOT NULL,
+          provenance TEXT NOT NULL,
+          target_scope TEXT NOT NULL,
+          target_key TEXT NOT NULL,
+          polarity TEXT NOT NULL,
+          eligible INTEGER NOT NULL DEFAULT 0,
+          event_age_ms INTEGER NOT NULL,
+          cutoff_at_ms INTEGER,
+          axes_json TEXT NOT NULL DEFAULT '{}',
+          allowed_effects_json TEXT NOT NULL DEFAULT '{}',
+          rejection_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+          confidence_contribution REAL NOT NULL DEFAULT 0.0,
+          policy_version TEXT NOT NULL,
+          policy_fingerprint TEXT NOT NULL,
+          evaluated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feedback_policy_evaluations_event
+          ON continue_feedback_policy_evaluations(event_id, evaluated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_feedback_policy_evaluations_context
+          ON continue_feedback_policy_evaluations(context_kind, context_id, evaluated_at_ms DESC);
+
         CREATE TABLE IF NOT EXISTS continue_breadcrumbs (
           id TEXT PRIMARY KEY,
           workstream_id TEXT NOT NULL,
@@ -36286,6 +39824,24 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(to_string)?;
+    for (column, definition) in [
+        ("requested_dimensions_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("per_probe_outcomes_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("deadline_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("status", "TEXT NOT NULL DEFAULT 'failed'"),
+        ("evidence_record_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("dimensions_changed_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("stale_result", "INTEGER NOT NULL DEFAULT 0"),
+        ("material_evidence_hash_before", "TEXT NOT NULL DEFAULT ''"),
+        ("material_evidence_hash_after", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "cooldown_surface_key",
+            "TEXT NOT NULL DEFAULT 'unknown_surface'",
+        ),
+        ("selected_probe", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        ensure_column_exists(conn, "continue_evidence_probes", column, definition)?;
+    }
     ensure_column_exists(
         conn,
         "continue_decision_open_events",
@@ -36305,6 +39861,13 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
     ensure_column_exists(conn, "continue_candidates", "supporting_episode_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_task_actions", "task_turn_id", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_continue_task_actions_task_turn
+         ON continue_task_actions(task_turn_id, created_at_ms)",
+        [],
+    )
+    .map_err(to_string)?;
     ensure_column_exists(
         conn,
         "continue_task_actions",
@@ -36602,6 +40165,7 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "TEXT",
     )?;
     ensure_column_exists(conn, "continue_decisions", "continue_dossier_json", "TEXT")?;
+    ensure_column_exists(conn, "continue_decisions", "work_truth_json", "TEXT")?;
     ensure_column_exists(
         conn,
         "continue_decisions",
@@ -36663,6 +40227,145 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "activity_recap_model_requested",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column_exists(conn, "continue_decisions", "session_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_decisions", "current_task_turn_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "semantic_graph_policy_version",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "semantic_graph_policy_fingerprint",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "cross_layer_consistency_json",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "direct_target_policy_json",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "feedback_policy_fingerprint",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_decisions",
+        "next_feedback_transition_at_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(conn, "continue_branch_contexts", "task_turn_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "origin_task_turn_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "promotion_task_turn_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "promoted_at_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "promotion_evidence_action_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "eligible_feedback_event_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "feedback_rejection_reasons_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "feedback_policy_version",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_branch_contexts",
+        "feedback_policy_fingerprint",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )?;
+    ensure_column_exists(conn, "continue_open_loops", "task_turn_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_open_loops", "parent_task_turn_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_open_loops", "origin_task_turn_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "relation_to_current_task",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "freshness",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "eligible_for_primary",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "eligible_for_objective",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "eligible_for_last_state",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "eligibility_reason_codes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_open_loops",
+        "ownership_revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_workstream_state_snapshots",
+        "task_turn_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(conn, "continue_workstream_edges", "task_turn_id", "TEXT")?;
     ensure_column_exists(
         conn,
         "continue_feedback_events",
@@ -36707,6 +40410,75 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         "is_negative_signal",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column_exists(conn, "continue_feedback_events", "provenance", "TEXT")?;
+    ensure_column_exists(conn, "continue_feedback_events", "task_turn_id", "TEXT")?;
+    ensure_column_exists(conn, "continue_feedback_events", "session_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "branch_context_id",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "applies_from_ms",
+        "INTEGER",
+    )?;
+    ensure_column_exists(conn, "continue_feedback_events", "expires_at_ms", "INTEGER")?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "feedback_policy_version",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "migration_policy_version",
+        "TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "evidence_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "normalized_targets_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "continue_feedback_events",
+        "chosen_artifact_stable_key",
+        "TEXT",
+    )?;
+    conn.execute(
+        "UPDATE continue_feedback_events
+         SET migration_policy_version=?1,
+             feedback_policy_version=COALESCE(feedback_policy_version, 'legacy'),
+             applies_from_ms=COALESCE(applies_from_ms, timestamp_ms)
+         WHERE migration_policy_version IS NULL",
+        params![FEEDBACK_MIGRATION_POLICY_VERSION],
+    )
+    .map_err(to_string)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_continue_feedback_events_policy_scope
+           ON continue_feedback_events(provenance, task_turn_id, session_id, timestamp_ms DESC);
+         CREATE INDEX IF NOT EXISTS idx_continue_feedback_events_branch_scope
+           ON continue_feedback_events(branch_context_id, timestamp_ms DESC);
+         CREATE INDEX IF NOT EXISTS idx_continue_branch_contexts_task_turn
+           ON continue_branch_contexts(task_turn_id, branch_started_at_ms DESC);
+         CREATE INDEX IF NOT EXISTS idx_continue_open_loops_task_turn
+           ON continue_open_loops(task_turn_id, state, last_updated_at_ms DESC);",
+    )
+    .map_err(to_string)?;
+    task_turn_evidence::ensure_task_turn_evidence_schema(conn)?;
+    task_turn::ensure_task_turn_schema(conn)?;
+    task_truth_v2::ensure_shadow_schema(conn)?;
     Ok(())
 }
 
@@ -36717,7 +40489,11 @@ pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         DELETE FROM continue_breadcrumbs;
+        DELETE FROM continue_semantic_consistency_evaluations;
+        DELETE FROM continue_semantic_eligibility_evaluations;
+        DELETE FROM continue_feedback_policy_evaluations;
         DELETE FROM continue_feedback_events;
+        DELETE FROM task_truth_v2_decision_contracts;
         DELETE FROM continue_decisions;
         DELETE FROM continue_candidates;
         DELETE FROM continue_activity_classifications;
@@ -36731,19 +40507,33 @@ pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
         DELETE FROM continue_boundary_revisions;
         DELETE FROM continue_open_loop_evidence;
         DELETE FROM continue_open_loop_artifacts;
+        DELETE FROM continue_open_loop_lifecycle_events;
         DELETE FROM continue_open_loops;
         DELETE FROM continue_branch_contexts;
         DELETE FROM continue_workstream_edges;
         DELETE FROM continue_workstream_state_snapshots;
         DELETE FROM continue_workstream_artifacts;
         DELETE FROM continue_workstream_episodes;
+        DELETE FROM continue_task_turn_workstream_memberships;
         DELETE FROM continue_workstreams;
         DELETE FROM continue_episode_artifacts;
         DELETE FROM continue_episode_actions;
         DELETE FROM continue_episodes;
+        DELETE FROM continue_task_turn_lifecycle;
+        DELETE FROM continue_task_turn_relations;
+        DELETE FROM continue_task_turn_evidence;
         DELETE FROM continue_task_action_events;
         DELETE FROM continue_task_actions;
+        DELETE FROM continue_task_turns;
         DELETE FROM continue_semantic_moments;
+        DELETE FROM task_truth_v2_shadow_audits;
+        DELETE FROM task_truth_v2_authority_audits;
+        DELETE FROM task_truth_v2_feedback_events;
+        DELETE FROM task_truth_v2_checkpoints;
+        DELETE FROM task_truth_v2_snapshots;
+        DELETE FROM task_truth_v2_observation_packets;
+        DELETE FROM continue_salient_turn_evidence;
+        DELETE FROM continue_ordered_evidence_spans;
         DELETE FROM continue_artifact_observations;
         DELETE FROM continue_artifacts;
         ",
@@ -36761,6 +40551,10 @@ pub fn continue_memory_status(conn: &Connection) -> Result<ContinueMemoryStatus,
             artifacts: count_if_present(conn, "continue_artifacts")?,
             artifact_observations: count_if_present(conn, "continue_artifact_observations")?,
             semantic_moments: count_if_present(conn, "continue_semantic_moments")?,
+            task_turns: count_if_present(conn, "continue_task_turns")?,
+            task_turn_evidence: count_if_present(conn, "continue_task_turn_evidence")?,
+            task_turn_relations: count_if_present(conn, "continue_task_turn_relations")?,
+            task_turn_lifecycle: count_if_present(conn, "continue_task_turn_lifecycle")?,
             task_actions: count_if_present(conn, "continue_task_actions")?,
             task_action_events: count_if_present(conn, "continue_task_action_events")?,
             episodes: count_if_present(conn, "continue_episodes")?,
@@ -36922,6 +40716,46 @@ mod tests {
     }
 
     #[test]
+    fn continue_schema_migrates_legacy_task_actions_before_creating_task_turn_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE continue_task_actions (
+                id TEXT PRIMARY KEY,
+                frame_id TEXT NOT NULL,
+                previous_frame_id TEXT,
+                artifact_id TEXT,
+                secondary_artifact_id TEXT,
+                action_kind TEXT NOT NULL DEFAULT 'unknown',
+                action_role TEXT NOT NULL DEFAULT 'unknown',
+                trigger_type TEXT,
+                transition_label TEXT,
+                evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                reason TEXT,
+                created_at_ms INTEGER NOT NULL,
+                collapse_count INTEGER NOT NULL DEFAULT 1,
+                first_frame_id TEXT,
+                last_frame_id TEXT,
+                strongest_frame_id TEXT
+            );",
+        )
+        .unwrap();
+
+        ensure_continue_schema(&conn).unwrap();
+
+        assert!(column_exists(&conn, "continue_task_actions", "task_turn_id").unwrap());
+        let index_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_continue_task_actions_task_turn'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
     fn empty_surface_snapshot_tables_do_not_break_get_continue_decision() {
         let conn = Connection::open_in_memory().unwrap();
         init_evidence_schema(&conn);
@@ -36943,7 +40777,9 @@ mod tests {
         );
         assert_eq!(
             result.activity_recap.why_no_safe_target.as_deref(),
-            Some("Recent activity is visible, but no safely openable return target is grounded.")
+            Some(
+                "Recent activity was captured, but the exact current task could not be determined."
+            )
         );
         assert!(result
             .activity_recap
@@ -37274,6 +41110,10 @@ mod tests {
                 feedback_kind: "corrected".to_string(),
                 note: Some("right target".to_string()),
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -37338,6 +41178,10 @@ mod tests {
                 feedback_kind: "corrected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -37431,11 +41275,10 @@ mod tests {
             FeedbackTargetScope::TargetArtifact,
             "artifact-wrong",
         );
-        assert_has_feedback_key(
-            &targets.negative_targets,
-            FeedbackTargetScope::Workstream,
-            "workstream-p1",
-        );
+        assert!(!targets
+            .negative_targets
+            .iter()
+            .any(|target| target.scope == FeedbackTargetScope::Workstream));
         assert_has_feedback_key(
             &targets.negative_targets,
             FeedbackTargetScope::ArtifactStableKey,
@@ -37559,6 +41402,10 @@ mod tests {
                 feedback_kind: "corrected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -37568,6 +41415,11 @@ mod tests {
             Some("artifact-wrong")
         );
         assert_eq!(feedback.workstream_id.as_deref(), Some("workstream-p4"));
+        assert!(feedback.normalized_targets.iter().any(|target| {
+            target.scope == feedback_policy::FeedbackPolicyTargetScope::StableKey
+                && target.id_or_key.starts_with("stable-key-hash-")
+                && target.polarity == FeedbackPolarity::Positive
+        }));
 
         let (target_stable_key, target_keys_json, is_positive, is_negative): (
             Option<String>,
@@ -37598,6 +41450,114 @@ mod tests {
             FeedbackTargetScope::TargetArtifact,
             "artifact-right",
         );
+    }
+
+    #[test]
+    fn p6_04_feedback_keeps_decision_time_task_scope_when_current_turn_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "INSERT INTO continue_task_turns (
+                task_turn_id, schema_version, started_at_ms, last_observed_at_ms,
+                material_fingerprint, selected, created_at_ms, updated_at_ms
+             ) VALUES ('turn-current', 'smalltalk.current_task_turn.v1', 2000, 2000,
+                       'current-fingerprint', 1, 2000, 2000)",
+            [],
+        )
+        .unwrap();
+
+        let feedback = record_continue_feedback(
+            &conn,
+            ContinueExplicitFeedbackRequest {
+                decision_id: Some("decision-p4".to_string()),
+                selected_candidate_id: None,
+                workstream_id: None,
+                target_artifact_id: None,
+                corrected_artifact_id: None,
+                feedback_kind: "accepted".to_string(),
+                note: None,
+                source: Some("desktop_ui".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(feedback.task_turn_id.as_deref(), Some("turn-p1"));
+        assert_eq!(feedback.session_id.as_deref(), Some("session-p1"));
+        assert_ne!(feedback.task_turn_id.as_deref(), Some("turn-current"));
+    }
+
+    #[test]
+    fn p6_04_inferred_island_navigation_never_writes_durable_positive_learning() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+
+        let feedback = insert_feedback_event(
+            &conn,
+            "decision-p4",
+            "corrected",
+            Some("frame-after-open"),
+            Some("artifact-wrong"),
+            Some("artifact-right"),
+            2_000,
+            0.7,
+            "behavior chose another artifact",
+            Some("island_primary"),
+        )
+        .unwrap();
+
+        assert_eq!(feedback.source.as_deref(), Some("island_primary"));
+        assert_eq!(feedback.provenance, "inferred_navigation");
+        let prior_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM continue_ranking_priors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pairwise_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_pairwise_preferences",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prior_count, 0);
+        assert_eq!(pairwise_count, 0);
+    }
+
+    #[test]
+    fn p6_04_exact_artifact_reject_does_not_suppress_workstream_sibling() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "feedback-reject-wrong",
+            "rejected",
+            "desktop_ui",
+            1_000,
+            Some("artifact-wrong"),
+            None,
+            Some("workstream-p4"),
+        );
+        let mut sibling = test_candidate(
+            "continue_edit",
+            Some(test_artifact("artifact-right", "code_editor", "lib.rs")),
+            Some(test_action("artifact-right", "editing")),
+            None,
+        );
+        sibling.id = "candidate-right".to_string();
+        sibling.workstream_id = "workstream-p4".to_string();
+
+        let aggregate = feedback_aggregate_for_scored_candidate_at(&conn, &sibling, 2_000).unwrap();
+        let decision = compute_feedback_decision(&aggregate, None, 2_000);
+
+        assert_eq!(decision.state, FeedbackSuppressionState::None);
+        assert_eq!(decision.negative_weight_since_reconfirmation, 0);
     }
 
     #[test]
@@ -38200,6 +42160,114 @@ mod tests {
     }
 
     #[test]
+    fn p6_04_feedback_policy_fingerprint_and_decay_transition_invalidate_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE frames (id INTEGER PRIMARY KEY, session_id TEXT)",
+            [],
+        )
+        .unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET evidence_watermark_hash='p1-cache-watermark',
+                 micro_inference_requested=0,
+                 latest_boundary_revision=NULL,
+                 feedback_policy_fingerprint='legacy-policy'",
+            [],
+        )
+        .unwrap();
+        let watermark = p1_cache_watermark();
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            continue_cache_bypass_reasons(&conn, None, &watermark, false)
+                .unwrap()
+                .contains(&"feedback_policy_version_changed".to_string())
+        );
+
+        conn.execute(
+            "UPDATE continue_decisions
+             SET feedback_policy_fingerprint=?1,
+                 next_feedback_transition_at_ms=?2",
+            params![FEEDBACK_POLICY_FINGERPRINT, current_time_millis() - 1],
+        )
+        .unwrap();
+        assert!(
+            fresh_cached_continue_decision(&conn, None, &watermark, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            continue_cache_bypass_reasons(&conn, None, &watermark, false)
+                .unwrap()
+                .contains(&"feedback_policy_transition_elapsed".to_string())
+        );
+    }
+
+    #[test]
+    fn p6_04_legacy_feedback_migration_is_idempotent_and_conservative() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE continue_feedback_events (
+                id TEXT PRIMARY KEY,
+                decision_id TEXT,
+                event_kind TEXT NOT NULL,
+                observed_frame_id TEXT,
+                target_artifact_id TEXT,
+                chosen_artifact_id TEXT,
+                timestamp_ms INTEGER NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                reason TEXT
+             );
+             INSERT INTO continue_feedback_events (
+                id, event_kind, target_artifact_id, timestamp_ms, confidence, reason
+             ) VALUES ('legacy-positive', 'auto_resumed', 'artifact-legacy', 1000, 0.9,
+                       'legacy row');",
+        )
+        .unwrap();
+
+        ensure_continue_schema(&conn).unwrap();
+        ensure_continue_schema(&conn).unwrap();
+
+        let (provenance, applies_from_ms, policy, migration): (
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT provenance, applies_from_ms, feedback_policy_version,
+                        migration_policy_version
+                 FROM continue_feedback_events WHERE id='legacy-positive'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(provenance, None);
+        assert_eq!(applies_from_ms, Some(1_000));
+        assert_eq!(policy.as_deref(), Some("legacy"));
+        assert_eq!(
+            migration.as_deref(),
+            Some(FEEDBACK_MIGRATION_POLICY_VERSION)
+        );
+
+        let results =
+            audit_feedback_event_against_current_task(&conn, "legacy-positive", 2_000).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| !result.eligible));
+        assert!(results.iter().all(|result| {
+            result
+                .rejection_reason_codes
+                .contains(&"inferred_source_cannot_promote".to_string())
+        }));
+    }
+
+    #[test]
     fn p1_explicit_rejected_feedback_bypasses_cached_decision_with_reason() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_continue_schema(&conn).unwrap();
@@ -38229,6 +42297,10 @@ mod tests {
                 feedback_kind: "rejected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -38456,6 +42528,10 @@ mod tests {
                 feedback_kind: "rejected".to_string(),
                 note: Some("raw https://example.com /Users/me/private.txt".to_string()),
                 source: Some("island_primary".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -38491,12 +42567,24 @@ mod tests {
             target_artifact_id: target_artifact_id.map(str::to_string),
             chosen_artifact_id: chosen_artifact_id.map(str::to_string),
             target_artifact_stable_key: target_artifact_stable_key.map(str::to_string),
+            chosen_artifact_stable_key: chosen_artifact_id.map(|id| format!("stable-{id}")),
             resume_work_target_artifact_id: None,
             timestamp_ms: 1_000,
             confidence: 1.0,
             reason: Some("test feedback".to_string()),
             note: None,
             source: Some("test".to_string()),
+            provenance: Some(
+                provenance_for_explicit_kind(event_kind)
+                    .as_str()
+                    .to_string(),
+            ),
+            task_turn_id: Some("turn-p1".to_string()),
+            session_id: Some("session-p1".to_string()),
+            branch_context_id: None,
+            applies_from_ms: Some(1_000),
+            expires_at_ms: None,
+            evidence_ids: Vec::new(),
         }
     }
 
@@ -38575,6 +42663,10 @@ mod tests {
                 feedback_kind: "ignored".to_string(),
                 note: Some(note.to_string()),
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -38596,14 +42688,21 @@ mod tests {
                 chosen_artifact_id, timestamp_ms, confidence, reason,
                 selected_candidate_id, workstream_id, note, source,
                 target_artifact_stable_key, feedback_target_keys_json,
-                is_positive_reconfirmation, is_negative_signal
+                is_positive_reconfirmation, is_negative_signal, provenance,
+                applies_from_ms, feedback_policy_version, migration_policy_version
              ) VALUES (
                 ?1, 'decision-p4', 'ignored', NULL, 'artifact-wrong',
                 NULL, ?2, 1.0, 'test ignored',
                 'candidate-wrong', 'workstream-p4', NULL, 'test',
-                'artifact-wrong', ?3, 0, 1
+                'artifact-wrong', ?3, 0, 1, 'explicit_user_ignore', ?2, ?4, ?5
              )",
-            params![id, timestamp_ms, target_keys_json],
+            params![
+                id,
+                timestamp_ms,
+                target_keys_json,
+                FEEDBACK_POLICY_VERSION,
+                FEEDBACK_MIGRATION_POLICY_VERSION
+            ],
         )
         .unwrap();
     }
@@ -38624,14 +42723,19 @@ mod tests {
                 chosen_artifact_id, timestamp_ms, confidence, reason,
                 selected_candidate_id, workstream_id, note, source,
                 target_artifact_stable_key, feedback_target_keys_json,
-                is_positive_reconfirmation, is_negative_signal
+                is_positive_reconfirmation, is_negative_signal, provenance,
+                applies_from_ms, feedback_policy_version, migration_policy_version
              ) VALUES (
                 'feedback-related-negative', NULL, 'rejected', NULL, 'artifact-wrong',
                 NULL, 2000, 1.0, 'related target rejected',
                 NULL, 'workstream-p4', NULL, 'test',
-                'artifact-wrong', ?1, 0, 1
+                'artifact-wrong', ?1, 0, 1, 'explicit_user_reject', 2000, ?2, ?3
              )",
-            params![target_keys_json],
+            params![
+                target_keys_json,
+                FEEDBACK_POLICY_VERSION,
+                FEEDBACK_MIGRATION_POLICY_VERSION
+            ],
         )
         .unwrap();
     }
@@ -38657,6 +42761,11 @@ mod tests {
         row.id = id.to_string();
         row.timestamp_ms = timestamp_ms;
         row.source = Some(source.to_string());
+        let provenance = if matches!(source, "inferred" | "auto" | "system") {
+            provenance_for_inferred_kind(event_kind)
+        } else {
+            provenance_for_explicit_kind(event_kind)
+        };
         let target_keys_json = feedback_event_target_keys_json(&row).unwrap();
         conn.execute(
             "INSERT INTO continue_feedback_events (
@@ -38664,12 +42773,14 @@ mod tests {
                 chosen_artifact_id, timestamp_ms, confidence, reason,
                 selected_candidate_id, workstream_id, note, source,
                 target_artifact_stable_key, feedback_target_keys_json,
-                is_positive_reconfirmation, is_negative_signal
+                is_positive_reconfirmation, is_negative_signal, provenance,
+                applies_from_ms, expires_at_ms, feedback_policy_version,
+                migration_policy_version, task_turn_id, session_id
              ) VALUES (
                 ?1, 'decision-p4', ?2, NULL, ?3,
                 ?4, ?5, 1.0, 'test feedback policy',
                 'candidate-wrong', ?6, NULL, ?7,
-                ?8, ?9, ?10, ?11
+                ?8, ?9, ?10, ?11, ?12, ?5, ?13, ?14, ?15, 'turn-p1', 'session-p1'
              )",
             params![
                 id,
@@ -38683,6 +42794,10 @@ mod tests {
                 target_keys_json,
                 feedback_event_is_positive_reconfirmation(event_kind) as i64,
                 feedback_event_is_negative_signal(event_kind) as i64,
+                provenance.as_str(),
+                default_expiry_ms(provenance, timestamp_ms),
+                FEEDBACK_POLICY_VERSION,
+                FEEDBACK_MIGRATION_POLICY_VERSION,
             ],
         )
         .unwrap();
@@ -38718,6 +42833,11 @@ mod tests {
             latest_semantic_moment_at_ms: None,
             latest_task_action_id: None,
             latest_task_action_at_ms: None,
+            latest_task_turn_id: None,
+            latest_task_turn_revision: None,
+            latest_task_turn_updated_at_ms: None,
+            semantic_graph_policy_fingerprint: None,
+            semantic_graph_material_fingerprint: None,
             latest_workstream_revision: None,
             latest_open_loop_revision: None,
             latest_boundary_revision: None,
@@ -38817,10 +42937,15 @@ mod tests {
                 id, requested_at_ms, source, current_focus_artifact_id,
                 selected_workstream_id, selected_candidate_id, return_target_artifact_id,
                 confidence, validation_status, continue_output_mode
+                , feedback_policy_fingerprint, semantic_graph_policy_fingerprint,
+                current_task_turn_id, session_id
              ) VALUES ('decision-p4', 1000, 'local_test', 'artifact-wrong',
                        'workstream-p4', 'candidate-wrong', 'artifact-wrong',
-                       0.7, 'valid', 'strong_continue')",
-            [],
+                       0.7, 'valid', 'strong_continue', ?1, ?2, 'turn-p1', 'session-p1')",
+            params![
+                FEEDBACK_POLICY_FINGERPRINT,
+                SEMANTIC_GRAPH_POLICY_FINGERPRINT
+            ],
         )
         .unwrap();
     }
@@ -38828,6 +42953,7 @@ mod tests {
     fn test_extracted_action(frame_id: &str, confidence: f64) -> ExtractedTaskAction {
         ExtractedTaskAction {
             id: format!("action-{}", frame_id),
+            task_turn_id: Some("task-turn-test".to_string()),
             frame_id: frame_id.to_string(),
             previous_frame_id: None,
             artifact_id: Some("artifact-code".to_string()),
@@ -38866,6 +42992,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_actions_do_not_collapse_across_task_turn_boundary() {
+        let first = test_extracted_action("1", 0.80);
+        let mut second = test_extracted_action("2", 0.82);
+        second.task_turn_id = Some("task-turn-new-request".to_string());
+
+        let collapsed = collapse_repeated_task_actions(vec![first, second]);
+
+        assert_eq!(collapsed.len(), 2);
+        assert_ne!(collapsed[0].task_turn_id, collapsed[1].task_turn_id);
+    }
+
     fn branch_test_frame(
         app_name: Option<&str>,
         window_name: Option<&str>,
@@ -38889,6 +43027,7 @@ mod tests {
             background_text: None,
             full_text_quality: None,
             text_quality_flags: Vec::new(),
+            structured_semantic_text: None,
             content_hash: None,
             image_hash: None,
             privacy_status: None,
@@ -39390,6 +43529,7 @@ mod tests {
     fn test_action(artifact_id: &str, action_kind: &str) -> ScorerAction {
         ScorerAction {
             id: format!("action-{}", action_kind),
+            task_turn_id: Some("task-turn-test".to_string()),
             frame_id: "1".to_string(),
             artifact_id: Some(artifact_id.to_string()),
             secondary_artifact_id: None,
@@ -39413,6 +43553,9 @@ mod tests {
         ScorerOpenLoop {
             id: "open-loop-test".to_string(),
             workstream_id: "workstream-test".to_string(),
+            task_turn_id: None,
+            parent_task_turn_id: None,
+            origin_task_turn_id: None,
             state: "open".to_string(),
             boundary_kind: boundary_kind.to_string(),
             quality: "strong".to_string(),
@@ -39432,6 +43575,12 @@ mod tests {
             unfinished_state: Some("quality gate still needed validation".to_string()),
             next_evidence_backed_action: Some("wire quality gate into decision output".to_string()),
             current_focus_relation: Some("branch_support_return_to_primary".to_string()),
+            relation_to_current_task: "same_task".to_string(),
+            freshness: "current_turn".to_string(),
+            eligible_for_primary: true,
+            eligible_for_objective: true,
+            eligible_for_last_state: true,
+            eligibility_reason_codes: Vec::new(),
             missing_fields: Vec::new(),
             evidence_spans: Vec::new(),
             local_reason: Some("test_open_loop".to_string()),
@@ -39470,6 +43619,79 @@ mod tests {
             last_meaningful_action: action,
             open_loops: open_loop.into_iter().collect(),
         }
+    }
+
+    fn test_current_task_turn() -> CurrentTaskTurn {
+        CurrentTaskTurn {
+            schema_version: "smalltalk.current_task_turn.v1".to_string(),
+            task_turn_id: "task-turn-test".to_string(),
+            session_id: Some("session-test".to_string()),
+            surface_key_hash: None,
+            artifact_id: Some("artifact-current".to_string()),
+            workstream_id: Some("workstream-test".to_string()),
+            started_at_ms: 900,
+            last_observed_at_ms: 1_000,
+            latest_user_goal_summary: Some("Finish the Continue quality gate".to_string()),
+            latest_user_goal_hash: None,
+            latest_user_goal_redaction_status: "public_safe".to_string(),
+            task_object: Some("continue_quality_gate".to_string()),
+            task_object_hash: None,
+            task_object_redaction_status: "public_safe".to_string(),
+            task_kind: "implementation".to_string(),
+            current_actor: task_turn::TaskTurnActor::AssistantOrAgent,
+            actor_activity_state: Some("editing".to_string()),
+            actor_activity_state_hash: None,
+            actor_activity_state_redaction_status: "public_safe".to_string(),
+            execution_state: task_turn::TaskExecutionState::Active,
+            waiting_on: task_turn::TaskTurnWaitingOn::Agent,
+            relation_to_prior: task_turn::TaskTurnRelation::NewTask,
+            prior_task_turn_id: Some("task-turn-prior".to_string()),
+            supersedes_task_turn_id: None,
+            parent_task_turn_id: None,
+            latest_user_span_ids: vec!["span-current".to_string()],
+            current_state_span_ids: vec!["span-agent".to_string()],
+            prior_boundary_span_ids: Vec::new(),
+            supporting_action_ids: vec!["action-editing".to_string()],
+            supporting_event_ids: Vec::new(),
+            evidence_quality: "strong".to_string(),
+            goal_confidence: 0.95,
+            task_object_confidence: 0.92,
+            actor_state_confidence: 0.90,
+            execution_state_confidence: 0.91,
+            waiting_on_confidence: 0.89,
+            relation_confidence: 0.90,
+            attribution_confidence: 0.94,
+            missing_evidence: Vec::new(),
+            quality_flags: Vec::new(),
+            reason_codes: vec!["explicit_user_goal".to_string()],
+            revision: 1,
+            selected: true,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn strong_stale_resolved_loop_cannot_win_current_task_open_loop_selection() {
+        let artifact = test_artifact("artifact-current", "document", "continuation.rs");
+        let mut current = test_open_loop("artifact-current", "unfinished_edit");
+        current.id = "loop-current".to_string();
+        current.task_turn_id = Some("task-turn-test".to_string());
+        current.quality = "thin".to_string();
+        current.confidence = 0.51;
+        let mut stale = test_open_loop("artifact-current", "completed_progress");
+        stale.id = "loop-stale".to_string();
+        stale.task_turn_id = Some("task-turn-prior".to_string());
+        stale.state = "completed".to_string();
+        stale.quality = "strong".to_string();
+        stale.confidence = 0.99;
+        stale.last_updated_at_ms = 2_000;
+        let mut workstream = test_workstream(artifact, "primary_target", None, None);
+        workstream.open_loops = vec![stale, current];
+
+        let selected = best_open_loop_for_workstream(&workstream, Some(&test_current_task_turn()))
+            .expect("current loop should remain eligible");
+
+        assert_eq!(selected.id, "loop-current");
     }
 
     fn test_candidate(
@@ -39593,6 +43815,111 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn p6_08_human_label_and_frame_fallback_never_become_public_targets() {
+        let mut target = test_artifact(
+            "artifact-preview",
+            "coding_agent_thread",
+            "Capture investigation",
+        );
+        target.browser_url = None;
+        target.document_path = None;
+        target.openability = "frame_fallback".to_string();
+        let candidate = test_candidate(
+            "continue_current_work",
+            Some(target),
+            Some(test_action("artifact-preview", "investigating")),
+            None,
+        );
+
+        assert!(candidate_has_human_return_target(&candidate));
+        assert!(!candidate_exposes_public_return_target(
+            &candidate,
+            &ContinueOutputMode::StrongContinue,
+        ));
+        let policy = direct_target_policy_for_candidate(Some(&candidate), None);
+        assert!(!policy.direct_target_allowed);
+        assert!(policy.evidence_preview_available);
+        assert!(policy
+            .reason_codes
+            .contains(&"no_validated_direct_locator".to_string()));
+    }
+
+    #[test]
+    fn p6_08_task_truth_survives_when_only_evidence_preview_exists() {
+        let mut target = test_artifact(
+            "artifact-preview",
+            "coding_agent_thread",
+            "Capture investigation",
+        );
+        target.browser_url = None;
+        target.document_path = None;
+        target.openability = "frame_fallback".to_string();
+        let candidate = test_candidate(
+            "continue_current_work",
+            Some(target),
+            Some(test_action("artifact-preview", "investigating")),
+            None,
+        );
+        let turn = test_current_task_turn();
+        let policy = direct_target_policy_for_candidate(Some(&candidate), Some(&turn));
+        let preview = evidence_preview_for_candidate(Some(&candidate));
+        let truth = target_truth_for_decision(
+            Some(&candidate),
+            Some(&turn),
+            None,
+            &policy,
+            None,
+            preview.as_ref(),
+        );
+
+        assert_eq!(truth.state, "task_known_target_unknown");
+        assert!(truth
+            .reason_codes
+            .contains(&"frame_preview_only".to_string()));
+        assert!(truth
+            .reason_codes
+            .contains(&"task_known_target_unknown".to_string()));
+        assert_eq!(
+            why_no_safe_target_for_truth(&truth),
+            "I know the task, but I do not have a direct page or file locator."
+        );
+        let recap = ContinueActivityRecap {
+            primary_work_summary: Some(
+                "Investigating what the island Capture button does in Smalltalk.".to_string(),
+            ),
+            last_meaningful_state: Some(
+                "The agent was tracing the Swift bridge and Rust handler.".to_string(),
+            ),
+            next_action_summary: Some(
+                "Wait for the tracing result or inspect the implementation evidence.".to_string(),
+            ),
+            ..ContinueActivityRecap::default()
+        };
+        let answer = compose_interruption_recovery_answer(
+            Some(&turn),
+            None,
+            &recap,
+            None,
+            preview.as_ref(),
+            &truth,
+            &CompactConfidenceSummary::default(),
+        );
+        assert!(answer
+            .what_you_were_doing
+            .as_deref()
+            .is_some_and(|value| value.contains("Capture button")));
+        assert!(answer
+            .where_you_left_off
+            .as_deref()
+            .is_some_and(|value| value.contains("Swift bridge") && value.contains("Rust handler")));
+        assert_eq!(answer.action, "inspect_evidence");
+        assert_eq!(
+            answer.target_note.as_deref(),
+            Some("I know the task, but I do not have a direct page or file locator.")
+        );
+    }
+
     fn test_current_surface(
         artifact_id: Option<&str>,
         app_name: &str,
@@ -39638,6 +43965,145 @@ mod tests {
                 "current_surface:no_direct_url_or_path".to_string(),
             ],
         }
+    }
+
+    fn test_work_truth_focus(
+        artifact_id: &str,
+        app_name: &str,
+        title: &str,
+        activity_state: Option<&str>,
+        observed_at_ms: i64,
+    ) -> ContinueFocusSummary {
+        ContinueFocusSummary {
+            frame_id: "frame-work-truth".into(),
+            artifact_id: Some(artifact_id.into()),
+            artifact_kind: Some("code_file".into()),
+            app_name: Some(app_name.into()),
+            window_title: Some(title.into()),
+            title: Some(title.into()),
+            browser_url: None,
+            document_path: Some(format!("/tmp/{title}")),
+            display_title: Some(title.into()),
+            domain: None,
+            activity_state: activity_state.map(str::to_string),
+            task_state: None,
+            evidence_quality: Some("strong".into()),
+            identity_confidence: Some(0.92),
+            snapshot_id: Some("snapshot-work-truth".into()),
+            missing_fields: Vec::new(),
+            openability: Some("openable".into()),
+            captured_at_ms: observed_at_ms,
+        }
+    }
+
+    #[test]
+    fn session_016_editor_activity_is_supported_without_chat_evidence() {
+        let now_ms = 500_000;
+        let title = "tt2-05-completion-audit.md";
+        let focus = test_work_truth_focus(
+            "artifact-session-016-md",
+            "Visual Studio Code",
+            title,
+            Some("actively_editing"),
+            now_ms,
+        );
+        let mut surface = test_current_surface(
+            Some("artifact-session-016-md"),
+            "Visual Studio Code",
+            title,
+            now_ms,
+            false,
+        );
+        surface.document_path = Some(format!("/tmp/{title}"));
+        surface.openability = "openable".into();
+        surface.identity_confidence = Some(0.92);
+        surface.evidence_quality = "strong".into();
+        surface.activity_state = Some("actively_editing".into());
+
+        let truth = derive_continue_work_truth(
+            None,
+            false,
+            Some(&focus),
+            &surface,
+            &ContinueAppActivityIntelligence::default(),
+            now_ms,
+        );
+
+        assert_eq!(truth.resolution_status, "activity_supported");
+        assert_eq!(truth.activity_kind, "editing");
+        assert_eq!(
+            truth.activity_summary.as_deref(),
+            Some("Editing tt2-05-completion-audit.md")
+        );
+        assert_eq!(
+            truth.artifact_id.as_deref(),
+            Some("artifact-session-016-md")
+        );
+        assert!(!truth.broader_goal_known);
+        assert!(truth.supports_direct_target());
+    }
+
+    #[test]
+    fn brief_browser_visit_remains_recent_activity_only() {
+        let now_ms = 600_000;
+        let mut focus =
+            test_work_truth_focus("artifact-instagram", "Helium", "Instagram", None, now_ms);
+        focus.artifact_kind = Some("browser_tab".into());
+        focus.browser_url = Some("https://www.instagram.com/".into());
+        focus.document_path = None;
+        let mut surface = test_current_surface(
+            Some("artifact-instagram"),
+            "Helium",
+            "Instagram",
+            now_ms,
+            false,
+        );
+        surface.artifact_kind = "browser_tab".into();
+        surface.browser_url = focus.browser_url.clone();
+
+        let truth = derive_continue_work_truth(
+            None,
+            false,
+            Some(&focus),
+            &surface,
+            &ContinueAppActivityIntelligence::default(),
+            now_ms,
+        );
+
+        assert_eq!(truth.resolution_status, "recent_activity_only");
+        assert_eq!(truth.primary_relation, "recent_only");
+        assert_eq!(
+            truth.activity_summary.as_deref(),
+            Some("Browsing Instagram")
+        );
+    }
+
+    #[test]
+    fn self_surface_cannot_establish_work_truth() {
+        let now_ms = 700_000;
+        let focus = test_work_truth_focus(
+            "artifact-smalltalk",
+            "Smalltalk",
+            "Continue diagnostics",
+            Some("actively_editing"),
+            now_ms,
+        );
+        let surface = test_current_surface(
+            Some("artifact-smalltalk"),
+            "Smalltalk",
+            "Continue diagnostics",
+            now_ms,
+            true,
+        );
+        let truth = derive_continue_work_truth(
+            None,
+            false,
+            Some(&focus),
+            &surface,
+            &ContinueAppActivityIntelligence::default(),
+            now_ms,
+        );
+        assert_eq!(truth.resolution_status, "unresolved");
     }
 
     fn stale_suppression_audit_for_test(
@@ -39808,6 +44274,7 @@ mod tests {
         let ctx = CandidateGenerationContext {
             now_ms: 120_000,
             workstreams: &[workstream],
+            current_task_turn: None,
             current_focus: None,
             active_current_work_unresolved: Some(&active),
         };
@@ -39878,6 +44345,7 @@ mod tests {
         let ctx = CandidateGenerationContext {
             now_ms: 120_000,
             workstreams: &workstreams,
+            current_task_turn: None,
             current_focus: None,
             active_current_work_unresolved: Some(&active),
         };
@@ -39959,6 +44427,7 @@ mod tests {
         let ctx = CandidateGenerationContext {
             now_ms: 130_000,
             workstreams: std::slice::from_ref(&workstream),
+            current_task_turn: None,
             current_focus: Some(&focus),
             active_current_work_unresolved: Some(&active),
         };
@@ -40012,6 +44481,7 @@ mod tests {
         let ctx = CandidateGenerationContext {
             now_ms: 120_000,
             workstreams: std::slice::from_ref(&workstream),
+            current_task_turn: None,
             current_focus: None,
             active_current_work_unresolved: Some(&active),
         };
@@ -40210,6 +44680,7 @@ mod tests {
         let ctx = CandidateGenerationContext {
             now_ms: 121_000,
             workstreams: &workstreams,
+            current_task_turn: None,
             current_focus: None,
             active_current_work_unresolved: Some(&active),
         };
@@ -40593,15 +45064,45 @@ mod tests {
             }),
             active_current_work_unresolved: None,
             p0_quality_signals: P0QualitySignals::default(),
+            work_truth: ContinueWorkTruth::unresolved(current_time_millis(), "test_fixture"),
             current_activity: Some("Reviewing local evidence".to_string()),
+            current_task_turn: None,
+            task_resolution_status: "current_task_supported".to_string(),
+            task_resolution_reason_codes: vec!["test_fixture".to_string()],
+            supported_surface: Some("Helium".to_string()),
+            alternative_hypotheses: Vec::new(),
+            request_trigger: "manual".to_string(),
+            task_understanding_source: "local_task_turn_evidence".to_string(),
+            wording_source: "local_deterministic".to_string(),
+            target_selection_source: "local_validated_target_policy".to_string(),
+            task_truth_v2: Default::default(),
             selected_workstream: Some(ContinueSelectedWorkstream {
                 workstream_id: "workstream-p5".to_string(),
+                selected_by_task_turn_id: None,
+                relation_to_current_task: "unknown".to_string(),
+                selection_reason_codes: Vec::new(),
                 state: "active".to_string(),
                 title_candidate: Some("P5 Continue".to_string()),
                 primary_artifact_id: Some("artifact-old".to_string()),
                 last_active_timestamp_ms: current_time_millis().saturating_sub(20 * 60 * 1000),
                 unresolved_signal: Some("visible_error_or_failure".to_string()),
             }),
+            semantic_graph_policy_version: SEMANTIC_GRAPH_POLICY_VERSION.to_string(),
+            cross_layer_consistency: CrossLayerConsistencyResult::default(),
+            direct_target_policy: DirectTargetPolicyResult::default(),
+            target_truth: ContinueTargetTruth {
+                schema: "smalltalk.continue_target_truth.v1".to_string(),
+                state: "thin_task_seen".to_string(),
+                reason_codes: vec!["frame_preview_only".to_string()],
+            },
+            evidence_preview: Some(ContinueEvidencePreview {
+                schema: "smalltalk.continue_evidence_preview.v1".to_string(),
+                preview_kind: "frame".to_string(),
+                frame_id: "event-browser".to_string(),
+            }),
+            confidence_vector: ContinueConfidenceVector::default(),
+            confidence_summary: CompactConfidenceSummary::default(),
+            legacy_confidence_derivation: LegacyConfidenceDerivation::default(),
             selected_candidate_id: Some("candidate-old".to_string()),
             return_target: Some(ContinueReturnTarget {
                 artifact_id: Some("artifact-old".to_string()),
@@ -40645,6 +45146,8 @@ mod tests {
             generated_candidates: 2,
             validation_status: "thin_evidence".to_string(),
             feedback_policy_version: FEEDBACK_POLICY_VERSION.to_string(),
+            feedback_policy_fingerprint: FEEDBACK_POLICY_FINGERPRINT.to_string(),
+            next_feedback_transition_at_ms: None,
             feedback_watermark_ms: None,
             open_watermark_ms: None,
             feedback_suppressed_candidate_count: 0,
@@ -40691,6 +45194,7 @@ mod tests {
             app_activity: None,
             activity_summary: None,
             activity_recap: ContinueActivityRecap::default(),
+            answer: ContinueInterruptionRecoveryAnswer::default(),
             activity_recap_watermark_hash: String::new(),
             activity_recap_synthesis_audit: Default::default(),
             activity_recap_proof: Default::default(),
@@ -41022,6 +45526,7 @@ mod tests {
         };
         let youtube_action = ScorerAction {
             id: "action-youtube".to_string(),
+            task_turn_id: Some("task-turn-youtube".to_string()),
             frame_id: "1664".to_string(),
             artifact_id: Some(youtube.id.clone()),
             secondary_artifact_id: None,
@@ -41041,6 +45546,7 @@ mod tests {
         };
         let smalltalk_action = ScorerAction {
             id: "action-smalltalk".to_string(),
+            task_turn_id: Some("task-turn-smalltalk".to_string()),
             frame_id: "1667".to_string(),
             artifact_id: Some(smalltalk.id.clone()),
             secondary_artifact_id: None,
@@ -41497,19 +46003,24 @@ mod tests {
     }
 
     #[test]
-    fn p5_sufficiency_classifier_requests_probe_for_thin_frame_fallback() {
+    fn p6_06_sufficiency_targets_missing_task_dimension_not_frame_target() {
         let result = p5_thin_frame_fallback_decision();
 
         let sufficiency = assess_continue_evidence_sufficiency(&result);
 
         assert_eq!(sufficiency.status, EvidenceSufficiencyStatus::NeedsProbe);
+        assert_eq!(
+            sufficiency.desired_claim,
+            Some(ConfidenceClaim::ActivityRecap)
+        );
         assert!(sufficiency
-            .reasons
-            .contains(&NeedMoreEvidenceReason::FrameFallbackOnly));
-        assert!(sufficiency
-            .reasons
-            .contains(&NeedMoreEvidenceReason::MissingUrlOrPath));
-        assert!(sufficiency
+            .below_threshold_dimensions
+            .contains(&ConfidenceDimension::SpeakerAttribution));
+        assert_eq!(
+            sufficiency.selected_probe,
+            Some(EvidenceProbeKind::AccessibilityTextProbe)
+        );
+        assert!(!sufficiency
             .requested_probes
             .contains(&EvidenceProbeKind::BrowserUrlProbe));
         assert!(!sufficiency.allow_heavy_capture);
@@ -41544,12 +46055,72 @@ mod tests {
             privacy_status: Some("normal".to_string()),
             warnings: vec!["no_new_metadata".to_string()],
             errors: Vec::new(),
+            deadline_at_ms: request.deadline_at_ms,
+            status: EvidenceProbeStatus::SucceededNoChange,
+            per_probe_outcomes: Vec::new(),
+            evidence_record_ids: Vec::new(),
+            dimensions_changed: Vec::new(),
+            stale_result: false,
+            material_evidence_hash_before: request.source_surface_fingerprint.clone(),
+            material_evidence_hash_after: request.source_surface_fingerprint.clone(),
         };
+        let before = build_continue_evidence_watermark(&conn, None).unwrap();
         record_continue_evidence_probe_result(&conn, &request, &probe_result).unwrap();
+        let after = build_continue_evidence_watermark(&conn, None).unwrap();
 
         let repeated = build_need_more_evidence_request_from_decision(&conn, &result).unwrap();
 
         assert!(repeated.is_none());
+        assert_eq!(before.hash, after.hash);
+    }
+
+    #[test]
+    fn p6_06_probe_rerun_requires_non_stale_material_dimension_change() {
+        let base = NeedMoreEvidenceProbeResult {
+            request_id: "request".to_string(),
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            probes_attempted: vec![EvidenceProbeKind::ActiveWindowProbe],
+            probes_succeeded: vec![EvidenceProbeKind::ActiveWindowProbe],
+            evidence_changed: true,
+            privacy_blocked: false,
+            observation_id: Some("observation".to_string()),
+            app_name: Some("Codex".to_string()),
+            app_bundle_id: Some("com.openai.codex".to_string()),
+            window_title: Some("P6".to_string()),
+            browser_url: None,
+            document_path: None,
+            accessibility_text_char_count: 0,
+            window_count: 1,
+            privacy_status: Some("normal".to_string()),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            deadline_at_ms: 100,
+            status: EvidenceProbeStatus::SucceededChangedEvidence,
+            per_probe_outcomes: Vec::new(),
+            evidence_record_ids: vec!["observation".to_string()],
+            dimensions_changed: vec![ConfidenceDimension::SurfaceIdentity],
+            stale_result: false,
+            material_evidence_hash_before: "before".to_string(),
+            material_evidence_hash_after: "after".to_string(),
+        };
+        assert!(probe_result_allows_rerun(&base));
+        for status in [
+            EvidenceProbeStatus::SucceededNoChange,
+            EvidenceProbeStatus::TimedOut,
+            EvidenceProbeStatus::PrivacyBlocked,
+            EvidenceProbeStatus::Failed,
+        ] {
+            let mut result = base.clone();
+            result.status = status;
+            assert!(!probe_result_allows_rerun(&result));
+        }
+        let mut stale = base.clone();
+        stale.stale_result = true;
+        assert!(!probe_result_allows_rerun(&stale));
+        let mut no_dimension_delta = base;
+        no_dimension_delta.dimensions_changed.clear();
+        assert!(!probe_result_allows_rerun(&no_dimension_delta));
     }
 
     #[test]
@@ -41573,6 +46144,14 @@ mod tests {
             source_decision_id: "decision-test".to_string(),
             source_evidence_watermark_hash: "watermark-before".to_string(),
             created_at_ms: 10_000,
+            desired_claim: ConfidenceClaim::DirectTarget,
+            requested_dimensions: vec![ConfidenceDimension::TargetIdentity],
+            selected_probe: EvidenceProbeKind::DocumentPathProbe,
+            surface_key: "cursor:continuation.rs".to_string(),
+            deadline_at_ms: 11_500,
+            success_criteria: "new document path".to_string(),
+            failure_behavior: "do not rerun".to_string(),
+            source_surface_fingerprint: "before".to_string(),
         };
         let probe_result = NeedMoreEvidenceProbeResult {
             request_id: request.id.clone(),
@@ -41593,6 +46172,14 @@ mod tests {
             privacy_status: Some("normal".to_string()),
             warnings: Vec::new(),
             errors: Vec::new(),
+            deadline_at_ms: request.deadline_at_ms,
+            status: EvidenceProbeStatus::SucceededChangedEvidence,
+            per_probe_outcomes: Vec::new(),
+            evidence_record_ids: vec!["probe-current-cursor".to_string()],
+            dimensions_changed: vec![ConfidenceDimension::TargetIdentity],
+            stale_result: false,
+            material_evidence_hash_before: "before".to_string(),
+            material_evidence_hash_after: "after".to_string(),
         };
         let before = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
         record_continue_evidence_probe_result(&conn, &request, &probe_result).unwrap();
@@ -41684,6 +46271,98 @@ mod tests {
             after.latest_ui_event_id.as_deref(),
             Some("event-high-value")
         );
+    }
+
+    #[test]
+    fn semantic_graph_watermark_changes_for_task_workstream_ownership_revision() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        let empty = semantic_graph_material_fingerprint(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO continue_task_turn_workstream_memberships (
+               task_turn_id, workstream_id, relation_to_current_task,
+               membership_score, selected, evidence_action_ids_json,
+               reason_codes_json, revision, created_at_ms, updated_at_ms
+             ) VALUES ('task-current','workstream-current','same_task',0.9,1,
+                       '[\"action-current\"]','[\"task_action_match\"]',1,1000,1000)",
+            [],
+        )
+        .unwrap();
+        let first = semantic_graph_material_fingerprint(&conn).unwrap();
+        conn.execute(
+            "UPDATE continue_task_turn_workstream_memberships
+             SET revision=2, reason_codes_json='[\"task_action_match\",\"artifact_match\"]',
+                 updated_at_ms=2000
+             WHERE task_turn_id='task-current' AND workstream_id='workstream-current'",
+            [],
+        )
+        .unwrap();
+        let revised = semantic_graph_material_fingerprint(&conn).unwrap();
+
+        assert_ne!(empty, first);
+        assert_ne!(first, revised);
+    }
+
+    #[test]
+    fn decision_scoped_conflict_filter_preserves_durable_historical_loop() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        conn.execute(
+            "INSERT INTO continue_workstreams (
+               id, state, title_candidate, created_at_ms,
+               last_active_timestamp_ms, confidence, source
+             ) VALUES ('workstream-history','historical','Prior task',100,100,0.9,'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_open_loops (
+               id, workstream_id, state, boundary_kind, quality, confidence,
+               objective_hint, local_reason, first_seen_at_ms, last_updated_at_ms,
+               task_turn_id, relation_to_current_task, freshness,
+               eligible_for_primary, eligible_for_objective, eligible_for_last_state
+             ) VALUES ('loop-history','workstream-history','completed','completed_progress',
+                       'strong',0.99,'Continue prior task','historical_test',100,100,
+                       'task-prior','superseded_task','historical',0,0,0)",
+            [],
+        )
+        .unwrap();
+        let eligibility = evaluate_semantic_eligibility(&SemanticEligibilityInput {
+            entity_kind: "open_loop".to_string(),
+            entity_id: "loop-history".to_string(),
+            current_task_turn_id: Some("task-current".to_string()),
+            current_workstream_id: Some("workstream-current".to_string()),
+            owner_task_turn_id: Some("task-prior".to_string()),
+            owner_workstream_id: Some("workstream-history".to_string()),
+            parent_task_turn_id: None,
+            origin_task_turn_id: Some("task-prior".to_string()),
+            relation_hint: Some(RelationToCurrentTask::SupersededTask),
+            lifecycle_state: Some("completed".to_string()),
+            current_task_started_at_ms: Some(1_000),
+            entity_updated_at_ms: Some(100),
+            supporting_evidence_ids: vec!["action-prior".to_string()],
+        });
+        persist_semantic_eligibility(&conn, "decision-current", &eligibility, 1_100).unwrap();
+
+        let durable_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_open_loops WHERE id='loop-history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted_projection: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT eligible_for_primary, eligible_for_objective, eligible_for_last_state
+                 FROM continue_semantic_eligibility_evaluations
+                 WHERE decision_id='decision-current' AND entity_id='loop-history'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(durable_rows, 1);
+        assert_eq!(persisted_projection, (0, 0, 0));
     }
 
     #[test]
@@ -43429,6 +48108,7 @@ mod tests {
     ) -> BranchPromotionActionEvidence {
         BranchPromotionActionEvidence {
             action_id: id.to_string(),
+            task_turn_id: Some("turn-test".to_string()),
             action_kind: kind.to_string(),
             action_role: role.to_string(),
             branch_kind: None,
@@ -43448,7 +48128,9 @@ mod tests {
             branch_started_at_ms: 1_000,
             returned_to_origin_at_ms: None,
             feedback_hard_suppressed: false,
-            feedback_positive_kind: None,
+            current_task_turn_id: Some("turn-test".to_string()),
+            eligible_feedback: None,
+            rejected_feedback: Vec::new(),
             has_origin: true,
             actions,
         }
@@ -43475,6 +48157,41 @@ mod tests {
         assert_eq!(decision.promotion_state.as_str(), "promoted_primary");
         assert!(decision.public_return_eligible);
         assert_eq!(decision.evidence_action_ids, vec!["action-edit"]);
+    }
+
+    #[test]
+    fn promoted_old_task_branch_cannot_become_current_primary() {
+        let mut old_action = promotion_action("action-old-edit", "editing", "primary", 2_000);
+        old_action.task_turn_id = Some("turn-prior".to_string());
+        let decision = evaluate_branch_promotion(branch_promotion_input(
+            "documentation_reference",
+            vec![old_action],
+        ));
+
+        assert_eq!(decision.promotion_state.as_str(), "unpromoted");
+        assert!(!decision.public_return_eligible);
+        assert!(decision.evidence_action_ids.is_empty());
+    }
+
+    #[test]
+    fn return_to_origin_clears_stale_branch_primacy() {
+        let mut input = branch_promotion_input(
+            "documentation_reference",
+            vec![promotion_action("action-edit", "editing", "primary", 2_000)],
+        );
+        input.returned_to_origin_at_ms = Some(3_000);
+
+        let decision = evaluate_branch_promotion(input);
+
+        assert_eq!(decision.promotion_state.as_str(), "unpromoted");
+        assert!(!decision.public_return_eligible);
+        assert_eq!(
+            decision.promotion_reason,
+            "returned_to_origin_clears_branch_primacy"
+        );
+        assert!(decision
+            .warnings
+            .contains(&"branch_promotion:returned_to_origin".to_string()));
     }
 
     #[test]
@@ -43544,12 +48261,161 @@ mod tests {
     #[test]
     fn branch_promotion_positive_feedback_promotes_branch() {
         let mut input = branch_promotion_input("search_branch", Vec::new());
-        input.feedback_positive_kind = Some("corrected".to_string());
+        input.eligible_feedback = Some(BranchEligibleFeedback {
+            event_id: "feedback-corrected".to_string(),
+            event_kind: "corrected".to_string(),
+            provenance: FeedbackProvenance::ExplicitUserCorrect,
+            occurred_at_ms: 1_001,
+            confidence: 1.0,
+        });
 
         let decision = evaluate_branch_promotion(input);
 
         assert_eq!(decision.promotion_state.as_str(), "promoted_user_corrected");
         assert!(decision.public_return_eligible);
+    }
+
+    #[test]
+    fn p6_04_stale_inferred_surface_feedback_is_rejected_for_branch_promotion() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "feedback-stale-inferred",
+            "auto_resumed",
+            "inferred",
+            1_000,
+            Some("artifact-right"),
+            None,
+            Some("workstream-p4"),
+        );
+        conn.execute(
+            "UPDATE continue_feedback_events
+             SET source='island_primary', task_turn_id=NULL, session_id=NULL
+             WHERE id='feedback-stale-inferred'",
+            [],
+        )
+        .unwrap();
+
+        let evaluation = evaluate_feedback_for_branch_promotion(
+            &conn,
+            "branch-current",
+            "artifact-right",
+            Some("workstream-p4"),
+            Some("turn-current"),
+            Some("session-current"),
+            2_000,
+            2_000_000,
+            false,
+        )
+        .unwrap();
+
+        assert!(evaluation.eligible.is_none());
+        let reasons = evaluation.rejection_reasons();
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.ends_with(":inferred_source_cannot_promote")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.ends_with(":predates_branch")));
+        assert!(reasons.iter().any(|reason| reason.ends_with(":expired")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.ends_with(":different_task_turn")));
+        assert!(reasons
+            .iter()
+            .any(|reason| { reason.ends_with(":different_session_without_durable_scope") }));
+        let provenance: String = conn
+            .query_row(
+                "SELECT provenance FROM continue_feedback_policy_evaluations
+                 WHERE event_id='feedback-stale-inferred' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance, "inferred_return");
+    }
+
+    #[test]
+    fn p6_04_fresh_same_turn_explicit_correction_can_promote_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "feedback-fresh-correction",
+            "corrected",
+            "desktop_ui",
+            2_000,
+            Some("artifact-wrong"),
+            Some("artifact-right"),
+            Some("workstream-p4"),
+        );
+
+        let evaluation = evaluate_feedback_for_branch_promotion(
+            &conn,
+            "branch-current",
+            "artifact-right",
+            Some("workstream-p4"),
+            Some("turn-p1"),
+            Some("session-p1"),
+            1_500,
+            2_500,
+            false,
+        )
+        .unwrap();
+
+        let eligible = evaluation.eligible.unwrap();
+        assert_eq!(eligible.event_id, "feedback-fresh-correction");
+        assert_eq!(eligible.event_kind, "corrected");
+        assert_eq!(eligible.provenance, FeedbackProvenance::ExplicitUserCorrect);
+    }
+
+    #[test]
+    fn p6_04_newer_negative_supersedes_older_positive_branch_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        insert_policy_feedback_row(
+            &conn,
+            "feedback-positive-old",
+            "corrected",
+            "desktop_ui",
+            2_000,
+            Some("artifact-wrong"),
+            Some("artifact-right"),
+            Some("workstream-p4"),
+        );
+        insert_policy_feedback_row(
+            &conn,
+            "feedback-negative-new",
+            "rejected",
+            "desktop_ui",
+            2_100,
+            Some("artifact-right"),
+            None,
+            Some("workstream-p4"),
+        );
+
+        let evaluation = evaluate_feedback_for_branch_promotion(
+            &conn,
+            "branch-current",
+            "artifact-right",
+            Some("workstream-p4"),
+            Some("turn-p1"),
+            Some("session-p1"),
+            1_500,
+            2_500,
+            false,
+        )
+        .unwrap();
+
+        assert!(evaluation.eligible.is_none());
+        assert!(evaluation
+            .rejection_reasons()
+            .iter()
+            .any(|reason| { reason.ends_with(":superseded_by_newer_feedback") }));
     }
 
     #[test]
@@ -45218,8 +50084,8 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*)
                  FROM continue_open_loops
-                 WHERE boundary_kind = 'search_branch_without_return'
-                   AND state = 'resolved'
+                 WHERE boundary_kind = 'returned_from_search'
+                   AND state = 'closed'
                    AND resume_work_artifact_id = ?1",
                 params![editor_artifact],
                 |row| row.get(0),
@@ -45414,8 +50280,8 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*)
                  FROM continue_open_loops
-                 WHERE boundary_kind = 'error_without_resolution'
-                   AND state = 'resolved'",
+                 WHERE boundary_kind = 'resolved_error'
+                   AND state = 'closed'",
                 [],
                 |row| row.get(0),
             )
@@ -45443,6 +50309,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolve_candidates, 0);
+    }
+
+    #[test]
+    fn open_loop_rebuild_is_deterministic_and_lifecycle_history_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Cursor",
+            "continuation.rs - smalltalk",
+            None,
+            Some("/Users/me/smalltalk/src-tauri/src/continuation.rs"),
+            "typing_pause",
+            "fn consistency_gate() { keep_working(); }",
+            Some("com.todesktop.230313mzl4w4u92"),
+            None,
+        );
+        insert_context(
+            &conn,
+            1,
+            "code_editor",
+            "continuation.rs",
+            None,
+            Some("/Users/me/smalltalk/src-tauri/src/continuation.rs"),
+            None,
+        );
+        insert_typing(&conn, 1, 0, 0);
+
+        rebuild_second_and_third(&conn);
+        rebuild_second_and_third(&conn);
+        let projection_after_second = conn
+            .prepare(
+                "SELECT id, workstream_id, COALESCE(task_turn_id, ''), state, boundary_kind,
+                        ownership_revision
+                 FROM continue_open_loops ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let lifecycle_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_open_loop_lifecycle_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        rebuild_second_and_third(&conn);
+        let projection_after_third = conn
+            .prepare(
+                "SELECT id, workstream_id, COALESCE(task_turn_id, ''), state, boundary_kind,
+                        ownership_revision
+                 FROM continue_open_loops ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let lifecycle_after_third: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM continue_open_loop_lifecycle_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!projection_after_second.is_empty());
+        assert_eq!(projection_after_second, projection_after_third);
+        assert_eq!(lifecycle_after_second, lifecycle_after_third);
     }
 
     #[test]
@@ -45619,24 +50576,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             (state.as_str(), boundary.as_str()),
-            ("resolved", "completed_progress")
+            ("completed", "completed_progress")
         );
         assert_eq!(resume, editor_artifact);
         assert_eq!(verification, terminal_artifact);
 
-        generate_local_decision(&conn);
-        let (candidate_kind, target_artifact): (String, String) = conn
-            .query_row(
-                "SELECT candidate_kind, target_artifact_id
-                 FROM continue_candidates
-                 ORDER BY score DESC
-                 LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(candidate_kind, "review_completed_changes");
-        assert_eq!(target_artifact, editor_artifact);
+        let decision = generate_local_decision(&conn);
+        assert_eq!(decision.task_resolution_status, "no_clear_current_task");
+        assert!(decision.candidate_kind.is_none());
+        assert!(!decision.direct_target_policy.direct_target_allowed);
+        assert!(decision.return_target.is_none());
     }
 
     #[test]
@@ -45675,21 +50624,17 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(state, "resolved");
+        assert_eq!(state, "completed");
         assert_eq!(boundary, "completed_progress");
         assert!(progress.contains("Goal achieved") || progress.contains("Tests passed"));
 
         let decision = generate_local_decision(&conn);
+        assert_eq!(decision.candidate_kind, None);
         assert_eq!(
-            decision.candidate_kind.as_deref(),
-            Some("review_completed_changes")
+            decision.cross_layer_consistency.agreement_status,
+            semantic_consistency::ConsistencyAgreementStatus::Unresolved
         );
-        assert!(decision
-            .next_action
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Review the completed changes"));
-        assert_eq!(decision.handoff.headline, "Review completed work");
+        assert!(!decision.direct_target_policy.direct_target_allowed);
     }
 
     fn distinct_episode_count_for_frames(conn: &Connection, frame_ids: &[&str]) -> i64 {
@@ -47530,13 +52475,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.source, "local_scorer");
-        assert_eq!(
-            decision
-                .return_target
-                .as_ref()
-                .and_then(|target| target.document_path.as_deref()),
-            Some("/Users/me/project/src/lib.rs")
-        );
+        assert_eq!(decision.task_resolution_status, "no_clear_current_task");
+        assert!(decision.return_target.is_none());
         assert_ne!(
             decision
                 .return_target
@@ -47624,8 +52564,9 @@ mod tests {
         assert_eq!(normal.decision_id, rebuild.decision_id);
         assert_eq!(normal.activity_recap, rebuild.activity_recap);
         assert!(normal.activity_recap.next_action_summary.is_some());
-        assert!(normal.activity_recap.why_this_target.is_some());
-        assert!(normal
+        assert_eq!(normal.task_resolution_status, "no_clear_current_task");
+        assert!(normal.activity_recap.why_this_target.is_none());
+        assert!(!normal
             .activity_recap
             .evidence_spans
             .iter()
@@ -48102,11 +53043,8 @@ mod tests {
             "{:?}",
             after_detour.activity_recap_proof.stitched_timeline
         );
-        assert!(after_detour
-            .activity_recap
-            .recent_detours
-            .iter()
-            .any(|detour| detour.app_name.as_deref() == Some("Finder")));
+        assert_eq!(after_detour.task_resolution_status, "no_clear_current_task");
+        assert!(after_detour.activity_recap.recent_detours.is_empty());
     }
 
     #[test]
@@ -48207,13 +53145,7 @@ mod tests {
         .unwrap();
 
         assert!(!decision.handoff.headline.is_empty());
-        assert!(
-            decision.handoff.return_line.contains("Continue from")
-                || decision
-                    .handoff
-                    .return_line
-                    .contains("No reliable return target")
-        );
+        assert!(!decision.handoff.return_line.is_empty());
         assert!(!decision.handoff.current_focus_line.is_empty());
         assert!(!decision.handoff.last_state_line.is_empty());
         assert!(!decision.handoff.next_action.is_empty());
@@ -48284,6 +53216,10 @@ mod tests {
             feedback_kind: "accepted".to_string(),
             note: Some("works".to_string()),
             source: Some("test".to_string()),
+            task_snapshot_id: None,
+            task_snapshot_revision: None,
+            affected_task_field: None,
+            task_hypothesis_id: None,
         };
         let first = record_continue_feedback(&conn, request.clone()).unwrap();
         let second = record_continue_feedback(&conn, request).unwrap();
@@ -48319,12 +53255,46 @@ mod tests {
             }],
             ..ContinueActivityRecap::default()
         };
+        let task_truth = activity_recap_truth::ActivityRecapTaskTruth {
+            schema: activity_recap_truth::ACTIVITY_RECAP_TASK_TRUTH_SCHEMA.to_string(),
+            validator_policy_version: activity_recap_truth::ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION
+                .to_string(),
+            identity: activity_recap_truth::ActivityRecapTaskIdentity {
+                task_turn_id: "task-p4".to_string(),
+                task_turn_revision: 1,
+                task_identity_key: "task-p4-identity".to_string(),
+                bounded_semantic_label: Some("activity recap decision integration".to_string()),
+                execution_state: "active".to_string(),
+                current_actor: "assistant_or_agent".to_string(),
+                waiting_on: "agent".to_string(),
+                relation_to_prior: "continuation".to_string(),
+                workstream_id: Some("workstream-p4".to_string()),
+            },
+            latest_user_goal: Some("Implement the activity recap decision integration".to_string()),
+            task_object: Some("activity recap decision integration".to_string()),
+            prior_task_turn_id: None,
+            prior_context_role: None,
+            consistency_status: "consistent".to_string(),
+            consistency_policy_version: semantic_consistency::SEMANTIC_GRAPH_POLICY_VERSION
+                .to_string(),
+            selected_primary_segment_id: None,
+            selected_open_loop_id: None,
+            direct_target_allowed: false,
+            direct_target_policy_version: semantic_consistency::DIRECT_TARGET_POLICY_VERSION
+                .to_string(),
+            direct_target_locator_kind: "none".to_string(),
+            claim_confidence_caps: std::collections::BTreeMap::new(),
+            claim_evidence_handles: std::collections::BTreeMap::new(),
+            missing_evidence: Vec::new(),
+            allowed_context_roles: vec!["same_task".to_string()],
+        };
         activity_recap_integration::promote_validated_activity_recap_memory(
             &conn,
             "decision-p4",
             Some("candidate-wrong"),
             Some("workstream-p4"),
             Some("artifact-wrong"),
+            Some(&task_truth),
             &recap,
             2_000,
         )
@@ -48338,6 +53308,17 @@ mod tests {
             )
             .unwrap();
         assert!(promoted > 0);
+        let promoted_anchor: String = conn
+            .query_row(
+                "SELECT source_anchor_json FROM continue_memory_cells
+                 WHERE created_by = 'p5_activity_recap' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(promoted_anchor.contains("task-p4"));
+        assert!(promoted_anchor.contains("task-p4-identity"));
+        assert!(promoted_anchor.contains("task_truth_recap_validation.v1"));
 
         record_continue_feedback(
             &conn,
@@ -48350,6 +53331,10 @@ mod tests {
                 feedback_kind: "rejected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -48437,20 +53422,24 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision.candidate_kind.as_deref(), Some("resolve_error"));
+        assert_eq!(decision.task_resolution_status, "no_clear_current_task");
+        assert!(decision.candidate_kind.is_none());
+        assert!(decision.return_target.is_none());
+        assert!(decision.unresolved_state.is_none());
+        assert_eq!(decision.confidence, decision.confidence_summary.recap.score);
         assert_eq!(
-            decision
-                .return_target
-                .as_ref()
-                .and_then(|target| target.document_path.as_deref()),
-            Some("/Users/me/project/src/lib.rs")
+            decision.confidence_summary.recap.label,
+            ConfidenceLabel::None
         );
-        assert!(decision
-            .unresolved_state
-            .as_deref()
-            .unwrap_or("")
-            .contains("error"));
-        assert!(decision.confidence >= 0.6);
+        assert_eq!(
+            decision.confidence_summary.target.label,
+            ConfidenceLabel::High
+        );
+        assert_eq!(
+            decision.cross_layer_consistency.agreement_status,
+            semantic_consistency::ConsistencyAgreementStatus::Unresolved
+        );
+        assert!(decision.direct_target_policy.direct_target_allowed);
     }
 
     #[test]
@@ -48484,16 +53473,21 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision.candidate_kind.as_deref(), Some("evidence_only"));
+        assert_eq!(decision.candidate_kind, None);
+        assert_eq!(
+            decision.cross_layer_consistency.agreement_status,
+            semantic_consistency::ConsistencyAgreementStatus::Unresolved
+        );
+        assert!(!decision.direct_target_policy.direct_target_allowed);
         assert_eq!(decision.validation_status, "fallback");
         assert!(decision
             .missing_evidence
             .iter()
-            .any(|item| item == "no_last_meaningful_action"));
+            .any(|item| item == "no_candidate_generated"));
         assert!(decision
             .warnings
             .iter()
-            .any(|warning| warning == "thin_evidence"));
+            .any(|warning| warning.starts_with("thin_evidence")));
     }
 
     #[test]

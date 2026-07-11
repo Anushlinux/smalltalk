@@ -135,6 +135,30 @@ pub fn get_island_continue_state_for_status(
     let mut state = island_state_from_decision_status(&decision, &status, false);
     annotate_gateway_state(&mut state, &input);
     state.audit_path = decision.continue_output_path.clone();
+    if let Some((mut retained, rejection_reasons)) =
+        rejected_gateway_adoption(&decision, &state, &status, &input)
+    {
+        for reason in &rejection_reasons {
+            retained.warnings.push(format!("result_adoption:{reason}"));
+        }
+        retained.warnings.sort();
+        retained.warnings.dedup();
+        annotate_gateway_state(&mut retained, &input);
+        super::write_island_continue_audit(
+            retained.audit_path.as_deref(),
+            &retained,
+            input.reason.as_str(),
+            input.source.as_deref().unwrap_or("native_island"),
+            false,
+            retained.allows_open_continue_target(),
+            Some(&rejection_reasons.join(",")),
+        );
+        emit_gateway_state(&app, &retained);
+        return Ok(IslandContinueGatewayResult {
+            state: retained,
+            decision: None,
+        });
+    }
     super::write_island_continue_audit(
         state.audit_path.as_deref(),
         &state,
@@ -155,6 +179,191 @@ pub fn get_island_continue_state_for_status(
         state,
         decision: Some(decision),
     })
+}
+
+fn rejected_gateway_adoption(
+    challenger: &crate::continuation::ContinueDecisionResult,
+    challenger_state: &IslandContinueState,
+    status: &CaptureStatus,
+    input: &IslandContinueStateInput,
+) -> Option<(IslandContinueState, Vec<String>)> {
+    if matches!(
+        input.reason,
+        IslandContinueReason::UserPressedContinue | IslandContinueReason::MainCardDecisionUpdated
+    ) {
+        return None;
+    }
+    let remembered = LAST_CONTINUE_ISLAND_STATE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())?;
+    let mut reasons = Vec::new();
+    let (challenger_task_id, challenger_task_revision) = adoption_task_identity(challenger);
+    let same_task = remembered.task_turn_id.as_deref().is_some()
+        && remembered.task_turn_id.as_deref() == challenger_task_id;
+    let challenger_evidence_ms = decision_evidence_updated_at_ms(challenger)
+        .or_else(|| newest_status_evidence_ms(status))
+        .unwrap_or_default();
+    let causally_newer =
+        challenger_evidence_ms > remembered.evidence_updated_at_ms.unwrap_or_default();
+
+    if remembered.task_turn_id.is_some() && challenger_task_id.is_none() {
+        reasons.push("rejected_lost_task_identity".to_string());
+    } else if remembered.task_turn_id.is_some() && !same_task {
+        if !adoption_task_is_supported(challenger) {
+            reasons.push("rejected_new_task_not_supported".to_string());
+        }
+        if !causally_newer {
+            reasons.push("rejected_new_task_not_causally_newer".to_string());
+        }
+    } else if same_task && challenger_task_revision < remembered.task_turn_revision {
+        reasons.push("rejected_older_task_revision".to_string());
+    }
+    if !causally_newer {
+        reasons.push("rejected_evidence_not_causally_newer".to_string());
+    }
+    if adoption_task_confidence(challenger) + f64::EPSILON < remembered.task_confidence {
+        reasons.push("rejected_lower_task_identity_confidence".to_string());
+    }
+    if remembered.continue_openable && !challenger_state.allows_open_continue_target() {
+        reasons.push("rejected_target_policy_downgrade".to_string());
+    }
+    for (present, next_present, field) in [
+        (
+            remembered.island_continue_state.activity_summary.is_some(),
+            challenger_state.activity_summary.is_some(),
+            "task",
+        ),
+        (
+            remembered.island_continue_state.activity_state.is_some(),
+            challenger_state.activity_state.is_some(),
+            "state",
+        ),
+        (
+            remembered.island_continue_state.next_action.is_some(),
+            challenger_state.next_action.is_some(),
+            "next",
+        ),
+        (
+            remembered.island_continue_state.activity_where.is_some(),
+            challenger_state.activity_where.is_some(),
+            "where",
+        ),
+    ] {
+        if present && !next_present {
+            reasons.push(format!("rejected_lost_supported_{field}"));
+        }
+    }
+    if source_quality_rank(adoption_wording_source(challenger))
+        < source_quality_rank(&remembered.wording_source)
+    {
+        reasons.push("rejected_wording_source_downgrade".to_string());
+    }
+    if target_source_quality_rank(adoption_target_selection_source(challenger))
+        < target_source_quality_rank(&remembered.target_selection_source)
+    {
+        reasons.push("rejected_target_selection_source_downgrade".to_string());
+    }
+    if remembered.request_trigger == "manual" && !reasons.is_empty() {
+        reasons.push("retained_stronger_manual_result".to_string());
+    }
+    reasons.sort();
+    reasons.dedup();
+    (!reasons.is_empty()).then_some((remembered.island_continue_state, reasons))
+}
+
+fn authoritative_task_truth_answer(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> Option<&crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1> {
+    (decision.task_truth_v2.effective_state
+        == crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative
+        && decision.task_truth_v2.release_gate_passed)
+        .then(|| decision.task_truth_v2.answer.as_ref())
+        .flatten()
+}
+
+fn adoption_task_identity(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> (Option<&str>, Option<i64>) {
+    if let Some(answer) = authoritative_task_truth_answer(decision) {
+        return (
+            Some(answer.snapshot_id.as_str()).filter(|id| !id.trim().is_empty()),
+            Some(answer.snapshot_revision),
+        );
+    }
+    (
+        decision
+            .current_task_turn
+            .as_ref()
+            .map(|turn| turn.task_turn_id.as_str()),
+        decision
+            .current_task_turn
+            .as_ref()
+            .map(|turn| turn.revision),
+    )
+}
+
+fn adoption_task_is_supported(decision: &crate::continuation::ContinueDecisionResult) -> bool {
+    authoritative_task_truth_answer(decision).map_or_else(
+        || decision.task_resolution_status == "current_task_supported",
+        |answer| answer.task_resolution_status != "unresolved",
+    )
+}
+
+fn adoption_task_confidence(decision: &crate::continuation::ContinueDecisionResult) -> f64 {
+    let Some(answer) = authoritative_task_truth_answer(decision) else {
+        return decision.confidence_summary.task.score;
+    };
+    ["task_summary", "task_object"]
+        .iter()
+        .filter_map(|field| {
+            answer
+                .field_support
+                .get(*field)
+                .and_then(|support| support.confidence)
+        })
+        .reduce(f64::min)
+        .unwrap_or_else(|| {
+            if answer.task_resolution_status == "resolved" {
+                0.85
+            } else {
+                0.6
+            }
+        })
+}
+
+fn adoption_wording_source(decision: &crate::continuation::ContinueDecisionResult) -> &str {
+    authoritative_task_truth_answer(decision)
+        .map(|answer| answer.wording_source.as_str())
+        .unwrap_or(decision.wording_source.as_str())
+}
+
+fn adoption_target_selection_source(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> &str {
+    authoritative_task_truth_answer(decision)
+        .map(|answer| answer.target_selection_source.as_str())
+        .unwrap_or(decision.target_selection_source.as_str())
+}
+
+fn source_quality_rank(source: &str) -> u8 {
+    if source.contains("model") {
+        2
+    } else if source.contains("fallback") || source.contains("abstained") {
+        0
+    } else {
+        1
+    }
+}
+
+fn target_source_quality_rank(source: &str) -> u8 {
+    if source.contains("validated") {
+        2
+    } else if source.contains("abstained") {
+        0
+    } else {
+        1
+    }
 }
 
 pub fn island_state_from_decision_status(
@@ -230,9 +439,16 @@ fn remember_gateway_decision(
     feedback_or_open_watermark_ms: Option<i64>,
 ) {
     super::remember_continue_decision_id(&decision.decision_id);
+    let (task_turn_id, task_turn_revision) = adoption_task_identity(decision);
     if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
         *slot = Some(RememberedContinueIslandState {
             decision_id: decision.decision_id.clone(),
+            request_trigger: decision.request_trigger.clone(),
+            task_turn_id: task_turn_id.map(str::to_string),
+            task_turn_revision,
+            task_confidence: adoption_task_confidence(decision),
+            wording_source: adoption_wording_source(decision).to_string(),
+            target_selection_source: adoption_target_selection_source(decision).to_string(),
             resume_headline: Some(headline_from_island_state(state).to_string()),
             resume_detail: state.next_action.clone(),
             resume_point: state
@@ -398,6 +614,12 @@ mod tests {
             )];
         RememberedContinueIslandState {
             decision_id: "decision-test".to_string(),
+            request_trigger: "manual".to_string(),
+            task_turn_id: Some("task-test".to_string()),
+            task_turn_revision: Some(2),
+            task_confidence: 0.9,
+            wording_source: "model_assisted".to_string(),
+            target_selection_source: "local_validated_target_policy".to_string(),
             resume_headline: Some("Ready to continue".to_string()),
             resume_detail: Some("Continue from the gateway.".to_string()),
             resume_point: Some("session_island.rs".to_string()),

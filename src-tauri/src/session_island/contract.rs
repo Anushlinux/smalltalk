@@ -104,6 +104,8 @@ pub struct IslandContinueState {
     pub decision_cache_hit: bool,
     pub evidence_watermark_ms: Option<i64>,
     pub decision_stale: bool,
+    pub target_state: String,
+    pub target_reason_codes: Vec<String>,
 
     pub current_focus: Option<IslandFocusSummary>,
     pub current_activity: Option<String>,
@@ -168,6 +170,8 @@ impl IslandContinueState {
             decision_cache_hit: false,
             evidence_watermark_ms: freshness.evidence_watermark_ms,
             decision_stale: freshness.decision_stale,
+            target_state: "no_clear_task".to_string(),
+            target_reason_codes: vec!["no_clear_task_or_target".to_string()],
             current_focus: None,
             current_activity: None,
             activity_label: None,
@@ -207,6 +211,8 @@ impl IslandContinueState {
             decision_cache_hit: true,
             evidence_watermark_ms: freshness.evidence_watermark_ms,
             decision_stale: true,
+            target_state: "stale_decision".to_string(),
+            target_reason_codes: vec!["target_stale".to_string()],
             current_focus: None,
             current_activity: None,
             activity_label: None,
@@ -262,6 +268,8 @@ impl IslandContinueState {
             decision_cache_hit: false,
             evidence_watermark_ms: None,
             decision_stale: false,
+            target_state: "error".to_string(),
+            target_reason_codes: Vec::new(),
             current_focus: None,
             current_activity: None,
             activity_label: None,
@@ -303,12 +311,28 @@ pub fn island_state_from_continue_decision(
     freshness: IslandFreshness,
     context: IslandStateContext,
 ) -> IslandContinueState {
+    let task_truth_answer = (decision.task_truth_v2.effective_state
+        == crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative
+        && decision.task_truth_v2.release_gate_passed)
+        .then(|| decision.task_truth_v2.answer.as_ref())
+        .flatten();
     let current_focus = decision.current_focus.as_ref().and_then(focus_summary);
-    let return_target = decision.return_target.as_ref().and_then(target_summary);
-    let resume_work_target = decision
-        .resume_work_target
-        .as_ref()
-        .and_then(target_summary);
+    let return_target = match task_truth_answer {
+        Some(answer) => answer
+            .direct_return_target
+            .as_ref()
+            .and_then(target_summary),
+        None => decision.return_target.as_ref().and_then(target_summary),
+    };
+    let resume_work_target = task_truth_answer
+        .is_none()
+        .then(|| {
+            decision
+                .resume_work_target
+                .as_ref()
+                .and_then(target_summary)
+        })
+        .flatten();
     let inspect_anchor_count = decision.evidence_anchors.frame_ids.len()
         + decision.evidence_anchors.action_ids.len()
         + decision.evidence_anchors.episode_ids.len()
@@ -324,6 +348,14 @@ pub fn island_state_from_continue_decision(
     let has_any_target = return_target.is_some() || resume_work_target.is_some();
     let validation_rejected = validation_rejected(&decision.validation_status);
     let no_clear_output = decision.continue_output_mode == "no_clear_continuation";
+    let work_supported = matches!(
+        decision.work_truth.resolution_status.as_str(),
+        "task_supported" | "activity_supported"
+    );
+    let no_clear_current_task = match task_truth_answer {
+        Some(answer) => answer.task_resolution_status == "unresolved",
+        None => decision.task_resolution_status == "no_clear_current_task" && !work_supported,
+    };
     let decision_stale = freshness.decision_stale
         || freshness
             .newest_evidence_ms
@@ -349,25 +381,53 @@ pub fn island_state_from_continue_decision(
     let missing_evidence = merge_safe_notes(&recap.missing_evidence, &decision.missing_evidence);
     let warnings = merge_safe_notes(&recap.warnings, &decision.warnings);
 
-    let can_open = !decision_stale
-        && !target_suppressed
-        && !support_blocked
-        && !thin
-        && !validation_rejected
-        && !no_clear_output
-        && has_openable_target
-        && !decision.decision_id.trim().is_empty();
+    let can_open = if let Some(answer) = task_truth_answer {
+        !decision_stale
+            && answer.task_resolution_status != "unresolved"
+            && return_target.as_ref().is_some_and(|target| target.openable)
+            && !decision.decision_id.trim().is_empty()
+    } else {
+        !decision_stale
+            && !no_clear_current_task
+            && !target_suppressed
+            && !support_blocked
+            && !validation_rejected
+            && !no_clear_output
+            && has_openable_target
+            && decision.direct_target_policy.direct_target_allowed
+            && decision.target_truth.state == "direct_continue_ready"
+            && !decision.decision_id.trim().is_empty()
+    };
 
+    let has_inspectable_evidence = inspect_anchor_count > 0
+        || task_truth_answer.is_some_and(|answer| answer.evidence_preview.is_some());
     let display_state = if decision_stale {
         IslandDisplayState::NeedsRefresh
+    } else if task_truth_answer.is_some() {
+        if no_clear_current_task {
+            IslandDisplayState::NoClearContinuation
+        } else if can_open {
+            IslandDisplayState::ContinueReady
+        } else {
+            IslandDisplayState::InspectOnly
+        }
     } else if support_blocked {
         IslandDisplayState::SupportBlocked
     } else if target_suppressed {
         IslandDisplayState::TargetSuppressed
-    } else if no_clear_output {
+    } else if no_clear_current_task {
         IslandDisplayState::NoClearContinuation
     } else if can_open {
         IslandDisplayState::ContinueReady
+    } else if matches!(
+        decision.target_truth.state.as_str(),
+        "task_known_target_unknown" | "activity_known_target_unknown"
+    ) {
+        IslandDisplayState::InspectOnly
+    } else if decision.target_truth.state == "thin_task_seen" {
+        IslandDisplayState::ThinCurrentWork
+    } else if no_clear_output && !work_supported {
+        IslandDisplayState::NoClearContinuation
     } else if decision.current_focus.is_some() && !has_any_target {
         if decision.active_current_work_unresolved.is_some() || thin {
             IslandDisplayState::ThinCurrentWork
@@ -376,7 +436,7 @@ pub fn island_state_from_continue_decision(
         }
     } else if thin {
         IslandDisplayState::ThinCurrentWork
-    } else if inspect_anchor_count > 0 {
+    } else if has_inspectable_evidence {
         IslandDisplayState::InspectOnly
     } else if context.local_memory_running || context.has_local_memory {
         IslandDisplayState::LocalMemoryWarming
@@ -395,14 +455,14 @@ pub fn island_state_from_continue_decision(
     if can_open {
         available_actions.push(IslandAvailableAction::enabled(
             IslandActionKind::OpenContinueTarget,
-            "Open Continue target",
+            "Continue here",
             Some(decision.decision_id.clone()),
         ));
     }
-    if has_any_target && !decision.decision_id.trim().is_empty() {
+    if !no_clear_current_task && has_any_target && !decision.decision_id.trim().is_empty() {
         available_actions.push(IslandAvailableAction::enabled(
             IslandActionKind::MarkWrongTarget,
-            "Wrong target",
+            "Not right",
             Some(decision.decision_id.clone()),
         ));
         available_actions.push(IslandAvailableAction::enabled(
@@ -453,43 +513,172 @@ pub fn island_state_from_continue_decision(
         decision_cache_hit: decision.cache_hit,
         evidence_watermark_ms: freshness.evidence_watermark_ms,
         decision_stale,
-        current_focus,
-        current_activity: safe_text(decision.current_activity.as_deref()),
-        activity_label: safe_text(recap.primary_work_label.as_deref()),
-        activity_summary: safe_text(recap.primary_work_summary.as_deref()),
-        activity_where: safe_text(recap.primary_where_summary.as_deref()),
-        activity_state: safe_text(
-            recap
-                .last_meaningful_state
-                .as_deref()
-                .or(recap.unfinished_state.as_deref())
-                .or_else(|| activity_state_label(recap.current_state)),
-        ),
-        activity_confidence_label: recap_has_useful_copy
-            .then(|| activity_confidence_label(recap.activity_confidence).to_string()),
-        target_confidence_label: recap_has_useful_copy
-            .then(|| activity_confidence_label(recap.target_confidence).to_string()),
-        recent_context_summary,
-        selected_workstream_title: decision
-            .selected_workstream
-            .as_ref()
-            .and_then(|workstream| safe_text(workstream.title_candidate.as_deref())),
-        return_target,
-        resume_work_target,
-        next_action: safe_text(
-            recap.next_action_summary.as_deref().or(decision
-                .next_action
-                .as_deref()
-                .or(Some(decision.handoff.next_action.as_str()))),
-        ),
-        confidence_label: safe_text(Some(&decision.confidence_label)),
-        validation_status: safe_text(Some(&decision.validation_status)),
-        provenance_label: safe_text(Some(&decision.source)),
+        target_state: if decision_stale {
+            "stale_decision".to_string()
+        } else if let Some(answer) = task_truth_answer {
+            if answer.task_resolution_status == "unresolved" {
+                "no_clear_task".to_string()
+            } else if answer.direct_return_target.is_some() {
+                "direct_continue_ready".to_string()
+            } else {
+                "task_known_target_unknown".to_string()
+            }
+        } else {
+            decision.target_truth.state.clone()
+        },
+        target_reason_codes: if decision_stale {
+            vec!["target_stale".to_string()]
+        } else if task_truth_answer.is_some() {
+            decision.task_truth_v2.reason_codes.clone()
+        } else {
+            decision.target_truth.reason_codes.clone()
+        },
+        current_focus: task_truth_answer
+            .is_none()
+            .then_some(current_focus)
+            .flatten(),
+        current_activity: (!no_clear_current_task)
+            .then(|| match task_truth_answer {
+                Some(answer) => safe_text(answer.task_summary.as_deref()),
+                None => safe_text(
+                    decision
+                        .work_truth
+                        .activity_summary
+                        .as_deref()
+                        .or(decision.current_activity.as_deref()),
+                ),
+            })
+            .flatten(),
+        activity_label: (task_truth_answer.is_none() && !no_clear_current_task)
+            .then(|| {
+                if decision.work_truth.resolution_status == "activity_supported" {
+                    safe_text(Some(&decision.work_truth.activity_kind))
+                        .or_else(|| safe_text(recap.primary_work_label.as_deref()))
+                } else {
+                    safe_text(recap.primary_work_label.as_deref())
+                }
+            })
+            .flatten(),
+        activity_summary: (!no_clear_current_task)
+            .then(|| match task_truth_answer {
+                Some(answer) => safe_text(answer.task_summary.as_deref()),
+                None => safe_text(
+                    decision
+                        .work_truth
+                        .activity_summary
+                        .as_deref()
+                        .or(decision.answer.what_you_were_doing.as_deref())
+                        .or(recap.primary_work_summary.as_deref()),
+                ),
+            })
+            .flatten(),
+        activity_where: match task_truth_answer {
+            Some(answer) => safe_text(answer.where_summary.as_deref()),
+            None if no_clear_current_task => safe_text(decision.supported_surface.as_deref()),
+            None => safe_text(
+                decision
+                    .work_truth
+                    .where_summary
+                    .as_deref()
+                    .or(decision.answer.where_label.as_deref())
+                    .or(recap.primary_where_summary.as_deref()),
+            ),
+        },
+        activity_state: (!no_clear_current_task)
+            .then(|| match task_truth_answer {
+                Some(answer) => {
+                    let parts = [
+                        answer.last_meaningful_progress.as_deref(),
+                        answer.unfinished_state.as_deref(),
+                    ]
+                    .into_iter()
+                    .filter_map(safe_text)
+                    .collect::<Vec<_>>();
+                    (!parts.is_empty()).then(|| parts.join(" "))
+                }
+                None => safe_text(
+                    decision
+                        .answer
+                        .where_you_left_off
+                        .as_deref()
+                        .or(recap.last_meaningful_state.as_deref())
+                        .or(recap.unfinished_state.as_deref())
+                        .or_else(|| activity_state_label(recap.current_state)),
+                ),
+            })
+            .flatten(),
+        activity_confidence_label: (task_truth_answer.is_none()
+            && !no_clear_current_task
+            && recap_has_useful_copy)
+            .then(|| {
+                if decision.answer.what_you_were_doing.is_some() {
+                    decision.answer.task_confidence_label.clone()
+                } else {
+                    activity_confidence_label(recap.activity_confidence).to_string()
+                }
+            }),
+        target_confidence_label: (task_truth_answer.is_none()
+            && !no_clear_current_task
+            && recap_has_useful_copy)
+            .then(|| {
+                if decision.answer.what_you_were_doing.is_some() {
+                    decision.answer.target_confidence_label.clone()
+                } else {
+                    activity_confidence_label(recap.target_confidence).to_string()
+                }
+            }),
+        recent_context_summary: (task_truth_answer.is_none() && !no_clear_current_task)
+            .then_some(recent_context_summary)
+            .flatten(),
+        selected_workstream_title: (task_truth_answer.is_none() && !no_clear_current_task)
+            .then(|| {
+                decision
+                    .selected_workstream
+                    .as_ref()
+                    .and_then(|workstream| safe_text(workstream.title_candidate.as_deref()))
+            })
+            .flatten(),
+        return_target: (!no_clear_current_task).then_some(return_target).flatten(),
+        resume_work_target: (!no_clear_current_task)
+            .then_some(resume_work_target)
+            .flatten(),
+        next_action: if no_clear_current_task {
+            Some("Inspect recent evidence or capture again to identify the exact task.".to_string())
+        } else {
+            match task_truth_answer {
+                Some(answer) => safe_text(answer.next_action.as_deref()),
+                None => safe_text(
+                    recap
+                        .next_action_summary
+                        .as_deref()
+                        .or(Some(&decision.answer.next)),
+                ),
+            }
+        },
+        confidence_label: task_truth_answer
+            .is_none()
+            .then(|| safe_text(Some(&decision.confidence_label)))
+            .flatten(),
+        validation_status: match task_truth_answer {
+            Some(answer) => safe_text(Some(&answer.task_resolution_status)),
+            None => safe_text(Some(&decision.validation_status)),
+        },
+        provenance_label: task_truth_answer
+            .is_none()
+            .then(|| safe_text(Some(&decision.wording_source)))
+            .flatten(),
         missing_evidence,
         warnings,
-        suppression_reasons,
+        suppression_reasons: if task_truth_answer.is_some() {
+            Vec::new()
+        } else {
+            suppression_reasons
+        },
         available_actions,
-        inspect_anchor_count,
+        inspect_anchor_count: inspect_anchor_count
+            + usize::from(
+                task_truth_answer.is_some_and(|answer| answer.evidence_preview.is_some()),
+            ),
         audit_path: None,
     }
 }
@@ -544,7 +733,8 @@ fn target_summary(target: &ContinueReturnTarget) -> Option<IslandTargetSummary> 
         .or_else(|| artifact_kind.clone())
         .unwrap_or_else(|| "Continue target".to_string());
     let openability = safe_text(Some(&target.openability)).unwrap_or_else(|| "unknown".to_string());
-    let openable = openability == "openable";
+    let openable = openability == "openable"
+        && (target.browser_url.is_some() || target.document_path.is_some());
     Some(IslandTargetSummary {
         title,
         subtitle: artifact_kind.clone(),
@@ -714,11 +904,12 @@ mod tests {
     use super::*;
     use crate::continuation::enrichment::WeakSurfaceEnrichmentDiagnostics;
     use crate::continuation::{
-        ContinueEvidenceAnchors, ContinueHandoff, ContinueSelectedWorkstream, P0QualitySignals,
+        ContinueEvidenceAnchors, ContinueHandoff, ContinueSelectedWorkstream, ContinueWorkTruth,
+        P0QualitySignals,
     };
 
     fn base_decision() -> ContinueDecisionResult {
-        ContinueDecisionResult {
+        let mut decision = ContinueDecisionResult {
             decision_id: "continue-test".to_string(),
             mode: "normal".to_string(),
             cache_hit: false,
@@ -751,15 +942,41 @@ mod tests {
                 return_target_openable: true,
                 ..P0QualitySignals::default()
             },
+            work_truth: ContinueWorkTruth::unresolved(2_000, "test_fixture"),
             current_activity: Some("Implementing island Continue state".to_string()),
+            current_task_turn: None,
+            task_resolution_status: "current_task_supported".to_string(),
+            task_resolution_reason_codes: vec!["test_fixture".to_string()],
+            supported_surface: Some("Codex".to_string()),
+            alternative_hypotheses: Vec::new(),
+            request_trigger: "manual".to_string(),
+            task_understanding_source: "local_task_turn_evidence".to_string(),
+            wording_source: "local_deterministic".to_string(),
+            target_selection_source: "local_validated_target_policy".to_string(),
+            task_truth_v2: Default::default(),
             selected_workstream: Some(ContinueSelectedWorkstream {
                 workstream_id: "workstream-test".to_string(),
+                selected_by_task_turn_id: None,
+                relation_to_current_task: "unknown".to_string(),
+                selection_reason_codes: Vec::new(),
                 state: "active".to_string(),
                 title_candidate: Some("P4 Island Contract".to_string()),
                 primary_artifact_id: Some("artifact-target".to_string()),
                 last_active_timestamp_ms: 1_900,
                 unresolved_signal: Some("implementation".to_string()),
             }),
+            semantic_graph_policy_version: String::new(),
+            cross_layer_consistency: Default::default(),
+            direct_target_policy: Default::default(),
+            target_truth: crate::continuation::ContinueTargetTruth {
+                schema: "smalltalk.continue_target_truth.v1".to_string(),
+                state: "direct_continue_ready".to_string(),
+                reason_codes: vec!["direct_target_available".to_string()],
+            },
+            evidence_preview: None,
+            confidence_vector: Default::default(),
+            confidence_summary: Default::default(),
+            legacy_confidence_derivation: Default::default(),
             selected_candidate_id: Some("candidate-test".to_string()),
             return_target: Some(ContinueReturnTarget {
                 artifact_id: Some("artifact-target".to_string()),
@@ -802,6 +1019,8 @@ mod tests {
             generated_candidates: 1,
             validation_status: "validated".to_string(),
             feedback_policy_version: "test".to_string(),
+            feedback_policy_fingerprint: "test-fingerprint".to_string(),
+            next_feedback_transition_at_ms: None,
             feedback_watermark_ms: None,
             open_watermark_ms: None,
             feedback_suppressed_candidate_count: 0,
@@ -826,6 +1045,7 @@ mod tests {
             app_activity: None,
             activity_summary: None,
             activity_recap: crate::continuation::ContinueActivityRecap::default(),
+            answer: crate::continuation::ContinueInterruptionRecoveryAnswer::default(),
             activity_recap_watermark_hash: String::new(),
             activity_recap_synthesis_audit: Default::default(),
             activity_recap_proof: Default::default(),
@@ -836,7 +1056,14 @@ mod tests {
             micro_inference_result_kind: None,
             continue_output_path: Some("/Users/example/continue_outputs/raw-path".to_string()),
             audit_inference_events: Vec::new(),
-        }
+        };
+        decision.direct_target_policy.direct_target_allowed = true;
+        decision
+            .direct_target_policy
+            .validated_direct_locator_present = true;
+        decision.direct_target_policy.openable = true;
+        decision.direct_target_policy.target_identity_confident = true;
+        decision
     }
 
     fn test_freshness() -> IslandFreshness {
@@ -878,6 +1105,16 @@ mod tests {
     #[test]
     fn island_state_thin_current_work_has_no_open_continue_action() {
         let mut decision = base_decision();
+        decision.return_target = None;
+        decision.resume_work_target = None;
+        decision.direct_target_policy.direct_target_allowed = false;
+        decision.target_truth.state = "thin_task_seen".to_string();
+        decision.target_truth.reason_codes = vec!["frame_preview_only".to_string()];
+        decision.evidence_preview = Some(crate::continuation::ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".to_string(),
+            preview_kind: "frame".to_string(),
+            frame_id: "frame-current".to_string(),
+        });
         decision.confidence = 0.42;
         decision.confidence_label = "Thin".to_string();
         decision.validation_status = "thin_evidence".to_string();
@@ -988,11 +1225,138 @@ mod tests {
         decision.confidence = 0.7;
         decision.confidence_label = "Medium".to_string();
         decision.validation_status = "validated".to_string();
+        decision.direct_target_policy.direct_target_allowed = false;
+        decision.target_truth.state = "no_clear_task".to_string();
+        decision.target_truth.reason_codes = vec!["no_clear_task_or_target".to_string()];
 
         let state = mapped(&decision);
 
         assert_eq!(state.display_state, IslandDisplayState::NoClearContinuation);
         assert!(!state.allows_open_continue_target());
+    }
+
+    #[test]
+    fn observed_activity_renders_before_generic_no_clear_state() {
+        let mut decision = base_decision();
+        decision.task_resolution_status = "no_clear_current_task".into();
+        decision.continue_output_mode = "thin_continue".into();
+        decision.work_truth = ContinueWorkTruth {
+            schema: crate::continuation::CONTINUE_WORK_TRUTH_SCHEMA.into(),
+            policy_version: crate::continuation::CONTINUE_WORK_TRUTH_POLICY_VERSION.into(),
+            resolution_status: "activity_supported".into(),
+            activity_kind: "editing".into(),
+            activity_summary: Some("Editing tt2-05-completion-audit.md".into()),
+            work_object: Some("tt2-05-completion-audit.md".into()),
+            where_summary: Some("tt2-05-completion-audit.md in Visual Studio Code".into()),
+            app_name: Some("Visual Studio Code".into()),
+            artifact_id: decision
+                .return_target
+                .as_ref()
+                .and_then(|target| target.artifact_id.clone()),
+            observed_at_ms: 2_000,
+            confidence: 0.88,
+            evidence_ids: vec!["frame-current".into()],
+            source: "local_direct_activity".into(),
+            broader_goal_known: false,
+            primary_relation: "primary".into(),
+            reason_codes: vec!["direct_production_action".into()],
+        };
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::ContinueReady);
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            Some("Editing tt2-05-completion-audit.md")
+        );
+        assert!(state.allows_open_continue_target());
+    }
+
+    #[test]
+    fn typed_no_clear_task_suppresses_polluted_task_copy_and_leaked_targets() {
+        let mut decision = base_decision();
+        decision.task_resolution_status = "no_clear_current_task".to_string();
+        decision.task_resolution_reason_codes = vec![
+            "no_eligible_current_user_goal".to_string(),
+            "categorical_control_ineligible".to_string(),
+        ];
+        decision.continue_output_mode = "no_clear_continuation".to_string();
+        decision.target_truth.state = "no_clear_task".to_string();
+        decision.target_truth.reason_codes = decision.task_resolution_reason_codes.clone();
+        decision.answer.what_you_were_doing = Some("Approve for me".to_string());
+        decision.answer.where_you_left_off = Some("Approve for me".to_string());
+        decision.activity_recap.primary_work_summary = Some("Approve for me".to_string());
+        decision.activity_recap.primary_work_label = Some("Approve for me".to_string());
+        decision.activity_recap.last_meaningful_state = Some("Approve for me".to_string());
+        decision
+            .selected_workstream
+            .as_mut()
+            .unwrap()
+            .title_candidate = Some("Approve for me".to_string());
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::NoClearContinuation);
+        assert!(!state.allows_open_continue_target());
+        assert!(state.return_target.is_none());
+        assert!(state.resume_work_target.is_none());
+        assert!(state.activity_summary.is_none());
+        assert!(state.activity_label.is_none());
+        assert!(state.activity_state.is_none());
+        assert!(state.selected_workstream_title.is_none());
+        assert!(!state
+            .next_action
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Approve"));
+        assert_eq!(
+            state.target_reason_codes,
+            decision.task_resolution_reason_codes
+        );
+    }
+
+    #[test]
+    fn p6_08_task_known_target_unknown_keeps_recap_and_inspect_action() {
+        let mut decision = base_decision();
+        decision.return_target = None;
+        decision.resume_work_target = None;
+        decision.direct_target_policy.direct_target_allowed = false;
+        decision.target_truth.state = "task_known_target_unknown".to_string();
+        decision.target_truth.reason_codes = vec![
+            "frame_preview_only".to_string(),
+            "missing_url_or_path".to_string(),
+            "task_known_target_unknown".to_string(),
+        ];
+        decision.evidence_preview = Some(crate::continuation::ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".to_string(),
+            preview_kind: "frame".to_string(),
+            frame_id: "frame-current".to_string(),
+        });
+        decision.activity_recap.primary_work_summary =
+            Some("Investigating what the island Capture button does".to_string());
+        decision.activity_recap.last_meaningful_state =
+            Some("The agent was tracing the Swift bridge and Rust handler".to_string());
+        decision.activity_recap.next_action_summary =
+            Some("Wait for the tracing result or inspect implementation evidence".to_string());
+        decision.activity_recap.activity_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::High;
+        decision.activity_recap.target_confidence =
+            crate::continuation::activity_recap::ActivityConfidence::None;
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::InspectOnly);
+        assert_eq!(state.target_state, "task_known_target_unknown");
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            Some("Investigating what the island Capture button does")
+        );
+        assert_eq!(state.target_confidence_label.as_deref(), Some("none"));
+        assert!(!state.allows_open_continue_target());
+        assert!(state
+            .available_actions
+            .iter()
+            .any(|action| action.kind == IslandActionKind::InspectEvidence));
     }
 
     #[test]
@@ -1186,5 +1550,78 @@ mod tests {
         assert!(state.activity_state.is_none());
         assert!(state.activity_confidence_label.is_none());
         assert!(state.target_confidence_label.is_none());
+    }
+
+    #[test]
+    fn authoritative_task_truth_with_null_target_cannot_leak_legacy_open_target() {
+        let mut decision = base_decision();
+        decision.task_truth_v2.effective_state =
+            crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative;
+        decision.task_truth_v2.release_gate_passed = true;
+        decision.task_truth_v2.answer = Some(
+            crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+                task_resolution_status: "resolved".into(),
+                task_summary: Some("Implement Task Truth authority".into()),
+                where_summary: Some("Smalltalk".into()),
+                snapshot_id: "snapshot-current".into(),
+                snapshot_revision: 3,
+                evidence_watermark: "watermark-current".into(),
+                ..Default::default()
+            },
+        );
+
+        let state = mapped(&decision);
+
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            Some("Implement Task Truth authority")
+        );
+        assert!(state.return_target.is_none());
+        assert!(state.resume_work_target.is_none());
+        assert!(!state.allows_open_continue_target());
+        assert_eq!(state.display_state, IslandDisplayState::InspectOnly);
+        assert!(state.current_focus.is_none());
+        assert!(state.next_action.is_none());
+    }
+
+    #[test]
+    fn authoritative_task_truth_owns_island_copy_and_open_policy() {
+        let mut decision = base_decision();
+        let authoritative_target = decision.return_target.clone().unwrap();
+        decision.task_resolution_status = "no_clear_current_task".into();
+        decision.continue_output_mode = "no_clear_continuation".into();
+        decision.validation_status = "rejected_legacy".into();
+        decision.target_truth.state = "support_only".into();
+        decision.direct_target_policy.direct_target_allowed = false;
+        decision.answer.next = "Legacy next action must not leak".into();
+        decision.activity_recap.primary_where_summary = Some("Legacy location".into());
+        decision.task_truth_v2.effective_state =
+            crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative;
+        decision.task_truth_v2.release_gate_passed = true;
+        decision.task_truth_v2.answer = Some(
+            crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+                task_resolution_status: "resolved".into(),
+                task_summary: Some("Use the authoritative island contract".into()),
+                direct_return_target: Some(authoritative_target),
+                snapshot_id: "snapshot-authoritative".into(),
+                snapshot_revision: 4,
+                evidence_watermark: "watermark-authoritative".into(),
+                ..Default::default()
+            },
+        );
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::ContinueReady);
+        assert!(state.allows_open_continue_target());
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            Some("Use the authoritative island contract")
+        );
+        assert!(state.current_focus.is_none());
+        assert!(state.activity_where.is_none());
+        assert!(state.next_action.is_none());
+        assert_eq!(state.target_state, "direct_continue_ready");
+        assert_eq!(state.validation_status.as_deref(), Some("resolved"));
     }
 }

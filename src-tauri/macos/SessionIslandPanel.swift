@@ -84,6 +84,8 @@ private struct IslandContinueState: Decodable, Equatable {
     var schema: String
     var displayState: IslandDisplayState
     var decisionId: String?
+    var targetState: String
+    var targetReasonCodes: [String]
     var currentFocus: IslandFocusSummary?
     var currentActivity: String?
     var activityLabel: String?
@@ -107,6 +109,8 @@ private struct IslandContinueState: Decodable, Equatable {
         case schema
         case displayState = "display_state"
         case decisionId = "decision_id"
+        case targetState = "target_state"
+        case targetReasonCodes = "target_reason_codes"
         case currentFocus = "current_focus"
         case currentActivity = "current_activity"
         case activityLabel = "activity_label"
@@ -131,6 +135,8 @@ private struct IslandContinueState: Decodable, Equatable {
         schema: String = "smalltalk.island_continue_state.v1",
         displayState: IslandDisplayState,
         decisionId: String? = nil,
+        targetState: String = "no_clear_task",
+        targetReasonCodes: [String] = [],
         currentFocus: IslandFocusSummary? = nil,
         currentActivity: String? = nil,
         activityLabel: String? = nil,
@@ -153,6 +159,8 @@ private struct IslandContinueState: Decodable, Equatable {
         self.schema = schema
         self.displayState = displayState
         self.decisionId = decisionId
+        self.targetState = targetState
+        self.targetReasonCodes = targetReasonCodes
         self.currentFocus = currentFocus
         self.currentActivity = currentActivity
         self.activityLabel = activityLabel
@@ -178,6 +186,8 @@ private struct IslandContinueState: Decodable, Equatable {
         schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? "unknown"
         displayState = try container.decodeIfPresent(IslandDisplayState.self, forKey: .displayState) ?? .error
         decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
+        targetState = try container.decodeIfPresent(String.self, forKey: .targetState) ?? "no_clear_task"
+        targetReasonCodes = try container.decodeIfPresent([String].self, forKey: .targetReasonCodes) ?? []
         currentFocus = try container.decodeIfPresent(IslandFocusSummary.self, forKey: .currentFocus)
         currentActivity = try container.decodeIfPresent(String.self, forKey: .currentActivity)
         activityLabel = try container.decodeIfPresent(String.self, forKey: .activityLabel)
@@ -215,7 +225,7 @@ private struct IslandContinueState: Decodable, Equatable {
         if snapshot.state == "starting" || snapshot.state == "processing" {
             return IslandContinueState(
                 displayState: .checkingContinue,
-                nextAction: "Looking for the safest return point",
+                nextAction: "Checking task and location",
                 availableActions: [
                     IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
                 ]
@@ -820,7 +830,7 @@ private struct SessionIslandView: View {
         case .needsRefresh:
             return "Continue needs refresh"
         case .inspectOnly, .noClearContinuation:
-            return "No safe return target yet"
+            return "Exact location unavailable"
         case .error:
             return "Continue unavailable"
         }
@@ -833,7 +843,7 @@ private struct SessionIslandView: View {
         case .localMemoryWarming:
             return "Collecting local evidence"
         case .checkingContinue:
-            return "Looking for the safest return point"
+            return "Checking task and location"
         case .continueReady:
             return compactActivityLine ?? shortTargetTitle
         case .thinCurrentWork, .targetSuppressed, .supportBlocked:
@@ -911,9 +921,9 @@ private struct SessionIslandView: View {
     private func actionLabel(_ action: IslandAvailableAction, compact: Bool) -> String {
         switch action.kind {
         case .openContinueTarget:
-            return compact ? "Open" : "Continue"
+            return compact ? "Continue" : "Continue here"
         case .markWrongTarget:
-            return compact ? "Wrong" : "Wrong target"
+            return compact ? "Not right" : "Not right"
         case .markNotUseful:
             return compact ? "Skip" : "Not useful"
         case .refreshContinue:
@@ -955,13 +965,6 @@ private struct SessionIslandView: View {
             ?? "Return target ready"
     }
 
-    private var currentFocusLine: String {
-        trimmed(continueState.currentFocus?.title)
-            .nonEmpty
-            ?? trimmed(continueState.currentActivity).nonEmpty
-            ?? "Current focus is unclear"
-    }
-
     private var activitySummaryLine: String? {
         trimmed(continueState.activitySummary).nonEmpty
     }
@@ -991,59 +994,8 @@ private struct SessionIslandView: View {
         trimmed(continueState.activityState).nonEmpty
     }
 
-    private var activityConfidenceLine: String? {
-        guard let confidence = trimmed(continueState.activityConfidenceLabel).nonEmpty else { return nil }
-        return confidence.capitalized
-    }
-
-    private var targetConfidenceLine: String? {
-        guard let confidence = trimmed(continueState.targetConfidenceLabel).nonEmpty else { return nil }
-        return confidence.capitalized
-    }
-
-    private var recentContextLine: String? {
-        trimmed(continueState.recentContextSummary).nonEmpty
-    }
-
-    private var returnTargetLine: String {
-        trimmed(continueState.returnTarget?.title)
-            .nonEmpty
-            ?? trimmed(continueState.resumeWorkTarget?.title).nonEmpty
-            ?? "No safe return target yet"
-    }
-
-    private var nextActionLine: String {
-        trimmed(continueState.nextAction).nonEmpty ?? secondaryDisplayText
-    }
-
-    private var confidenceLine: String? {
-        guard let confidence = trimmed(continueState.confidenceLabel).nonEmpty else { return nil }
-        return confidence.capitalized
-    }
-
-    private var combinedConfidenceLine: String? {
-        var parts: [String] = []
-        if let activityConfidenceLine {
-            parts.append("Activity \(activityConfidenceLine)")
-        }
-        if let targetConfidenceLine {
-            parts.append("Target \(targetConfidenceLine)")
-        }
-        if !parts.isEmpty {
-            return parts.joined(separator: " · ")
-        }
-        return confidenceLine.map { "Overall \($0)" }
-    }
-
-    private var missingEvidenceLine: String? {
-        continueState.missingEvidence
-            .map { trimmed($0) }
-            .first(where: { !$0.isEmpty })
-            .map { $0.hasSuffix(".") ? $0 : "\($0)." }
-            ?? continueState.warnings
-            .map { trimmed($0) }
-            .first(where: { !$0.isEmpty })
-            .map { $0.hasSuffix(".") ? $0 : "\($0)." }
+    private var nextActionLine: String? {
+        trimmed(continueState.nextAction).nonEmpty
     }
 
     private func trimmed(_ value: String?) -> String {
@@ -1346,22 +1298,24 @@ private struct SessionIslandView: View {
             }
 
             VStack(alignment: .leading, spacing: s(6)) {
-                ContinueDetailRow(label: "What", value: activitySummaryLine ?? secondaryDisplayText, scale: scale)
-                ContinueDetailRow(label: "Where", value: activityWhereLine ?? currentFocusLine, scale: scale)
-                if let recentContextLine {
-                    ContinueDetailRow(label: "Context", value: recentContextLine, scale: scale)
+                ContinueDetailRow(
+                    label: "You were",
+                    value: activitySummaryLine ?? "Exact task recovery is unavailable",
+                    scale: scale
+                )
+                ContinueDetailRow(
+                    label: "State",
+                    value: activityStateLine ?? "No supported unfinished state is available",
+                    scale: scale
+                )
+                if let nextActionLine {
+                    ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
                 }
-                if let activityStateLine {
-                    ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)
-                }
-                ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
-                ContinueDetailRow(label: "Target", value: returnTargetLine, scale: scale)
-                if let combinedConfidenceLine {
-                    ContinueDetailRow(label: "Confidence", value: combinedConfidenceLine, scale: scale)
-                }
-                if let missingEvidenceLine {
-                    ContinueDetailRow(label: "Evidence", value: missingEvidenceLine, scale: scale)
-                }
+                ContinueDetailRow(
+                    label: "Where",
+                    value: activityWhereLine ?? "Exact location unavailable",
+                    scale: scale
+                )
             }
             .padding(.horizontal, s(10))
             .padding(.vertical, s(10))

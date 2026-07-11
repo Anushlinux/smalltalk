@@ -33,13 +33,18 @@ pub(crate) fn validate_activity_recap_model_output(
     let mut repairs = Vec::new();
     let mut accepted_fields = Vec::new();
 
+    validate_semantic_identity(pack, output, &mut failures);
+    validate_cross_layer_truth(pack, &mut failures);
     validate_confidence(local_recap, output, &mut failures, &mut repairs);
     validate_uncertainty(local_recap, output, &mut failures);
     validate_evidence_handles(pack, output, &mut failures);
+    validate_claim_proofs(pack, output, &mut failures, &mut repairs);
     validate_all_public_copy(output, &mut failures);
     validate_claim_slots(local_recap, output, &mut failures);
     validate_target_policy(pack, output, &mut failures);
     validate_claim_terms(pack, output, &mut failures);
+    validate_forbidden_primary_terms(pack, output, &mut failures);
+    validate_temporal_state(pack, output, &mut failures);
     validate_detours(pack, output, &mut failures);
     dedupe(&mut failures);
     dedupe(&mut repairs);
@@ -60,7 +65,12 @@ pub(crate) fn validate_activity_recap_model_output(
         }
         return ActivityRecapValidationResult {
             recap,
-            report: report("rejected", failures, repairs, accepted_fields),
+            report: report(
+                rejection_outcome(&failures),
+                failures,
+                repairs,
+                accepted_fields,
+            ),
         };
     }
 
@@ -152,15 +162,225 @@ pub(crate) fn validate_activity_recap_model_output(
     dedupe(&mut accepted_fields);
     dedupe(&mut repairs);
     let outcome = if accepted_fields.is_empty() {
-        "fallback"
+        "fallback_local"
     } else if repairs.is_empty() {
         "valid"
     } else {
-        "repairable"
+        "repairable_copy_only"
     };
     ActivityRecapValidationResult {
         recap: recap.sanitized(),
         report: report(outcome, failures, repairs, accepted_fields),
+    }
+}
+
+fn validate_semantic_identity(
+    pack: &ActivityRecapModelPack,
+    output: &ActivityRecapModelOutput,
+    failures: &mut Vec<String>,
+) {
+    if output.identity.task_turn_id != pack.task_truth.identity.task_turn_id
+        || output.identity.task_turn_revision != pack.task_truth.identity.task_turn_revision
+        || output.identity.task_identity_key != pack.task_truth.identity.task_identity_key
+        || output.identity.bounded_semantic_label != pack.task_truth.identity.bounded_semantic_label
+    {
+        failures.push("task_identity_mismatch".to_string());
+    }
+    if output.identity.execution_state != pack.task_truth.identity.execution_state
+        || output.identity.current_actor != pack.task_truth.identity.current_actor
+        || output.identity.waiting_on != pack.task_truth.identity.waiting_on
+        || output.identity.relation_to_prior != pack.task_truth.identity.relation_to_prior
+    {
+        failures.push("task_lifecycle_identity_mismatch".to_string());
+    }
+    if output.identity.workstream_id != pack.task_truth.identity.workstream_id {
+        failures.push("workstream_identity_mismatch".to_string());
+    }
+    if output.target_policy != pack.target_policy {
+        failures.push("target_policy_identity_mismatch".to_string());
+    }
+}
+
+fn validate_cross_layer_truth(pack: &ActivityRecapModelPack, failures: &mut Vec<String>) {
+    if pack.task_truth.consistency_status == "conflicting" {
+        failures.push("cross_layer_semantic_conflict".to_string());
+    }
+}
+
+fn validate_claim_proofs(
+    pack: &ActivityRecapModelPack,
+    output: &ActivityRecapModelOutput,
+    failures: &mut Vec<String>,
+    repairs: &mut Vec<String>,
+) {
+    let material = [
+        ("primary_work_summary", output.primary_work_summary.as_ref()),
+        (
+            "primary_where_summary",
+            output.primary_where_summary.as_ref(),
+        ),
+        ("last_meaningful_state", output.last_meaning_state_ref()),
+        ("unfinished_state", output.unfinished_state.as_ref()),
+        ("next_action_summary", output.next_action_summary.as_ref()),
+        ("why_this_target", output.why_this_target.as_ref()),
+        ("why_no_safe_target", output.why_no_safe_target.as_ref()),
+    ];
+    let allowed_handles = pack
+        .evidence_handles
+        .iter()
+        .map(|value| value.handle.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for (key, value) in material {
+        if value.is_none() {
+            continue;
+        }
+        let Some(proof) = output
+            .claim_proofs
+            .iter()
+            .find(|proof| proof.claim_key == key)
+        else {
+            failures.push(format!("missing_claim_proof:{key}"));
+            continue;
+        };
+        if !seen.insert(key) {
+            failures.push(format!("duplicate_claim_proof:{key}"));
+        }
+        if proof.evidence_handles.is_empty()
+            || proof
+                .evidence_handles
+                .iter()
+                .any(|handle| !allowed_handles.contains(handle.as_str()))
+        {
+            failures.push(format!("unsupported_claim_evidence:{key}"));
+        }
+        if proof
+            .evidence_handles
+            .iter()
+            .any(|handle| !output.used_evidence_handles.contains(handle))
+        {
+            failures.push(format!("claim_evidence_not_declared_used:{key}"));
+        }
+        let allowed_for_claim = pack
+            .task_truth
+            .claim_evidence_handles
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        if !allowed_for_claim.is_empty()
+            && proof
+                .evidence_handles
+                .iter()
+                .any(|handle| !allowed_for_claim.contains(handle))
+        {
+            failures.push(format!("wrong_task_turn_claim_evidence:{key}"));
+        }
+        let cap = pack
+            .task_truth
+            .claim_confidence_caps
+            .get(key)
+            .copied()
+            .unwrap_or(0.0);
+        if proof.confidence > cap + 0.000_001 {
+            repairs.push(format!("claim_confidence_capped:{key}"));
+        }
+    }
+}
+
+trait LastMeaningfulStateRef {
+    fn last_meaning_state_ref(&self) -> Option<&String>;
+}
+
+impl LastMeaningfulStateRef for ActivityRecapModelOutput {
+    fn last_meaning_state_ref(&self) -> Option<&String> {
+        self.last_meaningful_state.as_ref()
+    }
+}
+
+fn validate_forbidden_primary_terms(
+    pack: &ActivityRecapModelPack,
+    output: &ActivityRecapModelOutput,
+    failures: &mut Vec<String>,
+) {
+    let primary = [
+        output.primary_work_summary.as_deref(),
+        output.last_meaningful_state.as_deref(),
+        output.unfinished_state.as_deref(),
+        output.next_action_summary.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(normalized_tokens)
+    .collect::<HashSet<_>>();
+    if pack
+        .local_guard
+        .forbidden_primary_terms
+        .iter()
+        .any(|term| primary.contains(term))
+    {
+        failures.push("ineligible_source_primary_term_leak".to_string());
+    }
+}
+
+fn validate_temporal_state(
+    pack: &ActivityRecapModelPack,
+    output: &ActivityRecapModelOutput,
+    failures: &mut Vec<String>,
+) {
+    let state = pack.task_truth.identity.execution_state.as_str();
+    let primary_text = [
+        output.primary_work_summary.as_deref(),
+        output.unfinished_state.as_deref(),
+        output.next_action_summary.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    if state == "active"
+        && [" completed", " finished", " done", " was complete"]
+            .iter()
+            .any(|term| primary_text.contains(term))
+    {
+        failures.push("prior_completion_applied_to_current_task".to_string());
+    }
+    if state == "completed" && output.unfinished_state.is_some() {
+        failures.push("completed_task_described_as_unfinished".to_string());
+    }
+    let waiting_on = pack.task_truth.identity.waiting_on.as_str();
+    let next = output
+        .next_action_summary
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if waiting_on == "agent" && (next.contains("start working") || next.contains("provide input")) {
+        failures.push("next_action_incompatible_with_waiting_on_agent".to_string());
+    }
+    if waiting_on == "user" && next.contains("wait for the agent") {
+        failures.push("next_action_incompatible_with_waiting_on_user".to_string());
+    }
+}
+
+fn rejection_outcome(failures: &[String]) -> &'static str {
+    if failures.iter().any(|value| value.contains("target")) {
+        "rejected_target_policy"
+    } else if failures
+        .iter()
+        .any(|value| value.contains("workstream") || value.contains("cross_layer"))
+    {
+        "rejected_workstream_conflict"
+    } else if failures.iter().any(|value| {
+        value.contains("completion") || value.contains("temporal") || value.contains("lifecycle")
+    }) {
+        "rejected_temporal_conflict"
+    } else if failures
+        .iter()
+        .any(|value| value.contains("ineligible_source"))
+    {
+        "rejected_ineligible_source"
+    } else {
+        "rejected_unsupported_claim"
     }
 }
 
@@ -788,7 +1008,7 @@ fn report(
     accepted_fields: Vec<String>,
 ) -> ActivityRecapValidationReport {
     ActivityRecapValidationReport {
-        schema: "smalltalk.activity_recap_model_validation.v1".to_string(),
+        schema: "smalltalk.activity_recap_model_validation.v2".to_string(),
         outcome: outcome.to_string(),
         failures,
         repairs,
@@ -833,10 +1053,15 @@ mod tests {
         ActivityCurrentState, ActivityDetourSummary, ActivityEvidenceAnchorType,
         ActivityEvidenceConfidence, ActivityEvidenceSpan,
     };
+    use crate::continuation::activity_recap_model::ActivityRecapModelClaimProof;
     use crate::continuation::activity_recap_model::{
         synthesize_activity_recap_with_fixture_response, ActivityRecapModelDetourOutput,
         ActivityRecapModelEvidenceHandle, ActivityRecapModelLocalSeed,
         ActivityRecapModelTargetPolicy, ACTIVITY_RECAP_MODEL_PACK_SCHEMA,
+    };
+    use crate::continuation::activity_recap_truth::{
+        ActivityRecapLocalGuard, ActivityRecapTaskIdentity, ActivityRecapTaskTruth,
+        ACTIVITY_RECAP_TASK_TRUTH_SCHEMA, ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION,
     };
     use serde_json::json;
 
@@ -950,9 +1175,77 @@ mod tests {
     }
 
     fn model_pack(local: &ContinueActivityRecap, has_target: bool) -> ActivityRecapModelPack {
+        let target_policy = ActivityRecapModelTargetPolicy {
+            has_safe_target: has_target,
+            openability: if has_target {
+                "direct".to_string()
+            } else {
+                "none_or_thin".to_string()
+            },
+            may_explain_target: has_target,
+            must_explain_no_safe_target: !has_target,
+        };
+        let identity = ActivityRecapTaskIdentity {
+            task_turn_id: "turn-current".to_string(),
+            task_turn_revision: 2,
+            task_identity_key: "identity-current".to_string(),
+            bounded_semantic_label: Some("Smalltalk activity recap".to_string()),
+            execution_state: "active".to_string(),
+            current_actor: "assistant_or_agent".to_string(),
+            waiting_on: "agent".to_string(),
+            relation_to_prior: "new_task".to_string(),
+            workstream_id: Some("workstream-smalltalk".to_string()),
+        };
+        let claim_confidence_caps = [
+            ("primary_work_summary", 0.8),
+            ("primary_where_summary", 0.8),
+            ("last_meaningful_state", 0.8),
+            ("unfinished_state", 0.8),
+            ("next_action_summary", 0.8),
+            ("why_this_target", if has_target { 0.8 } else { 0.0 }),
+            ("why_no_safe_target", 0.8),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+        let claim_evidence_handles = [
+            "primary_work_summary",
+            "primary_where_summary",
+            "last_meaningful_state",
+            "unfinished_state",
+            "next_action_summary",
+            "why_this_target",
+            "why_no_safe_target",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), vec!["e1".to_string()]))
+        .collect();
         ActivityRecapModelPack {
             schema: ACTIVITY_RECAP_MODEL_PACK_SCHEMA.to_string(),
             instructions: "fixture".to_string(),
+            task_truth: ActivityRecapTaskTruth {
+                schema: ACTIVITY_RECAP_TASK_TRUTH_SCHEMA.to_string(),
+                validator_policy_version: ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION.to_string(),
+                identity,
+                latest_user_goal: Some(
+                    "Write the Smalltalk activity recap implementation".to_string(),
+                ),
+                task_object: Some("Smalltalk activity recap".to_string()),
+                prior_task_turn_id: Some("turn-prior".to_string()),
+                prior_context_role: Some("prior_completed".to_string()),
+                consistency_status: "consistent".to_string(),
+                consistency_policy_version: "fixture".to_string(),
+                selected_primary_segment_id: None,
+                selected_open_loop_id: None,
+                direct_target_allowed: has_target,
+                direct_target_policy_version: "fixture".to_string(),
+                direct_target_locator_kind: if has_target { "browser_url" } else { "none" }
+                    .to_string(),
+                claim_confidence_caps,
+                claim_evidence_handles,
+                missing_evidence: Vec::new(),
+                allowed_context_roles: vec!["same_task".to_string()],
+            },
             current_surface: None,
             primary_segment: None,
             detours: vec![ActivityRecapModelDetour {
@@ -983,16 +1276,7 @@ mod tests {
             objective_terms: vec!["Smalltalk activity recap".to_string()],
             safe_next_action_candidates: local.next_action_summary.clone().into_iter().collect(),
             missing_evidence: local.missing_evidence.clone(),
-            target_policy: ActivityRecapModelTargetPolicy {
-                has_safe_target: has_target,
-                openability: if has_target {
-                    "direct".to_string()
-                } else {
-                    "none_or_thin".to_string()
-                },
-                may_explain_target: has_target,
-                must_explain_no_safe_target: !has_target,
-            },
+            target_policy,
             evidence_handles: vec![
                 ActivityRecapModelEvidenceHandle {
                     handle: "e1".to_string(),
@@ -1042,11 +1326,15 @@ mod tests {
                 "safe".to_string(),
                 "target".to_string(),
             ],
+            local_guard: ActivityRecapLocalGuard::default(),
         }
     }
 
     fn output() -> ActivityRecapModelOutput {
+        let pack = model_pack(&local_recap(true, false), true);
         ActivityRecapModelOutput {
+            identity: pack.task_truth.identity,
+            target_policy: pack.target_policy,
             primary_work_summary: Some(
                 "You were writing the Smalltalk activity recap implementation".to_string(),
             ),
@@ -1060,6 +1348,11 @@ mod tests {
             confidence: "medium".to_string(),
             uncertainty_notes: Vec::new(),
             used_evidence_handles: vec!["e1".to_string()],
+            claim_proofs: vec![ActivityRecapModelClaimProof {
+                claim_key: "primary_work_summary".to_string(),
+                evidence_handles: vec!["e1".to_string()],
+                confidence: 0.8,
+            }],
         }
     }
 
@@ -1109,7 +1402,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1132,7 +1425,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1157,7 +1450,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1177,7 +1470,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1198,7 +1491,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1278,7 +1571,7 @@ mod tests {
 
         let result = validate_activity_recap_model_output(&local, &pack, &model);
 
-        assert_eq!(result.report.outcome, "rejected");
+        assert!(result.report.outcome.starts_with("rejected_"));
         assert!(result
             .report
             .failures
@@ -1287,5 +1580,100 @@ mod tests {
             .report
             .failures
             .contains(&"incompatible_next_action".to_string()));
+    }
+
+    #[test]
+    fn active_current_task_cannot_inherit_prior_completion() {
+        let local = local_recap(true, false);
+        let mut pack = model_pack(&local, true);
+        pack.allowed_primary_terms.extend([
+            "completed".to_string(),
+            "smalltalk".to_string(),
+            "activity".to_string(),
+            "recap".to_string(),
+        ]);
+        let mut model = output();
+        model.primary_work_summary = Some("You completed the Smalltalk activity recap".to_string());
+        let result = validate_activity_recap_model_output(&local, &pack, &model);
+        assert_eq!(result.report.outcome, "rejected_temporal_conflict");
+        assert!(result
+            .report
+            .failures
+            .contains(&"prior_completion_applied_to_current_task".to_string()));
+    }
+
+    #[test]
+    fn model_workstream_must_match_local_task_identity() {
+        let local = local_recap(true, false);
+        let pack = model_pack(&local, true);
+        let mut model = output();
+        model.identity.workstream_id = Some("workstream-helium".to_string());
+        let result = validate_activity_recap_model_output(&local, &pack, &model);
+        assert_eq!(result.report.outcome, "rejected_workstream_conflict");
+        assert!(result
+            .report
+            .failures
+            .contains(&"workstream_identity_mismatch".to_string()));
+    }
+
+    #[test]
+    fn local_only_forbidden_terms_override_a_permissive_term_bank() {
+        let local = local_recap(true, false);
+        let mut pack = model_pack(&local, true);
+        pack.allowed_primary_terms.extend([
+            "stremio".to_string(),
+            "research".to_string(),
+            "smalltalk".to_string(),
+        ]);
+        pack.local_guard.forbidden_primary_terms = vec!["stremio".to_string()];
+        let mut model = output();
+        model.primary_work_summary = Some("Stremio research for Smalltalk".to_string());
+        let result = validate_activity_recap_model_output(&local, &pack, &model);
+        assert_eq!(result.report.outcome, "rejected_ineligible_source");
+        assert!(result
+            .report
+            .failures
+            .contains(&"ineligible_source_primary_term_leak".to_string()));
+    }
+
+    #[test]
+    fn claim_confidence_is_copy_only_repair_when_identity_is_unchanged() {
+        let local = local_recap(true, false);
+        let mut pack = model_pack(&local, true);
+        pack.task_truth
+            .claim_confidence_caps
+            .insert("primary_work_summary".to_string(), 0.5);
+        let mut model = output();
+        model.claim_proofs[0].confidence = 0.9;
+        let result = validate_activity_recap_model_output(&local, &pack, &model);
+        assert_eq!(result.report.outcome, "repairable_copy_only");
+        assert!(result
+            .report
+            .repairs
+            .contains(&"claim_confidence_capped:primary_work_summary".to_string()));
+    }
+
+    #[test]
+    fn conflicting_local_semantic_graph_never_validates_high_confidence_copy() {
+        let local = local_recap(true, false);
+        let mut pack = model_pack(&local, true);
+        pack.task_truth.consistency_status = "conflicting".to_string();
+        let result = validate_activity_recap_model_output(&local, &pack, &output());
+        assert_eq!(result.report.outcome, "rejected_workstream_conflict");
+        assert!(result
+            .report
+            .failures
+            .contains(&"cross_layer_semantic_conflict".to_string()));
+    }
+
+    #[test]
+    fn normal_model_pack_never_serializes_rejected_private_terms() {
+        let local = local_recap(true, false);
+        let mut pack = model_pack(&local, true);
+        pack.local_guard.forbidden_primary_terms = vec!["private-stale-term".to_string()];
+        pack.local_guard.rejected_source_hashes = vec!["hash-only-local".to_string()];
+        let serialized = serde_json::to_string(&pack).unwrap();
+        assert!(!serialized.contains("private-stale-term"));
+        assert!(!serialized.contains("hash-only-local"));
     }
 }

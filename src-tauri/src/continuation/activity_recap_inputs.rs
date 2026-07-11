@@ -1,17 +1,18 @@
 use super::activity_recap::sanitize_public_text;
+use super::semantic_consistency::{evaluate_semantic_eligibility, SemanticEligibilityInput};
 use super::{
     is_generated_debug_surface, is_smalltalk_self_surface, parse_string_array,
     privacy_status_is_limited, table_exists, ContinueActivitySummary,
     ContinueAppActivityIntelligence, ContinueDecisionQualityGate, ContinueMemoryRetrievalReport,
-    ContinueSupportEvidenceItem, CurrentSurfaceResolutionAudit, EvidenceFreshnessLedger,
-    P0QualitySignals, ResolvedCurrentSurface, ScoredContinueCandidate, ScorerArtifact,
-    ScorerWorkstream,
+    ContinueSupportEvidenceItem, CurrentSurfaceResolutionAudit, CurrentTaskTurn,
+    EvidenceFreshnessLedger, P0QualitySignals, ResolvedCurrentSurface, ScoredContinueCandidate,
+    ScorerArtifact, ScorerWorkstream,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-pub(crate) const ACTIVITY_RECAP_INPUTS_SCHEMA: &str = "smalltalk.activity_recap_inputs.v1";
+pub(crate) const ACTIVITY_RECAP_INPUTS_SCHEMA: &str = "smalltalk.activity_recap_inputs.v2";
 const MAX_SELECTED_RELEVANCE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,7 @@ pub(super) struct ActivityRecapBuildContext<'a> {
     pub evidence_watermark: Option<&'a str>,
     pub output_mode: Option<&'a str>,
     pub requested_at_ms: i64,
+    pub current_task_turn: Option<&'a CurrentTaskTurn>,
     pub current_surface: Option<&'a ResolvedCurrentSurface>,
     pub current_surface_resolution: Option<&'a CurrentSurfaceResolutionAudit>,
     pub selected_workstream: Option<&'a ScorerWorkstream>,
@@ -70,6 +72,7 @@ pub(super) struct ActivityRecapBuildContext<'a> {
 pub(crate) struct ActivityRecapInputs {
     pub schema: String,
     pub decision_context: ActivityRecapDecisionContext,
+    pub current_task_turn: Option<CurrentTaskTurnFact>,
     pub current_surface: Option<CurrentSurfaceFact>,
     pub selected_workstream: Option<WorkstreamFact>,
     pub selected_candidate: Option<CandidateFact>,
@@ -86,6 +89,37 @@ pub(crate) struct ActivityRecapInputs {
     pub memory_facts: Vec<MemoryFact>,
     pub existing_quality: ExistingQualityFacts,
     pub input_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct CurrentTaskTurnFact {
+    pub task_turn_id: String,
+    pub revision: i64,
+    pub workstream_id: Option<String>,
+    pub parent_task_turn_id: Option<String>,
+    pub prior_task_turn_id: Option<String>,
+    pub supersedes_task_turn_id: Option<String>,
+    pub latest_user_goal_summary: Option<String>,
+    pub task_object: Option<String>,
+    pub task_kind: String,
+    pub execution_state: String,
+    pub current_actor: String,
+    pub waiting_on: String,
+    pub relation_to_prior: String,
+    pub started_at_ms: i64,
+    pub last_observed_at_ms: i64,
+    pub goal_confidence: f64,
+    pub task_object_confidence: f64,
+    pub actor_state_confidence: f64,
+    pub execution_state_confidence: f64,
+    pub waiting_on_confidence: f64,
+    pub relation_confidence: f64,
+    pub attribution_confidence: f64,
+    pub task_claim_confidence: f64,
+    pub state_claim_confidence: f64,
+    pub missing_evidence: Vec<String>,
+    pub evidence_ids: Vec<String>,
+    pub reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -190,6 +224,7 @@ pub(crate) struct ActivitySegmentFact {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct TaskActionFact {
     pub action_id: String,
+    pub task_turn_id: Option<String>,
     pub frame_id: String,
     pub artifact_id: Option<String>,
     pub secondary_artifact_id: Option<String>,
@@ -241,6 +276,9 @@ pub(crate) struct EvidenceSpanFact {
 pub(crate) struct OpenLoopFact {
     pub open_loop_id: String,
     pub workstream_id: String,
+    pub task_turn_id: Option<String>,
+    pub parent_task_turn_id: Option<String>,
+    pub origin_task_turn_id: Option<String>,
     pub state: String,
     pub boundary_kind: String,
     pub quality: String,
@@ -256,6 +294,12 @@ pub(crate) struct OpenLoopFact {
     pub unfinished_state: Option<String>,
     pub next_evidence_backed_action: Option<String>,
     pub current_focus_relation: Option<String>,
+    pub relation_to_current_task: String,
+    pub freshness: String,
+    pub eligible_for_primary: bool,
+    pub eligible_for_objective: bool,
+    pub eligible_for_last_state: bool,
+    pub eligibility_reason_codes: Vec<String>,
     pub missing_evidence: Vec<String>,
     pub evidence_spans: Vec<EvidenceSpanFact>,
     pub last_updated_at_ms: i64,
@@ -265,6 +309,7 @@ pub(crate) struct OpenLoopFact {
 pub(crate) struct WorkstreamStateFact {
     pub snapshot_id: String,
     pub workstream_id: String,
+    pub task_turn_id: Option<String>,
     pub observed_at_ms: i64,
     pub state: String,
     pub previous_state: Option<String>,
@@ -279,6 +324,10 @@ pub(crate) struct WorkstreamStateFact {
 pub(crate) struct BranchContextFact {
     pub branch_id: String,
     pub branch_action_id: String,
+    pub task_turn_id: Option<String>,
+    pub origin_task_turn_id: Option<String>,
+    pub promotion_task_turn_id: Option<String>,
+    pub promoted_at_ms: Option<i64>,
     pub origin_artifact_id: Option<String>,
     pub origin_workstream_id: Option<String>,
     pub branch_artifact_id: String,
@@ -291,6 +340,9 @@ pub(crate) struct BranchContextFact {
     pub confidence: f64,
     pub reason_code: Option<String>,
     pub evidence_action_ids: Vec<String>,
+    pub promotion_evidence_action_ids: Vec<String>,
+    pub eligible_feedback_event_ids: Vec<String>,
+    pub feedback_rejection_reasons: Vec<String>,
     pub updated_at_ms: i64,
 }
 
@@ -339,6 +391,7 @@ pub(crate) struct MemoryFact {
     pub memory_type: String,
     pub relation: String,
     pub summary: Option<String>,
+    pub source_anchor: Value,
     pub last_seen_at_ms: i64,
     pub confidence: f64,
     pub importance: f64,
@@ -397,7 +450,7 @@ pub(super) fn build_activity_recap_inputs(
         "semantic_moments",
         &mut input_warnings,
     );
-    let open_loops = section_or_warning(
+    let mut open_loops = section_or_warning(
         load_open_loops(
             conn,
             since_ms,
@@ -409,6 +462,36 @@ pub(super) fn build_activity_recap_inputs(
         "open_loops",
         &mut input_warnings,
     );
+    if let Some(current_task_turn) = context.current_task_turn {
+        for open_loop in &mut open_loops {
+            let eligibility = evaluate_semantic_eligibility(&SemanticEligibilityInput {
+                entity_kind: "open_loop".to_string(),
+                entity_id: open_loop.open_loop_id.clone(),
+                current_task_turn_id: Some(current_task_turn.task_turn_id.clone()),
+                current_workstream_id: current_task_turn.workstream_id.clone(),
+                owner_task_turn_id: open_loop.task_turn_id.clone(),
+                owner_workstream_id: Some(open_loop.workstream_id.clone()),
+                parent_task_turn_id: open_loop.parent_task_turn_id.clone(),
+                origin_task_turn_id: open_loop.origin_task_turn_id.clone(),
+                relation_hint: None,
+                lifecycle_state: Some(open_loop.state.clone()),
+                current_task_started_at_ms: Some(current_task_turn.started_at_ms),
+                entity_updated_at_ms: Some(open_loop.last_updated_at_ms),
+                supporting_evidence_ids: open_loop
+                    .evidence_spans
+                    .iter()
+                    .map(|span| span.evidence_id.clone())
+                    .collect(),
+            });
+            open_loop.relation_to_current_task =
+                eligibility.relation_to_current_task.as_str().to_string();
+            open_loop.freshness = eligibility.freshness.as_str().to_string();
+            open_loop.eligible_for_primary = eligibility.eligible_for_primary;
+            open_loop.eligible_for_objective = eligibility.eligible_for_objective;
+            open_loop.eligible_for_last_state = eligibility.eligible_for_last_state;
+            open_loop.eligibility_reason_codes = eligibility.reason_codes;
+        }
+    }
     let workstream_states = section_or_warning(
         load_workstream_states(
             conn,
@@ -453,6 +536,7 @@ pub(super) fn build_activity_recap_inputs(
             evidence_watermark: context.evidence_watermark.map(str::to_string),
             output_mode: context.output_mode.map(str::to_string),
         },
+        current_task_turn: context.current_task_turn.map(current_task_turn_fact),
         current_surface: context.current_surface.map(|surface| {
             current_surface_fact(
                 surface,
@@ -491,6 +575,50 @@ pub(super) fn build_activity_recap_inputs(
         ),
         existing_quality: existing_quality_facts(&context),
         input_warnings,
+    }
+}
+
+fn current_task_turn_fact(turn: &CurrentTaskTurn) -> CurrentTaskTurnFact {
+    let mut evidence_ids = turn.latest_user_span_ids.clone();
+    evidence_ids.extend(turn.current_state_span_ids.iter().cloned());
+    evidence_ids.extend(turn.supporting_action_ids.iter().cloned());
+    evidence_ids.sort();
+    evidence_ids.dedup();
+    CurrentTaskTurnFact {
+        task_turn_id: turn.task_turn_id.clone(),
+        revision: turn.revision,
+        workstream_id: turn.workstream_id.clone(),
+        parent_task_turn_id: turn.parent_task_turn_id.clone(),
+        prior_task_turn_id: turn.prior_task_turn_id.clone(),
+        supersedes_task_turn_id: turn.supersedes_task_turn_id.clone(),
+        latest_user_goal_summary: safe_optional(turn.latest_user_goal_summary.as_deref(), 280),
+        task_object: safe_optional(turn.task_object.as_deref(), 96),
+        task_kind: turn.task_kind.clone(),
+        execution_state: turn.execution_state.label().to_string(),
+        current_actor: turn.current_actor.label().to_string(),
+        waiting_on: turn.waiting_on.label().to_string(),
+        relation_to_prior: turn.relation_to_prior.label().to_string(),
+        started_at_ms: turn.started_at_ms,
+        last_observed_at_ms: turn.last_observed_at_ms,
+        goal_confidence: turn.goal_confidence,
+        task_object_confidence: turn.task_object_confidence,
+        actor_state_confidence: turn.actor_state_confidence,
+        execution_state_confidence: turn.execution_state_confidence,
+        waiting_on_confidence: turn.waiting_on_confidence,
+        relation_confidence: turn.relation_confidence,
+        attribution_confidence: turn.attribution_confidence,
+        task_claim_confidence: turn
+            .attribution_confidence
+            .min(turn.goal_confidence)
+            .min(turn.task_object_confidence),
+        state_claim_confidence: turn
+            .attribution_confidence
+            .min(turn.actor_state_confidence)
+            .min(turn.execution_state_confidence)
+            .min(turn.waiting_on_confidence),
+        missing_evidence: turn.missing_evidence.clone(),
+        evidence_ids,
+        reason_codes: safe_string_list(&turn.reason_codes, 16, 100),
     }
 }
 
@@ -733,7 +861,7 @@ fn load_recent_actions(
                 ta.evidence_source_kind, ta.evidence_span_ids_json,
                 ta.attribution_confidence, ta.quality_flags_json, ta.branch_kind,
                 ta.branch_action_role, ta.branch_confidence, ta.branch_reason_code,
-                a.privacy_status, secondary.privacy_status, {frame_columns}
+                ta.task_turn_id, a.privacy_status, secondary.privacy_status, {frame_columns}
          FROM continue_task_actions ta
          LEFT JOIN continue_artifacts a ON a.id = ta.artifact_id
          LEFT JOIN continue_artifacts secondary ON secondary.id = ta.secondary_artifact_id
@@ -747,6 +875,7 @@ fn load_recent_actions(
         Ok((
             TaskActionFact {
                 action_id: row.get(0)?,
+                task_turn_id: row.get(19)?,
                 frame_id: row.get(1)?,
                 artifact_id: row.get(2)?,
                 secondary_artifact_id: row.get(3)?,
@@ -776,7 +905,6 @@ fn load_recent_actions(
                 branch_confidence: row.get(17)?,
                 branch_reason_code: row.get(18)?,
             },
-            row.get::<_, Option<String>>(19)?,
             row.get::<_, Option<String>>(20)?,
             row.get::<_, Option<String>>(21)?,
             row.get::<_, Option<String>>(22)?,
@@ -784,6 +912,7 @@ fn load_recent_actions(
             row.get::<_, Option<String>>(24)?,
             row.get::<_, Option<String>>(25)?,
             row.get::<_, Option<String>>(26)?,
+            row.get::<_, Option<String>>(27)?,
         ))
     };
     let rows = if has_frames && session_id.is_some() {
@@ -927,13 +1056,17 @@ fn load_open_loops(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT id, workstream_id, state, boundary_kind, quality, confidence,
+            "SELECT id, workstream_id, task_turn_id, parent_task_turn_id,
+                    origin_task_turn_id, state, boundary_kind, quality, confidence,
                     origin_artifact_id, current_focus_artifact_id,
                     primary_return_artifact_id, resume_work_artifact_id,
                     blocker_artifact_id, verification_artifact_id, objective_hint,
                     last_concrete_progress, unfinished_state,
                     next_evidence_backed_action, current_focus_relation,
-                    missing_fields_json, evidence_spans_json, last_updated_at_ms
+                    relation_to_current_task, freshness, eligible_for_primary,
+                    eligible_for_objective, eligible_for_last_state,
+                    eligibility_reason_codes_json, missing_fields_json,
+                    evidence_spans_json, last_updated_at_ms
              FROM continue_open_loops
              WHERE last_updated_at_ms >= ?1
                 OR (?2 IS NOT NULL AND workstream_id = ?2 AND last_updated_at_ms >= ?3)
@@ -952,7 +1085,7 @@ fn load_open_loops(
             ],
             |row| {
                 let spans = serde_json::from_str::<Vec<super::ContinueEvidenceSpan>>(
-                    &row.get::<_, String>(18)?,
+                    &row.get::<_, String>(27)?,
                 )
                 .unwrap_or_default()
                 .into_iter()
@@ -968,40 +1101,49 @@ fn load_open_loops(
                 Ok(OpenLoopFact {
                     open_loop_id: row.get(0)?,
                     workstream_id: row.get(1)?,
-                    state: row.get(2)?,
-                    boundary_kind: row.get(3)?,
-                    quality: row.get(4)?,
-                    confidence: row.get(5)?,
-                    origin_artifact_id: row.get(6)?,
-                    current_focus_artifact_id: row.get(7)?,
-                    primary_return_artifact_id: row.get(8)?,
-                    resume_work_artifact_id: row.get(9)?,
-                    blocker_artifact_id: row.get(10)?,
-                    verification_artifact_id: row.get(11)?,
+                    task_turn_id: row.get(2)?,
+                    parent_task_turn_id: row.get(3)?,
+                    origin_task_turn_id: row.get(4)?,
+                    state: row.get(5)?,
+                    boundary_kind: row.get(6)?,
+                    quality: row.get(7)?,
+                    confidence: row.get(8)?,
+                    origin_artifact_id: row.get(9)?,
+                    current_focus_artifact_id: row.get(10)?,
+                    primary_return_artifact_id: row.get(11)?,
+                    resume_work_artifact_id: row.get(12)?,
+                    blocker_artifact_id: row.get(13)?,
+                    verification_artifact_id: row.get(14)?,
                     objective_hint: safe_optional(
-                        row.get::<_, Option<String>>(12)?.as_deref(),
+                        row.get::<_, Option<String>>(15)?.as_deref(),
                         180,
                     ),
                     last_concrete_progress: safe_optional(
-                        row.get::<_, Option<String>>(13)?.as_deref(),
+                        row.get::<_, Option<String>>(16)?.as_deref(),
                         220,
                     ),
                     unfinished_state: safe_optional(
-                        row.get::<_, Option<String>>(14)?.as_deref(),
+                        row.get::<_, Option<String>>(17)?.as_deref(),
                         220,
                     ),
                     next_evidence_backed_action: safe_optional(
-                        row.get::<_, Option<String>>(15)?.as_deref(),
+                        row.get::<_, Option<String>>(18)?.as_deref(),
                         220,
                     ),
-                    current_focus_relation: row.get(16)?,
+                    current_focus_relation: row.get(19)?,
+                    relation_to_current_task: row.get(20)?,
+                    freshness: row.get(21)?,
+                    eligible_for_primary: row.get::<_, i64>(22)? != 0,
+                    eligible_for_objective: row.get::<_, i64>(23)? != 0,
+                    eligible_for_last_state: row.get::<_, i64>(24)? != 0,
+                    eligibility_reason_codes: parse_string_array(&row.get::<_, String>(25)?),
                     missing_evidence: safe_string_list(
-                        &parse_string_array(&row.get::<_, String>(17)?),
+                        &parse_string_array(&row.get::<_, String>(26)?),
                         16,
                         120,
                     ),
                     evidence_spans: spans,
-                    last_updated_at_ms: row.get(19)?,
+                    last_updated_at_ms: row.get(28)?,
                 })
             },
         )
@@ -1046,7 +1188,7 @@ fn load_workstream_states(
                     origin_artifact_id, active_artifact_id,
                     resume_work_target_artifact_id, blocker_artifact_id,
                     confidence, transition_reason, evidence_action_ids_json,
-                    missing_evidence_json
+                    missing_evidence_json, task_turn_id
              FROM continue_workstream_state_snapshots
              WHERE observed_at_ms >= ?1
                 OR (?2 IS NOT NULL AND workstream_id = ?2 AND observed_at_ms >= ?3)
@@ -1072,6 +1214,7 @@ fn load_workstream_states(
                     WorkstreamStateFact {
                         snapshot_id: row.get(0)?,
                         workstream_id: row.get(1)?,
+                        task_turn_id: row.get(13)?,
                         observed_at_ms: row.get(2)?,
                         state: row.get(3)?,
                         previous_state: row.get(4)?,
@@ -1137,6 +1280,11 @@ fn load_branch_contexts(
                     bc.returned_to_origin_at_ms, bc.promotion_state,
                     bc.promotion_reason, bc.confidence, bc.reason_code,
                     bc.evidence_action_ids_json, bc.updated_at_ms,
+                    bc.task_turn_id, bc.origin_task_turn_id,
+                    bc.promotion_task_turn_id, bc.promoted_at_ms,
+                    bc.promotion_evidence_action_ids_json,
+                    bc.eligible_feedback_event_ids_json,
+                    bc.feedback_rejection_reasons_json,
                     branch.privacy_status, origin.privacy_status
              FROM continue_branch_contexts bc
              LEFT JOIN continue_artifacts branch ON branch.id = bc.branch_artifact_id
@@ -1169,6 +1317,10 @@ fn load_branch_contexts(
                     BranchContextFact {
                         branch_id: row.get(0)?,
                         branch_action_id: row.get(1)?,
+                        task_turn_id: row.get(15)?,
+                        origin_task_turn_id: row.get(16)?,
+                        promotion_task_turn_id: row.get(17)?,
+                        promoted_at_ms: row.get(18)?,
                         origin_artifact_id: row.get(2)?,
                         origin_workstream_id: row.get(3)?,
                         branch_artifact_id: row.get(4)?,
@@ -1184,10 +1336,15 @@ fn load_branch_contexts(
                         confidence: row.get(11)?,
                         reason_code: row.get(12)?,
                         evidence_action_ids: parse_string_array(&row.get::<_, String>(13)?),
+                        promotion_evidence_action_ids: parse_string_array(
+                            &row.get::<_, String>(19)?,
+                        ),
+                        eligible_feedback_event_ids: parse_string_array(&row.get::<_, String>(20)?),
+                        feedback_rejection_reasons: parse_string_array(&row.get::<_, String>(21)?),
                         updated_at_ms: row.get(14)?,
                     },
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(22)?,
+                    row.get::<_, Option<String>>(23)?,
                 ))
             },
         )
@@ -1366,6 +1523,7 @@ fn map_memory_facts(
             memory_type: value.memory_type.clone(),
             relation: relation.to_string(),
             summary: safe_optional(Some(&value.summary), 220),
+            source_anchor: value.source_anchor.clone(),
             last_seen_at_ms: value.last_seen_at_ms,
             confidence: value.confidence,
             importance: value.importance,
@@ -1595,6 +1753,7 @@ mod tests {
             evidence_watermark: Some("watermark-test"),
             output_mode: Some("thin_continue"),
             requested_at_ms: NOW_MS,
+            current_task_turn: None,
             current_surface: None,
             current_surface_resolution: None,
             selected_workstream: None,

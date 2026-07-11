@@ -1,0 +1,55 @@
+{
+  "schema": "smalltalk.continue_accuracy_milestones.v1",
+  "manifest_version": "p6.08-v1",
+  "cases": [
+    {
+      "case_id": "capture_button_fresh_task_only",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_old_completion_visible",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_stale_inferred_feedback",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_unrelated_open_loop",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_all_contaminants",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_adjacent_before_new_task",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    },
+    {
+      "case_id": "capture_button_adjacent_after_support_detour",
+      "expected_status": "pass",
+      "expected_first_divergence": null,
+      "must_pass_by_phase": "p6_08",
+      "owner_checkpoint": "product_answer"
+    }
+  ]
+}

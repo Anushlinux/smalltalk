@@ -1,0 +1,207 @@
+{
+  "schema": "smalltalk.continue_accuracy_fixture.v1",
+  "case_id": "tt2_session_013_control",
+  "scenario": "causal_control_containment",
+  "description": "Privacy-safe live-shaped regression: a committed Enter has a legacy null post frame, the matching later frame contains one new right-aligned request, prior completion remains visible, and an actionable approval button is ineligible.",
+  "privacy_review": {
+    "status": "approved",
+    "reviewed_at_ms": 1783728000000,
+    "reviewer_role": "fixture_owner"
+  },
+  "fixture_partition": "development",
+  "injection_boundary": "capture_records",
+  "redacted_source_records": {
+    "frames": [
+      {
+        "record_id": "frame-before-submit",
+        "frame_id": "frame-before-submit",
+        "observed_at_ms": 1000,
+        "parent_record_id": null,
+        "source_role": "active_window",
+        "source_order": 0,
+        "bounds": { "x": 0.0, "y": 0.0, "width": 1200.0, "height": 800.0 },
+        "owner_id_hash": null,
+        "confidence": 1.0,
+        "text": null,
+        "metadata": {
+          "session_id": { "kind": "label", "value": "fixture-session" },
+          "app_name": { "kind": "label", "value": "AgentChat" },
+          "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" },
+          "window_id": { "kind": "integer", "value": 42 },
+          "window_title": { "kind": "label", "value": "Synthetic review task" },
+          "focused": { "kind": "boolean", "value": true },
+          "capture_trigger": { "kind": "label", "value": "manual" },
+          "previous_frame_id": { "kind": "null" }
+        }
+      },
+      {
+        "record_id": "frame-after-submit",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": "frame-before-submit",
+        "source_role": "active_window",
+        "source_order": 1,
+        "bounds": { "x": 0.0, "y": 0.0, "width": 1200.0, "height": 800.0 },
+        "owner_id_hash": null,
+        "confidence": 1.0,
+        "text": null,
+        "metadata": {
+          "session_id": { "kind": "label", "value": "fixture-session" },
+          "app_name": { "kind": "label", "value": "AgentChat" },
+          "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" },
+          "window_id": { "kind": "integer", "value": 42 },
+          "window_title": { "kind": "label", "value": "Synthetic review task" },
+          "focused": { "kind": "boolean", "value": true },
+          "capture_trigger": { "kind": "label", "value": "event_burst" },
+          "capture_trigger_id": { "kind": "label", "value": "trigger-transition-submit" },
+          "previous_frame_id": { "kind": "label", "value": "frame-before-submit" }
+        }
+      }
+    ],
+    "ax_nodes": [
+      {
+        "record_id": "node-001",
+        "frame_id": "frame-before-submit",
+        "observed_at_ms": 1000,
+        "parent_record_id": null,
+        "source_role": "AXStaticText",
+        "source_order": 1,
+        "bounds": { "x": 150.0, "y": 260.0, "width": 720.0, "height": 64.0 },
+        "owner_id_hash": null,
+        "confidence": 0.99,
+        "text": { "text": "The earlier evidence review is complete.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "window_id": { "kind": "integer", "value": 42 }, "enabled": { "kind": "boolean", "value": true } }
+      },
+      {
+        "record_id": "node-002",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "AXStaticText",
+        "source_order": 1,
+        "bounds": { "x": 150.0, "y": 260.0, "width": 720.0, "height": 64.0 },
+        "owner_id_hash": null,
+        "confidence": 0.99,
+        "text": { "text": "The earlier evidence review is complete.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "window_id": { "kind": "integer", "value": 42 }, "enabled": { "kind": "boolean", "value": true } }
+      },
+      {
+        "record_id": "node-003",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "AXStaticText",
+        "source_order": 2,
+        "bounds": { "x": 650.0, "y": 450.0, "width": 420.0, "height": 72.0 },
+        "owner_id_hash": null,
+        "confidence": 0.99,
+        "text": { "text": "Repair typing-to-frame causality and keep controls out of the current task.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "window_id": { "kind": "integer", "value": 42 }, "enabled": { "kind": "boolean", "value": true } }
+      },
+      {
+        "record_id": "node-004",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "AXTextArea",
+        "source_order": 3,
+        "bounds": { "x": 260.0, "y": 620.0, "width": 720.0, "height": 64.0 },
+        "owner_id_hash": null,
+        "confidence": 0.99,
+        "text": { "text": "Message", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "window_id": { "kind": "integer", "value": 42 }, "focused": { "kind": "boolean", "value": true }, "enabled": { "kind": "boolean", "value": true }, "role_description": { "kind": "label", "value": "composer" } }
+      },
+      {
+        "record_id": "node-005",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "AXButton",
+        "source_order": 4,
+        "bounds": { "x": 830.0, "y": 704.0, "width": 240.0, "height": 42.0 },
+        "owner_id_hash": null,
+        "confidence": 0.99,
+        "text": { "text": "Approve for me", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "window_id": { "kind": "integer", "value": 42 }, "enabled": { "kind": "boolean", "value": true }, "actions_json": { "kind": "label", "value": "[\"AXPress\"]" } }
+      }
+    ],
+    "ocr_spans": [],
+    "content_units": [],
+    "frame_text_resolution": [],
+    "app_window_context": [
+      {
+        "record_id": "context-001",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "active_window",
+        "source_order": 1,
+        "bounds": null,
+        "owner_id_hash": "fixture-owner",
+        "confidence": 0.96,
+        "text": { "text": "Synthetic review task", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null },
+        "metadata": { "adapter_id": { "kind": "label", "value": "fixture_agent_chat" }, "object_type": { "kind": "label", "value": "chat_conversation" } }
+      }
+    ],
+    "ui_events": [
+      {
+        "record_id": "event-enter",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2100,
+        "parent_record_id": null,
+        "source_role": "key_down",
+        "source_order": 1,
+        "bounds": null,
+        "owner_id_hash": "fixture-owner",
+        "confidence": 0.99,
+        "text": null,
+        "metadata": { "event_type": { "kind": "label", "value": "key_down" }, "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic review task" }, "key_category": { "kind": "label", "value": "enter" } }
+      }
+    ],
+    "transitions": [
+      {
+        "record_id": "transition-submit",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2200,
+        "parent_record_id": null,
+        "source_role": "capture_transition",
+        "source_order": 1,
+        "bounds": null,
+        "owner_id_hash": null,
+        "confidence": 0.98,
+        "text": null,
+        "metadata": { "pre_frame_id": { "kind": "label", "value": "frame-before-submit" }, "post_frame_id": { "kind": "label", "value": "frame-after-submit" }, "primary_event_id": { "kind": "label", "value": "event-enter" }, "caused_by_event_ids": { "kind": "label", "value": "[\"event-enter\"]" }, "transition_type": { "kind": "label", "value": "submitted_text" } }
+      }
+    ],
+    "typing_metadata": [
+      {
+        "record_id": "typing-001",
+        "frame_id": "frame-after-submit",
+        "observed_at_ms": 2100,
+        "parent_record_id": null,
+        "source_role": "typing_burst",
+        "source_order": 1,
+        "bounds": null,
+        "owner_id_hash": "fixture-owner",
+        "confidence": 0.9,
+        "text": null,
+        "metadata": { "started_at_ms": { "kind": "integer", "value": 1980 }, "ended_at_ms": { "kind": "integer", "value": 2100 }, "char_count": { "kind": "integer", "value": 72 }, "enter_count": { "kind": "integer", "value": 1 }, "committed": { "kind": "boolean", "value": true }, "commit_signal": { "kind": "label", "value": "enter" }, "raw_text_captured": { "kind": "boolean", "value": false }, "pre_frame_id": { "kind": "label", "value": "frame-before-submit" }, "post_frame_id": { "kind": "null" }, "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic review task" }, "commit_event_id": { "kind": "label", "value": "event-enter" } }
+      }
+    ]
+  },
+  "injected_historical_state": { "feedback_events": [], "branch_contexts": [], "workstreams": [], "open_loops": [], "memory_cells": [] },
+  "expected_checkpoints": [
+    { "checkpoint": "region_roles", "status": "expected", "slots": { "latest_user_region": { "kind": "label", "value": "user_message" }, "prior_result_region": { "kind": "label", "value": "conversation_history" } } },
+    { "checkpoint": "conversational_roles", "status": "expected", "slots": { "latest_user_role": { "kind": "label", "value": "user" }, "prior_result_role": { "kind": "label", "value": "assistant_or_agent" } } },
+    { "checkpoint": "ordered_turn_spans", "status": "expected", "slots": { "prior_completion_before_latest_user": { "kind": "boolean", "value": true } } },
+    { "checkpoint": "latest_task_turn", "status": "expected", "slots": { "latest_user_goal": { "kind": "text", "value": { "text": "Repair typing-to-frame causality and keep controls out of the current task.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } } } },
+    { "checkpoint": "public_target", "status": "expected_abstention", "slots": { "return_target": { "kind": "null" }, "resume_work_target": { "kind": "null" } } },
+    { "checkpoint": "product_answer", "status": "expected", "slots": { "public_target_honest": { "kind": "boolean", "value": true } } }
+  ],
+  "forbidden_claims": [
+    { "term": { "text": "Approve for me", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null }, "checkpoints": ["latest_task_turn", "primary_recap_segment", "local_recap", "validated_recap", "product_answer"], "primary_only": true },
+    { "term": { "text": "The earlier evidence review is complete.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null }, "checkpoints": ["latest_task_turn", "product_answer"], "primary_only": true }
+  ],
+  "allowed_uncertainty": [ { "checkpoint": "public_target", "slot": "target_reason", "allowed_labels": ["no_validated_locator", "not_openable"] } ],
+  "expected_model_parity": { "required": true, "identity_slots": ["latest_user_goal"] }
+}

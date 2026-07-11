@@ -8,6 +8,26 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  authoritativeTaskTruthActionState,
+  authoritativeTaskTruthAnswer,
+  authoritativeTaskTruthTarget,
+  compareContinueDecisionAdoption,
+  getContinuePresentationActionState,
+  inspectTargetCopy,
+  isDirectPresentationTargetOpenable,
+  NO_CLEAR_CURRENT_TASK_COPY,
+  NO_CLEAR_CURRENT_TASK_HEADLINE,
+  normalizeTaskResolutionStatus,
+  selectPrimaryTaskHeadline,
+  type ContinueAlternativeHypothesis,
+  type ContinueCurrentTaskTurnSummary,
+  type ContinueDecisionRequestTrigger,
+  type ContinueDecisionSupportedSurface,
+  type ContinueEvidenceFreshnessSummary,
+  type ContinuePresentationActionState,
+  type ContinueTaskResolutionStatus,
+} from "./continuePresentation";
 import "./App.css";
 
 type CaptureFrame = {
@@ -476,6 +496,44 @@ type ContinueReturnTarget = {
   fallback_frame_id?: string | null;
 };
 
+type ContinueTargetTruth = {
+  schema: string;
+  state:
+    | "direct_continue_ready"
+    | "task_known_target_unknown"
+    | "thin_task_seen"
+    | "no_clear_task"
+    | "stale_decision"
+    | "target_suppressed"
+    | "support_only"
+    | string;
+  reason_codes: string[];
+};
+
+type ContinueEvidencePreview = {
+  schema: string;
+  preview_kind: "frame" | string;
+  frame_id: string;
+};
+
+type ContinueInterruptionRecoveryAnswer = {
+  schema: string;
+  what_you_were_doing?: string | null;
+  where_label?: string | null;
+  where_you_left_off?: string | null;
+  next: string;
+  action: "continue_here" | "inspect_evidence" | "view_summary" | string;
+  target_note?: string | null;
+  task_confidence_label: string;
+  target_confidence_label: string;
+};
+
+type ClaimConfidenceSummary = {
+  score: number;
+  label: "none" | "low" | "medium" | "high" | string;
+  missing_evidence: string[];
+};
+
 type ContinueActionSummary = {
   action_id: string;
   action_kind: string;
@@ -685,18 +743,63 @@ type ActiveCurrentWorkUnresolved = {
   warnings: string[];
 };
 
+type ContinueWorkTruth = {
+  schema: string;
+  policy_version: string;
+  resolution_status: "task_supported" | "activity_supported" | "recent_activity_only" | "unresolved" | string;
+  activity_kind: string;
+  activity_summary?: string | null;
+  work_object?: string | null;
+  where_summary?: string | null;
+  app_name?: string | null;
+  artifact_id?: string | null;
+  observed_at_ms: number;
+  confidence: number;
+  evidence_ids: string[];
+  source: string;
+  broader_goal_known: boolean;
+  primary_relation: "primary" | "support" | "detour" | "recent-only" | string;
+  reason_codes: string[];
+};
+
 type ContinueDecisionResult = {
   decision_id: string;
   mode: string;
   cache_hit: boolean;
   source: string;
+  request_trigger?: ContinueDecisionRequestTrigger | string | null;
+  task_understanding_source?: string | null;
+  wording_source?: string | null;
+  target_selection_source?: string | null;
+  task_truth_v2?: TaskTruthProductionDecision | null;
   model?: string | null;
   response_id?: string | null;
+  task_resolution_status?: ContinueTaskResolutionStatus | string | null;
+  task_resolution_reason_codes?: string[];
+  supported_surface?: ContinueDecisionSupportedSurface | null;
+  alternative_hypotheses?: ContinueAlternativeHypothesis[];
   current_focus?: ContinueFocusSummary | null;
   active_current_work_unresolved?: ActiveCurrentWorkUnresolved | null;
+  work_truth?: ContinueWorkTruth | null;
   current_activity?: string | null;
+  current_task_turn?: ContinueCurrentTaskTurnSummary | null;
   selected_workstream?: ContinueSelectedWorkstream | null;
   selected_candidate_id?: string | null;
+  target_truth?: ContinueTargetTruth;
+  evidence_preview?: ContinueEvidencePreview | null;
+  answer?: ContinueInterruptionRecoveryAnswer;
+  direct_target_policy?: {
+    direct_target_allowed: boolean;
+    validated_direct_locator_present: boolean;
+    evidence_preview_available: boolean;
+    reason_codes: string[];
+  };
+  confidence_summary?: {
+    task: ClaimConfidenceSummary;
+    state: ClaimConfidenceSummary;
+    recap: ClaimConfidenceSummary;
+    target: ClaimConfidenceSummary;
+  };
   return_target?: ContinueReturnTarget | null;
   resume_work_target?: ContinueReturnTarget | null;
   candidate_kind?: string | null;
@@ -728,6 +831,8 @@ type ContinueDecisionResult = {
   support_evidence_count?: number;
   branch_validation_failures?: string[];
   continue_output_mode?: "strong_continue" | "thin_continue" | "no_clear_continuation";
+  evidence_watermark_hash?: string;
+  latest_boundary_revision?: number | null;
   current_surface_resolution?: {
     selected?: {
       evidence_ids?: string[];
@@ -738,13 +843,55 @@ type ContinueDecisionResult = {
       } | null;
     } | null;
   } | null;
-  evidence_freshness_ledger?: unknown | null;
+  evidence_freshness_ledger?: ContinueEvidenceFreshnessSummary | null;
   weak_surface_enrichment?: WeakSurfaceEnrichmentDiagnostics | null;
   observe_before_decide?: unknown | null;
   app_activity?: unknown | null;
   activity_summary?: ContinueActivitySummary | null;
   activity_recap?: ContinueActivityRecap | null;
   activity_recap_watermark_hash?: string;
+};
+
+type TaskTruthAlternative = {
+  hypothesis_id: string;
+  task_summary: string;
+  relation: string;
+  confidence: number;
+  evidence_refs: string[];
+};
+
+type TaskTruthPublicAnswer = {
+  schema: string;
+  task_resolution_status: "resolved" | "ambiguous" | "unresolved" | string;
+  task_summary?: string | null;
+  task_object?: string | null;
+  last_meaningful_progress?: string | null;
+  unfinished_state?: string | null;
+  next_action?: string | null;
+  where_summary?: string | null;
+  alternative_hypotheses: TaskTruthAlternative[];
+  direct_return_target?: ContinueReturnTarget | null;
+  evidence_preview?: ContinueEvidencePreview | null;
+  field_support?: Record<string, {
+    confidence?: number | null;
+    support_status?: string | null;
+    evidence_refs?: string[];
+  }> | null;
+  task_understanding_source: string;
+  wording_source: string;
+  target_selection_source: string;
+  snapshot_id: string;
+  snapshot_revision: number;
+  evidence_watermark: string;
+};
+
+type TaskTruthProductionDecision = {
+  requested_state: "off" | "shadow" | "eligible" | "authoritative" | "rollback";
+  effective_state: "off" | "shadow" | "eligible" | "authoritative" | "rollback";
+  release_gate_passed: boolean;
+  reason_codes: string[];
+  cache_fingerprint: string;
+  answer?: TaskTruthPublicAnswer | null;
 };
 
 type ContinueSupportEvidenceItem = {
@@ -771,10 +918,7 @@ type ContinueHandoff = {
   user_visible_uncertainty?: string | null;
 };
 
-type ContinueCardActionState =
-  | { kind: "openable_return_target"; label: "Continue here" }
-  | { kind: "thin_current_work"; label: "Inspect evidence" }
-  | { kind: "no_clear_continuation"; label: "Inspect evidence" };
+type ContinueCardActionState = ContinuePresentationActionState;
 
 type RecentContinueWorkstream = {
   id: string;
@@ -1008,7 +1152,15 @@ type ContinueFreshness =
   | "new_evidence"
   | "thin_evidence"
   | "needs_attention";
-type ContinueRequestTrigger = "manual" | "startup" | "background";
+type ContinueRequestTrigger = ContinueDecisionRequestTrigger;
+
+type ContinueAdoptionDiagnostic = {
+  recordedAtMs: number;
+  incumbentDecisionId: string;
+  challengerDecisionId: string;
+  challengerTrigger: ContinueRequestTrigger;
+  reasonCodes: string[];
+};
 
 type ContinueEvidenceSnapshot = {
   frameCount: number;
@@ -1147,6 +1299,9 @@ function App() {
     useState<ContinueEvidenceSnapshot | null>(null);
   const [continueError, setContinueError] = useState<string | null>(null);
   const [backgroundContinueError, setBackgroundContinueError] = useState<string | null>(null);
+  const [continueAdoptionDiagnostics, setContinueAdoptionDiagnostics] = useState<
+    ContinueAdoptionDiagnostic[]
+  >([]);
   const [continueOpenResult, setContinueOpenResult] = useState<OpenResumePointResult | null>(null);
   const [quietContinueRefreshing, setQuietContinueRefreshing] = useState(false);
   const [continueUpdatedAtMs, setContinueUpdatedAtMs] = useState<number | null>(null);
@@ -1173,6 +1328,8 @@ function App() {
   const storeGenerationRef = useRef(0);
   const autoContinueRef = useRef(false);
   const continueRequestInFlightRef = useRef(false);
+  const continueDecisionRef = useRef<ContinueDecisionResult | null>(null);
+  const continueDecisionTriggerRef = useRef<ContinueRequestTrigger | null>(null);
   const lastBackgroundContinueAttemptRef = useRef(0);
   const failedBackgroundContinueSignatureRef = useRef<string | null>(null);
   const captureMenuRef = useRef<HTMLDetailsElement | null>(null);
@@ -1348,7 +1505,44 @@ function App() {
   );
 
   const applyContinueDecision = useCallback(
-    async (decision: ContinueDecisionResult) => {
+    async (
+      decision: ContinueDecisionResult,
+      receivedTrigger: ContinueRequestTrigger,
+    ): Promise<boolean> => {
+      // The receiving path is authoritative for adoption priority. A cache hit may
+      // preserve the request trigger that originally produced the decision.
+      const challengerTrigger = receivedTrigger;
+      const incumbent = continueDecisionRef.current;
+      const comparison = compareContinueDecisionAdoption({
+        incumbent,
+        challenger: decision,
+        incumbentTrigger: continueDecisionTriggerRef.current,
+        challengerTrigger,
+      });
+      if (!comparison.adopt && incumbent) {
+        setContinueAdoptionDiagnostics((current) => [
+          {
+            recordedAtMs: Date.now(),
+            incumbentDecisionId: incumbent.decision_id,
+            challengerDecisionId: decision.decision_id,
+            challengerTrigger,
+            reasonCodes: comparison.reasonCodes,
+          },
+          ...current,
+        ].slice(0, 8));
+        if (challengerTrigger === "background") {
+          failedBackgroundContinueSignatureRef.current = continueEvidenceSignature(
+            buildContinueEvidenceSnapshot(status, continueMemory),
+          );
+          setBackgroundContinueError(
+            "A quiet refresh returned a weaker answer. Keeping the stronger Continue answer.",
+          );
+        }
+        return false;
+      }
+
+      continueDecisionRef.current = decision;
+      continueDecisionTriggerRef.current = challengerTrigger;
       setContinueDecision(decision);
       setSelectedWorkstreamId(decision.selected_workstream?.workstream_id || null);
       setContinueUpdatedAtMs(Date.now());
@@ -1365,6 +1559,7 @@ function App() {
       setContinueDecisionEvidenceSnapshot(
         buildContinueEvidenceSnapshot(evidenceStatus, evidenceMemory),
       );
+      return true;
     },
     [continueMemory, refreshContinueMemory, refreshStatus, status],
   );
@@ -1397,9 +1592,11 @@ function App() {
           activity_recap_model_enabled: trigger === "manual",
           max_candidates_for_model: 5,
           audit_output_enabled: options.writeAudit === true,
+          request_trigger: trigger,
         },
       });
-      await applyContinueDecision(decision);
+      const adopted = await applyContinueDecision(decision, trigger);
+      if (!adopted) return;
       await invoke("get_island_continue_state", {
         input: {
           reason: "main_card_decision_updated",
@@ -1412,7 +1609,7 @@ function App() {
       if (diagnosticsOpen) {
         await refreshWorkstreams();
       }
-      const firstEvidenceFrame = decision.evidence_anchors.frame_ids[0];
+      const firstEvidenceFrame = continueEvidencePreviewFrameId(decision);
       if (diagnosticsOpen && firstEvidenceFrame && !selectedFrame) {
         await revealContinueFrame(firstEvidenceFrame);
         setEvidenceOpen(false);
@@ -1451,7 +1648,10 @@ function App() {
       setContinueError("This surface is supporting evidence, not a safe continuation target.");
       return;
     }
-    const resumeTarget = continueDecision.resume_work_target || continueDecision.return_target || null;
+    const taskTruthAnswer = authoritativeTaskTruthAnswer(continueDecision);
+    const resumeTarget = taskTruthAnswer
+      ? authoritativeTaskTruthTarget(continueDecision)
+      : continueDecision.resume_work_target || continueDecision.return_target || null;
     setBusyAction("open_continue_target");
     setContinueOpenResult(null);
     setContinueError(null);
@@ -1530,6 +1730,10 @@ function App() {
         selectedCandidateId?: string | null;
         workstreamId?: string | null;
         note?: string | null;
+        taskSnapshotId?: string | null;
+        taskSnapshotRevision?: number | null;
+        affectedTaskField?: string | null;
+        taskHypothesisId?: string | null;
       } = {},
     ) => {
       const workstreamId =
@@ -1562,6 +1766,10 @@ function App() {
               feedback_kind: feedbackKind,
               note: options.note || null,
               source: "desktop_ui",
+              task_snapshot_id: options.taskSnapshotId || null,
+              task_snapshot_revision: options.taskSnapshotRevision || null,
+              affected_task_field: options.affectedTaskField || null,
+              task_hypothesis_id: options.taskHypothesisId || null,
             },
           },
         );
@@ -1574,6 +1782,8 @@ function App() {
           feedbackKind === "artifact_only_evidence" ||
           feedbackKind === "ignored_workstream"
         ) {
+          continueDecisionRef.current = null;
+          continueDecisionTriggerRef.current = null;
           setContinueDecision(null);
           await runContinueDecision({ forceRebuild: true, trigger: "manual" });
         }
@@ -1704,11 +1914,14 @@ function App() {
       setImageData(null);
       setFrameDetail(null);
       setTimeline(emptyTimeline);
+      continueDecisionRef.current = null;
+      continueDecisionTriggerRef.current = null;
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
       setContinueDecisionEvidenceSnapshot(null);
       setContinueUpdatedAtMs(null);
       setBackgroundContinueError(null);
+      setContinueAdoptionDiagnostics([]);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1800,11 +2013,14 @@ function App() {
       setImageData(null);
       setFrameDetail(null);
       setTimeline(emptyTimeline);
+      continueDecisionRef.current = null;
+      continueDecisionTriggerRef.current = null;
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
       setContinueDecisionEvidenceSnapshot(null);
       setContinueUpdatedAtMs(null);
       setBackgroundContinueError(null);
+      setContinueAdoptionDiagnostics([]);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -1861,11 +2077,14 @@ function App() {
       setImageData(null);
       setFrameDetail(null);
       setTimeline(emptyTimeline);
+      continueDecisionRef.current = null;
+      continueDecisionTriggerRef.current = null;
       setContinueDecision(null);
       setContinueDecisionFrameCount(null);
       setContinueDecisionEvidenceSnapshot(null);
       setContinueUpdatedAtMs(null);
       setBackgroundContinueError(null);
+      setContinueAdoptionDiagnostics([]);
       setWorkstreams([]);
       setSelectedWorkstreamId(null);
       setWorkstreamDetail(null);
@@ -2336,7 +2555,7 @@ function App() {
       .catch((err) => setError(String(err)));
 
     listen<ContinueDecisionResult>("smalltalk-continue-updated", (event) => {
-      void applyContinueDecision(event.payload);
+      void applyContinueDecision(event.payload, "island");
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -2527,11 +2746,13 @@ function App() {
             onContinue={() => void runContinueDecision({ writeAudit: true })}
             onOpenTarget={() => void openContinueTarget()}
             onInspectEvidence={() => {
-              const firstEvidenceFrame = continueDecision?.evidence_anchors.frame_ids[0] || null;
+              const firstEvidenceFrame = continueDecision
+                ? continueEvidencePreviewFrameId(continueDecision)
+                : null;
               void revealContinueFrame(firstEvidenceFrame);
             }}
             feedbackStatus={feedbackStatus}
-            onRecordFeedback={(kind) => void recordContinueFeedback(kind)}
+            onRecordFeedback={(kind, options) => void recordContinueFeedback(kind, options)}
             onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
           />
           <ContinueCompanionPanel
@@ -2925,6 +3146,30 @@ function App() {
           <p className="feed-empty">Run the built-in Continue fixture set to inspect product-quality metrics.</p>
         )}
       </section>
+
+      {continueAdoptionDiagnostics.length > 0 ? (
+        <section className="continue-eval-panel" aria-label="Continue result adoption diagnostics">
+          <div className="detail-section-head">
+            <div>
+              <h3>Result adoption</h3>
+              <span>Bounded record of quieter results that did not replace a stronger answer</span>
+            </div>
+            <span>{continueAdoptionDiagnostics.length}</span>
+          </div>
+          <div className="event-feed">
+            {continueAdoptionDiagnostics.map((diagnostic) => (
+              <div
+                className="event-row"
+                key={`${diagnostic.recordedAtMs}-${diagnostic.challengerDecisionId}`}
+              >
+                <time>{formatTime(diagnostic.recordedAtMs)}</time>
+                <strong>{sentenceCase(diagnostic.challengerTrigger)}</strong>
+                <span>{diagnostic.reasonCodes.join(" / ")}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="inspector-grid">
         <aside className="timeline-pane" aria-label="Evidence anchors">
@@ -3739,89 +3984,81 @@ function ContinuationAnswer({
   onContinue: () => void;
   onOpenTarget: () => void;
   onInspectEvidence: () => void;
-  onRecordFeedback: (feedbackKind: string) => void;
+  onRecordFeedback: (
+    feedbackKind: string,
+    options?: {
+      taskSnapshotId?: string | null;
+      taskSnapshotRevision?: number | null;
+      affectedTaskField?: string | null;
+      taskHypothesisId?: string | null;
+    },
+  ) => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
-  const resumeTarget = decision?.resume_work_target || decision?.return_target || null;
+  const taskTruthAnswer = decision?.task_truth_v2?.effective_state === "authoritative"
+    && decision.task_truth_v2.release_gate_passed
+    ? decision.task_truth_v2.answer || null
+    : null;
+  const resumeTarget = taskTruthAnswer
+    ? taskTruthAnswer.direct_return_target || null
+    : decision?.resume_work_target || decision?.return_target || null;
   const actionState = decision ? getContinueCardActionState(decision) : null;
+  const noClearCurrentTask = taskTruthAnswer
+    ? taskTruthAnswer.task_resolution_status === "unresolved"
+    : Boolean(
+        decision
+        && getContinueTaskResolutionStatus(decision) === "no_clear_current_task"
+        && !hasSupportedWorkTruth(decision),
+      );
   const canOpenResumeTarget = actionState?.kind === "openable_return_target";
   const isThinCurrentWork = actionState?.kind === "thin_current_work";
   const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
-  const lowConfidence = decision ? decision.confidence < 0.55 : false;
+  const lowConfidence = taskTruthAnswer
+    ? noClearCurrentTask
+    : decision ? decision.confidence < 0.55 || noClearCurrentTask : false;
   const handoff = decision?.handoff || null;
-  const activityRecap = usableActivityRecap(decision?.activity_recap);
+  const activityRecap = noClearCurrentTask || taskTruthAnswer
+    ? null
+    : usableActivityRecap(decision?.activity_recap);
   const presentation = decision ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
-  const alternatives = (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
+  const alternatives = noClearCurrentTask || taskTruthAnswer
+    ? []
+    : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
-  const evidenceLines = decision ? productEvidenceLines(decision).slice(0, 3) : [];
-  const supportEvidenceLines = decision ? supportEvidenceProductLines(decision).slice(0, 3) : [];
   const productState = decision && actionState && presentation
-    ? buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
+    ? taskTruthAnswer
+      ? buildTaskTruthProductStateCopy(taskTruthAnswer, actionState)
+      : buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
     : null;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
-  const targetLooksInternal = isInternalFacingText(rawTargetLine);
   const workstreamLine = productState?.headline || safeProductLine(
     handoff?.headline || presentation?.workstreamTitle || primaryMessage,
     "Recent work",
   );
   const targetLine = productState?.targetLine || safeProductLine(rawTargetLine, "No stable place to continue yet.");
+  const targetLooksInternal = isInternalFacingText(targetLine);
   const targetMeta = productState?.targetMeta || presentation?.targetMeta || humanTargetMeta(resumeTarget);
   const lastStateLine = productState?.lastStateLine || "No last meaningful state is clear yet.";
-  const nextActionLine = productState?.nextActionLine || "Inspect the latest evidence before choosing a return point.";
-  const currentFocusLine = safeProductLine(
+  const nextActionLine = productState?.nextActionLine || "";
+  const currentFocusLine = taskTruthAnswer ? "" : safeProductLine(
     productState?.currentFocusLine || stripCurrentFocusPrefix(
       safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
     ) || humanFocusLabel(decision?.current_focus),
     "",
   );
-  const activitySummaryLine = safeProductLine(activityRecap?.primary_work_summary || "", "");
-  const activityWhereLine = safeProductLine(
-    activityRecap?.primary_where_summary || currentFocusLine,
-    "",
-  );
-  const hasUsefulActivityRecap = Boolean(
-    activitySummaryLine ||
-      safeProductLine(activityRecap?.last_meaningful_state || "", "") ||
-      safeProductLine(activityRecap?.unfinished_state || "", "") ||
-      (activityRecap?.recent_detours || []).some((detour) => safeProductLine(detour.reason, "")) ||
-      (activityRecap?.supporting_context || []).some((support) => safeProductLine(support.summary, "")),
-  );
-  const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
-  const provenanceTone = decision ? continueProvenanceTone(decision) : "local";
-  const recapWhyLines = [activityRecap?.why_this_target, activityRecap?.why_no_safe_target]
-    .filter((line): line is string => Boolean(line))
-    .concat(handoff?.why_this || [])
-    .map(productizeInternalLabel)
-    .filter((line) => line && !isInternalFacingText(line));
-  const whyLines = (
-    recapWhyLines.length
-      ? recapWhyLines
-      : presentation?.decisionReason ? [presentation.decisionReason] : []
-  )
-    .map((line) => safeProductLine(line, ""))
-    .filter(Boolean)
-    .slice(0, 3);
-  const recentContextLines = [...new Set([
-    ...(activityRecap?.recent_detours || []).map((detour) => detour.reason),
-    ...(activityRecap?.supporting_context || []).map((support) => support.summary),
-  ]
-    .map((line) => safeProductLine(line, ""))
-    .filter(Boolean))]
-    .slice(0, 3);
-  const missingEvidenceLines = [...new Set([
-    ...(activityRecap?.missing_evidence || []),
-    ...(productState?.missingEvidenceLines || []),
-    ...(isInspectPrimary ? evidenceLines : []),
-  ]
-    .map((line) => productSafeEvidenceNote(line) || productizeInternalLabel(line) || line)
-    .map((line) => safeProductLine(line, ""))
-    .filter(Boolean))]
-    .slice(0, 4);
+  const activityWhereLine = taskTruthAnswer
+    ? safeProductLine(taskTruthAnswer.where_summary || "", "")
+    : safeProductLine(
+        noClearCurrentTask
+          ? ""
+          : decision?.answer?.where_label || activityRecap?.primary_where_summary || currentFocusLine,
+        "",
+      );
   const targetBlockLabel = productState?.targetBlockLabel || (
     isInspectPrimary
-      ? "No safe return target yet"
+      ? "Exact location unavailable"
       : lowConfidence
         ? "Best available place to continue"
         : "Continue at"
@@ -3841,26 +4078,21 @@ function ContinuationAnswer({
           "",
         )
   );
-  const showCurrentFocus =
-    Boolean(currentFocusLine) &&
-    currentFocusLine !== "No current focus returned." &&
-    currentFocusLine !== workstreamLine &&
-    (Boolean(productState) || isThinCurrentWork || currentFocusLine !== targetLine) &&
-    (
-      Boolean(productState && productState.kind !== "openable_enriched") ||
-      isThinCurrentWork ||
-      decision?.warnings.includes("current_focus_differs_from_return_target") ||
-      decision?.warnings.includes("current_focus_mismatch") ||
-      decision?.current_focus?.artifact_id !== resumeTarget?.artifact_id
-    );
-
   useEffect(() => {
     setCorrectionOpen(false);
     setAlternativesOpen(false);
   }, [decision?.decision_id]);
 
-  const recordAndClose = (feedbackKind: string) => {
-    onRecordFeedback(feedbackKind);
+  const recordAndClose = (
+    feedbackKind: string,
+    scope?: {
+      taskSnapshotId?: string | null;
+      taskSnapshotRevision?: number | null;
+      affectedTaskField?: string | null;
+      taskHypothesisId?: string | null;
+    },
+  ) => {
+    onRecordFeedback(feedbackKind, scope);
     setCorrectionOpen(false);
   };
   const emptyPrimaryStartsMemory = !hasEvidence && !running;
@@ -3914,14 +4146,10 @@ function ContinuationAnswer({
           {freshness.updatedAtLabel ? (
             <span className="freshness-updated">{freshness.updatedAtLabel}</span>
           ) : null}
-          <span className={`provenance-pill ${provenanceTone}`}>{provenanceLabel}</span>
-          {productState?.statusPills.map((pill) => (
-            <span className="answer-status-pill" key={pill}>{pill}</span>
-          ))}
         </div>
 
         <div className="answer-hero">
-          <p>{productState?.heroLabel || (isThinCurrentWork ? "Current work detected" : "You were working on")}</p>
+          <p>You were</p>
           <h2>{workstreamLine}</h2>
           {activityWhereLine ? (
             <div className="answer-where">
@@ -3931,26 +4159,15 @@ function ContinuationAnswer({
           ) : null}
         </div>
 
-        {recentContextLines.length ? (
-          <section className="answer-memory-section" aria-label="Recent context">
-            <span className="answer-section-label">Recent context</span>
-            <div className="answer-context-list">
-              {recentContextLines.map((line) => (
-                <p key={line}>{line}</p>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
         <div className="answer-state">
           <div>
-            <span>State left behind</span>
+            <span>State</span>
             <strong>{lastStateLine}</strong>
           </div>
-          <div>
+          {nextActionLine ? <div>
             <span>Next</span>
             <strong>{nextActionLine}</strong>
-          </div>
+          </div> : null}
         </div>
 
         <div className="answer-target">
@@ -3961,49 +4178,8 @@ function ContinuationAnswer({
           </div>
         </div>
 
-        {hasUsefulActivityRecap && activityRecap ? (
-          <div className="answer-confidence" aria-label="Activity and target confidence">
-            <span>Activity: <strong>{activityConfidenceText(activityRecap.activity_confidence)}</strong></span>
-            <span aria-hidden="true">·</span>
-            <span>Target: <strong>{activityConfidenceText(activityRecap.target_confidence)}</strong></span>
-          </div>
-        ) : null}
-
-        {whyLines.length ? (
-          <div className="answer-why-strip" aria-label="Why this continuation">
-            {whyLines.map((line) => (
-              <span key={line}>{line}</span>
-            ))}
-          </div>
-        ) : null}
-
-        {missingEvidenceLines.length ? (
-          <section className="answer-memory-section answer-missing-evidence" aria-label="Missing evidence">
-            <span className="answer-section-label">Missing evidence</span>
-            <div className="answer-why-strip">
-              {missingEvidenceLines.map((line) => (
-                <span key={line}>{line}</span>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
         {productState?.olderContextLine ? (
           <p className="answer-context">{productState.olderContextLine}</p>
-        ) : null}
-
-        {supportEvidenceLines.length ? (
-          <div className="answer-why-strip support-evidence-strip" aria-label="Support evidence">
-            {supportEvidenceLines.map((line) => (
-              <span key={line}>{line}</span>
-            ))}
-          </div>
-        ) : null}
-
-        {showCurrentFocus ? (
-          <p className="answer-context">
-            Current focus: <strong>{currentFocusLine}</strong>
-          </p>
         ) : null}
 
         {lowConfidence || uncertaintyLine ? (
@@ -4028,7 +4204,7 @@ function ContinuationAnswer({
             disabled={busyAction !== null}
             onClick={onInspectEvidence}
           >
-            Why this?
+            Why this answer?
           </button>
           <button
             className="secondary-button"
@@ -4041,14 +4217,58 @@ function ContinuationAnswer({
           </button>
         </div>
 
-        <div className="continue-correction">
+        {taskTruthAnswer?.alternative_hypotheses?.length === 2 ? (
+          <div className="alternative-list" aria-label="Two possible tasks">
+            <div className="alternative-heading">
+              <strong>Two tasks are similarly supported</strong>
+              <span>Choose one</span>
+            </div>
+            {taskTruthAnswer.alternative_hypotheses.map((hypothesis) => (
+              <div className="alternative-row" key={hypothesis.hypothesis_id}>
+                <div>
+                  <strong>{hypothesis.task_summary}</strong>
+                </div>
+                <div className="answer-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => recordAndClose("corrected", {
+                      taskSnapshotId: taskTruthAnswer.snapshot_id,
+                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                      affectedTaskField: "hypothesis",
+                      taskHypothesisId: hypothesis.hypothesis_id,
+                    })}
+                  >
+                    This one
+                  </button>
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => recordAndClose("rejected", {
+                      taskSnapshotId: taskTruthAnswer.snapshot_id,
+                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                      affectedTaskField: "hypothesis",
+                      taskHypothesisId: hypothesis.hypothesis_id,
+                    })}
+                  >
+                    Not right
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {!noClearCurrentTask ? <div className="continue-correction">
           <button
             className="text-button"
             type="button"
             disabled={busyAction !== null}
             onClick={() => setCorrectionOpen((open) => !open)}
           >
-            Wrong target?
+            Not right
           </button>
           {correctionOpen ? (
             <div className="continue-correction-panel" aria-label="Correction controls">
@@ -4056,9 +4276,13 @@ function ContinuationAnswer({
                 className="secondary-button"
                 type="button"
                 disabled={busyAction !== null}
-                onClick={() => recordAndClose("rejected")}
+                onClick={() => recordAndClose("rejected", taskTruthAnswer ? {
+                  taskSnapshotId: taskTruthAnswer.snapshot_id,
+                  taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                  affectedTaskField: "task_summary",
+                } : undefined)}
               >
-                Not this
+                Not right
               </button>
               <button
                 className="secondary-button"
@@ -4091,12 +4315,12 @@ function ContinuationAnswer({
           {feedbackStatus ? (
             <p className="correction-feedback" role="status">{feedbackStatus}</p>
           ) : null}
-        </div>
+        </div> : null}
 
         {visibleAlternatives.length > 0 ? (
           <div className="alternative-list" aria-label="Alternative continuations">
             <div className="alternative-heading">
-              <strong>{isThinCurrentWork ? "Older possible return points" : "Alternatives"}</strong>
+              <strong>{isThinCurrentWork ? "Older possible locations" : "Alternatives"}</strong>
               <span>{visibleAlternatives.length}</span>
             </div>
             {visibleAlternatives.map((candidate) => (
@@ -4145,7 +4369,10 @@ function ContinueEvidencePanel({
   imageData: string | null;
   onClose: () => void;
 }) {
-  const target = decision?.resume_work_target || decision?.return_target || null;
+  const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
+  const target = taskTruthAnswer
+    ? taskTruthAnswer.direct_return_target || null
+    : decision?.resume_work_target || decision?.return_target || null;
   const warnings = [
     ...(decision?.missing_evidence || []),
     ...(decision?.warnings || []),
@@ -4154,6 +4381,9 @@ function ContinueEvidencePanel({
   const presentation = decision ? presentContinueDecision(decision) : null;
   const provenanceLabel = decision ? continueProvenanceLabel(decision) : "";
   const surfaceDiagnostics = decision ? continueSurfaceDiagnostics(decision) : [];
+  const diagnosticFrameIds = taskTruthAnswer?.evidence_preview?.frame_id
+    ? [taskTruthAnswer.evidence_preview.frame_id]
+    : decision?.evidence_anchors.frame_ids || [];
 
   if (!decision) {
     return (
@@ -4176,7 +4406,7 @@ function ContinueEvidencePanel({
       <div className="continue-evidence-head">
         <div>
           <p className="product-kicker">Why this continuation?</p>
-          <h2>{presentation?.workstreamTitle || humanTargetLabel(target) || "Selected workstream"}</h2>
+          <h2>{taskTruthAnswer?.task_summary || presentation?.workstreamTitle || humanTargetLabel(target) || "Selected task"}</h2>
         </div>
         <button className="secondary-button" type="button" onClick={onClose}>
           Close
@@ -4185,34 +4415,80 @@ function ContinueEvidencePanel({
 
       <div className="continue-evidence-grid">
         <dl className="continue-evidence-facts">
-          <div>
-            <dt>Why this workstream</dt>
-            <dd>{presentation?.decisionReason || "Selected from local evidence."}</dd>
-          </div>
-          <div>
-            <dt>Return target</dt>
-            <dd>{presentation?.returnTarget || "No return target returned."}</dd>
-          </div>
-          <div>
-            <dt>Current focus</dt>
-            <dd>{presentation?.currentFocus || "No current focus returned."}</dd>
-          </div>
-          <div>
-            <dt>Last meaningful action</dt>
-            <dd>{presentation?.lastState || "No action returned."}</dd>
-          </div>
-          <div>
-            <dt>What is unresolved</dt>
-            <dd>{presentation?.unresolvedState || "No unresolved state returned."}</dd>
-          </div>
-          <div>
-            <dt>Missing evidence</dt>
-            <dd>{presentation?.missingEvidenceSummary || "No missing evidence called out."}</dd>
-          </div>
-          <div>
-            <dt>How this was chosen</dt>
-            <dd>{provenanceLabel}</dd>
-          </div>
+          {taskTruthAnswer ? (
+            <>
+              <div>
+                <dt>Snapshot</dt>
+                <dd>{taskTruthAnswer.snapshot_id} revision {taskTruthAnswer.snapshot_revision}</dd>
+              </div>
+              <div>
+                <dt>Task status</dt>
+                <dd>{sentenceCase(taskTruthAnswer.task_resolution_status)}</dd>
+              </div>
+              <div>
+                <dt>State</dt>
+                <dd>{[
+                  taskTruthAnswer.last_meaningful_progress,
+                  taskTruthAnswer.unfinished_state,
+                ].filter(Boolean).join(" ") || "No more precise state is supported."}</dd>
+              </div>
+              <div>
+                <dt>Next</dt>
+                <dd>{taskTruthAnswer.next_action || "No supported next action."}</dd>
+              </div>
+              <div>
+                <dt>Where</dt>
+                <dd>{taskTruthAnswer.where_summary || "Exact location unavailable."}</dd>
+              </div>
+              <div>
+                <dt>Return target</dt>
+                <dd>{humanTargetLabel(target) || "No strict direct target."}</dd>
+              </div>
+              <div>
+                <dt>Task understanding</dt>
+                <dd>{sentenceCase(taskTruthAnswer.task_understanding_source)}</dd>
+              </div>
+              <div>
+                <dt>Wording</dt>
+                <dd>{sentenceCase(taskTruthAnswer.wording_source)}</dd>
+              </div>
+              <div>
+                <dt>Target selection</dt>
+                <dd>{sentenceCase(taskTruthAnswer.target_selection_source)}</dd>
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                <dt>Why this workstream</dt>
+                <dd>{presentation?.decisionReason || "Selected from local evidence."}</dd>
+              </div>
+              <div>
+                <dt>Return target</dt>
+                <dd>{presentation?.returnTarget || "No return target returned."}</dd>
+              </div>
+              <div>
+                <dt>Current focus</dt>
+                <dd>{presentation?.currentFocus || "No current focus returned."}</dd>
+              </div>
+              <div>
+                <dt>Last meaningful action</dt>
+                <dd>{presentation?.lastState || "No action returned."}</dd>
+              </div>
+              <div>
+                <dt>What is unresolved</dt>
+                <dd>{presentation?.unresolvedState || "No unresolved state returned."}</dd>
+              </div>
+              <div>
+                <dt>Missing evidence</dt>
+                <dd>{presentation?.missingEvidenceSummary || "No missing evidence called out."}</dd>
+              </div>
+              <div>
+                <dt>How this was chosen</dt>
+                <dd>{provenanceLabel}</dd>
+              </div>
+            </>
+          )}
           {surfaceDiagnostics.map((item) => (
             <div key={item.label}>
               <dt>{item.label}</dt>
@@ -4240,7 +4516,7 @@ function ContinueEvidencePanel({
       </div>
 
       <div className="anchor-id-grid weak-surface-id-grid" aria-label="Continue diagnostic ids">
-        <AnchorIdGroup title="Frames" ids={decision.evidence_anchors.frame_ids} />
+        <AnchorIdGroup title="Frames" ids={diagnosticFrameIds} />
         <AnchorIdGroup title="Artifacts" ids={decision.evidence_anchors.artifact_ids} />
         <AnchorIdGroup title="Actions" ids={decision.evidence_anchors.action_ids} />
         <AnchorIdGroup title="Episodes" ids={decision.evidence_anchors.episode_ids} />
@@ -5035,15 +5311,29 @@ function isPrivatePrivacyLabel(value?: string | null) {
 
 function isPermissionMemoryError(value: string) {
   const error = value.toLowerCase();
+  const accessibilityPermissionError = error.includes("accessibility") && (
+    error.includes("permission") ||
+    error.includes("not authorized") ||
+    error.includes("not trusted") ||
+    error.includes("denied")
+  );
   return error.includes("permission") ||
     error.includes("screen access") ||
-    error.includes("accessibility") ||
+    accessibilityPermissionError ||
     error.includes("not authorized") ||
-    error.includes("denied");
+    error.includes("operation not permitted");
 }
 
 function productizeMemoryError(value: string) {
   const error = value.toLowerCase();
+  if (
+    error.includes("no such column") ||
+    error.includes("no such table") ||
+    error.includes("database schema") ||
+    error.includes("malformed")
+  ) {
+    return "Local memory needs a database update. Restart Smalltalk to finish it.";
+  }
   if (error.includes("screen") && (error.includes("permission") || error.includes("access"))) {
     return "Screen access is needed for local memory.";
   }
@@ -5182,6 +5472,29 @@ type ContinueProductStateCopy = {
 function presentContinueDecision(decision: ContinueDecisionResult): ContinuePresentation {
   const target = decision.resume_work_target || decision.return_target || null;
   const recap = usableActivityRecap(decision.activity_recap);
+  const answer = decision.answer;
+  if (
+    getContinueTaskResolutionStatus(decision) === "no_clear_current_task"
+    && !hasSupportedWorkTruth(decision)
+  ) {
+    const reason = (decision.task_resolution_reason_codes || [])
+      .map(productizeInternalLabel)
+      .find(Boolean);
+    return {
+      workstreamTitle: NO_CLEAR_CURRENT_TASK_HEADLINE,
+      currentFocus: "",
+      currentActivity: "",
+      returnTarget: NO_CLEAR_CURRENT_TASK_COPY.targetLine,
+      targetMeta: NO_CLEAR_CURRENT_TASK_COPY.targetMeta,
+      lastState: NO_CLEAR_CURRENT_TASK_COPY.lastStateLine,
+      unresolvedState: "",
+      nextAction: NO_CLEAR_CURRENT_TASK_COPY.nextActionLine,
+      confidenceLabel: "None",
+      confidenceSummary: "No exact current task is supported by the available evidence.",
+      missingEvidenceSummary: reason || "More current task evidence is needed.",
+      decisionReason: "Recent activity was captured, but it does not support one exact current task.",
+    };
+  }
   const unresolvedState = productizeUnresolvedState(
     decision.unresolved_state || decision.selected_workstream?.unresolved_signal,
   );
@@ -5194,14 +5507,19 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
     .map(productizeInternalLabel)
     .filter(Boolean);
   const targetLabel = humanTargetLabel(target);
-  const workstreamTitle = cleanHumanText(recap?.primary_work_summary)
-    || cleanHumanText(decision.selected_workstream?.title_candidate)
-    || targetLabel
-    || "Recent workstream";
+  const workstreamTitle = selectPrimaryTaskHeadline(
+    cleanHumanText(decision.work_truth?.activity_summary || answer?.what_you_were_doing),
+    cleanHumanText(recap?.primary_work_summary),
+    cleanHumanText(decision.selected_workstream?.title_candidate) || targetLabel,
+    humanFocusLabel(decision.current_focus),
+    decision.task_resolution_status,
+  );
   const confidence = decision.confidence_label
     ? sentenceCase(decision.confidence_label)
     : confidenceLabel(decision.confidence);
-  const confidenceSummary = missingEvidence.length
+  const confidenceSummary = decision.work_truth?.resolution_status === "activity_supported"
+    ? "Broader goal not captured."
+    : missingEvidence.length
     ? `${confidence}; ${missingEvidence[0]}`
     : `${confidence}; evidence is enough for a local recommendation.`;
 
@@ -5210,7 +5528,7 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
     currentFocus: humanFocusLabel(decision.current_focus),
     currentActivity: cleanHumanText(recap?.primary_work_label)
       || productizeInternalLabel(decision.current_activity || ""),
-    returnTarget: targetLabel || "No stable return target yet",
+    returnTarget: targetLabel || "Exact location unavailable",
     targetMeta: humanTargetMeta(target),
     lastState: cleanHumanText(recap?.last_meaningful_state)
       || lastAction
@@ -5220,7 +5538,7 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
     nextAction: productizeInternalLabel(
       recap?.next_action_summary
         || decision.next_action
-        || "Open the target and continue from the last meaningful state.",
+        || (target ? "Continue from the last meaningful state." : "Inspect the captured evidence before deciding what to do next."),
     ),
     confidenceLabel: confidence,
     confidenceSummary,
@@ -5229,6 +5547,66 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
       || productizeCandidateKind(decision.candidate_kind)
       || unresolvedState
       || "Selected from local workstream evidence.",
+  };
+}
+
+function buildTaskTruthProductStateCopy(
+  answer: TaskTruthPublicAnswer,
+  actionState: ContinueCardActionState,
+): ContinueProductStateCopy {
+  const unresolved = answer.task_resolution_status === "unresolved";
+  const ambiguous = answer.task_resolution_status === "ambiguous";
+  const target = answer.direct_return_target || null;
+  const taskLine = safeProductLine(answer.task_summary || "", "");
+  const stateLine = [answer.last_meaningful_progress, answer.unfinished_state]
+    .map((line) => safeProductLine(line || "", ""))
+    .filter(Boolean)
+    .join(" ");
+  const inspectCopy = inspectTargetCopy({
+    taskKnown: !unresolved && Boolean(taskLine),
+    evidencePreviewAvailable: Boolean(answer.evidence_preview),
+    appFocusOnly: false,
+  });
+
+  if (unresolved) {
+    return {
+      kind: "no_clear_continuation",
+      heroLabel: NO_CLEAR_CURRENT_TASK_COPY.heroLabel,
+      headline: NO_CLEAR_CURRENT_TASK_HEADLINE,
+      targetBlockLabel: inspectCopy.targetBlockLabel,
+      targetLine: inspectCopy.targetLine,
+      targetMeta: inspectCopy.targetMeta,
+      lastStateLine: NO_CLEAR_CURRENT_TASK_COPY.lastStateLine,
+      nextActionLine: "",
+      currentFocusLine: "",
+      uncertaintyLine: NO_CLEAR_CURRENT_TASK_COPY.uncertaintyLine,
+      missingEvidenceLines: [],
+      statusPills: [],
+    };
+  }
+
+  const targetOpenable = actionState.kind === "openable_return_target";
+  return {
+    kind: targetOpenable ? "openable_enriched" : "enriched_not_openable",
+    heroLabel: "You were",
+    headline: taskLine || (ambiguous
+      ? "Two tasks are similarly supported"
+      : "The current task is supported, but its precise summary is unavailable"),
+    targetBlockLabel: targetOpenable ? "Continue at" : inspectCopy.targetBlockLabel,
+    targetLine: targetOpenable
+      ? humanTargetLabel(target) || "Verified return location"
+      : inspectCopy.targetLine,
+    targetMeta: targetOpenable ? humanTargetMeta(target) : inspectCopy.targetMeta,
+    lastStateLine: stateLine || "No last meaningful state is supported at greater precision.",
+    nextActionLine: safeProductLine(answer.next_action || "", ""),
+    currentFocusLine: "",
+    uncertaintyLine: ambiguous
+      ? "Two task hypotheses remain close. Choose the one that matches your work."
+      : targetOpenable
+        ? ""
+        : "The task is understood, but no strict direct return location is available.",
+    missingEvidenceLines: [],
+    statusPills: [],
   };
 }
 
@@ -5242,11 +5620,57 @@ function buildContinueProductStateCopy(
   const focus = decision.current_focus || null;
   const activeWork = decision.active_current_work_unresolved || null;
   const recap = usableActivityRecap(decision.activity_recap);
+  const answer = decision.answer;
   const targetLooksInternal = isInternalFacingText(presentation.returnTarget);
   const currentFocusLine = humanEnrichedFocusLabel(focus, activeWork);
   const missingEvidenceLines = productMissingEvidenceLines(decision).slice(0, 4);
+  if (
+    getContinueTaskResolutionStatus(decision) === "no_clear_current_task"
+    && !hasSupportedWorkTruth(decision)
+  ) {
+    return {
+      kind: "no_clear_continuation",
+      heroLabel: NO_CLEAR_CURRENT_TASK_COPY.heroLabel,
+      headline: NO_CLEAR_CURRENT_TASK_HEADLINE,
+      targetBlockLabel: NO_CLEAR_CURRENT_TASK_COPY.targetBlockLabel,
+      targetLine: decision.evidence_preview
+        ? "Captured evidence is available to inspect"
+        : NO_CLEAR_CURRENT_TASK_COPY.targetLine,
+      targetMeta: NO_CLEAR_CURRENT_TASK_COPY.targetMeta,
+      lastStateLine: NO_CLEAR_CURRENT_TASK_COPY.lastStateLine,
+      nextActionLine: NO_CLEAR_CURRENT_TASK_COPY.nextActionLine,
+      currentFocusLine: "",
+      uncertaintyLine: NO_CLEAR_CURRENT_TASK_COPY.uncertaintyLine,
+      missingEvidenceLines,
+      statusPills: ["No clear task", "Evidence available"],
+    };
+  }
+  if (decision.work_truth?.resolution_status === "activity_supported") {
+    const targetOpenable = actionState.kind === "openable_return_target";
+    const activityLine = safeProductLine(
+      decision.work_truth.activity_summary || presentation.workstreamTitle,
+      "Recent work",
+    );
+    return {
+      kind: targetOpenable ? "openable_enriched" : "enriched_not_openable",
+      heroLabel: "You were",
+      headline: activityLine,
+      targetBlockLabel: targetOpenable ? "Continue at" : "Observed at",
+      targetLine: targetOpenable
+        ? safeProductLine(presentation.returnTarget, "Verified return location")
+        : safeProductLine(decision.work_truth.where_summary || presentation.returnTarget, "Exact location unavailable"),
+      targetMeta: presentation.targetMeta,
+      lastStateLine: activityLine,
+      nextActionLine: "",
+      currentFocusLine: safeProductLine(decision.work_truth.app_name || "", ""),
+      uncertaintyLine: "Broader goal wasn’t captured.",
+      missingEvidenceLines,
+      statusPills: [sentenceCase(decision.work_truth.activity_kind), "Observed activity"],
+    };
+  }
   const safeLastState = safeProductLine(
-    recap?.last_meaningful_state
+    answer?.where_you_left_off
+      || recap?.last_meaningful_state
       || recap?.unfinished_state
       || decision.handoff?.last_state_line
       || presentation.lastState
@@ -5254,8 +5678,8 @@ function buildContinueProductStateCopy(
     "No last meaningful state is clear yet.",
   );
   const safeNextAction = safeProductLine(
-    recap?.next_action_summary || decision.handoff?.next_action || presentation.nextAction || "",
-    "Inspect the latest evidence before choosing a return point.",
+    answer?.next || recap?.next_action_summary || decision.handoff?.next_action || presentation.nextAction || "",
+    "Inspect the latest evidence before deciding what to do next.",
   );
   const openability = normalizeToken(focus?.openability || target?.openability);
   const quality = surfaceQualityToken(focus?.evidence_quality, focus?.identity_confidence, activeWork);
@@ -5271,9 +5695,21 @@ function buildContinueProductStateCopy(
       ),
   );
   const activityHeadline = safeProductLine(
-    recap?.primary_work_summary || presentation.workstreamTitle || primaryMessage,
+    selectPrimaryTaskHeadline(
+      answer?.what_you_were_doing,
+      recap?.primary_work_summary,
+      presentation.workstreamTitle,
+      currentFocusLine || primaryMessage,
+      decision.task_resolution_status,
+    ),
     primaryMessage,
   );
+  const inspectCopy = inspectTargetCopy({
+    taskKnown: Boolean(answer?.what_you_were_doing) || decision.target_truth?.state === "task_known_target_unknown",
+    evidencePreviewAvailable: Boolean(decision.evidence_preview),
+    appFocusOnly: openability === "app_focus_only",
+    targetNote: answer?.target_note,
+  });
   const hasOlderContext =
     Boolean(target && actionState.kind !== "openable_return_target") &&
     (
@@ -5289,14 +5725,14 @@ function buildContinueProductStateCopy(
       : safeProductLine(presentation.returnTarget, "Openable return target");
     return {
       kind: "openable_enriched",
-      heroLabel: recap?.primary_work_summary ? "You were working on" : "Current focus",
+      heroLabel: recap?.primary_work_summary ? "What you were doing" : "Current focus",
       headline: activityHeadline || currentFocusLine,
       targetBlockLabel: "Return target",
       targetLine,
-      targetMeta: humanTargetMeta(target),
+      targetMeta: safeProductLine(answer?.target_note || humanTargetMeta(target), humanTargetMeta(target)),
       lastStateLine: safeLastState,
       nextActionLine: safeProductLine(
-        recap?.next_action_summary || decision.handoff?.next_action || presentation.nextAction || "",
+        answer?.next || recap?.next_action_summary || decision.handoff?.next_action || presentation.nextAction || "",
         "Open the target and continue from the last meaningful state.",
       ),
       currentFocusLine,
@@ -5309,10 +5745,10 @@ function buildContinueProductStateCopy(
   if (hasOlderContext) {
     return {
       kind: "older_context_with_thin_current_work",
-      heroLabel: recap?.primary_work_summary ? "You were working on" : "Current focus",
+      heroLabel: recap?.primary_work_summary ? "What you were doing" : "Current focus",
       headline: activityHeadline || `${currentFocusLine || "Current work"} - current work is visible but thin`,
       targetBlockLabel: "Older context",
-      targetLine: humanTargetLabel(target) || "Older possible return point",
+      targetLine: humanTargetLabel(target) || "Older possible location",
       targetMeta:
         "There is an older target that may be related, but newer current work makes it unsafe as the main action.",
       lastStateLine: safeLastState,
@@ -5331,14 +5767,11 @@ function buildContinueProductStateCopy(
   if (actionState.kind === "thin_current_work") {
     return {
       kind: "thin_current_work",
-      heroLabel: recap?.primary_work_summary ? "You were working on" : "Current focus",
+      heroLabel: recap?.primary_work_summary ? "What you were doing" : "Current focus",
       headline: activityHeadline || currentFocusLine || activeWork?.app_name || "Current work is visible but thin",
-      targetBlockLabel: "Evidence status",
-      targetLine:
-        "Smalltalk saw fresh activity, but the exact project, thread, or file was not visible.",
-      targetMeta: missingEvidenceLines.length
-        ? missingEvidenceLines[0]
-        : "No safe exact target is available yet.",
+      targetBlockLabel: inspectCopy.targetBlockLabel,
+      targetLine: inspectCopy.targetLine,
+      targetMeta: safeProductLine(inspectCopy.targetMeta, "No direct page or file locator is available."),
       lastStateLine: safeLastState,
       nextActionLine: safeNextAction,
       currentFocusLine,
@@ -5353,15 +5786,11 @@ function buildContinueProductStateCopy(
   if (hasEnrichedSurface && ["strong", "medium"].includes(quality)) {
     return {
       kind: "enriched_not_openable",
-      heroLabel: recap?.primary_work_summary ? "You were working on" : "Current focus",
+      heroLabel: recap?.primary_work_summary ? "What you were doing" : "Current focus",
       headline: activityHeadline || currentFocusLine || safeProductLine(presentation.currentFocus, "Current work"),
-      targetBlockLabel: "Best available return point",
-      targetLine:
-        "The latest work is visible, but Smalltalk cannot reopen the exact target safely yet.",
-      targetMeta:
-        openability === "app_focus_only"
-          ? "Smalltalk can identify the app, but not the exact thread, file, or page."
-          : "No direct URL, document path, or exact target is grounded yet.",
+      targetBlockLabel: inspectCopy.targetBlockLabel,
+      targetLine: inspectCopy.targetLine,
+      targetMeta: safeProductLine(inspectCopy.targetMeta, "No direct page or file locator is available."),
       lastStateLine: safeLastState,
       nextActionLine: safeNextAction,
       currentFocusLine,
@@ -5375,13 +5804,13 @@ function buildContinueProductStateCopy(
 
   return {
     kind: "no_clear_continuation",
-    heroLabel: hasUsefulActivityMemory ? "You were working on" : "Not enough evidence yet",
+    heroLabel: hasUsefulActivityMemory ? "What you were doing" : "Not enough evidence yet",
     headline: hasUsefulActivityMemory
       ? activityHeadline
       : "There is not enough activity evidence yet",
-    targetBlockLabel: "No safe return target yet",
-    targetLine: "Exact return target missing",
-    targetMeta: "Smalltalk does not yet have enough local evidence to reopen an exact task safely.",
+    targetBlockLabel: inspectCopy.targetBlockLabel,
+    targetLine: inspectCopy.targetLine,
+    targetMeta: safeProductLine(inspectCopy.targetMeta, "Exact location unavailable."),
     lastStateLine: safeLastState,
     nextActionLine: safeNextAction,
     currentFocusLine,
@@ -5455,8 +5884,20 @@ function continueStatusPills({
 }
 
 function continueProvenanceLabel(decision: ContinueDecisionResult) {
-  if (decision.source === "cloud_micro_inference" && decision.response_id) {
-    return "AI-assisted";
+  if (getContinueTaskResolutionStatus(decision) === "no_clear_current_task") {
+    return "Local only";
+  }
+  const wordingSource = normalizeToken(
+    decision.wording_source || decision.activity_recap?.generated_by,
+  );
+  if (wordingSource.includes("model") || wordingSource.includes("cloud")) {
+    return "AI-assisted wording";
+  }
+  if (wordingSource.includes("fallback")) {
+    return "Local fallback";
+  }
+  if (!wordingSource && decision.source === "cloud_micro_inference" && decision.response_id) {
+    return "AI-assisted routing";
   }
   if (decision.source === "local_fallback") {
     return "Local fallback";
@@ -5464,17 +5905,15 @@ function continueProvenanceLabel(decision: ContinueDecisionResult) {
   return "Local only";
 }
 
-function continueProvenanceTone(decision: ContinueDecisionResult) {
-  if (decision.source === "cloud_micro_inference" && decision.response_id) {
-    return "ai";
-  }
-  if (decision.source === "local_fallback") {
-    return "fallback";
-  }
-  return "local";
-}
+type HumanReadableTarget = {
+  title?: string | null;
+  document_path?: string | null;
+  browser_url?: string | null;
+  artifact_kind?: string | null;
+  openability?: string | null;
+};
 
-function humanTargetLabel(target?: ContinueReturnTarget | null) {
+function humanTargetLabel(target?: HumanReadableTarget | null) {
   if (!target) return "";
   return cleanHumanText(target.title)
     || pathBasename(target.document_path || target.browser_url)
@@ -5482,8 +5921,8 @@ function humanTargetLabel(target?: ContinueReturnTarget | null) {
     || "";
 }
 
-function humanTargetMeta(target?: ContinueReturnTarget | null) {
-  if (!target) return "I don't have a reliable app or page target for this yet.";
+function humanTargetMeta(target?: HumanReadableTarget | null) {
+  if (!target) return "I know the task separately from whether I can reopen its exact location.";
   const parts = [
     productizeArtifactKind(target.artifact_kind),
     productizeOpenability(target.openability),
@@ -5492,28 +5931,46 @@ function humanTargetMeta(target?: ContinueReturnTarget | null) {
 }
 
 function isDirectResumeTargetOpenable(target?: ContinueReturnTarget | null) {
-  return Boolean(
-    target &&
-      normalizeToken(target.openability) === "openable" &&
-      (target.browser_url || target.document_path),
-  );
+  return isDirectPresentationTargetOpenable(target);
+}
+
+function continueEvidencePreviewFrameId(decision: ContinueDecisionResult) {
+  const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
+  return taskTruthAnswer?.evidence_preview?.frame_id
+    || decision.evidence_anchors.frame_ids[0]
+    || null;
+}
+
+function getContinueTaskResolutionStatus(
+  decision: ContinueDecisionResult,
+): ContinueTaskResolutionStatus {
+  const explicit = normalizeTaskResolutionStatus(decision.task_resolution_status);
+  if (explicit !== "unknown") return explicit;
+  if (
+    decision.continue_output_mode === "no_clear_continuation" ||
+    decision.target_truth?.state === "no_clear_task"
+  ) {
+    return "no_clear_current_task";
+  }
+  return decision.current_task_turn ? "resolved_current_task" : "unknown";
+}
+
+function hasSupportedWorkTruth(decision: ContinueDecisionResult) {
+  return decision.work_truth?.resolution_status === "task_supported"
+    || decision.work_truth?.resolution_status === "activity_supported";
 }
 
 function getContinueCardActionState(decision: ContinueDecisionResult): ContinueCardActionState {
+  const authoritativeAction = authoritativeTaskTruthActionState(decision);
+  if (authoritativeAction) return authoritativeAction;
   const target = decision.resume_work_target || decision.return_target || null;
   const hasOpenableReturnTarget = isDirectResumeTargetOpenable(target);
-  if (
-    decision.decision_id?.trim() &&
-    decision.continue_output_mode !== "no_clear_continuation" &&
-    hasOpenableReturnTarget &&
-    !decisionReturnTargetIsSupportEvidence(decision)
-  ) {
-    return { kind: "openable_return_target", label: "Continue here" };
-  }
-
   const evidenceNotes = continueDecisionEvidenceNotes(decision);
   const unresolvedCurrentWork = decision.active_current_work_unresolved;
   const hasThinCurrentWork =
+    decision.target_truth?.state === "task_known_target_unknown" ||
+    decision.target_truth?.state === "activity_known_target_unknown" ||
+    decision.target_truth?.state === "thin_task_seen" ||
     Boolean(unresolvedCurrentWork && !unresolvedCurrentWork.has_openable_target) ||
     evidenceNotes.includes("stale_return_target_suppressed:newer_current_focus") ||
     (
@@ -5522,11 +5979,18 @@ function getContinueCardActionState(decision: ContinueDecisionResult): ContinueC
     ) ||
     evidenceNotes.includes("thin_evidence:no_human_return_target");
 
-  if (hasThinCurrentWork) {
-    return { kind: "thin_current_work", label: "Inspect evidence" };
-  }
-
-  return { kind: "no_clear_continuation", label: "Inspect evidence" };
+  return getContinuePresentationActionState({
+    decisionId: decision.decision_id,
+    outputMode: decision.continue_output_mode,
+    taskResolutionStatus: getContinueTaskResolutionStatus(decision),
+    workResolutionStatus: decision.work_truth?.resolution_status,
+    target,
+    targetTruthState: decision.target_truth?.state,
+    directTargetAllowed: Boolean(decision.direct_target_policy?.direct_target_allowed),
+    answerAction: decision.answer?.action,
+    supportEvidenceOnly: decisionReturnTargetIsSupportEvidence(decision),
+    thinCurrentWork: hasThinCurrentWork,
+  });
 }
 
 function decisionReturnTargetIsSupportEvidence(decision: ContinueDecisionResult) {
@@ -5623,51 +6087,9 @@ function continueDecisionEvidenceNotes(decision: ContinueDecisionResult) {
   ].filter(Boolean);
 }
 
-function supportEvidenceProductLines(decision: ContinueDecisionResult) {
-  return [...new Set((decision.support_evidence || [])
-    .filter((item) => !item.public_return_eligible)
-    .map(supportEvidenceProductLine)
-    .filter(Boolean))];
-}
-
-function supportEvidenceProductLine(item: ContinueSupportEvidenceItem) {
-  const title = cleanHumanText(item.title || "") || productizeArtifactKind(item.artifact_kind);
-  const role = productizeSupportEvidenceRole(item.branch_kind || item.role);
-  const reason = productizeInternalLabel(item.reason) || productizeSupportEvidenceRole(item.reason);
-  if (title && role) return `${title}: ${role}`;
-  if (role) return role;
-  if (reason) return reason;
-  return "Supporting evidence, not the return target.";
-}
-
-function productizeSupportEvidenceRole(value?: string | null) {
-  const key = normalizeToken(value);
-  const labels: Record<string, string> = {
-    support_context: "Supporting evidence, not the return target.",
-    support_evidence: "Supporting evidence, not the return target.",
-    search_branch: "Search evidence, not the return target.",
-    documentation_reference: "Reference material for the task.",
-    source_evidence: "Source evidence for the task.",
-    message_interrupt: "Interruption context, not the unfinished task.",
-    interruption: "Interruption context, not the unfinished task.",
-    diagnostic_only: "Diagnostic evidence, not the return target.",
-    current_focus_only: "Current focus only; no safe return target yet.",
-    branch_search_without_origin: "Search branch has no grounded origin target.",
-    branch_no_origin: "Support branch has no grounded origin target.",
-  };
-  return labels[key] || "";
-}
-
-function productEvidenceLines(decision: ContinueDecisionResult) {
-  return [...new Set(
-    continueDecisionEvidenceNotes(decision)
-      .map((note) => productSafeEvidenceNote(note) || productizeInternalLabel(note))
-      .filter(Boolean),
-  )];
-}
-
 function productMissingEvidenceLines(decision: ContinueDecisionResult) {
   const notes = [
+    ...(decision.task_resolution_reason_codes || []),
     ...(decision.current_focus?.missing_fields || []),
     ...(decision.active_current_work_unresolved?.missing_evidence || []),
     ...(decision.missing_evidence || []),
@@ -5681,7 +6103,10 @@ function continueSurfaceDiagnostics(decision: ContinueDecisionResult) {
   const activeWork = decision.active_current_work_unresolved || null;
   const attempt = decision.weak_surface_enrichment?.latest_weak_surface_attempt || null;
   const selectedSurface = decision.current_surface_resolution?.selected || null;
-  const target = decision.resume_work_target || decision.return_target || null;
+  const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
+  const target = taskTruthAnswer
+    ? taskTruthAnswer.direct_return_target || null
+    : decision.resume_work_target || decision.return_target || null;
   const adapterKey =
     attempt?.adapter_key ||
     selectedSurface?.weak_surface_classification?.adapter_key ||
@@ -5738,6 +6163,12 @@ function productSafeEvidenceNote(value?: string | null) {
     missing_fresh_heavy_frame_for_current_focus: "Latest surface was event-backed without a fresh screenshot.",
     openable_target_missing: "There is no safe exact target to open.",
     no_direct_url_or_document_path: "There is no safe exact target to open.",
+    no_clear_current_task: "The exact current task is not supported by the available evidence.",
+    no_current_goal: "No current user goal is supported by the available evidence.",
+    no_valid_current_user_goal: "No current user-authored goal could be verified.",
+    no_eligible_current_user_goal: "No current user-authored goal could be verified.",
+    prior_boundary_history_only: "Older task text is available only as history.",
+    control_only_current_evidence: "Recent visible controls were excluded from task understanding.",
     privacy_blocked_text: "Privacy rules blocked some visible evidence.",
   };
   return labels[key] || "";
@@ -5971,10 +6402,6 @@ function safeProductLine(value: string, fallback: string) {
   const cleaned = cleanHumanText(value);
   if (!cleaned || isInternalFacingText(cleaned)) return fallback;
   return cleaned;
-}
-
-function activityConfidenceText(value: ActivityConfidence) {
-  return value === "none" ? "None" : sentenceCase(value);
 }
 
 function usableActivityRecap(

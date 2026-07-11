@@ -1,0 +1,3263 @@
+{
+  "schema": "smalltalk.continue_accuracy_report.v2",
+  "fixture_schema": "smalltalk.continue_accuracy_fixture.v1",
+  "policy_version": "p6.01-v1",
+  "policy_hash": "171b91c2aa51cf7a09495e1ac2c8b7ec39aaffb1e20e209533e0b5089c70979d",
+  "fixture_hash": "02c56291953330d2a61b0cafb70bacf9dfe75154e7a530cde32907e4567cc786",
+  "manifest_hash": "f0aa1f303498723dc23b7d763ab54a685647f0439d85188a8dfad427ae5ac8c7",
+  "evaluated_at_ms": 1783722664087,
+  "case_count": 7,
+  "semantic_pass_count": 7,
+  "known_failure_count": 0,
+  "milestone_contract_passed": true,
+  "milestone_violations": [],
+  "first_divergence_counts": {},
+  "metrics": {
+    "conversational_role_macro_f1": {
+      "numerator": 3,
+      "denominator": 3,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "cross_layer_contradiction_count": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "current_actor_accuracy": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "current_agent_state_accuracy": {
+      "numerator": 6,
+      "denominator": 6,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "current_agent_status_precision": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "current_agent_status_recall": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "current_state_accuracy": {
+      "numerator": 21,
+      "denominator": 21,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "deterministic_replay_agreement": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "direct_openability_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "status": "insufficient_sample_size"
+    },
+    "execution_state_accuracy": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "fixture_parse_privacy_success": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "forbidden_stale_term_leakage": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "frame_fallback_public_target_count": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "labeled_openable_target_recall": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "status": "insufficient_sample_size"
+    },
+    "latest_user_goal_accuracy": {
+      "numerator": 6,
+      "denominator": 6,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "latest_user_span_precision": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "latest_user_span_recall": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "model_on_model_off_task_identity_agreement": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "no_clear_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "status": "insufficient_sample_size"
+    },
+    "prior_completion_override_rate": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "recap_current_task_contradiction_count": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "region_role_macro_f1": {
+      "numerator": 14,
+      "denominator": 14,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "selected_workstream_task_alignment": {
+      "numerator": 3,
+      "denominator": 3,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "semantic_delta_temporal_accuracy": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "stale_feedback_false_promotion_count": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "supported_next_action_coverage_recall": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "status": "insufficient_sample_size"
+    },
+    "supported_next_action_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "status": "insufficient_sample_size"
+    },
+    "task_action_accuracy": {
+      "numerator": 2,
+      "denominator": 2,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "task_summary_coverage": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "task_summary_precision": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "task_turn_boundary_accuracy": {
+      "numerator": 4,
+      "denominator": 4,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "unknown_abstention_correctness": {
+      "numerator": 14,
+      "denominator": 14,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "unrelated_open_loop_primary_count": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    },
+    "waiting_on_accuracy": {
+      "numerator": 7,
+      "denominator": 7,
+      "rate": 1.0,
+      "status": "measured"
+    },
+    "wrong_confident_rate": {
+      "numerator": 0,
+      "denominator": 7,
+      "rate": 0.0,
+      "status": "measured"
+    }
+  },
+  "surface_family_macro": {
+    "agent_chat": 1.0
+  },
+  "worst_slice_rate": 1.0,
+  "p50_model_off_replay_ms": 271.36,
+  "p95_model_off_replay_ms": 287.3,
+  "confidence_calibration": {
+    "active_window_ownership": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.1444,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "branch_role": {
+      "sample_size": 2,
+      "predicted_label_counts": {
+        "high": 5,
+        "medium": 2
+      },
+      "correct_count": 2,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.01,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "current_actor": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "high": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0484,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "current_actor_state": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "high": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0484,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "direct_target_policy": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "none": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "execution_state": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "high": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0324,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "latest_user_goal": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.094114,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "open_loop_relevance": {
+      "sample_size": 2,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 2,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.09,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "recap_claim_support": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "none": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 1,
+      "brier_score": 1.0,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "region_segmentation": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0676,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "relation_to_prior": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.094114,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "speaker_attribution": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0676,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "surface_identity": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.1369,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "target_identity": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "none": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "target_openability": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "none": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "task_object": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.094114,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "turn_order": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "medium": 7
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0676,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "waiting_on": {
+      "sample_size": 7,
+      "predicted_label_counts": {
+        "high": 7
+      },
+      "correct_count": 7,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.0484,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    },
+    "workstream_alignment": {
+      "sample_size": 1,
+      "predicted_label_counts": {
+        "high": 5,
+        "medium": 2
+      },
+      "correct_count": 1,
+      "incorrect_count": 0,
+      "overconfident_wrong_count": 0,
+      "underconfident_correct_count": 0,
+      "brier_score": 0.01,
+      "expected_calibration_error": null,
+      "status": "insufficient_sample_size_for_ece"
+    }
+  },
+  "probe_metrics": {
+    "sample_size": 6,
+    "status_counts": {
+      "failed": 1,
+      "privacy_blocked": 1,
+      "stale_result": 1,
+      "succeeded_changed_evidence": 1,
+      "succeeded_no_change": 1,
+      "timed_out": 1
+    },
+    "changed_count": 1,
+    "rerun_count": 1,
+    "timeout_count": 1,
+    "privacy_blocked_count": 1,
+    "failure_count": 1,
+    "changed_rate": 0.166667,
+    "rerun_rate": 0.166667,
+    "timeout_rate": 0.166667,
+    "privacy_blocked_rate": 0.166667,
+    "failure_rate": 0.166667,
+    "p50_duration_ms": 42.0,
+    "p95_duration_ms": 1500.0,
+    "decisions_with_probe_sample_size": 1,
+    "decisions_without_probe_sample_size": 6,
+    "p50_decision_with_probe_ms": 287.3,
+    "p95_decision_with_probe_ms": 287.3,
+    "p50_decision_without_probe_ms": 271.36,
+    "p95_decision_without_probe_ms": 283.39
+  },
+  "release_gate": {
+    "passed": false,
+    "corpus": {
+      "minimum_required_cases": 100,
+      "case_count": 7,
+      "independently_human_reviewed_count": 0,
+      "partition_counts": {
+        "development": 4,
+        "validation": 3
+      },
+      "locked_holdout_evaluated": false
+    },
+    "performance": {
+      "model_off_p95_ms": 287.3,
+      "frozen_baseline_p95_ms": 163.24,
+      "regression_budget_p95_ms": 204.05,
+      "passed": false
+    },
+    "automated_semantic_gate_passed": true,
+    "confidence_calibration_gate_passed": false,
+    "manual_macos_qa_passed": false,
+    "violations": [
+      "broad_corpus_requires_100_cases_found_7",
+      "independent_human_review_missing_for_7_cases",
+      "missing_locked_holdout_partition_cases",
+      "locked_holdout_not_evaluated",
+      "metric_supported_next_action_precision_has_no_labeled_samples",
+      "metric_supported_next_action_coverage_recall_has_no_labeled_samples",
+      "metric_no_clear_accuracy_has_no_labeled_samples",
+      "metric_direct_openability_precision_has_no_labeled_samples",
+      "metric_labeled_openable_target_recall_has_no_labeled_samples",
+      "confidence_calibration_sample_or_ece_gate_incomplete",
+      "model_off_p95_regression_287.30_exceeds_204.05",
+      "manual_macos_interruption_recovery_qa_not_proven"
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "capture_button_adjacent_after_support_detour",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "active_text_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "latest_user_region",
+            "support_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 7,
+          "correct_slot_count": 7,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "task_summary",
+            "turn_relation",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "surface_relation",
+            "task_identity_may_change"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "public_target_honest",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "adjacent5478796",
+      "feedback_policy_audit": {
+        "considered_event_count": 0,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 0,
+        "evaluations": [],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [],
+        "rejection_reason_codes": [],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 271.54,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 2,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.52,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.63,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 2,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.62,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 4,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.52,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_adjacent_before_new_task",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "active_text_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "latest_result_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 4,
+          "correct_slot_count": 4,
+          "evaluated_slots": [
+            "current_actor",
+            "execution_state",
+            "task_summary",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "execution_state",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "f37b2469aca56883c7e24bc88ebf926a83599b13eb77cc455dd59e39ca451e42",
+      "evidence_delta_classification": "adjacent5318852",
+      "feedback_policy_audit": {
+        "considered_event_count": 0,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 0,
+        "evaluations": [],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [],
+        "rejection_reason_codes": [],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 247.72,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 2,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.52,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "latest_user_goal": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "open_loop_relevance": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "region_segmentation": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "relation_to_prior": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "speaker_attribution": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "surface_identity": {
+          "score": 0.63,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 2,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "turn_order": {
+          "score": 0.58,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 1,
+          "missing_evidence_count": 1
+        },
+        "workstream_alignment": {
+          "score": 0.52,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_all_contaminants",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "active_text_contains",
+            "agent_state_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 3,
+          "correct_slot_count": 3,
+          "evaluated_slots": [
+            "current_agent_region",
+            "latest_user_region",
+            "prior_result_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 3,
+          "correct_slot_count": 3,
+          "evaluated_slots": [
+            "current_agent_role",
+            "latest_user_role",
+            "prior_result_role"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "latest_user_before_current_agent_status",
+            "prior_completion_before_latest_user"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 9,
+          "correct_slot_count": 9,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "prior_task",
+            "prior_task_state",
+            "task_summary",
+            "turn_relation",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "action_kind",
+            "task_object"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "prior_completion_applies_to_current_task",
+            "temporal_relation"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "stale_feedback_promoted"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 3,
+          "correct_slot_count": 3,
+          "evaluated_slots": [
+            "consistency_status",
+            "project",
+            "task_alignment"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "conflict_count",
+            "unrelated_open_loop_primary"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "project",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 5,
+          "correct_slot_count": 5,
+          "evaluated_slots": [
+            "consistency_status",
+            "cross_layer_contradiction_count",
+            "execution_state",
+            "task_identity",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "match",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 3,
+          "correct_slot_count": 3,
+          "evaluated_slots": [
+            "execution_state",
+            "task_identity",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "public_target_honest",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "allcontaminants",
+      "feedback_policy_audit": {
+        "considered_event_count": 1,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 1,
+        "evaluations": [
+          {
+            "axes": {
+              "branch_match": true,
+              "decision_match": true,
+              "freshness_match": true,
+              "provenance_match": true,
+              "session_match": false,
+              "target_match": true,
+              "task_turn_match": false,
+              "workstream_match": false
+            },
+            "confidence_contribution": 0.0,
+            "cutoff_at_ms": 1783723800627,
+            "eligible": false,
+            "event_age_ms": 59590,
+            "event_id": "feedback-stale",
+            "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+            "policy_version": "feedback_scope_provenance_decay.v2",
+            "provenance": "inferred_return",
+            "rejection_reason_codes": [
+              "scope_mismatch",
+              "different_task_turn",
+              "different_session_without_durable_scope",
+              "predates_branch",
+              "inferred_source_cannot_promote"
+            ],
+            "requested_effect": "promote",
+            "target": {
+              "allowed_effects": {
+                "annotate": true,
+                "promote": false,
+                "rank": true,
+                "suppress": false
+              },
+              "id_or_key": "artifact-helium-stale",
+              "polarity": "positive",
+              "scope": "target_artifact"
+            }
+          }
+        ],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [
+          "inferred_return"
+        ],
+        "rejection_reason_codes": [
+          "scope_mismatch",
+          "different_task_turn",
+          "different_session_without_durable_scope",
+          "predates_branch",
+          "inferred_source_cannot_promote"
+        ],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 287.3,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.9,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.7,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.9,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [
+        {
+          "status": "succeeded_changed_evidence",
+          "duration_ms": 42.0,
+          "evidence_changed": true,
+          "stale_result": false,
+          "reran_decision": true,
+          "confidence_increased": true,
+          "refreshed_warning_emitted": true,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        },
+        {
+          "status": "succeeded_no_change",
+          "duration_ms": 38.0,
+          "evidence_changed": false,
+          "stale_result": false,
+          "reran_decision": false,
+          "confidence_increased": false,
+          "refreshed_warning_emitted": false,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        },
+        {
+          "status": "timed_out",
+          "duration_ms": 1500.0,
+          "evidence_changed": false,
+          "stale_result": false,
+          "reran_decision": false,
+          "confidence_increased": false,
+          "refreshed_warning_emitted": false,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        },
+        {
+          "status": "privacy_blocked",
+          "duration_ms": 21.0,
+          "evidence_changed": false,
+          "stale_result": false,
+          "reran_decision": false,
+          "confidence_increased": false,
+          "refreshed_warning_emitted": false,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        },
+        {
+          "status": "failed",
+          "duration_ms": 16.0,
+          "evidence_changed": false,
+          "stale_result": false,
+          "reran_decision": false,
+          "confidence_increased": false,
+          "refreshed_warning_emitted": false,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        },
+        {
+          "status": "stale_result",
+          "duration_ms": 55.0,
+          "evidence_changed": false,
+          "stale_result": true,
+          "reran_decision": false,
+          "confidence_increased": false,
+          "refreshed_warning_emitted": false,
+          "task_identity_preserved": true,
+          "target_confidence_label": "none",
+          "wrong_confident": false
+        }
+      ],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_fresh_task_only",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "active_text_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "current_agent_region",
+            "latest_user_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 6,
+          "correct_slot_count": 6,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "turn_relation",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "public_target_honest",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "freshtaskonly",
+      "feedback_policy_audit": {
+        "considered_event_count": 0,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 0,
+        "evaluations": [],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [],
+        "rejection_reason_codes": [],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 254.97,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.7,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_old_completion_visible",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "active_text_contains",
+            "prior_completion_visible"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "latest_user_region",
+            "prior_result_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 7,
+          "correct_slot_count": 7,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "prior_task_state",
+            "turn_relation",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "public_target_honest",
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "oldcompletionvisible",
+      "feedback_policy_audit": {
+        "considered_event_count": 0,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 0,
+        "evaluations": [],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [],
+        "rejection_reason_codes": [],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 283.39,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.7,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_stale_inferred_feedback",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "active_text_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "current_agent_region",
+            "latest_user_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 5,
+          "correct_slot_count": 5,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "stale_feedback_promoted"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "staleinferredfeedback",
+      "feedback_policy_audit": {
+        "considered_event_count": 1,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 1,
+        "evaluations": [
+          {
+            "axes": {
+              "branch_match": true,
+              "decision_match": true,
+              "freshness_match": true,
+              "provenance_match": true,
+              "session_match": false,
+              "target_match": true,
+              "task_turn_match": false,
+              "workstream_match": false
+            },
+            "confidence_contribution": 0.0,
+            "cutoff_at_ms": 1783723803209,
+            "eligible": false,
+            "event_age_ms": 59563,
+            "event_id": "feedback-stale",
+            "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+            "policy_version": "feedback_scope_provenance_decay.v2",
+            "provenance": "inferred_return",
+            "rejection_reason_codes": [
+              "scope_mismatch",
+              "different_task_turn",
+              "different_session_without_durable_scope",
+              "predates_branch",
+              "inferred_source_cannot_promote"
+            ],
+            "requested_effect": "promote",
+            "target": {
+              "allowed_effects": {
+                "annotate": true,
+                "promote": false,
+                "rank": true,
+                "suppress": false
+              },
+              "id_or_key": "artifact-helium-stale",
+              "polarity": "positive",
+              "scope": "target_artifact"
+            }
+          }
+        ],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [
+          "inferred_return"
+        ],
+        "rejection_reason_codes": [
+          "scope_mismatch",
+          "different_task_turn",
+          "different_session_without_durable_scope",
+          "predates_branch",
+          "inferred_source_cannot_promote"
+        ],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 271.36,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.9,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.7,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    },
+    {
+      "case_id": "capture_button_unrelated_open_loop",
+      "status": "pass",
+      "first_divergent_checkpoint": null,
+      "checkpoint_results": [
+        {
+          "checkpoint": "resolved_text",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "active_text_contains"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "region_roles",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "current_agent_region",
+            "latest_user_region"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "conversational_roles",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "ordered_turn_spans",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "latest_task_turn",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 5,
+          "correct_slot_count": 5,
+          "evaluated_slots": [
+            "current_actor",
+            "current_agent_state",
+            "execution_state",
+            "latest_user_goal",
+            "waiting_on"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "task_action",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "semantic_delta",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_feedback",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_workstream",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "eligible_open_loop",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "primary_open_loop",
+            "unrelated_open_loop_primary"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "current_surface",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "selected_candidate",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "primary_recap_segment",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "local_recap",
+          "status": "not_expected",
+          "production_path_coverage": "production",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "validated_recap",
+          "status": "not_expected",
+          "production_path_coverage": "missing_production_checkpoint",
+          "expected_slot_count": 0,
+          "correct_slot_count": 0,
+          "evaluated_slots": [],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "public_target",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 2,
+          "correct_slot_count": 2,
+          "evaluated_slots": [
+            "resume_work_target",
+            "return_target"
+          ],
+          "mismatched_slots": []
+        },
+        {
+          "checkpoint": "product_answer",
+          "status": "match",
+          "production_path_coverage": "production",
+          "expected_slot_count": 1,
+          "correct_slot_count": 1,
+          "evaluated_slots": [
+            "task_identity"
+          ],
+          "mismatched_slots": []
+        }
+      ],
+      "forbidden_claim_matches": [],
+      "wrong_confident": false,
+      "public_target_honest": true,
+      "model_on_off_task_identity_match": true,
+      "deterministic_replay_match": true,
+      "privacy_lint_passed": true,
+      "semantic_identity_fingerprint": "6bf27dd91e4c7c01de6cffdb3562f20db05c23b8d2581e29383fcc1908c55558",
+      "evidence_delta_classification": "unrelatedopenloop",
+      "feedback_policy_audit": {
+        "considered_event_count": 0,
+        "eligible_promotion_event_ids": [],
+        "evaluated_target_count": 0,
+        "evaluations": [],
+        "policy_fingerprint": "feedback_scope_provenance_decay.v2:orthogonal_scope:per_target_effects:expiry",
+        "policy_version": "feedback_scope_provenance_decay.v2",
+        "provenance": [],
+        "rejection_reason_codes": [],
+        "stale_feedback_promoted": false
+      },
+      "replay_duration_ms": 255.13,
+      "confidence_dimensions": {
+        "active_window_ownership": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "branch_role": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        },
+        "current_actor": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "current_actor_state": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "direct_target_policy": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "execution_state": {
+          "score": 0.82,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "latest_user_goal": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "open_loop_relevance": {
+          "score": 0.7,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "recap_claim_support": {
+          "score": 0.0,
+          "label": "none",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "region_segmentation": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "relation_to_prior": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "speaker_attribution": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "surface_identity": {
+          "score": 0.69,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "target_identity": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "target_openability": {
+          "score": 0.0,
+          "label": "none",
+          "correct": true,
+          "expected_positive": false,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 1
+        },
+        "task_object": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "turn_order": {
+          "score": 0.74,
+          "label": "medium",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "waiting_on": {
+          "score": 0.78,
+          "label": "high",
+          "correct": true,
+          "expected_positive": true,
+          "supporting_evidence_count": 3,
+          "missing_evidence_count": 0
+        },
+        "workstream_alignment": {
+          "score": 0.9,
+          "label": "high",
+          "correct": null,
+          "expected_positive": null,
+          "supporting_evidence_count": 0,
+          "missing_evidence_count": 0
+        }
+      },
+      "probe_counterfactuals": [],
+      "notes": [
+        "Network disabled; model parity uses the production recap parser/validator with a deterministic synthetic transport response.",
+        "OS observe-before-decide and direct-open side effects are outside this deterministic core replay and are reported as uncovered rather than mocked."
+      ]
+    }
+  ]
+}

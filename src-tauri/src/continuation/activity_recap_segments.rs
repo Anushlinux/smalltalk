@@ -161,7 +161,7 @@ pub(crate) fn stitch_activity_segments(inputs: &ActivityRecapInputs) -> Stitched
     let mut merged = merge_adjacent_segments(inputs, segments);
     merged.sort_by(stitched_segment_order);
 
-    let uncapped_primary_index = select_primary_index(&merged);
+    let uncapped_primary_index = select_primary_index(inputs, &merged);
     let uncapped_current_index = select_current_index(inputs, &merged);
     let returned_to_primary = merged
         .iter()
@@ -187,7 +187,7 @@ pub(crate) fn stitch_activity_segments(inputs: &ActivityRecapInputs) -> Stitched
         );
     }
 
-    let primary_index = select_primary_index(&merged);
+    let primary_index = select_primary_index(inputs, &merged);
     let current_index = select_current_index(inputs, &merged);
     let primary_segment = primary_index.and_then(|index| merged.get(index).cloned());
     let current_segment = current_index.and_then(|index| merged.get(index).cloned());
@@ -364,6 +364,9 @@ fn classify_role(
         };
     }
     if segment.continuation_role.as_deref() == Some("support_context") {
+        if segment.app_family == "finder" && branch.is_none() {
+            return ActivitySegmentRole::Detour;
+        }
         return if signals.branch_related
             || segment.support_score.is_some_and(|score| score >= 0.45)
             || segment
@@ -781,20 +784,69 @@ fn meaningful_boundary_kind(value: &str) -> bool {
     )
 }
 
-fn select_primary_index(segments: &[StitchedActivitySegment]) -> Option<usize> {
-    segments
-        .iter()
-        .rposition(|segment| segment.role == ActivitySegmentRole::PromotedPrimary)
-        .or_else(|| {
-            segments
-                .iter()
-                .position(|segment| segment.role == ActivitySegmentRole::Primary)
-        })
-        .or_else(|| {
-            segments
-                .iter()
-                .rposition(|segment| segment.role == ActivitySegmentRole::Return)
-        })
+fn select_primary_index(
+    inputs: &ActivityRecapInputs,
+    segments: &[StitchedActivitySegment],
+) -> Option<usize> {
+    let current_task_turn_id = inputs
+        .current_task_turn
+        .as_ref()
+        .map(|turn| turn.task_turn_id.as_str());
+    let current_workstream_id = inputs
+        .current_task_turn
+        .as_ref()
+        .and_then(|turn| turn.workstream_id.as_deref());
+    let current_task_segment = |segment: &StitchedActivitySegment| {
+        let action_match = current_task_turn_id.is_some_and(|task_turn_id| {
+            inputs.recent_actions.iter().any(|action| {
+                action.task_turn_id.as_deref() == Some(task_turn_id)
+                    && (action.artifact_id.as_deref() == segment.artifact_id.as_deref()
+                        || action.secondary_artifact_id.as_deref()
+                            == segment.artifact_id.as_deref())
+            })
+        });
+        let workstream_match = current_workstream_id
+            .is_some_and(|workstream_id| segment.workstream_id.as_deref() == Some(workstream_id));
+        let role_eligible = matches!(
+            segment.role,
+            ActivitySegmentRole::Primary
+                | ActivitySegmentRole::Return
+                | ActivitySegmentRole::PromotedPrimary
+        );
+        let promotion_current = if segment.role == ActivitySegmentRole::PromotedPrimary {
+            inputs.branch_contexts.iter().any(|branch| {
+                branch.branch_artifact_id.as_str()
+                    == segment.artifact_id.as_deref().unwrap_or_default()
+                    && branch.returned_to_origin_at_ms.is_none()
+                    && current_task_turn_id.is_some_and(|task_turn_id| {
+                        branch.task_turn_id.as_deref() == Some(task_turn_id)
+                            && branch
+                                .promotion_task_turn_id
+                                .as_deref()
+                                .is_none_or(|promotion| promotion == task_turn_id)
+                    })
+                    && branch.feedback_rejection_reasons.is_empty()
+            })
+        } else {
+            true
+        };
+        (action_match || workstream_match) && role_eligible && promotion_current
+    };
+    segments.iter().rposition(current_task_segment).or_else(|| {
+        segments
+            .iter()
+            .rposition(|segment| segment.role == ActivitySegmentRole::PromotedPrimary)
+            .or_else(|| {
+                segments
+                    .iter()
+                    .position(|segment| segment.role == ActivitySegmentRole::Primary)
+            })
+            .or_else(|| {
+                segments
+                    .iter()
+                    .rposition(|segment| segment.role == ActivitySegmentRole::Return)
+            })
+    })
 }
 
 fn select_current_index(
@@ -1430,6 +1482,7 @@ mod tests {
     fn empty_inputs() -> ActivityRecapInputs {
         ActivityRecapInputs {
             schema: ACTIVITY_RECAP_INPUTS_SCHEMA.to_string(),
+            current_task_turn: None,
             decision_context: ActivityRecapDecisionContext {
                 decision_id_seed: Some("decision-test".to_string()),
                 mode: "normal".to_string(),
@@ -1531,6 +1584,7 @@ mod tests {
     ) -> TaskActionFact {
         TaskActionFact {
             action_id: id.to_string(),
+            task_turn_id: None,
             frame_id: format!("frame-{id}"),
             artifact_id: Some(artifact_id.to_string()),
             secondary_artifact_id: None,
@@ -1563,6 +1617,10 @@ mod tests {
         BranchContextFact {
             branch_id: id.to_string(),
             branch_action_id: format!("action-{id}"),
+            task_turn_id: None,
+            origin_task_turn_id: None,
+            promotion_task_turn_id: None,
+            promoted_at_ms: None,
             origin_artifact_id: origin_artifact_id.map(str::to_string),
             origin_workstream_id: origin_artifact_id.map(|_| "ws-primary".to_string()),
             branch_artifact_id: branch_artifact_id.to_string(),
@@ -1575,6 +1633,9 @@ mod tests {
             confidence: 0.9,
             reason_code: Some("branch:test".to_string()),
             evidence_action_ids: vec![format!("evidence-{id}")],
+            promotion_evidence_action_ids: Vec::new(),
+            eligible_feedback_event_ids: Vec::new(),
+            feedback_rejection_reasons: Vec::new(),
             updated_at_ms: 100,
         }
     }
@@ -2211,6 +2272,9 @@ mod tests {
         inputs.open_loops = vec![OpenLoopFact {
             open_loop_id: "loop".to_string(),
             workstream_id: "ws-primary".to_string(),
+            task_turn_id: None,
+            parent_task_turn_id: None,
+            origin_task_turn_id: None,
             state: "open".to_string(),
             boundary_kind: "unfinished_progress".to_string(),
             quality: "strong".to_string(),
@@ -2226,6 +2290,12 @@ mod tests {
             unfinished_state: None,
             next_evidence_backed_action: None,
             current_focus_relation: None,
+            relation_to_current_task: "same_task".to_string(),
+            freshness: "current_turn".to_string(),
+            eligible_for_primary: true,
+            eligible_for_objective: true,
+            eligible_for_last_state: true,
+            eligibility_reason_codes: Vec::new(),
             missing_evidence: Vec::new(),
             evidence_spans: Vec::new(),
             last_updated_at_ms: 10,

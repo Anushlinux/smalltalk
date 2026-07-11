@@ -28,6 +28,12 @@ static LAST_CONTINUE_ISLAND_STATE: Mutex<Option<RememberedContinueIslandState>> 
 #[derive(Debug, Clone)]
 struct RememberedContinueIslandState {
     decision_id: String,
+    request_trigger: String,
+    task_turn_id: Option<String>,
+    task_turn_revision: Option<i64>,
+    task_confidence: f64,
+    wording_source: String,
+    target_selection_source: String,
     resume_headline: Option<String>,
     resume_detail: Option<String>,
     resume_point: Option<String>,
@@ -1027,6 +1033,7 @@ fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRe
         activity_recap_model_enabled: Some(true),
         max_candidates_for_model: Some(5),
         audit_output_enabled: Some(true),
+        request_trigger: Some("island".to_string()),
         ..Default::default()
     }
 }
@@ -1500,6 +1507,10 @@ fn record_island_continue_feedback(
             feedback_kind: feedback_kind.to_string(),
             note: None,
             source: Some("island_primary".to_string()),
+            task_snapshot_id: None,
+            task_snapshot_revision: None,
+            affected_task_field: None,
+            task_hypothesis_id: None,
         },
     )?;
     let refreshed = gateway::get_island_continue_state_for_status(
@@ -1676,6 +1687,18 @@ fn remember_continue_decision_from_snapshot(
     if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
         *slot = Some(RememberedContinueIslandState {
             decision_id: decision.decision_id.clone(),
+            request_trigger: decision.request_trigger.clone(),
+            task_turn_id: decision
+                .current_task_turn
+                .as_ref()
+                .map(|turn| turn.task_turn_id.clone()),
+            task_turn_revision: decision
+                .current_task_turn
+                .as_ref()
+                .map(|turn| turn.revision),
+            task_confidence: decision.confidence_summary.task.score,
+            wording_source: decision.wording_source.clone(),
+            target_selection_source: decision.target_selection_source.clone(),
             resume_headline: snapshot.resume_headline.clone(),
             resume_detail: snapshot.resume_detail.clone(),
             resume_point: snapshot.resume_point.clone(),
@@ -2211,6 +2234,12 @@ mod tests {
             )];
             *slot = Some(RememberedContinueIslandState {
                 decision_id: "decision-test".to_string(),
+                request_trigger: "manual".to_string(),
+                task_turn_id: Some("task-test".to_string()),
+                task_turn_revision: Some(1),
+                task_confidence: 0.9,
+                wording_source: "model_assisted".to_string(),
+                target_selection_source: "local_validated_target_policy".to_string(),
                 resume_headline: Some("Ready to continue".to_string()),
                 resume_detail: Some("Editing was in progress.".to_string()),
                 resume_point: Some("PRODUCT.md".to_string()),

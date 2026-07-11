@@ -9,6 +9,10 @@ use super::activity_recap_model::ActivityRecapSynthesisAudit;
 use super::activity_recap_objective::ActivityWorkLabelResult;
 use super::activity_recap_open_loop::LastStateRecapResult;
 use super::activity_recap_segments::StitchedActivityTimeline;
+use super::activity_recap_truth::{
+    ActivityRecapTaskTruth, ActivityRecapTruthBundle, ACTIVITY_RECAP_TASK_TRUTH_SCHEMA,
+    ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION,
+};
 use super::{
     memory_keywords, rebuild_continue_memory_edges, stable_hash, ContinueEvidenceWatermark,
 };
@@ -16,8 +20,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub(crate) const ACTIVITY_RECAP_PROOF_SCHEMA: &str = "smalltalk.activity_recap_decision_proof.v1";
-pub(crate) const ACTIVITY_RECAP_PIPELINE_VERSION: &str = "p5.08.v1";
+pub(crate) const ACTIVITY_RECAP_PROOF_SCHEMA: &str = "smalltalk.activity_recap_decision_proof.v2";
+pub(crate) const ACTIVITY_RECAP_PIPELINE_VERSION: &str = "p6.07.v1";
 
 const MEMORY_TYPE_WORKSTREAM_SUMMARY: &str = "activity_workstream_summary";
 const MEMORY_TYPE_PRIMARY_LABEL: &str = "activity_primary_label";
@@ -49,12 +53,18 @@ pub(crate) struct ActivityRecapDecisionProof {
     pub schema: String,
     pub pipeline_version: String,
     pub input_summary: ActivityRecapInputSummary,
+    pub task_truth: Option<ActivityRecapTaskTruth>,
+    pub semantic_source_eligibility: Value,
+    pub local_deterministic_recap: ContinueActivityRecap,
+    pub claim_to_evidence: Value,
     pub stitched_timeline: StitchedActivityTimeline,
     pub work_labels: ActivityWorkLabelResult,
     pub detours: DetourRecapResult,
     pub last_state: LastStateRecapResult,
     pub model_status: Value,
     pub validation_failures: Vec<String>,
+    pub identity_parity: Value,
+    pub quality_gate_result: Value,
     pub final_recap: ContinueActivityRecap,
 }
 
@@ -67,12 +77,18 @@ impl Default for ActivityRecapDecisionProof {
                 schema: "smalltalk.activity_recap_input_summary.v1".to_string(),
                 ..ActivityRecapInputSummary::default()
             },
+            task_truth: None,
+            semantic_source_eligibility: json!({"eligible_roles": [], "rejected_source_hashes": [], "reason_codes": []}),
+            local_deterministic_recap: ContinueActivityRecap::default(),
+            claim_to_evidence: json!({}),
             stitched_timeline: StitchedActivityTimeline::default(),
             work_labels: ActivityWorkLabelResult::default(),
             detours: DetourRecapResult::default(),
             last_state: LastStateRecapResult::default(),
             model_status: json!({"attempted": false, "result": "not_available"}),
             validation_failures: Vec::new(),
+            identity_parity: json!({"status": "not_evaluated"}),
+            quality_gate_result: json!({"status": "not_available"}),
             final_recap: ContinueActivityRecap::default(),
         }
     }
@@ -93,9 +109,14 @@ pub(crate) fn activity_recap_policy_fingerprint(
 ) -> String {
     stable_hash(
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
             ACTIVITY_RECAP_PIPELINE_VERSION,
             ACTIVITY_RECAP_SCHEMA,
+            ACTIVITY_RECAP_TASK_TRUTH_SCHEMA,
+            ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION,
+            super::semantic_consistency::SEMANTIC_GRAPH_POLICY_VERSION,
+            super::semantic_consistency::DIRECT_TARGET_POLICY_VERSION,
+            super::confidence::CONTINUE_CONFIDENCE_POLICY_VERSION,
             model_enabled,
             model_override.unwrap_or("default")
         )
@@ -123,6 +144,8 @@ pub(crate) fn build_activity_recap_proof(
     detours: &DetourRecapResult,
     last_state: &LastStateRecapResult,
     synthesis_audit: &ActivityRecapSynthesisAudit,
+    truth: Option<&ActivityRecapTruthBundle>,
+    local_recap: &ContinueActivityRecap,
     recap: &ContinueActivityRecap,
 ) -> ActivityRecapDecisionProof {
     let validation_failures = synthesis_audit
@@ -170,6 +193,14 @@ pub(crate) fn build_activity_recap_proof(
             support_evidence_count: inputs.support_evidence.len(),
             input_warnings: inputs.input_warnings.iter().take(12).cloned().collect(),
         },
+        task_truth: truth.map(|truth| truth.model_truth.clone()),
+        semantic_source_eligibility: truth.map(|truth| json!({
+            "eligible_roles": truth.model_truth.allowed_context_roles,
+            "rejected_source_hashes": truth.local_guard.rejected_source_hashes,
+            "reason_codes": truth.local_guard.rejection_reason_codes,
+        })).unwrap_or_else(|| json!({"eligible_roles": [], "rejected_source_hashes": [], "reason_codes": ["task_truth_unavailable"]})),
+        local_deterministic_recap: local_recap.clone(),
+        claim_to_evidence: truth.map(|truth| json!(truth.model_truth.claim_evidence_handles)).unwrap_or_else(|| json!({})),
         stitched_timeline: timeline.clone(),
         work_labels: work_labels.clone(),
         detours: detours.clone(),
@@ -179,6 +210,12 @@ pub(crate) fn build_activity_recap_proof(
             "fallback": synthesis_audit.fallback,
         }),
         validation_failures,
+        identity_parity: json!({
+            "status": synthesis_audit.validation.get("outcome").and_then(Value::as_str).map(|outcome| if outcome.starts_with("rejected_") { "rejected" } else { "agreed" }).unwrap_or("not_evaluated"),
+            "task_turn_id": truth.map(|truth| truth.model_truth.identity.task_turn_id.clone()),
+            "task_identity_key": truth.map(|truth| truth.model_truth.identity.task_identity_key.clone()),
+        }),
+        quality_gate_result: inputs.existing_quality.quality_gate.clone().unwrap_or_else(|| json!({"status": "not_available"})),
         final_recap: recap.clone(),
     }
 }
@@ -186,9 +223,14 @@ pub(crate) fn build_activity_recap_proof(
 /// Uses narrative memory only to explain a thin same-artifact/workstream decision.
 /// It deliberately cannot create or modify a target, candidate, or openability fact.
 pub(crate) fn apply_prior_activity_memory(
+    _conn: &Connection,
     mut recap: ContinueActivityRecap,
     inputs: &ActivityRecapInputs,
+    task_truth: Option<&ActivityRecapTaskTruth>,
 ) -> ContinueActivityRecap {
+    let Some(task_truth) = task_truth else {
+        return recap;
+    };
     if matches!(
         recap.activity_confidence,
         ActivityConfidence::Medium | ActivityConfidence::High
@@ -220,6 +262,7 @@ pub(crate) fn apply_prior_activity_memory(
                 && memory.confidence >= 0.60
                 && memory.feedback_score >= 0.0
                 && memory_matches(memory, current_artifact_id, selected_workstream_id)
+                && memory_matches_task_truth(memory, task_truth)
         })
         .max_by(|left, right| {
             left.retrieval_score
@@ -247,6 +290,7 @@ pub(crate) fn apply_prior_activity_memory(
                 && memory.confidence >= 0.60
                 && memory.feedback_score >= 0.0
                 && memory_matches(memory, current_artifact_id, selected_workstream_id)
+                && memory_matches_task_truth(memory, task_truth)
         })
         .max_by_key(|memory| memory.last_seen_at_ms)
         .and_then(|memory| memory.summary.clone());
@@ -277,9 +321,13 @@ pub(crate) fn promote_validated_activity_recap_memory(
     selected_candidate_id: Option<&str>,
     workstream_id: Option<&str>,
     artifact_id: Option<&str>,
+    task_truth: Option<&ActivityRecapTaskTruth>,
     recap: &ContinueActivityRecap,
     now_ms: i64,
 ) -> Result<usize, String> {
+    let Some(task_truth) = task_truth else {
+        return Ok(0);
+    };
     if recap.validation_status != ActivityRecapValidationStatus::Valid
         || !matches!(
             recap.activity_confidence,
@@ -312,6 +360,12 @@ pub(crate) fn promote_validated_activity_recap_memory(
         "selected_candidate_id": selected_candidate_id,
         "workstream_id": workstream_id,
         "artifact_id": artifact_id,
+        "task_turn_id": task_truth.identity.task_turn_id,
+        "task_turn_revision": task_truth.identity.task_turn_revision,
+        "task_identity_key": task_truth.identity.task_identity_key,
+        "consistency_status": task_truth.consistency_status,
+        "consistency_policy_version": task_truth.consistency_policy_version,
+        "recap_validator_policy_version": task_truth.validator_policy_version,
         "evidence_handles": evidence_handles,
     });
     let values = [
@@ -337,7 +391,13 @@ pub(crate) fn promote_validated_activity_recap_memory(
         else {
             continue;
         };
-        let id = recap_memory_id(memory_type, workstream_id, artifact_id);
+        let id = recap_memory_id(
+            memory_type,
+            workstream_id,
+            artifact_id,
+            &task_truth.identity.task_turn_id,
+            task_truth.identity.task_turn_revision,
+        );
         let content_hash =
             stable_hash(format!("{}:{}:{}", memory_type, summary, source_anchor).as_bytes());
         let existing = conn
@@ -509,19 +569,51 @@ fn recap_memory_id(
     memory_type: &str,
     workstream_id: Option<&str>,
     artifact_id: Option<&str>,
+    task_turn_id: &str,
+    task_turn_revision: i64,
 ) -> String {
     format!(
         "continue-memory-{}",
         stable_hash(
             format!(
-                "activity_recap:{}:{}:{}",
+                "activity_recap:{}:{}:{}:{}:{}",
                 memory_type,
                 workstream_id.unwrap_or("none"),
-                artifact_id.unwrap_or("none")
+                artifact_id.unwrap_or("none"),
+                task_turn_id,
+                task_turn_revision,
             )
             .as_bytes(),
         )
     )
+}
+
+fn memory_matches_task_truth(memory: &MemoryFact, truth: &ActivityRecapTaskTruth) -> bool {
+    memory
+        .source_anchor
+        .get("task_turn_id")
+        .and_then(Value::as_str)
+        == Some(truth.identity.task_turn_id.as_str())
+        && memory
+            .source_anchor
+            .get("task_turn_revision")
+            .and_then(Value::as_i64)
+            == Some(truth.identity.task_turn_revision)
+        && memory
+            .source_anchor
+            .get("task_identity_key")
+            .and_then(Value::as_str)
+            == Some(truth.identity.task_identity_key.as_str())
+        && memory
+            .source_anchor
+            .get("consistency_status")
+            .and_then(Value::as_str)
+            == Some(truth.consistency_status.as_str())
+        && memory
+            .source_anchor
+            .get("recap_validator_policy_version")
+            .and_then(Value::as_str)
+            == Some(truth.validator_policy_version.as_str())
 }
 
 fn activity_memory_scope_is_safe(
@@ -601,6 +693,7 @@ mod tests {
     fn thin_inputs(memory_facts: Vec<MemoryFact>) -> ActivityRecapInputs {
         ActivityRecapInputs {
             schema: "smalltalk.activity_recap_inputs.v1".to_string(),
+            current_task_turn: None,
             decision_context: ActivityRecapDecisionContext {
                 decision_id_seed: None,
                 mode: "normal".to_string(),
@@ -660,6 +753,7 @@ mod tests {
             memory_type: memory_type.to_string(),
             relation: relation.to_string(),
             summary: Some("Implementing the P5 decision integration".to_string()),
+            source_anchor: Value::Null,
             last_seen_at_ms: 1_000,
             confidence: 0.82,
             importance: 0.85,
@@ -671,40 +765,113 @@ mod tests {
         }
     }
 
+    fn task_truth(task_turn_id: &str, revision: i64) -> ActivityRecapTaskTruth {
+        ActivityRecapTaskTruth {
+            schema: ACTIVITY_RECAP_TASK_TRUTH_SCHEMA.to_string(),
+            validator_policy_version: ACTIVITY_RECAP_VALIDATOR_POLICY_VERSION.to_string(),
+            identity: super::super::activity_recap_truth::ActivityRecapTaskIdentity {
+                task_turn_id: task_turn_id.to_string(),
+                task_turn_revision: revision,
+                task_identity_key: format!("identity-{task_turn_id}"),
+                bounded_semantic_label: Some("Capture button investigation".to_string()),
+                execution_state: "active".to_string(),
+                current_actor: "assistant_or_agent".to_string(),
+                waiting_on: "agent".to_string(),
+                relation_to_prior: "new_task".to_string(),
+                workstream_id: Some("workstream-prior".to_string()),
+            },
+            latest_user_goal: Some("Investigate the Capture button".to_string()),
+            task_object: Some("Capture button".to_string()),
+            prior_task_turn_id: None,
+            prior_context_role: None,
+            consistency_status: "consistent".to_string(),
+            consistency_policy_version: "fixture".to_string(),
+            selected_primary_segment_id: None,
+            selected_open_loop_id: None,
+            direct_target_allowed: false,
+            direct_target_policy_version: "fixture".to_string(),
+            direct_target_locator_kind: "none".to_string(),
+            claim_confidence_caps: std::collections::BTreeMap::new(),
+            claim_evidence_handles: std::collections::BTreeMap::new(),
+            missing_evidence: Vec::new(),
+            allowed_context_roles: vec!["same_task".to_string()],
+        }
+    }
+
+    fn memory_with_truth(mut memory: MemoryFact, truth: &ActivityRecapTaskTruth) -> MemoryFact {
+        memory.source_anchor = json!({
+            "task_turn_id": truth.identity.task_turn_id,
+            "task_turn_revision": truth.identity.task_turn_revision,
+            "task_identity_key": truth.identity.task_identity_key,
+            "consistency_status": truth.consistency_status,
+            "recap_validator_policy_version": truth.validator_policy_version,
+        });
+        memory
+    }
+
     #[test]
-    fn prior_activity_memory_supports_thin_recap_without_creating_target_claims() {
+    fn legacy_prior_activity_memory_is_ignored_without_task_truth_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
         let recap = apply_prior_activity_memory(
+            &conn,
             ContinueActivityRecap::default(),
             &thin_inputs(vec![
                 prior_memory(MEMORY_TYPE_LAST_GOOD_RECAP, "support", 0.0),
                 prior_memory(MEMORY_TYPE_PRIMARY_LABEL, "support", 0.0),
             ]),
+            None,
         );
-        assert_eq!(recap.activity_confidence, ActivityConfidence::Low);
-        assert!(recap
-            .primary_work_summary
-            .as_deref()
-            .is_some_and(|summary| summary.starts_with("Prior context:")));
-        assert_eq!(recap.target_confidence, ActivityConfidence::None);
-        assert!(recap.why_this_target.is_none());
-        assert!(recap.why_no_safe_target.is_none());
-        assert!(recap.evidence_spans.iter().any(|span| {
-            span.anchor_type == ActivityEvidenceAnchorType::MemoryCell
-                && span.anchor_ids == vec!["memory-prior".to_string()]
-        }));
+        assert!(recap.primary_work_summary.is_none());
+        assert_eq!(recap.activity_confidence, ActivityConfidence::None);
     }
 
     #[test]
     fn rejected_activity_memory_never_overrides_fresh_thin_state() {
+        let conn = Connection::open_in_memory().unwrap();
         let recap = apply_prior_activity_memory(
+            &conn,
             ContinueActivityRecap::default(),
             &thin_inputs(vec![prior_memory(
                 MEMORY_TYPE_REJECTED,
                 "contradiction",
                 -0.55,
             )]),
+            None,
         );
         assert!(recap.primary_work_summary.is_none());
         assert_eq!(recap.activity_confidence, ActivityConfidence::None);
+    }
+
+    #[test]
+    fn prior_recap_memory_requires_exact_task_turn_revision_and_consistency_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        let current = task_truth("turn-current", 3);
+        let compatible = memory_with_truth(
+            prior_memory(MEMORY_TYPE_LAST_GOOD_RECAP, "support", 0.0),
+            &current,
+        );
+        let recap = apply_prior_activity_memory(
+            &conn,
+            ContinueActivityRecap::default(),
+            &thin_inputs(vec![compatible]),
+            Some(&current),
+        );
+        assert!(recap
+            .primary_work_summary
+            .as_deref()
+            .is_some_and(|summary| summary.starts_with("Prior context:")));
+
+        let stale = task_truth("turn-prior", 2);
+        let incompatible = memory_with_truth(
+            prior_memory(MEMORY_TYPE_LAST_GOOD_RECAP, "support", 0.0),
+            &stale,
+        );
+        let recap = apply_prior_activity_memory(
+            &conn,
+            ContinueActivityRecap::default(),
+            &thin_inputs(vec![incompatible]),
+            Some(&current),
+        );
+        assert!(recap.primary_work_summary.is_none());
     }
 }

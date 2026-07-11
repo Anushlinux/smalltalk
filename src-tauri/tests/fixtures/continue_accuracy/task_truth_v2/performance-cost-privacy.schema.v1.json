@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smalltalk.task_truth_v2.performance_cost_privacy.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "budget_policy_version",
+    "policy_frozen_before_holdout_access",
+    "holdout_accessed_at_freeze",
+    "sample_count",
+    "measurements",
+    "background_multimodal_requests",
+    "privacy_blocked_frames_excluded_before_transport",
+    "privacy_violations",
+    "unsafe_opens",
+    "committed_fixture_secret_findings"
+  ],
+  "properties": {
+    "schema": {"const": "smalltalk.task_truth_v2.performance_cost_privacy.v1"},
+    "budget_policy_version": {"const": "tt2.05-budgets-v1"},
+    "policy_frozen_before_holdout_access": {"const": true},
+    "holdout_accessed_at_freeze": {"const": false},
+    "sample_count": {"type": "integer", "minimum": 30},
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manual_continue_p50_ms",
+        "manual_continue_p95_ms",
+        "local_packet_checkpoint_p50_ms",
+        "local_packet_checkpoint_p95_ms",
+        "model_request_max_images",
+        "model_request_max_bytes",
+        "model_request_max_tokens",
+        "semantic_checkpoint_writes_per_minute",
+        "semantic_checkpoint_retention_count",
+        "provider_failure_rate",
+        "safe_fallback_rate"
+      ],
+      "properties": {
+        "manual_continue_p50_ms": {"type": "number", "minimum": 0},
+        "manual_continue_p95_ms": {"type": "number", "minimum": 0},
+        "local_packet_checkpoint_p50_ms": {"type": "number", "minimum": 0},
+        "local_packet_checkpoint_p95_ms": {"type": "number", "minimum": 0},
+        "model_request_max_images": {"type": "number", "minimum": 0},
+        "model_request_max_bytes": {"type": "number", "minimum": 0},
+        "model_request_max_tokens": {"type": "number", "minimum": 0},
+        "semantic_checkpoint_writes_per_minute": {"type": "number", "minimum": 0},
+        "semantic_checkpoint_retention_count": {"type": "number", "minimum": 0},
+        "provider_failure_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "safe_fallback_rate": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "background_multimodal_requests": {"const": 0},
+    "privacy_blocked_frames_excluded_before_transport": {"const": true},
+    "privacy_violations": {"const": 0},
+    "unsafe_opens": {"const": 0},
+    "committed_fixture_secret_findings": {"const": 0}
+  }
+}

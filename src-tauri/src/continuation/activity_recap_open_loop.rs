@@ -254,7 +254,11 @@ fn select_open_loop<'a>(
         .selected_candidate
         .as_ref()
         .and_then(|candidate| candidate.open_loop_id.as_deref());
-    let mut candidates = inputs.open_loops.iter().collect::<Vec<_>>();
+    let mut candidates = inputs
+        .open_loops
+        .iter()
+        .filter(|open_loop| open_loop.eligible_for_last_state)
+        .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         open_loop_priority(right, selected_loop_id, selected_workstream_id, primary)
             .cmp(&open_loop_priority(
@@ -318,9 +322,13 @@ fn select_workstream_state<'a>(
         .workstream_states
         .iter()
         .filter(|state| {
-            selected_workstream_id == Some(state.workstream_id.as_str())
-                || primary_workstream_id == Some(state.workstream_id.as_str())
-                || (selected_workstream_id.is_none() && primary_workstream_id.is_none())
+            let current_turn_match = inputs.current_task_turn.as_ref().is_none_or(|turn| {
+                state.task_turn_id.as_deref() == Some(turn.task_turn_id.as_str())
+            });
+            current_turn_match
+                && (selected_workstream_id == Some(state.workstream_id.as_str())
+                    || primary_workstream_id == Some(state.workstream_id.as_str())
+                    || (selected_workstream_id.is_none() && primary_workstream_id.is_none()))
         })
         .max_by(|left, right| {
             workstream_state_priority(left, selected_workstream_id, primary_workstream_id)
@@ -1519,6 +1527,7 @@ mod tests {
     fn empty_inputs() -> ActivityRecapInputs {
         ActivityRecapInputs {
             schema: ACTIVITY_RECAP_INPUTS_SCHEMA.to_string(),
+            current_task_turn: None,
             decision_context: ActivityRecapDecisionContext {
                 decision_id_seed: Some("decision-last-state".to_string()),
                 mode: "normal".to_string(),
@@ -1605,6 +1614,7 @@ mod tests {
     fn action(id: &str, artifact_id: &str, kind: &str, at_ms: i64) -> TaskActionFact {
         TaskActionFact {
             action_id: id.to_string(),
+            task_turn_id: None,
             frame_id: format!("frame-{id}"),
             artifact_id: Some(artifact_id.to_string()),
             secondary_artifact_id: None,
@@ -1630,6 +1640,9 @@ mod tests {
         OpenLoopFact {
             open_loop_id: "open-loop-primary".to_string(),
             workstream_id: "ws-primary".to_string(),
+            task_turn_id: None,
+            parent_task_turn_id: None,
+            origin_task_turn_id: None,
             state: state.to_string(),
             boundary_kind: "continuation".to_string(),
             quality: "strong".to_string(),
@@ -1645,6 +1658,12 @@ mod tests {
             unfinished_state: None,
             next_evidence_backed_action: None,
             current_focus_relation: Some("same_as_origin".to_string()),
+            relation_to_current_task: "same_task".to_string(),
+            freshness: "current_turn".to_string(),
+            eligible_for_primary: true,
+            eligible_for_objective: true,
+            eligible_for_last_state: true,
+            eligibility_reason_codes: Vec::new(),
             missing_evidence: Vec::new(),
             evidence_spans: Vec::new(),
             last_updated_at_ms: 100,
@@ -1831,6 +1850,10 @@ mod tests {
         inputs.branch_contexts.push(BranchContextFact {
             branch_id: "branch-docs".to_string(),
             branch_action_id: "action-docs".to_string(),
+            task_turn_id: None,
+            origin_task_turn_id: None,
+            promotion_task_turn_id: None,
+            promoted_at_ms: None,
             origin_artifact_id: Some("primary-artifact".to_string()),
             origin_workstream_id: Some("ws-primary".to_string()),
             branch_artifact_id: "docs-artifact".to_string(),
@@ -1843,6 +1866,9 @@ mod tests {
             confidence: 0.9,
             reason_code: None,
             evidence_action_ids: vec!["action-docs".to_string()],
+            promotion_evidence_action_ids: Vec::new(),
+            eligible_feedback_event_ids: Vec::new(),
+            feedback_rejection_reasons: Vec::new(),
             updated_at_ms: 140,
         });
         let primary = stitched_segment(
@@ -2073,6 +2099,7 @@ mod tests {
         inputs.workstream_states.push(WorkstreamStateFact {
             snapshot_id: "state-primary".to_string(),
             workstream_id: "ws-primary".to_string(),
+            task_turn_id: None,
             observed_at_ms: 90,
             state: "ready_to_resume".to_string(),
             previous_state: Some("editing".to_string()),

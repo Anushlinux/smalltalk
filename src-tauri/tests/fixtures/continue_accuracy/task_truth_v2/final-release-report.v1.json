@@ -1,0 +1,564 @@
+{
+  "authority_state": "eligible",
+  "corpus_counts": {
+    "live_redacted": 5,
+    "live_release_denominator": 5
+  },
+  "evaluator_release_gate_passed": false,
+  "evaluator_validation_passed": false,
+  "evidence_inputs": {
+    "manual_macos_qa": "tests/fixtures/continue_accuracy/task_truth_v2/manual-macos-qa.v1.json",
+    "performance_cost_privacy": "tests/fixtures/continue_accuracy/task_truth_v2/performance-cost-privacy.v1.json",
+    "pre_holdout_baseline": "tests/fixtures/continue_accuracy/task_truth_v2/baseline-report.v1.json",
+    "release_budget_policy": "tests/fixtures/continue_accuracy/task_truth_v2/release-budgets.v1.json",
+    "task_truth_evaluator": "tests/fixtures/continue_accuracy/task_truth_v2/release-evaluator-report.v1.json"
+  },
+  "human_review_counts": {
+    "pending": 5
+  },
+  "locked_holdout_count": 0,
+  "macro_results": {},
+  "manual_macos_qa_passed": false,
+  "manual_scenario_count": 0,
+  "partition_counts": {
+    "development": 5
+  },
+  "passed": false,
+  "performance_cost_privacy_passed": false,
+  "policy_version": "tt2.02-v1",
+  "pre_holdout_baseline_report_id": "sha256:bee2c7d878aae8a5f23b470dc4385f9eb9d6378d7ebc734c0e2a204b491c42f1",
+  "release_budget_policy_passed": false,
+  "reviewed_live_count": 0,
+  "schema": "smalltalk.task_truth_v2.final_release_report.v1",
+  "slice_denominators": {},
+  "surface_denominators": {},
+  "tt2_05_confidence_intervals": {
+    "control_navigation_as_task_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "execution_state_accuracy": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "human_immediately_useful": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "model_on_off_unexplained_task_disagreement": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "precise_abstention": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "return_target_precision": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "stronger_manual_result_downgraded": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "supported_next_action_coverage": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "supported_next_action_precision": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "task_object_accuracy": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "unseen_application_useful_summary": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "unsupported_specific_claim_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "useful_non_generic_task_summary": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.agent_chat": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.browser_research_search": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.custom_rendered_canvas": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.documents": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.editor_ide": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.email_messaging": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.mixed_window_thin_unknown": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.pdf_file_manager": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.spreadsheets": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.terminal": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    }
+  },
+  "tt2_05_metric_results": {
+    "control_navigation_as_task_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "execution_state_accuracy": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "human_immediately_useful": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.85
+    },
+    "model_on_off_unexplained_task_disagreement": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "precise_abstention": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.95
+    },
+    "return_target_precision": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.98
+    },
+    "stronger_manual_result_downgraded": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "supported_next_action_coverage": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.85
+    },
+    "supported_next_action_precision": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "task_object_accuracy": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.88
+    },
+    "unseen_application_useful_summary": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.8
+    },
+    "unsupported_specific_claim_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.01
+    },
+    "useful_non_generic_task_summary": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "wrong_primary_task_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.03
+    }
+  },
+  "tt2_05_surface_wrong_task_results": {
+    "agent_chat": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "browser_research_search": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "custom_rendered_canvas": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "documents": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "editor_ide": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "email_messaging": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "mixed_window_thin_unknown": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "pdf_file_manager": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "spreadsheets": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "terminal": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    }
+  },
+  "validation": {
+    "evaluator": [
+      "evaluator_release_gate_closed",
+      "evaluator_has_violations",
+      "independently_reviewed_live_requires_200_found_0",
+      "locked_holdout_requires_50_found_0",
+      "tt2_05_metric_wrong_primary_task_rate_not_proven",
+      "tt2_05_metric_wrong_primary_task_rate_confidence_interval_missing",
+      "tt2_05_metric_control_navigation_as_task_rate_not_proven",
+      "tt2_05_metric_control_navigation_as_task_rate_confidence_interval_missing",
+      "tt2_05_metric_useful_non_generic_task_summary_not_proven",
+      "tt2_05_metric_useful_non_generic_task_summary_confidence_interval_missing",
+      "tt2_05_metric_task_object_accuracy_not_proven",
+      "tt2_05_metric_task_object_accuracy_confidence_interval_missing",
+      "tt2_05_metric_execution_state_accuracy_not_proven",
+      "tt2_05_metric_execution_state_accuracy_confidence_interval_missing",
+      "tt2_05_metric_supported_next_action_precision_not_proven",
+      "tt2_05_metric_supported_next_action_precision_confidence_interval_missing",
+      "tt2_05_metric_supported_next_action_coverage_not_proven",
+      "tt2_05_metric_supported_next_action_coverage_confidence_interval_missing",
+      "tt2_05_metric_return_target_precision_not_proven",
+      "tt2_05_metric_return_target_precision_confidence_interval_missing",
+      "tt2_05_metric_unsupported_specific_claim_rate_not_proven",
+      "tt2_05_metric_unsupported_specific_claim_rate_confidence_interval_missing",
+      "tt2_05_metric_stronger_manual_result_downgraded_not_proven",
+      "tt2_05_metric_stronger_manual_result_downgraded_confidence_interval_missing",
+      "tt2_05_metric_unseen_application_useful_summary_not_proven",
+      "tt2_05_metric_unseen_application_useful_summary_confidence_interval_missing",
+      "tt2_05_metric_human_immediately_useful_not_proven",
+      "tt2_05_metric_human_immediately_useful_confidence_interval_missing",
+      "tt2_05_metric_model_on_off_unexplained_task_disagreement_not_proven",
+      "tt2_05_metric_model_on_off_unexplained_task_disagreement_confidence_interval_missing",
+      "surface_agent_chat_wrong_task_gate_not_proven",
+      "surface_agent_chat_wrong_task_confidence_interval_missing",
+      "surface_editor_ide_wrong_task_gate_not_proven",
+      "surface_editor_ide_wrong_task_confidence_interval_missing",
+      "surface_terminal_wrong_task_gate_not_proven",
+      "surface_terminal_wrong_task_confidence_interval_missing",
+      "surface_browser_research_search_wrong_task_gate_not_proven",
+      "surface_browser_research_search_wrong_task_confidence_interval_missing",
+      "surface_documents_wrong_task_gate_not_proven",
+      "surface_documents_wrong_task_confidence_interval_missing",
+      "surface_spreadsheets_wrong_task_gate_not_proven",
+      "surface_spreadsheets_wrong_task_confidence_interval_missing",
+      "surface_email_messaging_wrong_task_gate_not_proven",
+      "surface_email_messaging_wrong_task_confidence_interval_missing",
+      "surface_pdf_file_manager_wrong_task_gate_not_proven",
+      "surface_pdf_file_manager_wrong_task_confidence_interval_missing",
+      "surface_custom_rendered_canvas_wrong_task_gate_not_proven",
+      "surface_custom_rendered_canvas_wrong_task_confidence_interval_missing",
+      "surface_mixed_window_thin_unknown_wrong_task_gate_not_proven",
+      "surface_mixed_window_thin_unknown_wrong_task_confidence_interval_missing",
+      "slice_interruption_resumption_requires_30_found_0",
+      "slice_ambiguous_or_privacy_blocked_requires_20_found_0",
+      "slice_waiting_on_agent_or_application_requires_20_found_0",
+      "slice_completed_vs_new_task_requires_20_found_0"
+    ],
+    "manual_macos_qa": [
+      "manual_macos_qa_manifest_missing"
+    ],
+    "performance_cost_privacy": [
+      "performance_cost_privacy_manifest_missing"
+    ],
+    "release_budget_policy": [
+      "release_budget_policy_missing"
+    ]
+  },
+  "violations": [
+    "evaluator_has_violations",
+    "evaluator_release_gate_closed",
+    "independently_reviewed_live_requires_200_found_0",
+    "locked_holdout_requires_50_found_0",
+    "manual_macos_qa_manifest_missing",
+    "performance_cost_privacy_manifest_missing",
+    "release_budget_policy_missing",
+    "slice_ambiguous_or_privacy_blocked_requires_20_found_0",
+    "slice_completed_vs_new_task_requires_20_found_0",
+    "slice_interruption_resumption_requires_30_found_0",
+    "slice_waiting_on_agent_or_application_requires_20_found_0",
+    "surface_agent_chat_wrong_task_confidence_interval_missing",
+    "surface_agent_chat_wrong_task_gate_not_proven",
+    "surface_browser_research_search_wrong_task_confidence_interval_missing",
+    "surface_browser_research_search_wrong_task_gate_not_proven",
+    "surface_custom_rendered_canvas_wrong_task_confidence_interval_missing",
+    "surface_custom_rendered_canvas_wrong_task_gate_not_proven",
+    "surface_documents_wrong_task_confidence_interval_missing",
+    "surface_documents_wrong_task_gate_not_proven",
+    "surface_editor_ide_wrong_task_confidence_interval_missing",
+    "surface_editor_ide_wrong_task_gate_not_proven",
+    "surface_email_messaging_wrong_task_confidence_interval_missing",
+    "surface_email_messaging_wrong_task_gate_not_proven",
+    "surface_mixed_window_thin_unknown_wrong_task_confidence_interval_missing",
+    "surface_mixed_window_thin_unknown_wrong_task_gate_not_proven",
+    "surface_pdf_file_manager_wrong_task_confidence_interval_missing",
+    "surface_pdf_file_manager_wrong_task_gate_not_proven",
+    "surface_spreadsheets_wrong_task_confidence_interval_missing",
+    "surface_spreadsheets_wrong_task_gate_not_proven",
+    "surface_terminal_wrong_task_confidence_interval_missing",
+    "surface_terminal_wrong_task_gate_not_proven",
+    "tt2_05_metric_control_navigation_as_task_rate_confidence_interval_missing",
+    "tt2_05_metric_control_navigation_as_task_rate_not_proven",
+    "tt2_05_metric_execution_state_accuracy_confidence_interval_missing",
+    "tt2_05_metric_execution_state_accuracy_not_proven",
+    "tt2_05_metric_human_immediately_useful_confidence_interval_missing",
+    "tt2_05_metric_human_immediately_useful_not_proven",
+    "tt2_05_metric_model_on_off_unexplained_task_disagreement_confidence_interval_missing",
+    "tt2_05_metric_model_on_off_unexplained_task_disagreement_not_proven",
+    "tt2_05_metric_return_target_precision_confidence_interval_missing",
+    "tt2_05_metric_return_target_precision_not_proven",
+    "tt2_05_metric_stronger_manual_result_downgraded_confidence_interval_missing",
+    "tt2_05_metric_stronger_manual_result_downgraded_not_proven",
+    "tt2_05_metric_supported_next_action_coverage_confidence_interval_missing",
+    "tt2_05_metric_supported_next_action_coverage_not_proven",
+    "tt2_05_metric_supported_next_action_precision_confidence_interval_missing",
+    "tt2_05_metric_supported_next_action_precision_not_proven",
+    "tt2_05_metric_task_object_accuracy_confidence_interval_missing",
+    "tt2_05_metric_task_object_accuracy_not_proven",
+    "tt2_05_metric_unseen_application_useful_summary_confidence_interval_missing",
+    "tt2_05_metric_unseen_application_useful_summary_not_proven",
+    "tt2_05_metric_unsupported_specific_claim_rate_confidence_interval_missing",
+    "tt2_05_metric_unsupported_specific_claim_rate_not_proven",
+    "tt2_05_metric_useful_non_generic_task_summary_confidence_interval_missing",
+    "tt2_05_metric_useful_non_generic_task_summary_not_proven",
+    "tt2_05_metric_wrong_primary_task_rate_confidence_interval_missing",
+    "tt2_05_metric_wrong_primary_task_rate_not_proven"
+  ],
+  "worst_surface_family_slice": {
+    "path_a_legacy_p6": null,
+    "path_b_causally_repaired": null,
+    "path_c_task_truth_shadow": null
+  },
+  "zero_tolerance": {
+    "background_multimodal_requests": null,
+    "control_navigation_as_task": 0,
+    "model_on_off_unexplained_task_disagreement": 0,
+    "privacy_violations": null,
+    "stronger_manual_result_downgraded": 0,
+    "unsafe_opens": null
+  }
+}

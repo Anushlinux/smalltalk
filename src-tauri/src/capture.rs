@@ -651,6 +651,8 @@ const EVENT_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const ISLAND_EVENT_STATUS_INTERVAL: Duration = Duration::from_millis(900);
 const MIN_IMPORTANT_CAPTURE_INTERVAL: Duration = Duration::from_secs(4);
 const MIN_LOW_VALUE_CAPTURE_INTERVAL: Duration = Duration::from_secs(45);
+const MAX_TYPING_POST_FRAME_ASSOCIATION_DELAY_MS: i64 = 60_000;
+const AUTHORITATIVE_TYPING_ASSOCIATION_CONFIDENCE: f64 = 0.96;
 const IDLE_CAPTURE_INTERVAL: Duration = Duration::from_secs(120);
 const CAPTURE_BUDGET_ROLLING_WINDOW_MS: i64 = 10 * 60 * 1000;
 const MAX_SCREENSHOT_FRAMES_PER_10_MINUTES: i64 = 24;
@@ -883,6 +885,11 @@ struct TypingBurstState {
     id: Option<String>,
     started_at_ms: i64,
     ended_at_ms: i64,
+    committed: bool,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_id: Option<i64>,
+    window_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3234,26 +3241,74 @@ pub fn get_continue_decision(
     if let Some((probe_request, sufficiency)) =
         crate::continuation::build_need_more_evidence_request_from_decision(&conn, &result)?
     {
-        let probe_result = run_continue_evidence_probes(&app, &probe_request);
+        let confidence_before = result.confidence_summary.clone();
+        let mut probe_result = run_continue_evidence_probes(&app, &probe_request);
+        let current_material_watermark =
+            crate::continuation::current_continue_evidence_watermark_hash(
+                &conn,
+                request.session_id.as_deref(),
+            )?;
+        if current_material_watermark != probe_request.source_evidence_watermark_hash {
+            probe_result.stale_result = true;
+            probe_result.evidence_changed = false;
+            probe_result.dimensions_changed.clear();
+            for outcome in &mut probe_result.per_probe_outcomes {
+                outcome.stale_result = true;
+                outcome.dimensions_changed.clear();
+            }
+        }
         crate::continuation::record_continue_evidence_probe_result(
             &conn,
             &probe_request,
             &probe_result,
         )?;
+        let reran_decision = crate::continuation::probe_result_allows_rerun(&probe_result);
+        let rerun_reason = if probe_result.stale_result {
+            "stale_result_isolated"
+        } else if reran_decision {
+            "material_requested_dimension_changed"
+        } else {
+            match probe_result.status {
+                crate::continuation::EvidenceProbeStatus::SucceededNoChange => {
+                    "succeeded_no_change"
+                }
+                crate::continuation::EvidenceProbeStatus::TimedOut => "timed_out",
+                crate::continuation::EvidenceProbeStatus::PrivacyBlocked => "privacy_blocked",
+                crate::continuation::EvidenceProbeStatus::PermissionBlocked => "permission_blocked",
+                crate::continuation::EvidenceProbeStatus::Cancelled => "cancelled",
+                crate::continuation::EvidenceProbeStatus::Failed => "failed",
+                crate::continuation::EvidenceProbeStatus::NotApplicable => "not_applicable",
+                crate::continuation::EvidenceProbeStatus::BudgetExhausted => "budget_exhausted",
+                crate::continuation::EvidenceProbeStatus::SucceededChangedEvidence => {
+                    "changed_without_material_requested_dimension"
+                }
+            }
+        }
+        .to_string();
+        if reran_decision {
+            result = crate::continuation::get_continue_decision(&conn, request.clone())?;
+            result
+                .warnings
+                .push("observe_before_decide:evidence_refreshed_before_decision".to_string());
+            result.warnings.sort();
+            result.warnings.dedup();
+        }
         let trace = crate::continuation::ObserveBeforeDecideTrace {
-            schema: "smalltalk.observe_before_decide_trace.v1".to_string(),
+            schema: "smalltalk.observe_before_decide_trace.v2".to_string(),
             request: probe_request,
             sufficiency,
-            reran_decision: true,
+            reran_decision,
+            rerun_reason,
+            confidence_before,
+            confidence_after: result.confidence_summary.clone(),
+            stale_or_cancelled: probe_result.stale_result
+                || matches!(
+                    probe_result.status,
+                    crate::continuation::EvidenceProbeStatus::Cancelled
+                ),
             probe_result,
         };
-        result = crate::continuation::get_continue_decision(&conn, request.clone())?;
         result.observe_before_decide = Some(trace);
-        result
-            .warnings
-            .push("observe_before_decide:evidence_refreshed_before_decision".to_string());
-        result.warnings.sort();
-        result.warnings.dedup();
     }
     if result.cache_hit {
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
@@ -3290,49 +3345,55 @@ fn run_continue_evidence_probes(
     let mut probes_succeeded = Vec::new();
     let mut context = AccessibilityContext::default();
     let mut window_count = 0_i64;
+    let mut timed_out = false;
+    let selected_probe = request.selected_probe.clone();
+    let run_accessibility = matches!(
+        selected_probe,
+        crate::continuation::EvidenceProbeKind::FrontmostAppProbe
+            | crate::continuation::EvidenceProbeKind::ActiveWindowProbe
+            | crate::continuation::EvidenceProbeKind::BrowserUrlProbe
+            | crate::continuation::EvidenceProbeKind::DocumentPathProbe
+            | crate::continuation::EvidenceProbeKind::AccessibilityTextProbe
+            | crate::continuation::EvidenceProbeKind::AppContextProbe
+            | crate::continuation::EvidenceProbeKind::ActiveElementProbe
+            | crate::continuation::EvidenceProbeKind::ScopedActiveWindowCapture
+            | crate::continuation::EvidenceProbeKind::OcrIfAxThin
+    );
+    let run_window_graph = matches!(
+        selected_probe,
+        crate::continuation::EvidenceProbeKind::WindowGraphProbe
+    );
 
     match capture_paths(app) {
         Ok(paths) => {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_else(|| Duration::from_millis(0));
-            let (next_context, accessibility_timed_out) =
-                collect_accessibility_context_with_timeout(paths.clone(), remaining);
-            context = next_context;
-            if accessibility_timed_out {
-                warnings.push("accessibility_probe_timed_out".to_string());
-            }
-            if context.error.is_some() {
-                warnings.push("accessibility_probe_returned_error".to_string());
-            } else if context_has_accessibility_signal(&context) {
-                probes_succeeded.push(crate::continuation::EvidenceProbeKind::FrontmostAppProbe);
-                probes_succeeded.push(crate::continuation::EvidenceProbeKind::ActiveWindowProbe);
-                if context.browser_url.is_some() {
-                    probes_succeeded.push(crate::continuation::EvidenceProbeKind::BrowserUrlProbe);
+            if run_accessibility {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                let (next_context, accessibility_timed_out) =
+                    collect_accessibility_context_with_timeout(paths.clone(), remaining);
+                context = next_context;
+                if accessibility_timed_out {
+                    timed_out = true;
+                    warnings.push("accessibility_probe_timed_out".to_string());
                 }
-                if context.document_path.is_some() {
-                    probes_succeeded
-                        .push(crate::continuation::EvidenceProbeKind::DocumentPathProbe);
-                }
-                if !context.text.trim().is_empty() {
-                    probes_succeeded
-                        .push(crate::continuation::EvidenceProbeKind::AccessibilityTextProbe);
+                if context.error.is_some() {
+                    warnings.push("accessibility_probe_returned_error".to_string());
                 }
             }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_else(|| Duration::from_millis(0));
-            match collect_window_snapshot_with_timeout(paths, remaining) {
-                Ok((snapshot, false)) => {
-                    window_count = snapshot.windows.len() as i64;
-                    probes_succeeded.push(crate::continuation::EvidenceProbeKind::WindowGraphProbe);
-                    if context.app_bundle_id.is_none() {
-                        context.app_bundle_id = snapshot.active_app_bundle_id.clone();
-                    }
-                    if context.window_id.is_none() {
-                        context.window_id = snapshot.active_window_id;
-                    }
-                    if context.app_name.is_none() || context.window_name.is_none() {
+            if run_window_graph {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                match collect_window_snapshot_with_timeout(paths, remaining) {
+                    Ok((snapshot, false)) => {
+                        window_count = snapshot.windows.len() as i64;
+                        if context.app_bundle_id.is_none() {
+                            context.app_bundle_id = snapshot.active_app_bundle_id.clone();
+                        }
+                        if context.window_id.is_none() {
+                            context.window_id = snapshot.active_window_id;
+                        }
                         if let Some(active) =
                             snapshot.windows.iter().find(|window| window.is_active)
                         {
@@ -3344,14 +3405,16 @@ fn run_continue_evidence_probes(
                             }
                         }
                     }
+                    Ok((_, true)) => {
+                        timed_out = true;
+                        warnings.push("window_graph_probe_timed_out".to_string());
+                    }
+                    Err(error) if error == "window_graph_probe_timed_out" => {
+                        timed_out = true;
+                        warnings.push("window_graph_probe_timed_out".to_string())
+                    }
+                    Err(error) => errors.push(format!("window_graph_probe_failed:{}", error)),
                 }
-                Ok((_, true)) => {
-                    warnings.push("window_graph_probe_timed_out".to_string());
-                }
-                Err(error) if error == "window_graph_probe_timed_out" => {
-                    warnings.push("window_graph_probe_timed_out".to_string())
-                }
-                Err(error) => warnings.push(format!("window_graph_probe_failed:{}", error)),
             }
         }
         Err(error) => errors.push(format!("capture_paths_failed:{}", error)),
@@ -3375,18 +3438,108 @@ fn run_continue_evidence_probes(
         "continue-probe-{}",
         stable_hash_bytes(format!("{}:{}", request.id, completed_at_ms).as_bytes())
     ));
+    let material_evidence_hash_after = stable_hash_bytes(
+        serde_json::to_string(&serde_json::json!({
+            "app_name": context.app_name.as_deref(),
+            "app_bundle_id": context.app_bundle_id.as_deref(),
+            "window_title": context.window_name.as_deref(),
+            "browser_url": context.browser_url.as_deref(),
+            "document_path": context.document_path.as_deref(),
+        }))
+        .unwrap_or_default()
+        .as_bytes(),
+    );
+    let can_materially_change = request.requested_dimensions.iter().any(|dimension| {
+        matches!(
+            dimension,
+            crate::continuation::ConfidenceDimension::SurfaceIdentity
+                | crate::continuation::ConfidenceDimension::ActiveWindowOwnership
+                | crate::continuation::ConfidenceDimension::TargetIdentity
+                | crate::continuation::ConfidenceDimension::TargetOpenability
+                | crate::continuation::ConfidenceDimension::DirectTargetPolicy
+        )
+    });
     let evidence_changed = !privacy_blocked
-        && (context.app_name.is_some()
-            || context.window_name.is_some()
-            || context.browser_url.is_some()
-            || context.document_path.is_some()
-            || window_count > 0);
+        && !timed_out
+        && errors.is_empty()
+        && can_materially_change
+        && material_evidence_hash_after != request.source_surface_fingerprint;
+    let status = if privacy_blocked {
+        crate::continuation::EvidenceProbeStatus::PrivacyBlocked
+    } else if timed_out || completed_at_ms > request.deadline_at_ms {
+        crate::continuation::EvidenceProbeStatus::TimedOut
+    } else if !errors.is_empty() || context.error.is_some() {
+        crate::continuation::EvidenceProbeStatus::Failed
+    } else if evidence_changed {
+        crate::continuation::EvidenceProbeStatus::SucceededChangedEvidence
+    } else {
+        crate::continuation::EvidenceProbeStatus::SucceededNoChange
+    };
+    if matches!(
+        status,
+        crate::continuation::EvidenceProbeStatus::SucceededChangedEvidence
+            | crate::continuation::EvidenceProbeStatus::SucceededNoChange
+    ) {
+        probes_succeeded.push(selected_probe.clone());
+    }
+    let dimensions_changed = if evidence_changed {
+        request
+            .requested_dimensions
+            .iter()
+            .filter(|dimension| {
+                matches!(
+                    dimension,
+                    crate::continuation::ConfidenceDimension::SurfaceIdentity
+                        | crate::continuation::ConfidenceDimension::ActiveWindowOwnership
+                        | crate::continuation::ConfidenceDimension::TargetIdentity
+                        | crate::continuation::ConfidenceDimension::TargetOpenability
+                        | crate::continuation::ConfidenceDimension::DirectTargetPolicy
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let evidence_record_ids = evidence_changed
+        .then(|| observation_id.clone())
+        .flatten()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let per_probe_outcomes = request
+        .requested_dimensions
+        .iter()
+        .map(|dimension| crate::continuation::EvidenceProbeOutcome {
+            probe_kind: selected_probe.clone(),
+            requested_dimension: *dimension,
+            started_at_ms,
+            completed_at_ms,
+            deadline_at_ms: request.deadline_at_ms,
+            status: status.clone(),
+            success_criteria: request.success_criteria.clone(),
+            evidence_record_ids: evidence_record_ids.clone(),
+            dimensions_changed: dimensions_changed.clone(),
+            failure_reason: (!matches!(
+                status,
+                crate::continuation::EvidenceProbeStatus::SucceededChangedEvidence
+                    | crate::continuation::EvidenceProbeStatus::SucceededNoChange
+            ))
+            .then(|| {
+                warnings
+                    .first()
+                    .cloned()
+                    .or_else(|| errors.first().cloned())
+                    .unwrap_or_else(|| status.as_str().to_string())
+            }),
+            stale_result: false,
+        })
+        .collect::<Vec<_>>();
 
     crate::continuation::NeedMoreEvidenceProbeResult {
         request_id: request.id.clone(),
         started_at_ms,
         completed_at_ms,
-        probes_attempted: request.requested_probes.clone(),
+        probes_attempted: vec![selected_probe],
         probes_succeeded,
         evidence_changed,
         privacy_blocked,
@@ -3415,6 +3568,14 @@ fn run_continue_evidence_probes(
         privacy_status: Some(privacy.status),
         warnings,
         errors,
+        deadline_at_ms: request.deadline_at_ms,
+        status,
+        per_probe_outcomes,
+        evidence_record_ids,
+        dimensions_changed,
+        stale_result: false,
+        material_evidence_hash_before: request.source_surface_fingerprint.clone(),
+        material_evidence_hash_after,
     }
 }
 
@@ -3570,6 +3731,15 @@ pub fn run_continue_replay_eval(
 ) -> Result<crate::continuation::ContinueReplayEvalReport, String> {
     let conn = open_db(&app)?;
     crate::continuation::run_continue_replay_eval(&conn, input)
+}
+
+#[tauri::command]
+pub fn run_continue_accuracy_eval(
+    input: Option<crate::continuation::accuracy_eval::ContinueAccuracyEvalOptions>,
+) -> Result<crate::continuation::accuracy_eval::ContinueAccuracyEvalReport, String> {
+    crate::continuation::accuracy_eval::run_committed_continue_accuracy_eval(
+        input.unwrap_or_default(),
+    )
 }
 
 #[tauri::command]
@@ -6103,6 +6273,17 @@ struct ContinueOpenDecisionRow {
     candidate_evidence_frame_id: Option<String>,
     candidate_workstream_id: Option<String>,
     return_target_last_seen_frame_id: Option<String>,
+    session_id: Option<String>,
+    evidence_watermark_hash: Option<String>,
+    continue_output_mode: Option<String>,
+    validation_status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskTruthOpenContractRow {
+    effective_state: String,
+    release_gate_passed: bool,
+    return_target_artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -6593,7 +6774,8 @@ fn resolve_continue_decision_for_open(
             "SELECT d.selected_candidate_id, d.return_target_artifact_id, d.confidence,
                     d.selected_workstream_id,
                     c.target_artifact_id, c.evidence_frame_id, c.workstream_id,
-                    a.last_seen_frame_id
+                    a.last_seen_frame_id, d.session_id, d.evidence_watermark_hash,
+                    d.continue_output_mode, d.validation_status
              FROM continue_decisions d
              LEFT JOIN continue_candidates c ON c.id = d.selected_candidate_id
              LEFT JOIN continue_artifacts a ON a.id = d.return_target_artifact_id
@@ -6609,6 +6791,10 @@ fn resolve_continue_decision_for_open(
                     candidate_evidence_frame_id: row.get(5)?,
                     candidate_workstream_id: row.get(6)?,
                     return_target_last_seen_frame_id: row.get(7)?,
+                    session_id: row.get(8)?,
+                    evidence_watermark_hash: row.get(9)?,
+                    continue_output_mode: row.get(10)?,
+                    validation_status: row.get(11)?,
                 })
             },
         )
@@ -6619,10 +6805,109 @@ fn resolve_continue_decision_for_open(
         return Ok(None);
     };
 
-    let decision_target_artifact_id = requested_artifact_id
-        .and_then(|value| non_empty(value.to_string()))
-        .or_else(|| row.candidate_target_artifact_id.clone())
-        .or_else(|| row.return_target_artifact_id.clone());
+    let task_truth_contract = if table_exists_in_capture(conn, "task_truth_v2_decision_contracts")?
+    {
+        conn.query_row(
+            "SELECT effective_state, release_gate_passed, return_target_artifact_id
+             FROM task_truth_v2_decision_contracts WHERE decision_id=?1",
+            params![decision_id],
+            |row| {
+                Ok(TaskTruthOpenContractRow {
+                    effective_state: row.get(0)?,
+                    release_gate_passed: row.get::<_, i64>(1)? != 0,
+                    return_target_artifact_id: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(to_string)?
+    } else {
+        None
+    };
+    let authoritative_task_truth_target = if strict_continue_target
+        && task_truth_contract
+            .as_ref()
+            .is_some_and(|contract| contract.effective_state == "authoritative")
+    {
+        let contract = task_truth_contract.as_ref().expect("checked above");
+        if !contract.release_gate_passed {
+            warnings
+                .push("blocked_by_continue_policy:task_truth_release_gate_not_passed".to_string());
+            return Ok(None);
+        }
+        let Some(target_artifact_id) = contract.return_target_artifact_id.clone() else {
+            warnings.push("blocked_by_continue_policy:task_truth_public_target_null".to_string());
+            return Ok(None);
+        };
+        if !crate::continuation::task_truth_v2::production::authoritative_runtime_enabled() {
+            warnings.push(
+                "blocked_by_continue_policy:task_truth_authority_no_longer_enabled".to_string(),
+            );
+            return Ok(None);
+        }
+        if row.return_target_artifact_id.as_deref() != Some(target_artifact_id.as_str()) {
+            warnings
+                .push("blocked_by_continue_policy:task_truth_target_contract_mismatch".to_string());
+            return Ok(None);
+        }
+        Some(target_artifact_id)
+    } else {
+        None
+    };
+
+    if strict_continue_target {
+        if authoritative_task_truth_target.is_none()
+            && (row
+                .continue_output_mode
+                .as_deref()
+                .is_some_and(|mode| mode == "no_clear_continuation")
+                || row.validation_status.as_deref().is_some_and(|status| {
+                    status.contains("rejected")
+                        || status.contains("blocked")
+                        || status.contains("suppressed")
+                }))
+        {
+            warnings
+                .push("blocked_by_continue_policy:decision_not_direct_open_eligible".to_string());
+            return Ok(None);
+        }
+        if let Some(stored_watermark) = row
+            .evidence_watermark_hash
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let current_watermark = crate::continuation::current_continue_evidence_watermark_hash(
+                conn,
+                row.session_id.as_deref(),
+            )?;
+            if current_watermark != stored_watermark {
+                warnings.push("blocked_by_continue_policy:target_stale".to_string());
+                return Ok(None);
+            }
+        }
+    }
+
+    let requested_artifact_id =
+        requested_artifact_id.and_then(|value| non_empty(value.to_string()));
+    let decision_target_artifact_id = if strict_continue_target {
+        let public_target_artifact_id = authoritative_task_truth_target
+            .as_ref()
+            .or(row.return_target_artifact_id.as_ref());
+        if requested_artifact_id.is_some()
+            && requested_artifact_id.as_deref() != public_target_artifact_id.map(String::as_str)
+        {
+            warnings.push(
+                "blocked_by_continue_policy:requested_target_not_public_decision_target"
+                    .to_string(),
+            );
+            return Ok(None);
+        }
+        authoritative_task_truth_target.or_else(|| row.return_target_artifact_id.clone())
+    } else {
+        requested_artifact_id
+            .or_else(|| row.return_target_artifact_id.clone())
+            .or_else(|| row.candidate_target_artifact_id.clone())
+    };
     if let Some(reason) = crate::continuation::continue_feedback_suppression_for_target(
         conn,
         row.selected_candidate_id.as_deref(),
@@ -6776,8 +7061,17 @@ fn resolve_strict_continue_artifact_for_open(
     confidence: f64,
     warnings: &mut Vec<String>,
 ) -> Result<Option<ResolvedOpenResumePoint>, String> {
-    let has_direct_locator = artifact.browser_url.is_some() || artifact.document_path.is_some();
-    if !has_direct_locator {
+    let valid_browser_url = artifact.browser_url.as_deref().is_some_and(|url| {
+        let url = url.trim();
+        !url.chars().any(char::is_whitespace)
+            && (url.starts_with("https://") || url.starts_with("http://"))
+    });
+    let valid_document_path = artifact.document_path.as_deref().is_some_and(|path| {
+        let path = path.trim();
+        path.starts_with('/') && path.len() > 1 && !path.contains('\0')
+    });
+    let has_direct_locator = valid_browser_url || valid_document_path;
+    if artifact.openability != "openable" || !has_direct_locator {
         let label = artifact
             .display_title
             .as_deref()
@@ -15149,19 +15443,23 @@ fn record_typing_event(
     typing_burst: &mut TypingBurstState,
 ) -> Result<(), String> {
     let now = event.ts_ms;
-    let should_start =
-        typing_burst.id.is_none() || now.saturating_sub(typing_burst.ended_at_ms) > 1_200;
+    let should_start = typing_burst.id.is_none()
+        || typing_burst.committed
+        || now.saturating_sub(typing_burst.ended_at_ms) > 1_200
+        || !typing_burst_surface_matches_event(typing_burst, event);
     if should_start {
         let id = next_id("type");
         let pre_frame_id = latest_frame_id_for_session_from_conn(conn, session_id)?;
+        let is_commit = event.key_category.as_deref() == Some("enter");
         conn.execute(
             "INSERT INTO typing_bursts (
                 id, started_at_ms, ended_at_ms, app_pid, app_bundle_id, app_name,
                 window_id, window_title, char_count, backspace_count, enter_count,
                 paste_count, shortcut_count, committed, commit_signal,
-                raw_text_captured, pre_frame_id, session_id
+                raw_text_captured, pre_frame_id, session_id, start_event_id,
+                last_event_id, commit_event_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                       ?13, ?14, ?15, 0, ?16, ?17)",
+                       ?13, ?14, ?15, 0, ?16, ?17, ?18, ?18, ?19)",
             params![
                 id,
                 now,
@@ -15176,24 +15474,23 @@ fn record_typing_event(
                 key_count(event, "enter"),
                 paste_count(event),
                 shortcut_count(event),
-                if event.key_category.as_deref() == Some("enter") {
-                    1
-                } else {
-                    0
-                },
-                if event.key_category.as_deref() == Some("enter") {
-                    Some("enter")
-                } else {
-                    None
-                },
+                i64::from(is_commit),
+                is_commit.then_some("enter"),
                 pre_frame_id,
                 session_id,
+                event.id,
+                is_commit.then_some(event.id.as_str()),
             ],
         )
         .map_err(to_string)?;
         typing_burst.id = Some(id);
         typing_burst.started_at_ms = now;
         typing_burst.ended_at_ms = now;
+        typing_burst.committed = is_commit;
+        typing_burst.app_bundle_id = event.app_bundle_id.clone();
+        typing_burst.app_name = event.app_name.clone();
+        typing_burst.window_id = event.window_id;
+        typing_burst.window_title = event.window_title.clone();
         return Ok(());
     }
 
@@ -15207,7 +15504,9 @@ fn record_typing_event(
                  paste_count = paste_count + ?6,
                  shortcut_count = shortcut_count + ?7,
                  committed = CASE WHEN ?8 = 1 THEN 1 ELSE committed END,
-                 commit_signal = CASE WHEN ?8 = 1 THEN 'enter' ELSE commit_signal END
+                 commit_signal = CASE WHEN ?8 = 1 THEN 'enter' ELSE commit_signal END,
+                 last_event_id = ?9,
+                 commit_event_id = CASE WHEN ?8 = 1 THEN ?9 ELSE commit_event_id END
              WHERE id = ?1",
             params![
                 id,
@@ -15222,13 +15521,44 @@ fn record_typing_event(
                 } else {
                     0
                 },
+                event.id,
             ],
         )
         .map_err(to_string)?;
         typing_burst.ended_at_ms = now;
+        typing_burst.committed |= event.key_category.as_deref() == Some("enter");
     }
 
     Ok(())
+}
+
+fn typing_burst_surface_matches_event(
+    typing_burst: &TypingBurstState,
+    event: &UiEventRecord,
+) -> bool {
+    let same_app = match (
+        typing_burst.app_bundle_id.as_deref(),
+        event.app_bundle_id.as_deref(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => optional_identity_matches(typing_burst.app_name.as_deref(), event.app_name.as_deref()),
+    };
+    let same_window = match (typing_burst.window_id, event.window_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => optional_identity_matches(
+            typing_burst.window_title.as_deref(),
+            event.window_title.as_deref(),
+        ),
+    };
+    same_app && same_window
+}
+
+fn optional_identity_matches(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn key_count(event: &UiEventRecord, category: &str) -> i64 {
@@ -15364,6 +15694,9 @@ fn finalize_capture_trigger_by_id(
         params![trigger_id, status, post_frame_id],
     )
     .map_err(to_string)?;
+    if let Some(post_frame_id) = post_frame_id.as_deref() {
+        associate_committed_typing_bursts_for_trigger(&conn, trigger_id, post_frame_id)?;
+    }
 
     let trigger = conn
         .query_row(
@@ -15425,6 +15758,204 @@ fn finalize_capture_trigger_by_id(
     )
     .map_err(to_string)?;
     Ok(())
+}
+
+fn associate_committed_typing_bursts_for_trigger(
+    conn: &Connection,
+    trigger_id: &str,
+    post_frame_id: &str,
+) -> Result<usize, String> {
+    let trigger = conn
+        .query_row(
+            "SELECT session_id, caused_by_event_ids
+             FROM capture_triggers WHERE id = ?1",
+            params![trigger_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((Some(session_id), caused_by_event_ids)) = trigger else {
+        return Ok(0);
+    };
+    let caused_by_event_ids = serde_json::from_str::<Vec<String>>(&caused_by_event_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if caused_by_event_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let frame = conn
+        .query_row(
+            "SELECT captured_at, app_bundle_id, app_name, window_id, window_name,
+                    COALESCE(privacy_status, 'normal')
+             FROM frames WHERE CAST(id AS TEXT) = ?1 AND session_id = ?2",
+            params![post_frame_id, session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((
+        frame_captured_at,
+        frame_bundle_id,
+        frame_app_name,
+        frame_window_id,
+        frame_window_title,
+        frame_privacy_status,
+    )) = frame
+    else {
+        return Ok(0);
+    };
+    if frame_privacy_status != "normal" {
+        return Ok(0);
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, ended_at_ms, app_bundle_id, app_name, window_id, window_title,
+                    commit_event_id, post_frame_id,
+                    COALESCE(post_frame_association_confidence, -1.0)
+             FROM typing_bursts
+             WHERE session_id = ?1 AND committed = 1
+               AND COALESCE(raw_text_captured, 0) = 0
+               AND commit_event_id IS NOT NULL",
+        )
+        .map_err(to_string)?;
+    let candidates = statement
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, f64>(8)?,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    drop(statement);
+
+    let mut associated = 0;
+    for (
+        burst_id,
+        ended_at_ms,
+        burst_bundle_id,
+        burst_app_name,
+        burst_window_id,
+        burst_window_title,
+        commit_event_id,
+        existing_post_frame_id,
+        existing_confidence,
+    ) in candidates
+    {
+        if !caused_by_event_ids.contains(&commit_event_id) {
+            continue;
+        }
+        if existing_post_frame_id
+            .as_deref()
+            .is_some_and(|existing| existing != post_frame_id)
+        {
+            continue;
+        }
+        if existing_confidence > AUTHORITATIVE_TYPING_ASSOCIATION_CONFIDENCE {
+            continue;
+        }
+        let temporal_distance_ms = frame_captured_at.saturating_sub(ended_at_ms);
+        if frame_captured_at < ended_at_ms
+            || temporal_distance_ms > MAX_TYPING_POST_FRAME_ASSOCIATION_DELAY_MS
+        {
+            continue;
+        }
+        let Some(mut reasons) = strict_typing_surface_match_reasons(
+            burst_bundle_id.as_deref(),
+            burst_app_name.as_deref(),
+            burst_window_id,
+            burst_window_title.as_deref(),
+            frame_bundle_id.as_deref(),
+            frame_app_name.as_deref(),
+            frame_window_id,
+            frame_window_title.as_deref(),
+        ) else {
+            continue;
+        };
+        reasons.extend([
+            "session_match".to_string(),
+            "commit_event_in_capture_trigger".to_string(),
+            format!("post_frame_temporal_distance_ms:{temporal_distance_ms}"),
+        ]);
+        let reasons_json = serde_json::to_string(&reasons).map_err(to_string)?;
+        let changed = conn
+            .execute(
+                "UPDATE typing_bursts
+                 SET post_frame_id = ?2,
+                     capture_trigger_id = ?3,
+                     post_frame_association_source = 'stored_capture_trigger_commit_event',
+                     post_frame_association_confidence = ?4,
+                     post_frame_association_reasons_json = ?5,
+                     post_frame_associated_at_ms = ?6
+                 WHERE id = ?1
+                   AND (post_frame_id IS NULL OR post_frame_id = ?2)
+                   AND COALESCE(post_frame_association_confidence, -1.0) < ?4",
+                params![
+                    burst_id,
+                    post_frame_id,
+                    trigger_id,
+                    AUTHORITATIVE_TYPING_ASSOCIATION_CONFIDENCE,
+                    reasons_json,
+                    now_millis(),
+                ],
+            )
+            .map_err(to_string)?;
+        associated += changed;
+    }
+    Ok(associated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_typing_surface_match_reasons(
+    burst_bundle_id: Option<&str>,
+    burst_app_name: Option<&str>,
+    burst_window_id: Option<i64>,
+    burst_window_title: Option<&str>,
+    frame_bundle_id: Option<&str>,
+    frame_app_name: Option<&str>,
+    frame_window_id: Option<i64>,
+    frame_window_title: Option<&str>,
+) -> Option<Vec<String>> {
+    let app_reason = match (burst_bundle_id, frame_bundle_id) {
+        (Some(left), Some(right)) if left == right => "surface_bundle_match",
+        (Some(_), Some(_)) => return None,
+        _ if named_identity_matches(burst_app_name, frame_app_name) => "surface_app_name_match",
+        _ => return None,
+    };
+    let window_reason = match (burst_window_id, frame_window_id) {
+        (Some(left), Some(right)) if left == right => "surface_window_id_match",
+        (Some(_), Some(_)) => return None,
+        _ if named_identity_matches(burst_window_title, frame_window_title) => {
+            "surface_window_title_match"
+        }
+        _ => return None,
+    };
+    Some(vec![app_reason.to_string(), window_reason.to_string()])
+}
+
+fn named_identity_matches(left: Option<&str>, right: Option<&str>) -> bool {
+    left.zip(right)
+        .is_some_and(|(left, right)| left.trim().eq_ignore_ascii_case(right.trim()))
 }
 
 fn mark_capture_trigger_failed(
@@ -16086,10 +16617,10 @@ fn persist_ax_nodes(
                 document, url, selected_text, selected_text_range_json,
                 visible_character_range_json, number_of_characters, focused,
                 enabled, selected, bounds_x, bounds_y, bounds_w, bounds_h,
-                actions_json, children_count, depth, raw_json
+                actions_json, children_count, depth, tree_order, raw_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
-                       ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                       ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             params![
                 id,
                 frame_id.to_string(),
@@ -16120,6 +16651,7 @@ fn persist_ax_nodes(
                 serde_json::to_string(&node.actions).map_err(to_string)?,
                 node.children_count,
                 i64::from(node.depth),
+                index as i64,
                 serde_json::to_string(node).map_err(to_string)?,
             ],
         )
@@ -16253,6 +16785,125 @@ fn persist_frame_text_resolution(
     Ok(())
 }
 
+/// Replays the same text ownership resolver used by live capture against rows
+/// inserted by the P6 accuracy harness. This deliberately remains a narrow
+/// database adapter so the evaluator cannot grow a fixture-only text pipeline.
+pub(crate) fn resolve_accuracy_frame_text(
+    conn: &Connection,
+    frame_id: i64,
+) -> Result<Value, String> {
+    let accessibility_text = conn
+        .query_row(
+            "SELECT accessibility_text FROM frames WHERE id = ?1",
+            params![frame_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .flatten()
+        .and_then(non_empty);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT text, confidence, bounds_x, bounds_y, bounds_w, bounds_h,
+                    normalized_bounds_json, raw_json, source_scope, ownership_kind,
+                    ownership_confidence, active_artifact_match_confidence,
+                    owner_window_id, owner_app_pid, owner_bundle_id, owner_app_name,
+                    owner_window_title, coordinate_space, coordinate_transform_json,
+                    quality_flags_json, provenance_json
+             FROM ocr_spans
+             WHERE frame_id = ?1
+             ORDER BY block_index ASC, line_index ASC, word_index ASC, id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![frame_id.to_string()], |row| {
+            let provenance_json = row.get::<_, Option<String>>(20)?.unwrap_or_default();
+            let parsed_provenance =
+                serde_json::from_str::<TextSpanProvenance>(&provenance_json).ok();
+            let quality_flags_json = row.get::<_, Option<String>>(19)?.unwrap_or_default();
+            let quality_flags =
+                serde_json::from_str::<Vec<String>>(&quality_flags_json).unwrap_or_default();
+            let coordinate_transform_json = row
+                .get::<_, Option<String>>(18)?
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let provenance = parsed_provenance.unwrap_or(TextSpanProvenance {
+                source_scope: row
+                    .get::<_, Option<String>>(8)?
+                    .unwrap_or_else(|| "active_window".to_string()),
+                ownership_kind: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                ownership_confidence: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                active_artifact_match_confidence: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+                owner_window_id: row.get(12)?,
+                owner_app_pid: row.get(13)?,
+                owner_bundle_id: row.get(14)?,
+                owner_app_name: row.get(15)?,
+                owner_window_title: row.get(16)?,
+                coordinate_space: row
+                    .get::<_, Option<String>>(17)?
+                    .unwrap_or_else(|| "fixture_normalized".to_string()),
+                coordinate_transform_json,
+                quality_flags,
+                reason: "accuracy_replay_source_ownership".to_string(),
+            });
+            Ok(OcrSpanDraft {
+                text: row.get(0)?,
+                confidence: row.get(1)?,
+                bounds: Rect {
+                    x: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    y: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    w: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    h: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                },
+                normalized_bounds_json: row
+                    .get::<_, Option<String>>(6)?
+                    .unwrap_or_else(|| "{}".to_string()),
+                raw_json: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "{}".to_string()),
+                provenance,
+            })
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+
+    let accessibility_is_thin = accessibility_text
+        .as_deref()
+        .map(|text| text.split_whitespace().count() < 12)
+        .unwrap_or(true);
+    let (text_source, full_text, resolution) =
+        resolve_frame_text(accessibility_text.as_deref(), &rows, accessibility_is_thin);
+    conn.execute(
+        "UPDATE frames
+         SET text_source = ?2, full_text = ?3, content_hash = ?4
+         WHERE id = ?1",
+        params![
+            frame_id,
+            text_source,
+            full_text,
+            resolution.active_content_hash
+        ],
+    )
+    .map_err(to_string)?;
+    persist_frame_text_resolution(conn, frame_id, &resolution)?;
+    Ok(serde_json::json!({
+        "frame_id": frame_id.to_string(),
+        "text_source": text_source,
+        "active_text": resolution.active_text,
+        "background_text": resolution.background_text,
+        "diagnostic_text": resolution.diagnostic_text,
+        "full_text_quality": resolution.full_text_quality,
+        "quality_flags": resolution.quality_flags,
+        "active_content_hash": resolution.active_content_hash,
+        "background_content_hash": resolution.background_content_hash,
+        "production_path": "capture::resolve_frame_text"
+    }))
+}
+
 fn persist_app_contexts(
     conn: &Connection,
     frame_id: i64,
@@ -16347,11 +16998,11 @@ fn persist_content_units(
                 bounds_w, bounds_h, visible_ratio, center_distance, confidence,
                 source_scope, ownership_kind, ownership_confidence,
                 active_artifact_match_confidence, owner_window_id, owner_bundle_id,
-                quality_flags_json, provenance_json, created_at_ms, raw_json
+                quality_flags_json, provenance_json, source_order, created_at_ms, raw_json
              ) VALUES (?1, ?2, ?3, 'ax', ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10,
                        ?11, ?12, ?13, ?14, ?15, 'active_element',
                        'ActiveWindowOwned', 0.92, 0.92, ?3, ?16, '[]', NULL,
-                       ?17, ?18)",
+                       ?17, ?18, ?19)",
             params![
                 format!("unit-{}-ax-{}", frame_id, index),
                 frame_id.to_string(),
@@ -16377,6 +17028,7 @@ fn persist_content_units(
                     0.78
                 },
                 &context.app_bundle_id,
+                index as i64,
                 now,
                 serde_json::to_string(node).map_err(to_string)?,
             ],
@@ -16453,10 +17105,10 @@ fn persist_content_units(
                 center_distance, confidence, source_scope, ownership_kind,
                 ownership_confidence, active_artifact_match_confidence, owner_window_id,
                 owner_bundle_id, quality_flags_json, provenance_json, created_at_ms,
-                raw_json
+                source_order, raw_json
              ) VALUES (?1, ?2, 'ocr', 'unknown', ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                        ?10, 1.0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                       ?19, ?20, ?21, ?22)",
+                       ?19, ?20, ?21, ?22, ?23)",
             params![
                 format!("unit-{}-ocr-{}", frame_id, index),
                 frame_id.to_string(),
@@ -16479,6 +17131,7 @@ fn persist_content_units(
                 quality_flags_json,
                 provenance_json,
                 now,
+                index as i64,
                 serde_json::json!({
                     "ocr_span_id": span_id,
                     "source_provenance": provenance_json
@@ -19255,6 +19908,10 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
     "continue_artifacts",
     "continue_artifact_observations",
     "continue_semantic_moments",
+    "continue_task_turns",
+    "continue_task_turn_evidence",
+    "continue_task_turn_relations",
+    "continue_task_turn_lifecycle",
     "continue_task_actions",
     "continue_task_action_events",
     "continue_episodes",
@@ -19275,6 +19932,8 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
     "continue_evidence_probes",
     "continue_surface_enrichment_attempts",
     "continue_surface_snapshots",
+    "continue_ordered_evidence_spans",
+    "continue_salient_turn_evidence",
     "continue_app_activity_segments",
     "continue_activity_classifications",
     "continue_boundary_revisions",
@@ -19580,6 +20239,24 @@ fn export_continue_output_audit_to_plan(
         &final_output_dir.join("handoff.json"),
         &serde_json::to_value(&result.handoff).map_err(to_string)?,
     )?;
+    write_json_pretty(
+        &decision_dir.join("confidence_vector.json"),
+        &serde_json::to_value(&result.confidence_vector).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("confidence_compatibility.json"),
+        &serde_json::json!({
+            "summary": result.confidence_summary,
+            "legacyDerivation": result.legacy_confidence_derivation,
+            "claimDependencies": crate::continuation::ConfidenceClaim::ALL
+                .into_iter()
+                .map(|claim| (
+                    claim.as_str(),
+                    crate::continuation::confidence::claim_dependencies(claim),
+                ))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        }),
+    )?;
     write_text_file(
         &semantic_dir.join("app_activity_segments.ndjson"),
         &continue_app_activity_segments_ndjson(result)?,
@@ -19801,6 +20478,10 @@ fn export_continue_output_audit_to_plan(
         &serde_json::to_value(&result).map_err(to_string)?,
     )?;
     write_json_pretty(
+        &decision_dir.join("work-truth.json"),
+        &serde_json::to_value(&result.work_truth).map_err(to_string)?,
+    )?;
+    write_json_pretty(
         &decision_dir.join("current_focus.json"),
         &serde_json::to_value(&result.current_focus).map_err(to_string)?,
     )?;
@@ -19827,6 +20508,14 @@ fn export_continue_output_audit_to_plan(
     write_json_pretty(
         &decision_dir.join("surface-snapshots.json"),
         &continue_surface_snapshots_audit_json(conn, result)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("task-turn-evidence.json"),
+        &crate::continuation::task_turn_evidence::task_turn_evidence_audit_json(conn, 240)?,
+    )?;
+    write_json_pretty(
+        &decision_dir.join("current-task-turn.json"),
+        &crate::continuation::task_turn::task_turn_audit_json(conn, 40)?,
     )?;
     write_json_pretty(
         &decision_dir.join("enriched-current-focus.json"),
@@ -20046,10 +20735,13 @@ fn write_continue_export_status(
                 "selectedCandidate": "continue/candidates/selected_candidate.json",
                 "finalDecision": "final/continue_decision_result.json",
                 "handoff": "final/handoff.json",
+                "workTruth": "decision/work-truth.json",
                 "currentSurfaceResolution": "decision/current_surface_resolution.json",
                 "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json",
                 "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
                 "surfaceSnapshots": "decision/surface-snapshots.json",
+                "taskTurnEvidence": "decision/task-turn-evidence.json",
+                "currentTaskTurn": "decision/current-task-turn.json",
                 "enrichedCurrentFocus": "decision/enriched-current-focus.json",
                 "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json"
             },
@@ -20120,10 +20812,13 @@ fn write_continue_output_manifest(
         "explainMd": "explain.md",
         "decisionTrace": "decision/decision_trace.json",
         "finalDecision": "decision/final_decision.json",
+        "workTruth": "decision/work-truth.json",
         "currentSurfaceResolution": "decision/current_surface_resolution.json",
         "evidenceFreshnessLedger": "decision/evidence_freshness_ledger.json",
         "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
         "surfaceSnapshots": "decision/surface-snapshots.json",
+        "taskTurnEvidence": "decision/task-turn-evidence.json",
+        "currentTaskTurn": "decision/current-task-turn.json",
         "enrichedCurrentFocus": "decision/enriched-current-focus.json",
         "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json",
         "legacyFinalDecision": "final/continue_decision_result.json",
@@ -20159,6 +20854,7 @@ fn write_continue_output_manifest(
         "selectedEvidenceFrames": "evidence/frames/",
         "evidenceClosure": "evidence/evidence_closure.json",
         "decisionTrace": "decision/decision_trace.json",
+        "workTruth": "decision/work-truth.json",
         "continueLayers": layer_manifest,
         "continueCandidates": candidate_manifest,
         "selectedCandidate": "continue/candidates/selected_candidate.json",
@@ -20168,6 +20864,8 @@ fn write_continue_output_manifest(
         "copyGate": "decision/copy_gate.json",
         "surfaceEnrichmentAttempts": "decision/surface-enrichment-attempts.json",
         "surfaceSnapshots": "decision/surface-snapshots.json",
+        "taskTurnEvidence": "decision/task-turn-evidence.json",
+        "currentTaskTurn": "decision/current-task-turn.json",
         "enrichedCurrentFocus": "decision/enriched-current-focus.json",
         "weakSurfaceCandidateGates": "decision/weak-surface-candidate-gates.json",
         "auditIntegrity": "audit_integrity.json",
@@ -20911,6 +21609,30 @@ fn export_activity_recap_model_audit(
     write_json_pretty(
         &activity_recap_dir.join("inputs_summary.json"),
         &serde_json::to_value(&proof.input_summary).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("task_truth.json"),
+        &serde_json::to_value(&proof.task_truth).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("semantic_sources.json"),
+        &proof.semantic_source_eligibility,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("local_deterministic_recap.json"),
+        &serde_json::to_value(&proof.local_deterministic_recap).map_err(to_string)?,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("claim_to_evidence.json"),
+        &proof.claim_to_evidence,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("identity_parity.json"),
+        &proof.identity_parity,
+    )?;
+    write_json_pretty(
+        &activity_recap_dir.join("quality_gate.json"),
+        &proof.quality_gate_result,
     )?;
     write_json_pretty(
         &activity_recap_dir.join("stitched_timeline.json"),
@@ -22320,14 +23042,21 @@ fn observe_before_decide_trace_markdown(
 ) -> String {
     format!(
         "# Observe Before Decide\n\n\
-This is a compact P5 probe trace. It records the bounded metadata probes used before the final Continue decision; it does not include raw typed text, clipboard text, screenshots, or OCR payloads.\n\n\
+This is a compact P6.06 probe trace. It records bounded dimension-targeted probes; it does not include raw typed text, clipboard text, screenshots, or OCR payloads.\n\n\
 - Source decision id: `{}`\n\
 - Reason: `{:?}`\n\
 - Sufficiency status: `{:?}`\n\
 - Probe request id: `{}`\n\
 - Probe evidence changed: {}\n\
+- Probe status: `{}`\n\
+- Probe duration ms: {}\n\
+- Requested dimensions: {}\n\
+- Dimensions changed: {}\n\
 - Privacy blocked: {}\n\
 - Reran decision: {}\n\
+- Rerun reason: `{}`\n\
+- Confidence before: task `{}`, recap `{}`, target `{}`\n\
+- Confidence after: task `{}`, recap `{}`, target `{}`\n\
 - Warnings: {}\n\
 - Errors: {}\n\n\
 See `need_more_evidence_request.json` and `need_more_evidence_probe_result.json` for the machine-readable probe metadata.\n",
@@ -22336,8 +23065,34 @@ See `need_more_evidence_request.json` and `need_more_evidence_probe_result.json`
         trace.sufficiency.status,
         trace.request.id,
         trace.probe_result.evidence_changed,
+        trace.probe_result.status.as_str(),
+        trace
+            .probe_result
+            .completed_at_ms
+            .saturating_sub(trace.probe_result.started_at_ms),
+        trace
+            .request
+            .requested_dimensions
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        trace
+            .probe_result
+            .dimensions_changed
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         trace.probe_result.privacy_blocked,
         trace.reran_decision,
+        trace.rerun_reason,
+        trace.confidence_before.task.label.as_str(),
+        trace.confidence_before.recap.label.as_str(),
+        trace.confidence_before.target.label.as_str(),
+        trace.confidence_after.task.label.as_str(),
+        trace.confidence_after.recap.label.as_str(),
+        trace.confidence_after.target.label.as_str(),
         if trace.probe_result.warnings.is_empty() {
             "none".to_string()
         } else {
@@ -24144,6 +24899,22 @@ fn frame_asset_paths(conn: &Connection, frame_id: i64) -> Result<Vec<PathBuf>, S
 
 fn delete_frame_dependents(conn: &Connection, frame_id: i64) -> Result<(), String> {
     let frame_key = frame_id.to_string();
+    crate::continuation::task_turn::clear_task_turns_for_frames(
+        conn,
+        std::slice::from_ref(&frame_key),
+    )?;
+    for table in [
+        "continue_salient_turn_evidence",
+        "continue_ordered_evidence_spans",
+    ] {
+        if table_exists_in_capture(conn, table)? {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE frame_id = ?1", table),
+                params![frame_key.as_str()],
+            )
+            .map_err(to_string)?;
+        }
+    }
     for (table, column) in [
         ("frame_quality_warnings", "frame_id"),
         ("sensitive_regions", "frame_id"),
@@ -24297,6 +25068,7 @@ fn prune_continue_refresh_rows(conn: &Connection) -> Result<(), String> {
         )
         .map_err(to_string)?;
     }
+    crate::continuation::task_turn::prune_task_turns(conn, now_millis())?;
     Ok(())
 }
 
@@ -24598,7 +25370,7 @@ fn configure_db_connection(conn: &Connection, writable: bool) -> Result<(), Stri
     Ok(())
 }
 
-fn init_db(conn: &Connection) -> Result<(), String> {
+pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS frames (
@@ -24796,6 +25568,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           actions_json TEXT,
           children_count INTEGER,
           depth INTEGER,
+          tree_order INTEGER,
           raw_json TEXT,
           FOREIGN KEY(frame_id) REFERENCES frames(id)
         );
@@ -24863,6 +25636,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           owner_bundle_id TEXT,
           quality_flags_json TEXT,
           provenance_json TEXT,
+          source_order INTEGER,
           created_at_ms INTEGER NOT NULL,
           raw_json TEXT,
           FOREIGN KEY(frame_id) REFERENCES frames(id)
@@ -24959,7 +25733,15 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           text_hash TEXT,
           redacted_preview TEXT,
           pre_frame_id TEXT,
-          post_frame_id TEXT
+          post_frame_id TEXT,
+          start_event_id TEXT,
+          last_event_id TEXT,
+          commit_event_id TEXT,
+          capture_trigger_id TEXT,
+          post_frame_association_source TEXT,
+          post_frame_association_confidence REAL,
+          post_frame_association_reasons_json TEXT,
+          post_frame_associated_at_ms INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_typing_bursts_session
           ON typing_bursts(session_id);
@@ -25082,10 +25864,12 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(to_string)?;
 
     ensure_frame_columns(conn)?;
+    ensure_ax_node_columns(conn)?;
     ensure_ocr_span_columns(conn)?;
     ensure_content_unit_columns(conn)?;
     ensure_frame_text_resolution_table(conn)?;
     ensure_session_columns(conn)?;
+    ensure_typing_burst_columns(conn)?;
     ensure_episode_columns(conn)?;
     crate::continuation::ensure_continue_schema(conn)?;
     ensure_default_exclusion_rules(conn)?;
@@ -25156,6 +25940,10 @@ fn ensure_ocr_span_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_ax_node_columns(conn: &Connection) -> Result<(), String> {
+    ensure_table_column(conn, "ax_nodes", "tree_order", "INTEGER")
+}
+
 fn ensure_content_unit_columns(conn: &Connection) -> Result<(), String> {
     for (name, definition) in [
         ("source_scope", "TEXT"),
@@ -25166,6 +25954,7 @@ fn ensure_content_unit_columns(conn: &Connection) -> Result<(), String> {
         ("owner_bundle_id", "TEXT"),
         ("quality_flags_json", "TEXT"),
         ("provenance_json", "TEXT"),
+        ("source_order", "INTEGER"),
     ] {
         ensure_table_column(conn, "content_units", name, definition)?;
     }
@@ -25218,6 +26007,22 @@ fn ensure_session_columns(conn: &Connection) -> Result<(), String> {
     ];
     for table in tables {
         ensure_table_column(conn, table, "session_id", "TEXT")?;
+    }
+    Ok(())
+}
+
+fn ensure_typing_burst_columns(conn: &Connection) -> Result<(), String> {
+    for (name, definition) in [
+        ("start_event_id", "TEXT"),
+        ("last_event_id", "TEXT"),
+        ("commit_event_id", "TEXT"),
+        ("capture_trigger_id", "TEXT"),
+        ("post_frame_association_source", "TEXT"),
+        ("post_frame_association_confidence", "REAL"),
+        ("post_frame_association_reasons_json", "TEXT"),
+        ("post_frame_associated_at_ms", "INTEGER"),
+    ] {
+        ensure_table_column(conn, "typing_bursts", name, definition)?;
     }
     Ok(())
 }
@@ -26946,6 +27751,372 @@ mod tests {
             ..event
         };
         assert!(!gate.should_drop(&settled));
+    }
+
+    #[test]
+    fn typing_burst_surface_change_starts_new_burst_and_records_causal_event_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = TypingBurstState::default();
+        let first = UiEventRecord {
+            id: "event-first".to_string(),
+            ts_ms: 1_000,
+            event_type: "key_down".to_string(),
+            app_bundle_id: Some("com.example.first".to_string()),
+            app_name: Some("First".to_string()),
+            window_id: Some(11),
+            window_title: Some("First window".to_string()),
+            key_category: Some("char".to_string()),
+            ..UiEventRecord::default()
+        };
+        record_typing_event(&conn, "session-typing", &first, &mut state).unwrap();
+        let second = UiEventRecord {
+            id: "event-second".to_string(),
+            ts_ms: 1_050,
+            event_type: "key_down".to_string(),
+            app_bundle_id: Some("com.example.second".to_string()),
+            app_name: Some("Second".to_string()),
+            window_id: Some(22),
+            window_title: Some("Second window".to_string()),
+            key_category: Some("enter".to_string()),
+            ..UiEventRecord::default()
+        };
+        record_typing_event(&conn, "session-typing", &second, &mut state).unwrap();
+
+        let mut statement = conn
+            .prepare(
+                "SELECT committed, start_event_id, last_event_id, commit_event_id,
+                        app_bundle_id, window_id
+                 FROM typing_bursts ORDER BY started_at_ms, id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.as_deref(), Some("event-first"));
+        assert_eq!(rows[0].2.as_deref(), Some("event-first"));
+        assert!(rows[0].3.is_none());
+        assert_eq!(rows[1].0, 1);
+        assert_eq!(rows[1].1.as_deref(), Some("event-second"));
+        assert_eq!(rows[1].2.as_deref(), Some("event-second"));
+        assert_eq!(rows[1].3.as_deref(), Some("event-second"));
+        assert_eq!(rows[1].4.as_deref(), Some("com.example.second"));
+        assert_eq!(rows[1].5, Some(22));
+    }
+
+    #[test]
+    fn typing_after_commit_starts_a_new_burst_on_the_same_surface() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = TypingBurstState::default();
+        for (id, ts_ms, key_category) in [
+            ("event-char", 1_000, "char"),
+            ("event-enter", 1_050, "enter"),
+            ("event-next", 1_100, "char"),
+        ] {
+            let event = UiEventRecord {
+                id: id.to_string(),
+                ts_ms,
+                event_type: "key_down".to_string(),
+                app_bundle_id: Some("com.example.chat".to_string()),
+                app_name: Some("Chat".to_string()),
+                window_id: Some(42),
+                window_title: Some("Conversation".to_string()),
+                key_category: Some(key_category.to_string()),
+                ..UiEventRecord::default()
+            };
+            record_typing_event(&conn, "session-typing", &event, &mut state).unwrap();
+        }
+
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT committed, start_event_id, commit_event_id
+                     FROM typing_bursts ORDER BY started_at_ms, id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].2.as_deref(), Some("event-enter"));
+        assert_eq!(rows[1].0, 0);
+        assert_eq!(rows[1].1.as_deref(), Some("event-next"));
+    }
+
+    #[test]
+    fn committed_typing_is_authoritatively_associated_with_trigger_post_frame() {
+        let db_path = std::env::temp_dir().join(format!(
+            "smalltalk-typing-post-frame-audit-{}.sqlite",
+            now_millis()
+        ));
+        let conn = Connection::open(&db_path).unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-association";
+        let mut state = TypingBurstState::default();
+        for (id, ts_ms, key_category) in [
+            ("event-char", 1_000, "char"),
+            ("event-enter", 1_100, "enter"),
+        ] {
+            let event = UiEventRecord {
+                id: id.to_string(),
+                ts_ms,
+                event_type: "key_down".to_string(),
+                app_bundle_id: Some("com.example.chat".to_string()),
+                app_name: Some("Chat".to_string()),
+                window_id: Some(42),
+                window_title: Some("Conversation".to_string()),
+                key_category: Some(key_category.to_string()),
+                ..UiEventRecord::default()
+            };
+            record_typing_event(&conn, session_id, &event, &mut state).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO capture_triggers (
+                id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                settle_delay_ms, dedupe_policy, status
+             ) VALUES ('trigger-typing', ?1, 1000, 'typing_pause', ?2, 850,
+                       'event_bucket', 'scheduled')",
+            params![
+                session_id,
+                serde_json::json!(["event-char", "event-enter"]).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+                id, session_id, captured_at, snapshot_path, app_name, window_name,
+                focused, capture_trigger, created_at, app_bundle_id, window_id,
+                privacy_status, capture_trigger_id
+             ) VALUES (7, ?1, 1800, 'fixture', 'Chat', 'Conversation', 1,
+                       'typing_pause', 1800, 'com.example.chat', 42, 'normal',
+                       'trigger-typing')",
+            params![session_id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            associate_committed_typing_bursts_for_trigger(&conn, "trigger-typing", "7").unwrap(),
+            1
+        );
+        let associated: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT post_frame_id, capture_trigger_id,
+                        post_frame_association_source,
+                        post_frame_association_confidence,
+                        post_frame_association_reasons_json
+                 FROM typing_bursts WHERE committed = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(associated.0.as_deref(), Some("7"));
+        assert_eq!(associated.1.as_deref(), Some("trigger-typing"));
+        assert_eq!(
+            associated.2.as_deref(),
+            Some("stored_capture_trigger_commit_event")
+        );
+        assert_eq!(
+            associated.3,
+            Some(AUTHORITATIVE_TYPING_ASSOCIATION_CONFIDENCE)
+        );
+        assert!(associated.4.contains("commit_event_in_capture_trigger"));
+        assert!(associated.4.contains("surface_window_id_match"));
+        assert_eq!(
+            associate_committed_typing_bursts_for_trigger(&conn, "trigger-typing", "7").unwrap(),
+            0,
+            "finalizing the same trigger twice must be idempotent"
+        );
+        drop(conn);
+
+        let read_only =
+            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let linked_count: i64 = read_only
+            .query_row(
+                "SELECT COUNT(*) FROM typing_bursts
+                 WHERE committed = 1 AND post_frame_id = '7'
+                   AND post_frame_association_source =
+                       'stored_capture_trigger_commit_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_count, 1);
+        drop(read_only);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+    }
+
+    #[test]
+    fn typing_post_frame_association_rejects_cross_window_and_uncommitted_bursts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-contained";
+        conn.execute(
+            "INSERT INTO typing_bursts (
+                id, session_id, started_at_ms, ended_at_ms, app_bundle_id,
+                app_name, window_id, window_title, char_count, committed,
+                raw_text_captured, commit_event_id
+             ) VALUES
+                ('cross-window', ?1, 1000, 1100, 'com.example.chat', 'Chat',
+                 1, 'First', 5, 1, 0, 'event-cross'),
+                ('uncommitted', ?1, 1000, 1100, 'com.example.chat', 'Chat',
+                 2, 'Second', 5, 0, 0, NULL)",
+            params![session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_triggers (
+                id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                settle_delay_ms, dedupe_policy, status
+             ) VALUES ('trigger-contained', ?1, 1000, 'typing_pause', ?2, 850,
+                       'event_bucket', 'scheduled')",
+            params![session_id, serde_json::json!(["event-cross"]).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+                id, session_id, captured_at, snapshot_path, app_name, window_name,
+                focused, capture_trigger, created_at, app_bundle_id, window_id,
+                privacy_status, capture_trigger_id
+             ) VALUES (8, ?1, 1800, 'fixture', 'Chat', 'Second', 1,
+                       'typing_pause', 1800, 'com.example.chat', 2, 'normal',
+                       'trigger-contained')",
+            params![session_id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            associate_committed_typing_bursts_for_trigger(&conn, "trigger-contained", "8").unwrap(),
+            0
+        );
+        let linked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM typing_bursts WHERE post_frame_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 0);
+    }
+
+    #[test]
+    fn typing_post_frame_association_preserves_stronger_existing_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "session-stronger";
+        conn.execute(
+            "INSERT INTO typing_bursts (
+                id, session_id, started_at_ms, ended_at_ms, app_bundle_id,
+                app_name, window_id, window_title, committed, raw_text_captured,
+                commit_event_id, post_frame_id, capture_trigger_id,
+                post_frame_association_source, post_frame_association_confidence,
+                post_frame_association_reasons_json
+             ) VALUES ('stronger', ?1, 1000, 1100, 'com.example.chat', 'Chat',
+                       2, 'Conversation', 1, 0, 'event-enter', '9',
+                       'trigger-stronger', 'explicit_manual_link', 0.99,
+                       '[\"explicit_manual_link\"]')",
+            params![session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_triggers (
+                id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                settle_delay_ms, dedupe_policy, status
+             ) VALUES ('trigger-new', ?1, 1000, 'typing_pause', ?2, 850,
+                       'event_bucket', 'scheduled')",
+            params![session_id, serde_json::json!(["event-enter"]).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+                id, session_id, captured_at, snapshot_path, app_name, window_name,
+                focused, capture_trigger, created_at, app_bundle_id, window_id,
+                privacy_status, capture_trigger_id
+             ) VALUES (9, ?1, 1800, 'fixture', 'Chat', 'Conversation', 1,
+                       'typing_pause', 1800, 'com.example.chat', 2, 'normal',
+                       'trigger-new')",
+            params![session_id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            associate_committed_typing_bursts_for_trigger(&conn, "trigger-new", "9").unwrap(),
+            0
+        );
+        let retained: (String, f64) = conn
+            .query_row(
+                "SELECT post_frame_association_source,
+                        post_frame_association_confidence
+                 FROM typing_bursts WHERE id = 'stronger'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained.0, "explicit_manual_link");
+        assert_eq!(retained.1, 0.99);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_typing_burst_association_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE typing_bursts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                pre_frame_id TEXT,
+                post_frame_id TEXT
+             );",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let columns = table_columns(&conn, "typing_bursts").unwrap();
+        for column in [
+            "start_event_id",
+            "last_event_id",
+            "commit_event_id",
+            "capture_trigger_id",
+            "post_frame_association_source",
+            "post_frame_association_confidence",
+            "post_frame_association_reasons_json",
+            "post_frame_associated_at_ms",
+        ] {
+            assert!(columns.contains(column), "missing typing_bursts.{column}");
+        }
     }
 
     #[test]
@@ -32697,6 +33868,139 @@ mod tests {
     }
 
     #[test]
+    fn p6_08_strict_open_cannot_revive_candidate_when_public_target_is_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/p6-08-public-null.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Candidate only",
+            "https://example.test/candidate-only",
+            "chat_conversation",
+            "Candidate remains internal evidence.",
+            "phash-p6-08-public-null",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-p6-08-candidate-only",
+            "chat_conversation",
+            Some("https://example.test/candidate-only"),
+            None,
+            Some(frame_id.to_string()),
+            "openable",
+            "Candidate only",
+            10,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "decision-p6-08-public-null",
+            "workstream-p6-08-public-null",
+            "candidate-p6-08-public-null",
+            "artifact-p6-08-candidate-only",
+            &frame_id.to_string(),
+            20,
+        );
+        conn.execute(
+            "UPDATE continue_decisions SET return_target_artifact_id = NULL
+             WHERE id = 'decision-p6-08-public-null'",
+            [],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "decision-p6-08-public-null",
+            None,
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("has no displayed target artifact")));
+    }
+
+    #[test]
+    fn task_truth_authoritative_null_target_cannot_revive_legacy_decision_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        crate::continuation::task_truth_v2::checkpoint::ensure_schema(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/tt2-authoritative-null.jpg",
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Legacy target",
+            "https://example.test/legacy-target",
+            "chat_conversation",
+            "Legacy decision still has an internal target.",
+            "phash-tt2-authoritative-null",
+            None,
+        );
+        insert_continue_open_artifact(
+            &conn,
+            "artifact-legacy-target",
+            "chat_conversation",
+            Some("https://example.test/legacy-target"),
+            None,
+            Some(frame_id.to_string()),
+            "openable",
+            "Legacy target",
+            10,
+        );
+        insert_continue_open_decision(
+            &conn,
+            "decision-tt2-authoritative-null",
+            "workstream-tt2-authoritative-null",
+            "candidate-tt2-authoritative-null",
+            "artifact-legacy-target",
+            &frame_id.to_string(),
+            20,
+        );
+        conn.execute(
+            "INSERT INTO task_truth_v2_decision_contracts (
+               decision_id, effective_state, release_gate_passed, snapshot_id,
+               snapshot_revision, return_target_artifact_id, created_at_ms
+             ) VALUES ('decision-tt2-authoritative-null','authoritative',1,
+                       'snapshot-current',3,NULL,20)",
+            [],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            "decision-tt2-authoritative-null",
+            None,
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:task_truth_public_target_null"
+        }));
+        assert!(warnings
+            .iter()
+            .all(|warning| !warning.contains("Opening strict Continue")));
+    }
+
+    #[test]
     fn open_resume_point_refuses_suppressed_stale_target() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -32780,10 +34084,9 @@ mod tests {
         .unwrap();
 
         assert!(resolved.is_none());
-        assert!(warnings.iter().any(|warning| {
-            warning.contains("Strict Continue target artifact-current-codex-thin")
-                && warning.contains("Staying in Smalltalk")
-        }));
+        assert!(warnings.iter().any(
+            |warning| warning == "blocked_by_continue_policy:decision_not_direct_open_eligible"
+        ));
         assert!(!warnings
             .iter()
             .any(|warning| warning.contains("suppressed-stale")));
@@ -32840,6 +34143,10 @@ mod tests {
                 feedback_kind: "rejected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -32911,6 +34218,10 @@ mod tests {
                 feedback_kind: "rejected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -33027,6 +34338,10 @@ mod tests {
                 feedback_kind: "corrected".to_string(),
                 note: None,
                 source: Some("test".to_string()),
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         )
         .unwrap();
@@ -34559,10 +35874,18 @@ mod tests {
         assert!(audit_dir.join("decision/p0_quality_signals.json").exists());
         assert!(audit_dir.join("decision/candidates.json").exists());
         assert!(audit_dir.join("decision/copy_gate.json").exists());
+        assert!(audit_dir.join("decision/task-turn-evidence.json").exists());
+        assert!(audit_dir.join("decision/current-task-turn.json").exists());
         assert!(audit_dir.join("cache/cache_decision.json").exists());
         assert!(audit_dir.join("model/model_skipped.json").exists());
         for file in [
             "inputs_summary.json",
+            "task_truth.json",
+            "semantic_sources.json",
+            "local_deterministic_recap.json",
+            "claim_to_evidence.json",
+            "identity_parity.json",
+            "quality_gate.json",
             "stitched_timeline.json",
             "work_labels.json",
             "detours.json",
@@ -34589,7 +35912,7 @@ mod tests {
         assert!(!activity_request.contains("sk-"));
         let activity_pack =
             fs::read_to_string(audit_dir.join("activity_recap/model_pack.json")).unwrap();
-        assert!(activity_pack.contains("smalltalk.activity_recap_model_pack.v1"));
+        assert!(activity_pack.contains("smalltalk.activity_recap_model_pack.v2"));
         assert!(!activity_pack.contains("/Users/"));
         assert!(!activity_pack.contains("file://"));
         assert!(!activity_pack.contains("candidate-"));
@@ -34830,7 +36153,7 @@ mod tests {
         let explain = fs::read_to_string(audit_dir.join("explain.md")).unwrap();
         assert!(explain.contains("## Cache Audit"));
         assert!(explain.contains("## Feedback Policy"));
-        assert!(explain.contains("Policy version: `feedback_obedience.v1`"));
+        assert!(explain.contains("Policy version: `feedback_scope_provenance_decay.v2`"));
         assert!(summary
             .folder_name
             .starts_with("session-001-session-test-1__continue-"));

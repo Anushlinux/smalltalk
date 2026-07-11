@@ -974,6 +974,7 @@ mod tests {
     fn empty_inputs() -> ActivityRecapInputs {
         ActivityRecapInputs {
             schema: "smalltalk.activity_recap_inputs.v1".to_string(),
+            current_task_turn: None,
             decision_context: ActivityRecapDecisionContext {
                 decision_id_seed: Some("decision-detour-test".to_string()),
                 mode: "normal".to_string(),
@@ -1044,6 +1045,10 @@ mod tests {
         BranchContextFact {
             branch_id: format!("branch-{id}"),
             branch_action_id: format!("branch-action-{id}"),
+            task_turn_id: None,
+            origin_task_turn_id: None,
+            promotion_task_turn_id: None,
+            promoted_at_ms: None,
             origin_artifact_id: origin_artifact_id.map(str::to_string),
             origin_workstream_id: origin_artifact_id.map(|_| "ws-primary".to_string()),
             branch_artifact_id: branch_artifact_id.to_string(),
@@ -1056,6 +1061,9 @@ mod tests {
             confidence: 0.9,
             reason_code: Some("branch:internal".to_string()),
             evidence_action_ids: vec![format!("promotion-action-{id}")],
+            promotion_evidence_action_ids: Vec::new(),
+            eligible_feedback_event_ids: Vec::new(),
+            feedback_rejection_reasons: Vec::new(),
             updated_at_ms: at_ms + 20,
         }
     }

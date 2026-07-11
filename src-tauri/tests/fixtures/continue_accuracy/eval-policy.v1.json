@@ -1,0 +1,46 @@
+{
+  "schema": "smalltalk.continue_accuracy_eval_policy.v1",
+  "policy_version": "p6.01-v1",
+  "semantic_slot_rubric": {
+    "latest_user_goal": "Exact task identity or a bounded semantic equivalent; stale support terms are incorrect.",
+    "current_agent_state": "Must preserve the active trace work and its one-shot versus continuous-capture question.",
+    "execution_state": "Exact active, completed, blocked, idle, or unclear label.",
+    "current_actor": "Exact user, assistant_or_agent, system_or_tool, or none label.",
+    "waiting_on": "Exact user, agent, external, none, or unclear label.",
+    "selected_workstream": "Must align with the latest task turn, not a stale feedback or open-loop contaminant.",
+    "public_target": "Null unless a direct validated locator exists; a frame preview is not a target."
+  },
+  "materially_wrong_slots": [
+    "latest_user_goal",
+    "current_agent_state",
+    "execution_state",
+    "current_actor",
+    "waiting_on",
+    "selected_workstream",
+    "return_target",
+    "resume_work_target"
+  ],
+  "confidence_boundaries": {
+    "none_max": 0.0,
+    "low_max": 0.44,
+    "medium_max": 0.74,
+    "high_min": 0.75
+  },
+  "wrong_confident_threshold": 0.65,
+  "minimum_samples": {
+    "calibration_predictions": 100,
+    "calibration_cases_per_bin": 5,
+    "worst_slice_cases": 5
+  },
+  "partitions": ["development", "validation", "locked_holdout"],
+  "aggregation_modes": ["case_macro", "surface_family_macro", "worst_slice"],
+  "calibration_ece_max": 0.1,
+  "baseline": {
+    "model_off_p95_ms": 163.24,
+    "sample_count": 7,
+    "warmup_count": 1,
+    "environment_label": "local macOS model off 2026-07-10"
+  },
+  "model_off_p95_regression_factor": 1.25,
+  "absolute_model_off_p95_budget_ms": null
+}

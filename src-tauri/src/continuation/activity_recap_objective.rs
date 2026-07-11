@@ -45,6 +45,8 @@ pub(crate) struct ActivityWorkLabelResult {
     pub where_label: Option<String>,
     pub object_label: Option<String>,
     pub objective_terms: Vec<String>,
+    pub selected_objective_source: Option<ObjectiveTermAudit>,
+    pub objective_candidate_audit: Vec<ObjectiveTermAudit>,
     pub rejected_terms: Vec<RejectedObjectiveTerm>,
     pub confidence: ActivityConfidence,
     pub evidence_spans: Vec<ActivityEvidenceSpan>,
@@ -60,6 +62,8 @@ impl Default for ActivityWorkLabelResult {
             where_label: None,
             object_label: None,
             objective_terms: Vec::new(),
+            selected_objective_source: None,
+            objective_candidate_audit: Vec::new(),
             rejected_terms: Vec::new(),
             confidence: ActivityConfidence::None,
             evidence_spans: Vec::new(),
@@ -70,6 +74,7 @@ impl Default for ActivityWorkLabelResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TermSource {
+    CurrentTaskGoal,
     OpenLoop,
     ActionSubject,
     Workstream,
@@ -80,6 +85,35 @@ enum TermSource {
     TargetTitle,
 }
 
+impl TermSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentTaskGoal => "current_task_goal",
+            Self::OpenLoop => "open_loop",
+            Self::ActionSubject => "current_task_action_subject",
+            Self::Workstream => "selected_workstream",
+            Self::Memory => "memory",
+            Self::SurfaceTask => "surface_task",
+            Self::RelativeFile => "relative_file",
+            Self::SurfaceTitle => "surface_title",
+            Self::TargetTitle => "target_title",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ObjectiveTermAudit {
+    pub term: String,
+    pub source_kind: String,
+    pub source_id: Option<String>,
+    pub task_turn_id: Option<String>,
+    pub workstream_id: Option<String>,
+    pub eligible: bool,
+    pub eligibility_reason_codes: Vec<String>,
+    pub attribution_confidence: ActivityEvidenceConfidence,
+    pub freshness: String,
+}
+
 #[derive(Debug, Clone)]
 struct TermCandidate {
     value: String,
@@ -88,6 +122,10 @@ struct TermCandidate {
     confidence: ActivityEvidenceConfidence,
     anchor_type: ActivityEvidenceAnchorType,
     anchor_ids: Vec<String>,
+    task_turn_id: Option<String>,
+    workstream_id: Option<String>,
+    eligibility_reason_codes: Vec<String>,
+    freshness: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -152,6 +190,12 @@ pub(crate) fn infer_activity_work_labels(
     dedupe_candidates(&mut candidates);
 
     let object_candidate = candidates.first().cloned();
+    result.objective_candidate_audit = candidates
+        .iter()
+        .take(MAX_OBJECTIVE_TERMS)
+        .map(objective_term_audit)
+        .collect();
+    result.selected_objective_source = object_candidate.as_ref().map(objective_term_audit);
     let object_label = object_candidate
         .as_ref()
         .and_then(|candidate| normalize_object_label(&candidate.value));
@@ -224,6 +268,20 @@ pub(crate) fn infer_activity_work_labels(
     result
 }
 
+fn objective_term_audit(candidate: &TermCandidate) -> ObjectiveTermAudit {
+    ObjectiveTermAudit {
+        term: candidate.value.clone(),
+        source_kind: candidate.source.as_str().to_string(),
+        source_id: candidate.anchor_ids.first().cloned(),
+        task_turn_id: candidate.task_turn_id.clone(),
+        workstream_id: candidate.workstream_id.clone(),
+        eligible: true,
+        eligibility_reason_codes: candidate.eligibility_reason_codes.clone(),
+        attribution_confidence: candidate.confidence,
+        freshness: candidate.freshness.clone(),
+    }
+}
+
 /// Applies only the P5-04 fields to the existing recap contract. Target
 /// confidence, open-loop state, detours, and target explanations belong to
 /// later recap stages and intentionally remain untouched.
@@ -274,8 +332,12 @@ fn matching_primary_actions<'a>(
         .recent_actions
         .iter()
         .filter(|action| {
+            let current_turn_match = inputs.current_task_turn.as_ref().is_none_or(|turn| {
+                action.task_turn_id.as_deref() == Some(turn.task_turn_id.as_str())
+            });
             (action.artifact_id.as_deref() == Some(artifact_id)
                 || action.secondary_artifact_id.as_deref() == Some(artifact_id))
+                && current_turn_match
                 && primary
                     .start_ms
                     .is_none_or(|start| action.created_at_ms >= start)
@@ -449,11 +511,48 @@ fn collect_term_candidates(
 ) -> Vec<TermCandidate> {
     let mut candidates = Vec::new();
 
-    for open_loop in inputs
-        .open_loops
-        .iter()
-        .filter(|open_loop| open_loop_matches_primary(open_loop, primary))
-    {
+    if let Some(turn) = inputs.current_task_turn.as_ref() {
+        if turn.goal_confidence >= 0.60 && turn.attribution_confidence >= 0.55 {
+            if let Some(raw) = turn
+                .latest_user_goal_summary
+                .as_deref()
+                .or(turn.task_object.as_deref())
+            {
+                match sanitize_objective_term(raw) {
+                    Ok(value) => candidates.push(TermCandidate {
+                        value,
+                        source: TermSource::CurrentTaskGoal,
+                        priority: 120,
+                        confidence: evidence_confidence(
+                            turn.goal_confidence.min(turn.attribution_confidence),
+                        ),
+                        anchor_type: ActivityEvidenceAnchorType::Action,
+                        anchor_ids: turn.evidence_ids.clone(),
+                        task_turn_id: Some(turn.task_turn_id.clone()),
+                        workstream_id: turn.workstream_id.clone(),
+                        eligibility_reason_codes: vec![
+                            "current_task_goal_high_attribution".to_string()
+                        ],
+                        freshness: "current_turn".to_string(),
+                    }),
+                    Err(reason) => audit_rejected(rejected, Some(raw), reason),
+                }
+            }
+        }
+    }
+
+    for open_loop in &inputs.open_loops {
+        if !open_loop.eligible_for_objective {
+            audit_rejected(
+                rejected,
+                open_loop.objective_hint.as_deref(),
+                "open_loop_ineligible_for_current_task",
+            );
+            continue;
+        }
+        if !open_loop_matches_primary(open_loop, primary) {
+            continue;
+        }
         if open_loop.confidence < 0.45 || open_loop.quality == "thin" {
             audit_rejected(
                 rejected,
@@ -472,6 +571,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::OpenLoop,
             vec![open_loop.open_loop_id.clone()],
             None,
+            open_loop.task_turn_id.as_deref(),
+            Some(&open_loop.workstream_id),
+            &open_loop.freshness,
         );
     }
 
@@ -482,7 +584,7 @@ fn collect_term_candidates(
             rejected,
             action.semantic_subject.as_deref(),
             TermSource::ActionSubject,
-            95,
+            110,
             evidence_confidence(
                 action
                     .attribution_confidence
@@ -492,6 +594,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::Action,
             vec![action.action_id.clone()],
             blocked_source_reason,
+            action.task_turn_id.as_deref(),
+            primary.workstream_id.as_deref(),
+            "current_turn",
         );
     }
 
@@ -509,6 +614,12 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::Workstream,
             vec![workstream.workstream_id.clone()],
             (workstream.confidence < 0.45).then_some("thin_workstream_title"),
+            inputs
+                .current_task_turn
+                .as_ref()
+                .map(|turn| turn.task_turn_id.as_str()),
+            Some(&workstream.workstream_id),
+            "current_turn",
         );
     }
 
@@ -533,6 +644,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::MemoryCell,
             vec![memory.memory_id.clone()],
             None,
+            None,
+            memory.workstream_id.as_deref(),
+            "historical",
         );
     }
 
@@ -548,6 +662,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::SurfaceSnapshot,
             vec![snapshot.snapshot_id.clone()],
             None,
+            None,
+            primary.workstream_id.as_deref(),
+            "current_turn",
         );
         add_candidate(
             &mut candidates,
@@ -559,6 +676,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::SurfaceSnapshot,
             vec![snapshot.snapshot_id.clone()],
             None,
+            None,
+            primary.workstream_id.as_deref(),
+            "current_turn",
         );
         add_candidate(
             &mut candidates,
@@ -570,6 +690,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::SurfaceSnapshot,
             vec![snapshot.snapshot_id.clone()],
             None,
+            None,
+            primary.workstream_id.as_deref(),
+            "current_turn",
         );
     }
 
@@ -591,6 +714,9 @@ fn collect_term_candidates(
             ActivityEvidenceAnchorType::Frame,
             target.evidence_frame_id.iter().cloned().collect(),
             None,
+            None,
+            primary.workstream_id.as_deref(),
+            "current_turn",
         );
     }
 
@@ -604,6 +730,9 @@ fn collect_term_candidates(
         ActivityEvidenceAnchorType::Episode,
         Vec::new(),
         None,
+        None,
+        primary.workstream_id.as_deref(),
+        "current_turn",
     );
     candidates
 }
@@ -619,6 +748,9 @@ fn add_candidate(
     anchor_type: ActivityEvidenceAnchorType,
     anchor_ids: Vec<String>,
     blocked_reason: Option<&str>,
+    task_turn_id: Option<&str>,
+    workstream_id: Option<&str>,
+    freshness: &str,
 ) {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -635,6 +767,10 @@ fn add_candidate(
             confidence,
             anchor_type,
             anchor_ids,
+            task_turn_id: task_turn_id.map(str::to_string),
+            workstream_id: workstream_id.map(str::to_string),
+            eligibility_reason_codes: vec!["eligible_after_task_relation_filter".to_string()],
+            freshness: freshness.to_string(),
         }),
         Err(reason) => audit_rejected(rejected, Some(raw), reason),
     }
@@ -806,7 +942,8 @@ fn label_confidence(
     let strong_object = object.is_some_and(|candidate| {
         matches!(
             candidate.source,
-            TermSource::OpenLoop
+            TermSource::CurrentTaskGoal
+                | TermSource::OpenLoop
                 | TermSource::ActionSubject
                 | TermSource::Workstream
                 | TermSource::RelativeFile
@@ -1173,14 +1310,15 @@ fn dedupe_strings(values: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::continuation::activity_recap_inputs::{
-        ActivityRecapDecisionContext, ExistingQualityFacts, MemoryFact, SurfaceSnapshotFact,
-        WorkstreamFact,
+        ActivityRecapDecisionContext, CurrentTaskTurnFact, ExistingQualityFacts, MemoryFact,
+        OpenLoopFact, SurfaceSnapshotFact, WorkstreamFact,
     };
     use crate::continuation::activity_recap_segments::ActivitySegmentPromotionState;
 
     fn empty_inputs() -> ActivityRecapInputs {
         ActivityRecapInputs {
             schema: "smalltalk.activity_recap_inputs.v1".to_string(),
+            current_task_turn: None,
             decision_context: ActivityRecapDecisionContext {
                 decision_id_seed: None,
                 mode: "normal".to_string(),
@@ -1262,6 +1400,7 @@ mod tests {
     ) -> TaskActionFact {
         TaskActionFact {
             action_id: id.to_string(),
+            task_turn_id: None,
             frame_id: "frame-safe".to_string(),
             artifact_id: Some(artifact_id.to_string()),
             secondary_artifact_id: None,
@@ -1310,6 +1449,134 @@ mod tests {
             evidence_sources: vec!["native_metadata".to_string()],
             observed_at_ms: 90,
         }
+    }
+
+    fn current_capture_task() -> CurrentTaskTurnFact {
+        CurrentTaskTurnFact {
+            task_turn_id: "task-capture".to_string(),
+            revision: 1,
+            workstream_id: Some("workstream-primary".to_string()),
+            parent_task_turn_id: None,
+            prior_task_turn_id: None,
+            supersedes_task_turn_id: None,
+            latest_user_goal_summary: Some(
+                "Understand what the island Capture button does".to_string(),
+            ),
+            task_object: Some("island_capture_button".to_string()),
+            task_kind: "investigation".to_string(),
+            execution_state: "active".to_string(),
+            current_actor: "assistant_or_agent".to_string(),
+            waiting_on: "agent".to_string(),
+            relation_to_prior: "new_task".to_string(),
+            started_at_ms: 100,
+            last_observed_at_ms: 200,
+            goal_confidence: 0.95,
+            task_object_confidence: 0.93,
+            actor_state_confidence: 0.92,
+            execution_state_confidence: 0.92,
+            waiting_on_confidence: 0.92,
+            relation_confidence: 0.90,
+            attribution_confidence: 0.94,
+            task_claim_confidence: 0.93,
+            state_claim_confidence: 0.92,
+            missing_evidence: Vec::new(),
+            evidence_ids: vec!["span-capture".to_string()],
+            reason_codes: vec!["explicit_user_goal".to_string()],
+        }
+    }
+
+    fn historical_open_loop(eligible_for_objective: bool) -> OpenLoopFact {
+        OpenLoopFact {
+            open_loop_id: "loop-stremio".to_string(),
+            workstream_id: "workstream-primary".to_string(),
+            task_turn_id: Some("task-prior".to_string()),
+            parent_task_turn_id: None,
+            origin_task_turn_id: Some("task-prior".to_string()),
+            state: "open".to_string(),
+            boundary_kind: "unfinished_edit".to_string(),
+            quality: "strong".to_string(),
+            confidence: 0.99,
+            origin_artifact_id: Some("artifact-primary".to_string()),
+            current_focus_artifact_id: Some("artifact-primary".to_string()),
+            primary_return_artifact_id: Some("artifact-primary".to_string()),
+            resume_work_artifact_id: Some("artifact-primary".to_string()),
+            blocker_artifact_id: None,
+            verification_artifact_id: None,
+            objective_hint: Some("Continue Stremio".to_string()),
+            last_concrete_progress: None,
+            unfinished_state: Some("editing".to_string()),
+            next_evidence_backed_action: None,
+            current_focus_relation: None,
+            relation_to_current_task: "unrelated".to_string(),
+            freshness: "stale".to_string(),
+            eligible_for_primary: false,
+            eligible_for_objective,
+            eligible_for_last_state: false,
+            eligibility_reason_codes: vec!["different_task_turn".to_string()],
+            missing_evidence: Vec::new(),
+            evidence_spans: Vec::new(),
+            last_updated_at_ms: 90,
+        }
+    }
+
+    #[test]
+    fn current_task_goal_outranks_generic_artifact_open_loop() {
+        let mut inputs = empty_inputs();
+        inputs.current_task_turn = Some(current_capture_task());
+        inputs.open_loops = vec![historical_open_loop(true)];
+        let primary = segment(
+            "segment-primary",
+            "artifact-primary",
+            "AgentChat",
+            "Smalltalk task",
+            "agent_chat",
+            ActivitySegmentRole::Primary,
+            &["planning"],
+        );
+
+        let result = infer_activity_work_labels(&inputs, &timeline(primary));
+
+        assert_eq!(
+            result
+                .selected_objective_source
+                .as_ref()
+                .map(|audit| audit.source_kind.as_str()),
+            Some("current_task_goal")
+        );
+        assert_eq!(
+            result
+                .selected_objective_source
+                .as_ref()
+                .and_then(|audit| audit.task_turn_id.as_deref()),
+            Some("task-capture")
+        );
+    }
+
+    #[test]
+    fn ineligible_open_loop_receives_no_objective_score() {
+        let mut inputs = empty_inputs();
+        inputs.current_task_turn = Some(current_capture_task());
+        inputs.open_loops = vec![historical_open_loop(false)];
+        let primary = segment(
+            "segment-primary",
+            "artifact-primary",
+            "AgentChat",
+            "Smalltalk task",
+            "agent_chat",
+            ActivitySegmentRole::Primary,
+            &["planning"],
+        );
+
+        let result = infer_activity_work_labels(&inputs, &timeline(primary));
+
+        assert!(result
+            .objective_candidate_audit
+            .iter()
+            .all(|candidate| candidate.source_id.as_deref() != Some("loop-stremio")));
+        assert!(result.rejected_terms.iter().any(|term| {
+            term.term == "Continue Stremio"
+                && term.reason == "open_loop_ineligible_for_current_task"
+        }));
     }
 
     #[test]
@@ -1627,6 +1894,7 @@ mod tests {
             memory_type: "correction".to_string(),
             relation: "contradicts_objective".to_string(),
             summary: None,
+            source_anchor: serde_json::Value::Null,
             last_seen_at_ms: 100,
             confidence: 0.9,
             importance: 0.9,
@@ -1668,6 +1936,7 @@ mod tests {
             memory_type: "origin_intent".to_string(),
             relation: "support".to_string(),
             summary: Some("Origin work target was Smalltalk activity recap.".to_string()),
+            source_anchor: serde_json::Value::Null,
             last_seen_at_ms: 100,
             confidence: 0.8,
             importance: 0.8,

@@ -4,6 +4,8 @@ Last updated: 2026-07-07
 
 This document describes the current native Smalltalk engine as implemented in this working tree. It is meant for debugging bad `Continue` output, not for marketing the product. It names what the system actually does, where data is processed, where it can become vague or wrong, and which artifacts to inspect when the UI points at the wrong thing.
 
+Task Truth v2.03 also runs a shadow-only semantic path before workstream and target selection. The second-layer rebuild constructs a bounded `smalltalk.observation_packet.v2` from existing frames, content units, OCR, events, triggers, transitions, typing bursts, and diffs. It projects the selected P6 `CurrentTaskTurn` into `smalltalk.task_snapshot.v2`, or persists an unresolved snapshot when current task evidence is insufficient. Semantic checkpoints are deduplicated and retained locally. Manual Continue writes a bounded comparison audit. This path does not replace the visible Continue answer, and target openability is excluded from snapshot selection.
+
 Primary source files:
 
 - `src/App.tsx`
@@ -222,6 +224,10 @@ Important heavy-frame triggers include `manual`, `session_start`, `app_switch`, 
 Low-value triggers include `typing_pause`, `scroll_stop`, `click`, `accessibility_change`, `event_burst`, and `idle`.
 
 This means the freshest evidence may be an event or typing burst rather than a screenshot. That is a central cause of screenshot/output mismatch: the engine may know the current surface changed from events, while the newest available frame image still belongs to an older surface.
+
+Committed typing bursts now retain privacy-safe event, app/window, trigger, and pre/post-frame provenance. Capture associates a committed burst with the authoritative post frame when the same session and surface caused that frame; older null-post rows may be recovered only by a bounded, unique same-surface predecessor rule. Task-turn extraction consumes a structured causal-attribution object rather than a boolean typing hint, and never stores raw typed characters. Missing or conflicting attribution remains explicit ambiguity.
+
+Current user-goal eligibility is shared across task-turn selection: controls, navigation, model pickers, approval chips, browser chrome, status labels, and other actionable UI affordances are history/context rather than user-authored goals. `prior_boundary_sample` is history-only and cannot seed a new current goal. If no eligible current goal survives, the backend emits `no_clear_current_task`; React and the native island suppress task, state, alternative, and direct-target claims while retaining only supported surface context and inspect-first guidance.
 
 ## Native Events And Trigger Coalescing
 
@@ -1153,6 +1159,17 @@ These are current risks, not future promises.
 - If evidence is thin, say it is thin.
 
 ## Quick Verification Commands
+
+P6 release evaluation is deliberately stricter than the per-phase milestone manifest. Generate the privacy-safe machine report with:
+
+```bash
+cd src-tauri
+cargo run --bin continue_accuracy_eval -- \
+  --output tests/fixtures/continue_accuracy/release-report.json \
+  --repeat 3
+```
+
+Read `release_gate.passed`, not only `milestone_contract_passed`. Missing labeled denominators, human adjudication, locked-holdout evidence, calibration samples, performance budget, or manual macOS QA keep the release gate closed.
 
 For docs-only changes:
 
