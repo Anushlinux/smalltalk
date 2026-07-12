@@ -4,6 +4,7 @@ mod capture;
 mod capture_core;
 mod continuation;
 mod session_island;
+mod workload;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -16,6 +17,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             capture::start_capture,
+            capture::get_screen_capture_permission_status,
+            capture::request_screen_capture_permission,
             capture::stop_capture,
             capture::capture_once,
             capture::capture_status,

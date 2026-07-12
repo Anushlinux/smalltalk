@@ -16,6 +16,7 @@ import {
   getContinuePresentationActionState,
   inspectTargetCopy,
   isDirectPresentationTargetOpenable,
+  taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   normalizeTaskResolutionStatus,
@@ -27,6 +28,7 @@ import {
   type ContinueEvidenceFreshnessSummary,
   type ContinuePresentationActionState,
   type ContinueTaskResolutionStatus,
+  type ContinueTaskTruthAnswer,
 } from "./continuePresentation";
 import "./App.css";
 
@@ -48,6 +50,7 @@ type CaptureFrame = {
   content_hash?: string | null;
   image_hash?: string | null;
   capture_provider?: string | null;
+  active_window_capture_provider?: string | null;
   scope?: string | null;
   display_id?: string | null;
   window_id?: number | null;
@@ -122,6 +125,14 @@ type StopCaptureOutput = {
 };
 
 type RuntimeDiagnostics = {
+  workload: {
+    active_operations: string[];
+    queued_operation_count: number;
+    coalesced_requests: number;
+    cancelled_or_superseded_requests: number;
+    background_decisions_avoided: number;
+    duration_percentiles_ms: Record<string, { p50: number; p95: number }>;
+  };
   heavy_captures_stored: number;
   heavy_captures_skipped: number;
   heavy_captures_skipped_budget: number;
@@ -145,6 +156,18 @@ type RuntimeDiagnostics = {
   weak_surface_enrichment_failed: number;
   latest_weak_surface_attempt?: string | null;
   latest_weak_surface_snapshot_id?: string | null;
+  sck_display_successes: number;
+  sck_active_window_successes: number;
+  sck_active_window_abnormal_exits: number;
+  sck_timeouts: number;
+  sck_circuit_breaker_opens: number;
+  screencapture_fallbacks: number;
+  latest_sck_capture_mode?: string | null;
+  latest_sck_provider?: string | null;
+  latest_sck_duration_ms?: number | null;
+  latest_sck_exit_category?: string | null;
+  latest_sck_fallback_used?: boolean | null;
+  sck_active_window_circuit_breaker_state: string;
 };
 
 type CaptureStatus = {
@@ -170,6 +193,28 @@ type CaptureStatus = {
   accessibility_tool: boolean;
   ocr_tool: boolean;
   runtime_diagnostics: RuntimeDiagnostics;
+};
+
+type ScreenCapturePermissionStatus = {
+  state: "granted" | "request_required" | "restart_required" | "unsupported";
+  granted: boolean;
+  can_request: boolean;
+  request_attempted: boolean;
+  restart_required: boolean;
+  message: string;
+  settings_hint?: string | null;
+  identity: {
+    executable_path: string;
+    executable_name?: string | null;
+    bundle_identifier?: string | null;
+    bundle_path?: string | null;
+    signing_identifier?: string | null;
+    team_identifier?: string | null;
+    designated_requirement?: string | null;
+    cdhash?: string | null;
+    signature_kind: string;
+    request_scope_key: string;
+  };
 };
 
 type LocalMemoryDiagnostics = {
@@ -852,37 +897,28 @@ type ContinueDecisionResult = {
   activity_recap_watermark_hash?: string;
 };
 
-type TaskTruthAlternative = {
-  hypothesis_id: string;
-  task_summary: string;
-  relation: string;
-  confidence: number;
-  evidence_refs: string[];
-};
+type TaskTruthPublicAnswer = ContinueTaskTruthAnswer;
 
-type TaskTruthPublicAnswer = {
+type TaskTruthInferenceDiagnostic = {
   schema: string;
-  task_resolution_status: "resolved" | "ambiguous" | "unresolved" | string;
-  task_summary?: string | null;
-  task_object?: string | null;
-  last_meaningful_progress?: string | null;
-  unfinished_state?: string | null;
-  next_action?: string | null;
-  where_summary?: string | null;
-  alternative_hypotheses: TaskTruthAlternative[];
-  direct_return_target?: ContinueReturnTarget | null;
-  evidence_preview?: ContinueEvidencePreview | null;
-  field_support?: Record<string, {
-    confidence?: number | null;
-    support_status?: string | null;
-    evidence_refs?: string[];
-  }> | null;
-  task_understanding_source: string;
-  wording_source: string;
-  target_selection_source: string;
-  snapshot_id: string;
-  snapshot_revision: number;
-  evidence_watermark: string;
+  status: string;
+  origin: "live_cloud" | "cache" | "fixture" | "none" | string;
+  provider: string;
+  model: string;
+  request_id?: string | null;
+  provider_request_id?: string | null;
+  response_id?: string | null;
+  provider_attempt_count: number;
+  latency_ms: number;
+  image_count: number;
+  image_bytes: number;
+  estimated_tokens: number;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  estimated_cost_usd?: number | null;
+  verification_status: string;
+  selected_hypothesis_id?: string | null;
 };
 
 type TaskTruthProductionDecision = {
@@ -892,6 +928,7 @@ type TaskTruthProductionDecision = {
   reason_codes: string[];
   cache_fingerprint: string;
   answer?: TaskTruthPublicAnswer | null;
+  inference_diagnostic?: TaskTruthInferenceDiagnostic | null;
 };
 
 type ContinueSupportEvidenceItem = {
@@ -1227,6 +1264,14 @@ const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: st
 };
 
 const emptyRuntimeDiagnostics: RuntimeDiagnostics = {
+  workload: {
+    active_operations: [],
+    queued_operation_count: 0,
+    coalesced_requests: 0,
+    cancelled_or_superseded_requests: 0,
+    background_decisions_avoided: 0,
+    duration_percentiles_ms: {},
+  },
   heavy_captures_stored: 0,
   heavy_captures_skipped: 0,
   heavy_captures_skipped_budget: 0,
@@ -1250,6 +1295,18 @@ const emptyRuntimeDiagnostics: RuntimeDiagnostics = {
   weak_surface_enrichment_failed: 0,
   latest_weak_surface_attempt: null,
   latest_weak_surface_snapshot_id: null,
+  sck_display_successes: 0,
+  sck_active_window_successes: 0,
+  sck_active_window_abnormal_exits: 0,
+  sck_timeouts: 0,
+  sck_circuit_breaker_opens: 0,
+  screencapture_fallbacks: 0,
+  latest_sck_capture_mode: null,
+  latest_sck_provider: null,
+  latest_sck_duration_ms: null,
+  latest_sck_exit_category: null,
+  latest_sck_fallback_used: null,
+  sck_active_window_circuit_breaker_state: "closed",
 };
 
 const initialStatus: CaptureStatus = {
@@ -1282,6 +1339,8 @@ const emptyTimeline: Timeline = {
 
 function App() {
   const [status, setStatus] = useState<CaptureStatus>(initialStatus);
+  const [screenCapturePermission, setScreenCapturePermission] =
+    useState<ScreenCapturePermissionStatus | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [selectedFrame, setSelectedFrame] = useState<CaptureFrame | null>(null);
@@ -1327,7 +1386,7 @@ function App() {
   const [appVisible, setAppVisible] = useState(() => document.visibilityState === "visible");
   const storeGenerationRef = useRef(0);
   const autoContinueRef = useRef(false);
-  const continueRequestInFlightRef = useRef(false);
+  const continueRequestInFlightRef = useRef<ContinueRequestTrigger | null>(null);
   const continueDecisionRef = useRef<ContinueDecisionResult | null>(null);
   const continueDecisionTriggerRef = useRef<ContinueRequestTrigger | null>(null);
   const lastBackgroundContinueAttemptRef = useRef(0);
@@ -1354,6 +1413,19 @@ function App() {
       return null;
     }
   }, [selectedFrame]);
+
+  const refreshScreenCapturePermission = useCallback(async () => {
+    try {
+      const permission = await invoke<ScreenCapturePermissionStatus>(
+        "get_screen_capture_permission_status",
+      );
+      setScreenCapturePermission(permission);
+      return permission;
+    } catch (err) {
+      setError(`Screen access status failed: ${String(err)}`);
+      return null;
+    }
+  }, []);
 
   const refreshContinueMemory = useCallback(async (): Promise<ContinueMemoryStatus | null> => {
     try {
@@ -1567,12 +1639,15 @@ function App() {
   const runContinueDecision = useCallback(async (options: {
     forceRebuild?: boolean;
     writeAudit?: boolean;
+    auditMode?: "none" | "mfti_review" | "full";
     trigger?: ContinueRequestTrigger;
   } = {}) => {
-    if (continueRequestInFlightRef.current) return;
     const trigger = options.trigger || (options.writeAudit === true ? "manual" : "startup");
+    const auditMode = options.auditMode || (trigger === "manual" ? "mfti_review" : "none");
     const background = trigger === "background";
-    continueRequestInFlightRef.current = true;
+    const activeTrigger = continueRequestInFlightRef.current;
+    if (activeTrigger && !(trigger === "manual" && activeTrigger === "background")) return;
+    continueRequestInFlightRef.current = trigger;
     if (background) {
       setQuietContinueRefreshing(true);
       setBackgroundContinueError(null);
@@ -1587,11 +1662,13 @@ function App() {
       const decision = await invoke<ContinueDecisionResult>("get_continue_decision", {
         input: {
           mode: options.forceRebuild === true ? "rebuild" : "normal",
+          session_id: status.active_session?.id || status.latest_session?.id || null,
           rebuild_layers: options.forceRebuild === true,
           micro_inference_enabled: true,
           activity_recap_model_enabled: trigger === "manual",
           max_candidates_for_model: 5,
-          audit_output_enabled: options.writeAudit === true,
+          audit_output_enabled: auditMode === "full",
+          audit_mode: auditMode,
           request_trigger: trigger,
         },
       });
@@ -1624,7 +1701,9 @@ function App() {
         setContinueError(`Continue failed: ${String(err)}`);
       }
     } finally {
-      continueRequestInFlightRef.current = false;
+      if (continueRequestInFlightRef.current === trigger) {
+        continueRequestInFlightRef.current = null;
+      }
       if (background) {
         setQuietContinueRefreshing(false);
       } else {
@@ -1779,6 +1858,10 @@ function App() {
           feedbackKind === "rejected" ||
           feedbackKind === "ignored" ||
           feedbackKind === "corrected" ||
+          feedbackKind === "supporting_work" ||
+          feedbackKind === "unrelated_activity" ||
+          feedbackKind === "completed" ||
+          feedbackKind === "reactivated" ||
           feedbackKind === "artifact_only_evidence" ||
           feedbackKind === "ignored_workstream"
         ) {
@@ -1950,6 +2033,22 @@ function App() {
       setBusyAction(action);
       setError(null);
       try {
+        if (action === "start_capture") {
+          let permission = await refreshScreenCapturePermission();
+          if (!permission) {
+            return;
+          }
+          if (!permission.granted && permission.can_request) {
+            permission = await invoke<ScreenCapturePermissionStatus>(
+              "request_screen_capture_permission",
+            );
+            setScreenCapturePermission(permission);
+          }
+          if (!permission.granted) {
+            setError(permission.message);
+            return;
+          }
+        }
         if (action === "stop_capture") {
           const response = await invoke<StopCaptureOutput>(action);
           const stoppedSessionId =
@@ -1993,12 +2092,41 @@ function App() {
         }
       } catch (err) {
         setError(String(err));
+        if (action === "start_capture") {
+          await refreshScreenCapturePermission();
+        }
       } finally {
         setBusyAction(null);
       }
     },
-    [currentSessionId, diagnosticsOpen, query, refreshStatus, refreshTimeline, runSearch, selectFrame],
+    [
+      currentSessionId,
+      diagnosticsOpen,
+      query,
+      refreshScreenCapturePermission,
+      refreshStatus,
+      refreshTimeline,
+      runSearch,
+      selectFrame,
+    ],
   );
+
+  const requestScreenCapturePermission = useCallback(async () => {
+    setBusyAction("request_screen_capture_permission");
+    setError(null);
+    try {
+      const permission = await invoke<ScreenCapturePermissionStatus>(
+        "request_screen_capture_permission",
+      );
+      setScreenCapturePermission(permission);
+      setPrivacyActionStatus(permission.message);
+    } catch (err) {
+      setError(`Screen access request failed: ${String(err)}`);
+      await refreshScreenCapturePermission();
+    } finally {
+      setBusyAction(null);
+    }
+  }, [refreshScreenCapturePermission]);
 
   const performDeleteAllMemory = useCallback(async () => {
     setBusyAction("delete_all_frames");
@@ -2121,9 +2249,15 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void refreshScreenCapturePermission();
     void refreshContinueMemory();
     void refreshExclusionRules();
-  }, [refreshContinueMemory, refreshExclusionRules, refreshStatus]);
+  }, [
+    refreshContinueMemory,
+    refreshExclusionRules,
+    refreshScreenCapturePermission,
+    refreshStatus,
+  ]);
 
   useEffect(() => {
     if (privacyPanelOpen) {
@@ -2625,7 +2759,7 @@ function App() {
                 aria-busy={continueRefreshBusy}
                 onClick={() => void runContinueDecision({ writeAudit: true })}
               >
-                {continueRefreshBusy ? "Finding" : "Continue"}
+                {continueRefreshBusy ? "Understanding your recent work…" : "Continue"}
               </button>
               <details
                 className="capture-menu topbar-memory-menu"
@@ -2692,7 +2826,7 @@ function App() {
                     }}
                     type="button"
 	                  >
-	                    {continueRefreshBusy ? "Refreshing" : "Refresh Continue"}
+	                    {continueRefreshBusy ? "Understanding your recent work…" : "Refresh Continue"}
 	                  </button>
 	                  <button
 	                    className="danger-button"
@@ -2801,11 +2935,19 @@ function App() {
 	        />
 	      ) : null}
 
-	      {continueError ? (
-	        <MemoryErrorBox message={continueError} />
-	      ) : null}
+		      {continueError ? (
+		        <MemoryErrorBox message={continueError} />
+		      ) : null}
 
-	      {error || status.last_error ? (
+              {screenCapturePermission && !screenCapturePermission.granted ? (
+                <ScreenCapturePermissionBox
+                  permission={screenCapturePermission}
+                  busy={busyAction !== null}
+                  onRequest={() => void requestScreenCapturePermission()}
+                />
+              ) : null}
+
+		      {error || status.last_error ? (
 	        <MemoryErrorBox message={error || status.last_error || ""} />
 	      ) : null}
 
@@ -2832,7 +2974,7 @@ function App() {
               aria-busy={continueRefreshBusy}
               onClick={() => void runContinueDecision({ writeAudit: true })}
             >
-              {continueRefreshBusy ? "Finding" : "Continue"}
+              {continueRefreshBusy ? "Understanding your recent work…" : "Continue"}
             </button>
             <details
               className="capture-menu"
@@ -2965,7 +3107,11 @@ function App() {
                 type="button"
                 disabled={busyAction !== null}
                 aria-busy={busyAction === "get_continue_decision"}
-                onClick={() => void runContinueDecision({ forceRebuild: true, writeAudit: true })}
+                onClick={() => void runContinueDecision({
+                  forceRebuild: true,
+                  writeAudit: true,
+                  auditMode: "full",
+                })}
               >
                 {busyAction === "get_continue_decision" ? "Rebuilding" : "Rebuild Continue"}
               </button>
@@ -3022,6 +3168,12 @@ function App() {
                 <MetricBlock label="Heavy skipped" value={String(memoryDiagnostics.runtime_diagnostics.heavy_captures_skipped)} />
                 <MetricBlock label="Event signals" value={String(memoryDiagnostics.runtime_diagnostics.events_aggregated)} />
                 <MetricBlock label="Cache hits" value={String(memoryDiagnostics.runtime_diagnostics.decision_cache_hits)} />
+                <MetricBlock label="Work queued" value={String(memoryDiagnostics.runtime_diagnostics.workload.queued_operation_count)} />
+                <MetricBlock label="Work coalesced" value={String(memoryDiagnostics.runtime_diagnostics.workload.coalesced_requests)} />
+                <MetricBlock label="Background avoided" value={String(memoryDiagnostics.runtime_diagnostics.workload.background_decisions_avoided)} />
+                <MetricBlock label="SCK display" value={String(memoryDiagnostics.runtime_diagnostics.sck_display_successes)} />
+                <MetricBlock label="SCK active window" value={String(memoryDiagnostics.runtime_diagnostics.sck_active_window_successes)} />
+                <MetricBlock label="Capture fallbacks" value={String(memoryDiagnostics.runtime_diagnostics.screencapture_fallbacks)} />
                 <MetricBlock label="Oldest frame" value={memoryDiagnostics.oldest_retained_frame_ms ? formatTime(memoryDiagnostics.oldest_retained_frame_ms) : "None"} />
                 <MetricBlock label="Last cleanup" value={memoryDiagnostics.cleanup_last_run_ms ? formatTime(memoryDiagnostics.cleanup_last_run_ms) : "Never"} />
               </div>
@@ -3062,6 +3214,18 @@ function App() {
                   <dt>Event pressure</dt>
                   <dd>
                     {memoryDiagnostics.event_count} stored events; {memoryDiagnostics.excess_low_value_events} excess scroll/AX rows; {memoryDiagnostics.self_capture_events} Smalltalk self rows
+                  </dd>
+                </div>
+                <div>
+                  <dt>Screen capture providers</dt>
+                  <dd>
+                    {memoryDiagnostics.runtime_diagnostics.sck_active_window_abnormal_exits} abnormal active-window exits; {memoryDiagnostics.runtime_diagnostics.sck_timeouts} timeouts; {memoryDiagnostics.runtime_diagnostics.sck_circuit_breaker_opens} breaker opens; breaker {memoryDiagnostics.runtime_diagnostics.sck_active_window_circuit_breaker_state}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Latest screen capture operation</dt>
+                  <dd>
+                    {memoryDiagnostics.runtime_diagnostics.latest_sck_capture_mode || "none"} via {memoryDiagnostics.runtime_diagnostics.latest_sck_provider || "none"}; {memoryDiagnostics.runtime_diagnostics.latest_sck_exit_category || "no result"}; {memoryDiagnostics.runtime_diagnostics.latest_sck_duration_ms ?? 0}ms; fallback {memoryDiagnostics.runtime_diagnostics.latest_sck_fallback_used ? "used" : "not used"}
                   </dd>
                 </div>
                 <div>
@@ -3497,7 +3661,7 @@ function ContinueCompanionPanel({
             aria-busy={continueRefreshBusy}
             onClick={onRefreshContinue}
           >
-            {continueRefreshBusy ? "Refreshing" : "Refresh Continue"}
+            {continueRefreshBusy ? "Understanding your recent work…" : "Refresh Continue"}
           </button>
           <button
             className="secondary-button"
@@ -3737,6 +3901,45 @@ function MemoryErrorBox({ message }: { message: string }) {
           <span>{message}</span>
         </details>
       ) : null}
+    </div>
+  );
+}
+
+function ScreenCapturePermissionBox({
+  permission,
+  busy,
+  onRequest,
+}: {
+  permission: ScreenCapturePermissionStatus;
+  busy: boolean;
+  onRequest: () => void;
+}) {
+  return (
+    <div className="error-box" role="status">
+      <strong>{permission.message}</strong>
+      {permission.can_request ? (
+        <button
+          className="primary-button"
+          type="button"
+          disabled={busy}
+          aria-busy={busy}
+          onClick={onRequest}
+        >
+          {busy ? "Waiting for macOS" : "Allow screen access"}
+        </button>
+      ) : null}
+      <details>
+        <summary>Running app identity</summary>
+        <span>
+          {permission.identity.bundle_identifier || "No macOS bundle identifier"}
+          {" · "}
+          {permission.identity.executable_path}
+          {" · "}
+          {permission.identity.team_identifier
+            ? `Team ${permission.identity.team_identifier}`
+            : permission.identity.signature_kind}
+        </span>
+      </details>
     </div>
   );
 }
@@ -3995,16 +4198,31 @@ function ContinuationAnswer({
   ) => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
-  const taskTruthAnswer = decision?.task_truth_v2?.effective_state === "authoritative"
-    && decision.task_truth_v2.release_gate_passed
-    ? decision.task_truth_v2.answer || null
+  const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
+  const taskTruthDiagnostic = decision?.task_truth_v2?.inference_diagnostic || null;
+  const rawUnresolvedTaskTruthAnswer =
+    decision?.task_truth_v2?.answer?.task_resolution_status === "unresolved"
+      ? decision.task_truth_v2.answer
+      : null;
+  const cardTaskTruthAnswer = taskTruthAnswer || rawUnresolvedTaskTruthAnswer;
+  const taskInferenceFailureStatus = normalizeToken(taskTruthDiagnostic?.status) === "success"
+    ? cardTaskTruthAnswer?.inference_status
+    : taskTruthDiagnostic?.status || cardTaskTruthAnswer?.inference_status;
+  const taskInferenceFailure = cardTaskTruthAnswer?.task_resolution_status === "unresolved"
+    ? taskInferenceFailurePresentation(
+        taskInferenceFailureStatus,
+        taskTruthDiagnostic?.verification_status,
+        taskTruthDiagnostic?.origin,
+        taskTruthDiagnostic?.image_count,
+        taskTruthDiagnostic?.provider_attempt_count,
+      )
     : null;
-  const resumeTarget = taskTruthAnswer
-    ? taskTruthAnswer.direct_return_target || null
+  const resumeTarget = cardTaskTruthAnswer
+    ? cardTaskTruthAnswer.direct_return_target || null
     : decision?.resume_work_target || decision?.return_target || null;
   const actionState = decision ? getContinueCardActionState(decision) : null;
-  const noClearCurrentTask = taskTruthAnswer
-    ? taskTruthAnswer.task_resolution_status === "unresolved"
+  const noClearCurrentTask = cardTaskTruthAnswer
+    ? cardTaskTruthAnswer.task_resolution_status === "unresolved"
     : Boolean(
         decision
         && getContinueTaskResolutionStatus(decision) === "no_clear_current_task"
@@ -4013,43 +4231,56 @@ function ContinuationAnswer({
   const canOpenResumeTarget = actionState?.kind === "openable_return_target";
   const isThinCurrentWork = actionState?.kind === "thin_current_work";
   const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
-  const lowConfidence = taskTruthAnswer
+  const lowConfidence = cardTaskTruthAnswer
     ? noClearCurrentTask
     : decision ? decision.confidence < 0.55 || noClearCurrentTask : false;
   const handoff = decision?.handoff || null;
-  const activityRecap = noClearCurrentTask || taskTruthAnswer
+  const activityRecap = noClearCurrentTask || cardTaskTruthAnswer
     ? null
     : usableActivityRecap(decision?.activity_recap);
   const presentation = decision ? presentContinueDecision(decision) : null;
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [alternativesOpen, setAlternativesOpen] = useState(false);
-  const alternatives = noClearCurrentTask || taskTruthAnswer
+  const alternatives = noClearCurrentTask || cardTaskTruthAnswer
     ? []
     : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
-  const productState = decision && actionState && presentation
-    ? taskTruthAnswer
-      ? buildTaskTruthProductStateCopy(taskTruthAnswer, actionState)
-      : buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
-    : null;
+  const taskTruthAlternatives = cardTaskTruthAnswer?.alternative_hypotheses || [];
+  const taskTruthActionState = actionState || {
+    kind: "no_clear_continuation",
+    label: "Inspect evidence",
+  } satisfies ContinueCardActionState;
+  const productState = decision && cardTaskTruthAnswer
+    ? buildTaskTruthProductStateCopy(
+        cardTaskTruthAnswer as TaskTruthPublicAnswer,
+        taskTruthActionState,
+        taskTruthDiagnostic,
+      )
+    : decision && actionState && presentation
+      ? buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
+      : null;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
-  const workstreamLine = productState?.headline || safeProductLine(
+  const workstreamLine = productState?.headline || taskInferenceFailure?.headline || safeProductLine(
     handoff?.headline || presentation?.workstreamTitle || primaryMessage,
     "Recent work",
   );
   const targetLine = productState?.targetLine || safeProductLine(rawTargetLine, "No stable place to continue yet.");
   const targetLooksInternal = isInternalFacingText(targetLine);
   const targetMeta = productState?.targetMeta || presentation?.targetMeta || humanTargetMeta(resumeTarget);
-  const lastStateLine = productState?.lastStateLine || "No last meaningful state is clear yet.";
+  const lastStateLine = cardTaskTruthAnswer
+    ? productState?.lastStateLine || taskInferenceFailure?.detail || ""
+    : productState?.lastStateLine
+      || taskInferenceFailure?.detail
+      || "No last meaningful state is clear yet.";
   const nextActionLine = productState?.nextActionLine || "";
-  const currentFocusLine = taskTruthAnswer ? "" : safeProductLine(
-    productState?.currentFocusLine || stripCurrentFocusPrefix(
+  const currentFocusLine = safeProductLine(
+    productState?.currentFocusLine || (cardTaskTruthAnswer ? "" : stripCurrentFocusPrefix(
       safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
-    ) || humanFocusLabel(decision?.current_focus),
+    ) || humanFocusLabel(decision?.current_focus)),
     "",
   );
-  const activityWhereLine = taskTruthAnswer
-    ? safeProductLine(taskTruthAnswer.where_summary || "", "")
+  const activityWhereLine = cardTaskTruthAnswer
+    ? safeProductLine(cardTaskTruthAnswer.where_summary || "", "")
     : safeProductLine(
         noClearCurrentTask
           ? ""
@@ -4159,16 +4390,25 @@ function ContinuationAnswer({
           ) : null}
         </div>
 
-        <div className="answer-state">
-          <div>
+        {currentFocusLine ? (
+          <div className="answer-state answer-current-activity">
+            <div>
+              <span>Currently</span>
+              <strong>{currentFocusLine}</strong>
+            </div>
+          </div>
+        ) : null}
+
+        {lastStateLine || nextActionLine ? <div className="answer-state">
+          {lastStateLine ? <div>
             <span>State</span>
             <strong>{lastStateLine}</strong>
-          </div>
+          </div> : null}
           {nextActionLine ? <div>
             <span>Next</span>
             <strong>{nextActionLine}</strong>
           </div> : null}
-        </div>
+        </div> : null}
 
         <div className="answer-target">
           <div>
@@ -4213,20 +4453,26 @@ function ContinuationAnswer({
             aria-busy={continueRefreshBusy}
             onClick={onContinue}
           >
-            {continueRefreshBusy ? "Refreshing" : freshness.stale ? "Refresh Continue" : "Refresh"}
+            {continueRefreshBusy
+              ? "Understanding your recent work…"
+              : taskInferenceFailure?.retryable
+                ? "Retry inference"
+                : freshness.stale
+                  ? "Refresh Continue"
+                  : "Refresh"}
           </button>
         </div>
 
-        {taskTruthAnswer?.alternative_hypotheses?.length === 2 ? (
-          <div className="alternative-list" aria-label="Two possible tasks">
+        {taskTruthAlternatives.length > 0 ? (
+          <div className="alternative-list" aria-label="Possible task interpretations">
             <div className="alternative-heading">
-              <strong>Two tasks are similarly supported</strong>
+              <strong>Another task interpretation is similarly supported</strong>
               <span>Choose one</span>
             </div>
-            {taskTruthAnswer.alternative_hypotheses.map((hypothesis) => (
+            {taskTruthAlternatives.slice(0, 2).map((hypothesis) => (
               <div className="alternative-row" key={hypothesis.hypothesis_id}>
                 <div>
-                  <strong>{hypothesis.task_summary}</strong>
+                  <strong>{taskTruthTaskProductLine(hypothesis.task_summary)}</strong>
                 </div>
                 <div className="answer-actions">
                   <button
@@ -4234,8 +4480,8 @@ function ContinuationAnswer({
                     type="button"
                     disabled={busyAction !== null}
                     onClick={() => recordAndClose("corrected", {
-                      taskSnapshotId: taskTruthAnswer.snapshot_id,
-                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                      taskSnapshotId: cardTaskTruthAnswer?.snapshot_id,
+                      taskSnapshotRevision: cardTaskTruthAnswer?.snapshot_revision,
                       affectedTaskField: "hypothesis",
                       taskHypothesisId: hypothesis.hypothesis_id,
                     })}
@@ -4247,8 +4493,8 @@ function ContinuationAnswer({
                     type="button"
                     disabled={busyAction !== null}
                     onClick={() => recordAndClose("rejected", {
-                      taskSnapshotId: taskTruthAnswer.snapshot_id,
-                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                      taskSnapshotId: cardTaskTruthAnswer?.snapshot_id,
+                      taskSnapshotRevision: cardTaskTruthAnswer?.snapshot_revision,
                       affectedTaskField: "hypothesis",
                       taskHypothesisId: hypothesis.hypothesis_id,
                     })}
@@ -4298,18 +4544,60 @@ function ContinuationAnswer({
                 className="secondary-button"
                 type="button"
                 disabled={busyAction !== null}
-                onClick={() => recordAndClose("artifact_only_evidence")}
+                onClick={() => recordAndClose(
+                  taskTruthAnswer ? "supporting_work" : "artifact_only_evidence",
+                  taskTruthAnswer ? {
+                    taskSnapshotId: taskTruthAnswer.snapshot_id,
+                    taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                    affectedTaskField: "relationship",
+                    taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
+                  } : undefined,
+                )}
               >
-                This was only evidence
+                This was supporting work
               </button>
               <button
                 className="secondary-button"
                 type="button"
                 disabled={busyAction !== null}
-                onClick={() => recordAndClose("ignored_workstream")}
+                onClick={() => recordAndClose(
+                  taskTruthAnswer ? "unrelated_activity" : "ignored_workstream",
+                  taskTruthAnswer ? {
+                    taskSnapshotId: taskTruthAnswer.snapshot_id,
+                    taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                    affectedTaskField: "relationship",
+                    taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
+                  } : undefined,
+                )}
               >
-                Ignore this workstream
+                This was unrelated
               </button>
+              {taskTruthAnswer ? <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null}
+                onClick={() => recordAndClose("completed", {
+                  taskSnapshotId: taskTruthAnswer.snapshot_id,
+                  taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                  affectedTaskField: "task_status",
+                  taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
+                })}
+              >
+                Mark task complete
+              </button> : null}
+              {taskTruthAnswer ? <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null}
+                onClick={() => recordAndClose("reactivated", {
+                  taskSnapshotId: taskTruthAnswer.snapshot_id,
+                  taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
+                  affectedTaskField: "task_status",
+                  taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
+                })}
+              >
+                Reactivate this task
+              </button> : null}
             </div>
           ) : null}
           {feedbackStatus ? (
@@ -4370,6 +4658,7 @@ function ContinueEvidencePanel({
   onClose: () => void;
 }) {
   const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
+  const taskTruthDiagnostic = decision?.task_truth_v2?.inference_diagnostic || null;
   const target = taskTruthAnswer
     ? taskTruthAnswer.direct_return_target || null
     : decision?.resume_work_target || decision?.return_target || null;
@@ -4426,6 +4715,22 @@ function ContinueEvidencePanel({
                 <dd>{sentenceCase(taskTruthAnswer.task_resolution_status)}</dd>
               </div>
               <div>
+                <dt>Observed surface</dt>
+                <dd>{taskTruthAnswer.observed_surface || "No supported surface description."}</dd>
+              </div>
+              <div>
+                <dt>Immediate operation</dt>
+                <dd>{taskTruthAnswer.immediate_user_operation || "No grounded operation."}</dd>
+              </div>
+              <div>
+                <dt>Semantic effect</dt>
+                <dd>{taskTruthAnswer.semantic_effect_of_operation || "No verified resulting change."}</dd>
+              </div>
+              <div>
+                <dt>Current subtask</dt>
+                <dd>{taskTruthAnswer.current_subtask || "No supported subtask."}</dd>
+              </div>
+              <div>
                 <dt>State</dt>
                 <dd>{[
                   taskTruthAnswer.last_meaningful_progress,
@@ -4447,6 +4752,28 @@ function ContinueEvidencePanel({
               <div>
                 <dt>Task understanding</dt>
                 <dd>{sentenceCase(taskTruthAnswer.task_understanding_source)}</dd>
+              </div>
+              <div>
+                <dt>Inference origin</dt>
+                <dd>{sentenceCase(taskTruthDiagnostic?.origin || "none")}</dd>
+              </div>
+              <div>
+                <dt>Provider status</dt>
+                <dd>{sentenceCase(taskTruthDiagnostic?.status || taskTruthAnswer.inference_status)}</dd>
+              </div>
+              <div>
+                <dt>Provider / model</dt>
+                <dd>{[taskTruthDiagnostic?.provider, taskTruthDiagnostic?.model].filter(Boolean).join(" / ") || "No provider call"}</dd>
+              </div>
+              <div>
+                <dt>Request / response</dt>
+                <dd>{[taskTruthDiagnostic?.request_id, taskTruthDiagnostic?.response_id].filter(Boolean).join(" / ") || "No completed response"}</dd>
+              </div>
+              <div>
+                <dt>Multimodal input</dt>
+                <dd>{taskTruthDiagnostic
+                  ? `${taskTruthDiagnostic.provider_attempt_count || 0} provider attempt${taskTruthDiagnostic.provider_attempt_count === 1 ? "" : "s"}, ${taskTruthDiagnostic.image_count} images, ${taskTruthDiagnostic.image_bytes} bytes, ${taskTruthDiagnostic.total_tokens ?? taskTruthDiagnostic.estimated_tokens} tokens, ${taskTruthDiagnostic.latency_ms} ms`
+                  : "No inference audit available."}</dd>
               </div>
               <div>
                 <dt>Wording</dt>
@@ -5460,7 +5787,7 @@ type ContinueProductStateCopy = {
   targetBlockLabel: string;
   targetLine: string;
   targetMeta: string;
-  lastStateLine: string;
+  lastStateLine: string | null;
   nextActionLine: string;
   currentFocusLine: string;
   uncertaintyLine: string;
@@ -5553,15 +5880,47 @@ function presentContinueDecision(decision: ContinueDecisionResult): ContinuePres
 function buildTaskTruthProductStateCopy(
   answer: TaskTruthPublicAnswer,
   actionState: ContinueCardActionState,
+  diagnostic?: TaskTruthInferenceDiagnostic | null,
 ): ContinueProductStateCopy {
   const unresolved = answer.task_resolution_status === "unresolved";
   const ambiguous = answer.task_resolution_status === "ambiguous";
   const target = answer.direct_return_target || null;
-  const taskLine = safeProductLine(answer.task_summary || "", "");
-  const stateLine = [answer.last_meaningful_progress, answer.unfinished_state]
-    .map((line) => safeProductLine(line || "", ""))
+  const taskLine = taskTruthTaskProductLine(answer.task_summary || "");
+  const stateLine = [
+    taskTruthStateProductLine(answer.last_meaningful_progress || "", "progress"),
+    taskTruthStateProductLine(answer.unfinished_state || "", "unfinished"),
+  ]
     .filter(Boolean)
     .join(" ");
+  const currentActivity = taskTruthTaskProductLine(
+    answer.current_activity?.current_subtask
+      || answer.current_subtask
+      || answer.current_activity?.immediate_user_operation
+      || answer.immediate_user_operation
+      || answer.current_activity?.observed_surface
+      || answer.observed_surface
+      || "",
+    "",
+  );
+  const relationship = normalizeToken(
+    answer.current_activity?.relationship_to_primary || answer.relationship_to_prior,
+  );
+  const currentActivityLine = currentActivity
+    ? (() => {
+        const relationshipCopy: Record<string, string> = {
+          continuation: "This continues the primary task.",
+          supporting_research: "This is supporting research for the primary task.",
+          verification: "This is verification work for the primary task.",
+          temporary_detour: "This is a temporary detour from the primary task.",
+          interruption: "This interrupted the primary task without completing it.",
+          new_task: "This appears to be a separate new task.",
+          return_to_prior_task: "This returns to the earlier primary task.",
+          unrelated_or_unknown: "Its relationship to the earlier task is not clear.",
+          unknown: "Its relationship to the earlier task is not clear.",
+        };
+        return `${currentActivity} ${relationshipCopy[relationship] || ""}`.trim();
+      })()
+    : "";
   const inspectCopy = inspectTargetCopy({
     taskKnown: !unresolved && Boolean(taskLine),
     evidencePreviewAvailable: Boolean(answer.evidence_preview),
@@ -5569,17 +5928,31 @@ function buildTaskTruthProductStateCopy(
   });
 
   if (unresolved) {
+    const failureStatus = normalizeToken(diagnostic?.status) === "success"
+      ? answer.inference_status
+      : diagnostic?.status || answer.inference_status;
+    const failure = taskInferenceFailurePresentation(
+      failureStatus,
+      diagnostic?.verification_status,
+      diagnostic?.origin,
+      diagnostic?.image_count,
+      diagnostic?.provider_attempt_count,
+    );
     return {
       kind: "no_clear_continuation",
       heroLabel: NO_CLEAR_CURRENT_TASK_COPY.heroLabel,
-      headline: NO_CLEAR_CURRENT_TASK_HEADLINE,
+      headline: failure.headline,
       targetBlockLabel: inspectCopy.targetBlockLabel,
       targetLine: inspectCopy.targetLine,
       targetMeta: inspectCopy.targetMeta,
-      lastStateLine: NO_CLEAR_CURRENT_TASK_COPY.lastStateLine,
+      lastStateLine: failure.detail,
       nextActionLine: "",
+      // Observed surface is diagnostic evidence, not inferred task truth. Keep
+      // it under “Why this answer?” whenever model-first inference is unresolved.
       currentFocusLine: "",
-      uncertaintyLine: NO_CLEAR_CURRENT_TASK_COPY.uncertaintyLine,
+      uncertaintyLine: failure.kind === "insufficient_evidence"
+        ? NO_CLEAR_CURRENT_TASK_COPY.uncertaintyLine
+        : "No local semantic fallback was substituted.",
       missingEvidenceLines: [],
       statusPills: [],
     };
@@ -5597,9 +5970,9 @@ function buildTaskTruthProductStateCopy(
       ? humanTargetLabel(target) || "Verified return location"
       : inspectCopy.targetLine,
     targetMeta: targetOpenable ? humanTargetMeta(target) : inspectCopy.targetMeta,
-    lastStateLine: stateLine || "No last meaningful state is supported at greater precision.",
-    nextActionLine: safeProductLine(answer.next_action || "", ""),
-    currentFocusLine: "",
+    lastStateLine: stateLine || null,
+    nextActionLine: taskTruthStateProductLine(answer.next_action || "", "next"),
+    currentFocusLine: currentActivityLine,
     uncertaintyLine: ambiguous
       ? "Two task hypotheses remain close. Choose the one that matches your work."
       : targetOpenable
@@ -6402,6 +6775,44 @@ function safeProductLine(value: string, fallback: string) {
   const cleaned = cleanHumanText(value);
   if (!cleaned || isInternalFacingText(cleaned)) return fallback;
   return cleaned;
+}
+
+function boundedProductPhrase(value: string, maxChars: number) {
+  if (value.length <= maxChars) return value;
+  const clipped = value
+    .slice(0, maxChars + 1)
+    .replace(/\s+\S*$/, "")
+    .replace(/[\s,;:.]+$/, "");
+  return clipped ? `${clipped}…` : value.slice(0, maxChars);
+}
+
+function taskTruthTaskProductLine(value: string) {
+  let line = safeProductLine(value, "")
+    .replace(/^the user (?:was|is) (?:likely )?/i, "")
+    .replace(/^the likely primary task is\s+/i, "")
+    .replace(/^the (?:current|immediate) (?:subtask|task) is\s+/i, "")
+    .replace(/^the user\s+/i, "")
+    .trim();
+  line = line.split(/,\s+so\s+the\s+primary\s+task\b/i)[0].trim();
+  if (line) line = `${line.charAt(0).toUpperCase()}${line.slice(1)}`;
+  return boundedProductPhrase(line, 150);
+}
+
+function taskTruthStateProductLine(
+  value: string,
+  kind: "progress" | "unfinished" | "next",
+) {
+  let line = safeProductLine(value, "")
+    .replace(/^the most recent meaningful progress is that\s+/i, "")
+    .replace(/^the unfinished (?:state|work) is\s+/i, "")
+    .replace(/^the user\s+/i, "")
+    .trim();
+  line = line.split(/,\s+(?:confirming|which confirms|showing that)\b/i)[0].trim();
+  line = line.split(/;\s*/)[0].trim();
+  if (!line) return "";
+  line = `${line.charAt(0).toUpperCase()}${line.slice(1)}`;
+  const prefix = kind === "unfinished" ? "Still: " : "";
+  return `${prefix}${boundedProductPhrase(line, kind === "progress" ? 150 : 130)}`;
 }
 
 function usableActivityRecap(

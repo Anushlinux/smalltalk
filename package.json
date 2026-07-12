@@ -9,7 +9,10 @@
     "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs",
     "test:webview": "npm run test:continue-presentation",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build:macos:qa": "./scripts/build-macos-qa.sh",
+    "tauri:build:macos:release": "SMALLTALK_SIGNING_PROFILE=release ./scripts/build-macos-qa.sh",
+    "tauri:verify:macos": "./scripts/verify-macos-bundle.sh"
   },
   "dependencies": {
     "react": "^19.1.0",

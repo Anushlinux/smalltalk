@@ -20,8 +20,10 @@ pub(crate) mod checkpoint;
 pub(crate) mod model;
 pub(crate) mod observation_packet;
 pub(crate) mod production;
+pub(crate) mod review;
 pub(crate) mod selection;
 pub(crate) mod task_snapshot;
+pub(crate) mod task_thread;
 pub(crate) mod verifier;
 
 use self::observation_packet::build_observation_packet;
@@ -39,29 +41,41 @@ pub(crate) struct MultimodalShadowAuditV1 {
     pub(crate) provider_enabled: bool,
     pub(crate) provider_model: String,
     pub(crate) resolver: model::ResolverAttemptV1,
+    pub(crate) first_pass_attempt: model::ResolverAttemptV1,
+    pub(crate) second_pass_attempt: Option<model::ResolverAttemptV1>,
+    pub(crate) selected_pass: String,
     pub(crate) verification: verifier::VerificationResultV1,
     pub(crate) second_pass_ran: bool,
     pub(crate) second_pass_latency_ms: i64,
     pub(crate) second_pass_changed_fields: bool,
+    pub(crate) verification_latency_ms: i64,
     pub(crate) estimated_request_cost_usd: Option<f64>,
+    pub(crate) estimated_second_pass_cost_usd: Option<f64>,
     pub(crate) deterministic_wording: Option<String>,
     pub(crate) production_authority_changed: bool,
 }
 
 fn multimodal_provider_enabled() -> bool {
-    std::env::var("SMALLTALK_TASK_TRUTH_MULTIMODAL_ENABLED")
+    let configured = std::env::var("SMALLTALK_TASK_TRUTH_PROVIDER_MODE")
         .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
+        .or_else(|| {
+            super::project_dotenv_values()
+                .ok()
+                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_PROVIDER_MODE").cloned())
         })
+        .or_else(|| std::env::var("SMALLTALK_TASK_TRUTH_MULTIMODAL_ENABLED").ok());
+    configured.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "disabled"
+        )
+    })
 }
 
 fn run_multimodal_shadow(
     packet: &observation_packet::ObservationPacketV2,
     prior: Option<&task_snapshot::TaskSnapshotV2>,
+    prior_threads: &[model::PriorTaskThreadContextV1],
 ) -> (
     Option<task_snapshot::TaskSnapshotV2>,
     MultimodalShadowAuditV1,
@@ -88,21 +102,26 @@ fn run_multimodal_shadow(
     let client: Box<dyn TaskTruthModelClient> = if enabled {
         match config.and_then(|config| config.api_key.map(|api_key| (config.model, api_key))) {
             Some((model, api_key)) => {
-                Box::new(model::OpenAiTaskTruthModelClient { model, api_key })
+                Box::new(model::OpenAiTaskTruthModelClient::new(model, api_key))
             }
             None => Box::new(model::UnavailableModelClient {
                 model: model_name.clone(),
-                reason: "credentials_unavailable".into(),
+                reason: "credentials_missing".into(),
             }),
         }
     } else {
         Box::new(model::UnavailableModelClient {
             model: model_name.clone(),
-            reason: "multimodal_shadow_disabled".into(),
+            reason: "multimodal_disabled".into(),
         })
     };
-    let resolver = model::MultimodalTaskTruthResolver.resolve(packet, prior, client.as_ref());
+    let mut resolver =
+        model::MultimodalTaskTruthResolver.resolve(packet, prior, prior_threads, client.as_ref());
+    let first_pass_attempt = resolver.clone();
+    let mut second_pass_attempt = None;
+    let mut selected_pass = "first".to_string();
     let verifier = verifier::LocalEvidenceVerifier;
+    let verification_started = std::time::Instant::now();
     let mut verification = resolver
         .output
         .as_ref()
@@ -114,6 +133,7 @@ fn run_multimodal_shadow(
             second_pass_reasons: Vec::new(),
             unsupported_claim_count: 0,
         });
+    let mut verification_latency_ms = verification_started.elapsed().as_millis() as i64;
     let mut second_pass_ran = false;
     let mut second_pass_latency_ms = 0;
     let mut second_pass_changed_fields = false;
@@ -133,46 +153,139 @@ fn run_multimodal_shadow(
             "first_pass_verdicts": verification.fields,
             "legacy_p6_answer_included": false,
         });
-        if let Ok(request) =
-            model::build_multimodal_request(packet, prior, client.model_name(), Some(&conflict))
-        {
+        let request_build_started = std::time::Instant::now();
+        if let Ok(request) = model::build_multimodal_request(
+            packet,
+            prior,
+            prior_threads,
+            client.model_name(),
+            Some(&conflict),
+        ) {
             second_pass_ran = true;
-            if let Ok(output) = client.infer(&request) {
-                let candidate =
-                    verifier.verify(packet, prior, &output.hypotheses, output.resolution_status);
-                let candidate_better = candidate.snapshot.is_some()
-                    && (verification.snapshot.is_none()
-                        || candidate.unsupported_claim_count
-                            < verification.unsupported_claim_count);
-                if candidate_better {
-                    second_pass_changed_fields = candidate.snapshot != verification.snapshot;
-                    verification = candidate;
+            let request_build_latency_ms = request_build_started.elapsed().as_millis() as i64;
+            let provider_started = std::time::Instant::now();
+            match client.infer(&request) {
+                Ok(response) => {
+                    let provider_latency_ms = provider_started.elapsed().as_millis() as i64;
+                    let verify_started = std::time::Instant::now();
+                    let candidate = verifier.verify(
+                        packet,
+                        prior,
+                        &response.output.hypotheses,
+                        response.output.resolution_status,
+                    );
+                    verification_latency_ms += verify_started.elapsed().as_millis() as i64;
+                    let candidate_attempt = model::ResolverAttemptV1 {
+                        status: response.output.resolution_status,
+                        diagnostic_status: model::ProviderDiagnosticStatusV1::Success,
+                        origin: client.inference_origin(),
+                        provider: client.provider_name().to_string(),
+                        model: client.model_name().to_string(),
+                        request_id: Some(request.audit.request_id.clone()),
+                        provider_request_id: response.provider_request_id.clone(),
+                        response_id: response.provider_response_id.clone(),
+                        usage: response.usage.clone(),
+                        provider_attempts: response.provider_attempts.clone(),
+                        output: Some(response.output.clone()),
+                        failure: None,
+                        request_audit: Some(request.audit.clone()),
+                        request_build_latency_ms,
+                        provider_latency_ms,
+                        latency_ms: started.elapsed().as_millis() as i64,
+                    };
+                    let candidate_better = candidate.snapshot.is_some()
+                        && (verification.snapshot.is_none()
+                            || candidate.unsupported_claim_count
+                                < verification.unsupported_claim_count);
+                    if candidate_better {
+                        second_pass_changed_fields = candidate.snapshot != verification.snapshot;
+                        verification = candidate;
+                        resolver = candidate_attempt.clone();
+                        selected_pass = "second".to_string();
+                    }
+                    second_pass_attempt = Some(candidate_attempt);
+                }
+                Err(failure) => {
+                    let provider_attempts = client.provider_attempts();
+                    let provider_attempt = provider_attempts.last();
+                    second_pass_attempt = Some(model::ResolverAttemptV1 {
+                        status: model::resolution_for_failure(&failure),
+                        diagnostic_status: model::diagnostic_for_failure(&failure),
+                        origin: client.inference_origin(),
+                        provider: client.provider_name().to_string(),
+                        model: client.model_name().to_string(),
+                        request_id: Some(request.audit.request_id.clone()),
+                        provider_request_id: provider_attempt
+                            .and_then(|attempt| attempt.request_id.clone()),
+                        response_id: provider_attempt
+                            .and_then(|attempt| attempt.response_id.clone()),
+                        usage: model::aggregate_provider_usage(&provider_attempts),
+                        provider_attempts,
+                        output: None,
+                        failure: Some(failure),
+                        request_audit: Some(request.audit.clone()),
+                        request_build_latency_ms,
+                        provider_latency_ms: provider_started.elapsed().as_millis() as i64,
+                        latency_ms: started.elapsed().as_millis() as i64,
+                    });
                 }
             }
         }
         second_pass_latency_ms = started.elapsed().as_millis() as i64;
     }
+    if let Some(snapshot) = verification.snapshot.as_mut() {
+        snapshot.semantic_source = "cloud_multimodal_model".into();
+        snapshot.provider_name = Some(resolver.provider.clone());
+        snapshot.provider_model = Some(resolver.model.clone());
+        snapshot.provider_request_id = resolver.request_id.clone();
+        snapshot.provider_response_id = resolver.response_id.clone();
+        snapshot.wording_source = "deterministic".into();
+        snapshot.inference_status = format!("{:?}", verification.status).to_ascii_lowercase();
+    }
+    if verification.status == model::ResolutionStatusV1::VerificationRejected {
+        resolver.diagnostic_status = model::ProviderDiagnosticStatusV1::VerificationRejected;
+    }
     let snapshot = verification.snapshot.clone();
     let deterministic_wording = snapshot
         .as_ref()
         .map(verifier::deterministic_first_screen_wording);
-    let estimated_request_cost_usd = resolver.request_audit.as_ref().map(|audit| {
-        // Audit-only rough estimate. Model selection remains based on locked task-truth results.
-        ((audit.estimated_tokens as f64 * 0.000_000_5) + (audit.image_count as f64 * 0.000_85))
-            * if second_pass_ran { 2.0 } else { 1.0 }
-    });
+    let estimate_attempt_cost = |attempt: &model::ResolverAttemptV1| {
+        attempt.request_audit.as_ref().map(|audit| {
+            let input_tokens = attempt
+                .usage
+                .input_tokens
+                .unwrap_or(audit.estimated_tokens as i64)
+                .max(0) as f64;
+            let output_tokens = attempt.usage.output_tokens.unwrap_or(0).max(0) as f64;
+            // Safe audit estimate only. Actual billing remains provider/model specific.
+            input_tokens * 0.000_000_5 + output_tokens * 0.000_002
+        })
+    };
+    let first_pass_cost = estimate_attempt_cost(&first_pass_attempt);
+    let second_pass_cost = second_pass_attempt.as_ref().and_then(estimate_attempt_cost);
+    let estimated_request_cost_usd = match (first_pass_cost, second_pass_cost) {
+        (Some(first), Some(second)) => Some(first + second),
+        (Some(first), None) => Some(first),
+        (None, Some(second)) => Some(second),
+        (None, None) => None,
+    };
     (
         snapshot,
         MultimodalShadowAuditV1 {
-            schema: "smalltalk.task_truth_multimodal_shadow_audit.v1".into(),
+            schema: "smalltalk.task_truth_multimodal_inference_audit.v2".into(),
             provider_enabled: enabled,
             provider_model: model_name,
             resolver,
+            first_pass_attempt,
+            second_pass_attempt,
+            selected_pass,
             verification,
             second_pass_ran,
             second_pass_latency_ms,
             second_pass_changed_fields,
+            verification_latency_ms,
             estimated_request_cost_usd,
+            estimated_second_pass_cost_usd: second_pass_cost,
             deterministic_wording,
             production_authority_changed: false,
         },
@@ -191,10 +304,11 @@ pub(super) fn checkpoint_observation_frames(
     if frames.is_empty() {
         return Ok(None);
     }
-    let prior = checkpoint::load_latest_snapshot(
-        conn,
-        frames.last().and_then(|frame| frame.session_id.as_deref()),
-    )?;
+    let resolved_session_id = frames
+        .last()
+        .and_then(|frame| frame.session_id.as_deref())
+        .filter(|value| !value.trim().is_empty());
+    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id)?;
     let packet = build_observation_packet(
         frames,
         evidence_watermark,
@@ -223,59 +337,131 @@ pub(super) fn record_manual_continue_shadow(
     decision_id: &str,
     session_id: Option<&str>,
     legacy_selected_candidate_id: Option<&str>,
+    manual_continue_frame_id: Option<&str>,
+    manual_continue_preflight_failure: Option<&str>,
+    manual_continue_started_at_ms: Option<i64>,
+) -> Result<audit::ShadowAuditSummaryV2, String> {
+    record_manual_continue_shadow_with_lookback(
+        conn,
+        decision_id,
+        session_id,
+        legacy_selected_candidate_id,
+        Some(45 * 60 * 1000),
+        manual_continue_frame_id,
+        manual_continue_preflight_failure,
+        manual_continue_started_at_ms,
+    )
+}
+
+pub(crate) fn finalize_manual_continue_performance(
+    conn: &Connection,
+    decision_id: &str,
+    total_manual_continue_ms: i64,
+) -> Result<(), String> {
+    audit::finalize_performance_total(conn, decision_id, total_manual_continue_ms)
+}
+
+fn record_manual_continue_shadow_with_lookback(
+    conn: &Connection,
+    decision_id: &str,
+    session_id: Option<&str>,
+    legacy_selected_candidate_id: Option<&str>,
+    lookback_ms: Option<i64>,
+    manual_continue_frame_id: Option<&str>,
+    manual_continue_preflight_failure: Option<&str>,
+    manual_continue_started_at_ms: Option<i64>,
 ) -> Result<audit::ShadowAuditSummaryV2, String> {
     let started = std::time::Instant::now();
-    let watermark = super::build_continue_evidence_watermark(conn, session_id)?;
+    let capture_to_packet_started = std::time::Instant::now();
     let mut frames = super::load_evidence_frames(
         conn,
         &super::ContinueSecondLayerRebuildRequest {
             session_id: session_id.map(str::to_string),
-            lookback_ms: Some(45 * 60 * 1000),
+            lookback_ms,
             limit: Some(24),
             ..Default::default()
         },
     )?;
-    if let Some(current) = frames.last_mut() {
-        current.capture_trigger = "manual_continue".into();
+    let mut preflight_failure = manual_continue_preflight_failure.map(str::to_string);
+    if let Some(anchor_id) = manual_continue_frame_id {
+        if let Some(position) = frames.iter().position(|frame| frame.id == anchor_id) {
+            frames.truncate(position + 1);
+            if let Some(anchor) = frames.last_mut() {
+                // This labels the packet boundary, not the captured app or
+                // surface. The frame itself remains the exact external frame
+                // selected by the preflight.
+                anchor.capture_trigger = "manual".to_string();
+            }
+        } else {
+            preflight_failure = Some("manual_continue_anchor_frame_missing".to_string());
+        }
     }
-    let prior = checkpoint::load_latest_snapshot(conn, session_id)?;
+    let resolved_session_id = session_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            frames
+                .last()
+                .and_then(|frame| frame.session_id.as_deref())
+                .filter(|value| !value.trim().is_empty())
+        });
+    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id)?;
+    let bounded_watermark = super::stable_hash(
+        serde_json::json!({
+            "schema": "smalltalk.task_truth_bounded_watermark.v1",
+            "session_id": resolved_session_id,
+            "prior_snapshot_id": prior.as_ref().map(|snapshot| snapshot.snapshot_id.as_str()),
+            "frames": frames.iter().map(|frame| serde_json::json!({
+                "id": frame.id,
+                "captured_at": frame.captured_at,
+                "content_hash": frame.content_hash,
+                "image_hash": frame.image_hash,
+                "capture_trigger": frame.capture_trigger,
+                "ui_event_ids": frame.ui_events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+                "transition_id": frame.transition.as_ref().map(|transition| transition.id.as_str()),
+            })).collect::<Vec<_>>()
+        })
+        .to_string()
+        .as_bytes(),
+    );
     let packet = build_observation_packet(
         &frames,
-        &watermark.hash,
+        &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
     )?;
+    let capture_to_packet_ms = manual_continue_started_at_ms
+        .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
+        .unwrap_or_else(|| capture_to_packet_started.elapsed().as_millis() as i64);
     let legacy_turn = super::task_turn::selected_current_task_turn(conn)?;
-    let local_fallback_snapshot = match legacy_turn.as_ref() {
-        Some(turn)
-            if turn
-                .latest_user_goal_summary
-                .as_deref()
-                .is_some_and(|goal| !goal.trim().is_empty()) =>
-        {
-            project_current_task_turn(turn, &packet, prior.as_ref())
-        }
-        _ => unresolved_snapshot(
-            &packet,
-            prior.as_ref(),
-            "manual_continue_without_supported_task",
-        ),
+    let prior_threads = task_thread::load_prior_thread_contexts(conn, resolved_session_id, 6)?;
+    let (verified_snapshot, multimodal_audit) = if let Some(reason) = preflight_failure.as_deref() {
+        (None, unresolved_manual_preflight_audit(reason))
+    } else {
+        run_multimodal_shadow(&packet, prior.as_ref(), &prior_threads)
     };
-    let (verified_snapshot, multimodal_audit) = run_multimodal_shadow(&packet, prior.as_ref());
     let snapshot = verified_snapshot.unwrap_or_else(|| {
-        let mut fallback = local_fallback_snapshot;
-        fallback.provenance.push(
+        let reason = preflight_failure.clone().unwrap_or_else(|| {
             format!(
-                "multimodal_shadow_fallback:{:?}",
-                multimodal_audit.resolver.status
+                "cloud_inference_unresolved:{:?}:{:?}",
+                multimodal_audit.resolver.status, multimodal_audit.resolver.diagnostic_status
             )
-            .to_ascii_lowercase(),
-        );
-        fallback
+            .to_ascii_lowercase()
+        });
+        let mut unresolved = unresolved_snapshot(&packet, prior.as_ref(), &reason);
+        unresolved.provider_name = Some(multimodal_audit.resolver.provider.clone());
+        unresolved.provider_model = Some(multimodal_audit.resolver.model.clone());
+        unresolved.provider_request_id = multimodal_audit.resolver.request_id.clone();
+        unresolved.provider_response_id = multimodal_audit.resolver.response_id.clone();
+        unresolved.inference_status = reason;
+        unresolved
     });
-    checkpoint::persist_checkpoint(conn, &packet, &snapshot)?;
-    let snapshots = checkpoint::load_recent_snapshots(conn, session_id, 24)?;
-    let selection = selection::select_snapshot(&snapshots);
-    audit::persist_shadow_audit(
+    let persistence_started = std::time::Instant::now();
+    let boundary = task_thread::persist_boundary_atomic(conn, &packet, snapshot)?;
+    let snapshots = checkpoint::load_recent_snapshots(conn, resolved_session_id, 24)?;
+    // The manual Continue attempt is one atomic boundary. Its audit selection
+    // must describe that boundary, not re-run selection over unrelated recent
+    // snapshots from the same session.
+    let selection = selection::select_snapshot(std::slice::from_ref(&boundary.snapshot));
+    let summary = audit::persist_shadow_audit(
         conn,
         decision_id,
         &packet,
@@ -285,7 +471,83 @@ pub(super) fn record_manual_continue_shadow(
         legacy_selected_candidate_id,
         started.elapsed().as_millis() as i64,
         Some(&multimodal_audit),
-    )
+    )?;
+    let verification_persistence_ms =
+        multimodal_audit.verification_latency_ms + persistence_started.elapsed().as_millis() as i64;
+    if let Err(error) = audit::persist_performance_sample(
+        conn,
+        decision_id,
+        &packet,
+        &audit::PerformanceStageTimingsV1 {
+            capture_to_packet_ms,
+            verification_persistence_ms,
+            total_manual_continue_ms: manual_continue_started_at_ms
+                .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
+                .unwrap_or_else(|| started.elapsed().as_millis() as i64),
+        },
+        &multimodal_audit,
+    ) {
+        eprintln!("[mfti_04_performance] sample persistence failed: {error}");
+    }
+    Ok(summary)
+}
+
+fn unresolved_manual_preflight_audit(reason: &str) -> MultimodalShadowAuditV1 {
+    let model_name = std::env::var("SMALLTALK_TASK_TRUTH_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            super::project_dotenv_values()
+                .ok()
+                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_MODEL").cloned())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "unconfigured".to_string());
+    let resolver = model::ResolverAttemptV1 {
+        status: model::ResolutionStatusV1::InsufficientEvidence,
+        diagnostic_status: model::ProviderDiagnosticStatusV1::RequestInvalid,
+        origin: model::InferenceOriginV1::None,
+        provider: "openai".into(),
+        model: model_name.clone(),
+        request_id: None,
+        provider_request_id: None,
+        response_id: None,
+        usage: model::ProviderUsageV1::default(),
+        provider_attempts: Vec::new(),
+        output: None,
+        failure: Some(model::ModelFailureV1 {
+            kind: model::ModelFailureKindV1::RequestInvalid,
+            reason: reason.to_string(),
+        }),
+        request_audit: None,
+        request_build_latency_ms: 0,
+        provider_latency_ms: 0,
+        latency_ms: 0,
+    };
+    MultimodalShadowAuditV1 {
+        schema: "smalltalk.task_truth_multimodal_inference_audit.v2".into(),
+        provider_enabled: multimodal_provider_enabled(),
+        provider_model: model_name.clone(),
+        resolver: resolver.clone(),
+        first_pass_attempt: resolver,
+        second_pass_attempt: None,
+        selected_pass: "none".into(),
+        verification: verifier::VerificationResultV1 {
+            status: model::ResolutionStatusV1::InsufficientEvidence,
+            snapshot: None,
+            fields: Vec::new(),
+            second_pass_reasons: Vec::new(),
+            unsupported_claim_count: 0,
+        },
+        second_pass_ran: false,
+        second_pass_latency_ms: 0,
+        second_pass_changed_fields: false,
+        verification_latency_ms: 0,
+        estimated_request_cost_usd: None,
+        estimated_second_pass_cost_usd: None,
+        deterministic_wording: None,
+        production_authority_changed: false,
+    }
 }
 
 const MAX_TEXT_CHARS: usize = 512;
@@ -310,12 +572,18 @@ const REQUIRED_SURFACES: [&str; 10] = [
     "mixed_window_thin_unknown",
 ];
 
-const COMPARISON_FIELDS: [&str; 13] = [
+const COMPARISON_FIELDS: [&str; 19] = [
     "observation_construction",
     "causal_interaction_association",
     "control_region_eligibility",
     "authorship",
+    "visible_surface_page_meaning",
+    "immediate_user_operation",
+    "semantic_effect_of_operation",
     "task_selection",
+    "current_subtask",
+    "relationship_to_prior",
+    "task_switch_completion_status",
     "task_object",
     "lifecycle_state",
     "last_progress",
@@ -476,6 +744,18 @@ pub(crate) struct HumanAdjudicationV2 {
     pub(crate) forbidden_claims: Vec<TaskTruthTextV2>,
     pub(crate) immediately_useful: bool,
     pub(crate) reviewer_notes: TaskTruthTextV2,
+    // MFTI-04 labels are optional here so the frozen TT2 corpus remains readable.
+    // A case is not MFTI release-eligible unless all five are present.
+    #[serde(default)]
+    pub(crate) visible_surface_page_meaning: Option<TaskTruthTextV2>,
+    #[serde(default)]
+    pub(crate) immediate_user_operation: Option<TaskTruthTextV2>,
+    #[serde(default)]
+    pub(crate) semantic_effect_of_operation: Option<TaskTruthTextV2>,
+    #[serde(default)]
+    pub(crate) current_subtask: Option<TaskTruthTextV2>,
+    #[serde(default)]
+    pub(crate) task_switch_completion_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -551,6 +831,8 @@ pub(crate) struct TaskTruthCaseV2 {
     pub(crate) waiting_on_agent_or_application: bool,
     #[serde(default)]
     pub(crate) completed_vs_new_task_boundary: bool,
+    #[serde(default)]
+    pub(crate) provider_failure_case: bool,
     pub(crate) source: ProductionEvidenceV2,
     pub(crate) adjudication: Option<HumanAdjudicationV2>,
     pub(crate) recorded_outputs: RecordedOutputsV2,
@@ -640,6 +922,15 @@ pub(crate) struct PathCaseResultV1 {
     pub(crate) return_target_claim_present: bool,
     pub(crate) critical_local_solvable: bool,
     pub(crate) model_on_off_disagreement_unexplained: bool,
+    pub(crate) mfti_labels_complete: bool,
+    pub(crate) visible_surface_substituted_for_task: bool,
+    pub(crate) relationship_to_prior_correct: Option<bool>,
+    pub(crate) task_switch_completion_correct: Option<bool>,
+    pub(crate) cross_session_stale_leakage: bool,
+    pub(crate) mixed_snapshot_semantic_fields: bool,
+    pub(crate) provider_failure_case: bool,
+    pub(crate) provider_failure_honest_unresolved: bool,
+    pub(crate) provider_failure_local_semantic_fallback: bool,
     pub(crate) consumed_evidence_groups: Vec<String>,
     pub(crate) unsupported_evidence_groups: Vec<String>,
     pub(crate) claim_confidence: Option<f64>,
@@ -707,6 +998,9 @@ pub(crate) struct TaskTruthReportV1 {
     pub(crate) tt2_05_metric_results: BTreeMap<String, MetricAssessmentV1>,
     pub(crate) tt2_05_surface_wrong_task_results: BTreeMap<String, MetricAssessmentV1>,
     pub(crate) tt2_05_confidence_intervals: BTreeMap<String, ConfidenceIntervalV1>,
+    pub(crate) mfti_04_metric_results: BTreeMap<String, MetricAssessmentV1>,
+    pub(crate) mfti_04_surface_wrong_task_results: BTreeMap<String, MetricAssessmentV1>,
+    pub(crate) mfti_04_confidence_intervals: BTreeMap<String, ConfidenceIntervalV1>,
     pub(crate) wrong_task_examples: BTreeMap<String, Vec<String>>,
     pub(crate) reviewed_live_wrong_task_examples: BTreeMap<String, Vec<String>>,
     pub(crate) first_divergence_histogram: BTreeMap<String, usize>,
@@ -1030,6 +1324,10 @@ fn lint_adjudication(case_id: &str, label: &HumanAdjudicationV2) -> Result<(), S
         &label.where_identity,
         &label.reviewer_notes,
     ];
+    texts.extend(label.visible_surface_page_meaning.iter());
+    texts.extend(label.immediate_user_operation.iter());
+    texts.extend(label.semantic_effect_of_operation.iter());
+    texts.extend(label.current_subtask.iter());
     texts.extend(label.support_detour_surfaces.iter());
     texts.extend(label.acceptable_alternative_hypotheses.iter());
     texts.extend(label.forbidden_claims.iter());
@@ -1045,14 +1343,20 @@ fn lint_adjudication(case_id: &str, label: &HumanAdjudicationV2) -> Result<(), S
         lint_text(&format!("{case_id}.adjudication.text[{index}]"), text)?;
     }
     for value in [
-        &label.resolution,
-        &label.expected_observation_status,
-        &label.execution_state,
-        &label.current_actor,
-        &label.waiting_on,
-        &label.relation_to_prior_task,
+        label.resolution.as_str(),
+        label.expected_observation_status.as_str(),
+        label.execution_state.as_str(),
+        label.current_actor.as_str(),
+        label.waiting_on.as_str(),
+        label.relation_to_prior_task.as_str(),
     ] {
         lint_bounded_string(&format!("{case_id}.adjudication.label"), value)?;
+    }
+    if let Some(value) = label.task_switch_completion_status.as_deref() {
+        lint_bounded_string(
+            &format!("{case_id}.adjudication.task_switch_completion_status"),
+            value,
+        )?;
     }
     for field in &label.required_abstention_fields {
         lint_bounded_string(&format!("{case_id}.required_abstention_field"), field)?;
@@ -1352,6 +1656,7 @@ fn placeholder_case(case_id: &str) -> TaskTruthCaseV2 {
         ambiguous_or_privacy_blocked: false,
         waiting_on_agent_or_application: false,
         completed_vs_new_task_boundary: false,
+        provider_failure_case: false,
         source: ProductionEvidenceV2::default(),
         adjudication: None,
         recorded_outputs: RecordedOutputsV2 {
@@ -1869,6 +2174,68 @@ fn evaluate_path(
                 })
         })
     });
+    let mfti_labels_complete = adjudication.is_some_and(|label| {
+        label.visible_surface_page_meaning.is_some()
+            && label.immediate_user_operation.is_some()
+            && label.semantic_effect_of_operation.is_some()
+            && label.current_subtask.is_some()
+            && label.task_switch_completion_status.is_some()
+    });
+    let visible_surface_substituted_for_task = adjudication.is_some_and(|label| {
+        output.task_identity.as_ref().is_some_and(|task| {
+            label
+                .visible_surface_page_meaning
+                .as_ref()
+                .is_some_and(|surface| {
+                    semantic_text_matches(&task.text, &surface.text)
+                        && !semantic_text_matches(&task.text, &label.primary_task_summary.text)
+                })
+        })
+    });
+    let relationship_to_prior_correct = adjudication.and_then(|label| {
+        output
+            .checkpoints
+            .get("relationship_to_prior")
+            .and_then(value_text)
+            .map(|actual| semantic_text_matches(actual, &label.relation_to_prior_task))
+    });
+    let task_switch_completion_correct = adjudication.and_then(|label| {
+        label
+            .task_switch_completion_status
+            .as_deref()
+            .and_then(|expected| {
+                output
+                    .checkpoints
+                    .get("task_switch_completion_status")
+                    .and_then(value_text)
+                    .map(|actual| semantic_text_matches(actual, expected))
+            })
+    });
+    let cross_session_stale_leakage = output
+        .checkpoints
+        .get("cross_session_stale_leakage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mixed_snapshot_semantic_fields = output
+        .checkpoints
+        .get("mixed_snapshot_semantic_fields")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let semantic_source = output
+        .checkpoints
+        .get("semantic_source")
+        .and_then(value_text);
+    let provider_failure_local_semantic_fallback = case.provider_failure_case
+        && (output.task_identity.is_some()
+            || matches!(semantic_source, Some("local_scorer" | "local_causal")));
+    let provider_failure_honest_unresolved = case.provider_failure_case
+        && output.task_identity.is_none()
+        && !provider_failure_local_semantic_fallback
+        && output
+            .checkpoints
+            .get("inference_status")
+            .and_then(value_text)
+            .is_some_and(|status| matches!(status, "unresolved" | "provider_unavailable"));
     for field in COMPARISON_FIELDS {
         let mut status = if output.status == PathStatusV2::NotImplemented {
             "not_implemented"
@@ -1951,6 +2318,15 @@ fn evaluate_path(
             .get("model_on_off_task_disagreement_unexplained")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        mfti_labels_complete,
+        visible_surface_substituted_for_task,
+        relationship_to_prior_correct,
+        task_switch_completion_correct,
+        cross_session_stale_leakage,
+        mixed_snapshot_semantic_fields,
+        provider_failure_case: case.provider_failure_case,
+        provider_failure_honest_unresolved,
+        provider_failure_local_semantic_fallback,
         consumed_evidence_groups: output.consumed_evidence_groups.clone(),
         unsupported_evidence_groups: output.unsupported_evidence_groups.clone(),
         claim_confidence: output.claim_confidence,
@@ -1982,7 +2358,25 @@ fn compare_labeled_field(
         };
     }
     let expected = match field {
+        "visible_surface_page_meaning" => label
+            .visible_surface_page_meaning
+            .as_ref()
+            .map(|value| value.text.as_str()),
+        "immediate_user_operation" => label
+            .immediate_user_operation
+            .as_ref()
+            .map(|value| value.text.as_str()),
+        "semantic_effect_of_operation" => label
+            .semantic_effect_of_operation
+            .as_ref()
+            .map(|value| value.text.as_str()),
         "task_selection" => Some(label.primary_task_summary.text.as_str()),
+        "current_subtask" => label
+            .current_subtask
+            .as_ref()
+            .map(|value| value.text.as_str()),
+        "relationship_to_prior" => Some(label.relation_to_prior_task.as_str()),
+        "task_switch_completion_status" => label.task_switch_completion_status.as_deref(),
         "task_object" => Some(label.task_object.text.as_str()),
         "lifecycle_state" => Some(label.execution_state.as_str()),
         "last_progress" => Some(label.last_meaningful_progress.text.as_str()),
@@ -2591,6 +2985,144 @@ fn assess_tt2_05_metrics(
     (metrics, surfaces, intervals)
 }
 
+fn assess_mfti_04_metrics(
+    cases: &[TaskTruthCaseResultV1],
+    manual_downgrade_count: usize,
+    manual_downgrade_evaluable_count: usize,
+) -> (
+    BTreeMap<String, MetricAssessmentV1>,
+    BTreeMap<String, MetricAssessmentV1>,
+    BTreeMap<String, ConfidenceIntervalV1>,
+) {
+    let (mut metrics, surfaces, _) = assess_tt2_05_metrics(
+        cases,
+        manual_downgrade_count,
+        manual_downgrade_evaluable_count,
+    );
+    metrics.remove("model_on_off_unexplained_task_disagreement");
+
+    let reviewed = cases
+        .iter()
+        .filter(|case| case.release_eligible)
+        .filter_map(|case| {
+            case.paths
+                .get("path_c_task_truth_shadow")
+                .map(|path| (case, path))
+        })
+        .collect::<Vec<_>>();
+    let mfti_reviewed = reviewed
+        .iter()
+        .copied()
+        .filter(|(_, path)| path.mfti_labels_complete)
+        .collect::<Vec<_>>();
+
+    metrics.insert(
+        "visible_surface_substituted_for_task".into(),
+        metric_assessment(
+            mfti_reviewed
+                .iter()
+                .filter(|(_, path)| path.visible_surface_substituted_for_task)
+                .count(),
+            mfti_reviewed.len(),
+            0.02,
+            false,
+        ),
+    );
+    let relationships = mfti_reviewed
+        .iter()
+        .filter_map(|(_, path)| path.relationship_to_prior_correct)
+        .collect::<Vec<_>>();
+    metrics.insert(
+        "wrong_activity_to_task_relationship".into(),
+        metric_assessment(
+            relationships.iter().filter(|correct| !**correct).count(),
+            relationships.len(),
+            0.05,
+            false,
+        ),
+    );
+    let switches = mfti_reviewed
+        .iter()
+        .filter_map(|(_, path)| path.task_switch_completion_correct)
+        .collect::<Vec<_>>();
+    metrics.insert(
+        "wrong_task_switch_or_detour".into(),
+        metric_assessment(
+            switches.iter().filter(|correct| !**correct).count(),
+            switches.len(),
+            0.05,
+            false,
+        ),
+    );
+    for (name, count) in [
+        (
+            "cross_session_stale_leakage",
+            mfti_reviewed
+                .iter()
+                .filter(|(_, path)| path.cross_session_stale_leakage)
+                .count(),
+        ),
+        (
+            "mixed_snapshot_semantic_fields",
+            mfti_reviewed
+                .iter()
+                .filter(|(_, path)| path.mixed_snapshot_semantic_fields)
+                .count(),
+        ),
+    ] {
+        metrics.insert(
+            name.into(),
+            metric_assessment(count, mfti_reviewed.len(), 0.0, false),
+        );
+    }
+    let provider_failures = reviewed
+        .iter()
+        .copied()
+        .filter(|(_, path)| path.provider_failure_case)
+        .collect::<Vec<_>>();
+    metrics.insert(
+        "provider_failure_local_semantic_fallback".into(),
+        metric_assessment(
+            provider_failures
+                .iter()
+                .filter(|(_, path)| path.provider_failure_local_semantic_fallback)
+                .count(),
+            provider_failures.len(),
+            0.0,
+            false,
+        ),
+    );
+    metrics.insert(
+        "provider_failure_honest_unresolved".into(),
+        metric_assessment(
+            provider_failures
+                .iter()
+                .filter(|(_, path)| path.provider_failure_honest_unresolved)
+                .count(),
+            provider_failures.len(),
+            1.0,
+            true,
+        ),
+    );
+
+    let intervals = metrics
+        .iter()
+        .map(|(name, metric)| {
+            (
+                name.clone(),
+                wilson_interval(metric.numerator, metric.denominator),
+            )
+        })
+        .chain(surfaces.iter().map(|(family, metric)| {
+            (
+                format!("wrong_primary_task_rate.surface.{family}"),
+                wilson_interval(metric.numerator, metric.denominator),
+            )
+        }))
+        .collect();
+    (metrics, surfaces, intervals)
+}
+
 pub(crate) fn evaluate(
     root: &Path,
     allow_locked_holdout: bool,
@@ -2848,6 +3380,12 @@ pub(crate) fn evaluate(
             manual_background_downgrade_count,
             manual_background_downgrade_evaluable_count,
         );
+    let (mfti_04_metric_results, mfti_04_surface_wrong_task_results, mfti_04_confidence_intervals) =
+        assess_mfti_04_metrics(
+            &cases,
+            manual_background_downgrade_count,
+            manual_background_downgrade_evaluable_count,
+        );
     for (metric, result) in &frozen_policy_metric_results {
         if !result.passed {
             violations.push(format!("frozen_metric_{metric}_{}", result.status));
@@ -3023,6 +3561,9 @@ pub(crate) fn evaluate(
         tt2_05_metric_results,
         tt2_05_surface_wrong_task_results,
         tt2_05_confidence_intervals,
+        mfti_04_metric_results,
+        mfti_04_surface_wrong_task_results,
+        mfti_04_confidence_intervals,
         wrong_task_examples: wrong,
         reviewed_live_wrong_task_examples: reviewed_wrong,
         first_divergence_histogram: first_hist,
@@ -3060,6 +3601,124 @@ pub(crate) fn write_report(report: &TaskTruthReportV1, output: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly supplied private database copy and live provider credentials"]
+    fn live_provider_smoke_against_private_session() {
+        let database_path = std::env::var("SMALLTALK_MFTI_LIVE_DB")
+            .expect("set SMALLTALK_MFTI_LIVE_DB to a writable private database copy");
+        let session_id = std::env::var("SMALLTALK_MFTI_LIVE_SESSION_ID")
+            .expect("set SMALLTALK_MFTI_LIVE_SESSION_ID to the reviewed private session");
+        let boundary_frame_id = std::env::var("SMALLTALK_MFTI_LIVE_FRAME_ID")
+            .expect("set SMALLTALK_MFTI_LIVE_FRAME_ID to the exact reviewed boundary frame");
+        let expected_relationship = std::env::var("SMALLTALK_MFTI_EXPECT_RELATIONSHIP").ok();
+        let conn = Connection::open(database_path).expect("open private smoke database copy");
+        let decision_id = format!(
+            "mfti-02-live-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis()
+        );
+
+        record_manual_continue_shadow_with_lookback(
+            &conn,
+            &decision_id,
+            Some(&session_id),
+            None,
+            None,
+            Some(&boundary_frame_id),
+            None,
+            None,
+        )
+        .expect("run real manual Continue inference");
+
+        let packet_summary_json: String = conn
+            .query_row(
+                "SELECT packet_summary_json
+                 FROM task_truth_v2_shadow_audits
+                 WHERE decision_id = ?1
+                 ORDER BY observed_at_ms DESC
+                 LIMIT 1",
+                [&decision_id],
+                |row| row.get(0),
+            )
+            .expect("load persisted smoke audit");
+        let audit: Value =
+            serde_json::from_str(&packet_summary_json).expect("parse persisted smoke audit");
+        let multimodal = audit
+            .get("multimodal")
+            .expect("smoke audit must include multimodal provenance");
+        let resolver = multimodal
+            .get("resolver")
+            .expect("smoke audit must include resolver provenance");
+        let verification = multimodal
+            .get("verification")
+            .expect("smoke audit must include verification provenance");
+
+        let diagnostic = resolver
+            .get("diagnostic_status")
+            .and_then(Value::as_str)
+            .expect("resolver diagnostic status");
+        let origin = resolver
+            .get("origin")
+            .and_then(Value::as_str)
+            .expect("inference origin");
+        let response_id = resolver
+            .get("response_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .expect("provider response identity");
+        let image_count = resolver
+            .pointer("/request_audit/image_count")
+            .and_then(Value::as_u64)
+            .expect("selected image count");
+        let verification_status = verification
+            .get("status")
+            .and_then(Value::as_str)
+            .expect("verification status");
+        let verified_snapshot = verification
+            .get("snapshot")
+            .filter(|value| !value.is_null())
+            .expect("verified structured snapshot");
+
+        assert_eq!(origin, "live_cloud");
+        assert_eq!(diagnostic, "success");
+        assert!(image_count > 0);
+        assert!(matches!(verification_status, "resolved" | "ambiguous"));
+        if let Some(expected) = expected_relationship.as_deref() {
+            assert_eq!(
+                verified_snapshot
+                    .get("relation_to_prior")
+                    .and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+
+        let safe_result = serde_json::json!({
+            "schema": multimodal.get("schema"),
+            "session_id": session_id,
+            "provider": resolver.get("provider"),
+            "model": resolver.get("model"),
+            "request_id": resolver.get("request_id"),
+            "provider_request_id": resolver.get("provider_request_id"),
+            "response_id": response_id,
+            "diagnostic_status": diagnostic,
+            "resolution_status": resolver.get("status"),
+            "verification_status": verification_status,
+            "relationship_to_prior": verified_snapshot.get("relation_to_prior"),
+            "latency_ms": resolver.get("latency_ms"),
+            "image_count": image_count,
+            "image_bytes": resolver.pointer("/request_audit/image_bytes"),
+            "estimated_tokens": resolver.pointer("/request_audit/estimated_tokens"),
+            "usage": resolver.get("usage"),
+            "estimated_request_cost_usd": multimodal.get("estimated_request_cost_usd"),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&safe_result).expect("serialize safe smoke metadata")
+        );
+    }
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continue_accuracy/task_truth_v2")
@@ -3108,6 +3767,11 @@ mod tests {
             forbidden_claims: vec![label_text("Approve for me")],
             immediately_useful: true,
             reviewer_notes: label_text("Blinded test label"),
+            visible_surface_page_meaning: Some(label_text("agent chat")),
+            immediate_user_operation: Some(label_text("submitted a request")),
+            semantic_effect_of_operation: Some(label_text("started an implementation run")),
+            current_subtask: Some(label_text("build the measurement authority")),
+            task_switch_completion_status: Some("new_task_after_completion".into()),
         }
     }
 
@@ -3352,6 +4016,15 @@ mod tests {
                 return_target_claim_present: true,
                 critical_local_solvable: true,
                 model_on_off_disagreement_unexplained: false,
+                mfti_labels_complete: true,
+                visible_surface_substituted_for_task: false,
+                relationship_to_prior_correct: Some(true),
+                task_switch_completion_correct: Some(true),
+                cross_session_stale_leakage: false,
+                mixed_snapshot_semantic_fields: false,
+                provider_failure_case: false,
+                provider_failure_honest_unresolved: false,
+                provider_failure_local_semantic_fallback: false,
                 consumed_evidence_groups: Vec::new(),
                 unsupported_evidence_groups: Vec::new(),
                 claim_confidence: Some(0.9),
@@ -3403,5 +4076,42 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn mfti_provider_failure_counts_honest_unresolved_without_local_semantics() {
+        let mut corpus =
+            parse_corpus(&fs::read(root().join("session-013-family.v2.json")).unwrap()).unwrap();
+        let source_case = &mut corpus.cases[0];
+        source_case.provider_failure_case = true;
+        let mut output = missing_path();
+        output.status = PathStatusV2::Implemented;
+        output.evidence_hash = stable_json_sha256(&source_case.source).unwrap();
+        output
+            .checkpoints
+            .insert("inference_status".into(), json!("provider_unavailable"));
+        output
+            .checkpoints
+            .insert("semantic_source".into(), json!("unresolved"));
+        let path = evaluate_path(&output, Some(&reviewed_label()), source_case);
+        assert!(path.provider_failure_honest_unresolved);
+        assert!(!path.provider_failure_local_semantic_fallback);
+
+        let case = TaskTruthCaseResultV1 {
+            case_id: "provider-failure".into(),
+            source_kind: SourceKindV2::LiveRedacted,
+            release_eligible: true,
+            requires_task_selection_abstention: true,
+            application_identity_bucket: "provider-failure".into(),
+            surface_family: "agent_chat".into(),
+            partition: TaskTruthPartitionV2::Development,
+            human_label_status: "available".into(),
+            paths: BTreeMap::from([("path_c_task_truth_shadow".into(), path)]),
+            deterministic_replay_match: true,
+        };
+        let (metrics, _, _) = assess_mfti_04_metrics(&[case], 0, 1);
+        assert!(!metrics.contains_key("model_on_off_unexplained_task_disagreement"));
+        assert!(metrics["provider_failure_honest_unresolved"].passed);
+        assert!(metrics["provider_failure_local_semantic_fallback"].passed);
     }
 }

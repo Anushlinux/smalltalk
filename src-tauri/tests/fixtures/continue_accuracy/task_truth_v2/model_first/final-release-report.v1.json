@@ -1,0 +1,631 @@
+{
+  "authority_state": "eligible",
+  "bindings": null,
+  "confidence_intervals": {
+    "control_navigation_as_task_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "cross_session_stale_leakage": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "execution_state_accuracy": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "human_immediately_useful": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "mixed_snapshot_semantic_fields": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "precise_abstention": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "provider_failure_honest_unresolved": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "provider_failure_local_semantic_fallback": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "return_target_precision": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "stronger_manual_result_downgraded": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "supported_next_action_coverage": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "supported_next_action_precision": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "task_object_accuracy": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "unseen_application_useful_summary": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "unsupported_specific_claim_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "useful_non_generic_task_summary": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "visible_surface_substituted_for_task": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_activity_to_task_relationship": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.agent_chat": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.browser_research_search": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.custom_rendered_canvas": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.documents": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.editor_ide": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.email_messaging": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.mixed_window_thin_unknown": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.pdf_file_manager": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.spreadsheets": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.terminal": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    },
+    "wrong_task_switch_or_detour": {
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "method": "wilson_score",
+      "upper": null
+    }
+  },
+  "evidence_inputs": {
+    "evaluator": "tests/fixtures/continue_accuracy/task_truth_v2/model_first/release-evaluator-report.v1.json",
+    "identity": "tests/fixtures/continue_accuracy/task_truth_v2/model_first/release-identity.v1.json",
+    "manual_macos_qa": "tests/fixtures/continue_accuracy/task_truth_v2/model_first/manual-macos-qa.v1.json",
+    "performance_cost_privacy": "tests/fixtures/continue_accuracy/task_truth_v2/model_first/performance-cost-privacy.v1.json",
+    "policy": "tests/fixtures/continue_accuracy/task_truth_v2/model_first/eval-policy.v1.json"
+  },
+  "locked_holdout_count": 0,
+  "manual_scenario_count": 0,
+  "metric_results": {
+    "control_navigation_as_task_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "cross_session_stale_leakage": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "execution_state_accuracy": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "human_immediately_useful": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.85
+    },
+    "mixed_snapshot_semantic_fields": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "precise_abstention": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.95
+    },
+    "provider_failure_honest_unresolved": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 1.0
+    },
+    "provider_failure_local_semantic_fallback": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "return_target_precision": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.98
+    },
+    "stronger_manual_result_downgraded": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.0
+    },
+    "supported_next_action_coverage": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.85
+    },
+    "supported_next_action_precision": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "task_object_accuracy": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.88
+    },
+    "unseen_application_useful_summary": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.8
+    },
+    "unsupported_specific_claim_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.01
+    },
+    "useful_non_generic_task_summary": {
+      "denominator": 0,
+      "higher_is_better": true,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.9
+    },
+    "visible_surface_substituted_for_task": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.02
+    },
+    "wrong_activity_to_task_relationship": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "wrong_primary_task_rate": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.03
+    },
+    "wrong_task_switch_or_detour": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    }
+  },
+  "passed": false,
+  "performance_sample_count": 0,
+  "policy_version": "mfti.04-v1",
+  "reviewed_live_count": 0,
+  "schema": "smalltalk.mfti_04.final_release_report.v1",
+  "surface_results": {
+    "agent_chat": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "browser_research_search": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "custom_rendered_canvas": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "documents": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "editor_ide": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "email_messaging": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "mixed_window_thin_unknown": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "pdf_file_manager": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "spreadsheets": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    },
+    "terminal": {
+      "denominator": 0,
+      "higher_is_better": false,
+      "numerator": 0,
+      "passed": false,
+      "rate": null,
+      "status": "missing_required_denominator",
+      "threshold": 0.05
+    }
+  },
+  "validation": {
+    "evaluator": [
+      "reviewed_live_requires_200_found_0",
+      "locked_holdout_requires_50_found_0",
+      "mfti_metric_wrong_primary_task_rate_not_proven",
+      "mfti_metric_wrong_primary_task_rate_confidence_interval_missing",
+      "mfti_metric_visible_surface_substituted_for_task_not_proven",
+      "mfti_metric_visible_surface_substituted_for_task_confidence_interval_missing",
+      "mfti_metric_wrong_activity_to_task_relationship_not_proven",
+      "mfti_metric_wrong_activity_to_task_relationship_confidence_interval_missing",
+      "mfti_metric_wrong_task_switch_or_detour_not_proven",
+      "mfti_metric_wrong_task_switch_or_detour_confidence_interval_missing",
+      "mfti_metric_cross_session_stale_leakage_not_proven",
+      "mfti_metric_cross_session_stale_leakage_confidence_interval_missing",
+      "mfti_metric_mixed_snapshot_semantic_fields_not_proven",
+      "mfti_metric_mixed_snapshot_semantic_fields_confidence_interval_missing",
+      "mfti_metric_control_navigation_as_task_rate_not_proven",
+      "mfti_metric_control_navigation_as_task_rate_confidence_interval_missing",
+      "mfti_metric_unsupported_specific_claim_rate_not_proven",
+      "mfti_metric_unsupported_specific_claim_rate_confidence_interval_missing",
+      "mfti_metric_provider_failure_local_semantic_fallback_not_proven",
+      "mfti_metric_provider_failure_local_semantic_fallback_confidence_interval_missing",
+      "mfti_metric_provider_failure_honest_unresolved_not_proven",
+      "mfti_metric_provider_failure_honest_unresolved_confidence_interval_missing",
+      "mfti_metric_useful_non_generic_task_summary_not_proven",
+      "mfti_metric_useful_non_generic_task_summary_confidence_interval_missing",
+      "mfti_metric_task_object_accuracy_not_proven",
+      "mfti_metric_task_object_accuracy_confidence_interval_missing",
+      "mfti_metric_execution_state_accuracy_not_proven",
+      "mfti_metric_execution_state_accuracy_confidence_interval_missing",
+      "mfti_metric_supported_next_action_precision_not_proven",
+      "mfti_metric_supported_next_action_precision_confidence_interval_missing",
+      "mfti_metric_supported_next_action_coverage_not_proven",
+      "mfti_metric_supported_next_action_coverage_confidence_interval_missing",
+      "mfti_metric_return_target_precision_not_proven",
+      "mfti_metric_return_target_precision_confidence_interval_missing",
+      "mfti_metric_stronger_manual_result_downgraded_not_proven",
+      "mfti_metric_stronger_manual_result_downgraded_confidence_interval_missing",
+      "mfti_metric_unseen_application_useful_summary_not_proven",
+      "mfti_metric_unseen_application_useful_summary_confidence_interval_missing",
+      "mfti_metric_human_immediately_useful_not_proven",
+      "mfti_metric_human_immediately_useful_confidence_interval_missing",
+      "surface_agent_chat_requires_15_reviewed_passes",
+      "surface_editor_ide_requires_15_reviewed_passes",
+      "surface_terminal_requires_15_reviewed_passes",
+      "surface_browser_research_search_requires_15_reviewed_passes",
+      "surface_documents_requires_15_reviewed_passes",
+      "surface_spreadsheets_requires_15_reviewed_passes",
+      "surface_email_messaging_requires_15_reviewed_passes",
+      "surface_pdf_file_manager_requires_15_reviewed_passes",
+      "surface_custom_rendered_canvas_requires_15_reviewed_passes",
+      "surface_mixed_window_thin_unknown_requires_15_reviewed_passes",
+      "slice_interruption_resumption_requires_30_found_0",
+      "slice_ambiguous_or_privacy_blocked_requires_20_found_0",
+      "slice_waiting_on_agent_or_application_requires_20_found_0",
+      "slice_completed_vs_new_task_requires_20_found_0"
+    ],
+    "manual_macos_qa": [
+      "manual_macos_qa_manifest_missing"
+    ],
+    "performance_cost_privacy": [
+      "performance_cost_privacy_manifest_missing"
+    ],
+    "policy": [],
+    "release_identity": [
+      "release_identity_manifest_missing"
+    ]
+  },
+  "violations": [
+    "locked_holdout_requires_50_found_0",
+    "manual_macos_qa_manifest_missing",
+    "mfti_metric_control_navigation_as_task_rate_confidence_interval_missing",
+    "mfti_metric_control_navigation_as_task_rate_not_proven",
+    "mfti_metric_cross_session_stale_leakage_confidence_interval_missing",
+    "mfti_metric_cross_session_stale_leakage_not_proven",
+    "mfti_metric_execution_state_accuracy_confidence_interval_missing",
+    "mfti_metric_execution_state_accuracy_not_proven",
+    "mfti_metric_human_immediately_useful_confidence_interval_missing",
+    "mfti_metric_human_immediately_useful_not_proven",
+    "mfti_metric_mixed_snapshot_semantic_fields_confidence_interval_missing",
+    "mfti_metric_mixed_snapshot_semantic_fields_not_proven",
+    "mfti_metric_provider_failure_honest_unresolved_confidence_interval_missing",
+    "mfti_metric_provider_failure_honest_unresolved_not_proven",
+    "mfti_metric_provider_failure_local_semantic_fallback_confidence_interval_missing",
+    "mfti_metric_provider_failure_local_semantic_fallback_not_proven",
+    "mfti_metric_return_target_precision_confidence_interval_missing",
+    "mfti_metric_return_target_precision_not_proven",
+    "mfti_metric_stronger_manual_result_downgraded_confidence_interval_missing",
+    "mfti_metric_stronger_manual_result_downgraded_not_proven",
+    "mfti_metric_supported_next_action_coverage_confidence_interval_missing",
+    "mfti_metric_supported_next_action_coverage_not_proven",
+    "mfti_metric_supported_next_action_precision_confidence_interval_missing",
+    "mfti_metric_supported_next_action_precision_not_proven",
+    "mfti_metric_task_object_accuracy_confidence_interval_missing",
+    "mfti_metric_task_object_accuracy_not_proven",
+    "mfti_metric_unseen_application_useful_summary_confidence_interval_missing",
+    "mfti_metric_unseen_application_useful_summary_not_proven",
+    "mfti_metric_unsupported_specific_claim_rate_confidence_interval_missing",
+    "mfti_metric_unsupported_specific_claim_rate_not_proven",
+    "mfti_metric_useful_non_generic_task_summary_confidence_interval_missing",
+    "mfti_metric_useful_non_generic_task_summary_not_proven",
+    "mfti_metric_visible_surface_substituted_for_task_confidence_interval_missing",
+    "mfti_metric_visible_surface_substituted_for_task_not_proven",
+    "mfti_metric_wrong_activity_to_task_relationship_confidence_interval_missing",
+    "mfti_metric_wrong_activity_to_task_relationship_not_proven",
+    "mfti_metric_wrong_primary_task_rate_confidence_interval_missing",
+    "mfti_metric_wrong_primary_task_rate_not_proven",
+    "mfti_metric_wrong_task_switch_or_detour_confidence_interval_missing",
+    "mfti_metric_wrong_task_switch_or_detour_not_proven",
+    "performance_cost_privacy_manifest_missing",
+    "release_identity_manifest_missing",
+    "reviewed_live_requires_200_found_0",
+    "slice_ambiguous_or_privacy_blocked_requires_20_found_0",
+    "slice_completed_vs_new_task_requires_20_found_0",
+    "slice_interruption_resumption_requires_30_found_0",
+    "slice_waiting_on_agent_or_application_requires_20_found_0",
+    "surface_agent_chat_requires_15_reviewed_passes",
+    "surface_browser_research_search_requires_15_reviewed_passes",
+    "surface_custom_rendered_canvas_requires_15_reviewed_passes",
+    "surface_documents_requires_15_reviewed_passes",
+    "surface_editor_ide_requires_15_reviewed_passes",
+    "surface_email_messaging_requires_15_reviewed_passes",
+    "surface_mixed_window_thin_unknown_requires_15_reviewed_passes",
+    "surface_pdf_file_manager_requires_15_reviewed_passes",
+    "surface_spreadsheets_requires_15_reviewed_passes",
+    "surface_terminal_requires_15_reviewed_passes"
+  ]
+}

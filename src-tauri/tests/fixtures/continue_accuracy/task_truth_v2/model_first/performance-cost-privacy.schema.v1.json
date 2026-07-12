@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smalltalk.mfti_04.performance_cost_privacy.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "policy_frozen_before_holdout_access", "holdout_accessed_at_freeze", "sample_count", "measurement_policy", "measurements", "background_multimodal_requests", "privacy_blocked_frames_excluded_before_transport", "privacy_violations", "unsafe_opens", "provider_failure_experience_reviewed"],
+  "properties": {
+    "schema": {"const": "smalltalk.mfti_04.performance_cost_privacy.v1"},
+    "policy_frozen_before_holdout_access": {"const": true},
+    "holdout_accessed_at_freeze": {"const": false},
+    "sample_count": {"type": "integer", "minimum": 30},
+    "measurement_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete_sample_minimum", "monthly_continues", "input_cost_usd_per_million_tokens", "output_cost_usd_per_million_tokens", "input_token_source", "output_token_source", "source_data_policy"],
+      "properties": {
+        "complete_sample_minimum": {"const": 30},
+        "monthly_continues": {"type": "integer", "minimum": 1},
+        "input_cost_usd_per_million_tokens": {"const": 0.5},
+        "output_cost_usd_per_million_tokens": {"const": 2.0},
+        "input_token_source": {"const": "provider_actual_or_request_estimate"},
+        "output_token_source": {"const": "provider_actual_or_zero_when_no_response"},
+        "source_data_policy": {"const": "numeric_and_bounded_categorical_audit_metadata_only"}
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "required": ["capture_to_packet_p50_ms", "capture_to_packet_p95_ms", "request_build_p50_ms", "request_build_p95_ms", "provider_p50_ms", "provider_p95_ms", "verification_persistence_p50_ms", "verification_persistence_p95_ms", "manual_continue_p50_ms", "manual_continue_p95_ms", "image_count_p50", "image_count_p95", "image_bytes_p50", "image_bytes_p95", "input_tokens_p50", "input_tokens_p95", "output_tokens_p50", "output_tokens_p95", "cost_per_continue_usd", "expected_monthly_cost_usd", "provider_timeout_rate", "provider_error_rate", "invalid_output_rate", "second_pass_rate", "second_pass_cost_usd", "privacy_exclusion_rate"],
+      "additionalProperties": false,
+      "patternProperties": {".*": {"type": "number", "minimum": 0}}
+    },
+    "background_multimodal_requests": {"const": 0},
+    "privacy_blocked_frames_excluded_before_transport": {"const": true},
+    "privacy_violations": {"const": 0},
+    "unsafe_opens": {"const": 0},
+    "provider_failure_experience_reviewed": {"const": true}
+  }
+}

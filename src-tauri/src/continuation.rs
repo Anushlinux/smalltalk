@@ -1509,6 +1509,24 @@ pub struct ContinueThirdLayerRebuildResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueAuditMode {
+    None,
+    MftiReview,
+    Full,
+}
+
+impl ContinueAuditMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::MftiReview => "mfti_review",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueDecisionRequest {
     pub session_id: Option<String>,
     pub lookback_ms: Option<i64>,
@@ -1520,9 +1538,17 @@ pub struct ContinueDecisionRequest {
     pub model: Option<String>,
     pub max_candidates_for_model: Option<i64>,
     pub audit_output_enabled: Option<bool>,
+    #[serde(default)]
+    pub audit_mode: Option<ContinueAuditMode>,
     pub island_trigger_reason: Option<String>,
     pub island_source: Option<String>,
     pub request_trigger: Option<String>,
+    #[serde(default)]
+    pub manual_continue_frame_id: Option<String>,
+    #[serde(default)]
+    pub manual_continue_preflight_failure: Option<String>,
+    #[serde(default)]
+    pub manual_continue_started_at_ms: Option<i64>,
 }
 
 impl Default for ContinueDecisionRequest {
@@ -1538,11 +1564,28 @@ impl Default for ContinueDecisionRequest {
             model: None,
             max_candidates_for_model: Some(5),
             audit_output_enabled: Some(false),
+            audit_mode: None,
             island_trigger_reason: None,
             island_source: None,
             request_trigger: None,
+            manual_continue_frame_id: None,
+            manual_continue_preflight_failure: None,
+            manual_continue_started_at_ms: None,
         }
     }
+}
+
+pub fn effective_continue_audit_mode(request: &ContinueDecisionRequest) -> ContinueAuditMode {
+    if let Some(mode) = request.audit_mode.clone() {
+        return mode;
+    }
+    if request.request_trigger.as_deref() == Some("manual") {
+        return ContinueAuditMode::MftiReview;
+    }
+    if request.audit_output_enabled == Some(true) {
+        return ContinueAuditMode::Full;
+    }
+    ContinueAuditMode::None
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2967,7 +3010,12 @@ struct EvidenceFrame {
     capture_trigger: String,
     text_source: Option<String>,
     scope: Option<String>,
+    display_id: Option<String>,
     window_id: Option<i64>,
+    screen_scale: Option<f64>,
+    pixel_width: Option<i64>,
+    pixel_height: Option<i64>,
+    full_screenshot_path: Option<String>,
     active_window_crop_path: Option<String>,
     full_text: Option<String>,
     active_text: Option<String>,
@@ -3075,6 +3123,13 @@ struct EvidenceUiEvent {
     ts_ms: Option<i64>,
     event_type: String,
     key_category: Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+    window_id: Option<i64>,
+    app_bundle_id: Option<String>,
+    scroll_delta_x: Option<f64>,
+    scroll_delta_y: Option<f64>,
+    button: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3091,11 +3146,17 @@ struct EvidenceTransition {
     transition_type: Option<String>,
     summary: Option<String>,
     confidence: Option<f64>,
+    pre_frame_id: Option<String>,
+    post_frame_id: Option<String>,
+    changed_region_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct EvidenceFrameDiff {
+    from_frame_id: Option<String>,
+    to_frame_id: Option<String>,
     diff_type: Option<String>,
+    changed_region_json: Option<String>,
     added_text_hashes: Option<String>,
     removed_text_hashes: Option<String>,
     summary: Option<String>,
@@ -4283,13 +4344,32 @@ pub fn rebuild_continue_third_layer(
     })
 }
 
+fn latest_evidence_session_id(conn: &Connection) -> Result<Option<String>, String> {
+    if !table_exists(conn, "frames")? || !column_exists(conn, "frames", "session_id")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT session_id FROM frames
+         WHERE session_id IS NOT NULL AND TRIM(session_id) <> ''
+         ORDER BY captured_at DESC, id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
 pub fn get_continue_decision(
     conn: &Connection,
     request: ContinueDecisionRequest,
 ) -> Result<ContinueDecisionResult, String> {
     ensure_continue_schema(conn)?;
+    let effective_session_id = request
+        .session_id
+        .clone()
+        .or_else(|| latest_evidence_session_id(conn).ok().flatten());
     let request = ContinueDecisionRequest {
-        session_id: request.session_id,
+        session_id: effective_session_id,
         lookback_ms: request.lookback_ms.or(Some(45 * 60 * 1000)),
         limit: request.limit.or(Some(700)),
         mode: request.mode.or(Some("normal".to_string())),
@@ -4299,9 +4379,13 @@ pub fn get_continue_decision(
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
+        audit_mode: request.audit_mode,
         island_trigger_reason: request.island_trigger_reason,
         island_source: request.island_source,
         request_trigger: request.request_trigger,
+        manual_continue_frame_id: request.manual_continue_frame_id,
+        manual_continue_preflight_failure: request.manual_continue_preflight_failure,
+        manual_continue_started_at_ms: request.manual_continue_started_at_ms,
     };
     let effective_mode = effective_continue_decision_mode(
         request.mode.as_deref(),
@@ -4340,7 +4424,7 @@ pub fn get_continue_decision(
             &current_watermark,
             &activity_recap_policy_fingerprint,
         );
-    let mut cache_bypass_reasons = if force_rebuild {
+    let mut cache_bypass_reasons = if force_rebuild || request.session_id.is_none() {
         Vec::new()
     } else {
         continue_cache_bypass_reasons(
@@ -4350,7 +4434,7 @@ pub fn get_continue_decision(
             micro_inference_enabled,
         )?
     };
-    let mut cached_meta = if !force_rebuild {
+    let mut cached_meta = if !force_rebuild && request.session_id.is_some() {
         fresh_cached_continue_decision_for_recap(
             conn,
             request.session_id.as_deref(),
@@ -4449,26 +4533,17 @@ pub fn get_continue_decision(
             .or(focus.app_name.as_deref())
             .and_then(|value| clean_user_handoff_line(value.to_string(), 120))
     });
-    // Task identity is selected before workstreams, open loops, candidates, or
-    // target features are considered. In shadow/eligible modes this is audited
-    // without changing legacy authority; in authoritative mode it is the only
-    // semantic source allowed to reach the public answer.
-    let mut task_truth_v2 =
-        task_truth_v2::production::production_decision(conn, request.session_id.as_deref())?;
-    let task_truth_snapshot_id = task_truth_v2
-        .answer
-        .as_ref()
-        .map(|answer| answer.snapshot_id.as_str());
-    let snapshot_legacy_turn_id = task_truth_v2::production::selected_snapshot_legacy_turn_id(
-        conn,
-        request.session_id.as_deref(),
-        task_truth_snapshot_id,
-    )?;
-    let request_trigger = request
-        .request_trigger
-        .clone()
-        .or_else(|| request.island_source.as_ref().map(|_| "island".to_string()))
-        .unwrap_or_else(|| "startup".to_string());
+    let request_trigger = if request.request_trigger.as_deref() == Some("manual")
+        || request.island_trigger_reason.as_deref() == Some("user_pressed_continue")
+    {
+        "manual".to_string()
+    } else {
+        request
+            .request_trigger
+            .clone()
+            .or_else(|| request.island_source.as_ref().map(|_| "island".to_string()))
+            .unwrap_or_else(|| "startup".to_string())
+    };
     annotate_current_surface_task_relation(
         &mut current_surface_resolution,
         current_task_turn.as_ref(),
@@ -5764,10 +5839,35 @@ pub fn get_continue_decision(
             &decision_id,
             request.session_id.as_deref(),
             selected.as_ref().map(|candidate| candidate.id.as_str()),
+            request.manual_continue_frame_id.as_deref(),
+            request.manual_continue_preflight_failure.as_deref(),
+            request.manual_continue_started_at_ms,
         ) {
             warnings.push(format!("task_truth_v2_shadow_audit_failed:{error}"));
         }
     }
+    // Manual inference is completed and persisted before this call reads the
+    // Task Truth result. This prevents a one-Continue lag in diagnostics and
+    // public provenance.
+    let mut task_truth_v2 = task_truth_v2::production::production_decision_for_attempt(
+        conn,
+        request.session_id.as_deref(),
+        request_trigger == "manual",
+        (request_trigger == "manual").then_some(decision_id.as_str()),
+    )?;
+    if cached_meta.is_some() && request_trigger != "manual" {
+        if let Some(diagnostic) = task_truth_v2.inference_diagnostic.as_mut() {
+            diagnostic.origin = "cache".into();
+        }
+    }
+    let task_truth_thread_id = task_truth_v2
+        .answer
+        .as_ref()
+        .and_then(|answer| answer.atomic_identity.task_thread_id.clone());
+    let task_truth_thread_revision = task_truth_v2
+        .answer
+        .as_ref()
+        .and_then(|answer| answer.atomic_identity.task_thread_revision);
 
     let evidence_anchors = evidence_anchors_for_decision(
         current_focus.as_ref(),
@@ -6309,20 +6409,38 @@ pub fn get_continue_decision(
     }
     .to_string();
     task_truth_v2::production::attach_observed_activity(&mut task_truth_v2, &work_truth);
+    let task_truth_target = public_return_candidate.map(|candidate| {
+        let artifact = candidate_public_target_artifact(candidate);
+        return_target_summary(
+            artifact,
+            artifact.and_then(|artifact| artifact.last_seen_frame_id.clone()),
+        )
+    });
+    let target_owner = task_truth_target
+        .as_ref()
+        .map(|target| {
+            task_truth_v2::production::strict_target_owner(
+                conn,
+                task_truth_v2.answer.as_ref(),
+                target,
+            )
+        })
+        .transpose()?
+        .flatten();
     task_truth_v2::production::attach_strict_target(
         &mut task_truth_v2,
-        snapshot_legacy_turn_id.as_deref(),
-        current_task_turn
+        task_truth_thread_id.as_deref(),
+        task_truth_thread_revision,
+        target_owner
             .as_ref()
-            .map(|turn| turn.task_turn_id.as_str()),
+            .map(|(thread_id, _)| thread_id.as_str()),
+        target_owner.as_ref().map(|(_, revision)| *revision),
         direct_target_policy.direct_target_allowed,
-        public_return_candidate.map(|candidate| {
-            return_target_summary(candidate_public_target_artifact(candidate), None)
-        }),
+        task_truth_target,
     );
     task_truth_v2::production::persist_decision_contract(conn, &decision_id, &task_truth_v2)?;
 
-    Ok(ContinueDecisionResult {
+    let result = ContinueDecisionResult {
         decision_id,
         mode: effective_mode.to_string(),
         cache_hit: cached_meta.is_some(),
@@ -6470,7 +6588,8 @@ pub fn get_continue_decision(
         micro_inference_result_kind,
         continue_output_path: None,
         audit_inference_events,
-    })
+    };
+    Ok(result)
 }
 
 pub fn assess_continue_evidence_sufficiency(
@@ -9830,6 +9949,10 @@ fn fresh_cached_continue_decision_internal(
     if !table_exists(conn, "continue_decisions")? {
         return Ok(None);
     }
+    let resolved_session_id = session_id
+        .map(str::to_string)
+        .or_else(|| latest_evidence_session_id(conn).ok().flatten());
+    let session_id = resolved_session_id.as_deref();
     let mut stmt = conn
         .prepare(
             "SELECT d.id, d.source, d.model, d.response_id, d.next_action,
@@ -11586,6 +11709,10 @@ pub fn record_continue_feedback(
         "artifact_only_evidence",
         "ignored_workstream",
         "user_next_step_note",
+        "supporting_work",
+        "unrelated_activity",
+        "completed",
+        "reactivated",
     ];
     if !allowed.contains(&feedback_kind) {
         return Err(format!("unsupported feedback_kind: {}", feedback_kind));
@@ -11622,6 +11749,8 @@ pub fn record_continue_feedback(
             "next_action",
             "where",
             "hypothesis",
+            "relationship",
+            "task_status",
         ];
         if !allowed_fields.contains(&affected_field) {
             return Err(format!("unsupported affected_task_field: {affected_field}"));
@@ -11630,47 +11759,142 @@ pub fn record_continue_feedback(
             return Err("hypothesis feedback requires a hypothesis id".into());
         }
         if affected_field != "hypothesis" && request.task_hypothesis_id.is_some() {
-            return Err("hypothesis id is valid only for hypothesis feedback".into());
+            if !matches!(
+                affected_field,
+                "relationship" | "task_status" | "task_summary"
+            ) {
+                return Err("hypothesis id is valid only for hypothesis, task-summary, relationship, or task-status feedback".into());
+            }
+        }
+        if affected_field == "relationship" {
+            if !matches!(feedback_kind, "supporting_work" | "unrelated_activity") {
+                return Err(
+                    "relationship feedback requires supporting_work or unrelated_activity".into(),
+                );
+            }
+        }
+        if affected_field == "task_status" && !matches!(feedback_kind, "completed" | "reactivated")
+        {
+            return Err("task-status feedback requires completed or reactivated".into());
         }
     }
     if has_complete_task_scope {
         let snapshot_id = request.task_snapshot_id.as_deref().unwrap_or_default();
         let snapshot_revision = request.task_snapshot_revision.unwrap_or_default();
         let affected_field = request.affected_task_field.as_deref().unwrap_or_default();
+        let snapshot_raw = conn
+            .query_row(
+                "SELECT snapshot_json FROM task_truth_v2_snapshots
+                 WHERE snapshot_id=?1 AND revision=?2",
+                params![snapshot_id, snapshot_revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .ok_or_else(|| "task feedback identity is stale or unknown".to_string())?;
+        let scoped_snapshot: task_truth_v2::task_snapshot::TaskSnapshotV2 =
+            serde_json::from_str(&snapshot_raw).map_err(to_string)?;
+        let task_thread_id = scoped_snapshot
+            .task_thread_id
+            .as_deref()
+            .ok_or_else(|| "task feedback requires a thread-owned snapshot".to_string())?;
+        let evidence_watermark = scoped_snapshot.evidence_watermark.as_str();
+        let correction_value = match (affected_field, feedback_kind) {
+            ("relationship", "supporting_work") => Some("supporting_research"),
+            ("relationship", "unrelated_activity") => Some("unrelated_or_unknown"),
+            ("task_status", "completed") => Some("completed"),
+            ("task_status", "reactivated") => Some("reactivated"),
+            _ => None,
+        };
+        let effective_hypothesis_id = request.task_hypothesis_id.clone().or_else(|| {
+            (affected_field == "task_summary" && feedback_kind == "rejected")
+                .then(|| scoped_snapshot.selected_hypothesis_id.clone())
+                .flatten()
+        });
+        if let Some(hypothesis_id) = effective_hypothesis_id.as_deref() {
+            let belongs = scoped_snapshot.selected_hypothesis_id.as_deref() == Some(hypothesis_id)
+                || scoped_snapshot
+                    .alternative_hypotheses
+                    .iter()
+                    .any(|hypothesis| hypothesis.hypothesis_id == hypothesis_id);
+            if !belongs {
+                return Err("task feedback hypothesis does not belong to the snapshot".into());
+            }
+        }
         let timestamp_ms = current_time_millis();
         let id = format!(
             "task-truth-feedback-{}",
             stable_hash(
                 format!(
-                    "{}:{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     request.decision_id.as_deref().unwrap_or("none"),
                     snapshot_id,
                     snapshot_revision,
+                    task_thread_id,
+                    evidence_watermark,
                     affected_field,
-                    request.task_hypothesis_id.as_deref().unwrap_or("none"),
+                    effective_hypothesis_id.as_deref().unwrap_or("none"),
                     feedback_kind,
                     source,
                 )
                 .as_bytes(),
             )
         );
-        conn.execute(
-            "INSERT OR IGNORE INTO task_truth_v2_feedback_events (
-               feedback_id, task_snapshot_id, task_snapshot_revision, affected_field,
-               hypothesis_id, feedback_kind, decision_id, observed_at_ms
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                id,
-                snapshot_id,
-                snapshot_revision,
-                affected_field,
-                request.task_hypothesis_id,
-                feedback_kind,
-                request.decision_id,
-                timestamp_ms,
-            ],
-        )
-        .map_err(to_string)?;
+        let creates_semantic_revision = matches!(
+            (affected_field, feedback_kind),
+            ("hypothesis", "corrected")
+                | ("relationship", "supporting_work" | "unrelated_activity")
+                | ("task_status", "completed" | "reactivated")
+                | ("task_summary", "rejected")
+        );
+        let feedback_already_persisted = conn
+            .query_row(
+                "SELECT 1 FROM task_truth_v2_feedback_events WHERE feedback_id=?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(to_string)?
+            .is_some();
+        if creates_semantic_revision && !feedback_already_persisted {
+            task_truth_v2::task_thread::persist_human_correction_atomic(
+                conn,
+                &scoped_snapshot,
+                &task_truth_v2::task_thread::HumanCorrectionPersistenceV1 {
+                    feedback_id: id.clone(),
+                    decision_id: request.decision_id.clone(),
+                    affected_field: affected_field.to_string(),
+                    hypothesis_id: effective_hypothesis_id.clone(),
+                    feedback_kind: feedback_kind.to_string(),
+                    correction_value: correction_value.map(str::to_string),
+                    observed_at_ms: timestamp_ms,
+                },
+            )?;
+        } else if !feedback_already_persisted {
+            conn.execute(
+                "INSERT OR IGNORE INTO task_truth_v2_feedback_events (
+                   feedback_id, task_thread_id, task_thread_revision,
+                   task_snapshot_id, task_snapshot_revision,
+                   affected_field, hypothesis_id, evidence_watermark, correction_value,
+                   feedback_kind, decision_id, observed_at_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    id,
+                    task_thread_id,
+                    scoped_snapshot.task_thread_revision,
+                    snapshot_id,
+                    snapshot_revision,
+                    affected_field,
+                    effective_hypothesis_id,
+                    evidence_watermark,
+                    correction_value,
+                    feedback_kind,
+                    request.decision_id,
+                    timestamp_ms,
+                ],
+            )
+            .map_err(to_string)?;
+        }
         return Ok(ContinueFeedbackEventResult {
             id,
             decision_id: request.decision_id,
@@ -28043,7 +28267,12 @@ fn event_rows_to_evidence_frames(
             capture_trigger: format!("event_signal_{}", signal),
             text_source: Some("event".to_string()),
             scope: None,
+            display_id: None,
             window_id: None,
+            screen_scale: None,
+            pixel_width: None,
+            pixel_height: None,
+            full_screenshot_path: None,
             active_window_crop_path: None,
             full_text: Some(summary),
             active_text: None,
@@ -28066,6 +28295,13 @@ fn event_rows_to_evidence_frames(
                 ts_ms: Some(row.ts_ms),
                 event_type: row.event_type.clone(),
                 key_category: row.key_category.clone(),
+                x: None,
+                y: None,
+                window_id: None,
+                app_bundle_id: row.app_bundle_id.clone(),
+                scroll_delta_x: None,
+                scroll_delta_y: None,
+                button: None,
             }],
             trigger: Some(EvidenceTrigger {
                 id: format!("event-trigger-{}", stable_hash(row.id.as_bytes())),
@@ -28167,7 +28403,12 @@ fn evidence_frame_from_row(row: &Row<'_>) -> rusqlite::Result<EvidenceFrame> {
         capture_trigger: row.get(6)?,
         text_source: row.get(7)?,
         scope: None,
+        display_id: None,
         window_id: None,
+        screen_scale: None,
+        pixel_width: None,
+        pixel_height: None,
+        full_screenshot_path: None,
         active_window_crop_path: None,
         full_text: row.get(8)?,
         active_text: None,
@@ -28211,6 +28452,17 @@ fn load_frame_capture_attribution(
             .map_err(to_string)?
             .flatten();
     }
+    if column_exists(conn, "frames", "display_id")? {
+        frame.display_id = conn
+            .query_row(
+                "SELECT display_id FROM frames WHERE CAST(id AS TEXT) = ?1",
+                params![frame.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .flatten();
+    }
     if column_exists(conn, "frames", "window_id")? {
         frame.window_id = conn
             .query_row(
@@ -28232,6 +28484,23 @@ fn load_frame_capture_attribution(
             .optional()
             .map_err(to_string)?
             .flatten();
+    }
+    if column_exists(conn, "frames", "full_screenshot_path")? {
+        let geometry = conn
+            .query_row(
+                "SELECT screen_scale, pixel_width, pixel_height, full_screenshot_path
+                 FROM frames WHERE CAST(id AS TEXT) = ?1",
+                params![frame.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(to_string)?;
+        if let Some((scale, width, height, path)) = geometry {
+            frame.screen_scale = scale;
+            frame.pixel_width = width;
+            frame.pixel_height = height;
+            frame.full_screenshot_path = path;
+        }
     }
     if table_exists(conn, "frame_text_resolutions")? {
         if let Some((active_text, background_text, full_text_quality, quality_flags_json)) = conn
@@ -28529,7 +28798,27 @@ fn load_frame_visible_windows(
     let mut stmt = conn
         .prepare(
             "SELECT w.id, w.cg_window_id, w.owner_name, w.bundle_id, w.window_title,
-                    w.layer, w.alpha, w.is_onscreen, w.is_active,
+                    w.layer, w.alpha, w.is_onscreen,
+                    CASE
+                      WHEN COALESCE(w.is_active, 0) = 1 THEN 1
+                      WHEN s.active_window_id IS NULL
+                       AND s.active_app_bundle_id IS NOT NULL
+                       AND w.bundle_id = s.active_app_bundle_id
+                       AND COALESCE(w.is_onscreen, 1) = 1
+                       AND COALESCE(w.layer, 0) = 0
+                       AND (COALESCE(w.bounds_w, 0) * COALESCE(w.bounds_h, 0)) >
+                           COALESCE((
+                             SELECT MAX(COALESCE(other.bounds_w, 0) * COALESCE(other.bounds_h, 0))
+                             FROM windows other
+                             WHERE other.window_snapshot_id = w.window_snapshot_id
+                               AND other.id <> w.id
+                               AND other.bundle_id = s.active_app_bundle_id
+                               AND COALESCE(other.is_onscreen, 1) = 1
+                               AND COALESCE(other.layer, 0) = 0
+                           ), -1)
+                      THEN 1
+                      ELSE 0
+                    END AS effective_is_active,
                     w.bounds_x, w.bounds_y, w.bounds_w, w.bounds_h
              FROM windows w
              JOIN window_snapshots s ON s.id = w.window_snapshot_id
@@ -28584,16 +28873,29 @@ fn load_frame_ui_events(
             }
         }
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, ts_ms, event_type, key_category
+    let event_column = |name: &str| -> Result<String, String> {
+        Ok(if column_exists(conn, "ui_events", name)? {
+            name.to_string()
+        } else {
+            "NULL".to_string()
+        })
+    };
+    let sql = format!(
+        "SELECT id, ts_ms, event_type, key_category, {}, {}, {}, {}, {}, {}, {}
              FROM ui_events
              WHERE (?1 IS NULL OR session_id = ?1)
                AND ABS(ts_ms - ?2) <= 2500
              ORDER BY ts_ms ASC
              LIMIT 12",
-        )
-        .map_err(to_string)?;
+        event_column("x")?,
+        event_column("y")?,
+        event_column("window_id")?,
+        event_column("app_bundle_id")?,
+        event_column("scroll_dx")?,
+        event_column("scroll_dy")?,
+        event_column("button")?
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(
             params![frame.session_id.as_deref(), frame.captured_at],
@@ -28603,6 +28905,13 @@ fn load_frame_ui_events(
                     ts_ms: row.get(1)?,
                     event_type: row.get(2)?,
                     key_category: row.get(3)?,
+                    x: row.get(4)?,
+                    y: row.get(5)?,
+                    window_id: row.get(6)?,
+                    app_bundle_id: row.get(7)?,
+                    scroll_delta_x: row.get(8)?,
+                    scroll_delta_y: row.get(9)?,
+                    button: row.get(10)?,
                 })
             },
         )
@@ -28619,21 +28928,41 @@ fn load_ui_event_by_id(
     conn: &Connection,
     event_id: &str,
 ) -> Result<Option<EvidenceUiEvent>, String> {
-    conn.query_row(
-        "SELECT id, ts_ms, event_type, key_category
+    let event_column = |name: &str| -> Result<String, String> {
+        Ok(if column_exists(conn, "ui_events", name)? {
+            name.to_string()
+        } else {
+            "NULL".to_string()
+        })
+    };
+    let sql = format!(
+        "SELECT id, ts_ms, event_type, key_category, {}, {}, {}, {}, {}, {}, {}
          FROM ui_events
          WHERE id = ?1
          LIMIT 1",
-        params![event_id],
-        |row| {
-            Ok(EvidenceUiEvent {
-                id: row.get(0)?,
-                ts_ms: row.get(1)?,
-                event_type: row.get(2)?,
-                key_category: row.get(3)?,
-            })
-        },
-    )
+        event_column("x")?,
+        event_column("y")?,
+        event_column("window_id")?,
+        event_column("app_bundle_id")?,
+        event_column("scroll_dx")?,
+        event_column("scroll_dy")?,
+        event_column("button")?
+    );
+    conn.query_row(&sql, params![event_id], |row| {
+        Ok(EvidenceUiEvent {
+            id: row.get(0)?,
+            ts_ms: row.get(1)?,
+            event_type: row.get(2)?,
+            key_category: row.get(3)?,
+            x: row.get(4)?,
+            y: row.get(5)?,
+            window_id: row.get(6)?,
+            app_bundle_id: row.get(7)?,
+            scroll_delta_x: row.get(8)?,
+            scroll_delta_y: row.get(9)?,
+            button: row.get(10)?,
+        })
+    })
     .optional()
     .map_err(to_string)
 }
@@ -28672,23 +29001,31 @@ fn load_frame_transition(
     if !table_exists(conn, "event_transitions")? {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT id, primary_event_id, transition_type, summary, confidence
+    let changed_region_expr = if column_exists(conn, "event_transitions", "changed_region_json")? {
+        "changed_region_json"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, primary_event_id, transition_type, summary, confidence,
+                pre_frame_id, post_frame_id, {changed_region_expr}
          FROM event_transitions
          WHERE post_frame_id = ?1 OR pre_frame_id = ?1
          ORDER BY ts_end_ms DESC
-         LIMIT 1",
-        params![frame_id],
-        |row| {
-            Ok(EvidenceTransition {
-                id: row.get(0)?,
-                primary_event_id: row.get(1)?,
-                transition_type: row.get(2)?,
-                summary: row.get(3)?,
-                confidence: row.get(4)?,
-            })
-        },
-    )
+         LIMIT 1"
+    );
+    conn.query_row(&sql, params![frame_id], |row| {
+        Ok(EvidenceTransition {
+            id: row.get(0)?,
+            primary_event_id: row.get(1)?,
+            transition_type: row.get(2)?,
+            summary: row.get(3)?,
+            confidence: row.get(4)?,
+            pre_frame_id: row.get(5)?,
+            post_frame_id: row.get(6)?,
+            changed_region_json: row.get(7)?,
+        })
+    })
     .optional()
     .map_err(to_string)
 }
@@ -28697,22 +29034,30 @@ fn load_frame_diff(conn: &Connection, frame_id: &str) -> Result<Option<EvidenceF
     if !table_exists(conn, "frame_diffs")? {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT diff_type, added_text_hashes, removed_text_hashes, summary
+    let changed_region_expr = if column_exists(conn, "frame_diffs", "changed_region_json")? {
+        "changed_region_json"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT from_frame_id, to_frame_id, diff_type, {changed_region_expr},
+                added_text_hashes, removed_text_hashes, summary
          FROM frame_diffs
          WHERE to_frame_id = ?1
          ORDER BY ts_ms DESC
-         LIMIT 1",
-        params![frame_id],
-        |row| {
-            Ok(EvidenceFrameDiff {
-                diff_type: row.get(0)?,
-                added_text_hashes: row.get(1)?,
-                removed_text_hashes: row.get(2)?,
-                summary: row.get(3)?,
-            })
-        },
-    )
+         LIMIT 1"
+    );
+    conn.query_row(&sql, params![frame_id], |row| {
+        Ok(EvidenceFrameDiff {
+            from_frame_id: row.get(0)?,
+            to_frame_id: row.get(1)?,
+            diff_type: row.get(2)?,
+            changed_region_json: row.get(3)?,
+            added_text_hashes: row.get(4)?,
+            removed_text_hashes: row.get(5)?,
+            summary: row.get(6)?,
+        })
+    })
     .optional()
     .map_err(to_string)
 }
@@ -40696,6 +41041,39 @@ mod tests {
     use rusqlite::params;
 
     #[test]
+    fn audit_mode_preserves_full_legacy_and_defaults_manual_to_review() {
+        let background_full = ContinueDecisionRequest {
+            audit_output_enabled: Some(true),
+            request_trigger: Some("background".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            effective_continue_audit_mode(&background_full),
+            ContinueAuditMode::Full
+        ));
+
+        let manual_legacy = ContinueDecisionRequest {
+            audit_output_enabled: Some(true),
+            request_trigger: Some("manual".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            effective_continue_audit_mode(&manual_legacy),
+            ContinueAuditMode::MftiReview
+        ));
+
+        let explicit_full = ContinueDecisionRequest {
+            audit_mode: Some(ContinueAuditMode::Full),
+            request_trigger: Some("manual".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            effective_continue_audit_mode(&explicit_full),
+            ContinueAuditMode::Full
+        ));
+    }
+
+    #[test]
     fn continue_schema_status_reports_empty_foundation() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_continue_schema(&conn).unwrap();
@@ -43020,7 +43398,12 @@ mod tests {
             capture_trigger: "manual".to_string(),
             text_source: Some("accessibility".to_string()),
             scope: Some("active_window".to_string()),
+            display_id: Some("main".to_string()),
             window_id: Some(1),
+            screen_scale: Some(1.0),
+            pixel_width: Some(1200),
+            pixel_height: Some(800),
+            full_screenshot_path: None,
             active_window_crop_path: None,
             full_text: None,
             active_text: None,
@@ -43248,7 +43631,10 @@ mod tests {
     fn branch_taxonomy_classifies_terminal_output_without_input_as_support_output() {
         let mut frame = branch_test_frame(Some("Terminal"), Some("cargo test output"), None, None);
         frame.frame_diff = Some(EvidenceFrameDiff {
+            from_frame_id: None,
+            to_frame_id: Some(frame.id.clone()),
             diff_type: Some("text_added".to_string()),
+            changed_region_json: None,
             added_text_hashes: Some("hash-a".to_string()),
             removed_text_hashes: None,
             summary: None,

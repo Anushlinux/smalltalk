@@ -27,6 +27,7 @@ static LAST_CONTINUE_ISLAND_STATE: Mutex<Option<RememberedContinueIslandState>> 
 
 #[derive(Debug, Clone)]
 struct RememberedContinueIslandState {
+    session_id: Option<String>,
     decision_id: String,
     request_trigger: String,
     task_turn_id: Option<String>,
@@ -441,6 +442,10 @@ struct SessionIslandAction {
     decision_id: Option<String>,
     source: Option<String>,
     trace_id: Option<String>,
+    task_snapshot_id: Option<String>,
+    task_snapshot_revision: Option<i64>,
+    affected_task_field: Option<String>,
+    task_hypothesis_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -466,6 +471,10 @@ pub struct IslandContinueActionInput {
     pub decision_id: Option<String>,
     pub source: Option<String>,
     pub trace_id: Option<String>,
+    pub task_snapshot_id: Option<String>,
+    pub task_snapshot_revision: Option<i64>,
+    pub affected_task_field: Option<String>,
+    pub task_hypothesis_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -835,13 +844,11 @@ fn is_sensitive_privacy_label(label: &str) -> bool {
 
 fn apply_remembered_continue_to_status_snapshot(
     snapshot: &mut SessionIslandSnapshot,
-    _status: &CaptureStatus,
+    status: &CaptureStatus,
 ) {
     if matches!(
         snapshot.state,
         SessionIslandState::Hidden
-            | SessionIslandState::Starting
-            | SessionIslandState::Processing
             | SessionIslandState::TrailReconstructing
             | SessionIslandState::StoppedToast
             | SessionIslandState::Error
@@ -856,10 +863,24 @@ fn apply_remembered_continue_to_status_snapshot(
     let Some(remembered) = remembered else {
         return;
     };
+    let status_session_id = status
+        .active_session
+        .as_ref()
+        .or(status.latest_session.as_ref())
+        .map(|session| session.id.as_str())
+        .or_else(|| {
+            status
+                .latest_frame
+                .as_ref()
+                .and_then(|frame| frame.session_id.as_deref())
+        });
+    let session_changed = remembered.session_id.as_deref() != status_session_id
+        && (remembered.session_id.is_some() || status_session_id.is_some());
 
     let latest_capture_at = snapshot.last_capture_at_ms.unwrap_or_default();
     let remembered_evidence_at = remembered.evidence_updated_at_ms.unwrap_or_default();
-    let has_new_evidence = snapshot.frame_count > remembered.frame_count
+    let has_new_evidence = session_changed
+        || snapshot.frame_count > remembered.frame_count
         || snapshot.trail_moment_count > remembered.signal_count
         || snapshot.event_count > remembered.event_count
         || latest_capture_at > remembered_evidence_at;
@@ -945,6 +966,10 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
                 action.decision_id,
                 action.source,
                 action.trace_id,
+                action.task_snapshot_id,
+                action.task_snapshot_revision,
+                action.affected_task_field,
+                action.task_hypothesis_id,
             )
         }
         SessionIslandActionKind::OpenMainWindow => open_main_window(),
@@ -1032,7 +1057,8 @@ fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRe
         micro_inference_enabled: Some(true),
         activity_recap_model_enabled: Some(true),
         max_candidates_for_model: Some(5),
-        audit_output_enabled: Some(true),
+        audit_output_enabled: Some(false),
+        audit_mode: Some(crate::continuation::ContinueAuditMode::None),
         request_trigger: Some("island".to_string()),
         ..Default::default()
     }
@@ -1321,6 +1347,10 @@ fn open_resume_point_from_island(
                 decision_id,
                 source: source.or_else(|| Some("native_callback".to_string())),
                 trace_id,
+                task_snapshot_id: None,
+                task_snapshot_revision: None,
+                affected_task_field: None,
+                task_hypothesis_id: None,
             },
         );
         match result {
@@ -1348,6 +1378,10 @@ fn perform_typed_continue_action_from_island(
     decision_id: Option<String>,
     source: Option<String>,
     trace_id: Option<String>,
+    task_snapshot_id: Option<String>,
+    task_snapshot_revision: Option<i64>,
+    affected_task_field: Option<String>,
+    task_hypothesis_id: Option<String>,
 ) {
     let Some(app) = APP_HANDLE.get().cloned() else {
         eprintln!("[session_island] typed Continue action requested before AppHandle was ready");
@@ -1385,6 +1419,10 @@ fn perform_typed_continue_action_from_island(
                 decision_id,
                 source: source.or_else(|| Some("native_callback".to_string())),
                 trace_id,
+                task_snapshot_id,
+                task_snapshot_revision,
+                affected_task_field,
+                task_hypothesis_id,
             },
         );
         match result {
@@ -1446,6 +1484,15 @@ fn perform_island_continue_action_for_status(
         }
         IslandActionKind::MarkNotUseful => {
             record_island_continue_feedback(app, status, input, "ignored", "island_not_useful")
+        }
+        IslandActionKind::ChooseTaskAlternative
+        | IslandActionKind::RejectSelectedTask
+        | IslandActionKind::RejectTaskAlternative
+        | IslandActionKind::MarkSupportingWork
+        | IslandActionKind::MarkUnrelatedActivity
+        | IslandActionKind::MarkTaskCompleted
+        | IslandActionKind::ReactivateTask => {
+            record_scoped_island_task_feedback(app, status, input)
         }
         IslandActionKind::InspectEvidence | IslandActionKind::OpenSmalltalk => {
             open_main_window();
@@ -1532,6 +1579,97 @@ fn record_island_continue_feedback(
         open_strategy: Some("feedback_recorded".to_string()),
         refreshed_state: Some(refreshed),
         warnings: vec![warning_code.to_string()],
+    })
+}
+
+fn scoped_task_feedback_contract(
+    kind: &IslandActionKind,
+) -> Option<(&'static str, &'static str, bool)> {
+    match kind {
+        IslandActionKind::ChooseTaskAlternative => Some(("corrected", "hypothesis", true)),
+        IslandActionKind::RejectSelectedTask => Some(("rejected", "task_summary", false)),
+        IslandActionKind::RejectTaskAlternative => Some(("rejected", "hypothesis", true)),
+        IslandActionKind::MarkSupportingWork => Some(("supporting_work", "relationship", true)),
+        IslandActionKind::MarkUnrelatedActivity => {
+            Some(("unrelated_activity", "relationship", true))
+        }
+        IslandActionKind::MarkTaskCompleted => Some(("completed", "task_status", true)),
+        IslandActionKind::ReactivateTask => Some(("reactivated", "task_status", true)),
+        _ => None,
+    }
+}
+
+fn record_scoped_island_task_feedback(
+    app: AppHandle,
+    status: CaptureStatus,
+    input: IslandContinueActionInput,
+) -> Result<IslandContinueActionResult, String> {
+    let (feedback_kind, expected_field, hypothesis_required) =
+        scoped_task_feedback_contract(&input.action_kind)
+            .ok_or_else(|| "island action is not scoped task feedback".to_string())?;
+    let snapshot_id = input
+        .task_snapshot_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "scoped island task feedback requires snapshot id".to_string())?;
+    let snapshot_revision = input
+        .task_snapshot_revision
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| "scoped island task feedback requires snapshot revision".to_string())?;
+    if input.affected_task_field.as_deref() != Some(expected_field) {
+        return Err("scoped island task feedback field does not match its action".into());
+    }
+    if hypothesis_required
+        && input
+            .task_hypothesis_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("scoped island task feedback requires hypothesis id".into());
+    }
+    let decision_id = input
+        .decision_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let feedback = crate::capture::record_continue_feedback(
+        app.clone(),
+        crate::continuation::ContinueExplicitFeedbackRequest {
+            decision_id: decision_id.clone(),
+            selected_candidate_id: None,
+            workstream_id: None,
+            target_artifact_id: None,
+            corrected_artifact_id: None,
+            feedback_kind: feedback_kind.to_string(),
+            note: None,
+            source: Some("island_primary".to_string()),
+            task_snapshot_id: Some(snapshot_id.to_string()),
+            task_snapshot_revision: Some(snapshot_revision),
+            affected_task_field: Some(expected_field.to_string()),
+            task_hypothesis_id: input.task_hypothesis_id.clone(),
+        },
+    )?;
+    let refreshed = gateway::get_island_continue_state_for_status(
+        app,
+        status,
+        IslandContinueStateInput {
+            reason: IslandContinueReason::EvidenceChanged,
+            existing_decision_id: decision_id.clone(),
+            allow_refresh: true,
+            force_refresh: true,
+            source: Some("island_primary".to_string()),
+        },
+    )?
+    .state;
+    Ok(IslandContinueActionResult {
+        action_kind: input.action_kind,
+        decision_id: decision_id.or(feedback.decision_id),
+        opened: false,
+        open_strategy: Some("scoped_task_feedback_recorded".to_string()),
+        refreshed_state: Some(refreshed),
+        warnings: Vec::new(),
     })
 }
 
@@ -1686,6 +1824,7 @@ fn remember_continue_decision_from_snapshot(
     remember_continue_decision(decision);
     if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
         *slot = Some(RememberedContinueIslandState {
+            session_id: snapshot.session_id.clone(),
             decision_id: decision.decision_id.clone(),
             request_trigger: decision.request_trigger.clone(),
             task_turn_id: decision
@@ -1856,6 +1995,54 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn native_scoped_task_feedback_envelope_preserves_exact_identity() {
+        let action: SessionIslandAction = serde_json::from_value(serde_json::json!({
+            "action": "perform_continue_action",
+            "action_kind": "choose_task_alternative",
+            "decision_id": "decision-a",
+            "task_snapshot_id": "snapshot-a",
+            "task_snapshot_revision": 4,
+            "affected_task_field": "hypothesis",
+            "task_hypothesis_id": "hypothesis-b",
+            "source": "native_island"
+        }))
+        .unwrap();
+        assert_eq!(
+            action.action_kind,
+            Some(IslandActionKind::ChooseTaskAlternative)
+        );
+        assert_eq!(action.task_snapshot_id.as_deref(), Some("snapshot-a"));
+        assert_eq!(action.task_snapshot_revision, Some(4));
+        assert_eq!(action.affected_task_field.as_deref(), Some("hypothesis"));
+        assert_eq!(action.task_hypothesis_id.as_deref(), Some("hypothesis-b"));
+
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::ChooseTaskAlternative),
+            Some(("corrected", "hypothesis", true))
+        );
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::RejectSelectedTask),
+            Some(("rejected", "task_summary", false))
+        );
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::MarkSupportingWork),
+            Some(("supporting_work", "relationship", true))
+        );
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::MarkUnrelatedActivity),
+            Some(("unrelated_activity", "relationship", true))
+        );
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::MarkTaskCompleted),
+            Some(("completed", "task_status", true))
+        );
+        assert_eq!(
+            scoped_task_feedback_contract(&IslandActionKind::ReactivateTask),
+            Some(("reactivated", "task_status", true))
+        );
+    }
+
+    #[test]
     fn snapshot_from_status_uses_event_backed_signal_count_for_trail_moments() {
         let _guard = TEST_LOCK.lock().unwrap();
         clear_remembered_continue_for_test();
@@ -1935,7 +2122,70 @@ mod tests {
     }
 
     #[test]
-    fn island_continue_request_writes_audit_output() {
+    fn capture_status_session_change_preserves_atomic_continue_as_stale() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        remember_continue_for_test(1, 7, 12, "current");
+        if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+            slot.as_mut().unwrap().session_id = Some("previous-session".to_string());
+        }
+        let status = status_for_island_freshness(1, 7, 12, 10_000);
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
+
+        assert_eq!(
+            snapshot.continue_decision_id.as_deref(),
+            Some("decision-test")
+        );
+        assert_eq!(snapshot.continue_freshness.as_deref(), Some("new_evidence"));
+        let state = snapshot.island_continue_state.unwrap();
+        assert_eq!(state.display_state, IslandDisplayState::NeedsRefresh);
+        assert_eq!(state.decision_id.as_deref(), Some("decision-test"));
+        assert_eq!(
+            state.available_actions.first().map(|action| &action.kind),
+            Some(&IslandActionKind::RefreshContinue)
+        );
+    }
+
+    #[test]
+    fn processing_capture_status_does_not_erase_latest_continue_state() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        remember_continue_for_test(1, 7, 12, "current");
+        let status = status_for_island_freshness(1, 7, 12, 10_000);
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::Processing);
+
+        assert_eq!(
+            snapshot.continue_decision_id.as_deref(),
+            Some("decision-test")
+        );
+        assert_eq!(snapshot.continue_freshness.as_deref(), Some("current"));
+        assert_eq!(
+            snapshot
+                .island_continue_state
+                .as_ref()
+                .map(|state| &state.display_state),
+            Some(&IslandDisplayState::ContinueReady)
+        );
+    }
+
+    #[test]
+    fn swift_action_contract_keeps_capture_secondary_to_continue() {
+        let source = include_str!("../macos/SessionIslandPanel.swift");
+
+        assert!(source.contains(
+            "case .localMemoryWarming:\n            priority = [.refreshContinue, .openSmalltalk, .captureEvidenceNow]"
+        ));
+        assert!(source.contains(
+            "if displayState == .localMemoryWarming,\n           let updateEvidence = firstEnabledAction(in: [.captureEvidenceNow])"
+        ));
+        assert!(source.contains("return compact ? \"Update\" : \"Update local evidence\""));
+        assert!(source.contains(
+            "case .inspectOnly:\n            priority = [.inspectEvidence, .refreshContinue, .openSmalltalk]"
+        ));
+    }
+
+    #[test]
+    fn island_base_request_does_not_write_full_audit_output() {
         let request = island_continue_decision_request();
 
         assert_eq!(request.mode.as_deref(), Some("normal"));
@@ -1943,7 +2193,11 @@ mod tests {
         assert_eq!(request.micro_inference_enabled, Some(true));
         assert_eq!(request.activity_recap_model_enabled, Some(true));
         assert_eq!(request.max_candidates_for_model, Some(5));
-        assert_eq!(request.audit_output_enabled, Some(true));
+        assert_eq!(request.audit_output_enabled, Some(false));
+        assert!(matches!(
+            request.audit_mode,
+            Some(crate::continuation::ContinueAuditMode::None)
+        ));
     }
 
     #[test]
@@ -2233,6 +2487,7 @@ mod tests {
                 Some("decision-test".to_string()),
             )];
             *slot = Some(RememberedContinueIslandState {
+                session_id: None,
                 decision_id: "decision-test".to_string(),
                 request_trigger: "manual".to_string(),
                 task_turn_id: Some("task-test".to_string()),
@@ -2295,6 +2550,7 @@ mod tests {
                 content_hash: None,
                 image_hash: None,
                 capture_provider: None,
+                active_window_capture_provider: None,
                 scope: None,
                 display_id: None,
                 window_id: None,

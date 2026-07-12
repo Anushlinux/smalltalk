@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  authoritativeTaskTruthAnswer,
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
   inspectTargetCopy,
+  isTaskInferenceUnavailable,
+  taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
   splitConfidenceLabels,
@@ -91,6 +94,21 @@ function authoritativeDecision({
         snapshot_id: snapshotId,
         snapshot_revision: revision,
         evidence_watermark: `watermark-${revision}`,
+        selected_hypothesis_id: "hypothesis-one",
+        alternative_hypotheses: [],
+        atomic_identity: {
+          session_id: "session-one",
+          task_thread_id: "thread-one",
+          task_thread_revision: revision,
+          task_snapshot_id: snapshotId,
+          snapshot_revision: revision,
+          selected_hypothesis_id: "hypothesis-one",
+          model_request_id: "request-one",
+          model_response_id: "response-one",
+          observation_packet_id: `packet-${revision}`,
+          evidence_watermark: `watermark-${revision}`,
+          correction_fingerprint: "",
+        },
       },
     },
     ...overrides,
@@ -156,6 +174,130 @@ test("authoritative target-null cannot revive a legacy openable target", () => {
     label: "Inspect evidence",
   });
   assert.equal(authoritativeTaskTruthTarget(decision), null);
+});
+
+test("atomic identity validation failures have a retryable validation state", () => {
+  assert.deepEqual(
+    taskInferenceFailurePresentation("invalid_atomic_identity", "resolved", "live_cloud", 2),
+    {
+      kind: "model_response_invalid",
+      headline: "The model response could not be validated",
+      detail: "The provider responded, but the task, snapshot, and inference identities did not form one valid decision.",
+      retryable: true,
+    },
+  );
+});
+
+test("resolved Task Truth without complete atomic identity becomes honest unresolved", () => {
+  const decision = authoritativeDecision();
+  decision.task_truth_v2.answer.atomic_identity.model_response_id = null;
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.task_resolution_status, "unresolved");
+  assert.equal(answer?.task_summary, null);
+  assert.equal(answer?.inference_status, "invalid_atomic_identity");
+  assert.deepEqual(authoritativeTaskTruthActionState(decision), {
+    kind: "no_clear_continuation",
+    label: "Inspect evidence",
+  });
+  assert.equal(authoritativeTaskTruthTarget(decision), null);
+});
+
+test("startup with model-first evidence cannot fall through to legacy semantic copy", () => {
+  const decision = authoritativeDecision({
+    overrides: {
+      request_trigger: "startup",
+      return_target: {
+        artifact_id: "legacy-target",
+        openability: "openable",
+        document_path: "/tmp/legacy.md",
+      },
+    },
+  });
+  decision.task_truth_v2.effective_state = "eligible";
+  decision.task_truth_v2.release_gate_passed = false;
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.task_resolution_status, "unresolved");
+  assert.equal(answer?.task_summary, null);
+  assert.equal(answer?.inference_status, "authority_not_released");
+  assert.equal(authoritativeTaskTruthTarget(decision), null);
+  assert.deepEqual(authoritativeTaskTruthActionState(decision), {
+    kind: "no_clear_continuation",
+    label: "Inspect evidence",
+  });
+});
+
+test("provider-failure unresolved answer remains usable without task identity", () => {
+  const decision = authoritativeDecision({ status: "unresolved" });
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: null,
+    inference_status: "provider_error",
+  });
+  Object.assign(decision.task_truth_v2.answer.atomic_identity, {
+    task_thread_id: null,
+    task_thread_revision: null,
+    selected_hypothesis_id: null,
+    model_response_id: null,
+  });
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.task_resolution_status, "unresolved");
+  assert.equal(answer?.inference_status, "provider_error");
+  assert.deepEqual(authoritativeTaskTruthActionState(decision), {
+    kind: "no_clear_continuation",
+    label: "Inspect evidence",
+  });
+});
+
+test("typed provider failures share one unavailable-state policy", () => {
+  for (const status of [
+    "disabled",
+    "credentials_missing",
+    "model_unavailable",
+    "timeout",
+    "provider_error",
+    "provider_failure",
+    "request_invalid",
+    "invalid_response",
+  ]) {
+    assert.equal(isTaskInferenceUnavailable(status), true, status);
+  }
+  assert.equal(isTaskInferenceUnavailable("insufficient_evidence"), false);
+  assert.equal(isTaskInferenceUnavailable("privacy_blocked"), false);
+});
+
+test("task inference failures have distinct user-facing states and retry policy", () => {
+  assert.deepEqual(taskInferenceFailurePresentation("request_invalid"), {
+    kind: "capture_unavailable",
+    headline: "Capture was unavailable for this Continue attempt",
+    detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+    retryable: false,
+  });
+  assert.equal(taskInferenceFailurePresentation("timeout").kind, "provider_unavailable");
+  assert.equal(taskInferenceFailurePresentation("timeout").retryable, true);
+  assert.equal(
+    taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 1).kind,
+    "provider_unavailable",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 0).kind,
+    "capture_unavailable",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 1).kind,
+    "provider_unavailable",
+  );
+  assert.equal(taskInferenceFailurePresentation("invalid_response").kind, "model_response_invalid");
+  assert.equal(taskInferenceFailurePresentation("invalid_response").retryable, true);
+  assert.equal(
+    taskInferenceFailurePresentation("success", "verification_rejected").kind,
+    "evidence_verifier_rejected",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("insufficient_evidence").kind,
+    "insufficient_evidence",
+  );
 });
 
 test("frame preview is inspect-only and contains no target-shaped action copy", () => {

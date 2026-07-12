@@ -110,7 +110,13 @@ func configurationSummary(_ configuration: SCStreamConfiguration, request: Scree
     "shows_cursor": configuration.showsCursor,
     "captures_audio": configuration.capturesAudio,
     "quality": request.quality ?? 0.82,
-    "max_width": request.max_width
+    "max_width": request.max_width,
+    "source_rect": [
+      "x": configuration.sourceRect.minX,
+      "y": configuration.sourceRect.minY,
+      "w": configuration.sourceRect.width,
+      "h": configuration.sourceRect.height
+    ]
   ])
 }
 
@@ -155,6 +161,7 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
   var capturedWindowId: Int?
   var capturedBundleId: String?
   var filterScope = "display"
+  var captureScale = 1.0
 
   switch mode {
   case "active_window":
@@ -188,15 +195,57 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
       ])
     }
 
-    filter = SCContentFilter(desktopIndependentWindow: selectedWindow)
+    let windowFrame = selectedWindow.frame
+    guard selectedWindow.isOnScreen,
+          selectedWindow.windowLayer == 0,
+          windowFrame.width.isFinite,
+          windowFrame.height.isFinite,
+          windowFrame.minX.isFinite,
+          windowFrame.minY.isFinite,
+          windowFrame.width >= 2,
+          windowFrame.height >= 2 else {
+      throw NSError(domain: "SmalltalkSCK", code: 8, userInfo: [
+        NSLocalizedDescriptionKey: "active window geometry was empty, stale, minimized, or invalid"
+      ])
+    }
+    let displayIntersections = content.displays.compactMap { display -> (SCDisplay, CGRect)? in
+      let intersection = display.frame.intersection(windowFrame)
+      guard !intersection.isNull, intersection.width >= 2, intersection.height >= 2 else {
+        return nil
+      }
+      return (display, intersection)
+    }
+    guard let (display, intersection) = displayIntersections.max(by: {
+      $0.1.width * $0.1.height < $1.1.width * $1.1.height
+    }) else {
+      throw NSError(domain: "SmalltalkSCK", code: 9, userInfo: [
+        NSLocalizedDescriptionKey: "active window did not intersect an available display"
+      ])
+    }
+
+    // Window-only SCContentFilter construction has aborted inside Apple's
+    // ScreenCaptureKit stack on supported systems. Capture the validated
+    // display instead and crop it to the window's on-display rectangle.
+    filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+    let displayScale = display.frame.width > 0
+      ? Double(display.width) / display.frame.width
+      : 1
+    captureScale = displayScale
     configuration = makeConfiguration(
-      width: Int(selectedWindow.frame.width.rounded()),
-      height: Int(selectedWindow.frame.height.rounded()),
+      width: Int((intersection.width * displayScale).rounded()),
+      height: Int((intersection.height * displayScale).rounded()),
       request: request
     )
+    configuration.sourceRect = CGRect(
+      x: intersection.minX - display.frame.minX,
+      y: intersection.minY - display.frame.minY,
+      width: intersection.width,
+      height: intersection.height
+    )
+    capturedDisplayId = String(display.displayID)
     capturedWindowId = Int(selectedWindow.windowID)
     capturedBundleId = selectedWindow.owningApplication?.bundleIdentifier
-    filterScope = "window"
+    filterScope = "display_window_crop"
 
   case "app_filtered":
     guard let display = content.displays.first else {
@@ -212,6 +261,7 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
     }
     filter = SCContentFilter(display: display, including: [app], exceptingWindows: excludedWindows)
     configuration = makeConfiguration(width: display.width, height: display.height, request: request)
+    captureScale = display.frame.width > 0 ? Double(display.width) / display.frame.width : 1
     capturedDisplayId = String(display.displayID)
     capturedBundleId = app.bundleIdentifier
     filterScope = "application"
@@ -224,6 +274,7 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
     }
     filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
     configuration = makeConfiguration(width: display.width, height: display.height, request: request)
+    captureScale = display.frame.width > 0 ? Double(display.width) / display.frame.width : 1
     capturedDisplayId = String(display.displayID)
   }
 
@@ -258,7 +309,7 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
         "h": written.1
       ],
       "content_scale": 1,
-      "scale_factor": NSScreen.main?.backingScaleFactor ?? 1,
+      "scale_factor": captureScale,
       "status": "complete"
     ]),
     capture_mode: "screenshot",

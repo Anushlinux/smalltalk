@@ -1,0 +1,2101 @@
+{
+  "schema": "smalltalk.task_truth_v2.report.v1",
+  "policy_version": "tt2.02-v1",
+  "corpus_counts": {
+    "live_redacted": 5,
+    "live_release_denominator": 5
+  },
+  "partition_counts": {
+    "development": 5
+  },
+  "human_review_counts": {
+    "pending": 5
+  },
+  "privacy_review_counts": {
+    "pending": 5
+  },
+  "surface_denominators": {
+    "agent_chat": 5
+  },
+  "reviewed_live_surface_denominators": {},
+  "slice_denominators": {
+    "ambiguous_or_privacy_blocked": 1,
+    "completed_vs_new_task": 5,
+    "interruption_resumption": 5,
+    "waiting_on_agent_or_application": 5
+  },
+  "reviewed_live_slice_denominators": {},
+  "per_path_field_metrics": {
+    "path_a_legacy_p6": {
+      "answer_composition": {
+        "missing_human_evidence": 5
+      },
+      "authorship": {
+        "missing_human_evidence": 5
+      },
+      "causal_interaction_association": {
+        "missing_human_evidence": 5
+      },
+      "control_region_eligibility": {
+        "missing_human_evidence": 5
+      },
+      "last_progress": {
+        "missing_human_evidence": 5
+      },
+      "lifecycle_state": {
+        "missing_human_evidence": 5
+      },
+      "next_action": {
+        "missing_human_evidence": 5
+      },
+      "observation_construction": {
+        "missing_human_evidence": 5
+      },
+      "target_resolution": {
+        "missing_human_evidence": 5
+      },
+      "task_object": {
+        "missing_human_evidence": 5
+      },
+      "task_selection": {
+        "missing_human_evidence": 5
+      },
+      "unfinished_step": {
+        "missing_human_evidence": 5
+      },
+      "where": {
+        "missing_human_evidence": 5
+      }
+    },
+    "path_b_causally_repaired": {
+      "answer_composition": {
+        "missing_human_evidence": 5
+      },
+      "authorship": {
+        "missing_human_evidence": 5
+      },
+      "causal_interaction_association": {
+        "missing_human_evidence": 5
+      },
+      "control_region_eligibility": {
+        "missing_human_evidence": 5
+      },
+      "last_progress": {
+        "missing_human_evidence": 5
+      },
+      "lifecycle_state": {
+        "missing_human_evidence": 5
+      },
+      "next_action": {
+        "missing_human_evidence": 5
+      },
+      "observation_construction": {
+        "missing_human_evidence": 5
+      },
+      "target_resolution": {
+        "missing_human_evidence": 5
+      },
+      "task_object": {
+        "missing_human_evidence": 5
+      },
+      "task_selection": {
+        "missing_human_evidence": 5
+      },
+      "unfinished_step": {
+        "missing_human_evidence": 5
+      },
+      "where": {
+        "missing_human_evidence": 5
+      }
+    },
+    "path_c_task_truth_shadow": {
+      "answer_composition": {
+        "missing_human_evidence": 5
+      },
+      "authorship": {
+        "missing_human_evidence": 5
+      },
+      "causal_interaction_association": {
+        "missing_human_evidence": 5
+      },
+      "control_region_eligibility": {
+        "missing_human_evidence": 5
+      },
+      "last_progress": {
+        "missing_human_evidence": 5
+      },
+      "lifecycle_state": {
+        "missing_human_evidence": 5
+      },
+      "next_action": {
+        "missing_human_evidence": 5
+      },
+      "observation_construction": {
+        "missing_human_evidence": 5
+      },
+      "target_resolution": {
+        "missing_human_evidence": 5
+      },
+      "task_object": {
+        "missing_human_evidence": 5
+      },
+      "task_selection": {
+        "missing_human_evidence": 5
+      },
+      "unfinished_step": {
+        "missing_human_evidence": 5
+      },
+      "where": {
+        "missing_human_evidence": 5
+      }
+    }
+  },
+  "reviewed_live_per_path_field_metrics": {},
+  "path_macro_results": {
+    "path_a_legacy_p6": {
+      "missing_human_evidence": 65
+    },
+    "path_b_causally_repaired": {
+      "missing_human_evidence": 65
+    },
+    "path_c_task_truth_shadow": {
+      "missing_human_evidence": 65
+    }
+  },
+  "reviewed_live_path_macro_results": {},
+  "synthetic_counterfactual_path_macro_results": {},
+  "surface_family_macro_results": {
+    "agent_chat": {
+      "path_a_legacy_p6": {
+        "missing_human_evidence": 65
+      },
+      "path_b_causally_repaired": {
+        "missing_human_evidence": 65
+      },
+      "path_c_task_truth_shadow": {
+        "missing_human_evidence": 65
+      }
+    }
+  },
+  "reviewed_live_surface_family_macro_results": {},
+  "worst_surface_family_slice_by_path": {
+    "path_a_legacy_p6": null,
+    "path_b_causally_repaired": null,
+    "path_c_task_truth_shadow": null
+  },
+  "frozen_policy_metric_results": {
+    "control_navigation_as_task": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "execution_state_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "generic_non_answer": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "human_immediately_useful_rating": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.85,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "precise_abstention": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.95,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "return_target_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 1.0,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "stronger_manual_result_downgraded": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "supported_next_action_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "task_object_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "unseen_application_useful_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.8,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "unsupported_specific_claim": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "useful_non_generic_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    },
+    "wrong_primary_task": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_human_evidence_or_path"
+    }
+  },
+  "tt2_05_metric_results": {
+    "control_navigation_as_task_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "execution_state_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "human_immediately_useful": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.85,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "model_on_off_unexplained_task_disagreement": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "precise_abstention": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.95,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "return_target_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.98,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "stronger_manual_result_downgraded": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "supported_next_action_coverage": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.85,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "supported_next_action_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "task_object_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.88,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "unseen_application_useful_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.8,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "unsupported_specific_claim_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.01,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "useful_non_generic_task_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "wrong_primary_task_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.03,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    }
+  },
+  "tt2_05_surface_wrong_task_results": {
+    "agent_chat": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "browser_research_search": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "custom_rendered_canvas": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "documents": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "editor_ide": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "email_messaging": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "mixed_window_thin_unknown": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "pdf_file_manager": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "spreadsheets": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "terminal": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    }
+  },
+  "tt2_05_confidence_intervals": {
+    "control_navigation_as_task_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "execution_state_accuracy": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "human_immediately_useful": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "model_on_off_unexplained_task_disagreement": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "precise_abstention": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "return_target_precision": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "stronger_manual_result_downgraded": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "supported_next_action_coverage": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "supported_next_action_precision": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "task_object_accuracy": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "unseen_application_useful_summary": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "unsupported_specific_claim_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "useful_non_generic_task_summary": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.agent_chat": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.browser_research_search": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.custom_rendered_canvas": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.documents": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.editor_ide": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.email_messaging": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.mixed_window_thin_unknown": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.pdf_file_manager": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.spreadsheets": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.terminal": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    }
+  },
+  "mfti_04_metric_results": {
+    "control_navigation_as_task_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "cross_session_stale_leakage": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "execution_state_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "human_immediately_useful": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.85,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "mixed_snapshot_semantic_fields": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "precise_abstention": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.95,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "provider_failure_honest_unresolved": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 1.0,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "provider_failure_local_semantic_fallback": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "return_target_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.98,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "stronger_manual_result_downgraded": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.0,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "supported_next_action_coverage": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.85,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "supported_next_action_precision": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "task_object_accuracy": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.88,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "unseen_application_useful_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.8,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "unsupported_specific_claim_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.01,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "useful_non_generic_task_summary": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.9,
+      "higher_is_better": true,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "visible_surface_substituted_for_task": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.02,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "wrong_activity_to_task_relationship": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "wrong_primary_task_rate": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.03,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "wrong_task_switch_or_detour": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    }
+  },
+  "mfti_04_surface_wrong_task_results": {
+    "agent_chat": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "browser_research_search": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "custom_rendered_canvas": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "documents": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "editor_ide": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "email_messaging": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "mixed_window_thin_unknown": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "pdf_file_manager": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "spreadsheets": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    },
+    "terminal": {
+      "numerator": 0,
+      "denominator": 0,
+      "rate": null,
+      "threshold": 0.05,
+      "higher_is_better": false,
+      "passed": false,
+      "status": "missing_required_denominator"
+    }
+  },
+  "mfti_04_confidence_intervals": {
+    "control_navigation_as_task_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "cross_session_stale_leakage": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "execution_state_accuracy": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "human_immediately_useful": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "mixed_snapshot_semantic_fields": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "precise_abstention": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "provider_failure_honest_unresolved": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "provider_failure_local_semantic_fallback": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "return_target_precision": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "stronger_manual_result_downgraded": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "supported_next_action_coverage": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "supported_next_action_precision": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "task_object_accuracy": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "unseen_application_useful_summary": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "unsupported_specific_claim_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "useful_non_generic_task_summary": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "visible_surface_substituted_for_task": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_activity_to_task_relationship": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.agent_chat": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.browser_research_search": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.custom_rendered_canvas": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.documents": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.editor_ide": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.email_messaging": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.mixed_window_thin_unknown": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.pdf_file_manager": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.spreadsheets": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_primary_task_rate.surface.terminal": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    },
+    "wrong_task_switch_or_detour": {
+      "method": "wilson_score",
+      "confidence_level": 0.95,
+      "denominator": 0,
+      "lower": null,
+      "upper": null
+    }
+  },
+  "wrong_task_examples": {},
+  "reviewed_live_wrong_task_examples": {},
+  "first_divergence_histogram": {},
+  "reviewed_live_first_divergence_histogram": {},
+  "worst_surface_family_slice": null,
+  "manual_background_downgrade_count": 0,
+  "manual_background_downgrade_evaluable_count": 0,
+  "unsupported_claim_count": 0,
+  "path_b_partial_evidence_case_count": 5,
+  "reviewed_live_path_b_partial_evidence_case_count": 0,
+  "locked_holdout_access_status": "not_accessed",
+  "release_gate_passed": false,
+  "release_gate_violations": [
+    "frozen_metric_control_navigation_as_task_missing_human_evidence_or_path",
+    "frozen_metric_execution_state_accuracy_missing_human_evidence_or_path",
+    "frozen_metric_generic_non_answer_missing_human_evidence_or_path",
+    "frozen_metric_human_immediately_useful_rating_missing_human_evidence_or_path",
+    "frozen_metric_precise_abstention_missing_human_evidence_or_path",
+    "frozen_metric_return_target_precision_missing_human_evidence_or_path",
+    "frozen_metric_stronger_manual_result_downgraded_missing_human_evidence_or_path",
+    "frozen_metric_supported_next_action_accuracy_missing_human_evidence_or_path",
+    "frozen_metric_task_object_accuracy_missing_human_evidence_or_path",
+    "frozen_metric_unseen_application_useful_summary_missing_human_evidence_or_path",
+    "frozen_metric_unsupported_specific_claim_missing_human_evidence_or_path",
+    "frozen_metric_useful_non_generic_summary_missing_human_evidence_or_path",
+    "frozen_metric_wrong_primary_task_missing_human_evidence_or_path",
+    "tt2_05_metric_control_navigation_as_task_rate_missing_required_denominator",
+    "tt2_05_metric_execution_state_accuracy_missing_required_denominator",
+    "tt2_05_metric_human_immediately_useful_missing_required_denominator",
+    "tt2_05_metric_model_on_off_unexplained_task_disagreement_missing_required_denominator",
+    "tt2_05_metric_precise_abstention_missing_required_denominator",
+    "tt2_05_metric_return_target_precision_missing_required_denominator",
+    "tt2_05_metric_stronger_manual_result_downgraded_missing_required_denominator",
+    "tt2_05_metric_supported_next_action_coverage_missing_required_denominator",
+    "tt2_05_metric_supported_next_action_precision_missing_required_denominator",
+    "tt2_05_metric_task_object_accuracy_missing_required_denominator",
+    "tt2_05_metric_unseen_application_useful_summary_missing_required_denominator",
+    "tt2_05_metric_unsupported_specific_claim_rate_missing_required_denominator",
+    "tt2_05_metric_useful_non_generic_task_summary_missing_required_denominator",
+    "tt2_05_metric_wrong_primary_task_rate_missing_required_denominator",
+    "tt2_05_surface_wrong_task_agent_chat_missing_required_denominator",
+    "tt2_05_surface_wrong_task_browser_research_search_missing_required_denominator",
+    "tt2_05_surface_wrong_task_custom_rendered_canvas_missing_required_denominator",
+    "tt2_05_surface_wrong_task_documents_missing_required_denominator",
+    "tt2_05_surface_wrong_task_editor_ide_missing_required_denominator",
+    "tt2_05_surface_wrong_task_email_messaging_missing_required_denominator",
+    "tt2_05_surface_wrong_task_mixed_window_thin_unknown_missing_required_denominator",
+    "tt2_05_surface_wrong_task_pdf_file_manager_missing_required_denominator",
+    "tt2_05_surface_wrong_task_spreadsheets_missing_required_denominator",
+    "tt2_05_surface_wrong_task_terminal_missing_required_denominator",
+    "independently_reviewed_live_cases_requires_200_found_0",
+    "locked_holdout_requires_50_found_0",
+    "surface_agent_chat_requires_15_found_0",
+    "surface_editor_ide_requires_15_found_0",
+    "surface_terminal_requires_15_found_0",
+    "surface_browser_research_search_requires_15_found_0",
+    "surface_documents_requires_15_found_0",
+    "surface_spreadsheets_requires_15_found_0",
+    "surface_email_messaging_requires_15_found_0",
+    "surface_pdf_file_manager_requires_15_found_0",
+    "surface_custom_rendered_canvas_requires_15_found_0",
+    "surface_mixed_window_thin_unknown_requires_15_found_0",
+    "slice_interruption_resumption_requires_30_found_0",
+    "slice_ambiguous_or_privacy_blocked_requires_20_found_0",
+    "slice_waiting_on_agent_or_application_requires_20_found_0",
+    "slice_completed_vs_new_task_requires_20_found_0",
+    "missing_independent_human_evidence",
+    "missing_privacy_approval",
+    "locked_holdout_not_accessed",
+    "manual_background_downgrade_adoption_evidence_missing"
+  ],
+  "cases": [
+    {
+      "case_id": "session_013_decision_01",
+      "source_kind": "live_redacted",
+      "release_eligible": false,
+      "requires_task_selection_abstention": false,
+      "application_identity_bucket": "codex_native_ax_sparse",
+      "surface_family": "agent_chat",
+      "partition": "development",
+      "human_label_status": "missing_human_evidence",
+      "paths": {
+        "path_a_legacy_p6": {
+          "status": "recorded_production_output",
+          "source_fingerprint": "f3461c229ccd8c9e67b90622df8301e14fb92e47c411f2e05541662203bafd1c",
+          "recorded_private_output_hash": "925499aff29c114851cfc19311f9961c0642882c79219f819253c88ef161d4d2",
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Approve for me",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": true,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": false,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": null
+        },
+        "path_b_causally_repaired": {
+          "status": "replayed_production_output",
+          "source_fingerprint": "f3461c229ccd8c9e67b90622df8301e14fb92e47c411f2e05541662203bafd1c",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "ax_nodes",
+            "ocr_spans",
+            "content_units",
+            "app_window_surface",
+            "ui_events",
+            "event_transitions",
+            "typing_bursts"
+          ],
+          "unsupported_evidence_groups": [
+            "redacted_screenshot_regions",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "claim_confidence": 0.74
+        },
+        "path_c_task_truth_shadow": {
+          "status": "implemented",
+          "source_fingerprint": "f3461c229ccd8c9e67b90622df8301e14fb92e47c411f2e05541662203bafd1c",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "redacted_screenshot_regions",
+            "ax_nodes",
+            "app_window_surface",
+            "ui_events",
+            "typing_bursts",
+            "capture_triggers",
+            "event_transitions",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": 0.84
+        }
+      },
+      "deterministic_replay_match": true
+    },
+    {
+      "case_id": "session_013_decision_02",
+      "source_kind": "live_redacted",
+      "release_eligible": false,
+      "requires_task_selection_abstention": false,
+      "application_identity_bucket": "codex_native_ax_sparse",
+      "surface_family": "agent_chat",
+      "partition": "development",
+      "human_label_status": "missing_human_evidence",
+      "paths": {
+        "path_a_legacy_p6": {
+          "status": "recorded_production_output",
+          "source_fingerprint": "46c74cca149125642f74fac450394d29a83f4c5d13ca43322206e8d06b77c2b1",
+          "recorded_private_output_hash": "abf6727c4c384a0b42e79a2a920c5db0b48bf1298e30b05ca210e3200cc2618b",
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Approve for me",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": true,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": false,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": null
+        },
+        "path_b_causally_repaired": {
+          "status": "replayed_production_output",
+          "source_fingerprint": "46c74cca149125642f74fac450394d29a83f4c5d13ca43322206e8d06b77c2b1",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": null,
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "ax_nodes",
+            "ocr_spans",
+            "content_units",
+            "app_window_surface",
+            "ui_events",
+            "event_transitions",
+            "typing_bursts"
+          ],
+          "unsupported_evidence_groups": [
+            "redacted_screenshot_regions",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "claim_confidence": 0.0
+        },
+        "path_c_task_truth_shadow": {
+          "status": "implemented",
+          "source_fingerprint": "46c74cca149125642f74fac450394d29a83f4c5d13ca43322206e8d06b77c2b1",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "redacted_screenshot_regions",
+            "ax_nodes",
+            "app_window_surface",
+            "typing_bursts",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": 0.84
+        }
+      },
+      "deterministic_replay_match": true
+    },
+    {
+      "case_id": "session_013_decision_03",
+      "source_kind": "live_redacted",
+      "release_eligible": false,
+      "requires_task_selection_abstention": false,
+      "application_identity_bucket": "codex_native_ax_sparse",
+      "surface_family": "agent_chat",
+      "partition": "development",
+      "human_label_status": "missing_human_evidence",
+      "paths": {
+        "path_a_legacy_p6": {
+          "status": "recorded_production_output",
+          "source_fingerprint": "a6940e5203eefe9d5eadfb040f031982efe293c249bd3224d998cb759b9486af",
+          "recorded_private_output_hash": "3b154c4432b0f4aba7cc7509c06312d9cd1651d1ebb3ab245a61bdc798ee8194",
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Approve for me",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": true,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": false,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": null
+        },
+        "path_b_causally_repaired": {
+          "status": "replayed_production_output",
+          "source_fingerprint": "a6940e5203eefe9d5eadfb040f031982efe293c249bd3224d998cb759b9486af",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": null,
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "ax_nodes",
+            "ocr_spans",
+            "content_units",
+            "app_window_surface",
+            "ui_events",
+            "event_transitions",
+            "typing_bursts"
+          ],
+          "unsupported_evidence_groups": [
+            "redacted_screenshot_regions",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "claim_confidence": 0.0
+        },
+        "path_c_task_truth_shadow": {
+          "status": "implemented",
+          "source_fingerprint": "a6940e5203eefe9d5eadfb040f031982efe293c249bd3224d998cb759b9486af",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "redacted_screenshot_regions",
+            "ax_nodes",
+            "app_window_surface",
+            "typing_bursts",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": 0.84
+        }
+      },
+      "deterministic_replay_match": true
+    },
+    {
+      "case_id": "session_013_decision_04",
+      "source_kind": "live_redacted",
+      "release_eligible": false,
+      "requires_task_selection_abstention": false,
+      "application_identity_bucket": "codex_native_ax_sparse",
+      "surface_family": "agent_chat",
+      "partition": "development",
+      "human_label_status": "missing_human_evidence",
+      "paths": {
+        "path_a_legacy_p6": {
+          "status": "recorded_production_output",
+          "source_fingerprint": "dcfd3f2a7d5bfacdfe2600ec6146b6a26a7b324aa34138a2ea06711b8541d33c",
+          "recorded_private_output_hash": "1fe380eb4097165aa907837efe141010183f079770371d7ac43fbf9c2d4f66c8",
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Approve for me",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": true,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": false,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": null
+        },
+        "path_b_causally_repaired": {
+          "status": "replayed_production_output",
+          "source_fingerprint": "dcfd3f2a7d5bfacdfe2600ec6146b6a26a7b324aa34138a2ea06711b8541d33c",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": null,
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "ax_nodes",
+            "ocr_spans",
+            "content_units",
+            "app_window_surface",
+            "ui_events",
+            "event_transitions",
+            "typing_bursts"
+          ],
+          "unsupported_evidence_groups": [
+            "redacted_screenshot_regions",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "claim_confidence": 0.0
+        },
+        "path_c_task_truth_shadow": {
+          "status": "implemented",
+          "source_fingerprint": "dcfd3f2a7d5bfacdfe2600ec6146b6a26a7b324aa34138a2ea06711b8541d33c",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "redacted_screenshot_regions",
+            "ax_nodes",
+            "app_window_surface",
+            "typing_bursts",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": 0.84
+        }
+      },
+      "deterministic_replay_match": true
+    },
+    {
+      "case_id": "session_013_decision_05",
+      "source_kind": "live_redacted",
+      "release_eligible": false,
+      "requires_task_selection_abstention": false,
+      "application_identity_bucket": "codex_native_ax_sparse",
+      "surface_family": "agent_chat",
+      "partition": "development",
+      "human_label_status": "missing_human_evidence",
+      "paths": {
+        "path_a_legacy_p6": {
+          "status": "recorded_production_output",
+          "source_fingerprint": "5170ea0524638977ec83b170b1e2042d433b9e1ab4498cc7ada9f16501cbcdc3",
+          "recorded_private_output_hash": "8cdd52a4929433adc4b3ba82d079b631e71b32b1093600f7d9bde533b1390c63",
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Approve for me",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": true,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": false,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": null
+        },
+        "path_b_causally_repaired": {
+          "status": "replayed_production_output",
+          "source_fingerprint": "5170ea0524638977ec83b170b1e2042d433b9e1ab4498cc7ada9f16501cbcdc3",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": null,
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "ax_nodes",
+            "ocr_spans",
+            "content_units",
+            "app_window_surface",
+            "ui_events",
+            "event_transitions",
+            "typing_bursts"
+          ],
+          "unsupported_evidence_groups": [
+            "redacted_screenshot_regions",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "claim_confidence": 0.0
+        },
+        "path_c_task_truth_shadow": {
+          "status": "implemented",
+          "source_fingerprint": "5170ea0524638977ec83b170b1e2042d433b9e1ab4498cc7ada9f16501cbcdc3",
+          "recorded_private_output_hash": null,
+          "first_divergence": null,
+          "field_results": {
+            "answer_composition": "missing_human_evidence",
+            "authorship": "missing_human_evidence",
+            "causal_interaction_association": "missing_human_evidence",
+            "control_region_eligibility": "missing_human_evidence",
+            "last_progress": "missing_human_evidence",
+            "lifecycle_state": "missing_human_evidence",
+            "next_action": "missing_human_evidence",
+            "observation_construction": "missing_human_evidence",
+            "target_resolution": "missing_human_evidence",
+            "task_object": "missing_human_evidence",
+            "task_selection": "missing_human_evidence",
+            "unfinished_step": "missing_human_evidence",
+            "where": "missing_human_evidence"
+          },
+          "task_identity": "Implement only the live corpus and shadow evaluation measurement work.",
+          "answer_class": "not_evaluable",
+          "unsupported_claim_count": 0,
+          "control_navigation_as_task": false,
+          "human_immediately_useful": null,
+          "next_action_label_present": false,
+          "next_action_claim_present": true,
+          "return_target_claim_present": false,
+          "critical_local_solvable": false,
+          "model_on_off_disagreement_unexplained": false,
+          "mfti_labels_complete": false,
+          "visible_surface_substituted_for_task": false,
+          "relationship_to_prior_correct": null,
+          "task_switch_completion_correct": null,
+          "cross_session_stale_leakage": false,
+          "mixed_snapshot_semantic_fields": false,
+          "provider_failure_case": false,
+          "provider_failure_honest_unresolved": false,
+          "provider_failure_local_semantic_fallback": false,
+          "consumed_evidence_groups": [
+            "frames",
+            "redacted_screenshot_regions",
+            "ax_nodes",
+            "app_window_surface",
+            "typing_bursts",
+            "capture_triggers",
+            "frame_diffs",
+            "change_regions",
+            "prior_valid_task_snapshot",
+            "return_anchor_facts"
+          ],
+          "unsupported_evidence_groups": [],
+          "claim_confidence": 0.58
+        }
+      },
+      "deterministic_replay_match": true
+    }
+  ]
+}

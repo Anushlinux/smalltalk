@@ -10,6 +10,18 @@ fn default_task_basis() -> String {
     "unresolved".into()
 }
 
+fn default_semantic_source() -> String {
+    "unresolved".into()
+}
+
+fn default_wording_source() -> String {
+    "deterministic".into()
+}
+
+fn default_thread_status() -> String {
+    "unresolved".into()
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SnapshotSelectionStatusV2 {
@@ -38,10 +50,26 @@ pub(crate) struct ClaimEvidenceV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SnapshotHypothesisV2 {
+    #[serde(default)]
+    pub(crate) hypothesis_id: String,
     pub(crate) summary: String,
     pub(crate) relation: String,
     pub(crate) confidence: f64,
     pub(crate) evidence_refs: Vec<EvidenceHandleV2>,
+    #[serde(default)]
+    pub(crate) contradicting_evidence_refs: Vec<EvidenceHandleV2>,
+    #[serde(default)]
+    pub(crate) task_thread_id: Option<String>,
+    #[serde(default)]
+    pub(crate) task_thread_revision: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_supported_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) disposition: String,
+    #[serde(default)]
+    pub(crate) reason_codes: Vec<String>,
+    #[serde(default)]
+    pub(crate) semantic_payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,9 +82,33 @@ pub(crate) struct TaskSnapshotV2 {
     pub(crate) observed_at_ms: i64,
     pub(crate) evidence_watermark: String,
     pub(crate) packet_id: String,
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) task_thread_id: Option<String>,
+    #[serde(default)]
+    pub(crate) task_thread_revision: Option<i64>,
+    #[serde(default = "default_thread_status")]
+    pub(crate) thread_status: String,
+    #[serde(default)]
+    pub(crate) continuity_thread_id: Option<String>,
+    #[serde(default)]
+    pub(crate) continuity_thread_revision: Option<i64>,
+    #[serde(default)]
+    pub(crate) continuity_identity_token: Option<String>,
+    #[serde(default)]
+    pub(crate) supersedes_thread_id: Option<String>,
     pub(crate) legacy_task_turn_id: Option<String>,
     #[serde(default = "default_task_basis")]
     pub(crate) task_basis: String,
+    #[serde(default)]
+    pub(crate) observed_surface: Option<String>,
+    #[serde(default)]
+    pub(crate) immediate_user_operation: Option<String>,
+    #[serde(default)]
+    pub(crate) semantic_effect_of_operation: Option<String>,
+    #[serde(default)]
+    pub(crate) current_subtask: Option<String>,
     pub(crate) task_summary: Option<String>,
     pub(crate) task_kind: String,
     pub(crate) task_object: Option<String>,
@@ -82,6 +134,22 @@ pub(crate) struct TaskSnapshotV2 {
     pub(crate) resolver_version: String,
     pub(crate) provenance: Vec<String>,
     pub(crate) continuity_confidence_decay: f64,
+    #[serde(default = "default_semantic_source")]
+    pub(crate) semantic_source: String,
+    #[serde(default)]
+    pub(crate) provider_name: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_model: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_request_id: Option<String>,
+    #[serde(default)]
+    pub(crate) provider_response_id: Option<String>,
+    #[serde(default)]
+    pub(crate) selected_hypothesis_id: Option<String>,
+    #[serde(default = "default_wording_source")]
+    pub(crate) wording_source: String,
+    #[serde(default)]
+    pub(crate) inference_status: String,
 }
 
 fn evidence_refs(turn: &CurrentTaskTurn, packet: &ObservationPacketV2) -> Vec<EvidenceHandleV2> {
@@ -175,8 +243,20 @@ pub(crate) fn project_current_task_turn(
         observed_at_ms: packet.observed_at_ms,
         evidence_watermark: packet.evidence_watermark.clone(),
         packet_id: packet.packet_id.clone(),
+        session_id: packet.session_id.clone(),
+        task_thread_id: None,
+        task_thread_revision: None,
+        thread_status: "unresolved".into(),
+        continuity_thread_id: None,
+        continuity_thread_revision: None,
+        continuity_identity_token: None,
+        supersedes_thread_id: None,
         legacy_task_turn_id: Some(turn.task_turn_id.clone()),
         task_basis: "explicit_goal".into(),
+        observed_surface: None,
+        immediate_user_operation: None,
+        semantic_effect_of_operation: None,
+        current_subtask: None,
         task_summary: task_summary.clone(),
         task_kind: turn.task_kind.clone(),
         task_object: turn.task_object.clone(),
@@ -215,6 +295,14 @@ pub(crate) fn project_current_task_turn(
             "target_features_excluded_from_task_confidence".into(),
         ],
         continuity_confidence_decay: 0.0,
+        semantic_source: "unresolved".into(),
+        provider_name: None,
+        provider_model: None,
+        provider_request_id: None,
+        provider_response_id: None,
+        selected_hypothesis_id: None,
+        wording_source: "deterministic".into(),
+        inference_status: "no_inference".into(),
     }
 }
 
@@ -234,8 +322,20 @@ pub(crate) fn unresolved_snapshot(
         observed_at_ms: packet.observed_at_ms,
         evidence_watermark: packet.evidence_watermark.clone(),
         packet_id: packet.packet_id.clone(),
+        session_id: packet.session_id.clone(),
+        task_thread_id: None,
+        task_thread_revision: None,
+        thread_status: "unresolved".into(),
+        continuity_thread_id: None,
+        continuity_thread_revision: None,
+        continuity_identity_token: None,
+        supersedes_thread_id: None,
         legacy_task_turn_id: None,
         task_basis: "unresolved".into(),
+        observed_surface: None,
+        immediate_user_operation: None,
+        semantic_effect_of_operation: None,
+        current_subtask: None,
         task_summary: None,
         task_kind: "unknown".into(),
         task_object: None,
@@ -265,6 +365,14 @@ pub(crate) fn unresolved_snapshot(
         resolver_version: "task_truth_v2.local_projection.v1".into(),
         provenance: vec!["uncertainty_persisted_without_stale_task_carry_forward".into()],
         continuity_confidence_decay: if prior_snapshot.is_some() { 0.2 } else { 0.0 },
+        semantic_source: "unresolved".into(),
+        provider_name: None,
+        provider_model: None,
+        provider_request_id: None,
+        provider_response_id: None,
+        selected_hypothesis_id: None,
+        wording_source: "deterministic".into(),
+        inference_status: reason.into(),
     }
 }
 
@@ -285,8 +393,23 @@ mod tests {
             frame_id: format!("frame-{observed_at_ms}"),
             observed_at_ms,
             partition: EvidencePartitionV2::Current,
+            surface_identity: ActiveSurfaceIdentityV2 {
+                app_name: Some("Test App".into()),
+                app_bundle_id: Some("com.example.test".into()),
+                window_title_hash: Some("window-hash".into()),
+                window_id: Some(1),
+                browser_url_hash: None,
+                document_path_hash: Some("document-hash".into()),
+            },
+            surface_ownership_confidence: 0.95,
             privacy_status: "allowed".into(),
             model_eligible: true,
+            image_source_kind: "native_active_window".into(),
+            image_scope: "active_window".into(),
+            image_width: None,
+            image_height: None,
+            image_rejection_reason: None,
+            crop_pixels: None,
             local_image_handle_hash: None,
             ephemeral_local_image_path: None,
             selection_reasons: vec!["current_frame".into()],
@@ -332,6 +455,7 @@ mod tests {
                 serialized_bytes: 100,
                 estimated_tokens: 25,
                 truncated: false,
+                frame_accounting: Vec::new(),
             },
         }
     }
@@ -449,10 +573,8 @@ mod tests {
         support.observed_at_ms = 2_000;
         support.relation_to_prior = "child_support_step".into();
         let selected = select_snapshot(&[primary.clone(), support]);
-        assert_eq!(
-            selected.selected_snapshot_id.as_deref(),
-            Some(primary.snapshot_id.as_str())
-        );
+        assert!(selected.selected_snapshot_id.is_none());
+        assert!(selected.unresolved);
     }
 
     #[test]
@@ -476,10 +598,7 @@ mod tests {
             baseline.selected_snapshot_id,
             without_openability.selected_snapshot_id
         );
-        assert_eq!(
-            baseline.selected_snapshot_id.as_deref(),
-            Some(primary.snapshot_id.as_str())
-        );
+        assert!(baseline.selected_snapshot_id.is_none());
     }
 
     #[test]
@@ -498,5 +617,35 @@ mod tests {
         assert!(unresolved.user_goal.is_none());
         assert_eq!(unresolved.execution_state, "unclear");
         assert!(unresolved.continuity_confidence_decay > 0.0);
+    }
+
+    #[test]
+    fn provider_failure_cannot_select_a_local_semantic_fallback_label() {
+        let mut local = project_current_task_turn(
+            &turn(TaskExecutionState::Active, TaskTurnActor::User),
+            &packet(1_000),
+            None,
+        );
+        local.task_thread_id = Some("thread-prior".into());
+        local.task_thread_revision = Some(4);
+        local.thread_status = "active".into();
+        let unresolved = unresolved_snapshot(
+            &packet(2_000),
+            Some(&local),
+            "cloud_inference_unresolved:provider_failure:provider_error",
+        );
+        let selection = select_snapshot(&[local.clone(), unresolved.clone()]);
+        assert!(selection.selected_snapshot_id.is_none());
+        assert!(selection.unresolved);
+        assert!(unresolved.task_summary.is_none());
+        assert_eq!(unresolved.semantic_source, "unresolved");
+        assert_eq!(
+            unresolved.prior_snapshot_id.as_deref(),
+            Some(local.snapshot_id.as_str())
+        );
+        assert!(unresolved.task_thread_id.is_none());
+        assert!(unresolved.task_thread_revision.is_none());
+        assert!(unresolved.continuity_thread_id.is_none());
+        assert_eq!(unresolved.relation_to_prior, "continuity_unproven");
     }
 }

@@ -80,12 +80,119 @@ private struct IslandSnapshot: Decodable {
     }
 }
 
+private struct IslandSemanticCurrentActivity: Decodable, Equatable {
+    var observedSurface: String?
+    var immediateUserOperation: String?
+    var semanticEffectOfOperation: String?
+    var currentSubtask: String?
+    var relationshipToPrimary: String
+
+    enum CodingKeys: String, CodingKey {
+        case observedSurface = "observed_surface"
+        case immediateUserOperation = "immediate_user_operation"
+        case semanticEffectOfOperation = "semantic_effect_of_operation"
+        case currentSubtask = "current_subtask"
+        case relationshipToPrimary = "relationship_to_primary"
+    }
+}
+
+private struct IslandSemanticAtomicIdentity: Decodable, Equatable {
+    var sessionId: String?
+    var taskThreadId: String?
+    var taskThreadRevision: Int64?
+    var taskSnapshotId: String
+    var snapshotRevision: Int64
+    var selectedHypothesisId: String?
+    var modelRequestId: String?
+    var modelResponseId: String?
+    var observationPacketId: String
+    var evidenceWatermark: String
+    var correctionFingerprint: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case taskThreadId = "task_thread_id"
+        case taskThreadRevision = "task_thread_revision"
+        case taskSnapshotId = "task_snapshot_id"
+        case snapshotRevision = "snapshot_revision"
+        case selectedHypothesisId = "selected_hypothesis_id"
+        case modelRequestId = "model_request_id"
+        case modelResponseId = "model_response_id"
+        case observationPacketId = "observation_packet_id"
+        case evidenceWatermark = "evidence_watermark"
+        case correctionFingerprint = "correction_fingerprint"
+    }
+}
+
+private struct IslandSemanticAlternative: Decodable, Equatable {
+    var hypothesisId: String
+    var taskSummary: String
+    var relation: String
+    var confidence: Double
+    var evidenceRefs: [String]
+    var contradictingEvidenceRefs: [String]
+    var taskThreadId: String?
+    var taskThreadRevision: Int64?
+    var lastSupportedAtMs: Int64?
+    var disposition: String
+    var reasonCodes: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case hypothesisId = "hypothesis_id"
+        case taskSummary = "task_summary"
+        case relation
+        case confidence
+        case evidenceRefs = "evidence_refs"
+        case contradictingEvidenceRefs = "contradicting_evidence_refs"
+        case taskThreadId = "task_thread_id"
+        case taskThreadRevision = "task_thread_revision"
+        case lastSupportedAtMs = "last_supported_at_ms"
+        case disposition
+        case reasonCodes = "reason_codes"
+    }
+}
+
+private struct IslandSemanticAnswer: Decodable, Equatable {
+    var schema: String
+    var taskResolutionStatus: String
+    var taskSummary: String?
+    var taskObject: String?
+    var currentActivity: IslandSemanticCurrentActivity
+    var lastMeaningfulProgress: String?
+    var unfinishedState: String?
+    var executionState: String
+    var nextAction: String?
+    var whereSummary: String?
+    var relationshipToPrior: String
+    var alternativeHypotheses: [IslandSemanticAlternative]
+    var inferenceStatus: String?
+    var atomicIdentity: IslandSemanticAtomicIdentity
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case taskResolutionStatus = "task_resolution_status"
+        case taskSummary = "task_summary"
+        case taskObject = "task_object"
+        case currentActivity = "current_activity"
+        case lastMeaningfulProgress = "last_meaningful_progress"
+        case unfinishedState = "unfinished_state"
+        case executionState = "execution_state"
+        case nextAction = "next_action"
+        case whereSummary = "where_summary"
+        case relationshipToPrior = "relationship_to_prior"
+        case alternativeHypotheses = "alternative_hypotheses"
+        case inferenceStatus = "inference_status"
+        case atomicIdentity = "atomic_identity"
+    }
+}
+
 private struct IslandContinueState: Decodable, Equatable {
     var schema: String
     var displayState: IslandDisplayState
     var decisionId: String?
     var targetState: String
     var targetReasonCodes: [String]
+    var semanticAnswer: IslandSemanticAnswer?
     var currentFocus: IslandFocusSummary?
     var currentActivity: String?
     var activityLabel: String?
@@ -111,6 +218,7 @@ private struct IslandContinueState: Decodable, Equatable {
         case decisionId = "decision_id"
         case targetState = "target_state"
         case targetReasonCodes = "target_reason_codes"
+        case semanticAnswer = "semantic_answer"
         case currentFocus = "current_focus"
         case currentActivity = "current_activity"
         case activityLabel = "activity_label"
@@ -137,6 +245,7 @@ private struct IslandContinueState: Decodable, Equatable {
         decisionId: String? = nil,
         targetState: String = "no_clear_task",
         targetReasonCodes: [String] = [],
+        semanticAnswer: IslandSemanticAnswer? = nil,
         currentFocus: IslandFocusSummary? = nil,
         currentActivity: String? = nil,
         activityLabel: String? = nil,
@@ -161,6 +270,7 @@ private struct IslandContinueState: Decodable, Equatable {
         self.decisionId = decisionId
         self.targetState = targetState
         self.targetReasonCodes = targetReasonCodes
+        self.semanticAnswer = semanticAnswer
         self.currentFocus = currentFocus
         self.currentActivity = currentActivity
         self.activityLabel = activityLabel
@@ -188,6 +298,7 @@ private struct IslandContinueState: Decodable, Equatable {
         decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
         targetState = try container.decodeIfPresent(String.self, forKey: .targetState) ?? "no_clear_task"
         targetReasonCodes = try container.decodeIfPresent([String].self, forKey: .targetReasonCodes) ?? []
+        semanticAnswer = try container.decodeIfPresent(IslandSemanticAnswer.self, forKey: .semanticAnswer)
         currentFocus = try container.decodeIfPresent(IslandFocusSummary.self, forKey: .currentFocus)
         currentActivity = try container.decodeIfPresent(String.self, forKey: .currentActivity)
         activityLabel = try container.decodeIfPresent(String.self, forKey: .activityLabel)
@@ -236,8 +347,9 @@ private struct IslandContinueState: Decodable, Equatable {
                 displayState: .localMemoryWarming,
                 nextAction: "Collecting local evidence",
                 availableActions: [
+                    IslandAvailableAction(kind: .refreshContinue, label: "Continue", enabled: true),
                     IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true),
-                    IslandAvailableAction(kind: .captureEvidenceNow, label: "Capture evidence", enabled: true),
+                    IslandAvailableAction(kind: .captureEvidenceNow, label: "Update local evidence", enabled: true),
                 ]
             )
         }
@@ -309,6 +421,10 @@ private struct IslandAvailableAction: Decodable, Equatable {
     var enabled: Bool
     var reason: String?
     var decisionId: String?
+    var taskSnapshotId: String?
+    var taskSnapshotRevision: Int64?
+    var affectedTaskField: String?
+    var taskHypothesisId: String?
 
     enum CodingKeys: String, CodingKey {
         case kind
@@ -316,14 +432,32 @@ private struct IslandAvailableAction: Decodable, Equatable {
         case enabled
         case reason
         case decisionId = "decision_id"
+        case taskSnapshotId = "task_snapshot_id"
+        case taskSnapshotRevision = "task_snapshot_revision"
+        case affectedTaskField = "affected_task_field"
+        case taskHypothesisId = "task_hypothesis_id"
     }
 
-    init(kind: IslandActionKind, label: String, enabled: Bool, reason: String? = nil, decisionId: String? = nil) {
+    init(
+        kind: IslandActionKind,
+        label: String,
+        enabled: Bool,
+        reason: String? = nil,
+        decisionId: String? = nil,
+        taskSnapshotId: String? = nil,
+        taskSnapshotRevision: Int64? = nil,
+        affectedTaskField: String? = nil,
+        taskHypothesisId: String? = nil
+    ) {
         self.kind = kind
         self.label = label
         self.enabled = enabled
         self.reason = reason
         self.decisionId = decisionId
+        self.taskSnapshotId = taskSnapshotId
+        self.taskSnapshotRevision = taskSnapshotRevision
+        self.affectedTaskField = affectedTaskField
+        self.taskHypothesisId = taskHypothesisId
     }
 }
 
@@ -332,6 +466,13 @@ private enum IslandActionKind: String, Decodable, Equatable {
     case openContinueTarget = "open_continue_target"
     case markWrongTarget = "mark_wrong_target"
     case markNotUseful = "mark_not_useful"
+    case chooseTaskAlternative = "choose_task_alternative"
+    case rejectSelectedTask = "reject_selected_task"
+    case rejectTaskAlternative = "reject_task_alternative"
+    case markSupportingWork = "mark_supporting_work"
+    case markUnrelatedActivity = "mark_unrelated_activity"
+    case markTaskCompleted = "mark_task_completed"
+    case reactivateTask = "reactivate_task"
     case inspectEvidence = "inspect_evidence"
     case openSmalltalk = "open_smalltalk"
     case startLocalMemory = "start_local_memory"
@@ -830,7 +971,7 @@ private struct SessionIslandView: View {
         case .needsRefresh:
             return "Continue needs refresh"
         case .inspectOnly, .noClearContinuation:
-            return "Exact location unavailable"
+            return taskInferenceUnavailable ? "Task inference unavailable" : "Exact task unavailable"
         case .error:
             return "Continue unavailable"
         }
@@ -851,7 +992,9 @@ private struct SessionIslandView: View {
         case .needsRefresh:
             return "Newer local evidence is available"
         case .inspectOnly, .noClearContinuation:
-            return compactUncertainActivityLine ?? "Evidence is available to inspect"
+            return taskInferenceUnavailable
+                ? "Recent activity was captured, but inference failed"
+                : compactUncertainActivityLine ?? "Evidence is available to inspect"
         case .error:
             return "Open Smalltalk to inspect local memory"
         }
@@ -885,10 +1028,14 @@ private struct SessionIslandView: View {
             priority = [.openContinueTarget, .inspectEvidence, .openSmalltalk, .refreshContinue]
         case .needsRefresh, .checkingContinue:
             priority = [.refreshContinue, .inspectEvidence, .openSmalltalk]
-        case .thinCurrentWork, .targetSuppressed, .supportBlocked, .inspectOnly, .noClearContinuation:
-            priority = [.inspectEvidence, .openSmalltalk, .captureEvidenceNow, .refreshContinue]
-        case .noLocalMemory, .localMemoryWarming:
-            priority = [.startLocalMemory, .captureEvidenceNow, .openSmalltalk]
+        case .thinCurrentWork, .targetSuppressed, .supportBlocked, .noClearContinuation:
+            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk, .captureEvidenceNow]
+        case .inspectOnly:
+            priority = [.inspectEvidence, .refreshContinue, .openSmalltalk]
+        case .noLocalMemory:
+            priority = [.startLocalMemory, .openSmalltalk]
+        case .localMemoryWarming:
+            priority = [.refreshContinue, .openSmalltalk, .captureEvidenceNow]
         case .error:
             priority = [.openSmalltalk]
         }
@@ -898,11 +1045,30 @@ private struct SessionIslandView: View {
 
     private var secondaryContinueAction: IslandAvailableAction? {
         let primary = primaryContinueAction
+        if displayState == .localMemoryWarming,
+           let updateEvidence = firstEnabledAction(in: [.captureEvidenceNow]),
+           updateEvidence.kind != primary.kind {
+            return updateEvidence
+        }
         return continueState.availableActions.first { action in
             action.enabled &&
                 action.kind != .unknown &&
                 action.kind != primary.kind &&
                 actionLabel(action, compact: false) != actionLabel(primary, compact: false)
+        }
+    }
+
+    private var semanticCorrectionActions: [IslandAvailableAction] {
+        continueState.availableActions.filter { action in
+            action.enabled && [
+                .chooseTaskAlternative,
+                .rejectSelectedTask,
+                .rejectTaskAlternative,
+                .markSupportingWork,
+                .markUnrelatedActivity,
+                .markTaskCompleted,
+                .reactivateTask,
+            ].contains(action.kind)
         }
     }
 
@@ -926,6 +1092,12 @@ private struct SessionIslandView: View {
             return compact ? "Not right" : "Not right"
         case .markNotUseful:
             return compact ? "Skip" : "Not useful"
+        case .chooseTaskAlternative:
+            return compact ? "Choose" : action.label
+        case .rejectSelectedTask, .rejectTaskAlternative:
+            return compact ? "Reject" : action.label
+        case .markSupportingWork, .markUnrelatedActivity, .markTaskCompleted, .reactivateTask:
+            return compact ? "Correct" : action.label
         case .refreshContinue:
             return compact ? "Refresh" : "Refresh"
         case .inspectEvidence:
@@ -935,7 +1107,7 @@ private struct SessionIslandView: View {
         case .startLocalMemory:
             return compact ? "Start" : "Start local memory"
         case .captureEvidenceNow:
-            return compact ? "Capture" : "Capture evidence"
+            return compact ? "Update" : "Update local evidence"
         case .unknown:
             return compact ? "Open" : "Open Smalltalk"
         }
@@ -966,7 +1138,20 @@ private struct SessionIslandView: View {
     }
 
     private var activitySummaryLine: String? {
-        trimmed(continueState.activitySummary).nonEmpty
+        trimmed(continueState.semanticAnswer?.taskSummary).nonEmpty
+            ?? trimmed(continueState.activitySummary).nonEmpty
+    }
+
+    private var taskInferenceUnavailable: Bool {
+        let status = trimmed(continueState.semanticAnswer?.inferenceStatus).lowercased()
+        return [
+            "disabled", "credentials_missing", "model_unavailable", "timeout",
+            "provider_error", "provider_failure", "request_invalid", "invalid_response",
+        ].contains(status)
+    }
+
+    private var currentActivityLine: String? {
+        trimmed(continueState.currentActivity).nonEmpty
     }
 
     private var compactActivityLine: String? {
@@ -1298,24 +1483,27 @@ private struct SessionIslandView: View {
             }
 
             VStack(alignment: .leading, spacing: s(6)) {
-                ContinueDetailRow(
-                    label: "You were",
-                    value: activitySummaryLine ?? "Exact task recovery is unavailable",
-                    scale: scale
-                )
-                ContinueDetailRow(
-                    label: "State",
-                    value: activityStateLine ?? "No supported unfinished state is available",
-                    scale: scale
-                )
+                if let activitySummaryLine {
+                    ContinueDetailRow(label: "You were", value: activitySummaryLine, scale: scale)
+                } else if taskInferenceUnavailable {
+                    ContinueDetailRow(
+                        label: "Task",
+                        value: "Inference is unavailable right now",
+                        scale: scale
+                    )
+                }
+                if let currentActivityLine {
+                    ContinueDetailRow(label: "Currently", value: currentActivityLine, scale: scale)
+                }
+                if let activityStateLine {
+                    ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)
+                }
                 if let nextActionLine {
                     ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
                 }
-                ContinueDetailRow(
-                    label: "Where",
-                    value: activityWhereLine ?? "Exact location unavailable",
-                    scale: scale
-                )
+                if let activityWhereLine {
+                    ContinueDetailRow(label: "Where", value: activityWhereLine, scale: scale)
+                }
             }
             .padding(.horizontal, s(10))
             .padding(.vertical, s(10))
@@ -1360,6 +1548,21 @@ private struct SessionIslandView: View {
                     if let secondaryContinueAction {
                         onContinueAction(secondaryContinueAction)
                     }
+                }
+
+                if !semanticCorrectionActions.isEmpty {
+                    Menu {
+                        ForEach(Array(semanticCorrectionActions.enumerated()), id: \.offset) { _, action in
+                            Button(action.label) {
+                                onContinueAction(action)
+                            }
+                        }
+                    } label: {
+                        Text("Correct")
+                            .font(Brand.swiftUIFont(size: s(11.5), weight: .semibold))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
                 }
             }
         }
@@ -2127,6 +2330,14 @@ private final class SessionIslandController: NSObject {
             setPresentation(.expanded, resetIdleTimer: false)
         case .refreshContinue, .markWrongTarget, .markNotUseful, .startLocalMemory, .captureEvidenceNow:
             revealCompact()
+        case .chooseTaskAlternative,
+             .rejectSelectedTask,
+             .rejectTaskAlternative,
+             .markSupportingWork,
+             .markUnrelatedActivity,
+             .markTaskCompleted,
+             .reactivateTask:
+            revealCompact()
         case .inspectEvidence, .openSmalltalk:
             break
         case .unknown:
@@ -2136,7 +2347,11 @@ private final class SessionIslandController: NSObject {
         sendAction(
             "perform_continue_action",
             decisionId: action.decisionId ?? snapshot.islandContinueState?.decisionId ?? snapshot.continueDecisionId,
-            continueActionKind: action.kind.rawValue
+            continueActionKind: action.kind.rawValue,
+            taskSnapshotId: action.taskSnapshotId,
+            taskSnapshotRevision: action.taskSnapshotRevision,
+            affectedTaskField: action.affectedTaskField,
+            taskHypothesisId: action.taskHypothesisId
         )
     }
 
@@ -2191,7 +2406,15 @@ private final class SessionIslandController: NSObject {
         }
     }
 
-    private func sendAction(_ action: String, decisionId: String? = nil, continueActionKind: String? = nil) {
+    private func sendAction(
+        _ action: String,
+        decisionId: String? = nil,
+        continueActionKind: String? = nil,
+        taskSnapshotId: String? = nil,
+        taskSnapshotRevision: Int64? = nil,
+        affectedTaskField: String? = nil,
+        taskHypothesisId: String? = nil
+    ) {
         guard let callback = gActionCallback else { return }
         var fields = ["\"action\":\"\(jsonEscaped(action))\""]
         if let decisionId, !decisionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2199,6 +2422,18 @@ private final class SessionIslandController: NSObject {
         }
         if let continueActionKind, !continueActionKind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             fields.append("\"action_kind\":\"\(jsonEscaped(continueActionKind))\"")
+        }
+        if let taskSnapshotId, !taskSnapshotId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fields.append("\"task_snapshot_id\":\"\(jsonEscaped(taskSnapshotId))\"")
+        }
+        if let taskSnapshotRevision {
+            fields.append("\"task_snapshot_revision\":\(taskSnapshotRevision)")
+        }
+        if let affectedTaskField, !affectedTaskField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fields.append("\"affected_task_field\":\"\(jsonEscaped(affectedTaskField))\"")
+        }
+        if let taskHypothesisId, !taskHypothesisId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fields.append("\"task_hypothesis_id\":\"\(jsonEscaped(taskHypothesisId))\"")
         }
         fields.append("\"source\":\"native_island\"")
         let json = "{\(fields.joined(separator: ","))}"

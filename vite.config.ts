@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// @ts-expect-error process is a nodejs global
+// @ts-ignore process is a nodejs global in the Vite runtime
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/

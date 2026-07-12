@@ -593,9 +593,13 @@ pub(crate) fn run_fixture_once(
             model: None,
             max_candidates_for_model: Some(5),
             audit_output_enabled: Some(false),
+            audit_mode: None,
             island_trigger_reason: None,
             island_source: Some("accuracy_eval".to_string()),
             request_trigger: Some("accuracy_eval".to_string()),
+            manual_continue_frame_id: None,
+            manual_continue_preflight_failure: None,
+            manual_continue_started_at_ms: None,
         },
     )?;
     let mut actual = collect_checkpoints(&conn, &decision)?;

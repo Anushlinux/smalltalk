@@ -126,10 +126,16 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
 
          CREATE TABLE IF NOT EXISTS task_truth_v2_feedback_events (
            feedback_id TEXT PRIMARY KEY,
+           task_thread_id TEXT,
+           task_thread_revision INTEGER,
            task_snapshot_id TEXT NOT NULL,
            task_snapshot_revision INTEGER NOT NULL,
+           corrected_snapshot_id TEXT,
+           corrected_snapshot_revision INTEGER,
            affected_field TEXT NOT NULL,
            hypothesis_id TEXT,
+           evidence_watermark TEXT,
+           correction_value TEXT,
            feedback_kind TEXT NOT NULL,
            decision_id TEXT,
            observed_at_ms INTEGER NOT NULL
@@ -143,11 +149,104 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
            release_gate_passed INTEGER NOT NULL,
            snapshot_id TEXT,
            snapshot_revision INTEGER,
+           task_thread_id TEXT,
+           task_thread_revision INTEGER,
+           selected_hypothesis_id TEXT,
+           model_request_id TEXT,
+           model_response_id TEXT,
+           provider_attempt_count INTEGER NOT NULL DEFAULT 0,
+           observation_packet_id TEXT,
+           evidence_watermark TEXT,
+           correction_fingerprint TEXT,
            return_target_artifact_id TEXT,
            created_at_ms INTEGER NOT NULL
          );",
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    for (table, column, sql_type) in [
+        ("task_truth_v2_feedback_events", "task_thread_id", "TEXT"),
+        (
+            "task_truth_v2_feedback_events",
+            "task_thread_revision",
+            "INTEGER",
+        ),
+        (
+            "task_truth_v2_feedback_events",
+            "corrected_snapshot_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_feedback_events",
+            "corrected_snapshot_revision",
+            "INTEGER",
+        ),
+        (
+            "task_truth_v2_feedback_events",
+            "evidence_watermark",
+            "TEXT",
+        ),
+        ("task_truth_v2_feedback_events", "correction_value", "TEXT"),
+        ("task_truth_v2_decision_contracts", "task_thread_id", "TEXT"),
+        (
+            "task_truth_v2_decision_contracts",
+            "task_thread_revision",
+            "INTEGER",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "selected_hypothesis_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "model_request_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "model_response_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "provider_attempt_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "observation_packet_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "evidence_watermark",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "correction_fingerprint",
+            "TEXT",
+        ),
+    ] {
+        let exists = {
+            let mut statement = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .map_err(|error| error.to_string())?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            columns.iter().any(|existing| existing == column)
+        };
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+            ))
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_fingerprint(snapshot: &TaskSnapshotV2) -> String {
@@ -173,24 +272,21 @@ pub(crate) fn load_latest_snapshot(
     session_id: Option<&str>,
 ) -> Result<Option<TaskSnapshotV2>, String> {
     ensure_schema(conn)?;
-    let sql = if session_id.is_some() {
-        "SELECT s.snapshot_json
-         FROM task_truth_v2_snapshots s
-         JOIN task_truth_v2_observation_packets p ON p.packet_id=s.packet_id
-         WHERE p.session_id=?1
-         ORDER BY s.observed_at_ms DESC, s.revision DESC LIMIT 1"
-    } else {
-        "SELECT snapshot_json FROM task_truth_v2_snapshots
-         ORDER BY observed_at_ms DESC, revision DESC LIMIT 1"
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
     };
-    let raw = if let Some(session_id) = session_id {
-        conn.query_row(sql, params![session_id], |row| row.get::<_, String>(0))
-            .optional()
-    } else {
-        conn.query_row(sql, [], |row| row.get::<_, String>(0))
-            .optional()
-    }
-    .map_err(|error| error.to_string())?;
+    let raw = conn
+        .query_row(
+            "SELECT s.snapshot_json
+             FROM task_truth_v2_snapshots s
+             JOIN task_truth_v2_observation_packets p ON p.packet_id=s.packet_id
+             WHERE p.session_id=?1
+             ORDER BY s.observed_at_ms DESC, s.revision DESC LIMIT 1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
         .transpose()
 }
@@ -345,31 +441,25 @@ pub(crate) fn load_recent_snapshots(
     limit: usize,
 ) -> Result<Vec<TaskSnapshotV2>, String> {
     ensure_schema(conn)?;
-    let sql = if session_id.is_some() {
-        "SELECT s.snapshot_json
-         FROM task_truth_v2_snapshots s
-         JOIN task_truth_v2_observation_packets p ON p.packet_id=s.packet_id
-         WHERE p.session_id=?1
-         ORDER BY s.observed_at_ms DESC, s.revision DESC LIMIT ?2"
-    } else {
-        "SELECT snapshot_json FROM task_truth_v2_snapshots
-         ORDER BY observed_at_ms DESC, revision DESC LIMIT ?1"
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
     };
-    let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
-    let raw_rows = if let Some(session_id) = session_id {
-        stmt.query_map(params![session_id, limit.clamp(1, 100) as i64], |row| {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.snapshot_json
+             FROM task_truth_v2_snapshots s
+             JOIN task_truth_v2_observation_packets p ON p.packet_id=s.packet_id
+             WHERE p.session_id=?1
+             ORDER BY s.observed_at_ms DESC, s.revision DESC LIMIT ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let raw_rows = stmt
+        .query_map(params![session_id, limit.clamp(1, 100) as i64], |row| {
             row.get::<_, String>(0)
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
-    } else {
-        stmt.query_map(params![limit.clamp(1, 100) as i64], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-    }
-    .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
     raw_rows
         .into_iter()
         .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
@@ -419,4 +509,43 @@ fn prune(conn: &Connection, now_ms: i64) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unscoped_snapshot_reads_never_fall_back_to_global_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO task_truth_v2_observation_packets (
+               packet_id, schema_version, observed_at_ms, session_id, evidence_watermark,
+               current_frame_id, privacy_status, model_eligible, serialized_bytes,
+               estimated_tokens, packet_json, created_at_ms
+             ) VALUES ('packet-a','packet.v2',1,'session-a','watermark-a',
+                       'frame-a','allowed',1,1,1,'{}',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_truth_v2_snapshots (
+               snapshot_id, schema_version, revision, observed_at_ms, evidence_watermark,
+               packet_id, execution_state, relation_to_prior, selection_status,
+               semantic_fingerprint, snapshot_json, created_at_ms
+             ) VALUES ('snapshot-a','snapshot.v2',1,1,'watermark-a','packet-a',
+                       'active','new_task','selected','fingerprint-a','not-json',1)",
+            [],
+        )
+        .unwrap();
+
+        assert!(load_latest_snapshot(&conn, None).unwrap().is_none());
+        assert!(load_latest_snapshot(&conn, Some(" ")).unwrap().is_none());
+        assert!(load_recent_snapshots(&conn, None, 24).unwrap().is_empty());
+        assert!(load_recent_snapshots(&conn, Some(""), 24)
+            .unwrap()
+            .is_empty());
+        assert!(load_latest_snapshot(&conn, Some("session-a")).is_err());
+    }
 }

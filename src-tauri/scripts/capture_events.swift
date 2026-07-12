@@ -41,9 +41,12 @@ var cachedFrontmostContextAtMs: Int64 = 0
 var lastAxEmitByKey: [String: Int64] = [:]
 var pendingScrollDx = 0.0
 var pendingScrollDy = 0.0
+var pendingScrollX: Double?
+var pendingScrollY: Double?
 var pendingScrollContext: FrontmostContext?
 var scrollFlushTimer: Timer?
 var lastScrollEmitAtMs: Int64 = 0
+var droppedAtSource: Int64 = 0
 
 let smalltalkBundleId = "com.smalltalk.app"
 let frontmostContextCacheMs: Int64 = 250
@@ -164,9 +167,16 @@ func baseEvent(
 
 func emitObserved(_ payload: EventPayload) {
   if isSmalltalkBundle(payload.app_bundle_id) || isSmalltalkAppName(payload.app_name) {
+    droppedAtSource += 1
     return
   }
   emit(payload)
+}
+
+Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { _ in
+  emit(baseEvent(type: "source_diagnostics", payload: [
+    "dropped_at_source": "\(droppedAtSource)"
+  ]))
 }
 
 func modifierDescription(_ flags: CGEventFlags) -> String? {
@@ -292,6 +302,7 @@ func axThrottleMs(for notification: String) -> Int64 {
 
 func shouldEmitAxNotification(_ notification: String) -> Bool {
   guard !isSmalltalkBundle(activeObservedBundleId) else {
+    droppedAtSource += 1
     return false
   }
   let now = nowMs()
@@ -299,6 +310,7 @@ func shouldEmitAxNotification(_ notification: String) -> Bool {
   let key = "\(pidKey):\(notification)"
   let throttleMs = axThrottleMs(for: notification)
   if let last = lastAxEmitByKey[key], now - last < throttleMs {
+    droppedAtSource += 1
     return false
   }
   lastAxEmitByKey[key] = now
@@ -385,8 +397,12 @@ func flushPendingScroll() {
 
   let dx = pendingScrollDx
   let dy = pendingScrollDy
+  let x = pendingScrollX
+  let y = pendingScrollY
   pendingScrollDx = 0
   pendingScrollDy = 0
+  pendingScrollX = nil
+  pendingScrollY = nil
   pendingScrollContext = nil
 
   if abs(dx) < 0.01 && abs(dy) < 0.01 {
@@ -394,7 +410,14 @@ func flushPendingScroll() {
   }
 
   lastScrollEmitAtMs = nowMs()
-  emitObserved(baseEvent(type: "scroll", scrollDx: dx, scrollDy: dy, context: context))
+  emitObserved(baseEvent(
+    type: "scroll",
+    x: x,
+    y: y,
+    scrollDx: dx,
+    scrollDy: dy,
+    context: context
+  ))
 }
 
 func scheduleScrollFlush(after delayMs: Int64) {
@@ -407,14 +430,17 @@ func scheduleScrollFlush(after delayMs: Int64) {
   }
 }
 
-func handleScroll(dx: Double, dy: Double) {
+func handleScroll(dx: Double, dy: Double, x: Double, y: Double) {
   let context = frontmostContext()
   if shouldSuppressContext(context) {
+    droppedAtSource += 1
     return
   }
 
   pendingScrollDx += dx
   pendingScrollDy += dy
+  pendingScrollX = x
+  pendingScrollY = y
   pendingScrollContext = context
 
   let now = nowMs()
@@ -422,6 +448,7 @@ func handleScroll(dx: Double, dy: Double) {
     flushPendingScroll()
     return
   }
+  droppedAtSource += 1
   scheduleScrollFlush(after: scrollCoalesceMs - (now - lastScrollEmitAtMs))
 }
 
@@ -470,7 +497,8 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   case .scrollWheel:
     let dx = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
     let dy = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
-    handleScroll(dx: dx, dy: dy)
+    let location = event.location
+    handleScroll(dx: dx, dy: dy, x: location.x, y: location.y)
   case .keyDown:
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
     let flags = event.flags

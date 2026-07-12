@@ -109,14 +109,21 @@ fn score(snapshot: &TaskSnapshotV2, newest_at_ms: i64) -> SnapshotSelectionScore
 }
 
 pub(crate) fn select_snapshot(snapshots: &[TaskSnapshotV2]) -> SnapshotSelectionResultV2 {
-    let newest_at_ms = snapshots
-        .iter()
-        .map(|snapshot| snapshot.observed_at_ms)
-        .max()
-        .unwrap_or(0);
+    let newest = snapshots.iter().max_by(|left, right| {
+        left.observed_at_ms
+            .cmp(&right.observed_at_ms)
+            .then_with(|| left.revision.cmp(&right.revision))
+            .then_with(|| left.snapshot_id.cmp(&right.snapshot_id))
+    });
+    let newest_at_ms = newest.map(|snapshot| snapshot.observed_at_ms).unwrap_or(0);
     let mut scores = snapshots
         .iter()
-        .filter(|snapshot| snapshot.selection_status != SnapshotSelectionStatusV2::Unresolved)
+        .filter(|snapshot| {
+            matches!(
+                snapshot.semantic_source.as_str(),
+                "cloud_multimodal_model" | "human_correction"
+            )
+        })
         .map(|snapshot| score(snapshot, newest_at_ms))
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| {
@@ -126,10 +133,35 @@ pub(crate) fn select_snapshot(snapshots: &[TaskSnapshotV2]) -> SnapshotSelection
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.snapshot_id.cmp(&right.snapshot_id))
     });
-    let selected_snapshot_id = scores
-        .first()
-        .filter(|score| score.total >= 0.35)
-        .map(|score| score.snapshot_id.clone());
+    for score in &mut scores {
+        let Some(snapshot) = snapshots
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id == score.snapshot_id)
+        else {
+            continue;
+        };
+        if newest.is_some_and(|newest| newest.snapshot_id != snapshot.snapshot_id) {
+            score.reason_codes.push("stale_unsupported_snapshot".into());
+        }
+        if snapshot.task_thread_id.is_none()
+            && snapshot.selection_status != SnapshotSelectionStatusV2::Unresolved
+        {
+            score.reason_codes.push("missing_continuity_edge".into());
+        }
+        if snapshot.thread_status == "superseded" {
+            score.reason_codes.push("superseded_thread".into());
+        }
+    }
+    let selected_snapshot_id = newest.and_then(|snapshot| {
+        let current_is_unresolved = snapshot.selection_status
+            == SnapshotSelectionStatusV2::Unresolved
+            || snapshot.task_summary.is_none()
+            || snapshot.semantic_source == "unresolved";
+        let hard_rejected = snapshot.thread_status == "superseded"
+            || (snapshot.task_thread_id.is_none()
+                && snapshot.semantic_source != "human_correction");
+        (!current_is_unresolved && !hard_rejected).then(|| snapshot.snapshot_id.clone())
+    });
     SnapshotSelectionResultV2 {
         policy_version: SNAPSHOT_SELECTION_POLICY_V1.into(),
         unresolved: selected_snapshot_id.is_none(),

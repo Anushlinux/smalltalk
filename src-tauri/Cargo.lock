@@ -3114,6 +3114,9 @@ name = "smalltalk"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "core-foundation",
+ "core-graphics",
+ "foreign-types",
  "rusqlite",
  "serde",
  "serde_json",

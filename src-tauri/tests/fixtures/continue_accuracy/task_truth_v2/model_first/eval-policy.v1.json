@@ -1,0 +1,27 @@
+{
+  "schema": "smalltalk.mfti_04.eval_policy.v1",
+  "policy_version": "mfti.04-v1",
+  "frozen_before_holdout_access": true,
+  "holdout_accessed_at_freeze": false,
+  "metrics": {
+    "wrong_primary_task_rate": {"definition":"A specific primary task conflicts with independent human ground truth.","threshold":0.03,"higher_is_better":false},
+    "visible_surface_substituted_for_task": {"definition":"The visible page or surface is presented as the broader task when the human label distinguishes them.","threshold":0.02,"higher_is_better":false},
+    "wrong_activity_to_task_relationship": {"definition":"The current activity relationship to the primary task is wrong.","threshold":0.05,"higher_is_better":false},
+    "wrong_task_switch_or_detour": {"definition":"A task switch, completion, return, support step, or detour is classified incorrectly.","threshold":0.05,"higher_is_better":false},
+    "cross_session_stale_leakage": {"definition":"An old cross-session task wins without explicit continuity evidence.","threshold":0.0,"higher_is_better":false},
+    "mixed_snapshot_semantic_fields": {"definition":"One public answer contains semantic fields from different task or thread revisions.","threshold":0.0,"higher_is_better":false},
+    "control_navigation_as_task_rate": {"definition":"Browser chrome, application controls, or navigation are selected as the primary task.","threshold":0.0,"higher_is_better":false},
+    "unsupported_specific_claim_rate": {"definition":"A specific semantic claim is not supported by cited evidence.","threshold":0.01,"higher_is_better":false},
+    "provider_failure_local_semantic_fallback": {"definition":"Provider failure produces a locally invented semantic task.","threshold":0.0,"higher_is_better":false},
+    "provider_failure_honest_unresolved": {"definition":"Provider failure produces an honest unresolved or unavailable answer.","threshold":1.0,"higher_is_better":true},
+    "useful_non_generic_task_summary": {"definition":"The answer gives a useful non-generic task summary.","threshold":0.9,"higher_is_better":true},
+    "task_object_accuracy": {"definition":"The work object matches the independent label or an accepted alternative.","threshold":0.88,"higher_is_better":true},
+    "execution_state_accuracy": {"definition":"Progress and unfinished, waiting, or blocked state match the independent label.","threshold":0.9,"higher_is_better":true},
+    "supported_next_action_precision": {"definition":"Every presented next action is evidence-supported and correct.","threshold":0.9,"higher_is_better":true},
+    "supported_next_action_coverage": {"definition":"A supported next action is presented when independently labeled as available.","threshold":0.85,"higher_is_better":true},
+    "return_target_precision": {"definition":"Every presented return target matches the selected task revision and passes strict-open validation.","threshold":0.98,"higher_is_better":true},
+    "stronger_manual_result_downgraded": {"definition":"A weaker background or cached result replaces a stronger manual result.","threshold":0.0,"higher_is_better":false},
+    "unseen_application_useful_summary": {"definition":"A useful task summary is produced for an application bucket absent from development.","threshold":0.8,"higher_is_better":true},
+    "human_immediately_useful": {"definition":"An independent reviewer marks the answer immediately useful.","threshold":0.85,"higher_is_better":true}
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smalltalk.mfti_04.release_identity.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "bindings"],
+  "properties": {
+    "schema": {"const": "smalltalk.mfti_04.release_identity.v1"},
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["corpus_sha256","holdout_sha256","provider","model","prompt_version","response_schema_version","observation_packet_version","verifier_version","task_thread_version","public_answer_version","performance_privacy_policy_version","manual_qa_manifest_sha256","source_commit","build_identity"],
+      "properties": {
+        "corpus_sha256": {"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+        "holdout_sha256": {"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+        "provider": {"type":"string","minLength":1}, "model": {"type":"string","minLength":1},
+        "prompt_version": {"type":"string","minLength":1}, "response_schema_version": {"type":"string","minLength":1},
+        "observation_packet_version": {"type":"string","minLength":1}, "verifier_version": {"type":"string","minLength":1},
+        "task_thread_version": {"type":"string","minLength":1}, "public_answer_version": {"type":"string","minLength":1},
+        "performance_privacy_policy_version": {"type":"string","minLength":1},
+        "manual_qa_manifest_sha256": {"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+        "source_commit": {"type":"string","minLength":1}, "build_identity": {"type":"string","minLength":1}
+      }
+    }
+  }
+}

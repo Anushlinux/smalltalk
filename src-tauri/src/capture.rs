@@ -20,21 +20,34 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod swift_helpers;
+
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-static CONTINUE_DECISION_LOCK: Mutex<()> = Mutex::new(());
+const SCK_HELPER_TIMEOUT: Duration = Duration::from_secs(12);
+const SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX: &str =
+    "screen_capture_permission_requested_at_ms";
+const SCREEN_CAPTURE_SETTINGS_HINT: &str =
+    "System Settings > Privacy & Security > Screen & System Audio Recording";
+// One recovery probe is allowed after this boundary. Starting a new capture
+// session resets the breaker immediately.
+const SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+static SCK_PROVIDER_HEALTH: OnceLock<Mutex<CaptureProviderCircuitBreaker>> = OnceLock::new();
+static SCREEN_CAPTURE_IDENTITY: OnceLock<ScreenCapturePermissionIdentity> = OnceLock::new();
 const ACCESSIBILITY_SCRIPT: &str = r#"
 on replaceText(sourceText, oldText, newText)
   set oldDelims to AppleScript's text item delimiters
@@ -175,79 +188,6 @@ tell application "System Events"
 end tell
 "#;
 
-const VISION_OCR_SWIFT: &str = include_str!("../scripts/vision_ocr.swift");
-const ACCESSIBILITY_SNAPSHOT_SWIFT: &str = include_str!("../scripts/accessibility_snapshot.swift");
-const CAPTURE_EVENTS_SWIFT: &str = include_str!("../scripts/capture_events.swift");
-const WINDOW_SNAPSHOT_SWIFT: &str = include_str!("../scripts/window_snapshot.swift");
-const SCK_SCREENSHOT_SWIFT: &str = include_str!("../scripts/sck_screenshot.swift");
-const IMAGE_MASK_SWIFT: &str = r#"
-import AppKit
-import Foundation
-
-struct MaskRect: Decodable {
-    let x: Double
-    let y: Double
-    let w: Double
-    let h: Double
-}
-
-let args = CommandLine.arguments
-guard args.count >= 4 else {
-    fputs("usage: image_mask <input> <output> <rects-json>\n", stderr)
-    exit(2)
-}
-
-let input = URL(fileURLWithPath: args[1])
-let output = URL(fileURLWithPath: args[2])
-let rectData = args[3].data(using: .utf8) ?? Data()
-let rects = (try? JSONDecoder().decode([MaskRect].self, from: rectData)) ?? []
-
-guard let image = NSImage(contentsOf: input) else {
-    fputs("could not load input image\n", stderr)
-    exit(3)
-}
-
-let size = image.size
-guard let bitmap = NSBitmapImageRep(
-    bitmapDataPlanes: nil,
-    pixelsWide: max(1, Int(size.width.rounded())),
-    pixelsHigh: max(1, Int(size.height.rounded())),
-    bitsPerSample: 8,
-    samplesPerPixel: 4,
-    hasAlpha: true,
-    isPlanar: false,
-    colorSpaceName: .deviceRGB,
-    bytesPerRow: 0,
-    bitsPerPixel: 0
-) else {
-    fputs("could not create bitmap\n", stderr)
-    exit(4)
-}
-
-NSGraphicsContext.saveGraphicsState()
-NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
-image.draw(in: NSRect(origin: .zero, size: size))
-NSColor.black.setFill()
-for rect in rects {
-    let x = max(0.0, min(rect.x, size.width))
-    let y = max(0.0, min(rect.y, size.height))
-    let w = max(0.0, min(rect.w, size.width - x))
-    let h = max(0.0, min(rect.h, size.height - y))
-    NSBezierPath(rect: NSRect(x: x, y: size.height - y - h, width: w, height: h)).fill()
-}
-NSGraphicsContext.restoreGraphicsState()
-
-guard let png = bitmap.representation(using: .png, properties: [:]) else {
-    fputs("could not encode png\n", stderr)
-    exit(5)
-}
-
-try FileManager.default.createDirectory(
-    at: output.deletingLastPathComponent(),
-    withIntermediateDirectories: true
-)
-try png.write(to: output)
-"#;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -280,6 +220,12 @@ struct CaptureRuntime {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeDiagnostics {
+    pub workload: crate::workload::WorkloadDiagnostics,
+    pub events_received: i64,
+    pub events_dropped_at_source: i64,
+    pub events_dropped_at_ingest: i64,
+    pub events_persisted: i64,
+    pub events_promoted_to_capture: i64,
     pub heavy_captures_stored: i64,
     pub heavy_captures_skipped: i64,
     pub heavy_captures_skipped_budget: i64,
@@ -303,6 +249,18 @@ pub struct RuntimeDiagnostics {
     pub weak_surface_enrichment_failed: i64,
     pub latest_weak_surface_attempt: Option<String>,
     pub latest_weak_surface_snapshot_id: Option<String>,
+    pub sck_display_successes: i64,
+    pub sck_active_window_successes: i64,
+    pub sck_active_window_abnormal_exits: i64,
+    pub sck_timeouts: i64,
+    pub sck_circuit_breaker_opens: i64,
+    pub screencapture_fallbacks: i64,
+    pub latest_sck_capture_mode: Option<String>,
+    pub latest_sck_provider: Option<String>,
+    pub latest_sck_duration_ms: Option<i64>,
+    pub latest_sck_exit_category: Option<String>,
+    pub latest_sck_fallback_used: Option<bool>,
+    pub sck_active_window_circuit_breaker_state: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -517,6 +475,7 @@ pub struct CaptureFrame {
     pub content_hash: Option<String>,
     pub image_hash: Option<String>,
     pub capture_provider: Option<String>,
+    pub active_window_capture_provider: Option<String>,
     pub scope: Option<String>,
     pub display_id: Option<String>,
     pub window_id: Option<i64>,
@@ -559,7 +518,7 @@ const FRAME_COLUMNS: &str = "id, captured_at, snapshot_path, app_name, window_na
     capture_trigger_id, previous_frame_id, session_id, sck_display_id,
     sck_window_id, sck_owning_bundle_id, sck_filter_summary_json,
     sck_configuration_summary_json, sck_frame_metadata_json, sck_capture_mode,
-    sck_audio_policy";
+    sck_audio_policy, active_window_capture_provider";
 
 const FRAME_COLUMNS_F: &str = "f.id, f.captured_at, f.snapshot_path, f.app_name, f.window_name,
     f.browser_url, f.document_path, f.focused, f.capture_trigger, f.text_source,
@@ -570,7 +529,7 @@ const FRAME_COLUMNS_F: &str = "f.id, f.captured_at, f.snapshot_path, f.app_name,
     f.capture_trigger_id, f.previous_frame_id, f.session_id, f.sck_display_id,
     f.sck_window_id, f.sck_owning_bundle_id, f.sck_filter_summary_json,
     f.sck_configuration_summary_json, f.sck_frame_metadata_json, f.sck_capture_mode,
-    f.sck_audio_policy";
+    f.sck_audio_policy, f.active_window_capture_provider";
 
 const INSERT_FRAME_SQL: &str = "INSERT INTO frames (
     captured_at, snapshot_path, app_name, window_name, browser_url,
@@ -663,6 +622,14 @@ const MAX_RETAINED_LOW_VALUE_UI_EVENTS: i64 = 5_000;
 const MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP: i64 = 5_000;
 const MAX_RETAINED_FRAME_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_RETAINED_CONTINUE_DECISION_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+const RETENTION_POLICY_VERSION: &str = "smalltalk.retention.v1";
+const RUNTIME_MAINTENANCE_EVENT_INTERVAL: i64 = 250;
+const RUNTIME_MAINTENANCE_FRAME_INTERVAL: i64 = 12;
+const RUNTIME_MAINTENANCE_MIN_INTERVAL_MS: i64 = 30_000;
+const RUNTIME_MAINTENANCE_CHUNK_SIZE: i64 = 250;
+const MAX_RETAINED_HIGH_VALUE_UI_EVENTS: i64 = 20_000;
+const MAX_RETAINED_CAPTURE_TRIGGERS: i64 = 5_000;
+const MAX_RETAINED_TYPING_BURSTS: i64 = 5_000;
 const SMALLTALK_BUNDLE_ID: &str = "com.smalltalk.app";
 const UI_EVENT_SCROLL_MIN_INTERVAL_MS: i64 = 650;
 const UI_EVENT_AX_DEFAULT_MIN_INTERVAL_MS: i64 = 900;
@@ -745,6 +712,7 @@ struct FrameTextResolution {
 #[derive(Debug, Clone, Default)]
 struct FrameMetadata {
     capture_provider: String,
+    active_window_capture_provider: Option<String>,
     scope: String,
     display_id: Option<String>,
     window_id: Option<i64>,
@@ -781,6 +749,7 @@ struct ScreenshotCapture {
     frame_metadata_json: Option<String>,
     capture_mode: Option<String>,
     audio_policy: Option<String>,
+    helper_duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -798,6 +767,109 @@ struct SckScreenshotResponse {
     capture_mode: Option<String>,
     audio_policy: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperExitCategory {
+    Success,
+    StructuredHelperError,
+    InvalidResponse,
+    NonZeroExit,
+    AbnormalTermination,
+    Timeout,
+    LaunchFailure,
+    CircuitBreakerSkip,
+}
+
+impl HelperExitCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::StructuredHelperError => "structured_helper_error",
+            Self::InvalidResponse => "invalid_response",
+            Self::NonZeroExit => "non_zero_exit",
+            Self::AbnormalTermination => "signal_or_abnormal_termination",
+            Self::Timeout => "timeout",
+            Self::LaunchFailure => "launch_failure",
+            Self::CircuitBreakerSkip => "circuit_breaker_skip",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HelperExecutionResult {
+    category: HelperExitCategory,
+    response: Option<SckScreenshotResponse>,
+    stderr: String,
+    duration_ms: i64,
+}
+
+#[derive(Debug)]
+struct SckCaptureFailure {
+    category: HelperExitCategory,
+    duration_ms: i64,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitBreakerDecision {
+    NormalAttempt,
+    RecoveryProbe,
+    Skip,
+}
+
+#[derive(Debug, Default)]
+struct CaptureProviderCircuitBreaker {
+    active_window_opened_at: Option<Instant>,
+    active_window_recovery_probe_used: bool,
+}
+
+impl CaptureProviderCircuitBreaker {
+    fn active_window_decision(&mut self, now: Instant) -> CircuitBreakerDecision {
+        let Some(opened_at) = self.active_window_opened_at else {
+            return CircuitBreakerDecision::NormalAttempt;
+        };
+        if !self.active_window_recovery_probe_used
+            && now.saturating_duration_since(opened_at) >= SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN
+        {
+            self.active_window_recovery_probe_used = true;
+            CircuitBreakerDecision::RecoveryProbe
+        } else {
+            CircuitBreakerDecision::Skip
+        }
+    }
+
+    fn record_active_window_abnormal_exit(&mut self, now: Instant) -> bool {
+        let newly_opened = self.active_window_opened_at.is_none();
+        self.active_window_opened_at = Some(now);
+        self.active_window_recovery_probe_used = false;
+        newly_opened
+    }
+
+    fn record_active_window_success(&mut self) {
+        self.active_window_opened_at = None;
+        self.active_window_recovery_probe_used = false;
+    }
+
+    fn reset_for_new_session(&mut self) {
+        self.record_active_window_success();
+    }
+
+    fn active_window_state(&self) -> &'static str {
+        if self.active_window_opened_at.is_some() {
+            if self.active_window_recovery_probe_used {
+                "open_probe_used"
+            } else {
+                "open_cooldown"
+            }
+        } else {
+            "closed"
+        }
+    }
+}
+
+fn sck_provider_health() -> &'static Mutex<CaptureProviderCircuitBreaker> {
+    SCK_PROVIDER_HEALTH.get_or_init(|| Mutex::new(CaptureProviderCircuitBreaker::default()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -857,7 +929,6 @@ struct VisionOcrElement {
 struct CapturePaths {
     root_dir: PathBuf,
     snapshot_dir: PathBuf,
-    helper_dir: PathBuf,
     db_path: PathBuf,
 }
 
@@ -895,6 +966,16 @@ struct TypingBurstState {
 #[derive(Debug, Clone, Default)]
 struct EventIngestGate {
     last_persisted_by_key: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct RuntimeMaintenanceResult {
+    policy_version: String,
+    deleted_low_value_events: i64,
+    deleted_high_value_events: i64,
+    deleted_capture_triggers: i64,
+    deleted_typing_bursts: i64,
+    chunks_executed: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1912,10 +1993,392 @@ pub struct ResumeEvalCaseReport {
     pub redacted_frame_handling_ok: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScreenCapturePermissionIdentity {
+    pub executable_path: String,
+    pub executable_name: Option<String>,
+    pub bundle_identifier: Option<String>,
+    pub bundle_path: Option<String>,
+    pub signing_identifier: Option<String>,
+    pub team_identifier: Option<String>,
+    pub designated_requirement: Option<String>,
+    pub cdhash: Option<String>,
+    pub signature_kind: String,
+    pub request_scope_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScreenCapturePermissionStatus {
+    pub state: String,
+    pub granted: bool,
+    pub can_request: bool,
+    pub request_attempted: bool,
+    pub restart_required: bool,
+    pub message: String,
+    pub settings_hint: Option<String>,
+    pub identity: ScreenCapturePermissionIdentity,
+}
+
 struct CaptureEventSource {
     child: Child,
     reader: Option<JoinHandle<()>>,
     rx: Receiver<String>,
+}
+
+fn screen_capture_permission_presentation(
+    supported: bool,
+    granted: bool,
+    request_attempted: bool,
+    identity: ScreenCapturePermissionIdentity,
+) -> ScreenCapturePermissionStatus {
+    if !supported {
+        return ScreenCapturePermissionStatus {
+            state: "unsupported".into(),
+            granted: false,
+            can_request: false,
+            request_attempted,
+            restart_required: false,
+            message: "Screen capture is only available in the macOS desktop app.".into(),
+            settings_hint: None,
+            identity,
+        };
+    }
+    if granted {
+        return ScreenCapturePermissionStatus {
+            state: "granted".into(),
+            granted: true,
+            can_request: false,
+            request_attempted,
+            restart_required: false,
+            message: "Screen access is ready for this running Smalltalk app.".into(),
+            settings_hint: None,
+            identity,
+        };
+    }
+    if request_attempted {
+        return ScreenCapturePermissionStatus {
+            state: "restart_required".into(),
+            granted: false,
+            can_request: false,
+            request_attempted: true,
+            restart_required: true,
+            message: format!(
+                "Screen access is still off for this Smalltalk app. Enable it in {SCREEN_CAPTURE_SETTINGS_HINT}, then quit and reopen Smalltalk."
+            ),
+            settings_hint: Some(SCREEN_CAPTURE_SETTINGS_HINT.into()),
+            identity,
+        };
+    }
+    ScreenCapturePermissionStatus {
+        state: "request_required".into(),
+        granted: false,
+        can_request: true,
+        request_attempted: false,
+        restart_required: false,
+        message: "Smalltalk needs screen access before local memory can start. Choose Allow screen access once; macOS will show the permission prompt.".into(),
+        settings_hint: Some(SCREEN_CAPTURE_SETTINGS_HINT.into()),
+        identity,
+    }
+}
+
+fn screen_capture_permission_start_error(status: &ScreenCapturePermissionStatus) -> String {
+    format!(
+        "screen_capture_permission_{}: {}",
+        status.state, status.message
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CodeSigningIdentity {
+    signing_identifier: Option<String>,
+    team_identifier: Option<String>,
+    designated_requirement: Option<String>,
+    cdhash: Option<String>,
+    signature_kind: String,
+}
+
+fn parse_code_signing_identity(output: &str) -> CodeSigningIdentity {
+    let mut identity = CodeSigningIdentity::default();
+    for line in output.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("Identifier=") {
+            identity.signing_identifier = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("TeamIdentifier=") {
+            let value = value.trim();
+            if !value.is_empty() && value != "not set" {
+                identity.team_identifier = Some(value.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("CDHash=") {
+            identity.cdhash = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Signature=") {
+            identity.signature_kind = value.trim().to_ascii_lowercase();
+        } else if let Some(value) = line.strip_prefix("# designated =>") {
+            identity.designated_requirement = Some(value.trim().to_string());
+        }
+    }
+    if identity.signature_kind.is_empty() {
+        identity.signature_kind = "unsigned_or_unknown".into();
+    }
+    identity
+}
+
+fn code_signing_identity(executable: Option<&Path>) -> CodeSigningIdentity {
+    let Some(executable) = executable else {
+        return CodeSigningIdentity {
+            signature_kind: "unknown_executable".into(),
+            ..Default::default()
+        };
+    };
+    let Ok(output) = Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-", "--verbose=4"])
+        .arg(executable)
+        .output()
+    else {
+        return CodeSigningIdentity {
+            signature_kind: "codesign_unavailable".into(),
+            ..Default::default()
+        };
+    };
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_code_signing_identity(&combined)
+}
+
+fn permission_request_scope_key(
+    executable: Option<&Path>,
+    signing: &CodeSigningIdentity,
+) -> String {
+    // A certificate-backed designated requirement is stable across signed app
+    // updates. An ad-hoc designated requirement contains its CDHash, so a new
+    // ad-hoc build receives a new request scope instead of inheriting a stale
+    // denial marker from an older binary.
+    let material = signing
+        .designated_requirement
+        .as_ref()
+        .map(|requirement| format!("designated_requirement:{requirement}"))
+        .unwrap_or_else(|| {
+            let metadata = executable.and_then(|path| fs::metadata(path).ok());
+            let modified = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            format!(
+                "unsigned:{}:{}:{modified}",
+                executable
+                    .map(|path| path.to_string_lossy())
+                    .unwrap_or_default(),
+                metadata
+                    .as_ref()
+                    .map(|value| value.len())
+                    .unwrap_or_default(),
+            )
+        });
+    format!(
+        "{SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX}:{}",
+        stable_hash_bytes(material.as_bytes())
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn running_screen_capture_identity() -> ScreenCapturePermissionIdentity {
+    use core_foundation::base::TCFType;
+    use core_foundation::bundle::{CFBundle, CFBundleGetIdentifier};
+    use core_foundation::string::CFString;
+
+    SCREEN_CAPTURE_IDENTITY
+        .get_or_init(|| {
+            let executable = std::env::current_exe().ok();
+            let signing = code_signing_identity(executable.as_deref());
+            let bundle = CFBundle::main_bundle();
+            let bundle_identifier = unsafe {
+                let identifier = CFBundleGetIdentifier(bundle.as_concrete_TypeRef());
+                (!identifier.is_null())
+                    .then(|| CFString::wrap_under_get_rule(identifier).to_string())
+            };
+            ScreenCapturePermissionIdentity {
+                executable_path: executable
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into()),
+                executable_name: executable
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned()),
+                bundle_identifier,
+                bundle_path: bundle
+                    .path()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                signing_identifier: signing.signing_identifier.clone(),
+                team_identifier: signing.team_identifier.clone(),
+                designated_requirement: signing.designated_requirement.clone(),
+                cdhash: signing.cdhash.clone(),
+                signature_kind: signing.signature_kind.clone(),
+                request_scope_key: permission_request_scope_key(executable.as_deref(), &signing),
+            }
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn running_screen_capture_identity() -> ScreenCapturePermissionIdentity {
+    SCREEN_CAPTURE_IDENTITY
+        .get_or_init(|| {
+            let executable = std::env::current_exe().ok();
+            let signing = code_signing_identity(executable.as_deref());
+            ScreenCapturePermissionIdentity {
+                executable_path: executable
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into()),
+                executable_name: executable
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned()),
+                bundle_identifier: None,
+                bundle_path: None,
+                signing_identifier: signing.signing_identifier.clone(),
+                team_identifier: signing.team_identifier.clone(),
+                designated_requirement: signing.designated_requirement.clone(),
+                cdhash: signing.cdhash.clone(),
+                signature_kind: signing.signature_kind.clone(),
+                request_scope_key: permission_request_scope_key(executable.as_deref(), &signing),
+            }
+        })
+        .clone()
+}
+
+fn screen_capture_permission_was_requested(
+    app: &AppHandle,
+    identity: &ScreenCapturePermissionIdentity,
+) -> bool {
+    open_readonly_db(app)
+        .ok()
+        .and_then(|conn| maintenance_value(&conn, &identity.request_scope_key).ok())
+        .flatten()
+        .is_some()
+}
+
+fn claim_screen_capture_permission_request(conn: &Connection, key: &str) -> Result<bool, String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO local_memory_maintenance (key, value, updated_at_ms)
+         VALUES (?1, ?2, ?2)",
+        params![key, now_millis()],
+    )
+    .map(|changed| changed == 1)
+    .map_err(to_string)
+}
+
+fn permission_request_markers(conn: &Connection) -> Result<Vec<(String, String, i64)>, String> {
+    if !table_exists_in_capture(conn, "local_memory_maintenance")? {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("{SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX}:%");
+    let mut statement = conn
+        .prepare(
+            "SELECT key, value, updated_at_ms
+             FROM local_memory_maintenance
+             WHERE key LIKE ?1
+             ORDER BY key ASC",
+        )
+        .map_err(to_string)?;
+    let markers = statement
+        .query_map(params![pattern], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    Ok(markers)
+}
+
+fn restore_permission_request_markers(
+    conn: &Connection,
+    markers: &[(String, String, i64)],
+) -> Result<(), String> {
+    for (key, value, updated_at_ms) in markers {
+        conn.execute(
+            "INSERT OR REPLACE INTO local_memory_maintenance (key, value, updated_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![key, value, updated_at_ms],
+        )
+        .map_err(to_string)?;
+    }
+    Ok(())
+}
+
+fn screen_capture_permission_status(
+    app: &AppHandle,
+) -> Result<ScreenCapturePermissionStatus, String> {
+    let identity = running_screen_capture_identity();
+    let request_attempted = screen_capture_permission_was_requested(app, &identity);
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::access::ScreenCaptureAccess;
+        return Ok(screen_capture_permission_presentation(
+            true,
+            ScreenCaptureAccess.preflight(),
+            request_attempted,
+            identity,
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(screen_capture_permission_presentation(
+            false,
+            false,
+            request_attempted,
+            identity,
+        ))
+    }
+}
+
+#[tauri::command]
+pub fn get_screen_capture_permission_status(
+    app: AppHandle,
+) -> Result<ScreenCapturePermissionStatus, String> {
+    screen_capture_permission_status(&app)
+}
+
+#[tauri::command]
+pub fn request_screen_capture_permission(
+    app: AppHandle,
+) -> Result<ScreenCapturePermissionStatus, String> {
+    ensure_db(&app)?;
+    let current = screen_capture_permission_status(&app)?;
+    if current.granted || !current.can_request {
+        return Ok(current);
+    }
+
+    // Persist before invoking the operating-system request. Even if the app is
+    // interrupted while macOS presents its prompt, another click will report
+    // the restart/settings instructions instead of repeatedly reopening it.
+    let conn = open_db(&app)?;
+    let claimed =
+        claim_screen_capture_permission_request(&conn, &current.identity.request_scope_key)?;
+    drop(conn);
+    if !claimed {
+        return screen_capture_permission_status(&app);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::access::ScreenCaptureAccess;
+        let granted = ScreenCaptureAccess.request();
+        return Ok(screen_capture_permission_presentation(
+            true,
+            granted || ScreenCaptureAccess.preflight(),
+            true,
+            running_screen_capture_identity(),
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        screen_capture_permission_status(&app)
+    }
 }
 
 impl SemanticFingerprint {
@@ -1947,12 +2410,21 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
         }
     }
 
+    let permission = screen_capture_permission_status(&app)?;
+    if !permission.granted {
+        return Err(screen_capture_permission_start_error(&permission));
+    }
+
     crate::session_island::update_session_island(
         crate::session_island::SessionIslandSnapshot::starting(),
     );
     crate::session_island::show_session_island();
 
     let session = create_capture_session(&app)?;
+    sck_provider_health()
+        .lock()
+        .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
+        .reset_for_new_session();
 
     {
         let mut runtime = lock_runtime(state.inner())?;
@@ -2002,6 +2474,10 @@ pub fn stop_capture(
     };
 
     stop_runtime(state.inner())?;
+
+    if let Ok(conn) = open_db(&app) {
+        let _ = maybe_run_runtime_maintenance(&conn, true);
+    }
 
     let mut stopped_session = None;
     let mut resume_query = None;
@@ -2122,6 +2598,7 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
         None,
         Some(&trigger_id),
         pre_frame_id.as_deref(),
+        None,
     )?;
     let frame = outcome
         .frame
@@ -2189,6 +2666,8 @@ pub fn cleanup_local_memory(
     app: AppHandle,
     input: Option<CleanupLocalMemoryInput>,
 ) -> Result<CleanupLocalMemoryResult, String> {
+    let _maintenance_permit =
+        crate::workload::governor().acquire(crate::workload::WorkClass::MaintenanceCleanup)?;
     cleanup_local_memory_impl(
         &app,
         input.unwrap_or(CleanupLocalMemoryInput {
@@ -3215,16 +3694,335 @@ pub fn get_continue_workstream_detail(
     crate::continuation::get_continue_workstream_detail(&conn, input)
 }
 
+const MANUAL_CONTINUE_EVENT_RECENCY_MS: i64 = 60_000;
+
+#[derive(Debug, Clone)]
+struct ManualContinueExternalEvent {
+    ts_ms: i64,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_id: Option<i64>,
+    window_title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManualContinueCaptureExpectation {
+    app_bundle_id: Option<String>,
+    window_id: Option<i64>,
+}
+
+fn latest_manual_continue_external_event(
+    conn: &Connection,
+    session_id: &str,
+    pressed_at_ms: i64,
+) -> Result<Option<ManualContinueExternalEvent>, String> {
+    conn.query_row(
+        "SELECT ts_ms, app_bundle_id, app_name, window_id, window_title
+         FROM ui_events
+         WHERE session_id = ?1
+           AND event_type IN ('app_switch','window_focus','click','scroll','key_down','clipboard')
+           AND COALESCE(app_bundle_id, '') != ?2
+           AND lower(COALESCE(app_name, '')) NOT IN (
+             'smalltalk', 'system settings', 'usernotificationcenter',
+             'universalaccessauthwarn'
+           )
+           AND ts_ms >= ?3
+         ORDER BY ts_ms DESC, created_at_ms DESC
+         LIMIT 1",
+        params![
+            session_id,
+            SMALLTALK_BUNDLE_ID,
+            pressed_at_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS)
+        ],
+        |row| {
+            Ok(ManualContinueExternalEvent {
+                ts_ms: row.get(0)?,
+                app_bundle_id: row.get(1)?,
+                app_name: row.get(2)?,
+                window_id: row.get(3)?,
+                window_title: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn privacy_status_allows_manual_continue_frame(status: Option<&str>) -> bool {
+    !matches!(
+        status
+            .unwrap_or("normal")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "private" | "excluded" | "blocked" | "sensitive"
+    )
+}
+
+fn manual_continue_anchor_once(
+    conn: &Connection,
+    session_id: &str,
+    event: Option<&ManualContinueExternalEvent>,
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    let minimum_captured_at = event
+        .map(|event| event.ts_ms)
+        .unwrap_or_else(|| now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS));
+    let mut stmt = conn
+        .prepare(
+            "SELECT CAST(id AS TEXT), app_bundle_id, app_name, window_id,
+                    privacy_status, active_window_crop_path, full_screenshot_path
+             FROM frames
+             WHERE session_id = ?1 AND captured_at >= ?2
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 24",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![session_id, minimum_captured_at], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    Ok(rows.into_iter().find_map(
+        |(frame_id, bundle_id, app_name, window_id, privacy, crop, full)| {
+            let is_smalltalk = bundle_id.as_deref() == Some(SMALLTALK_BUNDLE_ID)
+                || app_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"));
+            let has_readable_asset = crop
+                .as_deref()
+                .is_some_and(|value| Path::new(value).is_file())
+                || full
+                    .as_deref()
+                    .is_some_and(|value| Path::new(value).is_file());
+            if is_smalltalk
+                || !has_readable_asset
+                || !privacy_status_allows_manual_continue_frame(privacy.as_deref())
+            {
+                return None;
+            }
+            let Some(event) = event else {
+                return Some(frame_id);
+            };
+            let app_matches = match (event.app_bundle_id.as_deref(), bundle_id.as_deref()) {
+                (Some(expected), Some(actual)) if !expected.trim().is_empty() => expected == actual,
+                _ => match (event.app_name.as_deref(), app_name.as_deref()) {
+                    (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
+                    _ => false,
+                },
+            };
+            let window_matches = match (event.window_id, window_id) {
+                (Some(expected), Some(actual)) if expected > 0 && actual > 0 => expected == actual,
+                _ => true,
+            };
+            (app_matches && window_matches).then_some(frame_id)
+        },
+    ))
+}
+
+fn manual_continue_capture_identity_matches(
+    expected: &ManualContinueCaptureExpectation,
+    capture: &ScreenshotCapture,
+) -> bool {
+    let window_matches = expected
+        .window_id
+        .map(|window_id| capture.window_id == Some(window_id))
+        .unwrap_or(true);
+    let bundle_matches = expected
+        .app_bundle_id
+        .as_deref()
+        .filter(|bundle_id| !bundle_id.trim().is_empty())
+        .map(|bundle_id| capture.bundle_id.as_deref() == Some(bundle_id))
+        .unwrap_or(true);
+    window_matches && bundle_matches
+}
+
+fn resolve_manual_continue_window_id(
+    event: &ManualContinueExternalEvent,
+    snapshot: Option<&WindowSnapshotPayload>,
+) -> Option<i64> {
+    if let Some(window_id) = event.window_id.filter(|value| *value > 0) {
+        return Some(window_id);
+    }
+    let expected_bundle = event
+        .app_bundle_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let expected_title = event
+        .window_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let matches = snapshot?
+        .windows
+        .iter()
+        .filter(|window| window.is_onscreen.unwrap_or(false) && window.layer.unwrap_or(0) == 0)
+        .filter(|window| {
+            expected_bundle
+                .map(|bundle| window.bundle_id.as_deref() == Some(bundle))
+                .unwrap_or(true)
+        })
+        .filter(|window| {
+            expected_title
+                .map(|title| window.window_title.as_deref().map(str::trim) == Some(title))
+                .unwrap_or(true)
+        })
+        .filter_map(|window| window.cg_window_id.filter(|value| *value > 0))
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then_some(matches[0])
+}
+
+fn capture_manual_continue_external_frame(
+    app: &AppHandle,
+    session_id: &str,
+    event: &ManualContinueExternalEvent,
+) -> Result<String, String> {
+    let expected_bundle = event
+        .app_bundle_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if expected_bundle == Some(SMALLTALK_BUNDLE_ID)
+        || event
+            .app_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"))
+    {
+        return Err("manual_continue_external_surface_is_smalltalk".to_string());
+    }
+    let paths = capture_paths(app)?;
+    let window_snapshot = collect_window_snapshot(&paths).ok();
+    let target_window_id = resolve_manual_continue_window_id(event, window_snapshot.as_ref());
+    if target_window_id.is_none() && expected_bundle.is_none() {
+        return Err("manual_continue_external_surface_identity_missing".to_string());
+    }
+
+    let pre_frame_id = latest_frame_id_for_session(app, session_id).ok().flatten();
+    let trigger_id = insert_system_capture_trigger(
+        app,
+        session_id,
+        "manual_continue_boundary",
+        pre_frame_id.clone(),
+        false,
+    )?;
+    let context = AccessibilityContext {
+        app_bundle_id: event.app_bundle_id.clone(),
+        app_name: event.app_name.clone(),
+        window_id: target_window_id,
+        window_name: event.window_title.clone(),
+        error: Some("manual_continue_targeted_external_capture".to_string()),
+        ..AccessibilityContext::default()
+    };
+    let expectation = ManualContinueCaptureExpectation {
+        app_bundle_id: event.app_bundle_id.clone(),
+        window_id: target_window_id,
+    };
+    let outcome = match capture_frame(
+        app,
+        session_id,
+        "manual_continue_boundary",
+        false,
+        None,
+        None,
+        Some(context),
+        None,
+        None,
+        Some(&trigger_id),
+        pre_frame_id.as_deref(),
+        Some(&expectation),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = mark_capture_trigger_failed(app, &trigger_id, &error);
+            return Err("manual_continue_external_window_capture_failed".to_string());
+        }
+    };
+    let Some(frame) = outcome.frame else {
+        let reason = outcome
+            .skip_reason
+            .unwrap_or_else(|| "capture_not_stored".to_string());
+        let _ = mark_capture_trigger_failed(app, &trigger_id, &reason);
+        return Err(format!("manual_continue_external_window_{reason}"));
+    };
+    if frame.captured_at < event.ts_ms {
+        let _ = mark_capture_trigger_failed(app, &trigger_id, "captured_before_external_event");
+        return Err("manual_continue_external_window_not_post_event".to_string());
+    }
+    let _ = finalize_capture_trigger_by_id(app, &trigger_id, true);
+    Ok(frame.id.to_string())
+}
+
+fn resolve_manual_continue_frame(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: &str,
+) -> Result<String, String> {
+    let pressed_at_ms = now_millis();
+    let event = latest_manual_continue_external_event(conn, session_id, pressed_at_ms)?;
+    if let Some(frame_id) =
+        manual_continue_anchor_once(conn, session_id, event.as_ref(), pressed_at_ms)?
+    {
+        return Ok(frame_id);
+    }
+    let event = event.ok_or_else(|| "manual_continue_recent_external_event_missing".to_string())?;
+    capture_manual_continue_external_frame(app, session_id, &event)
+}
+
 #[tauri::command]
 pub fn get_continue_decision(
     app: AppHandle,
     input: Option<crate::continuation::ContinueDecisionRequest>,
 ) -> Result<crate::continuation::ContinueDecisionResult, String> {
-    let request = input.unwrap_or_default();
-    let _continue_guard = CONTINUE_DECISION_LOCK
-        .lock()
-        .map_err(|_| "continue decision lock poisoned".to_string())?;
+    let mut request = input.unwrap_or_default();
+    let trigger = request.request_trigger.as_deref().unwrap_or_else(|| {
+        if request.island_source.is_some() {
+            "island"
+        } else {
+            "startup"
+        }
+    });
+    let work_class = match trigger {
+        "manual" => crate::workload::WorkClass::ManualContinue,
+        "background" | "startup" => crate::workload::WorkClass::BackgroundContinue,
+        _ if request.island_source.is_some() => crate::workload::WorkClass::IslandRefresh,
+        _ => crate::workload::WorkClass::BackgroundContinue,
+    };
+    request.manual_continue_started_at_ms = (trigger == "manual").then_some(now_millis());
     let conn = open_db(&app)?;
+    // Every native caller, including startup/background/island paths, shares one
+    // explicit session-scope contract. React normally supplies this value. Native
+    // callers resolve the latest capture session here rather than silently running
+    // an all-session query.
+    if request.session_id.is_none() {
+        request.session_id = latest_session_id(&conn)?;
+    }
+    request.manual_continue_frame_id = None;
+    request.manual_continue_preflight_failure = None;
+    if trigger == "manual" {
+        match request.session_id.as_deref() {
+            Some(session_id) => match resolve_manual_continue_frame(&app, &conn, session_id) {
+                Ok(frame_id) => request.manual_continue_frame_id = Some(frame_id),
+                Err(reason) => request.manual_continue_preflight_failure = Some(reason),
+            },
+            None => {
+                request.manual_continue_preflight_failure =
+                    Some("manual_continue_session_scope_missing".to_string())
+            }
+        }
+    }
+    // Screenshot capture must remain allowed while the preflight waits for the
+    // exact persisted external frame. Only acquire the Continue permit after
+    // that boundary is established or has failed closed.
+    let _continue_permit = crate::workload::governor().acquire(work_class)?;
     let effective_mode = crate::continuation::effective_continue_decision_mode(
         request.mode.as_deref(),
         request.rebuild_layers.unwrap_or(false),
@@ -3311,6 +4109,8 @@ pub fn get_continue_decision(
         result.observe_before_decide = Some(trace);
     }
     if result.cache_hit {
+        crate::workload::governor()
+            .note_coalesced(work_class == crate::workload::WorkClass::BackgroundContinue);
         increment_maintenance_counter(&conn, "decision_cache_hits", 1)?;
     }
     if continue_output_audit_enabled(&request) {
@@ -3326,11 +4126,34 @@ pub fn get_continue_decision(
             }
         }
     }
+    if let Some(started_at_ms) = request.manual_continue_started_at_ms {
+        let total_manual_continue_ms = now_millis().saturating_sub(started_at_ms);
+        if let Err(error) = crate::continuation::task_truth_v2::finalize_manual_continue_performance(
+            &conn,
+            &result.decision_id,
+            total_manual_continue_ms,
+        ) {
+            eprintln!("[mfti_04_performance] total finalization failed: {error}");
+        }
+    }
+    if matches!(
+        crate::continuation::effective_continue_audit_mode(&request),
+        crate::continuation::ContinueAuditMode::MftiReview
+    ) {
+        if let Err(error) =
+            crate::continuation::task_truth_v2::review::write_mfti_review_artifact(&conn, &result)
+        {
+            eprintln!("[mfti_review] artifact write failed: {error}");
+        }
+    }
     Ok(result)
 }
 
 fn continue_output_audit_enabled(request: &crate::continuation::ContinueDecisionRequest) -> bool {
-    request.audit_output_enabled.unwrap_or(false)
+    matches!(
+        crate::continuation::effective_continue_audit_mode(request),
+        crate::continuation::ContinueAuditMode::Full
+    )
 }
 
 fn run_continue_evidence_probes(
@@ -6283,6 +7106,14 @@ struct ContinueOpenDecisionRow {
 struct TaskTruthOpenContractRow {
     effective_state: String,
     release_gate_passed: bool,
+    snapshot_id: Option<String>,
+    snapshot_revision: Option<i64>,
+    task_thread_id: Option<String>,
+    task_thread_revision: Option<i64>,
+    selected_hypothesis_id: Option<String>,
+    model_response_id: Option<String>,
+    observation_packet_id: Option<String>,
+    evidence_watermark: Option<String>,
     return_target_artifact_id: Option<String>,
 }
 
@@ -6808,14 +7639,25 @@ fn resolve_continue_decision_for_open(
     let task_truth_contract = if table_exists_in_capture(conn, "task_truth_v2_decision_contracts")?
     {
         conn.query_row(
-            "SELECT effective_state, release_gate_passed, return_target_artifact_id
+            "SELECT effective_state, release_gate_passed, snapshot_id, snapshot_revision,
+                    task_thread_id, task_thread_revision, selected_hypothesis_id,
+                    model_response_id, observation_packet_id, evidence_watermark,
+                    return_target_artifact_id
              FROM task_truth_v2_decision_contracts WHERE decision_id=?1",
             params![decision_id],
             |row| {
                 Ok(TaskTruthOpenContractRow {
                     effective_state: row.get(0)?,
                     release_gate_passed: row.get::<_, i64>(1)? != 0,
-                    return_target_artifact_id: row.get(2)?,
+                    snapshot_id: row.get(2)?,
+                    snapshot_revision: row.get(3)?,
+                    task_thread_id: row.get(4)?,
+                    task_thread_revision: row.get(5)?,
+                    selected_hypothesis_id: row.get(6)?,
+                    model_response_id: row.get(7)?,
+                    observation_packet_id: row.get(8)?,
+                    evidence_watermark: row.get(9)?,
+                    return_target_artifact_id: row.get(10)?,
                 })
             },
         )
@@ -6824,13 +7666,13 @@ fn resolve_continue_decision_for_open(
     } else {
         None
     };
-    let authoritative_task_truth_target = if strict_continue_target
-        && task_truth_contract
-            .as_ref()
-            .is_some_and(|contract| contract.effective_state == "authoritative")
-    {
-        let contract = task_truth_contract.as_ref().expect("checked above");
-        if !contract.release_gate_passed {
+    let task_truth_owned_target = if strict_continue_target {
+        let Some(contract) = task_truth_contract.as_ref() else {
+            warnings
+                .push("blocked_by_continue_policy:task_truth_target_ownership_missing".to_string());
+            return Ok(None);
+        };
+        if contract.effective_state == "authoritative" && !contract.release_gate_passed {
             warnings
                 .push("blocked_by_continue_policy:task_truth_release_gate_not_passed".to_string());
             return Ok(None);
@@ -6839,7 +7681,13 @@ fn resolve_continue_decision_for_open(
             warnings.push("blocked_by_continue_policy:task_truth_public_target_null".to_string());
             return Ok(None);
         };
-        if !crate::continuation::task_truth_v2::production::authoritative_runtime_enabled() {
+        if let Some(reason) = task_truth_open_contract_identity_rejection(conn, contract)? {
+            warnings.push(format!("blocked_by_continue_policy:{reason}"));
+            return Ok(None);
+        }
+        if contract.effective_state == "authoritative"
+            && !crate::continuation::task_truth_v2::production::authoritative_runtime_enabled()
+        {
             warnings.push(
                 "blocked_by_continue_policy:task_truth_authority_no_longer_enabled".to_string(),
             );
@@ -6856,7 +7704,7 @@ fn resolve_continue_decision_for_open(
     };
 
     if strict_continue_target {
-        if authoritative_task_truth_target.is_none()
+        if task_truth_owned_target.is_none()
             && (row
                 .continue_output_mode
                 .as_deref()
@@ -6890,7 +7738,7 @@ fn resolve_continue_decision_for_open(
     let requested_artifact_id =
         requested_artifact_id.and_then(|value| non_empty(value.to_string()));
     let decision_target_artifact_id = if strict_continue_target {
-        let public_target_artifact_id = authoritative_task_truth_target
+        let public_target_artifact_id = task_truth_owned_target
             .as_ref()
             .or(row.return_target_artifact_id.as_ref());
         if requested_artifact_id.is_some()
@@ -6902,7 +7750,7 @@ fn resolve_continue_decision_for_open(
             );
             return Ok(None);
         }
-        authoritative_task_truth_target.or_else(|| row.return_target_artifact_id.clone())
+        task_truth_owned_target.or_else(|| row.return_target_artifact_id.clone())
     } else {
         requested_artifact_id
             .or_else(|| row.return_target_artifact_id.clone())
@@ -6980,6 +7828,126 @@ fn resolve_continue_decision_for_open(
             .unwrap_or_default()
     ));
     resolved_open_resume_point_from_frame(conn, frame, None, row.confidence).map(Some)
+}
+
+fn task_truth_open_contract_identity_rejection(
+    conn: &Connection,
+    contract: &TaskTruthOpenContractRow,
+) -> Result<Option<&'static str>, String> {
+    let (
+        Some(snapshot_id),
+        Some(snapshot_revision),
+        Some(thread_id),
+        Some(thread_revision),
+        Some(hypothesis_id),
+        Some(model_response_id),
+        Some(packet_id),
+        Some(evidence_watermark),
+    ) = (
+        contract.snapshot_id.as_deref(),
+        contract.snapshot_revision,
+        contract.task_thread_id.as_deref(),
+        contract.task_thread_revision,
+        contract.selected_hypothesis_id.as_deref(),
+        contract.model_response_id.as_deref(),
+        contract.observation_packet_id.as_deref(),
+        contract.evidence_watermark.as_deref(),
+    )
+    else {
+        return Ok(Some("task_truth_target_identity_incomplete"));
+    };
+    if !table_exists_in_capture(conn, "task_truth_v2_task_threads")?
+        || !table_exists_in_capture(conn, "task_truth_v2_task_thread_revisions")?
+        || !table_exists_in_capture(conn, "task_truth_v2_snapshots")?
+    {
+        return Ok(Some("task_truth_thread_head_missing"));
+    }
+
+    let head = conn
+        .query_row(
+            "SELECT head_revision, status, head_snapshot_id
+             FROM task_truth_v2_task_threads WHERE task_thread_id=?1",
+            params![thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((head_revision, head_status, head_snapshot_id)) = head else {
+        return Ok(Some("task_truth_thread_head_missing"));
+    };
+    if head_revision != thread_revision {
+        return Ok(Some("task_truth_thread_head_revision_changed"));
+    }
+    if matches!(
+        head_status.as_str(),
+        "completed" | "superseded" | "unresolved"
+    ) {
+        return Ok(Some("task_truth_thread_no_longer_openable"));
+    }
+    if head_snapshot_id != snapshot_id {
+        return Ok(Some("task_truth_thread_head_snapshot_changed"));
+    }
+
+    let revision_matches = conn
+        .query_row(
+            "SELECT snapshot_id, hypothesis_id, model_response_id, packet_id,
+                    evidence_watermark
+             FROM task_truth_v2_task_thread_revisions
+             WHERE task_thread_id=?1 AND revision=?2",
+            params![thread_id, thread_revision],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?
+        .is_some_and(|revision| {
+            revision.0 == snapshot_id
+                && revision.1 == hypothesis_id
+                && revision.2 == model_response_id
+                && revision.3 == packet_id
+                && revision.4 == evidence_watermark
+        });
+    if !revision_matches {
+        return Ok(Some("task_truth_thread_revision_identity_mismatch"));
+    }
+
+    let snapshot_raw = conn
+        .query_row(
+            "SELECT snapshot_json FROM task_truth_v2_snapshots
+             WHERE snapshot_id=?1 AND revision=?2",
+            params![snapshot_id, snapshot_revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some(snapshot_raw) = snapshot_raw else {
+        return Ok(Some("task_truth_snapshot_identity_mismatch"));
+    };
+    let snapshot: crate::continuation::task_truth_v2::task_snapshot::TaskSnapshotV2 =
+        serde_json::from_str(&snapshot_raw).map_err(to_string)?;
+    let snapshot_matches = snapshot.task_thread_id.as_deref() == Some(thread_id)
+        && snapshot.task_thread_revision == Some(thread_revision)
+        && snapshot.selected_hypothesis_id.as_deref() == Some(hypothesis_id)
+        && snapshot.provider_response_id.as_deref() == Some(model_response_id)
+        && snapshot.packet_id == packet_id
+        && snapshot.evidence_watermark == evidence_watermark;
+    if !snapshot_matches {
+        return Ok(Some("task_truth_snapshot_identity_mismatch"));
+    }
+    Ok(None)
 }
 
 fn continue_decision_context_contains_artifact(
@@ -13966,16 +14934,15 @@ fn mask_rects_for_export(sensitive_regions: &[SensitiveRegionSummary]) -> Vec<Re
 }
 
 fn mask_image_with_swift(
-    helper_dir: &Path,
+    _helper_dir: &Path,
     source_path: &Path,
     output_path: &Path,
     rects: &[Rect],
 ) -> Result<(), String> {
-    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/swiftc").exists() {
+    if !cfg!(target_os = "macos") || !swift_helpers::available("image_mask") {
         return Err("image masking helper unavailable".to_string());
     }
-    let helper =
-        ensure_export_swift_helper(helper_dir, "image_mask", IMAGE_MASK_SWIFT, &["AppKit"])?;
+    let helper = swift_helpers::resolve("image_mask")?;
     let rect_json = serde_json::to_string(rects).map_err(to_string)?;
     let output = Command::new(helper)
         .arg(source_path)
@@ -13993,39 +14960,6 @@ fn mask_image_with_swift(
             stderr
         })
     }
-}
-
-fn ensure_export_swift_helper(
-    helper_dir: &Path,
-    name: &str,
-    source: &str,
-    frameworks: &[&str],
-) -> Result<PathBuf, String> {
-    fs::create_dir_all(helper_dir).map_err(to_string)?;
-    let source_path = helper_dir.join(format!("{}.swift", name));
-    let helper_path = helper_dir.join(name);
-    let should_write = fs::read_to_string(&source_path)
-        .map(|existing| existing != source)
-        .unwrap_or(true);
-    if should_write {
-        fs::write(&source_path, source).map_err(to_string)?;
-        let _ = fs::remove_file(&helper_path);
-    }
-    if !helper_path.exists() {
-        let mut command = Command::new("/usr/bin/swiftc");
-        command.arg("-O").arg(&source_path);
-        for framework in frameworks {
-            command.arg("-framework").arg(framework);
-        }
-        command.arg("-o").arg(&helper_path);
-        let output = command
-            .output()
-            .map_err(|error| format!("swiftc failed: {}", error))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-    }
-    Ok(helper_path)
 }
 
 fn write_fully_redacted_png(path: &Path) -> Result<(), String> {
@@ -15042,6 +15976,7 @@ fn capture_and_emit(
         Some(stop_signal),
         trigger_id.as_deref(),
         pre_frame_id.as_deref(),
+        None,
     )?;
 
     *previous_image_hash = Some(outcome.image_hash.clone());
@@ -15106,7 +16041,21 @@ fn queue_event_trigger(
         return Ok(());
     };
 
+    let conn = open_db(app)?;
+    increment_maintenance_counter(&conn, "events_received", 1)?;
+
     if event.event_type == "helper_started" {
+        return Ok(());
+    }
+    if event.event_type == "source_diagnostics" {
+        if let Some(payload) = event.payload.as_ref() {
+            let dropped = payload
+                .get("dropped_at_source")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            record_maintenance_value(&conn, "events_dropped_at_source", &dropped.to_string())?;
+        }
         return Ok(());
     }
 
@@ -15116,15 +16065,17 @@ fn queue_event_trigger(
     };
 
     if event_ingest_gate.should_drop(&event) {
+        increment_maintenance_counter(&conn, "events_dropped_at_ingest", 1)?;
         return Ok(());
     }
 
-    let conn = open_db(app)?;
     if event.id.is_empty() {
         event.id = next_id("evt");
     }
     insert_ui_event(&conn, session_id, &event)?;
     increment_maintenance_counter(&conn, "events_aggregated", 1)?;
+    increment_maintenance_counter(&conn, "events_persisted", 1)?;
+    run_event_ingest_maintenance_diagnostic_only(&conn);
     record_event_side_effects(&conn, session_id, &event, typing_burst)?;
 
     let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
@@ -15134,7 +16085,8 @@ fn queue_event_trigger(
         existing.ready_at = Instant::now() + settle_delay;
         existing.settle_delay_ms = settle_delay.as_millis() as i64;
         if existing.capture_trigger != capture_trigger {
-            existing.capture_trigger = "event_burst".to_string();
+            existing.capture_trigger =
+                merge_pending_capture_trigger(&existing.capture_trigger, &capture_trigger);
         }
         update_capture_trigger_events(&conn, existing)?;
         return Ok(());
@@ -15166,6 +16118,7 @@ fn queue_event_trigger(
         },
     );
     insert_capture_trigger(&conn, session_id, &trigger, now, false, "event_bucket")?;
+    increment_maintenance_counter(&conn, "events_promoted_to_capture", 1)?;
     *pending = Some(trigger);
     Ok(())
 }
@@ -15310,6 +16263,33 @@ fn capture_interval_for_trigger(trigger: &str) -> Duration {
             MIN_LOW_VALUE_CAPTURE_INTERVAL
         }
         _ => MIN_LOW_VALUE_CAPTURE_INTERVAL,
+    }
+}
+
+fn capture_trigger_priority(trigger: &str) -> u8 {
+    match trigger {
+        // These boundaries identify a foreground/surface change. Demoting one
+        // into a generic event burst can delay the only truthful pre-Continue
+        // frame by the 45-second low-value interval.
+        "app_switch" => 4,
+        "window_focus" => 3,
+        "clipboard" => 2,
+        "typing_pause" | "scroll_stop" | "click" | "accessibility_change" => 1,
+        _ => 0,
+    }
+}
+
+fn merge_pending_capture_trigger(existing: &str, incoming: &str) -> String {
+    if existing == incoming {
+        return existing.to_string();
+    }
+    let existing_priority = capture_trigger_priority(existing);
+    let incoming_priority = capture_trigger_priority(incoming);
+    match existing_priority.cmp(&incoming_priority) {
+        std::cmp::Ordering::Greater => existing.to_string(),
+        std::cmp::Ordering::Less => incoming.to_string(),
+        std::cmp::Ordering::Equal if existing_priority > 1 => existing.to_string(),
+        std::cmp::Ordering::Equal => "event_burst".to_string(),
     }
 }
 
@@ -16042,17 +17022,12 @@ fn transition_summary(trigger_type: &str, transition_type: &str, stored: bool) -
     format!("{} classified as {}", trigger_type, transition_type)
 }
 
-fn start_capture_event_source(paths: &CapturePaths) -> Result<CaptureEventSource, String> {
+fn start_capture_event_source(_paths: &CapturePaths) -> Result<CaptureEventSource, String> {
     if !cfg!(target_os = "macos") {
         return Err("native UI event capture is only implemented for macOS".to_string());
     }
 
-    let helper_path = ensure_swift_helper(
-        paths,
-        "capture_events",
-        CAPTURE_EVENTS_SWIFT,
-        &["ApplicationServices", "AppKit"],
-    )?;
+    let helper_path = swift_helpers::resolve("capture_events")?;
     let mut child = Command::new(helper_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -16102,7 +17077,10 @@ fn capture_frame(
     cancellation: Option<&AtomicBool>,
     capture_trigger_id: Option<&str>,
     previous_frame_id: Option<&str>,
+    manual_continue_expectation: Option<&ManualContinueCaptureExpectation>,
 ) -> Result<CaptureOutcome, String> {
+    let _capture_permit =
+        crate::workload::governor().acquire(crate::workload::WorkClass::ScreenshotCapture)?;
     let paths = capture_paths(app)?;
     fs::create_dir_all(&paths.snapshot_dir).map_err(to_string)?;
     ensure_db(app)?;
@@ -16155,14 +17133,14 @@ fn capture_frame(
     }
 
     let window_snapshot = collect_window_snapshot(&paths).ok();
-    let active_window_id = context.window_id.or_else(|| {
+    let mut active_window_id = context.window_id.or_else(|| {
         window_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.active_window_id)
     });
 
     let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
-    let full_capture = capture_screenshot(&paths, &snapshot_path)?;
+    let full_capture = capture_screenshot(&paths, &conn, &snapshot_path)?;
     let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
     let image_hash = stable_hash_bytes(&image_bytes);
     let image_dimensions = jpeg_dimensions(&image_bytes);
@@ -16170,6 +17148,7 @@ fn capture_frame(
         let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
         match capture_window_screenshot(
             &paths,
+            &conn,
             window_id,
             &crop_path,
             context.app_bundle_id.as_deref(),
@@ -16177,9 +17156,39 @@ fn capture_frame(
             Ok(capture) => Some((crop_path, capture)),
             Err(_) => None,
         }
+    } else if let Some(expected_bundle) = manual_continue_expectation
+        .and_then(|expected| expected.app_bundle_id.as_deref())
+        .filter(|bundle_id| !bundle_id.trim().is_empty())
+    {
+        let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
+        match capture_sck_screenshot(
+            &paths,
+            "active_window",
+            &crop_path,
+            None,
+            Some(expected_bundle),
+            false,
+        ) {
+            Ok(capture) => {
+                active_window_id = capture.window_id;
+                Some((crop_path, capture))
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };
+    if let Some(expectation) = manual_continue_expectation {
+        let Some((crop_path, capture)) = active_window_capture.as_ref() else {
+            let _ = fs::remove_file(&snapshot_path);
+            return Err("manual Continue external window capture unavailable".to_string());
+        };
+        if !manual_continue_capture_identity_matches(expectation, capture) {
+            let _ = fs::remove_file(&snapshot_path);
+            let _ = fs::remove_file(crop_path);
+            return Err("manual Continue external window identity mismatch".to_string());
+        }
+    }
     let active_window_crop_path = active_window_capture
         .as_ref()
         .map(|(path, _)| path.to_path_buf());
@@ -16228,6 +17237,9 @@ fn capture_frame(
         .or_else(|| full_sck_capture.map(|_| "disabled".to_string()));
     let metadata = FrameMetadata {
         capture_provider: full_capture.provider.clone(),
+        active_window_capture_provider: active_window_capture
+            .as_ref()
+            .map(|(_, capture)| capture.provider.clone()),
         scope: if active_window_capture.is_some() {
             "active_window".to_string()
         } else {
@@ -16249,7 +17261,12 @@ fn capture_frame(
                 .as_ref()
                 .and_then(|snapshot| snapshot.active_app_bundle_id.clone())
         }),
-        screen_scale: 1.0,
+        screen_scale: sck_capture
+            .and_then(|capture| capture.frame_metadata_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| value.get("scale_factor").and_then(Value::as_f64))
+            .filter(|scale| *scale > 0.0)
+            .unwrap_or(1.0),
         pixel_width: full_capture
             .width
             .or_else(|| image_dimensions.map(|(width, _)| width)),
@@ -16409,6 +17426,13 @@ fn capture_frame(
     .map_err(to_string)?;
 
     let frame_id = conn.last_insert_rowid();
+    if let Some(provider) = metadata.active_window_capture_provider.as_deref() {
+        conn.execute(
+            "UPDATE frames SET active_window_capture_provider = ?2 WHERE id = ?1",
+            params![frame_id, provider],
+        )
+        .map_err(to_string)?;
+    }
     persist_frame_text_resolution(&conn, frame_id, &text_resolution)?;
     let mut ocr_text_for_fts = None;
     if let Some(text) = ocr_text {
@@ -16454,6 +17478,7 @@ fn capture_frame(
         content_hash: content_hash.clone(),
         image_hash: None,
         capture_provider: Some(metadata.capture_provider.clone()),
+        active_window_capture_provider: metadata.active_window_capture_provider.clone(),
         scope: Some(metadata.scope.clone()),
         display_id: metadata.display_id.clone(),
         window_id: metadata.window_id,
@@ -18198,9 +19223,7 @@ fn capture_status_snapshot_inner(
         database_path: paths.db_path.to_string_lossy().to_string(),
         screenshot_tool: Path::new("/usr/sbin/screencapture").exists(),
         accessibility_tool: Path::new("/usr/bin/osascript").exists(),
-        ocr_tool: Path::new("/usr/bin/swiftc").exists()
-            || Path::new("/usr/bin/swift").exists()
-            || command_in_path("tesseract"),
+        ocr_tool: swift_helpers::available("vision_ocr") || command_in_path("tesseract"),
         runtime_diagnostics: runtime_diagnostics_from_conn(conn.as_ref()),
     })
 }
@@ -19550,6 +20573,7 @@ fn frame_from_row(row: &Row<'_>) -> rusqlite::Result<CaptureFrame> {
         content_hash: row.get(13)?,
         image_hash: row.get(14)?,
         capture_provider: row.get(15)?,
+        active_window_capture_provider: row.get(40)?,
         scope: row.get(16)?,
         display_id: row.get(17)?,
         window_id: row.get(18)?,
@@ -19971,6 +20995,14 @@ fn schedule_continue_output_audit(
     let mut audit_result = result.clone();
     audit_result.continue_output_path = Some(summary.path.clone());
     thread::spawn(move || {
+        let mut permit =
+            match crate::workload::governor().acquire(crate::workload::WorkClass::AuditExport) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    eprintln!("[continue_output_audit] cancelled: {}", error);
+                    return;
+                }
+            };
         let export_result = (|| -> Result<(), String> {
             let conn = open_db_at_path(&db_path, true)?;
             export_continue_output_audit_to_plan(
@@ -19983,6 +21015,7 @@ fn schedule_continue_output_audit(
             Ok(())
         })();
         if let Err(error) = export_result {
+            permit.mark_failed();
             eprintln!("[continue_output_audit] failed: {}", error);
             if let Ok(conn) = open_db_at_path(&db_path, true) {
                 let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
@@ -20211,6 +21244,47 @@ fn export_continue_output_audit_to_plan(
                 "max_candidates_for_model": request.max_candidates_for_model.unwrap_or(5),
             }
         }),
+    )?;
+
+    let model_input_preview = conn
+        .query_row(
+            "SELECT a.packet_summary_json, a.keyframe_reasons_json,
+                    a.canonical_conflicts_json, a.causal_edges_json,
+                    p.packet_json
+             FROM task_truth_v2_shadow_audits a
+             JOIN task_truth_v2_observation_packets p ON p.packet_id = a.packet_id
+             WHERE a.decision_id = ?1
+             ORDER BY a.observed_at_ms DESC LIMIT 1",
+            params![result.decision_id],
+            |row| {
+                let packet_summary: String = row.get(0)?;
+                let keyframes: String = row.get(1)?;
+                let conflicts: String = row.get(2)?;
+                let interactions: String = row.get(3)?;
+                let packet: String = row.get(4)?;
+                Ok(serde_json::json!({
+                    "schema": "smalltalk.model_input_preview.v1",
+                    "private_developer_audit_only": true,
+                    "effective_session_id": request.session_id,
+                    "packet_summary": serde_json::from_str::<Value>(&packet_summary).unwrap_or(Value::Null),
+                    "selected_keyframes_chronological": serde_json::from_str::<Value>(&keyframes).unwrap_or(Value::Null),
+                    "ownership_conflicts": serde_json::from_str::<Value>(&conflicts).unwrap_or(Value::Null),
+                    "causal_interactions": serde_json::from_str::<Value>(&interactions).unwrap_or(Value::Null),
+                    "packet": serde_json::from_str::<Value>(&packet).unwrap_or(Value::Null),
+                }))
+            },
+        )
+        .optional()
+        .map_err(to_string)?
+        .unwrap_or_else(|| serde_json::json!({
+            "schema": "smalltalk.model_input_preview.v1",
+            "private_developer_audit_only": true,
+            "effective_session_id": request.session_id,
+            "status": "shadow_packet_unavailable"
+        }));
+    write_json_pretty(
+        &model_dir.join("model_input_preview.json"),
+        &model_input_preview,
     )?;
 
     let inference_manifest =
@@ -24448,7 +25522,17 @@ fn ensure_db(app: &AppHandle) -> Result<(), String> {
 fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
     let paths = capture_paths(app)?;
     fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
+    let permission_markers = if paths.db_path.exists() {
+        let conn = open_readonly_db(app)?;
+        permission_request_markers(&conn)?
+    } else {
+        Vec::new()
+    };
     replace_capture_db(&paths)?;
+    if !permission_markers.is_empty() {
+        let conn = open_db(app)?;
+        restore_permission_request_markers(&conn, &permission_markers)?;
+    }
     clear_snapshot_dir(&paths.snapshot_dir)?;
     clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
     clear_project_output_dir()?;
@@ -24876,6 +25960,194 @@ fn delete_ui_events(conn: &Connection, event_ids: &[String]) -> Result<i64, Stri
     Ok(deleted)
 }
 
+fn event_is_protected(conn: &Connection, event_id: &str) -> Result<bool, String> {
+    for (table, column) in [
+        ("typing_bursts", "start_event_id"),
+        ("typing_bursts", "last_event_id"),
+        ("typing_bursts", "commit_event_id"),
+    ] {
+        if table_exists_in_capture(conn, table)? {
+            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1)");
+            if conn
+                .query_row(&sql, params![event_id], |row| row.get::<_, i64>(0))
+                .map_err(to_string)?
+                != 0
+            {
+                return Ok(true);
+            }
+        }
+    }
+    for (table, column) in [
+        ("capture_triggers", "caused_by_event_ids"),
+        ("continue_task_actions", "evidence_event_ids_json"),
+    ] {
+        if table_exists_in_capture(conn, table)? && column_exists_in_capture(conn, table, column)? {
+            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} LIKE ?1)");
+            let needle = format!("%\"{}\"%", event_id.replace('"', ""));
+            if conn
+                .query_row(&sql, params![needle], |row| row.get::<_, i64>(0))
+                .map_err(to_string)?
+                != 0
+            {
+                return Ok(true);
+            }
+        }
+    }
+    if table_exists_in_capture(conn, "event_transitions")? {
+        let protected: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_transitions WHERE primary_event_id=?1)",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .map_err(to_string)?;
+        if protected != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn column_exists_in_capture(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    Ok(table_columns(conn, table)?.contains(column))
+}
+
+fn prune_event_class_chunk(
+    conn: &Connection,
+    low_value: bool,
+    retained: i64,
+) -> Result<i64, String> {
+    let predicate = if low_value {
+        "event_type IN ('scroll','ax_notification','accessibility_change')"
+    } else {
+        "event_type NOT IN ('scroll','ax_notification','accessibility_change')"
+    };
+    let sql = format!(
+        "SELECT id FROM ui_events WHERE {predicate} ORDER BY ts_ms DESC, id DESC LIMIT ?1 OFFSET ?2"
+    );
+    let ids = query_string_rows(conn, &sql, &[&RUNTIME_MAINTENANCE_CHUNK_SIZE, &retained])?;
+    let mut deleted = 0;
+    for id in ids {
+        if !event_is_protected(conn, &id)? {
+            deleted += conn
+                .execute("DELETE FROM ui_events WHERE id=?1", params![id])
+                .map_err(to_string)? as i64;
+        }
+    }
+    Ok(deleted)
+}
+
+fn prune_unreferenced_rows_chunk(
+    conn: &Connection,
+    table: &str,
+    order_column: &str,
+    retained: i64,
+    reference_sql: &str,
+) -> Result<i64, String> {
+    if !table_exists_in_capture(conn, table)? {
+        return Ok(0);
+    }
+    let sql = format!(
+        "DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE {reference_sql} ORDER BY {order_column} DESC, id DESC LIMIT ?1 OFFSET ?2)"
+    );
+    conn.execute(&sql, params![RUNTIME_MAINTENANCE_CHUNK_SIZE, retained])
+        .map(|n| n as i64)
+        .map_err(to_string)
+}
+
+fn run_runtime_maintenance(conn: &Connection) -> Result<RuntimeMaintenanceResult, String> {
+    let tx = conn.unchecked_transaction().map_err(to_string)?;
+    let low = prune_event_class_chunk(&tx, true, MAX_RETAINED_LOW_VALUE_UI_EVENTS)?;
+    let high = prune_event_class_chunk(&tx, false, MAX_RETAINED_HIGH_VALUE_UI_EVENTS)?;
+    let mut trigger_reference_sql = String::from(
+        "post_frame_id IS NULL AND id NOT IN (SELECT COALESCE(capture_trigger_id,'') FROM typing_bursts)",
+    );
+    if table_exists_in_capture(&tx, "event_transitions")?
+        && column_exists_in_capture(&tx, "event_transitions", "trigger_id")?
+    {
+        trigger_reference_sql
+            .push_str(" AND id NOT IN (SELECT COALESCE(trigger_id,'') FROM event_transitions)");
+    }
+    let triggers = prune_unreferenced_rows_chunk(
+        &tx,
+        "capture_triggers",
+        "ts_ms",
+        MAX_RETAINED_CAPTURE_TRIGGERS,
+        &trigger_reference_sql,
+    )?;
+    let bursts = prune_unreferenced_rows_chunk(
+        &tx,
+        "typing_bursts",
+        "ended_at_ms",
+        MAX_RETAINED_TYPING_BURSTS,
+        "pre_frame_id IS NULL AND post_frame_id IS NULL",
+    )?;
+    prune_continue_refresh_rows(&tx)?;
+    let result = RuntimeMaintenanceResult {
+        policy_version: RETENTION_POLICY_VERSION.to_string(),
+        deleted_low_value_events: low,
+        deleted_high_value_events: high,
+        deleted_capture_triggers: triggers,
+        deleted_typing_bursts: bursts,
+        chunks_executed: 1,
+    };
+    record_maintenance_value(&tx, "retention_policy_version", RETENTION_POLICY_VERSION)?;
+    record_maintenance_value(
+        &tx,
+        "runtime_maintenance_last_run_ms",
+        &now_millis().to_string(),
+    )?;
+    record_maintenance_value(
+        &tx,
+        "runtime_maintenance_last_result",
+        &serde_json::to_string(&result).map_err(to_string)?,
+    )?;
+    tx.commit().map_err(to_string)?;
+    Ok(result)
+}
+
+fn maybe_run_runtime_maintenance(
+    conn: &Connection,
+    force: bool,
+) -> Result<Option<RuntimeMaintenanceResult>, String> {
+    let events = maintenance_i64(conn, "events_persisted")?;
+    let frames = maintenance_i64(conn, "heavy_captures_stored")?;
+    let last_events = maintenance_i64(conn, "runtime_maintenance_event_watermark")?;
+    let last_frames = maintenance_i64(conn, "runtime_maintenance_frame_watermark")?;
+    let last_run = maintenance_i64(conn, "runtime_maintenance_last_run_ms")?;
+    let due = force
+        || (events - last_events >= RUNTIME_MAINTENANCE_EVENT_INTERVAL
+            && now_millis() - last_run >= RUNTIME_MAINTENANCE_MIN_INTERVAL_MS)
+        || frames - last_frames >= RUNTIME_MAINTENANCE_FRAME_INTERVAL;
+    if !due {
+        return Ok(None);
+    }
+    let result = run_runtime_maintenance(conn)?;
+    record_maintenance_value(
+        conn,
+        "runtime_maintenance_event_watermark",
+        &events.to_string(),
+    )?;
+    record_maintenance_value(
+        conn,
+        "runtime_maintenance_frame_watermark",
+        &frames.to_string(),
+    )?;
+    Ok(Some(result))
+}
+
+fn run_event_ingest_maintenance_diagnostic_only(conn: &Connection) {
+    if let Err(error) = maybe_run_runtime_maintenance(conn, false) {
+        let _ = increment_maintenance_counter(conn, "runtime_maintenance_failure_count", 1);
+        let _ = record_maintenance_value(conn, "runtime_maintenance_last_error", &error);
+        let _ = record_maintenance_value(
+            conn,
+            "runtime_maintenance_last_failure_ms",
+            &now_millis().to_string(),
+        );
+    }
+}
+
 fn frame_asset_paths(conn: &Connection, frame_id: i64) -> Result<Vec<PathBuf>, String> {
     conn.query_row(
         "SELECT snapshot_path, full_screenshot_path, active_window_crop_path, active_element_crop_path
@@ -25139,6 +26411,13 @@ fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostic
         return RuntimeDiagnostics::default();
     };
     RuntimeDiagnostics {
+        workload: crate::workload::governor().diagnostics(),
+        events_received: maintenance_i64(conn, "events_received").unwrap_or(0),
+        events_dropped_at_source: maintenance_i64(conn, "events_dropped_at_source").unwrap_or(0),
+        events_dropped_at_ingest: maintenance_i64(conn, "events_dropped_at_ingest").unwrap_or(0),
+        events_persisted: maintenance_i64(conn, "events_persisted").unwrap_or(0),
+        events_promoted_to_capture: maintenance_i64(conn, "events_promoted_to_capture")
+            .unwrap_or(0),
         heavy_captures_stored: maintenance_i64(conn, "heavy_captures_stored").unwrap_or(0),
         heavy_captures_skipped: maintenance_i64(conn, "heavy_captures_skipped").unwrap_or(0),
         heavy_captures_skipped_budget: maintenance_i64(conn, "heavy_captures_skipped_budget")
@@ -25198,6 +26477,28 @@ fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostic
             .unwrap_or(None),
         latest_weak_surface_snapshot_id: maintenance_value(conn, "latest_weak_surface_snapshot_id")
             .unwrap_or(None),
+        sck_display_successes: maintenance_i64(conn, "sck_display_successes").unwrap_or(0),
+        sck_active_window_successes: maintenance_i64(conn, "sck_active_window_successes")
+            .unwrap_or(0),
+        sck_active_window_abnormal_exits: maintenance_i64(conn, "sck_active_window_abnormal_exits")
+            .unwrap_or(0),
+        sck_timeouts: maintenance_i64(conn, "sck_timeouts").unwrap_or(0),
+        sck_circuit_breaker_opens: maintenance_i64(conn, "sck_circuit_breaker_opens").unwrap_or(0),
+        screencapture_fallbacks: maintenance_i64(conn, "screencapture_fallbacks").unwrap_or(0),
+        latest_sck_capture_mode: maintenance_value(conn, "latest_sck_capture_mode").unwrap_or(None),
+        latest_sck_provider: maintenance_value(conn, "latest_sck_provider").unwrap_or(None),
+        latest_sck_duration_ms: maintenance_value(conn, "latest_sck_duration_ms")
+            .unwrap_or(None)
+            .and_then(|value| value.parse().ok()),
+        latest_sck_exit_category: maintenance_value(conn, "latest_sck_exit_category")
+            .unwrap_or(None),
+        latest_sck_fallback_used: maintenance_value(conn, "latest_sck_fallback_used")
+            .unwrap_or(None)
+            .and_then(|value| value.parse().ok()),
+        sck_active_window_circuit_breaker_state: sck_provider_health()
+            .lock()
+            .map(|health| health.active_window_state().to_string())
+            .unwrap_or_else(|_| "unavailable".to_string()),
     }
 }
 
@@ -25904,6 +27205,7 @@ fn ensure_frame_columns(conn: &Connection) -> Result<(), String> {
         ("sck_frame_metadata_json", "TEXT"),
         ("sck_capture_mode", "TEXT"),
         ("sck_audio_policy", "TEXT"),
+        ("active_window_capture_provider", "TEXT"),
     ];
 
     for (name, definition) in additions {
@@ -26266,21 +27568,227 @@ fn capture_paths(app: &AppHandle) -> Result<CapturePaths, String> {
         .join("capture");
     Ok(CapturePaths {
         snapshot_dir: root_dir.join("snapshots"),
-        helper_dir: root_dir.join("helpers"),
         db_path: root_dir.join("smalltalk-capture.sqlite"),
         root_dir,
     })
 }
 
-fn capture_screenshot(paths: &CapturePaths, path: &Path) -> Result<ScreenshotCapture, String> {
+#[cfg(target_os = "macos")]
+fn write_cg_image(image: &core_graphics::image::CGImage, path: &Path) -> Result<(), String> {
+    use core_foundation::base::{CFRelease, TCFType};
+    use core_foundation::string::CFString;
+    use core_foundation::url::CFURL;
+    use foreign_types::ForeignType;
+    use std::ffi::c_void;
+
+    type CGImageDestinationRef = *mut c_void;
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageDestinationCreateWithURL(
+            url: core_foundation::url::CFURLRef,
+            type_identifier: core_foundation::string::CFStringRef,
+            count: usize,
+            options: core_foundation::dictionary::CFDictionaryRef,
+        ) -> CGImageDestinationRef;
+        fn CGImageDestinationAddImage(
+            destination: CGImageDestinationRef,
+            image: core_graphics::sys::CGImageRef,
+            properties: core_foundation::dictionary::CFDictionaryRef,
+        );
+        fn CGImageDestinationFinalize(destination: CGImageDestinationRef) -> bool;
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+    let url = CFURL::from_path(path, false)
+        .ok_or_else(|| "failed to create image destination URL".to_string())?;
+    let image_type = CFString::new("public.jpeg");
+    let destination = unsafe {
+        CGImageDestinationCreateWithURL(
+            url.as_concrete_TypeRef(),
+            image_type.as_concrete_TypeRef(),
+            1,
+            std::ptr::null(),
+        )
+    };
+    if destination.is_null() {
+        return Err("failed to create in-process JPEG destination".into());
+    }
+    unsafe {
+        CGImageDestinationAddImage(destination, image.as_ptr(), std::ptr::null());
+    }
+    let finalized = unsafe { CGImageDestinationFinalize(destination) };
+    unsafe {
+        CFRelease(destination.cast());
+    }
+    if !finalized || !path.is_file() {
+        let _ = fs::remove_file(path);
+        return Err("failed to finalize in-process JPEG".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn capture_core_graphics_in_process(
+    mode: &str,
+    path: &Path,
+    target_window_id: Option<i64>,
+    target_bundle_id: Option<&str>,
+) -> Result<ScreenshotCapture, String> {
+    use core_graphics::access::ScreenCaptureAccess;
+    use core_graphics::display::CGDisplay;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use core_graphics::window::{
+        create_image, kCGWindowImageBestResolution, kCGWindowImageBoundsIgnoreFraming,
+        kCGWindowListOptionIncludingWindow,
+    };
+
+    // This check never opens System Settings or requests permission. The app
+    // uses only the permission already granted to its own bundle identity.
+    if !ScreenCaptureAccess.preflight() {
+        return Err("main_app_screen_capture_permission_unavailable".into());
+    }
+    let image = if mode == "active_window" {
+        let window_id = target_window_id
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "active window id was unavailable".to_string())?;
+        let null_bounds = CGRect::new(
+            &CGPoint::new(f64::INFINITY, f64::INFINITY),
+            &CGSize::new(0.0, 0.0),
+        );
+        create_image(
+            null_bounds,
+            kCGWindowListOptionIncludingWindow,
+            window_id,
+            kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
+        )
+        .ok_or_else(|| "in-process active-window capture returned no image".to_string())?
+    } else {
+        CGDisplay::main()
+            .image()
+            .ok_or_else(|| "in-process display capture returned no image".to_string())?
+    };
+    let width = image.width() as i64;
+    let height = image.height() as i64;
+    write_cg_image(&image, path)?;
+    let permission_identity = running_screen_capture_identity();
+    Ok(ScreenshotCapture {
+        provider: "core_graphics_in_process".into(),
+        display_id: (mode != "active_window").then(|| CGDisplay::main().id.to_string()),
+        window_id: target_window_id,
+        bundle_id: target_bundle_id.map(str::to_string),
+        width: Some(width),
+        height: Some(height),
+        filter_summary_json: serde_json::to_string(&serde_json::json!({
+            "scope": mode,
+            "runs_in_permission_bearing_app_process": true,
+            "target_window_id": target_window_id,
+            "target_bundle_id": target_bundle_id,
+        }))
+        .ok(),
+        configuration_summary_json: serde_json::to_string(&serde_json::json!({
+            "profile": if mode == "active_window" { "active_window_still" } else { "display_still" },
+            "width": width,
+            "height": height,
+            "captures_audio": false,
+            "shows_cursor": false,
+        }))
+        .ok(),
+        frame_metadata_json: serde_json::to_string(&serde_json::json!({
+            "provider": "core_graphics_in_process",
+            "permission_identity": permission_identity,
+        }))
+        .ok(),
+        capture_mode: Some("screenshot".into()),
+        audio_policy: Some("disabled".into()),
+        helper_duration_ms: None,
+    })
+}
+
+fn capture_screenshot(
+    paths: &CapturePaths,
+    conn: &Connection,
+    path: &Path,
+) -> Result<ScreenshotCapture, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = paths;
+        let started = Instant::now();
+        return match capture_core_graphics_in_process("display", path, None, None) {
+            Ok(capture) => {
+                increment_maintenance_counter(conn, "in_process_display_successes", 1)?;
+                record_sck_operation(
+                    conn,
+                    "display",
+                    "core_graphics_in_process",
+                    started.elapsed().as_millis() as i64,
+                    HelperExitCategory::Success,
+                    false,
+                )?;
+                Ok(capture)
+            }
+            Err(error) => {
+                record_sck_operation(
+                    conn,
+                    "display",
+                    "core_graphics_in_process",
+                    started.elapsed().as_millis() as i64,
+                    HelperExitCategory::LaunchFailure,
+                    false,
+                )?;
+                Err(error)
+            }
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (paths, conn);
+        return capture_screenshot_cli(path);
+    }
+
+    #[allow(unreachable_code)]
     if cfg!(target_os = "macos") {
         match capture_sck_screenshot(paths, "display", path, None, None, false) {
-            Ok(capture) => return Ok(capture),
-            Err(sck_error) => {
-                return capture_screenshot_cli(path).map_err(|cli_error| {
+            Ok(capture) => {
+                increment_maintenance_counter(conn, "sck_display_successes", 1)?;
+                record_sck_operation(
+                    conn,
+                    "display",
+                    "screen_capture_kit",
+                    capture.helper_duration_ms.unwrap_or(0),
+                    HelperExitCategory::Success,
+                    false,
+                )?;
+                return Ok(capture);
+            }
+            Err(failure) => {
+                if failure.category == HelperExitCategory::Timeout {
+                    increment_maintenance_counter(conn, "sck_timeouts", 1)?;
+                }
+                let fallback = capture_screenshot_cli(path);
+                let fallback_used = fallback.is_ok();
+                if fallback_used {
+                    increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
+                }
+                record_sck_operation(
+                    conn,
+                    "display",
+                    if fallback_used {
+                        "screencapture_cli"
+                    } else {
+                        "screen_capture_kit"
+                    },
+                    failure.duration_ms,
+                    failure.category,
+                    fallback_used,
+                )?;
+                return fallback.map_err(|cli_error| {
                     format!(
                         "ScreenCaptureKit failed: {}; screencapture fallback failed: {}",
-                        sck_error, cli_error
+                        failure.message, cli_error
                     )
                 });
             }
@@ -26292,11 +27800,73 @@ fn capture_screenshot(paths: &CapturePaths, path: &Path) -> Result<ScreenshotCap
 
 fn capture_window_screenshot(
     paths: &CapturePaths,
+    conn: &Connection,
     window_id: i64,
     path: &Path,
     target_bundle_id: Option<&str>,
 ) -> Result<ScreenshotCapture, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = paths;
+        let started = Instant::now();
+        return match capture_core_graphics_in_process(
+            "active_window",
+            path,
+            Some(window_id),
+            target_bundle_id,
+        ) {
+            Ok(capture) => {
+                increment_maintenance_counter(conn, "in_process_active_window_successes", 1)?;
+                record_sck_operation(
+                    conn,
+                    "active_window",
+                    "core_graphics_in_process",
+                    started.elapsed().as_millis() as i64,
+                    HelperExitCategory::Success,
+                    false,
+                )?;
+                Ok(capture)
+            }
+            Err(error) => {
+                record_sck_operation(
+                    conn,
+                    "active_window",
+                    "core_graphics_in_process",
+                    started.elapsed().as_millis() as i64,
+                    HelperExitCategory::LaunchFailure,
+                    false,
+                )?;
+                Err(error)
+            }
+        };
+    }
+
+    #[allow(unreachable_code)]
     if cfg!(target_os = "macos") {
+        let decision = sck_provider_health()
+            .lock()
+            .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
+            .active_window_decision(Instant::now());
+        if decision == CircuitBreakerDecision::Skip {
+            let fallback = capture_window_screenshot_cli(window_id, path);
+            let fallback_used = fallback.is_ok();
+            if fallback_used {
+                increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
+            }
+            record_sck_operation(
+                conn,
+                "active_window",
+                if fallback_used {
+                    "screencapture_cli"
+                } else {
+                    "screen_capture_kit"
+                },
+                0,
+                HelperExitCategory::CircuitBreakerSkip,
+                fallback_used,
+            )?;
+            return fallback;
+        }
         match capture_sck_screenshot(
             paths,
             "active_window",
@@ -26305,12 +27875,62 @@ fn capture_window_screenshot(
             target_bundle_id,
             false,
         ) {
-            Ok(capture) => return Ok(capture),
-            Err(sck_error) => {
-                return capture_window_screenshot_cli(window_id, path).map_err(|cli_error| {
+            Ok(capture) => {
+                sck_provider_health()
+                    .lock()
+                    .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
+                    .record_active_window_success();
+                increment_maintenance_counter(conn, "sck_active_window_successes", 1)?;
+                record_sck_operation(
+                    conn,
+                    "active_window",
+                    "screen_capture_kit",
+                    capture.helper_duration_ms.unwrap_or(0),
+                    HelperExitCategory::Success,
+                    false,
+                )?;
+                return Ok(capture);
+            }
+            Err(failure) => {
+                if matches!(
+                    failure.category,
+                    HelperExitCategory::AbnormalTermination | HelperExitCategory::Timeout
+                ) {
+                    if failure.category == HelperExitCategory::AbnormalTermination {
+                        increment_maintenance_counter(conn, "sck_active_window_abnormal_exits", 1)?;
+                    }
+                    if failure.category == HelperExitCategory::Timeout {
+                        increment_maintenance_counter(conn, "sck_timeouts", 1)?;
+                    }
+                    let opened = sck_provider_health()
+                        .lock()
+                        .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
+                        .record_active_window_abnormal_exit(Instant::now());
+                    if opened {
+                        increment_maintenance_counter(conn, "sck_circuit_breaker_opens", 1)?;
+                    }
+                }
+                let fallback = capture_window_screenshot_cli(window_id, path);
+                let fallback_used = fallback.is_ok();
+                if fallback_used {
+                    increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
+                }
+                record_sck_operation(
+                    conn,
+                    "active_window",
+                    if fallback_used {
+                        "screencapture_cli"
+                    } else {
+                        "screen_capture_kit"
+                    },
+                    failure.duration_ms,
+                    failure.category,
+                    fallback_used,
+                )?;
+                return fallback.map_err(|cli_error| {
                     format!(
                         "ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
-                        sck_error, cli_error
+                        failure.message, cli_error
                     )
                 });
             }
@@ -26321,19 +27941,20 @@ fn capture_window_screenshot(
 }
 
 fn capture_sck_screenshot(
-    paths: &CapturePaths,
+    _paths: &CapturePaths,
     mode: &str,
     path: &Path,
     target_window_id: Option<i64>,
     target_bundle_id: Option<&str>,
     include_cursor: bool,
-) -> Result<ScreenshotCapture, String> {
-    let helper_path = ensure_swift_helper(
-        paths,
-        "sck_screenshot",
-        SCK_SCREENSHOT_SWIFT,
-        &["AppKit", "CoreGraphics", "ScreenCaptureKit"],
-    )?;
+) -> Result<ScreenshotCapture, SckCaptureFailure> {
+    let started = Instant::now();
+    let helper_path =
+        swift_helpers::resolve("sck_screenshot").map_err(|message| SckCaptureFailure {
+            category: HelperExitCategory::LaunchFailure,
+            duration_ms: started.elapsed().as_millis() as i64,
+            message,
+        })?;
     let request = serde_json::json!({
         "mode": mode,
         "target_window_id": target_window_id,
@@ -26343,15 +27964,12 @@ fn capture_sck_screenshot(
         "quality": 0.82,
         "include_cursor": include_cursor
     });
-    let output = Command::new(helper_path)
-        .arg(request.to_string())
-        .output()
-        .map_err(|error| format!("ScreenCaptureKit helper failed to start: {}", error))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let response = serde_json::from_str::<SckScreenshotResponse>(stdout.trim())
-        .map_err(|error| format!("ScreenCaptureKit helper returned invalid JSON: {}", error))?;
+    let mut command = Command::new(helper_path);
+    command.arg(request.to_string());
+    let execution = run_sck_helper(&mut command, SCK_HELPER_TIMEOUT);
 
-    if output.status.success() && response.ok && path.exists() {
+    if execution.category == HelperExitCategory::Success && path.exists() {
+        let response = execution.response.expect("successful helper has response");
         return Ok(ScreenshotCapture {
             provider: response.provider,
             display_id: response.captured_display_id,
@@ -26364,17 +27982,132 @@ fn capture_sck_screenshot(
             frame_metadata_json: response.frame_metadata_json,
             capture_mode: response.capture_mode,
             audio_policy: response.audio_policy,
+            helper_duration_ms: Some(execution.duration_ms),
         });
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(response.error.unwrap_or_else(|| {
-        if stderr.is_empty() {
-            "ScreenCaptureKit helper failed".to_string()
+    let message = execution
+        .response
+        .and_then(|response| response.error)
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| (!execution.stderr.is_empty()).then_some(execution.stderr))
+        .unwrap_or_else(|| {
+            if execution.category == HelperExitCategory::Success {
+                "ScreenCaptureKit helper reported success without an output image".to_string()
+            } else {
+                format!(
+                    "ScreenCaptureKit helper failed ({})",
+                    execution.category.as_str()
+                )
+            }
+        });
+    Err(SckCaptureFailure {
+        category: if execution.category == HelperExitCategory::Success {
+            HelperExitCategory::InvalidResponse
         } else {
-            stderr
+            execution.category
+        },
+        duration_ms: execution.duration_ms,
+        message,
+    })
+}
+
+fn run_sck_helper(command: &mut Command, timeout: Duration) -> HelperExecutionResult {
+    let started = Instant::now();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return HelperExecutionResult {
+                category: HelperExitCategory::LaunchFailure,
+                response: None,
+                stderr: error.to_string(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            }
         }
-    }))
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Err(_) => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default())
+        .trim()
+        .to_string();
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let response = serde_json::from_str::<SckScreenshotResponse>(&stdout).ok();
+    let category = if timed_out {
+        HelperExitCategory::Timeout
+    } else if status.as_ref().and_then(|status| status.signal()).is_some() {
+        HelperExitCategory::AbnormalTermination
+    } else if status.as_ref().is_some_and(|status| status.success()) {
+        match response.as_ref() {
+            Some(response) if response.ok => HelperExitCategory::Success,
+            Some(_) => HelperExitCategory::StructuredHelperError,
+            None => HelperExitCategory::InvalidResponse,
+        }
+    } else if response.as_ref().is_some_and(|response| !response.ok) {
+        HelperExitCategory::StructuredHelperError
+    } else {
+        HelperExitCategory::NonZeroExit
+    };
+    HelperExecutionResult {
+        category,
+        response,
+        stderr,
+        duration_ms: started.elapsed().as_millis() as i64,
+    }
+}
+
+fn record_sck_operation(
+    conn: &Connection,
+    mode: &str,
+    provider: &str,
+    duration_ms: i64,
+    category: HelperExitCategory,
+    fallback_used: bool,
+) -> Result<(), String> {
+    record_maintenance_value(conn, "latest_sck_capture_mode", mode)?;
+    record_maintenance_value(conn, "latest_sck_provider", provider)?;
+    record_maintenance_value(conn, "latest_sck_duration_ms", &duration_ms.to_string())?;
+    record_maintenance_value(conn, "latest_sck_exit_category", category.as_str())?;
+    record_maintenance_value(
+        conn,
+        "latest_sck_fallback_used",
+        if fallback_used { "true" } else { "false" },
+    )?;
+    Ok(())
 }
 
 fn capture_screenshot_cli(path: &Path) -> Result<ScreenshotCapture, String> {
@@ -26492,17 +28225,12 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(i64, i64)> {
     None
 }
 
-fn collect_window_snapshot(paths: &CapturePaths) -> Result<WindowSnapshotPayload, String> {
+fn collect_window_snapshot(_paths: &CapturePaths) -> Result<WindowSnapshotPayload, String> {
     if !cfg!(target_os = "macos") {
         return Err("window graph capture is only implemented for macOS".to_string());
     }
 
-    let helper_path = ensure_swift_helper(
-        paths,
-        "window_snapshot",
-        WINDOW_SNAPSHOT_SWIFT,
-        &["AppKit", "CoreGraphics", "ApplicationServices"],
-    )?;
+    let helper_path = swift_helpers::resolve("window_snapshot")?;
     let output = Command::new(helper_path)
         .output()
         .map_err(|error| format!("window snapshot helper failed to start: {}", error))?;
@@ -26658,18 +28386,13 @@ fn collect_accessibility_context(paths: &CapturePaths) -> AccessibilityContext {
 }
 
 fn collect_accessibility_context_native(
-    paths: &CapturePaths,
+    _paths: &CapturePaths,
 ) -> Result<AccessibilityContext, String> {
     if !cfg!(target_os = "macos") {
         return Err("native accessibility capture is only implemented for macOS".to_string());
     }
 
-    let helper_path = ensure_swift_helper(
-        paths,
-        "accessibility_snapshot",
-        ACCESSIBILITY_SNAPSHOT_SWIFT,
-        &["ApplicationServices", "AppKit"],
-    )?;
+    let helper_path = swift_helpers::resolve("accessibility_snapshot")?;
     let output = Command::new(helper_path)
         .output()
         .map_err(|error| format!("accessibility helper failed to start: {}", error))?;
@@ -26949,48 +28672,6 @@ fn titleish_text(text: &str, window_title: &str) -> bool {
                 && text_terms(text).len() <= text_terms(window_title).len() + 6))
 }
 
-fn ensure_swift_helper(
-    paths: &CapturePaths,
-    name: &str,
-    source: &str,
-    frameworks: &[&str],
-) -> Result<PathBuf, String> {
-    fs::create_dir_all(&paths.helper_dir).map_err(to_string)?;
-    let source_path = paths.helper_dir.join(format!("{}.swift", name));
-    let helper_path = paths.helper_dir.join(name);
-
-    let should_write = fs::read_to_string(&source_path)
-        .map(|existing| existing != source)
-        .unwrap_or(true);
-    if should_write {
-        fs::write(&source_path, source).map_err(to_string)?;
-        let _ = fs::remove_file(&helper_path);
-    }
-
-    if !helper_path.exists() {
-        let mut command = Command::new("/usr/bin/swiftc");
-        command.arg("-O").arg(&source_path);
-        for framework in frameworks {
-            command.arg("-framework").arg(framework);
-        }
-        command.arg("-o").arg(&helper_path);
-
-        let output = command
-            .output()
-            .map_err(|error| format!("swiftc failed to start: {}", error))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(if stderr.is_empty() {
-                format!("swiftc failed to build {}", name)
-            } else {
-                stderr
-            });
-        }
-    }
-
-    Ok(helper_path)
-}
-
 fn run_ocr(paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
     if cfg!(target_os = "macos") {
         match run_vision_ocr(paths, image_path) {
@@ -27013,50 +28694,12 @@ fn run_ocr(paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String>
     run_tesseract(image_path)
 }
 
-fn run_vision_ocr(paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
-    fs::create_dir_all(&paths.helper_dir).map_err(to_string)?;
-    let source_path = paths.helper_dir.join("vision_ocr.swift");
-    let helper_path = paths.helper_dir.join("vision_ocr");
-
-    let should_write = fs::read_to_string(&source_path)
-        .map(|existing| existing != VISION_OCR_SWIFT)
-        .unwrap_or(true);
-    if should_write {
-        fs::write(&source_path, VISION_OCR_SWIFT).map_err(to_string)?;
-        let _ = fs::remove_file(&helper_path);
-    }
-
-    if !helper_path.exists() {
-        let output = Command::new("/usr/bin/swiftc")
-            .arg("-O")
-            .arg(&source_path)
-            .arg("-framework")
-            .arg("Vision")
-            .arg("-framework")
-            .arg("AppKit")
-            .arg("-o")
-            .arg(&helper_path)
-            .output()
-            .map_err(|error| format!("swiftc failed to start: {}", error))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return run_vision_ocr_interpreted(&source_path, image_path).or(Err(stderr));
-        }
-    }
-
+fn run_vision_ocr(_paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
+    let helper_path = swift_helpers::resolve("vision_ocr")?;
     let output = Command::new(&helper_path)
         .arg(image_path)
         .output()
         .map_err(|error| format!("vision helper failed to start: {}", error))?;
-    parse_vision_output(output, "AppleVision")
-}
-
-fn run_vision_ocr_interpreted(source_path: &Path, image_path: &Path) -> Result<OcrOutput, String> {
-    let output = Command::new("/usr/bin/swift")
-        .arg(source_path)
-        .arg(image_path)
-        .output()
-        .map_err(|error| format!("swift failed to start: {}", error))?;
     parse_vision_output(output, "AppleVision")
 }
 
@@ -27185,6 +28828,7 @@ fn record_capture_outcome_counters(
     let conn = open_db(app)?;
     if outcome.frame.is_some() {
         increment_maintenance_counter(&conn, "heavy_captures_stored", 1)?;
+        maybe_run_runtime_maintenance(&conn, false)?;
         return Ok(());
     }
 
@@ -27628,7 +29272,6 @@ mod tests {
         let paths = CapturePaths {
             root_dir: root.clone(),
             snapshot_dir: root.join("snapshots"),
-            helper_dir: root.join("helpers"),
             db_path: root.join("smalltalk-capture.sqlite"),
         };
         fs::create_dir_all(&paths.snapshot_dir).unwrap();
@@ -27677,6 +29320,262 @@ mod tests {
         assert_eq!(
             capture_interval_for_trigger("accessibility_change"),
             MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn mixed_event_burst_preserves_app_switch_capture_priority() {
+        assert_eq!(
+            merge_pending_capture_trigger("accessibility_change", "app_switch"),
+            "app_switch"
+        );
+        assert_eq!(
+            merge_pending_capture_trigger("app_switch", "scroll_stop"),
+            "app_switch"
+        );
+        assert_eq!(
+            capture_interval_for_trigger(&merge_pending_capture_trigger(
+                "accessibility_change",
+                "app_switch"
+            )),
+            MIN_IMPORTANT_CAPTURE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn mixed_low_value_events_remain_a_bounded_event_burst() {
+        assert_eq!(
+            merge_pending_capture_trigger("scroll_stop", "accessibility_change"),
+            "event_burst"
+        );
+        assert_eq!(
+            capture_interval_for_trigger("event_burst"),
+            MIN_LOW_VALUE_CAPTURE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn manual_continue_anchor_requires_a_matching_post_event_external_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO ui_events (
+               id, session_id, ts_ms, event_type, app_bundle_id, app_name,
+               window_id, created_at_ms
+             ) VALUES ('event-code','session-a',1000,'app_switch',
+                       'com.microsoft.VSCode','Code',42,1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, focused,
+               capture_trigger, created_at, app_bundle_id, window_id,
+               privacy_status, full_screenshot_path
+             ) VALUES ('session-a',900,'stale.png','ChatGPT',1,'event_burst',900,
+                       'com.openai.codex',7,'normal','stale.png')",
+            [],
+        )
+        .unwrap();
+        let event = latest_manual_continue_external_event(&conn, "session-a", 1_100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_100)
+                .unwrap()
+                .is_none()
+        );
+
+        let readable_image = std::env::temp_dir().join(format!(
+            "smalltalk-manual-anchor-{}-code.png",
+            std::process::id()
+        ));
+        fs::write(&readable_image, b"test-image").unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, focused,
+               capture_trigger, created_at, app_bundle_id, window_id,
+               privacy_status, full_screenshot_path
+             ) VALUES ('session-a',1100,?1,'Code',1,'app_switch',1100,
+                       'com.microsoft.VSCode',42,'normal',?1)",
+            params![readable_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        assert_eq!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_200).unwrap(),
+            Some("2".to_string())
+        );
+        let _ = fs::remove_file(readable_image);
+    }
+
+    #[test]
+    fn manual_continue_anchor_rejects_private_or_wrong_task_surface_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO ui_events (
+               id, session_id, ts_ms, event_type, app_bundle_id, app_name,
+               window_id, created_at_ms
+             ) VALUES ('event-code','session-a',1000,'app_switch',
+                       'com.microsoft.VSCode','Code',42,1000)",
+            [],
+        )
+        .unwrap();
+        let readable_browser_image = std::env::temp_dir().join(format!(
+            "smalltalk-manual-anchor-{}-browser.png",
+            std::process::id()
+        ));
+        fs::write(&readable_browser_image, b"test-image").unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, focused,
+               capture_trigger, created_at, app_bundle_id, window_id,
+               privacy_status, full_screenshot_path
+             ) VALUES
+               ('session-a',1100,'private.png','Code',1,'app_switch',1100,
+                'com.microsoft.VSCode',42,'private','private.png'),
+               ('session-a',1200,?1,'Comet',1,'app_switch',1200,
+                'ai.perplexity.comet',9,'normal',?1)",
+            params![readable_browser_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let event = latest_manual_continue_external_event(&conn, "session-a", 1_300)
+            .unwrap()
+            .unwrap();
+        assert!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_300)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_file(readable_browser_image);
+    }
+
+    #[test]
+    fn manual_continue_target_capture_requires_exact_available_identity() {
+        let exact = ManualContinueCaptureExpectation {
+            app_bundle_id: Some("net.imput.helium".to_string()),
+            window_id: Some(42),
+        };
+        assert!(manual_continue_capture_identity_matches(
+            &exact,
+            &ScreenshotCapture {
+                window_id: Some(42),
+                bundle_id: Some("net.imput.helium".to_string()),
+                ..ScreenshotCapture::default()
+            }
+        ));
+        assert!(!manual_continue_capture_identity_matches(
+            &exact,
+            &ScreenshotCapture {
+                window_id: Some(7),
+                bundle_id: Some("net.imput.helium".to_string()),
+                ..ScreenshotCapture::default()
+            }
+        ));
+        assert!(!manual_continue_capture_identity_matches(
+            &exact,
+            &ScreenshotCapture {
+                window_id: Some(42),
+                bundle_id: Some("com.smalltalk.app".to_string()),
+                ..ScreenshotCapture::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn manual_continue_target_capture_supports_verified_bundle_when_window_id_is_missing() {
+        let bundle_only = ManualContinueCaptureExpectation {
+            app_bundle_id: Some("net.imput.helium".to_string()),
+            window_id: None,
+        };
+        assert!(manual_continue_capture_identity_matches(
+            &bundle_only,
+            &ScreenshotCapture {
+                window_id: Some(99),
+                bundle_id: Some("net.imput.helium".to_string()),
+                ..ScreenshotCapture::default()
+            }
+        ));
+        assert!(!manual_continue_capture_identity_matches(
+            &bundle_only,
+            &ScreenshotCapture {
+                window_id: Some(99),
+                bundle_id: None,
+                ..ScreenshotCapture::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn manual_continue_resolves_unique_bundle_and_title_to_a_window_id() {
+        let event = ManualContinueExternalEvent {
+            ts_ms: 1_000,
+            app_bundle_id: Some("net.imput.helium".to_string()),
+            app_name: Some("Helium".to_string()),
+            window_id: None,
+            window_title: Some("Tool Annotations Charter".to_string()),
+        };
+        let snapshot = WindowSnapshotPayload {
+            ts_ms: 1_100,
+            active_window_id: Some(7),
+            active_app_pid: None,
+            active_app_bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+            screen_count: 1,
+            windows: vec![
+                WindowPayload {
+                    cg_window_id: Some(42),
+                    owner_pid: Some(100),
+                    owner_name: Some("Helium".to_string()),
+                    bundle_id: Some("net.imput.helium".to_string()),
+                    window_title: Some("Tool Annotations Charter".to_string()),
+                    layer: Some(0),
+                    alpha: Some(1.0),
+                    is_onscreen: Some(true),
+                    is_active: false,
+                    bounds: None,
+                    workspace: None,
+                    raw: HashMap::new(),
+                },
+                WindowPayload {
+                    cg_window_id: Some(7),
+                    owner_pid: Some(200),
+                    owner_name: Some("Smalltalk".to_string()),
+                    bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+                    window_title: Some("Smalltalk".to_string()),
+                    layer: Some(0),
+                    alpha: Some(1.0),
+                    is_onscreen: Some(true),
+                    is_active: true,
+                    bounds: None,
+                    workspace: None,
+                    raw: HashMap::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            resolve_manual_continue_window_id(&event, Some(&snapshot)),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn manual_continue_ignores_external_events_older_than_the_recency_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO ui_events (
+               id, session_id, ts_ms, event_type, app_bundle_id, app_name,
+               window_id, created_at_ms
+             ) VALUES ('event-old','session-a',1000,'app_switch',
+                       'com.microsoft.VSCode','Code',42,1000)",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            latest_manual_continue_external_event(&conn, "session-a", 70_000)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -28157,6 +30056,244 @@ mod tests {
             row_count(&conn, "ui_events").unwrap(),
             MAX_RETAINED_LOW_VALUE_UI_EVENTS
         );
+    }
+
+    #[test]
+    fn synthetic_sixty_minute_event_pressure_converges_and_preserves_causal_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let total = MAX_RETAINED_LOW_VALUE_UI_EVENTS + 1_800;
+        for index in 0..total {
+            conn.execute(
+                "INSERT INTO ui_events (id, session_id, ts_ms, event_type, app_name, created_at_ms)
+                 VALUES (?1, 'synthetic-60m', ?2, 'scroll', 'Browser', ?2)",
+                params![format!("noise-{index}"), index * 500],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO capture_triggers (id, session_id, ts_ms, trigger_type, caused_by_event_ids, settle_delay_ms, rate_limited, dedupe_policy, status)
+             VALUES ('protected-trigger', 'synthetic-60m', 1, 'navigation', '[\"noise-0\"]', 0, 0, 'synthetic', 'captured')",
+            [],
+        ).unwrap();
+
+        for _ in 0..20 {
+            run_runtime_maintenance(&conn).unwrap();
+        }
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ui_events WHERE event_type='scroll'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retained <= MAX_RETAINED_LOW_VALUE_UI_EVENTS + 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ui_events WHERE id='noise-0'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let first_count = row_count(&conn, "ui_events").unwrap();
+        let result = run_runtime_maintenance(&conn).unwrap();
+        assert_eq!(row_count(&conn, "ui_events").unwrap(), first_count);
+        assert_eq!(result.deleted_low_value_events, 0);
+    }
+
+    #[test]
+    fn runtime_maintenance_preserves_transition_triggers_and_ingest_failure_is_diagnostic_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_db(&conn).unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        for index in 0..(MAX_RETAINED_CAPTURE_TRIGGERS + 2) {
+            tx.execute(
+                "INSERT INTO capture_triggers (
+                    id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                    settle_delay_ms, rate_limited, dedupe_policy, status
+                 ) VALUES (?1, 'retention-session', ?2, 'click', '[]', 0, 0, 'test', 'pending')",
+                params![format!("trigger-{index:05}"), index],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO event_transitions (
+                id, session_id, trigger_id, ts_start_ms, ts_end_ms, transition_type
+             ) VALUES (
+                'transition-protected', 'retention-session', 'trigger-00000', 0, 1, 'click'
+             )",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        record_maintenance_value(
+            &conn,
+            "events_persisted",
+            &RUNTIME_MAINTENANCE_EVENT_INTERVAL.to_string(),
+        )
+        .unwrap();
+        let result = maybe_run_runtime_maintenance(&conn, false)
+            .unwrap()
+            .expect("event watermark should make maintenance due");
+
+        assert_eq!(result.deleted_capture_triggers, 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM capture_triggers WHERE id='trigger-00000'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "a transition-owned trigger must survive retention",
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM capture_triggers WHERE id='trigger-00001'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the oldest unreferenced trigger should be pruned",
+        );
+        assert_eq!(
+            row_count(&conn, "capture_triggers").unwrap(),
+            MAX_RETAINED_CAPTURE_TRIGGERS + 1,
+        );
+        assert_eq!(
+            maintenance_i64(&conn, "runtime_maintenance_event_watermark").unwrap(),
+            RUNTIME_MAINTENANCE_EVENT_INTERVAL,
+        );
+        let successful_result = maintenance_value(&conn, "runtime_maintenance_last_result")
+            .unwrap()
+            .expect("successful maintenance result");
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_key_check", [], |row| row
+                .get::<_, String>(0))
+                .optional()
+                .unwrap(),
+            None,
+        );
+
+        conn.execute(
+            "INSERT INTO capture_triggers (
+                id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+                settle_delay_ms, rate_limited, dedupe_policy, status
+             ) VALUES (
+                'trigger-extra', 'retention-session', 6000, 'click', '[]', 0, 0, 'test', 'pending'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ui_events (
+                id, session_id, ts_ms, event_type, app_name, created_at_ms
+             ) VALUES (
+                'current-ingested-event', 'retention-session', 6000, 'click', 'Test App', 6000
+             )",
+            [],
+        )
+        .unwrap();
+        record_maintenance_value(
+            &conn,
+            "events_persisted",
+            &(RUNTIME_MAINTENANCE_EVENT_INTERVAL * 2).to_string(),
+        )
+        .unwrap();
+        record_maintenance_value(&conn, "runtime_maintenance_last_run_ms", "0").unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_capture_trigger_retention
+             BEFORE DELETE ON capture_triggers
+             BEGIN
+               SELECT RAISE(ABORT, 'forced maintenance failure');
+             END;",
+        )
+        .unwrap();
+
+        run_event_ingest_maintenance_diagnostic_only(&conn);
+
+        assert_eq!(
+            maintenance_i64(&conn, "runtime_maintenance_event_watermark").unwrap(),
+            RUNTIME_MAINTENANCE_EVENT_INTERVAL,
+            "a failed maintenance pass must not advance the success watermark",
+        );
+        assert_eq!(
+            maintenance_i64(&conn, "runtime_maintenance_failure_count").unwrap(),
+            1,
+        );
+        assert!(maintenance_value(&conn, "runtime_maintenance_last_error")
+            .unwrap()
+            .is_some_and(|error| error.contains("forced maintenance failure")));
+        assert_eq!(
+            maintenance_value(&conn, "runtime_maintenance_last_result")
+                .unwrap()
+                .as_deref(),
+            Some(successful_result.as_str()),
+            "failure diagnostics must not replace the last successful result",
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ui_events WHERE id='current-ingested-event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "routine maintenance failure must not roll back the current event",
+        );
+    }
+
+    #[test]
+    fn copied_oversized_database_remediation_is_restart_safe_and_integrity_checked() {
+        let root = std::env::temp_dir().join(format!("smalltalk-runtime02-{}", now_millis()));
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original.sqlite");
+        let copied = root.join("copied.sqlite");
+        {
+            let conn = Connection::open(&original).unwrap();
+            init_db(&conn).unwrap();
+            for index in 0..(MAX_RETAINED_LOW_VALUE_UI_EVENTS + 600) {
+                conn.execute(
+                    "INSERT INTO ui_events (id, ts_ms, event_type, created_at_ms) VALUES (?1, ?2, 'ax_notification', ?2)",
+                    params![format!("oversized-{index}"), index],
+                ).unwrap();
+            }
+        }
+        fs::copy(&original, &copied).unwrap();
+        let conn = Connection::open(&copied).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        for _ in 0..4 {
+            run_runtime_maintenance(&conn).unwrap();
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(row_count(&conn, "ui_events").unwrap() <= MAX_RETAINED_LOW_VALUE_UI_EVENTS);
+        drop(conn);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn retention_queries_use_ui_event_time_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let plan: String = conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT id FROM ui_events WHERE event_type='scroll' ORDER BY ts_ms DESC LIMIT 250 OFFSET 5000",
+            [], |row| row.get(3)
+        ).unwrap();
+        assert!(plan.contains("idx_ui_events_type_ts"), "plan={plan}");
     }
 
     #[test]
@@ -28672,6 +30809,183 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    fn insert_task_truth_open_ownership(
+        conn: &Connection,
+        decision_id: &str,
+        target_artifact_id: &str,
+        head_revision: i64,
+    ) {
+        use crate::continuation::task_truth_v2::task_snapshot::{
+            ReturnAnchorStatusV2, SnapshotSelectionStatusV2, TaskSnapshotV2,
+        };
+        crate::continuation::task_truth_v2::checkpoint::ensure_schema(conn).unwrap();
+        crate::continuation::task_truth_v2::task_thread::ensure_schema(conn).unwrap();
+        let snapshot = TaskSnapshotV2 {
+            schema: "smalltalk.task_snapshot.v2".into(),
+            snapshot_id: format!("snapshot-{decision_id}"),
+            revision: 1,
+            prior_snapshot_id: None,
+            supersedes_snapshot_id: None,
+            observed_at_ms: 1,
+            evidence_watermark: "watermark-open".into(),
+            packet_id: format!("packet-{decision_id}"),
+            session_id: Some("session-open".into()),
+            task_thread_id: Some(format!("thread-{decision_id}")),
+            task_thread_revision: Some(1),
+            thread_status: "active".into(),
+            continuity_thread_id: None,
+            continuity_thread_revision: None,
+            continuity_identity_token: None,
+            supersedes_thread_id: None,
+            legacy_task_turn_id: None,
+            task_basis: "explicit_goal".into(),
+            observed_surface: Some("Open target fixture".into()),
+            immediate_user_operation: Some("Selected exact target".into()),
+            semantic_effect_of_operation: None,
+            current_subtask: None,
+            task_summary: Some("Test exact target ownership".into()),
+            task_kind: "model_inferred".into(),
+            task_object: Some("open-target-fixture".into()),
+            user_goal: None,
+            app_identity: Some("Test".into()),
+            surface_identity_hash: None,
+            document_or_thread_identity_hash: None,
+            execution_state: "active".into(),
+            current_actor: "user".into(),
+            waiting_on: "nothing".into(),
+            last_meaningful_progress: Some("Selected the exact target".into()),
+            unfinished_step: Some("Open it".into()),
+            next_action: None,
+            relation_to_prior: "new_task".into(),
+            selection_status: SnapshotSelectionStatusV2::Selected,
+            claim_evidence: Vec::new(),
+            alternative_hypotheses: Vec::new(),
+            contradictions: Vec::new(),
+            confidence_by_field: std::collections::BTreeMap::new(),
+            confidence_by_source: std::collections::BTreeMap::new(),
+            return_anchor_candidate_id: None,
+            return_anchor_status: ReturnAnchorStatusV2::Safe,
+            resolver_version: "test".into(),
+            provenance: Vec::new(),
+            continuity_confidence_decay: 0.0,
+            semantic_source: "cloud_multimodal_model".into(),
+            provider_name: Some("test".into()),
+            provider_model: Some("test".into()),
+            provider_request_id: Some("request-open".into()),
+            provider_response_id: Some("response-open".into()),
+            selected_hypothesis_id: Some("hypothesis-open".into()),
+            wording_source: "deterministic".into(),
+            inference_status: "verified".into(),
+        };
+        let packet_id = snapshot.packet_id.clone();
+        let snapshot_id = snapshot.snapshot_id.clone();
+        let thread_id = snapshot.task_thread_id.clone().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_truth_v2_observation_packets (
+               packet_id, schema_version, observed_at_ms, session_id, evidence_watermark,
+               current_frame_id, privacy_status, model_eligible, serialized_bytes,
+               estimated_tokens, packet_json, created_at_ms
+             ) VALUES (?1,'smalltalk.observation_packet.v2',1,'session-open',
+                       'watermark-open','frame-open','normal',1,1,1,'{}',1)",
+            params![packet_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_truth_v2_snapshots (
+               snapshot_id, schema_version, revision, observed_at_ms, evidence_watermark,
+               packet_id, legacy_task_turn_id, execution_state, relation_to_prior,
+               selection_status, semantic_fingerprint, snapshot_json, created_at_ms
+             ) VALUES (?1,'smalltalk.task_snapshot.v2',1,1,'watermark-open',?2,NULL,
+                       'active','new_task','selected','fingerprint-open',?3,1)",
+            params![
+                snapshot_id,
+                packet_id,
+                serde_json::to_string(&snapshot).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_truth_v2_task_threads (
+               task_thread_id, schema_version, identity_token, head_revision, status,
+               head_snapshot_id, current_session_id, first_supported_at_ms,
+               last_supported_at_ms, superseded_by_thread_id, thread_json, updated_at_ms
+             ) VALUES (?1,'smalltalk.task_thread.v1','identity-open',?2,'active',?3,
+                       'session-open',1,1,NULL,'{}',1)",
+            params![thread_id, head_revision, snapshot_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_truth_v2_task_thread_revisions (
+               task_thread_id, revision, session_id, snapshot_id, hypothesis_id,
+               model_response_id, packet_id, evidence_watermark, prior_revision,
+               relationship, status, revision_json, created_at_ms
+             ) VALUES (?1,1,'session-open',?2,'hypothesis-open','response-open',?3,
+                       'watermark-open',NULL,'new_task','active','{}',1)",
+            params![thread_id, snapshot_id, packet_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_truth_v2_decision_contracts (
+               decision_id, effective_state, release_gate_passed, snapshot_id,
+               snapshot_revision, task_thread_id, task_thread_revision,
+               selected_hypothesis_id, model_response_id, observation_packet_id,
+               evidence_watermark, correction_fingerprint, return_target_artifact_id,
+               created_at_ms
+             ) VALUES (?1,'shadow',0,?2,1,?3,1,'hypothesis-open','response-open',?4,
+                       'watermark-open','',?5,1)",
+            params![
+                decision_id,
+                snapshot_id,
+                thread_id,
+                packet_id,
+                target_artifact_id
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_owned_strict_open_fixture(conn: &Connection, suffix: &str) -> (String, String, i64) {
+        let session = insert_numbered_test_session(conn);
+        let decision_id = format!("decision-owned-{suffix}");
+        let artifact_id = format!("artifact-owned-{suffix}");
+        let frame_id = insert_resume_test_frame(
+            conn,
+            &session.id,
+            &format!("/tmp/owned-{suffix}.jpg"),
+            10,
+            "Helium",
+            "co.madcow.Helium",
+            "Owned target",
+            &format!("https://example.test/{suffix}"),
+            "browser_tab",
+            "Exact owned target.",
+            &format!("phash-owned-{suffix}"),
+            None,
+        );
+        insert_continue_open_artifact(
+            conn,
+            &artifact_id,
+            "browser_tab",
+            Some(&format!("https://example.test/{suffix}")),
+            None,
+            Some(frame_id.to_string()),
+            "openable",
+            "Owned target",
+            10,
+        );
+        insert_continue_open_decision(
+            conn,
+            &decision_id,
+            &format!("workstream-owned-{suffix}"),
+            &format!("candidate-owned-{suffix}"),
+            &artifact_id,
+            &frame_id.to_string(),
+            20,
+        );
+        insert_task_truth_open_ownership(conn, &decision_id, &artifact_id, 1);
+        (decision_id, artifact_id, frame_id)
     }
 
     fn replace_resume_test_content_units(
@@ -33848,6 +36162,12 @@ mod tests {
             "event-4311492174e5ec10",
             30,
         );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-strict-x",
+            "artifact-x-frame-fallback",
+            1,
+        );
         let mut warnings = Vec::new();
 
         let resolved = resolve_continue_decision_for_open(
@@ -33907,9 +36227,21 @@ mod tests {
             &frame_id.to_string(),
             20,
         );
+        insert_task_truth_open_ownership(
+            &conn,
+            "decision-p6-08-public-null",
+            "artifact-p6-08-candidate-only",
+            1,
+        );
         conn.execute(
             "UPDATE continue_decisions SET return_target_artifact_id = NULL
              WHERE id = 'decision-p6-08-public-null'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE task_truth_v2_decision_contracts SET return_target_artifact_id = NULL
+             WHERE decision_id = 'decision-p6-08-public-null'",
             [],
         )
         .unwrap();
@@ -33925,9 +36257,9 @@ mod tests {
         .unwrap();
 
         assert!(resolved.is_none());
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("has no displayed target artifact")));
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:task_truth_public_target_null"
+        }));
     }
 
     #[test]
@@ -34051,6 +36383,12 @@ mod tests {
             "event-current-codex",
             40,
         );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-suppressed-stale",
+            "artifact-current-codex-thin",
+            1,
+        );
         conn.execute(
             "INSERT INTO continue_workstream_artifacts (
                 workstream_id, artifact_id, durable_role, importance_score,
@@ -34084,9 +36422,9 @@ mod tests {
         .unwrap();
 
         assert!(resolved.is_none());
-        assert!(warnings.iter().any(
-            |warning| warning == "blocked_by_continue_policy:decision_not_direct_open_eligible"
-        ));
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:task_truth_target_contract_mismatch"
+        }));
         assert!(!warnings
             .iter()
             .any(|warning| warning.contains("suppressed-stale")));
@@ -34131,6 +36469,12 @@ mod tests {
             "artifact-rejected-continue",
             &frame_id.to_string(),
             20,
+        );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-rejected",
+            "artifact-rejected-continue",
+            1,
         );
         crate::continuation::record_continue_feedback(
             &conn,
@@ -34206,6 +36550,12 @@ mod tests {
             "artifact-reconfirmed-continue",
             &frame_id.to_string(),
             20,
+        );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-reconfirmed",
+            "artifact-reconfirmed-continue",
+            1,
         );
         crate::continuation::record_continue_feedback(
             &conn,
@@ -34327,6 +36677,12 @@ mod tests {
             &wrong_frame_id.to_string(),
             20,
         );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-corrected",
+            "artifact-corrected-wrong",
+            1,
+        );
         crate::continuation::record_continue_feedback(
             &conn,
             crate::continuation::ContinueExplicitFeedbackRequest {
@@ -34427,6 +36783,12 @@ mod tests {
             &x_frame.to_string(),
             30,
         );
+        insert_task_truth_open_ownership(
+            &conn,
+            "continue-decision-strict-openable",
+            "artifact-x-openable",
+            1,
+        );
         let mut warnings = Vec::new();
 
         let resolved = resolve_continue_decision_for_open(
@@ -34448,6 +36810,75 @@ mod tests {
         assert!(warnings.iter().any(|warning| warning.contains(
             "Opening strict Continue decision continue-decision-strict-openable target artifact-x-openable"
         )));
+    }
+
+    #[test]
+    fn strict_open_rejects_task_truth_identity_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let (decision_id, artifact_id, _) =
+            insert_owned_strict_open_fixture(&conn, "identity-mismatch");
+        conn.execute(
+            "UPDATE task_truth_v2_decision_contracts
+             SET selected_hypothesis_id='hypothesis-other'
+             WHERE decision_id=?1",
+            params![decision_id],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            &decision_id,
+            Some(&artifact_id),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:task_truth_thread_revision_identity_mismatch"
+        }));
+    }
+
+    #[test]
+    fn strict_open_rejects_changed_task_thread_head_revision() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::continuation::ensure_continue_schema(&conn).unwrap();
+        let (decision_id, artifact_id, _) =
+            insert_owned_strict_open_fixture(&conn, "head-revision-change");
+        let thread_id: String = conn
+            .query_row(
+                "SELECT task_thread_id FROM task_truth_v2_decision_contracts
+                 WHERE decision_id=?1",
+                params![decision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE task_truth_v2_task_threads SET head_revision=2
+             WHERE task_thread_id=?1",
+            params![thread_id],
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let resolved = resolve_continue_decision_for_open(
+            &conn,
+            &decision_id,
+            Some(&artifact_id),
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning == "blocked_by_continue_policy:task_truth_thread_head_revision_changed"
+        }));
     }
 
     #[test]
@@ -36412,5 +38843,263 @@ mod tests {
         );
 
         fs::remove_dir_all(output_root).unwrap();
+    }
+
+    fn sck_test_response(ok: bool, error: Option<&str>) -> String {
+        serde_json::json!({
+            "ok": ok,
+            "provider": "screen_capture_kit",
+            "captured_display_id": "1",
+            "captured_window_id": 42,
+            "captured_bundle_id": "com.example.app",
+            "width": 100,
+            "height": 80,
+            "filter_summary_json": "{}",
+            "configuration_summary_json": "{}",
+            "frame_metadata_json": "{}",
+            "capture_mode": "screenshot",
+            "audio_policy": "disabled",
+            "error": error
+        })
+        .to_string()
+    }
+
+    fn shell_printing(value: &str, exit_code: i32) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("printf '%s' \"$1\"; exit {}", exit_code))
+            .arg("smalltalk-sck-test")
+            .arg(value);
+        command
+    }
+
+    #[test]
+    fn sck_helper_runner_classifies_success_and_structured_nonzero() {
+        let success = run_sck_helper(
+            &mut shell_printing(&sck_test_response(true, None), 0),
+            Duration::from_secs(1),
+        );
+        assert_eq!(success.category, HelperExitCategory::Success);
+        assert!(success.response.is_some_and(|response| response.ok));
+
+        let structured = run_sck_helper(
+            &mut shell_printing(&sck_test_response(false, Some("permission unavailable")), 7),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            structured.category,
+            HelperExitCategory::StructuredHelperError
+        );
+    }
+
+    #[test]
+    fn sck_helper_runner_classifies_invalid_output_and_launch_failure() {
+        let invalid = run_sck_helper(&mut shell_printing("", 0), Duration::from_secs(1));
+        assert_eq!(invalid.category, HelperExitCategory::InvalidResponse);
+
+        let mut missing = Command::new("/definitely/missing/smalltalk-sck-helper");
+        let launch = run_sck_helper(&mut missing, Duration::from_secs(1));
+        assert_eq!(launch.category, HelperExitCategory::LaunchFailure);
+    }
+
+    #[test]
+    fn sck_helper_runner_classifies_abnormal_termination() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("kill -TERM $$");
+        let result = run_sck_helper(&mut command, Duration::from_secs(1));
+        assert_eq!(result.category, HelperExitCategory::AbnormalTermination);
+    }
+
+    #[test]
+    fn sck_helper_runner_times_out_and_reaps_child() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 5");
+        let started = Instant::now();
+        let result = run_sck_helper(&mut command, Duration::from_millis(40));
+        assert_eq!(result.category, HelperExitCategory::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn sck_active_window_circuit_breaker_skips_until_recovery_boundary() {
+        let start = Instant::now();
+        let mut breaker = CaptureProviderCircuitBreaker::default();
+        assert_eq!(
+            breaker.active_window_decision(start),
+            CircuitBreakerDecision::NormalAttempt
+        );
+        assert!(breaker.record_active_window_abnormal_exit(start));
+        assert_eq!(
+            breaker.active_window_decision(start + Duration::from_secs(60)),
+            CircuitBreakerDecision::Skip
+        );
+        assert_eq!(
+            breaker.active_window_decision(start + SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN),
+            CircuitBreakerDecision::RecoveryProbe
+        );
+        assert_eq!(
+            breaker.active_window_decision(
+                start + SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN + Duration::from_secs(1)
+            ),
+            CircuitBreakerDecision::Skip
+        );
+        breaker.reset_for_new_session();
+        assert_eq!(
+            breaker.active_window_decision(start),
+            CircuitBreakerDecision::NormalAttempt
+        );
+    }
+
+    #[test]
+    fn sck_active_window_failure_does_not_disable_display_provider() {
+        let start = Instant::now();
+        let mut breaker = CaptureProviderCircuitBreaker::default();
+        breaker.record_active_window_abnormal_exit(start);
+        assert_eq!(
+            breaker.active_window_decision(start),
+            CircuitBreakerDecision::Skip
+        );
+        // Display capture has no breaker state and therefore remains eligible.
+        assert_eq!(breaker.active_window_state(), "open_cooldown");
+    }
+
+    #[test]
+    fn screencapture_fallback_metadata_names_actual_provider() {
+        let path = std::env::temp_dir().join(format!(
+            "smalltalk-screencapture-provider-{}.jpg",
+            now_millis()
+        ));
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        let capture = screenshot_capture_from_file("screencapture_cli", &path);
+        assert_eq!(capture.provider, "screencapture_cli");
+        let metadata = FrameMetadata {
+            capture_provider: "screen_capture_kit".to_string(),
+            active_window_capture_provider: Some(capture.provider),
+            ..FrameMetadata::default()
+        };
+        assert_eq!(
+            metadata.active_window_capture_provider.as_deref(),
+            Some("screencapture_cli")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    fn permission_identity_fixture() -> ScreenCapturePermissionIdentity {
+        ScreenCapturePermissionIdentity {
+            executable_path: "/Applications/smalltalk.app/Contents/MacOS/smalltalk".into(),
+            executable_name: Some("smalltalk".into()),
+            bundle_identifier: Some("com.example.actual-smalltalk".into()),
+            bundle_path: Some("/Applications/smalltalk.app".into()),
+            signing_identifier: Some("com.example.actual-smalltalk".into()),
+            team_identifier: Some("TEAM123".into()),
+            designated_requirement: Some(
+                "identifier \"com.example.actual-smalltalk\" and anchor apple generic".into(),
+            ),
+            cdhash: Some("stable-build-hash".into()),
+            signature_kind: "developer id application".into(),
+            request_scope_key: "screen_capture_permission_requested_at_ms:stable".into(),
+        }
+    }
+
+    #[test]
+    fn permission_request_scope_tracks_the_actual_designated_requirement() {
+        let first = parse_code_signing_identity(
+            "Identifier=com.smalltalk.app\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=aaa\n# designated => cdhash H\"aaa\"",
+        );
+        let second = parse_code_signing_identity(
+            "Identifier=com.smalltalk.app\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=bbb\n# designated => cdhash H\"bbb\"",
+        );
+        assert_eq!(first.team_identifier, None);
+        assert_eq!(first.signature_kind, "adhoc");
+        assert_ne!(
+            permission_request_scope_key(None, &first),
+            permission_request_scope_key(None, &second)
+        );
+
+        let stable_requirement = "identifier \"com.smalltalk.app\" and anchor apple generic and certificate leaf[subject.OU] = TEAM123";
+        let stable_first = parse_code_signing_identity(&format!(
+            "Identifier=com.smalltalk.app\nSignature=Developer ID Application\nTeamIdentifier=TEAM123\nCDHash=111\n# designated => {stable_requirement}"
+        ));
+        let stable_second = parse_code_signing_identity(&format!(
+            "Identifier=com.smalltalk.app\nSignature=Developer ID Application\nTeamIdentifier=TEAM123\nCDHash=222\n# designated => {stable_requirement}"
+        ));
+        assert_eq!(
+            permission_request_scope_key(None, &stable_first),
+            permission_request_scope_key(None, &stable_second)
+        );
+    }
+
+    #[test]
+    fn permission_request_claim_is_atomic_and_survives_local_memory_reset() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let key = format!("{SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX}:identity-a");
+        assert!(claim_screen_capture_permission_request(&conn, &key).unwrap());
+        assert!(!claim_screen_capture_permission_request(&conn, &key).unwrap());
+        record_maintenance_value(&conn, "ordinary_diagnostic", "delete-me").unwrap();
+
+        let markers = permission_request_markers(&conn).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].0, key);
+        conn.execute("DELETE FROM local_memory_maintenance", [])
+            .unwrap();
+        restore_permission_request_markers(&conn, &markers).unwrap();
+
+        assert!(maintenance_value(&conn, &key).unwrap().is_some());
+        assert_eq!(
+            maintenance_value(&conn, "ordinary_diagnostic").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_capture_permission_requires_one_explicit_request_before_start() {
+        let status = screen_capture_permission_presentation(
+            true,
+            false,
+            false,
+            permission_identity_fixture(),
+        );
+        assert_eq!(status.state, "request_required");
+        assert!(!status.granted);
+        assert!(status.can_request);
+        assert!(!status.request_attempted);
+        assert!(!status.restart_required);
+        assert!(screen_capture_permission_start_error(&status)
+            .starts_with("screen_capture_permission_request_required:"));
+    }
+
+    #[test]
+    fn attempted_permission_request_is_not_offered_repeatedly() {
+        let status = screen_capture_permission_presentation(
+            true,
+            false,
+            true,
+            permission_identity_fixture(),
+        );
+        assert_eq!(status.state, "restart_required");
+        assert!(!status.can_request);
+        assert!(status.request_attempted);
+        assert!(status.restart_required);
+        assert!(status.message.contains("quit and reopen Smalltalk"));
+        assert_eq!(
+            status.settings_hint.as_deref(),
+            Some(SCREEN_CAPTURE_SETTINGS_HINT)
+        );
+    }
+
+    #[test]
+    fn granted_permission_reports_the_actual_running_identity() {
+        let identity = permission_identity_fixture();
+        let status = screen_capture_permission_presentation(true, true, true, identity.clone());
+        assert_eq!(status.state, "granted");
+        assert!(status.granted);
+        assert!(!status.can_request);
+        assert_eq!(status.identity, identity);
+        assert_ne!(
+            status.identity.bundle_identifier.as_deref(),
+            Some("com.smalltalk.app")
+        );
     }
 }

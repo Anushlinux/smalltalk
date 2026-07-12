@@ -68,14 +68,59 @@ type ContinueTaskTruthFieldSupport = {
   evidence_refs?: string[];
 };
 
-type ContinueTaskTruthAnswer = {
+export type ContinueTaskTruthAtomicIdentity = {
+  session_id?: string | null;
+  task_thread_id: string | null;
+  task_thread_revision: number | null;
+  task_snapshot_id: string;
+  snapshot_revision: number;
+  selected_hypothesis_id: string | null;
+  model_request_id?: string | null;
+  model_response_id: string | null;
+  observation_packet_id: string;
+  evidence_watermark: string;
+  correction_fingerprint: string;
+};
+
+export type ContinueTaskTruthAlternative = {
+  hypothesis_id: string;
+  task_summary: string;
+  relation: string;
+  confidence: number;
+  evidence_refs: string[];
+  contradicting_evidence_refs?: string[];
+  task_thread_id?: string | null;
+  task_thread_revision?: number | null;
+  last_supported_at_ms?: number | null;
+  disposition?: string | null;
+  reason_codes?: string[];
+  semantic_payload?: unknown | null;
+};
+
+export type ContinueTaskTruthAnswer = {
+  schema: string;
+  task_basis?: string | null;
   task_resolution_status?: string | null;
+  observed_surface?: string | null;
+  immediate_user_operation?: string | null;
+  semantic_effect_of_operation?: string | null;
+  current_subtask?: string | null;
+  current_activity?: {
+    observed_surface?: string | null;
+    immediate_user_operation?: string | null;
+    semantic_effect_of_operation?: string | null;
+    current_subtask?: string | null;
+    relationship_to_primary?: string | null;
+  } | null;
   task_summary?: string | null;
   task_object?: string | null;
   last_meaningful_progress?: string | null;
   unfinished_state?: string | null;
+  execution_state?: string | null;
   next_action?: string | null;
   where_summary?: string | null;
+  relationship_to_prior?: string | null;
+  alternative_hypotheses: ContinueTaskTruthAlternative[];
   direct_return_target?: ContinueAdoptionTarget | null;
   evidence_preview?: {
     frame_id?: string | null;
@@ -84,15 +129,27 @@ type ContinueTaskTruthAnswer = {
   task_understanding_source?: string | null;
   wording_source?: string | null;
   target_selection_source?: string | null;
-  snapshot_id?: string | null;
-  snapshot_revision?: number | null;
-  evidence_watermark?: string | null;
+  snapshot_id: string;
+  snapshot_revision: number;
+  evidence_watermark: string;
+  semantic_source?: string | null;
+  provider_name?: string | null;
+  provider_model?: string | null;
+  request_id?: string | null;
+  response_id?: string | null;
+  selected_hypothesis_id: string | null;
+  inference_status?: string | null;
+  atomic_identity: ContinueTaskTruthAtomicIdentity;
 };
 
 type ContinueTaskTruthProductionDecision = {
   effective_state?: string | null;
   release_gate_passed?: boolean | null;
   answer?: ContinueTaskTruthAnswer | null;
+  inference_diagnostic?: {
+    status?: string | null;
+    origin?: string | null;
+  } | null;
 };
 
 export type ContinueAdoptionComparableDecision = {
@@ -189,6 +246,110 @@ function normalizeToken(value?: string | null) {
     .replace(/^_+|_+$/g, "");
 }
 
+export function isTaskInferenceUnavailable(status?: string | null) {
+  return [
+    "disabled",
+    "credentials_missing",
+    "model_unavailable",
+    "timeout",
+    "provider_error",
+    "provider_failure",
+    "request_invalid",
+    "invalid_response",
+  ].includes(normalizeToken(status));
+}
+
+export type TaskInferenceFailureKind =
+  | "capture_unavailable"
+  | "provider_unavailable"
+  | "model_response_invalid"
+  | "evidence_verifier_rejected"
+  | "insufficient_evidence";
+
+export function taskInferenceFailurePresentation(
+  status?: string | null,
+  verificationStatus?: string | null,
+  origin?: string | null,
+  imageCount?: number | null,
+  providerAttemptCount?: number | null,
+) {
+  const normalized = normalizeToken(status);
+  const verification = normalizeToken(verificationStatus);
+  const normalizedOrigin = normalizeToken(origin);
+  const providerRequestWasBuilt = (imageCount || 0) > 0;
+  const providerWasAttempted = (providerAttemptCount || 0) > 0
+    || (normalizedOrigin === "live_cloud" && providerRequestWasBuilt);
+  if (verification === "verification_rejected" || normalized === "verification_rejected") {
+    return {
+      kind: "evidence_verifier_rejected" as TaskInferenceFailureKind,
+      headline: "The proposed task did not match the captured evidence",
+      detail: "Cloud inference returned a task, but the local evidence verifier rejected it.",
+      retryable: true,
+    };
+  }
+  if ([
+    "invalid_response",
+    "invalid_atomic_identity",
+    "missing_model_response_identity",
+    "unsupported_semantic_source",
+  ].includes(normalized)) {
+    return {
+      kind: "model_response_invalid" as TaskInferenceFailureKind,
+      headline: "The model response could not be validated",
+      detail: normalized === "invalid_atomic_identity"
+        ? "The provider responded, but the task, snapshot, and inference identities did not form one valid decision."
+        : "The provider responded, but its evidence references did not satisfy the response contract.",
+      retryable: true,
+    };
+  }
+  if (
+    normalized === "request_invalid"
+    && providerWasAttempted
+  ) {
+    return {
+      kind: "provider_unavailable" as TaskInferenceFailureKind,
+      headline: "Cloud task inference could not accept this request",
+      detail: "The provider rejected the bounded inference request before returning a task answer.",
+      retryable: true,
+    };
+  }
+  if (
+    ["privacy_blocked", "request_invalid", "capture_unavailable"].includes(normalized)
+    || normalized.includes("requestinvalid")
+    || normalized.includes("privacyblocked")
+  ) {
+    return {
+      kind: "capture_unavailable" as TaskInferenceFailureKind,
+      headline: "Capture was unavailable for this Continue attempt",
+      detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+      retryable: false,
+    };
+  }
+  if ([
+    "disabled",
+    "credentials_missing",
+    "model_unavailable",
+    "timeout",
+    "provider_error",
+    "provider_failure",
+  ].includes(normalized)) {
+    return {
+      kind: "provider_unavailable" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is unavailable right now",
+      detail: normalized === "timeout"
+        ? "The provider timed out before a verified answer was returned."
+        : "The provider could not return a verified task answer.",
+      retryable: true,
+    };
+  }
+  return {
+    kind: "insufficient_evidence" as TaskInferenceFailureKind,
+    headline: "There is not enough evidence for a clear continuation",
+    detail: "Smalltalk could not support one task strongly enough, so it did not invent one.",
+    retryable: false,
+  };
+}
+
 export function isDirectPresentationTargetOpenable(
   target?: ContinuePresentationTarget | null,
 ) {
@@ -202,13 +363,80 @@ export function isDirectPresentationTargetOpenable(
 export function authoritativeTaskTruthAnswer(
   decision?: ContinueAdoptionComparableDecision | null,
 ) {
-  if (
-    normalizeToken(decision?.task_truth_v2?.effective_state) !== "authoritative" ||
-    decision?.task_truth_v2?.release_gate_passed !== true
-  ) {
-    return null;
+  const releaseAuthoritative =
+    normalizeToken(decision?.task_truth_v2?.effective_state) === "authoritative" &&
+    decision?.task_truth_v2?.release_gate_passed === true;
+  const currentManualInference =
+    normalizeToken(decision?.request_trigger) === "manual" &&
+    Boolean(decision?.task_truth_v2?.inference_diagnostic);
+  const answer = decision?.task_truth_v2?.answer || null;
+  if (!answer) return null;
+  if (!releaseAuthoritative && !currentManualInference) {
+    // Once model-first evidence exists, a startup/cache/background path must
+    // not fall through to legacy semantic copy. Until the release gate opens,
+    // present the boundary honestly as unresolved.
+    return unresolvedTaskTruthAnswer(answer, "authority_not_released");
   }
-  return decision.task_truth_v2.answer || null;
+  if (normalizeToken(answer.task_resolution_status) === "unresolved") return answer;
+  if (hasCompleteTaskTruthAtomicIdentity(answer.atomic_identity)) return answer;
+
+  // A Task Truth decision with incomplete provenance must not fall through to
+  // the legacy task turn. Preserve the boundary as an honest unresolved result
+  // while removing every semantic claim that lacked its required identity.
+  return unresolvedTaskTruthAnswer(answer, "invalid_atomic_identity");
+}
+
+function unresolvedTaskTruthAnswer(
+  answer: ContinueTaskTruthAnswer,
+  inferenceStatus: string,
+): ContinueTaskTruthAnswer {
+  return {
+    ...answer,
+    task_resolution_status: "unresolved",
+    observed_surface: null,
+    immediate_user_operation: null,
+    semantic_effect_of_operation: null,
+    current_subtask: null,
+    current_activity: {
+      observed_surface: null,
+      immediate_user_operation: null,
+      semantic_effect_of_operation: null,
+      current_subtask: null,
+      relationship_to_primary: "unrelated_or_unknown",
+    },
+    task_summary: null,
+    task_object: null,
+    last_meaningful_progress: null,
+    unfinished_state: null,
+    execution_state: "unclear",
+    next_action: null,
+    where_summary: null,
+    relationship_to_prior: "unrelated_or_unknown",
+    alternative_hypotheses: [],
+    direct_return_target: null,
+    field_support: {},
+    task_understanding_source: "unresolved",
+    semantic_source: "unresolved",
+    inference_status: inferenceStatus,
+  };
+}
+
+function hasCompleteTaskTruthAtomicIdentity(
+  identity: ContinueTaskTruthAtomicIdentity | null | undefined,
+) {
+  return Boolean(
+    identity &&
+      identity.task_thread_id?.trim() &&
+      Number.isInteger(identity.task_thread_revision) &&
+      (identity.task_thread_revision || 0) > 0 &&
+      identity.task_snapshot_id.trim() &&
+      Number.isInteger(identity.snapshot_revision) &&
+      identity.snapshot_revision > 0 &&
+      identity.selected_hypothesis_id?.trim() &&
+      identity.model_response_id?.trim() &&
+      identity.observation_packet_id.trim() &&
+      identity.evidence_watermark.trim(),
+  );
 }
 
 export function authoritativeTaskTruthTarget(
@@ -495,11 +723,13 @@ function causalEvidenceTimestamp(decision: ContinueAdoptionComparableDecision) {
 
 function adoptionTaskIdentity(decision: ContinueAdoptionComparableDecision) {
   const taskTruth = authoritativeTaskTruthAnswer(decision);
-  if (taskTruth?.snapshot_id) {
+  if (taskTruth) {
+    const atomic = taskTruth.atomic_identity;
+    if (!hasCompleteTaskTruthAtomicIdentity(atomic)) return null;
     return {
-      task_turn_id: taskTruth.snapshot_id,
-      revision: taskTruth.snapshot_revision ?? 0,
-      latest_user_goal_summary: taskTruth.task_summary,
+      task_turn_id: atomic.task_thread_id as string,
+      revision: atomic.task_thread_revision as number,
+      latest_user_goal_summary: taskTruth?.task_summary,
       goal_confidence: adoptionTaskConfidence(decision),
     } satisfies ContinueCurrentTaskTurnSummary;
   }

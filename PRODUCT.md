@@ -2529,3 +2529,19 @@ Manual QA should verify:
 | Recap model phrasing | Separately gated, disabled-by-default model rewrite of bounded local recap facts; locally validated and unable to alter target policy. |
 | Evidence anchor | Frame/action/episode/artifact id that explains a Continue result. |
 | Evidence span | Per-claim mapping from public recap copy to bounded local frame, event, action, episode, workstream, open-loop, branch, snapshot, or memory anchors. |
+
+## Model-First Task Truth Production Contract
+
+Smalltalk's production semantic authority is the cloud multimodal Task Truth path. Local code still captures and redacts evidence, orders the observation stream, verifies model claims, maintains task-thread revisions, persists results, and validates return targets. It does not invent the user's task, current subtask, relationship to earlier work, unfinished state, or next action.
+
+The only valid semantic sources for the first-screen Continue answer are:
+
+- `cloud_multimodal_model` for a provider result that passed local evidence verification;
+- `human_correction` for a correction scoped to the exact task snapshot or hypothesis;
+- `unresolved` when the provider is unavailable, the request is blocked, the evidence is insufficient, the response is invalid, or verification rejects the central task claim.
+
+A provider failure must never fall back to a title-derived label such as "Browsing", "Editing", or "Reviewing output". The app may show the observed surface inside **Why this answer?**, but that surface is evidence rather than inferred task truth. An older verified answer may remain visible while a manual refresh is running only when it is clearly the previous result; it cannot absorb newer local surface fields.
+
+Every public model-first answer is one atomic revision. The session, observation packet, task thread and revision, selected hypothesis, model request and response, evidence watermark, and correction state travel together. React and the native island consume that same answer. A direct `Continue here` action is attached only after local validation proves that the return anchor belongs to the same task-thread revision. Understanding the task does not imply that a safe target exists.
+
+Production authority is fail-closed behind the model-first release report. Deterministic tests and a successful provider transport call are necessary but not sufficient. The gate also requires independently reviewed live decision boundaries, the locked application-level holdout, non-zero denominators for every required slice and surface family, provider-failure honesty, latency/cost/privacy measurements, and the manual macOS scenarios. Missing human review or a zero denominator keeps `passed = false`; it never re-enables legacy local semantic authority.

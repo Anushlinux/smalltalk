@@ -18,11 +18,11 @@ dist
 dist-ssr
 *.local
 target/
+src-tauri/binaries/*-apple-darwin
 
 reference/
 
 docs/
-
 
 cloud_resume_exports/
 continue_outputs/

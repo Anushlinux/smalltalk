@@ -4,10 +4,10 @@ use tauri::{AppHandle, Emitter, State};
 use crate::capture::{CaptureState, CaptureStatus};
 
 use super::{
-    continue_freshness_from_island_state, decision_evidence_updated_at_ms,
-    headline_from_island_state, island_continue_decision_request, IslandContinueState,
-    IslandDisplayState, IslandFreshness, IslandStateContext, RememberedContinueIslandState,
-    LAST_CONTINUE_ISLAND_STATE,
+    continue_freshness_from_island_state, contract::authoritative_task_truth_answer,
+    decision_evidence_updated_at_ms, headline_from_island_state, island_continue_decision_request,
+    IslandContinueState, IslandDisplayState, IslandFreshness, IslandStateContext,
+    RememberedContinueIslandState, LAST_CONTINUE_ISLAND_STATE,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,10 +127,12 @@ pub fn get_island_continue_state_for_status(
         }
     }
 
-    let mut request = island_continue_decision_request();
-    request.audit_output_enabled = Some(true);
-    request.island_trigger_reason = Some(input.reason.as_str().to_string());
-    request.island_source = input.source.clone();
+    let mut request = continue_decision_request_for_input(&input);
+    request.session_id = status
+        .active_session
+        .as_ref()
+        .or(status.latest_session.as_ref())
+        .map(|session| session.id.clone());
     let decision = crate::capture::get_continue_decision(app.clone(), Some(request))?;
     let mut state = island_state_from_decision_status(&decision, &status, false);
     annotate_gateway_state(&mut state, &input);
@@ -181,6 +183,27 @@ pub fn get_island_continue_state_for_status(
     })
 }
 
+fn continue_decision_request_for_input(
+    input: &IslandContinueStateInput,
+) -> crate::continuation::ContinueDecisionRequest {
+    let mut request = island_continue_decision_request();
+    let user_pressed_continue = matches!(&input.reason, IslandContinueReason::UserPressedContinue);
+    request.audit_output_enabled = Some(false);
+    request.audit_mode = Some(if user_pressed_continue {
+        crate::continuation::ContinueAuditMode::MftiReview
+    } else {
+        crate::continuation::ContinueAuditMode::None
+    });
+    request.request_trigger = Some(if user_pressed_continue {
+        "manual".to_string()
+    } else {
+        "island".to_string()
+    });
+    request.island_trigger_reason = Some(input.reason.as_str().to_string());
+    request.island_source = input.source.clone();
+    request
+}
+
 fn rejected_gateway_adoption(
     challenger: &crate::continuation::ContinueDecisionResult,
     challenger_state: &IslandContinueState,
@@ -200,7 +223,7 @@ fn rejected_gateway_adoption(
     let mut reasons = Vec::new();
     let (challenger_task_id, challenger_task_revision) = adoption_task_identity(challenger);
     let same_task = remembered.task_turn_id.as_deref().is_some()
-        && remembered.task_turn_id.as_deref() == challenger_task_id;
+        && remembered.task_turn_id.as_deref() == challenger_task_id.as_deref();
     let challenger_evidence_ms = decision_evidence_updated_at_ms(challenger)
         .or_else(|| newest_status_evidence_ms(status))
         .unwrap_or_default();
@@ -254,12 +277,12 @@ fn rejected_gateway_adoption(
             reasons.push(format!("rejected_lost_supported_{field}"));
         }
     }
-    if source_quality_rank(adoption_wording_source(challenger))
+    if source_quality_rank(&adoption_wording_source(challenger))
         < source_quality_rank(&remembered.wording_source)
     {
         reasons.push("rejected_wording_source_downgrade".to_string());
     }
-    if target_source_quality_rank(adoption_target_selection_source(challenger))
+    if target_source_quality_rank(&adoption_target_selection_source(challenger))
         < target_source_quality_rank(&remembered.target_selection_source)
     {
         reasons.push("rejected_target_selection_source_downgrade".to_string());
@@ -272,30 +295,23 @@ fn rejected_gateway_adoption(
     (!reasons.is_empty()).then_some((remembered.island_continue_state, reasons))
 }
 
-fn authoritative_task_truth_answer(
-    decision: &crate::continuation::ContinueDecisionResult,
-) -> Option<&crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1> {
-    (decision.task_truth_v2.effective_state
-        == crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative
-        && decision.task_truth_v2.release_gate_passed)
-        .then(|| decision.task_truth_v2.answer.as_ref())
-        .flatten()
-}
-
 fn adoption_task_identity(
     decision: &crate::continuation::ContinueDecisionResult,
-) -> (Option<&str>, Option<i64>) {
+) -> (Option<String>, Option<i64>) {
     if let Some(answer) = authoritative_task_truth_answer(decision) {
         return (
-            Some(answer.snapshot_id.as_str()).filter(|id| !id.trim().is_empty()),
-            Some(answer.snapshot_revision),
+            answer
+                .atomic_identity
+                .task_thread_id
+                .filter(|id| !id.trim().is_empty()),
+            answer.atomic_identity.task_thread_revision,
         );
     }
     (
         decision
             .current_task_turn
             .as_ref()
-            .map(|turn| turn.task_turn_id.as_str()),
+            .map(|turn| turn.task_turn_id.clone()),
         decision
             .current_task_turn
             .as_ref()
@@ -332,18 +348,18 @@ fn adoption_task_confidence(decision: &crate::continuation::ContinueDecisionResu
         })
 }
 
-fn adoption_wording_source(decision: &crate::continuation::ContinueDecisionResult) -> &str {
+fn adoption_wording_source(decision: &crate::continuation::ContinueDecisionResult) -> String {
     authoritative_task_truth_answer(decision)
-        .map(|answer| answer.wording_source.as_str())
-        .unwrap_or(decision.wording_source.as_str())
+        .map(|answer| answer.wording_source)
+        .unwrap_or_else(|| decision.wording_source.clone())
 }
 
 fn adoption_target_selection_source(
     decision: &crate::continuation::ContinueDecisionResult,
-) -> &str {
+) -> String {
     authoritative_task_truth_answer(decision)
-        .map(|answer| answer.target_selection_source.as_str())
-        .unwrap_or(decision.target_selection_source.as_str())
+        .map(|answer| answer.target_selection_source)
+        .unwrap_or_else(|| decision.target_selection_source.clone())
 }
 
 fn source_quality_rank(source: &str) -> u8 {
@@ -412,6 +428,20 @@ pub fn remembered_state_is_stale(
     status: &CaptureStatus,
     feedback_or_open_watermark_ms: Option<i64>,
 ) -> bool {
+    let status_session_id = status
+        .active_session
+        .as_ref()
+        .or(status.latest_session.as_ref())
+        .map(|session| session.id.as_str())
+        .or_else(|| {
+            status
+                .latest_frame
+                .as_ref()
+                .and_then(|frame| frame.session_id.as_deref())
+        });
+    if remembered.session_id.as_deref() != status_session_id {
+        return true;
+    }
     let latest_capture_at = status
         .latest_frame
         .as_ref()
@@ -442,13 +472,18 @@ fn remember_gateway_decision(
     let (task_turn_id, task_turn_revision) = adoption_task_identity(decision);
     if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
         *slot = Some(RememberedContinueIslandState {
+            session_id: status
+                .active_session
+                .as_ref()
+                .or(status.latest_session.as_ref())
+                .map(|session| session.id.clone()),
             decision_id: decision.decision_id.clone(),
             request_trigger: decision.request_trigger.clone(),
-            task_turn_id: task_turn_id.map(str::to_string),
+            task_turn_id,
             task_turn_revision,
             task_confidence: adoption_task_confidence(decision),
-            wording_source: adoption_wording_source(decision).to_string(),
-            target_selection_source: adoption_target_selection_source(decision).to_string(),
+            wording_source: adoption_wording_source(decision),
+            target_selection_source: adoption_target_selection_source(decision),
             resume_headline: Some(headline_from_island_state(state).to_string()),
             resume_detail: state.next_action.clone(),
             resume_point: state
@@ -554,6 +589,7 @@ mod tests {
                 content_hash: None,
                 image_hash: None,
                 capture_provider: None,
+                active_window_capture_provider: None,
                 scope: None,
                 display_id: None,
                 window_id: None,
@@ -613,6 +649,7 @@ mod tests {
                 Some("decision-test".to_string()),
             )];
         RememberedContinueIslandState {
+            session_id: Some("session-test".to_string()),
             decision_id: "decision-test".to_string(),
             request_trigger: "manual".to_string(),
             task_turn_id: Some("task-test".to_string()),
@@ -640,6 +677,17 @@ mod tests {
     fn island_continue_gateway_reuses_existing_fresh_decision_state() {
         let remembered = remembered();
         assert!(!remembered_state_is_stale(
+            &remembered,
+            &status(1, 2, 3, Some(1_000)),
+            Some(900)
+        ));
+    }
+
+    #[test]
+    fn island_continue_gateway_rejects_remembered_state_from_adjacent_session() {
+        let mut remembered = remembered();
+        remembered.session_id = Some("session-a".to_string());
+        assert!(remembered_state_is_stale(
             &remembered,
             &status(1, 2, 3, Some(1_000)),
             Some(900)
@@ -704,5 +752,24 @@ mod tests {
             state.provenance_label.as_deref(),
             Some("island:test:initial_render")
         );
+    }
+
+    #[test]
+    fn explicit_island_continue_uses_manual_semantic_trigger_with_island_provenance() {
+        let input = IslandContinueStateInput::for_user_continue(Some("decision-prior".into()));
+
+        let request = continue_decision_request_for_input(&input);
+
+        assert_eq!(request.request_trigger.as_deref(), Some("manual"));
+        assert_eq!(
+            request.island_trigger_reason.as_deref(),
+            Some("user_pressed_continue")
+        );
+        assert_eq!(request.island_source.as_deref(), Some("native_island"));
+        assert_eq!(request.audit_output_enabled, Some(false));
+        assert!(matches!(
+            request.audit_mode,
+            Some(crate::continuation::ContinueAuditMode::MftiReview)
+        ));
     }
 }
