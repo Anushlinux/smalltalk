@@ -4359,6 +4359,29 @@ fn latest_evidence_session_id(conn: &Connection) -> Result<Option<String>, Strin
     .map_err(to_string)
 }
 
+fn continue_decision_id_for_request(
+    decision_watermark: i64,
+    selected_candidate_id: Option<&str>,
+    current_focus_frame_id: Option<&str>,
+    validation_status: &str,
+    manual_request_nonce: Option<i64>,
+) -> String {
+    format!(
+        "continue-decision-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                decision_watermark,
+                selected_candidate_id.unwrap_or("none"),
+                current_focus_frame_id.unwrap_or("none"),
+                validation_status,
+                manual_request_nonce.unwrap_or_default()
+            )
+            .as_bytes()
+        )
+    )
+}
+
 pub fn get_continue_decision(
     conn: &Connection,
     request: ContinueDecisionRequest,
@@ -4411,6 +4434,8 @@ pub fn get_continue_decision(
             Some(&activity_recap_effective_model),
         );
     let requested_at_ms = current_time_millis();
+    let manual_request = request.request_trigger.as_deref() == Some("manual")
+        || request.island_trigger_reason.as_deref() == Some("user_pressed_continue");
     let pre_decision_enrichment = run_continue_request_weak_surface_enrichment(
         conn,
         request.session_id.as_deref(),
@@ -4434,7 +4459,7 @@ pub fn get_continue_decision(
             micro_inference_enabled,
         )?
     };
-    let mut cached_meta = if !force_rebuild && request.session_id.is_some() {
+    let mut cached_meta = if !force_rebuild && !manual_request && request.session_id.is_some() {
         fresh_cached_continue_decision_for_recap(
             conn,
             request.session_id.as_deref(),
@@ -4533,9 +4558,7 @@ pub fn get_continue_decision(
             .or(focus.app_name.as_deref())
             .and_then(|value| clean_user_handoff_line(value.to_string(), 120))
     });
-    let request_trigger = if request.request_trigger.as_deref() == Some("manual")
-        || request.island_trigger_reason.as_deref() == Some("user_pressed_continue")
-    {
+    let request_trigger = if manual_request {
         "manual".to_string()
     } else {
         request
@@ -5656,24 +5679,12 @@ pub fn get_continue_decision(
         .as_ref()
         .map(|cached| cached.decision_id.clone())
         .unwrap_or_else(|| {
-            format!(
-                "continue-decision-{}",
-                stable_hash(
-                    format!(
-                        "{}:{}:{}:{}",
-                        decision_watermark,
-                        selected
-                            .as_ref()
-                            .map(|candidate| candidate.id.as_str())
-                            .unwrap_or("none"),
-                        current_focus
-                            .as_ref()
-                            .map(|focus| focus.frame_id.as_str())
-                            .unwrap_or("none"),
-                        validation_status
-                    )
-                    .as_bytes()
-                )
+            continue_decision_id_for_request(
+                decision_watermark,
+                selected.as_ref().map(|candidate| candidate.id.as_str()),
+                current_focus.as_ref().map(|focus| focus.frame_id.as_str()),
+                &validation_status,
+                manual_request.then_some(requested_at_ms),
             )
         });
 
@@ -21674,7 +21685,9 @@ fn candidate_recency_then_score(
 }
 
 fn continue_openai_config(model_override: Option<String>) -> Result<ContinueOpenAiConfig, String> {
-    let project_env = project_dotenv_values()?;
+    // A process-level configuration must remain usable even if the optional
+    // development dotenv file is absent or temporarily unreadable.
+    let project_env = project_dotenv_values().unwrap_or_default();
     let process_key = std::env::var("OPENAI_API_KEY").ok().and_then(non_empty);
     let project_key = project_env
         .get("OPENAI_API_KEY")
@@ -41039,6 +41052,42 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn manual_continue_attempts_never_reuse_a_cached_decision_identity() {
+        let normal_a = continue_decision_id_for_request(
+            100,
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        let normal_b = continue_decision_id_for_request(
+            100,
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        assert_eq!(normal_a, normal_b);
+
+        let manual_a = continue_decision_id_for_request(
+            100,
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            Some(1_000),
+        );
+        let manual_b = continue_decision_id_for_request(
+            100,
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            Some(1_001),
+        );
+        assert_ne!(manual_a, manual_b);
+        assert_ne!(normal_a, manual_a);
+    }
 
     #[test]
     fn audit_mode_preserves_full_legacy_and_defaults_manual_to_review() {

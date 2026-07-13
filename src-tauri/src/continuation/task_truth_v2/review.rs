@@ -312,15 +312,15 @@ fn review_artifact(
         .and_then(|identity| nonempty_identity(identity.model_request_id.as_deref()));
     let answer_request_id = answer
         .and_then(|answer| nonempty_identity(answer.atomic_identity.model_request_id.as_deref()));
-    let diagnostic_request_id = diagnostic
-        .and_then(|diagnostic| nonempty_identity(diagnostic.request_id.as_deref()));
+    let diagnostic_request_id =
+        diagnostic.and_then(|diagnostic| nonempty_identity(diagnostic.request_id.as_deref()));
     let contract_response_id = contract_identity
         .as_ref()
         .and_then(|identity| nonempty_identity(identity.model_response_id.as_deref()));
     let answer_response_id = answer
         .and_then(|answer| nonempty_identity(answer.atomic_identity.model_response_id.as_deref()));
-    let diagnostic_response_id = diagnostic
-        .and_then(|diagnostic| nonempty_identity(diagnostic.response_id.as_deref()));
+    let diagnostic_response_id =
+        diagnostic.and_then(|diagnostic| nonempty_identity(diagnostic.response_id.as_deref()));
     if contract_request_id != answer_request_id
         || contract_request_id != diagnostic_request_id
         || contract_response_id != answer_response_id

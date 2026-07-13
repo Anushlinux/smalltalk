@@ -3879,7 +3879,10 @@ fn resolve_manual_continue_window_id(
         })
         .filter_map(|window| window.cg_window_id.filter(|value| *value > 0))
         .collect::<Vec<_>>();
-    (matches.len() == 1).then_some(matches[0])
+    match matches.as_slice() {
+        [window_id] => Some(*window_id),
+        _ => None,
+    }
 }
 
 fn capture_manual_continue_external_frame(
@@ -29555,6 +29558,22 @@ mod tests {
         assert_eq!(
             resolve_manual_continue_window_id(&event, Some(&snapshot)),
             Some(42)
+        );
+
+        let mut no_matching_window = snapshot.clone();
+        no_matching_window.windows.clear();
+        assert_eq!(
+            resolve_manual_continue_window_id(&event, Some(&no_matching_window)),
+            None
+        );
+
+        let mut ambiguous_windows = snapshot.clone();
+        let mut second_match = ambiguous_windows.windows[0].clone();
+        second_match.cg_window_id = Some(43);
+        ambiguous_windows.windows.push(second_match);
+        assert_eq!(
+            resolve_manual_continue_window_id(&event, Some(&ambiguous_windows)),
+            None
         );
     }
 

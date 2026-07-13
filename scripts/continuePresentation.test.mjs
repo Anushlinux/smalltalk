@@ -250,18 +250,12 @@ test("provider-failure unresolved answer remains usable without task identity", 
   });
 });
 
-test("typed provider failures share one unavailable-state policy", () => {
-  for (const status of [
-    "disabled",
-    "credentials_missing",
-    "model_unavailable",
-    "timeout",
-    "provider_error",
-    "provider_failure",
-    "request_invalid",
-    "invalid_response",
-  ]) {
+test("task inference availability names only actual provider availability failures", () => {
+  for (const status of ["model_unavailable", "provider_error", "provider_failure"]) {
     assert.equal(isTaskInferenceUnavailable(status), true, status);
+  }
+  for (const status of ["disabled", "credentials_missing", "timeout", "request_invalid", "invalid_response"]) {
+    assert.equal(isTaskInferenceUnavailable(status), false, status);
   }
   assert.equal(isTaskInferenceUnavailable("insufficient_evidence"), false);
   assert.equal(isTaskInferenceUnavailable("privacy_blocked"), false);
@@ -271,14 +265,18 @@ test("task inference failures have distinct user-facing states and retry policy"
   assert.deepEqual(taskInferenceFailurePresentation("request_invalid"), {
     kind: "capture_unavailable",
     headline: "Capture was unavailable for this Continue attempt",
-    detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+    detail: "Smalltalk could not prepare a readable current-work packet for this request.",
     retryable: false,
   });
-  assert.equal(taskInferenceFailurePresentation("timeout").kind, "provider_unavailable");
+  assert.equal(taskInferenceFailurePresentation("disabled").kind, "provider_disabled");
+  assert.equal(taskInferenceFailurePresentation("credentials_missing").kind, "credentials_missing");
+  assert.equal(taskInferenceFailurePresentation("model_unavailable").kind, "model_unavailable");
+  assert.equal(taskInferenceFailurePresentation("timeout").kind, "provider_timeout");
   assert.equal(taskInferenceFailurePresentation("timeout").retryable, true);
+  assert.equal(taskInferenceFailurePresentation("request_rejected").kind, "provider_request_rejected");
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 1).kind,
-    "provider_unavailable",
+    "provider_request_rejected",
   );
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 0).kind,
@@ -286,7 +284,7 @@ test("task inference failures have distinct user-facing states and retry policy"
   );
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 1).kind,
-    "provider_unavailable",
+    "provider_request_rejected",
   );
   assert.equal(taskInferenceFailurePresentation("invalid_response").kind, "model_response_invalid");
   assert.equal(taskInferenceFailurePresentation("invalid_response").retryable, true);

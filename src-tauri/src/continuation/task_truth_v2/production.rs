@@ -1295,12 +1295,7 @@ pub(crate) fn production_decision_for_attempt(
                 "SELECT packet_id, selected_snapshot_id FROM task_truth_v2_shadow_audits
                  WHERE decision_id=?1 ORDER BY observed_at_ms DESC LIMIT 1",
                 params![decision_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())
@@ -1584,19 +1579,33 @@ pub(crate) fn persist_decision_contract(
                 nonempty_identity(Some(answer.snapshot_id.as_str()))
                     .map(|_| answer.snapshot_revision)
             }),
-            nonempty_identity(answer.and_then(|answer| answer.atomic_identity.task_thread_id.as_deref())),
+            nonempty_identity(
+                answer.and_then(|answer| answer.atomic_identity.task_thread_id.as_deref())
+            ),
             answer.and_then(|answer| answer.atomic_identity.task_thread_revision),
-            nonempty_identity(answer.and_then(|answer| answer.atomic_identity.selected_hypothesis_id.as_deref())),
-            nonempty_identity(answer.and_then(|answer| answer.atomic_identity.model_request_id.as_deref())),
-            nonempty_identity(answer.and_then(|answer| answer.atomic_identity.model_response_id.as_deref())),
+            nonempty_identity(
+                answer.and_then(|answer| answer.atomic_identity.selected_hypothesis_id.as_deref())
+            ),
+            nonempty_identity(
+                answer.and_then(|answer| answer.atomic_identity.model_request_id.as_deref())
+            ),
+            nonempty_identity(
+                answer.and_then(|answer| answer.atomic_identity.model_response_id.as_deref())
+            ),
             decision
                 .inference_diagnostic
                 .as_ref()
                 .map(|diagnostic| diagnostic.provider_attempt_count as i64)
                 .unwrap_or_default(),
-            nonempty_identity(answer.map(|answer| answer.atomic_identity.observation_packet_id.as_str())),
-            nonempty_identity(answer.map(|answer| answer.atomic_identity.evidence_watermark.as_str())),
-            nonempty_identity(answer.map(|answer| answer.atomic_identity.correction_fingerprint.as_str())),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.observation_packet_id.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.evidence_watermark.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.correction_fingerprint.as_str())
+            ),
             answer
                 .and_then(|answer| answer.direct_return_target.as_ref())
                 .and_then(|target| target.artifact_id.as_deref()),
@@ -1754,7 +1763,8 @@ mod tests {
         // A later row can share the packet after a correction or migration.
         // The decision audit still names snapshot-attempt, so production must
         // not select this higher revision merely because it is newer.
-        let mut same_packet_newer = unresolved_snapshot(&packet, Some(&snapshot), "same_packet_newer");
+        let mut same_packet_newer =
+            unresolved_snapshot(&packet, Some(&snapshot), "same_packet_newer");
         same_packet_newer.snapshot_id = "snapshot-same-packet-newer".into();
         same_packet_newer.revision = 99;
         checkpoint::persist_checkpoint(&conn, &packet, &same_packet_newer).unwrap();

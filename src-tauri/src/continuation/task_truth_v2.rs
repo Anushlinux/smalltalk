@@ -22,6 +22,7 @@ pub(crate) mod observation_packet;
 pub(crate) mod production;
 pub(crate) mod review;
 pub(crate) mod selection;
+pub(crate) mod semantic_probe;
 pub(crate) mod task_snapshot;
 pub(crate) mod task_thread;
 pub(crate) mod verifier;
@@ -83,17 +84,8 @@ fn run_multimodal_shadow(
     use self::model::{TaskTruthModelClient, TaskTruthResolver};
     let enabled = multimodal_provider_enabled();
     let mut config = super::continue_openai_config(None).ok();
-    let task_truth_model = std::env::var("SMALLTALK_TASK_TRUTH_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            super::project_dotenv_values()
-                .ok()
-                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_MODEL").cloned())
-                .filter(|value| !value.trim().is_empty())
-        });
-    if let (Some(config), Some(task_truth_model)) = (config.as_mut(), task_truth_model) {
-        config.model = task_truth_model;
+    if let Some(config) = config.as_mut() {
+        config.model = semantic_probe::configured_model_name();
     }
     let model_name = config
         .as_ref()
@@ -428,6 +420,15 @@ fn record_manual_continue_shadow_with_lookback(
         &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
     )?;
+    if semantic_probe::probe_enabled() {
+        if let Err(error) =
+            semantic_probe::run_manual_probe(conn, decision_id, resolved_session_id, &packet)
+        {
+            // The probe is deliberately outside production authority. A proof-path
+            // failure is persisted when possible and must never make Continue fail.
+            eprintln!("[pftu_01_probe] {error}");
+        }
+    }
     let capture_to_packet_ms = manual_continue_started_at_ms
         .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
         .unwrap_or_else(|| capture_to_packet_started.elapsed().as_millis() as i64);
@@ -493,16 +494,7 @@ fn record_manual_continue_shadow_with_lookback(
 }
 
 fn unresolved_manual_preflight_audit(reason: &str) -> MultimodalShadowAuditV1 {
-    let model_name = std::env::var("SMALLTALK_TASK_TRUTH_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            super::project_dotenv_values()
-                .ok()
-                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_MODEL").cloned())
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "unconfigured".to_string());
+    let model_name = semantic_probe::configured_model_name();
     let resolver = model::ResolverAttemptV1 {
         status: model::ResolutionStatusV1::InsufficientEvidence,
         diagnostic_status: model::ProviderDiagnosticStatusV1::RequestInvalid,

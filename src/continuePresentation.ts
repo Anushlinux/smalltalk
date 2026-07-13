@@ -248,19 +248,20 @@ function normalizeToken(value?: string | null) {
 
 export function isTaskInferenceUnavailable(status?: string | null) {
   return [
-    "disabled",
-    "credentials_missing",
     "model_unavailable",
-    "timeout",
     "provider_error",
     "provider_failure",
-    "request_invalid",
-    "invalid_response",
   ].includes(normalizeToken(status));
 }
 
 export type TaskInferenceFailureKind =
   | "capture_unavailable"
+  | "provider_disabled"
+  | "credentials_missing"
+  | "model_unavailable"
+  | "provider_timeout"
+  | "provider_request_rejected"
+  | "provider_failure"
   | "provider_unavailable"
   | "model_response_invalid"
   | "evidence_verifier_rejected"
@@ -303,11 +304,11 @@ export function taskInferenceFailurePresentation(
     };
   }
   if (
-    normalized === "request_invalid"
-    && providerWasAttempted
+    normalized === "request_rejected"
+    || (normalized === "request_invalid" && providerWasAttempted)
   ) {
     return {
-      kind: "provider_unavailable" as TaskInferenceFailureKind,
+      kind: "provider_request_rejected" as TaskInferenceFailureKind,
       headline: "Cloud task inference could not accept this request",
       detail: "The provider rejected the bounded inference request before returning a task answer.",
       retryable: true,
@@ -321,24 +322,47 @@ export function taskInferenceFailurePresentation(
     return {
       kind: "capture_unavailable" as TaskInferenceFailureKind,
       headline: "Capture was unavailable for this Continue attempt",
-      detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+      detail: "Smalltalk could not prepare a readable current-work packet for this request.",
       retryable: false,
     };
   }
-  if ([
-    "disabled",
-    "credentials_missing",
-    "model_unavailable",
-    "timeout",
-    "provider_error",
-    "provider_failure",
-  ].includes(normalized)) {
+  if (normalized === "disabled") {
     return {
-      kind: "provider_unavailable" as TaskInferenceFailureKind,
-      headline: "Cloud task inference is unavailable right now",
-      detail: normalized === "timeout"
-        ? "The provider timed out before a verified answer was returned."
-        : "The provider could not return a verified task answer.",
+      kind: "provider_disabled" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is disabled in this build",
+      detail: "No provider request was attempted. Enable Task Truth inference and run Continue again.",
+      retryable: false,
+    };
+  }
+  if (normalized === "credentials_missing") {
+    return {
+      kind: "credentials_missing" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is not configured",
+      detail: "No provider request was attempted because an OpenAI API key was not available.",
+      retryable: false,
+    };
+  }
+  if (normalized === "model_unavailable") {
+    return {
+      kind: "model_unavailable" as TaskInferenceFailureKind,
+      headline: "The configured inference model is unavailable",
+      detail: "The provider could not use the configured model for this request.",
+      retryable: true,
+    };
+  }
+  if (normalized === "timeout") {
+    return {
+      kind: "provider_timeout" as TaskInferenceFailureKind,
+      headline: "Cloud task inference timed out",
+      detail: "The provider did not return a verified answer before the request deadline.",
+      retryable: true,
+    };
+  }
+  if (["provider_error", "provider_failure"].includes(normalized)) {
+    return {
+      kind: "provider_failure" as TaskInferenceFailureKind,
+      headline: "Cloud task inference failed",
+      detail: "The provider request failed before Smalltalk received a verified task answer.",
       retryable: true,
     };
   }

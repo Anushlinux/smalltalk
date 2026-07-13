@@ -4208,7 +4208,12 @@ function ContinuationAnswer({
   const taskInferenceFailureStatus = normalizeToken(taskTruthDiagnostic?.status) === "success"
     ? cardTaskTruthAnswer?.inference_status
     : taskTruthDiagnostic?.status || cardTaskTruthAnswer?.inference_status;
-  const taskInferenceFailure = cardTaskTruthAnswer?.task_resolution_status === "unresolved"
+  const taskInferenceFailed = cardTaskTruthAnswer?.task_resolution_status === "unresolved"
+    || Boolean(
+      taskTruthDiagnostic
+      && normalizeToken(taskTruthDiagnostic.status) !== "success",
+    );
+  const taskInferenceFailure = taskInferenceFailed
     ? taskInferenceFailurePresentation(
         taskInferenceFailureStatus,
         taskTruthDiagnostic?.verification_status,
@@ -4256,7 +4261,7 @@ function ContinuationAnswer({
         taskTruthActionState,
         taskTruthDiagnostic,
       )
-    : decision && actionState && presentation
+    : !taskInferenceFailure && decision && actionState && presentation
       ? buildContinueProductStateCopy(decision, actionState, presentation, primaryMessage)
       : null;
   const rawTargetLine = handoff?.return_line || presentation?.returnTarget || "No stable place to continue yet.";
@@ -5900,7 +5905,6 @@ function buildTaskTruthProductStateCopy(
       || answer.current_activity?.observed_surface
       || answer.observed_surface
       || "",
-    "",
   );
   const relationship = normalizeToken(
     answer.current_activity?.relationship_to_primary || answer.relationship_to_prior,

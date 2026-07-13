@@ -57,6 +57,7 @@ pub(crate) enum ProviderDiagnosticStatusV1 {
     ModelUnavailable,
     PrivacyBlocked,
     RequestInvalid,
+    RequestRejected,
     Timeout,
     ProviderError,
     InvalidResponse,
@@ -180,6 +181,7 @@ pub(crate) struct TaskTruthModelOutputV1 {
 pub(crate) enum ModelFailureKindV1 {
     Unavailable,
     RequestInvalid,
+    RequestRejected,
     Timeout,
     InvalidJson,
     PolicyRefusal,
@@ -314,11 +316,12 @@ pub(crate) fn diagnostic_for_failure(failure: &ModelFailureV1) -> ProviderDiagno
         }
         ModelFailureKindV1::Unavailable => ProviderDiagnosticStatusV1::ModelUnavailable,
         ModelFailureKindV1::RequestInvalid => ProviderDiagnosticStatusV1::RequestInvalid,
+        ModelFailureKindV1::RequestRejected | ModelFailureKindV1::PolicyRefusal => {
+            ProviderDiagnosticStatusV1::RequestRejected
+        }
         ModelFailureKindV1::Timeout => ProviderDiagnosticStatusV1::Timeout,
         ModelFailureKindV1::InvalidJson => ProviderDiagnosticStatusV1::InvalidResponse,
-        ModelFailureKindV1::PolicyRefusal | ModelFailureKindV1::ProviderError => {
-            ProviderDiagnosticStatusV1::ProviderError
-        }
+        ModelFailureKindV1::ProviderError => ProviderDiagnosticStatusV1::ProviderError,
     }
 }
 
@@ -328,6 +331,7 @@ pub(crate) fn resolution_for_failure(failure: &ModelFailureV1) -> ResolutionStat
         ModelFailureKindV1::InvalidJson => ResolutionStatusV1::InvalidResponse,
         ModelFailureKindV1::RequestInvalid => ResolutionStatusV1::InvalidResponse,
         ModelFailureKindV1::Timeout
+        | ModelFailureKindV1::RequestRejected
         | ModelFailureKindV1::PolicyRefusal
         | ModelFailureKindV1::ProviderError => ResolutionStatusV1::ProviderFailure,
     }
@@ -473,7 +477,7 @@ fn mime_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(super) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -497,7 +501,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn read_model_image(
+pub(super) fn read_model_image(
     frame: &super::observation_packet::KeyframeReferenceV2,
 ) -> Result<(Vec<u8>, String), String> {
     let raw_path = frame
@@ -1318,7 +1322,7 @@ impl TaskTruthModelClient for OpenAiTaskTruthModelClient {
     }
 }
 
-fn provider_attempt_metadata(response: &Value) -> ProviderAttemptMetadataV1 {
+pub(super) fn provider_attempt_metadata(response: &Value) -> ProviderAttemptMetadataV1 {
     let usage = response.get("usage");
     ProviderAttemptMetadataV1 {
         response_id: response
@@ -1367,24 +1371,22 @@ fn contract_correction(
     request: &TaskTruthModelRequestV1,
     rejected_response: &Value,
 ) -> Option<Value> {
-    let (field, reason) = if let Some(detail) = failure
-        .reason
-        .strip_prefix("evidence_policy_mismatch:")
-    {
-        detail.split_once(':')?
-    } else {
-        match failure.reason.as_str() {
-            "partial_thread_continuity_identity"
-            | "continuity_relationship_without_exact_thread_head"
-            | "new_or_unrelated_task_reused_prior_thread"
-            | "invalid_supersedes_thread_id"
-            | "supersession_missing_prior_and_current_evidence"
-            | "continuity_relationship_missing_prior_and_current_evidence" => {
-                ("relationship_to_prior", failure.reason.as_str())
+    let (field, reason) =
+        if let Some(detail) = failure.reason.strip_prefix("evidence_policy_mismatch:") {
+            detail.split_once(':')?
+        } else {
+            match failure.reason.as_str() {
+                "partial_thread_continuity_identity"
+                | "continuity_relationship_without_exact_thread_head"
+                | "new_or_unrelated_task_reused_prior_thread"
+                | "invalid_supersedes_thread_id"
+                | "supersession_missing_prior_and_current_evidence"
+                | "continuity_relationship_missing_prior_and_current_evidence" => {
+                    ("relationship_to_prior", failure.reason.as_str())
+                }
+                _ => return None,
             }
-            _ => return None,
-        }
-    };
+        };
     let allowed_keys = allowed_evidence_keys_for_field(
         field,
         &request.evidence_catalog.keys().cloned().collect::<Vec<_>>(),
@@ -1547,6 +1549,12 @@ fn classify_transport_failure(error: String) -> ModelFailureV1 {
         ModelFailureKindV1::Timeout
     } else if lower.contains("400") || lower.contains("invalid_request") {
         ModelFailureKindV1::RequestInvalid
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("permission")
+    {
+        ModelFailureKindV1::RequestRejected
     } else if lower.contains("404") || lower.contains("model_not_found") {
         ModelFailureKindV1::Unavailable
     } else {
@@ -2818,5 +2826,21 @@ mod tests {
             assert!(attempt.output.is_none());
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_rejection_timeout_and_model_unavailable_remain_distinct() {
+        let rejected = classify_transport_failure("curl failed with HTTP 401".into());
+        assert_eq!(rejected.kind, ModelFailureKindV1::RequestRejected);
+        assert_eq!(
+            diagnostic_for_failure(&rejected),
+            ProviderDiagnosticStatusV1::RequestRejected
+        );
+
+        let timed_out = classify_transport_failure("request timed out".into());
+        assert_eq!(timed_out.kind, ModelFailureKindV1::Timeout);
+
+        let unavailable = classify_transport_failure("HTTP 404 model_not_found".into());
+        assert_eq!(unavailable.kind, ModelFailureKindV1::Unavailable);
     }
 }

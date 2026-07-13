@@ -40,6 +40,11 @@ name = "mfti_04_performance_report"
 path = "src/bin/mfti_04_performance_report.rs"
 required-features = ["eval-binaries"]
 
+[[bin]]
+name = "pftu_01_probe"
+path = "src/bin/pftu_01_probe.rs"
+required-features = ["eval-binaries"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

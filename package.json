@@ -10,6 +10,8 @@
     "test:webview": "npm run test:continue-presentation",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:dev:mfti": "./scripts/tauri-dev-mfti.sh",
+    "tauri:dev:pftu": "./scripts/tauri-dev-pftu.sh",
     "tauri:build:macos:qa": "./scripts/build-macos-qa.sh",
     "tauri:build:macos:release": "SMALLTALK_SIGNING_PROFILE=release ./scripts/build-macos-qa.sh",
     "tauri:verify:macos": "./scripts/verify-macos-bundle.sh"

@@ -12,6 +12,15 @@ pub fn run() {
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[pftu_dev] model={} probe_enabled={} case={}",
+                continuation::task_truth_v2::semantic_probe::configured_model_name(),
+                continuation::task_truth_v2::semantic_probe::probe_enabled(),
+                continuation::task_truth_v2::semantic_probe::configured_case_id()
+                    .as_deref()
+                    .unwrap_or("none")
+            );
             session_island::init_session_island(app.handle().clone());
             Ok(())
         })
@@ -141,4 +150,37 @@ pub fn build_task_truth_v2_candidate_cli(
         dry_run,
     )?;
     serde_json::to_value(manifest).map_err(|error| error.to_string())
+}
+
+/// Arm one private PFTU-01 case before its model output exists.
+pub fn arm_pftu_01_case_cli(
+    database_path: String,
+    input_path: String,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::arm_case_from_path(
+        std::path::Path::new(&database_path),
+        std::path::Path::new(&input_path),
+    )
+}
+
+/// Export a private, local-only PFTU-01 review bundle. The caller chooses the path.
+pub fn export_pftu_01_review_cli(
+    database_path: String,
+    output_path: String,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::export_private_review_bundle(
+        std::path::Path::new(&database_path),
+        std::path::Path::new(&output_path),
+    )
+}
+
+/// Evaluate only redacted, human-reviewed PFTU-01 corpus rows.
+pub fn evaluate_pftu_01_corpus_cli(
+    input_path: String,
+    output_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::evaluate_corpus_path(
+        std::path::Path::new(&input_path),
+        output_path.as_deref().map(std::path::Path::new),
+    )
 }
