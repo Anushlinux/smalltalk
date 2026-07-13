@@ -688,7 +688,7 @@ fn build_activity_recap_openai_request(
 ) -> Result<Value, String> {
     Ok(json!({
         "model": model,
-        "store": false,
+        "store": crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens": 750,
         "text": {
             "format": {

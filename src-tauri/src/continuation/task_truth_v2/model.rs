@@ -910,7 +910,7 @@ pub(crate) fn build_multimodal_request(
     content.insert(0, json!({"type":"input_text", "text": structured_text}));
     let body = json!({
         "model": model,
-        "store": false,
+        "store": crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens": 6000,
         "text": {"format": {
             "type": "json_schema",

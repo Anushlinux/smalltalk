@@ -20,6 +20,8 @@ const MAX_ESTIMATED_TEXT_TOKENS: usize = 6_144;
 const MAX_OBSERVATIONS_PER_BOUNDARY: usize = 6;
 const MAX_ACTIONS_PER_BOUNDARY: usize = 4;
 const MAX_DELTAS_PER_BOUNDARY: usize = 3;
+const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
+const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
 const MAX_ARMED_CASE_AGE_MS: i64 = 15 * 60 * 1_000;
 const SEMANTIC_FIELDS: [&str; 4] = [
     "primary_task",
@@ -106,6 +108,24 @@ pub(crate) struct ProbeRequestAudit {
     pub(crate) output_contract_field_count: usize,
     pub(crate) supplied_image_slots: Vec<String>,
     pub(crate) missing_evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) final_frame_id: String,
+    #[serde(default)]
+    pub(crate) cutoff_observed_at_ms: i64,
+    #[serde(default)]
+    pub(crate) earliest_included_at_ms: i64,
+    #[serde(default)]
+    pub(crate) boundary_selection_reasons: Vec<String>,
+    #[serde(default)]
+    pub(crate) raw_candidate_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) admitted_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) deduplication_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) excluded_late_records_by_kind: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) excluded_nonsemantic_records_by_kind: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +179,25 @@ struct RequestSlot<'a> {
 #[derive(Debug, Clone, Serialize)]
 struct RequestBoundary<'a> {
     boundary_index: usize,
+    selection_reason: &'a str,
+    surface_relation: &'a str,
     slots: Vec<RequestSlot<'a>>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedBoundary {
+    selection_reason: String,
+    surface_relation: String,
+    frames: Vec<super::observation_packet::KeyframeReferenceV2>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SlotBuildAudit {
+    raw_candidate_counts: BTreeMap<String, usize>,
+    admitted_counts: BTreeMap<String, usize>,
+    deduplication_counts: BTreeMap<String, usize>,
+    excluded_late_records_by_kind: BTreeMap<String, usize>,
+    excluded_nonsemantic_records_by_kind: BTreeMap<String, usize>,
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -183,51 +221,287 @@ fn insert_slot(slots: &mut BTreeMap<String, SupportSlot>, slot: SupportSlot) {
     slots.insert(slot.slot.clone(), slot);
 }
 
-fn selected_frames(
-    packet: &ObservationPacketV2,
-) -> Result<Vec<super::observation_packet::KeyframeReferenceV2>, ProbeDiagnosticStatus> {
-    if is_private_status(Some(&packet.current_frame.privacy_status)) {
-        return Err(ProbeDiagnosticStatus::PrivacyBlocked);
-    }
-    if !packet.current_frame.model_eligible {
-        return Err(ProbeDiagnosticStatus::RequestNotBuilt);
-    }
-    let mut frames = packet
+fn frame_time(packet: &ObservationPacketV2, frame_id: &str) -> Option<i64> {
+    packet
         .semantic_keyframes
         .iter()
+        .chain(std::iter::once(&packet.current_frame))
+        .find(|frame| frame.frame_id == frame_id)
+        .map(|frame| frame.observed_at_ms)
+}
+
+fn same_surface(
+    left: &super::observation_packet::KeyframeReferenceV2,
+    right: &super::observation_packet::KeyframeReferenceV2,
+) -> bool {
+    let left_identity = &left.surface_identity;
+    let right_identity = &right.surface_identity;
+    let same_app = left_identity.app_bundle_id.is_some()
+        && left_identity.app_bundle_id == right_identity.app_bundle_id;
+    let same_owned_object = [
+        left_identity
+            .document_path_hash
+            .as_ref()
+            .zip(right_identity.document_path_hash.as_ref()),
+        left_identity
+            .browser_url_hash
+            .as_ref()
+            .zip(right_identity.browser_url_hash.as_ref()),
+        left_identity
+            .window_title_hash
+            .as_ref()
+            .zip(right_identity.window_title_hash.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|(left, right)| left == right)
+        || (left_identity.window_id.is_some()
+            && left_identity.window_id == right_identity.window_id);
+    same_app && same_owned_object
+}
+
+fn event_has_material_result(
+    packet: &ObservationPacketV2,
+    event: &super::observation_packet::CausalEventV2,
+    cutoff: i64,
+) -> bool {
+    packet.frame_changes.iter().any(|delta| {
+        let belongs_to_event = if let Some(reference) = event.semantic_delta_reference.as_deref() {
+            reference == delta.delta_id
+        } else if delta
+            .causal_event_ids
+            .iter()
+            .any(|id| id == &event.event_id)
+        {
+            true
+        } else {
+            event.target_frame_id.as_deref() == Some(delta.next_frame_id.as_str())
+        };
+        !delta.no_observable_change
+            && frame_time(packet, &delta.next_frame_id).is_some_and(|time| time <= cutoff)
+            && belongs_to_event
+    })
+}
+
+fn event_is_meaningful(
+    packet: &ObservationPacketV2,
+    event: &super::observation_packet::CausalEventV2,
+    cutoff: i64,
+) -> bool {
+    if event.observed_at_ms > cutoff || event.grounding_confidence < 0.5 {
+        return false;
+    }
+    if event
+        .target_frame_id
+        .as_deref()
+        .and_then(|frame_id| frame_time(packet, frame_id))
+        .is_some_and(|time| time > cutoff)
+    {
+        return false;
+    }
+    let kind = event.event_kind.trim().to_ascii_lowercase();
+    let source = event.source.trim().to_ascii_lowercase();
+    if [
+        "notification",
+        "accessibility",
+        "focus",
+        "window_metadata",
+        "capture",
+        "bookkeeping",
+    ]
+    .iter()
+    .any(|passive| kind.contains(passive))
+        || (source.contains("accessibility")
+            && ["focus", "window", "notification", "changed"]
+                .iter()
+                .any(|passive| kind.contains(passive)))
+    {
+        return false;
+    }
+    if kind.contains("scroll") {
+        return event_has_material_result(packet, event, cutoff);
+    }
+    if kind.contains("app_switch") {
+        let target_time = event
+            .target_frame_id
+            .as_deref()
+            .and_then(|frame_id| frame_time(packet, frame_id));
+        return target_time.is_some_and(|time| time <= cutoff)
+            && packet.causal_events.iter().any(|later| {
+                later.observed_at_ms > event.observed_at_ms
+                    && later.observed_at_ms <= cutoff
+                    && later.app_bundle_id == event.app_bundle_id
+                    && later.event_id != event.event_id
+                    && !later.event_kind.to_ascii_lowercase().contains("focus")
+            });
+    }
+    event.committed == Some(true)
+        || [
+            "submit",
+            "send",
+            "command",
+            "terminal",
+            "typing_commit",
+            "committed_typing",
+        ]
+        .iter()
+        .any(|signal| kind.contains(signal))
+        || (["click", "navigation"]
+            .iter()
+            .any(|signal| kind.contains(signal))
+            && event_has_material_result(packet, event, cutoff))
+}
+
+fn delta_has_grounded_cause(
+    packet: &ObservationPacketV2,
+    delta: &super::observation_packet::FrameChangeV2,
+    cutoff: i64,
+) -> bool {
+    packet.causal_events.iter().any(|event| {
+        (delta
+            .causal_event_ids
+            .iter()
+            .any(|id| id == &event.event_id)
+            || event.semantic_delta_reference.as_deref() == Some(delta.delta_id.as_str())
+            || event.target_frame_id.as_deref() == Some(delta.next_frame_id.as_str()))
+            && event_is_meaningful(packet, event, cutoff)
+            && event_has_material_result(packet, event, cutoff)
+    })
+}
+
+fn selected_boundaries(
+    packet: &ObservationPacketV2,
+) -> Result<Vec<SelectedBoundary>, (ProbeDiagnosticStatus, String)> {
+    let current = &packet.current_frame;
+    if current.frame_id.trim().is_empty() {
+        return Err((
+            ProbeDiagnosticStatus::RequestNotBuilt,
+            "current_frame_missing".into(),
+        ));
+    }
+    if current.observed_at_ms != packet.observed_at_ms {
+        return Err((
+            ProbeDiagnosticStatus::RequestNotBuilt,
+            "current_frame_stale".into(),
+        ));
+    }
+    if is_private_status(Some(&current.privacy_status)) {
+        return Err((
+            ProbeDiagnosticStatus::PrivacyBlocked,
+            "current_frame_privacy_blocked".into(),
+        ));
+    }
+    if !current.model_eligible {
+        return Err((
+            ProbeDiagnosticStatus::RequestNotBuilt,
+            "current_frame_model_ineligible".into(),
+        ));
+    }
+    let cutoff = current.observed_at_ms;
+    let mut eligible_frames = packet
+        .semantic_keyframes
+        .iter()
+        .chain(std::iter::once(current))
         .filter(|frame| {
-            frame.partition != EvidencePartitionV2::Background
+            frame.observed_at_ms <= cutoff
+                && frame.partition != EvidencePartitionV2::Background
                 && frame.model_eligible
                 && !is_private_status(Some(&frame.privacy_status))
         })
         .cloned()
         .collect::<Vec<_>>();
-    if !frames
-        .iter()
-        .any(|frame| frame.frame_id == packet.current_frame.frame_id)
-    {
-        frames.push(packet.current_frame.clone());
-    }
-    frames.sort_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()));
-    frames.dedup_by(|left, right| left.frame_id == right.frame_id);
-    if frames.len() > MAX_IMAGES {
-        frames = frames.split_off(frames.len() - MAX_IMAGES);
-    }
-    if frames.is_empty() {
-        Err(ProbeDiagnosticStatus::RequestNotBuilt)
-    } else {
-        Ok(frames)
-    }
-}
+    eligible_frames.sort_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()));
+    eligible_frames.dedup_by(|left, right| left.frame_id == right.frame_id);
 
-fn boundary_assignments(frame_count: usize) -> Vec<Vec<usize>> {
-    match frame_count {
-        0 => Vec::new(),
-        1 => vec![vec![0]],
-        2 => vec![vec![0, 1]],
-        3 => vec![vec![0], vec![1, 2]],
-        _ => vec![vec![0, 1], vec![2, 3]],
+    let frame_by_id = |frame_id: &str| {
+        eligible_frames
+            .iter()
+            .find(|frame| frame.frame_id == frame_id)
+            .cloned()
+    };
+    let direct_prior = packet
+        .frame_changes
+        .iter()
+        .filter(|delta| {
+            !delta.no_observable_change
+                && delta.next_frame_id == current.frame_id
+                && frame_time(packet, &delta.next_frame_id).is_some_and(|time| time <= cutoff)
+                && delta_has_grounded_cause(packet, delta, cutoff)
+        })
+        .filter_map(|delta| delta.prior_frame_id.as_deref().and_then(frame_by_id))
+        .max_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
+        .or_else(|| {
+            packet
+                .causal_events
+                .iter()
+                .filter(|event| {
+                    event.target_frame_id.as_deref() == Some(current.frame_id.as_str())
+                        && event_is_meaningful(packet, event, cutoff)
+                })
+                .filter_map(|event| frame_by_id(&event.source_frame_id))
+                .max_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
+        });
+    let mut current_frames = direct_prior.into_iter().collect::<Vec<_>>();
+    if !current_frames
+        .iter()
+        .any(|frame| frame.frame_id == current.frame_id)
+    {
+        current_frames.push(current.clone());
     }
+    current_frames.sort_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()));
+    current_frames.dedup_by(|left, right| left.frame_id == right.frame_id);
+    let current_start = current_frames
+        .first()
+        .map(|frame| frame.observed_at_ms)
+        .unwrap_or(cutoff);
+
+    let current_boundary_has_grounded_result = packet.causal_events.iter().any(|event| {
+        event.target_frame_id.as_deref() == Some(current.frame_id.as_str())
+            && event_is_meaningful(packet, event, cutoff)
+            && event_has_material_result(packet, event, cutoff)
+    });
+
+    let earlier = if current_boundary_has_grounded_result {
+        None
+    } else {
+        packet
+            .frame_changes
+            .iter()
+            .filter(|delta| !delta.no_observable_change)
+            .filter_map(|delta| {
+                let prior = delta.prior_frame_id.as_deref().and_then(frame_by_id)?;
+                let next = frame_by_id(&delta.next_frame_id)?;
+                if next.observed_at_ms >= current_start || !same_surface(&next, current) {
+                    return None;
+                }
+                delta_has_grounded_cause(packet, delta, cutoff).then_some(SelectedBoundary {
+                    selection_reason: "committed_action_with_result".into(),
+                    surface_relation: "same_surface_as_current".into(),
+                    frames: vec![prior, next],
+                })
+            })
+            .max_by_key(|boundary| {
+                boundary
+                    .frames
+                    .last()
+                    .map(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
+            })
+    };
+
+    let current_boundary = SelectedBoundary {
+        selection_reason: "current_manual_boundary".into(),
+        surface_relation: "current_surface".into(),
+        frames: current_frames,
+    };
+    let mut boundaries = earlier.into_iter().collect::<Vec<_>>();
+    boundaries.push(current_boundary);
+    if boundaries.is_empty() || boundaries.len() > MAX_BOUNDARIES {
+        return Err((
+            ProbeDiagnosticStatus::RequestNotBuilt,
+            "invalid_boundary_count".into(),
+        ));
+    }
+    Ok(boundaries)
 }
 
 fn element_is_probe_eligible(element: &super::observation_packet::CanonicalElementV2) -> bool {
@@ -244,16 +518,97 @@ fn element_is_probe_eligible(element: &super::observation_packet::CanonicalEleme
 
 fn build_slots(
     packet: &ObservationPacketV2,
-    frames: &[super::observation_packet::KeyframeReferenceV2],
-    assignments: &[Vec<usize>],
-) -> BTreeMap<String, SupportSlot> {
+    boundaries: &[SelectedBoundary],
+    cutoff: i64,
+) -> (BTreeMap<String, SupportSlot>, SlotBuildAudit) {
     let mut slots = BTreeMap::new();
-    for (assignment_index, frame_indexes) in assignments.iter().enumerate() {
+    let mut audit = SlotBuildAudit::default();
+    let raw_keyframe_count = packet
+        .semantic_keyframes
+        .iter()
+        .map(|frame| frame.frame_id.as_str())
+        .chain(std::iter::once(packet.current_frame.frame_id.as_str()))
+        .collect::<BTreeSet<_>>()
+        .len();
+    audit.raw_candidate_counts = BTreeMap::from([
+        ("keyframe".into(), raw_keyframe_count),
+        (
+            "canonical_observation".into(),
+            packet.canonical_elements.len(),
+        ),
+        ("causal_event".into(), packet.causal_events.len()),
+        ("semantic_delta".into(), packet.frame_changes.len()),
+    ]);
+    audit.excluded_late_records_by_kind = BTreeMap::from([
+        (
+            "keyframe".into(),
+            packet
+                .semantic_keyframes
+                .iter()
+                .filter(|frame| frame.observed_at_ms > cutoff)
+                .count(),
+        ),
+        (
+            "canonical_observation".into(),
+            packet
+                .canonical_elements
+                .iter()
+                .filter(|element| element.changed_at_ms > cutoff)
+                .count(),
+        ),
+        (
+            "causal_event".into(),
+            packet
+                .causal_events
+                .iter()
+                .filter(|event| {
+                    event.observed_at_ms > cutoff
+                        || event
+                            .target_frame_id
+                            .as_deref()
+                            .and_then(|frame_id| frame_time(packet, frame_id))
+                            .is_some_and(|time| time > cutoff)
+                })
+                .count(),
+        ),
+        (
+            "semantic_delta".into(),
+            packet
+                .frame_changes
+                .iter()
+                .filter(|delta| {
+                    frame_time(packet, &delta.next_frame_id).is_some_and(|time| time > cutoff)
+                })
+                .count(),
+        ),
+    ]);
+
+    let mut reason_strings = packet
+        .canonical_elements
+        .iter()
+        .filter(|element| element.changed_at_ms <= cutoff)
+        .flat_map(|element| {
+            element
+                .source_conflicts
+                .iter()
+                .chain(element.rejection_reasons.iter())
+        })
+        .map(|reason| bounded_text(reason, MAX_MISSING_EVIDENCE_CHARS))
+        .collect::<Vec<_>>();
+    let raw_reason_count = reason_strings.len();
+    reason_strings.sort();
+    reason_strings.dedup();
+    audit
+        .raw_candidate_counts
+        .insert("reason_string".into(), raw_reason_count);
+    audit.deduplication_counts.insert(
+        "reason_string".into(),
+        raw_reason_count.saturating_sub(reason_strings.len()),
+    );
+
+    for (assignment_index, boundary) in boundaries.iter().enumerate() {
         let boundary_index = assignment_index + 1;
-        let boundary_frames = frame_indexes
-            .iter()
-            .filter_map(|index| frames.get(*index))
-            .collect::<Vec<_>>();
+        let boundary_frames = &boundary.frames;
         let boundary_frame_ids = boundary_frames
             .iter()
             .map(|frame| frame.frame_id.as_str())
@@ -290,33 +645,6 @@ fn build_slots(
                             .into(),
                 },
             );
-            insert_slot(
-                &mut slots,
-                SupportSlot {
-                    slot: slot_name(boundary_index, &format!("SURFACE_{}", position + 1)),
-                    boundary_index,
-                    category: SupportCategory::SurfaceIdentity,
-                    source_kind: "surface_identity".into(),
-                    record_id: frame.frame_id.clone(),
-                    frame_id: Some(frame.frame_id.clone()),
-                    content_hash: None,
-                    source_fingerprint: fingerprint(&frame.surface_identity),
-                    observed_at_ms: frame.observed_at_ms,
-                    privacy_eligible: true,
-                    ownership_eligible: true,
-                    summary: bounded_text(
-                        &format!(
-                            "app={:?} bundle={:?} window_hash={:?} page_hash={:?} document_hash={:?}",
-                            frame.surface_identity.app_name,
-                            frame.surface_identity.app_bundle_id,
-                            frame.surface_identity.window_title_hash,
-                            frame.surface_identity.browser_url_hash,
-                            frame.surface_identity.document_path_hash
-                        ),
-                        360,
-                    ),
-                },
-            );
         }
 
         let mut observations = packet
@@ -324,6 +652,7 @@ fn build_slots(
             .iter()
             .filter(|element| {
                 boundary_frame_ids.contains(element.frame_id.as_str())
+                    && element.changed_at_ms <= cutoff
                     && element_is_probe_eligible(element)
             })
             .collect::<Vec<_>>();
@@ -336,6 +665,26 @@ fn build_slots(
                 element.element_id.clone(),
             )
         });
+        let observation_candidates = observations.len();
+        let mut observation_keys = BTreeSet::new();
+        observations.retain(|element| {
+            let identity = fingerprint(&json!({
+                "frame_id": element.frame_id,
+                "text_reference": element.text_reference,
+                "visual_description": element.visual_description,
+                "owning_app_bundle": element.owning_app_bundle,
+                "source_scope": element.source_scope,
+                "ownership_kind": element.ownership_kind,
+                "region_role": element.region_role,
+                "bounds": element.bounds,
+                "authorship_status": element.authorship_status,
+            }));
+            observation_keys.insert(identity)
+        });
+        *audit
+            .deduplication_counts
+            .entry("canonical_observation".into())
+            .or_default() += observation_candidates.saturating_sub(observations.len());
         for (index, element) in observations
             .into_iter()
             .take(MAX_OBSERVATIONS_PER_BOUNDARY)
@@ -376,9 +725,27 @@ fn build_slots(
                         .as_deref()
                         .is_some_and(|frame_id| boundary_frame_ids.contains(frame_id))
             })
-            .filter(|event| event.grounding_confidence >= 0.5)
+            .filter(|event| event_is_meaningful(packet, event, cutoff))
             .collect::<Vec<_>>();
         actions.sort_by_key(|event| (event.observed_at_ms, event.event_id.clone()));
+        let action_candidates = actions.len();
+        let mut action_keys = BTreeSet::new();
+        actions.retain(|event| {
+            let identity = fingerprint(&json!({
+                "event_kind": event.event_kind.to_ascii_lowercase(),
+                "frame_id": event.frame_id,
+                "target_frame_id": event.target_frame_id,
+                "target_element_id": event.target_element_id,
+                "post_state_reference": event.post_state_reference,
+                "semantic_delta_reference": event.semantic_delta_reference,
+                "committed": event.committed,
+            }));
+            action_keys.insert(identity)
+        });
+        *audit
+            .deduplication_counts
+            .entry("causal_event".into())
+            .or_default() += action_candidates.saturating_sub(actions.len());
         for (index, event) in actions
             .into_iter()
             .rev()
@@ -404,11 +771,10 @@ fn build_slots(
                     ownership_eligible: true,
                     summary: bounded_text(
                         &format!(
-                            "event={} committed={:?} target_region={:?} grounding={:.2}",
+                            "user-grounded event={} committed={:?} observable_result={}",
                             event.event_kind,
                             event.committed,
-                            event.target_region,
-                            event.grounding_confidence
+                            event_has_material_result(packet, event, cutoff)
                         ),
                         240,
                     ),
@@ -420,9 +786,29 @@ fn build_slots(
             .frame_changes
             .iter()
             .filter(|delta| boundary_frame_ids.contains(delta.next_frame_id.as_str()))
+            .filter(|delta| {
+                frame_time(packet, &delta.next_frame_id).is_some_and(|time| time <= cutoff)
+            })
             .filter(|delta| !delta.no_observable_change)
             .collect::<Vec<_>>();
-        deltas.sort_by_key(|delta| delta.delta_id.clone());
+        deltas.sort_by_key(|delta| (delta.next_frame_id.clone(), delta.delta_id.clone()));
+        let delta_candidates = deltas.len();
+        let mut delta_keys = BTreeSet::new();
+        deltas.retain(|delta| {
+            let identity = fingerprint(&json!({
+                "prior_frame_id": delta.prior_frame_id,
+                "next_frame_id": delta.next_frame_id,
+                "diff_kind": delta.diff_kind,
+                "observable_changes": delta.observable_changes,
+                "summary_hash": delta.summary_hash,
+                "changed_regions": delta.changed_regions,
+            }));
+            delta_keys.insert(identity)
+        });
+        *audit
+            .deduplication_counts
+            .entry("semantic_delta".into())
+            .or_default() += delta_candidates.saturating_sub(deltas.len());
         for (index, delta) in deltas.into_iter().take(MAX_DELTAS_PER_BOUNDARY).enumerate() {
             insert_slot(
                 &mut slots,
@@ -435,11 +821,7 @@ fn build_slots(
                     frame_id: Some(delta.frame_id.clone()),
                     content_hash: delta.summary_hash.clone(),
                     source_fingerprint: fingerprint(delta),
-                    observed_at_ms: frames
-                        .iter()
-                        .find(|frame| frame.frame_id == delta.next_frame_id)
-                        .map(|frame| frame.observed_at_ms)
-                        .unwrap_or(packet.observed_at_ms),
+                    observed_at_ms: frame_time(packet, &delta.next_frame_id).unwrap_or(cutoff),
                     privacy_eligible: true,
                     ownership_eligible: true,
                     summary: bounded_text(
@@ -453,7 +835,32 @@ fn build_slots(
             );
         }
     }
-    slots
+    for slot in slots.values() {
+        let key = match slot.category {
+            SupportCategory::ImageBefore | SupportCategory::ImageAfter => "keyframe",
+            SupportCategory::OwnedObservation => "canonical_observation",
+            SupportCategory::UserAction => "causal_event",
+            SupportCategory::Delta => "semantic_delta",
+            SupportCategory::SurfaceIdentity => "surface_identity",
+        };
+        *audit.admitted_counts.entry(key.into()).or_default() += 1;
+    }
+    let excluded_passive_events = packet
+        .causal_events
+        .iter()
+        .filter(|event| event.observed_at_ms <= cutoff)
+        .filter(|event| !event_is_meaningful(packet, event, cutoff))
+        .count();
+    let excluded_no_op_deltas = packet
+        .frame_changes
+        .iter()
+        .filter(|delta| delta.no_observable_change)
+        .count();
+    audit.excluded_nonsemantic_records_by_kind = BTreeMap::from([
+        ("passive_or_no_effect_event".into(), excluded_passive_events),
+        ("no_observable_change_delta".into(), excluded_no_op_deltas),
+    ]);
+    (slots, audit)
 }
 
 fn response_schema(slot_names: &[String]) -> Value {
@@ -522,50 +929,109 @@ fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -
     structured_bytes <= MAX_TEXT_BYTES && estimated_text_tokens <= MAX_ESTIMATED_TEXT_TOKENS
 }
 
+fn request_category_caps_allowed(
+    boundary_count: usize,
+    image_count: usize,
+    slots: &BTreeMap<String, SupportSlot>,
+) -> bool {
+    if boundary_count == 0 || boundary_count > MAX_BOUNDARIES || image_count > MAX_IMAGES {
+        return false;
+    }
+    (1..=boundary_count).all(|boundary_index| {
+        let category_count = |category: SupportCategory| {
+            slots
+                .values()
+                .filter(|slot| slot.boundary_index == boundary_index && slot.category == category)
+                .count()
+        };
+        category_count(SupportCategory::ImageBefore) + category_count(SupportCategory::ImageAfter)
+            <= 2
+            && category_count(SupportCategory::OwnedObservation) <= MAX_OBSERVATIONS_PER_BOUNDARY
+            && category_count(SupportCategory::UserAction) <= MAX_ACTIONS_PER_BOUNDARY
+            && category_count(SupportCategory::Delta) <= MAX_DELTAS_PER_BOUNDARY
+    })
+}
+
+fn support_category_order(category: SupportCategory) -> u8 {
+    match category {
+        SupportCategory::ImageBefore => 0,
+        SupportCategory::UserAction => 1,
+        SupportCategory::OwnedObservation => 2,
+        SupportCategory::Delta => 3,
+        SupportCategory::ImageAfter => 4,
+        SupportCategory::SurfaceIdentity => 5,
+    }
+}
+
 pub(crate) fn build_probe_request(
     packet: &ObservationPacketV2,
     model_name: &str,
 ) -> Result<ProbeRequest, (ProbeDiagnosticStatus, String)> {
-    let frames = selected_frames(packet).map_err(|status| {
-        (
-            status,
-            if status == ProbeDiagnosticStatus::PrivacyBlocked {
-                "current_boundary_privacy_blocked"
-            } else {
-                "current_boundary_missing"
-            }
-            .to_string(),
-        )
-    })?;
-    let assignments = boundary_assignments(frames.len());
-    if assignments.is_empty() || assignments.len() > MAX_BOUNDARIES {
+    let boundaries = selected_boundaries(packet)?;
+    let cutoff = packet.current_frame.observed_at_ms;
+    let mut frames = boundaries
+        .iter()
+        .flat_map(|boundary| boundary.frames.iter().cloned())
+        .collect::<Vec<_>>();
+    frames.sort_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()));
+    frames.dedup_by(|left, right| left.frame_id == right.frame_id);
+    let (slots, mut slot_audit) = build_slots(packet, &boundaries, cutoff);
+    if !request_category_caps_allowed(boundaries.len(), frames.len(), &slots) {
         return Err((
             ProbeDiagnosticStatus::RequestNotBuilt,
-            "invalid_boundary_count".into(),
+            "probe_category_cap_exceeded".into(),
         ));
     }
-    let slots = build_slots(packet, &frames, &assignments);
-    let request_boundaries = (1..=assignments.len())
-        .map(|boundary_index| RequestBoundary {
-            boundary_index,
-            slots: slots
+    let request_boundaries = boundaries
+        .iter()
+        .enumerate()
+        .map(|(index, boundary)| {
+            let mut boundary_slots = slots
                 .values()
-                .filter(|slot| slot.boundary_index == boundary_index)
+                .filter(|slot| slot.boundary_index == index + 1)
                 .map(|slot| RequestSlot {
                     slot: &slot.slot,
                     category: slot.category,
                     observed_at_ms: slot.observed_at_ms,
                     summary: &slot.summary,
                 })
-                .collect(),
+                .collect::<Vec<_>>();
+            boundary_slots.sort_by_key(|slot| {
+                (
+                    slot.observed_at_ms,
+                    support_category_order(slot.category),
+                    slot.slot,
+                )
+            });
+            RequestBoundary {
+                boundary_index: index + 1,
+                selection_reason: &boundary.selection_reason,
+                surface_relation: &boundary.surface_relation,
+                slots: boundary_slots,
+            }
         })
         .collect::<Vec<_>>();
+    let mut missing_evidence = packet
+        .missing_source_notes
+        .iter()
+        .map(|note| bounded_text(note, MAX_MISSING_EVIDENCE_CHARS))
+        .collect::<Vec<_>>();
+    let raw_missing_evidence_count = missing_evidence.len();
+    missing_evidence.sort();
+    missing_evidence.dedup();
+    missing_evidence.truncate(8);
+    slot_audit
+        .raw_candidate_counts
+        .insert("missing_evidence".into(), raw_missing_evidence_count);
+    slot_audit.deduplication_counts.insert(
+        "missing_evidence".into(),
+        raw_missing_evidence_count.saturating_sub(missing_evidence.len()),
+    );
     let structured = json!({
         "schema":PROBE_REQUEST_SCHEMA,
-        "packet_id":packet.packet_id,
-        "observed_at_ms":packet.observed_at_ms,
+        "final_cutoff_ms":cutoff,
         "boundaries":request_boundaries,
-        "missing_evidence":packet.missing_source_notes.iter().take(8).map(|note| bounded_text(note, 240)).collect::<Vec<_>>(),
+        "missing_evidence":missing_evidence,
         "policy":{
             "explicit_continue_or_authorized_replay_only":true,
             "background_upload":false,
@@ -648,7 +1114,7 @@ pub(crate) fn build_probe_request(
         .collect::<Vec<_>>();
     let body = json!({
         "model":model_name,
-        "store":false,
+        "store":crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens":1200,
         "text":{"format":{
             "type":"json_schema",
@@ -667,7 +1133,7 @@ pub(crate) fn build_probe_request(
             request_schema: PROBE_REQUEST_SCHEMA.into(),
             request_id,
             model: model_name.into(),
-            boundary_count: assignments.len(),
+            boundary_count: boundaries.len(),
             image_count: supplied_image_slots.len(),
             image_bytes,
             structured_bytes: structured_text.len(),
@@ -676,12 +1142,23 @@ pub(crate) fn build_probe_request(
             max_estimated_text_tokens: MAX_ESTIMATED_TEXT_TOKENS,
             output_contract_field_count: SEMANTIC_FIELDS.len(),
             supplied_image_slots,
-            missing_evidence: packet
-                .missing_source_notes
+            missing_evidence,
+            final_frame_id: packet.current_frame.frame_id.clone(),
+            cutoff_observed_at_ms: cutoff,
+            earliest_included_at_ms: slots
+                .values()
+                .map(|slot| slot.observed_at_ms)
+                .min()
+                .unwrap_or(cutoff),
+            boundary_selection_reasons: boundaries
                 .iter()
-                .take(8)
-                .map(|note| bounded_text(note, 240))
+                .map(|boundary| boundary.selection_reason.clone())
                 .collect(),
+            raw_candidate_counts: slot_audit.raw_candidate_counts,
+            admitted_counts: slot_audit.admitted_counts,
+            deduplication_counts: slot_audit.deduplication_counts,
+            excluded_late_records_by_kind: slot_audit.excluded_late_records_by_kind,
+            excluded_nonsemantic_records_by_kind: slot_audit.excluded_nonsemantic_records_by_kind,
         },
         slots,
     })
@@ -757,7 +1234,7 @@ fn primary_task_is_generic(value: &str) -> bool {
         .trim()
         .trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
         .to_ascii_lowercase();
-    [
+    let generic_labels = [
         "editing",
         "viewing",
         "browsing",
@@ -768,13 +1245,19 @@ fn primary_task_is_generic(value: &str) -> bool {
         "filling_form",
         "filling form",
         "searching",
-    ]
-    .iter()
-    .any(|generic| {
-        normalized == *generic
-            || normalized.starts_with(&format!("{generic} "))
-            || normalized.starts_with(&format!("{generic} a "))
-            || normalized.starts_with(&format!("{generic} the "))
+    ];
+    if generic_labels.contains(&normalized.as_str()) {
+        return true;
+    }
+    let generic_objects = [
+        "code", "document", "form", "output", "page", "results", "screen", "text", "website",
+    ];
+    generic_labels.iter().any(|generic| {
+        generic_objects.iter().any(|object| {
+            normalized == format!("{generic} {object}")
+                || normalized == format!("{generic} a {object}")
+                || normalized == format!("{generic} the {object}")
+        })
     })
 }
 
@@ -823,6 +1306,70 @@ fn source_fingerprint_matches(packet: &ObservationPacketV2, slot: &SupportSlot) 
     }
 }
 
+fn slot_chronology_valid(
+    packet: &ObservationPacketV2,
+    request: &ProbeRequest,
+    slot: &SupportSlot,
+) -> bool {
+    let cutoff = request.audit.cutoff_observed_at_ms;
+    if cutoff <= 0 || slot.observed_at_ms > cutoff {
+        return false;
+    }
+    match slot.source_kind.as_str() {
+        "keyframe" | "surface_identity" => frame_time(packet, &slot.record_id)
+            .is_some_and(|observed_at_ms| observed_at_ms <= cutoff),
+        "canonical_element" => packet
+            .canonical_elements
+            .iter()
+            .find(|element| element.element_id == slot.record_id)
+            .is_some_and(|element| element.changed_at_ms <= cutoff),
+        "causal_event" => packet
+            .causal_events
+            .iter()
+            .find(|event| event.event_id == slot.record_id)
+            .is_some_and(|event| {
+                event.observed_at_ms <= cutoff
+                    && event
+                        .target_frame_id
+                        .as_deref()
+                        .and_then(|frame_id| frame_time(packet, frame_id))
+                        .is_none_or(|observed_at_ms| observed_at_ms <= cutoff)
+            }),
+        "semantic_delta" => packet
+            .frame_changes
+            .iter()
+            .find(|delta| delta.delta_id == slot.record_id)
+            .and_then(|delta| frame_time(packet, &delta.next_frame_id))
+            .is_some_and(|observed_at_ms| observed_at_ms <= cutoff),
+        _ => false,
+    }
+}
+
+fn request_has_primary_task_basis(packet: &ObservationPacketV2, request: &ProbeRequest) -> bool {
+    request
+        .slots
+        .values()
+        .any(|slot| match slot.source_kind.as_str() {
+            "causal_event" => packet
+                .causal_events
+                .iter()
+                .find(|event| event.event_id == slot.record_id)
+                .is_some_and(|event| {
+                    event_is_meaningful(packet, event, request.audit.cutoff_observed_at_ms)
+                        && !event.event_kind.to_ascii_lowercase().contains("scroll")
+                }),
+            "canonical_element" => packet
+                .canonical_elements
+                .iter()
+                .find(|element| element.element_id == slot.record_id)
+                .is_some_and(|element| {
+                    element.authorship_status == AuthorshipStatusV2::User
+                        || !element.causal_evidence_refs.is_empty()
+                }),
+            _ => false,
+        })
+}
+
 pub(crate) fn admit_output(
     packet: &ObservationPacketV2,
     request: &ProbeRequest,
@@ -849,11 +1396,13 @@ pub(crate) fn admit_output(
 
     for field in SEMANTIC_FIELDS {
         let value = field_value(&output, field).cloned();
-        let supports = output
+        let mut supports = output
             .support_slots_by_field
             .get(field)
             .cloned()
             .unwrap_or_default();
+        supports.sort();
+        supports.dedup();
         let confidence = output
             .confidence_by_field
             .get(field)
@@ -868,11 +1417,26 @@ pub(crate) fn admit_output(
                 field_issues.push("null_field_has_support_slots");
             }
         } else {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                field_issues.push("empty_field_value");
+            }
+            if value
+                .as_deref()
+                .is_some_and(|value| value.chars().count() > MAX_SEMANTIC_FIELD_CHARS)
+            {
+                field_issues.push("field_value_too_long");
+            }
             if supports.is_empty() {
                 field_issues.push("non_null_field_has_no_support");
             }
             if field == "primary_task" && value.as_deref().is_some_and(primary_task_is_generic) {
                 field_issues.push("forbidden_generic_primary_task");
+            }
+            if field == "primary_task" && !request_has_primary_task_basis(packet, request) {
+                field_issues.push("passive_evidence_cannot_establish_primary_task");
             }
             for support in &supports {
                 match request.slots.get(support) {
@@ -886,6 +1450,9 @@ pub(crate) fn admit_output(
                     }
                     Some(slot) if !semantic_support_allowed(field, slot.category) => {
                         field_issues.push("slot_category_not_allowed_for_field")
+                    }
+                    Some(slot) if !slot_chronology_valid(packet, request, slot) => {
+                        field_issues.push("slot_chronology_invalid")
                     }
                     Some(_) => {}
                 }
@@ -904,8 +1471,8 @@ pub(crate) fn admit_output(
                 .support_slots_by_field
                 .insert(field.into(), Vec::new());
             output.confidence_by_field.insert(field.into(), 0.0);
-        } else if let Some(value) = value {
-            set_field_value(&mut output, field, Some(bounded_text(&value, 320)));
+        } else {
+            output.support_slots_by_field.insert(field.into(), supports);
         }
     }
     let admitted_count = SEMANTIC_FIELDS
@@ -922,12 +1489,25 @@ pub(crate) fn admit_output(
     } else {
         ProbeResolutionStatus::PartlyResolved
     };
-    output.missing_evidence = output
+    let mut missing_evidence = output
         .missing_evidence
         .into_iter()
-        .take(8)
-        .map(|note| bounded_text(&note, 240))
-        .collect();
+        .filter(|note| {
+            let valid =
+                !note.trim().is_empty() && note.chars().count() <= MAX_MISSING_EVIDENCE_CHARS;
+            if !valid {
+                issues.push("missing_evidence_entry_invalid".into());
+            }
+            valid
+        })
+        .collect::<Vec<_>>();
+    missing_evidence.sort();
+    missing_evidence.dedup();
+    if missing_evidence.len() > 8 {
+        issues.push("missing_evidence_count_exceeded".into());
+        missing_evidence.truncate(8);
+    }
+    output.missing_evidence = missing_evidence;
     issues.sort();
     issues.dedup();
     (output, issues)
@@ -1015,11 +1595,7 @@ fn estimated_cost(model_name: &str, usage: &ProviderUsageV1) -> Option<f64> {
     // Rechecked against the official model pages on 2026-07-13. Exact
     // environment overrides take precedence so a later proof run cannot
     // silently use a stale price.
-    let documented_rates = match model_name {
-        "gpt-5.6-luna" => Some((1.0, 6.0)),
-        "gpt-5.6-sol" => Some((5.0, 30.0)),
-        _ => None,
-    };
+    let documented_rates = (model_name == DEFAULT_LUNA_MODEL).then_some((1.0, 6.0));
     let input_rate =
         read_rate(&input_key, generic_input).or_else(|| documented_rates.map(|rates| rates.0))?;
     let output_rate =
@@ -1036,6 +1612,29 @@ pub(crate) fn run_probe(
     api_key: Option<&str>,
 ) -> (ProbeAttempt, Option<BTreeMap<String, SupportSlot>>) {
     let started = Instant::now();
+    if model_name != DEFAULT_LUNA_MODEL {
+        return (
+            ProbeAttempt {
+                diagnostic_status: ProbeDiagnosticStatus::RequestNotBuilt,
+                model: model_name.into(),
+                request_id: None,
+                provider_request_id: None,
+                response_id: None,
+                response_model: None,
+                request_audit: None,
+                usage: ProviderUsageV1::default(),
+                estimated_cost_usd: None,
+                latency_ms: started.elapsed().as_millis() as i64,
+                output_bytes: None,
+                parsed_response: false,
+                cited_support_slots_before_admission: BTreeMap::new(),
+                admitted_output: None,
+                validation_issues: Vec::new(),
+                failure_reason: Some("semantic_probe_requires_gpt_5_6_luna".into()),
+            },
+            None,
+        );
+    }
     let request = match build_probe_request(packet, model_name) {
         Ok(request) => request,
         Err((diagnostic_status, failure_reason)) => {
@@ -1183,28 +1782,7 @@ fn runtime_or_compiled(value: Option<String>, compiled: Option<&'static str>) ->
 }
 
 pub(crate) fn configured_model_name() -> String {
-    runtime_or_compiled(
-        std::env::var("SMALLTALK_PFTU_COST_MODEL").ok(),
-        option_env!("SMALLTALK_PFTU_COST_MODEL"),
-    )
-    .or_else(|| {
-        runtime_or_compiled(
-            std::env::var("SMALLTALK_TASK_TRUTH_MODEL").ok(),
-            option_env!("SMALLTALK_TASK_TRUTH_MODEL"),
-        )
-    })
-    .or_else(|| {
-        super::super::project_dotenv_values()
-            .ok()
-            .and_then(|values| {
-                values
-                    .get("SMALLTALK_PFTU_COST_MODEL")
-                    .or_else(|| values.get("SMALLTALK_TASK_TRUTH_MODEL"))
-                    .cloned()
-            })
-    })
-    .filter(|value| !value.trim().is_empty())
-    .unwrap_or_else(|| DEFAULT_LUNA_MODEL.into())
+    DEFAULT_LUNA_MODEL.into()
 }
 
 pub(crate) fn configured_case_id() -> Option<String> {
@@ -1214,18 +1792,39 @@ pub(crate) fn configured_case_id() -> Option<String> {
     )
 }
 
-pub(crate) fn probe_enabled() -> bool {
-    runtime_or_compiled(
-        std::env::var("SMALLTALK_PFTU_SEMANTIC_PROBE_ENABLED").ok(),
-        option_env!("SMALLTALK_PFTU_SEMANTIC_PROBE_ENABLED"),
-    )
-    .as_deref()
-    .is_some_and(|value| {
+fn configured_enabled(value: Option<String>) -> bool {
+    value.as_deref().is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on" | "enabled"
         )
     })
+}
+
+fn probe_mode_enabled(probe: Option<String>, compact_only: Option<String>) -> bool {
+    configured_enabled(probe) || configured_enabled(compact_only)
+}
+
+pub(crate) fn probe_enabled() -> bool {
+    // The compact-only development launcher is a fail-closed guard. It must
+    // never allow a missing or accidentally false ordinary probe flag to send
+    // the legacy full-packet request during a PFTU proof run.
+    probe_mode_enabled(
+        runtime_or_compiled(
+            std::env::var("SMALLTALK_PFTU_SEMANTIC_PROBE_ENABLED").ok(),
+            option_env!("SMALLTALK_PFTU_SEMANTIC_PROBE_ENABLED"),
+        ),
+        runtime_or_compiled(
+            std::env::var("SMALLTALK_PFTU_COMPACT_ONLY").ok(),
+            option_env!("SMALLTALK_PFTU_COMPACT_ONLY"),
+        ),
+    )
+}
+
+/// Prompt 01 is an evidence-boundary proof. Prompt 03 owns the production
+/// authority cutover, so there is deliberately no runtime override here.
+pub(crate) fn public_authority_enabled() -> bool {
+    false
 }
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
@@ -1246,6 +1845,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
            decision_id TEXT NOT NULL,
            session_id TEXT,
            packet_id TEXT NOT NULL,
+           evidence_watermark TEXT NOT NULL DEFAULT '',
            model TEXT NOT NULL,
            diagnostic_status TEXT NOT NULL,
            request_id TEXT,
@@ -1286,6 +1886,24 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "ALTER TABLE task_truth_v2_semantic_probe_runs
              ADD COLUMN cited_support_slots_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let has_evidence_watermark_column = conn
+        .prepare("PRAGMA table_info(task_truth_v2_semantic_probe_runs)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|column| column == "evidence_watermark");
+    if !has_evidence_watermark_column {
+        conn.execute(
+            "ALTER TABLE task_truth_v2_semantic_probe_runs
+             ADD COLUMN evidence_watermark TEXT NOT NULL DEFAULT ''",
             [],
         )
         .map_err(|error| error.to_string())?;
@@ -1433,7 +2051,7 @@ fn persist_attempt(
     );
     conn.execute(
         "INSERT INTO task_truth_v2_semantic_probe_runs (
-           run_id, case_id, decision_id, session_id, packet_id, model,
+           run_id, case_id, decision_id, session_id, packet_id, evidence_watermark, model,
            diagnostic_status, request_id, provider_request_id, response_id,
            response_model, request_audit_json, support_slot_map_json,
            cited_support_slots_json, admitted_output_json, validation_issues_json, failure_reason,
@@ -1441,7 +2059,7 @@ fn persist_attempt(
            latency_ms, output_bytes, parsed_response, created_at_ms
          ) VALUES (
            ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-           ?17,?18,?19,?20,?21,?22,?23,?24,?25
+           ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26
          )",
         params![
             run_id,
@@ -1449,6 +2067,7 @@ fn persist_attempt(
             decision_id,
             session_id,
             packet.packet_id,
+            packet.evidence_watermark,
             attempt.model,
             diagnostic_label(attempt.diagnostic_status),
             attempt.request_id,
@@ -1500,6 +2119,7 @@ pub(crate) fn run_manual_probe(
     decision_id: &str,
     session_id: Option<&str>,
     packet: &ObservationPacketV2,
+    preflight_failure: Option<&str>,
 ) -> Result<(), String> {
     ensure_schema(conn)?;
     let case_id = configured_case_id().ok_or_else(|| "probe_case_id_not_configured".to_string())?;
@@ -1507,7 +2127,43 @@ pub(crate) fn run_manual_probe(
     let now_ms = super::super::current_time_millis();
     validate_expected_timing(armed.expected_recorded_at_ms, now_ms)?;
     let (api_key, model_name) = configured_model()?;
-    let (attempt, slots) = run_probe(packet, &model_name, api_key.as_deref());
+    let (attempt, slots) = if let Some(reason) = preflight_failure {
+        let normalized = reason.to_ascii_lowercase();
+        let diagnostic_status = if normalized.contains("private")
+            || normalized.contains("secure")
+            || normalized.contains("privacy")
+        {
+            ProbeDiagnosticStatus::PrivacyBlocked
+        } else {
+            ProbeDiagnosticStatus::RequestNotBuilt
+        };
+        (
+            ProbeAttempt {
+                diagnostic_status,
+                model: model_name.clone(),
+                request_id: None,
+                provider_request_id: None,
+                response_id: None,
+                response_model: None,
+                request_audit: None,
+                usage: ProviderUsageV1::default(),
+                estimated_cost_usd: None,
+                latency_ms: 0,
+                output_bytes: None,
+                parsed_response: false,
+                cited_support_slots_before_admission: BTreeMap::new(),
+                admitted_output: None,
+                validation_issues: Vec::new(),
+                failure_reason: Some(format!(
+                    "manual_continue_boundary_not_built:{}",
+                    bounded_text(reason, 160)
+                )),
+            },
+            None,
+        )
+    } else {
+        run_probe(packet, &model_name, api_key.as_deref())
+    };
     persist_attempt(
         conn,
         &case_id,
@@ -2085,14 +2741,14 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    fn surface(id: usize) -> ActiveSurfaceIdentityV2 {
+    fn surface(_id: usize) -> ActiveSurfaceIdentityV2 {
         ActiveSurfaceIdentityV2 {
-            app_name: Some(format!("App{id}")),
-            app_bundle_id: Some(format!("com.example.app{id}")),
-            window_title_hash: Some(format!("window-hash-{id}")),
-            window_id: Some(id as i64),
+            app_name: Some("Code Editor".into()),
+            app_bundle_id: Some("com.example.editor".into()),
+            window_title_hash: Some("window-hash-semantic-probe".into()),
+            window_id: Some(44),
             browser_url_hash: None,
-            document_path_hash: Some(format!("document-hash-{id}")),
+            document_path_hash: Some("document-hash-semantic-probe".into()),
         }
     }
 
@@ -2132,7 +2788,7 @@ mod tests {
             bounds: None,
             display_id: Some("display-1".into()),
             window_id: Some(id as i64),
-            owning_app_bundle: Some(format!("com.example.app{id}")),
+            owning_app_bundle: Some("com.example.editor".into()),
             source_scope: Some("active_window".into()),
             ownership_kind: Some("active_window".into()),
             ownership_confidence: Some(0.95),
@@ -2167,7 +2823,7 @@ mod tests {
         CausalEventV2 {
             event_id: format!("event-{id}"),
             event_kind: "typing_commit".into(),
-            observed_at_ms: id as i64 * 1_000 + 100,
+            observed_at_ms: id as i64 * 1_000 - 100,
             frame_id: format!("frame-{id}"),
             source_frame_id: format!("frame-{id}"),
             target_frame_id: Some(format!("frame-{id}")),
@@ -2175,8 +2831,8 @@ mod tests {
             target_region: Some(RegionRoleV2::ComposerEditor),
             focused_element_before: None,
             focused_element_after: Some(format!("element-{id}")),
-            window_id: Some(id as i64),
-            app_bundle_id: Some(format!("com.example.app{id}")),
+            window_id: Some(44),
+            app_bundle_id: Some("com.example.editor".into()),
             pointer_x: None,
             pointer_y: None,
             scroll_delta_x: None,
@@ -2271,12 +2927,35 @@ mod tests {
         }
     }
 
-    fn output(primary: Option<&str>) -> ProbeModelOutput {
+    fn latest_slot(request: &ProbeRequest, category: SupportCategory) -> String {
+        request
+            .slots
+            .values()
+            .filter(|slot| slot.category == category)
+            .max_by_key(|slot| (slot.observed_at_ms, slot.slot.clone()))
+            .unwrap_or_else(|| panic!("missing {category:?} support slot"))
+            .slot
+            .clone()
+    }
+
+    fn output(primary: Option<&str>, request: &ProbeRequest) -> ProbeModelOutput {
         let values = BTreeMap::from([
-            ("primary_task".into(), vec!["B2_IMAGE_AFTER".into()]),
-            ("current_step".into(), vec!["B2_USER_ACTION_1".into()]),
-            ("last_progress".into(), vec!["B2_DELTA_1".into()]),
-            ("unfinished_state".into(), vec!["B2_OBSERVATION_1".into()]),
+            (
+                "primary_task".into(),
+                vec![latest_slot(request, SupportCategory::ImageAfter)],
+            ),
+            (
+                "current_step".into(),
+                vec![latest_slot(request, SupportCategory::UserAction)],
+            ),
+            (
+                "last_progress".into(),
+                vec![latest_slot(request, SupportCategory::Delta)],
+            ),
+            (
+                "unfinished_state".into(),
+                vec![latest_slot(request, SupportCategory::OwnedObservation)],
+            ),
         ]);
         ProbeModelOutput {
             primary_task: primary.map(str::to_string),
@@ -2294,22 +2973,17 @@ mod tests {
     }
 
     #[test]
-    fn probe_selects_two_chronological_boundaries_and_stays_under_size_caps() {
+    fn sufficient_current_boundary_omits_unneeded_prior_context_and_stays_under_size_caps() {
         let request = build_probe_request(&packet(false), "model-a").expect("build request");
-        assert_eq!(request.audit.boundary_count, 2);
-        assert_eq!(request.audit.image_count, 4);
+        assert_eq!(request.audit.boundary_count, 1);
+        assert_eq!(request.audit.image_count, 2);
         assert!(request_size_allowed(
             request.audit.structured_bytes,
             request.audit.estimated_text_tokens
         ));
         assert_eq!(
             request.audit.supplied_image_slots,
-            vec![
-                "B1_IMAGE_BEFORE",
-                "B1_IMAGE_AFTER",
-                "B2_IMAGE_BEFORE",
-                "B2_IMAGE_AFTER"
-            ]
+            vec!["B1_IMAGE_BEFORE", "B1_IMAGE_AFTER"]
         );
         let transported_labels = request
             .body
@@ -2333,6 +3007,274 @@ mod tests {
     }
 
     #[test]
+    fn supplied_log_style_cutoff_excludes_all_eleven_late_events() {
+        let mut packet = packet(false);
+        for index in 0..11 {
+            let mut late = event(4);
+            late.event_id = format!("late-event-{index}");
+            late.observed_at_ms = 4_001 + index;
+            packet.causal_events.push(late);
+        }
+        let mut late_observation = element(4);
+        late_observation.element_id = "late-observation".into();
+        late_observation.changed_at_ms = 4_050;
+        packet.canonical_elements.push(late_observation);
+        let mut future_frame = keyframe(5, false);
+        future_frame.observed_at_ms = 4_100;
+        future_frame.frame_id = "future-frame".into();
+        packet.semantic_keyframes.push(future_frame);
+        let mut late_delta = delta(4);
+        late_delta.delta_id = "late-delta".into();
+        late_delta.next_frame_id = "future-frame".into();
+        packet.frame_changes.push(late_delta);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("build request");
+        assert_eq!(request.audit.final_frame_id, "frame-4");
+        assert_eq!(request.audit.cutoff_observed_at_ms, 4_000);
+        assert_eq!(
+            request
+                .audit
+                .excluded_late_records_by_kind
+                .get("causal_event"),
+            Some(&11)
+        );
+        assert_eq!(
+            request
+                .audit
+                .excluded_late_records_by_kind
+                .get("canonical_observation"),
+            Some(&1)
+        );
+        assert_eq!(
+            request
+                .audit
+                .excluded_late_records_by_kind
+                .get("semantic_delta"),
+            Some(&1)
+        );
+        assert!(request
+            .slots
+            .values()
+            .all(|slot| slot.observed_at_ms <= request.audit.cutoff_observed_at_ms));
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.record_id.starts_with("late-") || slot.record_id == "future-frame"));
+        assert!(request.audit.structured_bytes < 14_046);
+        eprintln!(
+            "compact_cutoff_fixture structured_bytes={} estimated_tokens={} images={} boundaries={}",
+            request.audit.structured_bytes,
+            request.audit.estimated_text_tokens,
+            request.audit.image_count,
+            request.audit.boundary_count
+        );
+    }
+
+    #[test]
+    fn future_target_frame_cannot_pull_an_earlier_event_into_the_request() {
+        let mut packet = packet(false);
+        let mut future_frame = keyframe(5, false);
+        future_frame.observed_at_ms = 4_500;
+        future_frame.frame_id = "future-target".into();
+        packet.semantic_keyframes.push(future_frame);
+        let mut event = event(4);
+        event.event_id = "early-event-with-future-target".into();
+        event.observed_at_ms = 3_950;
+        event.target_frame_id = Some("future-target".into());
+        packet.causal_events.push(event);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("build request");
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.record_id == "early-event-with-future-target"));
+        assert_eq!(
+            request
+                .audit
+                .excluded_late_records_by_kind
+                .get("causal_event"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn passive_accessibility_notifications_never_become_user_action_slots() {
+        let mut packet = packet(false);
+        packet.causal_events.clear();
+        for index in 0..6 {
+            let mut notification = event(4);
+            notification.event_id = format!("notification-{index}");
+            notification.event_kind = "accessibility_focus_notification".into();
+            notification.source = "accessibility".into();
+            notification.observed_at_ms = 3_800 + index;
+            packet.causal_events.push(notification);
+        }
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("build request");
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.category == SupportCategory::UserAction));
+        assert_eq!(
+            request
+                .audit
+                .excluded_nonsemantic_records_by_kind
+                .get("passive_or_no_effect_event"),
+            Some(&6)
+        );
+    }
+
+    #[test]
+    fn duplicates_and_no_effect_scrolls_are_collapsed_before_serialization() {
+        let mut packet = packet(false);
+        let mut duplicate = packet.canonical_elements[3].clone();
+        duplicate.element_id = "duplicate-element".into();
+        duplicate.source_conflicts = vec![
+            "ax_ocr_text_disagreement".into(),
+            "ax_ocr_text_disagreement".into(),
+        ];
+        duplicate.rejection_reasons = vec!["repeated_reason".into(), "repeated_reason".into()];
+        packet.canonical_elements[3].source_conflicts = vec!["ax_ocr_text_disagreement".into()];
+        packet.canonical_elements.push(duplicate);
+        let mut no_op_scroll = event(4);
+        no_op_scroll.event_id = "duplicate-no-op-scroll".into();
+        no_op_scroll.event_kind = "scroll".into();
+        no_op_scroll.semantic_delta_reference = Some("no-op-delta".into());
+        packet.causal_events.push(no_op_scroll);
+        let mut no_op_delta = delta(4);
+        no_op_delta.delta_id = "no-op-delta".into();
+        no_op_delta.no_observable_change = true;
+        no_op_delta.observable_changes.clear();
+        packet.frame_changes.push(no_op_delta);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("build request");
+        assert!(request
+            .audit
+            .deduplication_counts
+            .get("canonical_observation")
+            .is_some_and(|count| *count >= 1));
+        assert!(request
+            .audit
+            .deduplication_counts
+            .get("reason_string")
+            .is_some_and(|count| *count >= 2));
+        assert_eq!(
+            request
+                .slots
+                .values()
+                .filter(|slot| slot.content_hash.as_deref() == Some("text-hash-4"))
+                .count(),
+            1
+        );
+        assert!(!request.slots.values().any(|slot| {
+            slot.record_id == "duplicate-no-op-scroll" || slot.record_id == "no-op-delta"
+        }));
+    }
+
+    #[test]
+    fn current_boundary_preserves_distinct_before_after_and_delta_facts() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        assert!(request.slots.contains_key("B1_IMAGE_BEFORE"));
+        assert!(request.slots.contains_key("B1_IMAGE_AFTER"));
+        assert!(request
+            .slots
+            .values()
+            .any(|slot| slot.category == SupportCategory::Delta));
+        assert_eq!(
+            request.audit.boundary_selection_reasons,
+            vec!["current_manual_boundary"]
+        );
+    }
+
+    #[test]
+    fn thin_current_boundary_adds_one_grounded_earlier_boundary() {
+        let mut packet = packet(false);
+        let current_event = packet
+            .causal_events
+            .iter_mut()
+            .find(|event| event.event_id == "event-4")
+            .expect("current event");
+        current_event.event_kind = "accessibility_focus_notification".into();
+        current_event.source = "accessibility".into();
+        current_event.committed = None;
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        assert_eq!(request.audit.boundary_count, 2);
+        assert_eq!(request.audit.image_count, 3);
+        assert_eq!(
+            request.audit.boundary_selection_reasons,
+            vec!["committed_action_with_result", "current_manual_boundary"]
+        );
+        assert!(request
+            .slots
+            .values()
+            .filter(|slot| slot.boundary_index == 1)
+            .any(|slot| slot.category == SupportCategory::Delta));
+        assert!(!request
+            .slots
+            .values()
+            .filter(|slot| slot.boundary_index == 2)
+            .any(|slot| slot.category == SupportCategory::UserAction));
+    }
+
+    #[test]
+    fn serialized_boundary_slots_are_chronological() {
+        let mut packet = packet(false);
+        let current_event = packet
+            .causal_events
+            .iter_mut()
+            .find(|event| event.event_id == "event-4")
+            .expect("current event");
+        current_event.event_kind = "accessibility_focus_notification".into();
+        current_event.source = "accessibility".into();
+        current_event.committed = None;
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        let structured: Value = serde_json::from_str(structured_text).expect("structured JSON");
+        for boundary in structured
+            .get("boundaries")
+            .and_then(Value::as_array)
+            .expect("boundaries")
+        {
+            let timestamps = boundary
+                .get("slots")
+                .and_then(Value::as_array)
+                .expect("slots")
+                .iter()
+                .map(|slot| {
+                    slot.get("observed_at_ms")
+                        .and_then(Value::as_i64)
+                        .expect("slot timestamp")
+                })
+                .collect::<Vec<_>>();
+            assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+    }
+
+    #[test]
+    fn unrelated_recent_frame_is_not_selected_as_prior_context() {
+        let mut packet = packet(false);
+        let mut unrelated = keyframe(9, false);
+        unrelated.frame_id = "unrelated-recent-frame".into();
+        unrelated.observed_at_ms = 3_500;
+        unrelated.surface_identity.app_bundle_id = Some("com.example.unrelated".into());
+        unrelated.surface_identity.document_path_hash = Some("unrelated-document".into());
+        unrelated.surface_identity.window_title_hash = Some("unrelated-window".into());
+        unrelated.surface_identity.window_id = Some(999);
+        packet.semantic_keyframes.push(unrelated);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.record_id == "unrelated-recent-frame"));
+        assert_eq!(request.audit.boundary_count, 1);
+    }
+
+    #[test]
     fn request_size_limit_accepts_boundary_and_rejects_overflow() {
         assert!(request_size_allowed(
             MAX_TEXT_BYTES,
@@ -2349,16 +3291,89 @@ mod tests {
     }
 
     #[test]
+    fn boundary_image_and_per_category_caps_fail_closed() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        assert!(!request_category_caps_allowed(
+            MAX_BOUNDARIES + 1,
+            request.audit.image_count,
+            &request.slots
+        ));
+        assert!(!request_category_caps_allowed(
+            request.audit.boundary_count,
+            MAX_IMAGES + 1,
+            &request.slots
+        ));
+        let mut overfull_slots = request.slots.clone();
+        let template = overfull_slots
+            .values()
+            .find(|slot| slot.category == SupportCategory::OwnedObservation)
+            .expect("owned observation")
+            .clone();
+        for index in 0..=MAX_OBSERVATIONS_PER_BOUNDARY {
+            let mut extra = template.clone();
+            extra.slot = format!("B{}_EXTRA_OBSERVATION_{index}", template.boundary_index);
+            overfull_slots.insert(extra.slot.clone(), extra);
+        }
+        assert!(!request_category_caps_allowed(
+            request.audit.boundary_count,
+            request.audit.image_count,
+            &overfull_slots
+        ));
+    }
+
+    #[test]
     fn private_current_boundary_is_blocked_before_transport() {
         let error = build_probe_request(&packet(true), "model-a").unwrap_err();
         assert_eq!(error.0, ProbeDiagnosticStatus::PrivacyBlocked);
     }
 
     #[test]
+    fn stale_missing_and_model_ineligible_current_frames_are_typed_failures() {
+        let mut stale = packet(false);
+        stale.observed_at_ms = stale.current_frame.observed_at_ms + 1;
+        let error = build_probe_request(&stale, DEFAULT_LUNA_MODEL).unwrap_err();
+        assert_eq!(error.0, ProbeDiagnosticStatus::RequestNotBuilt);
+        assert_eq!(error.1, "current_frame_stale");
+
+        let mut missing = packet(false);
+        missing.current_frame.frame_id.clear();
+        let error = build_probe_request(&missing, DEFAULT_LUNA_MODEL).unwrap_err();
+        assert_eq!(error.1, "current_frame_missing");
+
+        let mut ineligible = packet(false);
+        ineligible.current_frame.model_eligible = false;
+        let error = build_probe_request(&ineligible, DEFAULT_LUNA_MODEL).unwrap_err();
+        assert_eq!(error.1, "current_frame_model_ineligible");
+    }
+
+    #[test]
+    fn runtime_probe_rejects_every_model_except_luna() {
+        assert_eq!(configured_model_name(), DEFAULT_LUNA_MODEL);
+        assert!(!public_authority_enabled());
+        let (attempt, slots) = run_probe(&packet(false), "gpt-5.6-sol", None);
+        assert_eq!(
+            attempt.diagnostic_status,
+            ProbeDiagnosticStatus::RequestNotBuilt
+        );
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some("semantic_probe_requires_gpt_5_6_luna")
+        );
+        assert!(slots.is_none());
+    }
+
+    #[test]
+    fn compact_only_mode_cannot_fall_back_to_the_legacy_request_path() {
+        assert!(probe_mode_enabled(Some("1".into()), None));
+        assert!(probe_mode_enabled(Some("0".into()), Some("true".into())));
+        assert!(!probe_mode_enabled(Some("0".into()), Some("off".into())));
+    }
+
+    #[test]
     fn foreign_slot_nulls_only_that_field_without_semantic_replacement() {
         let packet = packet(false);
         let request = build_probe_request(&packet, "model-a").expect("build request");
-        let mut output = output(Some("Implement the PFTU semantic probe"));
+        let mut output = output(Some("Implement the PFTU semantic probe"), &request);
         output
             .support_slots_by_field
             .insert("current_step".into(), vec!["FOREIGN_SLOT".into()]);
@@ -2377,7 +3392,7 @@ mod tests {
     fn valid_short_slots_round_trip_without_changing_model_semantics() {
         let packet = packet(false);
         let request = build_probe_request(&packet, "model-a").expect("build request");
-        let generated = output(Some("Implement the PFTU semantic probe"));
+        let generated = output(Some("Implement the PFTU semantic probe"), &request);
         let (admitted, issues) = admit_output(&packet, &request, generated.clone());
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(admitted, generated);
@@ -2411,7 +3426,7 @@ mod tests {
         assert!(schema_slots.contains("B1_IMAGE_BEFORE"));
         assert!(!schema_slots.iter().any(|slot| slot.contains("SURFACE")));
 
-        let mut generated = output(Some("Implement the PFTU semantic probe"));
+        let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
         generated
             .support_slots_by_field
             .insert("primary_task".into(), vec!["B1_IMAGE_BEFORE".into()]);
@@ -2426,18 +3441,23 @@ mod tests {
     #[test]
     fn cited_slots_are_preserved_before_field_level_admission() {
         let packet = packet(false);
-        let request = build_probe_request(&packet, "model-a").expect("build request");
-        let mut generated = output(Some("Implement the PFTU semantic probe"));
+        let mut request = build_probe_request(&packet, "model-a").expect("build request");
+        request
+            .slots
+            .get_mut("B1_IMAGE_BEFORE")
+            .expect("image slot")
+            .category = SupportCategory::SurfaceIdentity;
+        let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
         generated
             .support_slots_by_field
-            .insert("current_step".into(), vec!["B1_SURFACE_1".into()]);
+            .insert("current_step".into(), vec!["B1_IMAGE_BEFORE".into()]);
         let response = json!({"output_text": serde_json::to_string(&generated).unwrap()});
         let (admitted, _, issues, cited_before_admission) =
             parse_probe_response(&packet, &request, &response).expect("parse response");
         assert_eq!(admitted.current_step, None);
         assert_eq!(
             cited_before_admission.get("current_step"),
-            Some(&vec!["B1_SURFACE_1".into()])
+            Some(&vec!["B1_IMAGE_BEFORE".into()])
         );
         assert!(issues
             .iter()
@@ -2452,7 +3472,7 @@ mod tests {
         let (admitted, issues) = admit_output(
             &packet,
             &request,
-            output(Some("Implement the PFTU semantic probe")),
+            output(Some("Implement the PFTU semantic probe"), &request),
         );
         assert_eq!(admitted.unfinished_state, None);
         assert!(issues
@@ -2461,18 +3481,40 @@ mod tests {
     }
 
     #[test]
+    fn slot_round_trip_rejects_chronology_drift_even_when_source_hash_matches() {
+        let packet = packet(false);
+        let mut request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let action_slot = latest_slot(&request, SupportCategory::UserAction);
+        request
+            .slots
+            .get_mut(&action_slot)
+            .expect("user action")
+            .observed_at_ms = request.audit.cutoff_observed_at_ms + 1;
+        let (admitted, issues) = admit_output(
+            &packet,
+            &request,
+            output(Some("Implement the PFTU semantic probe"), &request),
+        );
+        assert_eq!(admitted.current_step, None);
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "current_step:slot_chronology_invalid"));
+    }
+
+    #[test]
     fn privacy_blocked_slot_is_rejected_and_only_its_field_is_nulled() {
         let packet = packet(false);
         let mut request = build_probe_request(&packet, "model-a").expect("build request");
+        let observation_slot = latest_slot(&request, SupportCategory::OwnedObservation);
         request
             .slots
-            .get_mut("B2_OBSERVATION_1")
+            .get_mut(&observation_slot)
             .expect("owned observation slot")
             .privacy_eligible = false;
         let (admitted, issues) = admit_output(
             &packet,
             &request,
-            output(Some("Implement the PFTU semantic probe")),
+            output(Some("Implement the PFTU semantic probe"), &request),
         );
         assert_eq!(admitted.unfinished_state, None);
         assert_eq!(
@@ -2488,7 +3530,8 @@ mod tests {
     fn generic_primary_task_is_rejected_without_local_repair() {
         let packet = packet(false);
         let request = build_probe_request(&packet, "model-a").expect("build request");
-        let (admitted, issues) = admit_output(&packet, &request, output(Some("Editing code")));
+        let (admitted, issues) =
+            admit_output(&packet, &request, output(Some("Editing code"), &request));
         assert_eq!(admitted.primary_task, None);
         assert!(issues
             .iter()
@@ -2496,10 +3539,107 @@ mod tests {
     }
 
     #[test]
+    fn concrete_purpose_with_activity_prefix_is_preserved() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let purpose = "Reviewing the agent output for future-event leakage";
+        let (admitted, issues) = admit_output(&packet, &request, output(Some(purpose), &request));
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(admitted.primary_task.as_deref(), Some(purpose));
+    }
+
+    #[test]
+    fn overlong_semantic_field_is_nulled_instead_of_truncated_or_rewritten() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let overlong = "x".repeat(MAX_SEMANTIC_FIELD_CHARS + 1);
+        let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
+        generated.current_step = Some(overlong);
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert_eq!(admitted.current_step, None);
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "current_step:field_value_too_long"));
+    }
+
+    #[test]
+    fn passive_scrolling_without_visible_objective_admits_no_primary_task() {
+        let mut packet = packet(false);
+        for element in &mut packet.canonical_elements {
+            element.authorship_status = AuthorshipStatusV2::ApplicationOrAgent;
+            element.causal_evidence_refs.clear();
+        }
+        packet.causal_events.clear();
+        let mut scroll = event(4);
+        scroll.event_id = "passive-scroll".into();
+        scroll.event_kind = "scroll".into();
+        scroll.committed = None;
+        scroll.semantic_delta_reference = Some("delta-4".into());
+        packet.causal_events.push(scroll);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let primary_slot = request
+            .slots
+            .values()
+            .find(|slot| {
+                matches!(
+                    slot.category,
+                    SupportCategory::ImageBefore | SupportCategory::ImageAfter
+                )
+            })
+            .expect("image support")
+            .slot
+            .clone();
+        let mut generated = ProbeModelOutput {
+            primary_task: Some("Research the product described on the page".into()),
+            current_step: None,
+            last_progress: None,
+            unfinished_state: None,
+            support_slots_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
+            missing_evidence: Vec::new(),
+            confidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), 0.0))
+                .collect(),
+            status: ProbeResolutionStatus::PartlyResolved,
+        };
+        generated
+            .support_slots_by_field
+            .insert("primary_task".into(), vec![primary_slot]);
+        generated
+            .confidence_by_field
+            .insert("primary_task".into(), 0.9);
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert_eq!(admitted.primary_task, None);
+        assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert!(issues.iter().any(|issue| {
+            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+        }));
+    }
+
+    #[test]
+    fn provider_payload_contains_only_short_slots_and_neutral_boundary_metadata() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        assert!(!structured_text.contains("packet-probe"));
+        assert!(!structured_text.contains("com.example.editor"));
+        assert!(!structured_text.contains("document-hash-semantic-probe"));
+        assert!(!structured_text.contains("SURFACE"));
+        assert!(structured_text.contains("current_manual_boundary"));
+        assert!(request.slots.keys().all(|slot| slot.starts_with('B')));
+    }
+
+    #[test]
     fn parsing_distinguishes_resolved_partial_unresolved_refusal_empty_and_malformed_output() {
         let packet = packet(false);
         let request = build_probe_request(&packet, "model-a").expect("build request");
-        let resolved = json!({"output_text":serde_json::to_string(&output(Some("Implement the PFTU semantic probe"))).unwrap()});
+        let resolved = json!({"output_text":serde_json::to_string(&output(Some("Implement the PFTU semantic probe"), &request)).unwrap()});
         assert_eq!(
             parse_probe_response(&packet, &request, &resolved)
                 .expect("resolved response")
@@ -2508,7 +3648,7 @@ mod tests {
             ProbeResolutionStatus::Resolved
         );
 
-        let mut partial_output = output(Some("Implement the PFTU semantic probe"));
+        let mut partial_output = output(Some("Implement the PFTU semantic probe"), &request);
         partial_output.current_step = None;
         partial_output
             .support_slots_by_field
@@ -2526,7 +3666,7 @@ mod tests {
             ProbeResolutionStatus::PartlyResolved
         );
 
-        let mut unresolved_output = output(None);
+        let mut unresolved_output = output(None, &request);
         unresolved_output.current_step = None;
         unresolved_output.last_progress = None;
         unresolved_output.unfinished_state = None;
@@ -2587,7 +3727,7 @@ mod tests {
 
     #[test]
     fn missing_credentials_is_a_typed_provider_failure_with_no_output() {
-        let (attempt, _) = run_probe(&packet(false), "model-a", None);
+        let (attempt, _) = run_probe(&packet(false), DEFAULT_LUNA_MODEL, None);
         assert_eq!(
             attempt.diagnostic_status,
             ProbeDiagnosticStatus::ProviderUnavailable

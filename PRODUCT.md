@@ -1891,7 +1891,7 @@ If the API fails, the key is missing, parsing fails, or validation fails, the de
 
 Fallback decisions are still cached when their evidence watermark and inference policy match the next normal request. This matters because default micro-inference should not repeatedly attempt network/model work when the same local evidence already produced a validated local fallback.
 
-The decision layer also refuses to present a selected candidate as a clear continuation when there is no human-readable return target. In that case it adds `thin_evidence:no_human_return_target`, lowers confidence, suppresses model handoff output, and returns no-clear-continuation copy rather than exposing internal target metadata.
+The decision layer keeps semantic task understanding separate from target safety. When a model answer exists but there is no human-readable, strictly supported return target, Smalltalk shows the model answer and changes the action to evidence inspection. It does not suppress the paid model response merely because direct opening is unavailable. Internal target metadata remains hidden, and no unsupported app, page, URL, or file is opened.
 
 Micro-inference cannot override the local safety gates. A model choice does not create promotion evidence, restore a feedback-suppressed candidate, make a thin snapshot openable, or turn diagnostic/support evidence into a public target.
 

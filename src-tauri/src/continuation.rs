@@ -21724,6 +21724,33 @@ fn continue_openai_config(model_override: Option<String>) -> Result<ContinueOpen
     Ok(ContinueOpenAiConfig { api_key, model })
 }
 
+/// Controls whether OpenAI keeps Responses API results for later inspection.
+/// Development builds store responses by default so they remain visible and
+/// retrievable in the OpenAI Platform. Release builds remain privacy-first.
+/// `SMALLTALK_OPENAI_STORE_RESPONSES` can explicitly override either default.
+pub(crate) fn openai_response_storage_enabled() -> bool {
+    let configured = std::env::var("SMALLTALK_OPENAI_STORE_RESPONSES")
+        .ok()
+        .or_else(|| {
+            project_dotenv_values()
+                .ok()
+                .and_then(|values| values.get("SMALLTALK_OPENAI_STORE_RESPONSES").cloned())
+        });
+
+    configured
+        .as_deref()
+        .and_then(parse_configured_bool)
+        .unwrap_or(cfg!(debug_assertions))
+}
+
+fn parse_configured_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ContinueOpenAiConfig {
     api_key: Option<String>,
@@ -21754,7 +21781,7 @@ fn build_continue_openai_request(
 ) -> Result<Value, String> {
     Ok(serde_json::json!({
         "model": model,
-        "store": false,
+        "store": openai_response_storage_enabled(),
         "max_output_tokens": 900,
         "text": {
             "format": {

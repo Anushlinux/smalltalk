@@ -970,7 +970,9 @@ private struct SessionIslandView: View {
             return "Support surface seen"
         case .needsRefresh:
             return "Continue needs refresh"
-        case .inspectOnly, .noClearContinuation:
+        case .inspectOnly:
+            return activitySummaryLine ?? currentActivityLine ?? "Continue answer"
+        case .noClearContinuation:
             return taskInferenceUnavailable ? "Task inference unavailable" : "Exact task unavailable"
         case .error:
             return "Continue unavailable"
@@ -991,7 +993,9 @@ private struct SessionIslandView: View {
             return compactUncertainActivityLine ?? "Exact return target is unclear"
         case .needsRefresh:
             return "Newer local evidence is available"
-        case .inspectOnly, .noClearContinuation:
+        case .inspectOnly:
+            return currentActivityLine ?? compactUncertainActivityLine ?? "The answer is available to inspect"
+        case .noClearContinuation:
             return taskInferenceUnavailable
                 ? "Recent activity was captured, but inference failed"
                 : compactUncertainActivityLine ?? "Evidence is available to inspect"

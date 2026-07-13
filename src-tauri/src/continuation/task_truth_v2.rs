@@ -420,21 +420,40 @@ fn record_manual_continue_shadow_with_lookback(
         &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
     )?;
-    if semantic_probe::probe_enabled() {
-        if let Err(error) =
-            semantic_probe::run_manual_probe(conn, decision_id, resolved_session_id, &packet)
-        {
-            // The probe is deliberately outside production authority. A proof-path
-            // failure is persisted when possible and must never make Continue fail.
+    let semantic_probe_owns_attempt = semantic_probe::probe_enabled();
+    let semantic_probe_error = if semantic_probe_owns_attempt {
+        if let Err(error) = semantic_probe::run_manual_probe(
+            conn,
+            decision_id,
+            resolved_session_id,
+            &packet,
+            preflight_failure.as_deref(),
+        ) {
+            // A proof-path failure is persisted when possible and must never
+            // make the rest of Continue fail.
             eprintln!("[pftu_01_probe] {error}");
+            Some(error)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     let capture_to_packet_ms = manual_continue_started_at_ms
         .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
         .unwrap_or_else(|| capture_to_packet_started.elapsed().as_millis() as i64);
     let legacy_turn = super::task_turn::selected_current_task_turn(conn)?;
     let prior_threads = task_thread::load_prior_thread_contexts(conn, resolved_session_id, 6)?;
-    let (verified_snapshot, multimodal_audit) = if let Some(reason) = preflight_failure.as_deref() {
+    let (verified_snapshot, multimodal_audit) = if semantic_probe_owns_attempt {
+        // PFTU is one semantic authority for this explicit Continue boundary.
+        // Its persisted provider answer is projected into the public contract
+        // below. Never spend a second request on the legacy multimodal path and
+        // then replace the first answer with the legacy verifier's fallback.
+        let reason = semantic_probe_error
+            .as_deref()
+            .unwrap_or("pftu_semantic_probe_owns_manual_attempt");
+        (None, unresolved_manual_preflight_audit(reason))
+    } else if let Some(reason) = preflight_failure.as_deref() {
         (None, unresolved_manual_preflight_audit(reason))
     } else {
         run_multimodal_shadow(&packet, prior.as_ref(), &prior_threads)

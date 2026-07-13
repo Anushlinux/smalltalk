@@ -5966,7 +5966,7 @@ function buildTaskTruthProductStateCopy(
   return {
     kind: targetOpenable ? "openable_enriched" : "enriched_not_openable",
     heroLabel: "You were",
-    headline: taskLine || (ambiguous
+    headline: taskLine || currentActivity || stateLine || (ambiguous
       ? "Two tasks are similarly supported"
       : "The current task is supported, but its precise summary is unavailable"),
     targetBlockLabel: targetOpenable ? "Continue at" : inspectCopy.targetBlockLabel,
@@ -5981,7 +5981,9 @@ function buildTaskTruthProductStateCopy(
       ? "Two task hypotheses remain close. Choose the one that matches your work."
       : targetOpenable
         ? ""
-        : "The task is understood, but no strict direct return location is available.",
+        : normalizeToken(answer.inference_status).includes("verification_limits")
+          ? "The model answer is shown, but Smalltalk could not verify it enough to open a location safely."
+          : "The model answer is shown, but no strict direct return location is available.",
     missingEvidenceLines: [],
     statusPills: [],
   };

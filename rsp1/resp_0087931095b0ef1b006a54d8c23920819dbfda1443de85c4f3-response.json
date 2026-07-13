@@ -1,0 +1,2778 @@
+{
+  "id": "resp_0087931095b0ef1b006a54d8c23920819dbfda1443de85c4f3",
+  "object": "response",
+  "created_at": 1783945410,
+  "status": "completed",
+  "background": false,
+  "billing": {
+    "payer": "developer"
+  },
+  "completed_at": 1783945430,
+  "error": null,
+  "frequency_penalty": 0.0,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 6000,
+  "max_tool_calls": null,
+  "model": "gpt-5.6-luna",
+  "moderation": null,
+  "output": [
+    {
+      "id": "rs_0087931095b0ef1b006a54d8c399a0819da4eb1c21f1863cc1",
+      "type": "reasoning",
+      "content": [],
+      "summary": []
+    },
+    {
+      "id": "rs_0087931095b0ef1b006a54d8c7b51c819d90aa8d3c31dbc3e9",
+      "type": "reasoning",
+      "content": [],
+      "summary": []
+    },
+    {
+      "id": "rs_0087931095b0ef1b006a54d8cb9c24819db181922c20f03902",
+      "type": "reasoning",
+      "content": [],
+      "summary": []
+    },
+    {
+      "id": "msg_0087931095b0ef1b006a54d8cd7f54819daf09f25123647071",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "{\"hypotheses\":[{\"app_identity\":\"Helium\",\"claim_evidence\":{\"app_identity\":{\"claim\":\"Helium is the active application.\",\"confidence\":0.99,\"evidence_refs\":[\"evidence_0132\"]},\"current_actor\":{\"claim\":\"User-directed clicks, scrolling, and application switches occurred.\",\"confidence\":0.94,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"current_subtask\":{\"claim\":\"Inspecting request construction, storage behavior, and API endpoint guidance.\",\"confidence\":0.91,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0124\",\"evidence_0125\",\"evidence_0128\"]},\"document_or_thread_identity_hash\":{\"claim\":\"The active browser document is identified by the current browser URL hash.\",\"confidence\":0.95,\"evidence_refs\":[\"evidence_0135\"]},\"execution_state\":{\"claim\":\"Reviewing.\",\"confidence\":0.92,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"immediate_user_operation\":{\"claim\":\"Clicked and scrolled the main content, then switched applications; detected typing was uncommitted.\",\"confidence\":0.9,\"evidence_refs\":[\"evidence_0115\",\"evidence_0118\",\"evidence_0123\",\"evidence_0128\",\"evidence_0129\",\"evidence_0130\"]},\"last_meaningful_progress\":{\"claim\":\"The Logs view and adjacent chat reached guidance about request construction, storage flags, and Responses API endpoint verification.\",\"confidence\":0.9,\"evidence_refs\":[\"evidence_0132\",\"evidence_0137\"]},\"likely_primary_task\":{\"claim\":\"Reviewing Logs and chat guidance for API request and storage behavior.\",\"confidence\":0.9,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\",\"evidence_0130\"]},\"observed_surface\":{\"claim\":\"Helium displays a Logs Responses list beside a chat discussing request construction, storage settings, and Responses API verification.\",\"confidence\":0.97,\"evidence_refs\":[\"evidence_0132\"]},\"possible_next_action\":null,\"relationship_to_prior\":{\"claim\":\"A new activity replaces the prior browser-page review hypothesis; the current Logs/chat inspection does not continue the MCP community-page review.\",\"confidence\":0.88,\"evidence_refs\":[\"evidence_0133\",\"evidence_0134\",\"evidence_0118\",\"evidence_0137\"]},\"semantic_effect_of_operation\":{\"claim\":\"The active surface changed to the Logs and chat inspection view, with new content appearing after the transition.\",\"confidence\":0.95,\"evidence_refs\":[\"evidence_0137\"]},\"surface_identity_hash\":{\"claim\":\"The active Helium surface has the recorded opaque surface identity.\",\"confidence\":0.99,\"evidence_refs\":[\"evidence_0132\"]},\"task_object\":null,\"unfinished_state\":{\"claim\":\"The Logs and chat material remains open for continued inspection of request construction and API behavior.\",\"confidence\":0.88,\"evidence_refs\":[\"evidence_0132\",\"evidence_0137\"]},\"waiting_on\":null},\"confidence\":0.92,\"confidence_by_field\":{\"app_identity\":0.99,\"current_actor\":0.94,\"current_subtask\":0.91,\"document_or_thread_identity_hash\":0.95,\"execution_state\":0.92,\"immediate_user_operation\":0.9,\"last_meaningful_progress\":0.9,\"likely_primary_task\":0.9,\"observed_surface\":0.97,\"possible_next_action\":1,\"relationship_to_prior\":0.88,\"semantic_effect_of_operation\":0.95,\"surface_identity_hash\":0.99,\"task_object\":1,\"unfinished_state\":0.88,\"waiting_on\":1},\"continuity_identity_token\":null,\"continuity_thread_id\":null,\"continuity_thread_revision\":null,\"contradictions\":[{\"evidence_refs\":[\"evidence_0133\",\"evidence_0134\",\"evidence_0137\"],\"field\":\"relationship_to_prior\",\"reason\":\"The prior thread concerned reviewing an MCP community page, while the current surface concerns Logs and API behavior.\"}],\"current_actor\":\"user\",\"current_subtask\":\"Inspecting request construction, storage behavior, and API endpoint guidance.\",\"document_or_thread_identity_hash\":\"62b2660192df9253\",\"execution_state\":\"reviewing\",\"hypothesis_id\":\"current-logs-api-review\",\"immediate_user_operation\":\"Clicked and scrolled the main content, then switched applications; detected typing was uncommitted.\",\"last_meaningful_progress\":\"The Logs view and adjacent chat reached guidance about request construction, storage flags, and Responses API endpoint verification.\",\"likely_primary_task\":\"Reviewing Logs and chat guidance for API request and storage behavior.\",\"observed_surface\":\"Helium displays a Logs Responses list beside a chat discussing request construction, storage settings, and Responses API verification.\",\"possible_next_action\":null,\"relationship_to_prior\":\"new_task\",\"return_anchor_record_id\":null,\"semantic_effect_of_operation\":\"The active surface changed to the Logs and chat inspection view, with new content appearing after the transition.\",\"supersedes_thread_id\":null,\"surface_identity_hash\":\"13d8c187e66cfa13\",\"task_object\":null,\"unfinished_state\":\"The Logs and chat material remains open for continued inspection of request construction and API behavior.\",\"waiting_on\":null},{\"app_identity\":\"Helium\",\"claim_evidence\":{\"app_identity\":{\"claim\":\"Helium is the active application.\",\"confidence\":0.99,\"evidence_refs\":[\"evidence_0132\"]},\"current_actor\":{\"claim\":\"User-directed clicks, scrolling, and application switches occurred.\",\"confidence\":0.94,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"current_subtask\":{\"claim\":\"Inspecting request construction, storage behavior, and API endpoint guidance.\",\"confidence\":0.82,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"document_or_thread_identity_hash\":{\"claim\":\"The active browser document is identified by the current browser URL hash.\",\"confidence\":0.95,\"evidence_refs\":[\"evidence_0135\"]},\"execution_state\":{\"claim\":\"Reviewing.\",\"confidence\":0.9,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"immediate_user_operation\":{\"claim\":\"Clicked and scrolled the main content, then switched applications.\",\"confidence\":0.9,\"evidence_refs\":[\"evidence_0115\",\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"last_meaningful_progress\":{\"claim\":\"The Logs view and adjacent chat reached guidance about request construction, storage flags, and Responses API endpoint verification.\",\"confidence\":0.86,\"evidence_refs\":[\"evidence_0132\",\"evidence_0137\"]},\"likely_primary_task\":{\"claim\":\"Reviewing Logs and chat guidance for API request and storage behavior.\",\"confidence\":0.84,\"evidence_refs\":[\"evidence_0118\",\"evidence_0123\",\"evidence_0128\"]},\"observed_surface\":{\"claim\":\"Helium displays a Logs Responses list beside a chat discussing request construction, storage settings, and Responses API verification.\",\"confidence\":0.97,\"evidence_refs\":[\"evidence_0132\"]},\"possible_next_action\":null,\"relationship_to_prior\":{\"claim\":\"The current activity is unrelated to the bounded prior MCP community-page review hypothesis.\",\"confidence\":0.78,\"evidence_refs\":[\"evidence_0133\",\"evidence_0134\",\"evidence_0137\"]},\"semantic_effect_of_operation\":{\"claim\":\"The active surface changed to the Logs and chat inspection view, with new content appearing after the transition.\",\"confidence\":0.95,\"evidence_refs\":[\"evidence_0137\"]},\"surface_identity_hash\":{\"claim\":\"The active Helium surface has the recorded opaque surface identity.\",\"confidence\":0.99,\"evidence_refs\":[\"evidence_0132\"]},\"task_object\":null,\"unfinished_state\":{\"claim\":\"The Logs and chat material remains open for continued inspection.\",\"confidence\":0.82,\"evidence_refs\":[\"evidence_0132\",\"evidence_0137\"]},\"waiting_on\":null},\"confidence\":0.8,\"confidence_by_field\":{\"app_identity\":0.99,\"current_actor\":0.94,\"current_subtask\":0.82,\"document_or_thread_identity_hash\":0.95,\"execution_state\":0.9,\"immediate_user_operation\":0.9,\"last_meaningful_progress\":0.86,\"likely_primary_task\":0.84,\"observed_surface\":0.97,\"possible_next_action\":1,\"relationship_to_prior\":0.78,\"semantic_effect_of_operation\":0.95,\"surface_identity_hash\":0.99,\"task_object\":1,\"unfinished_state\":0.82,\"waiting_on\":1},\"continuity_identity_token\":null,\"continuity_thread_id\":null,\"continuity_thread_revision\":null,\"contradictions\":[],\"current_actor\":\"user\",\"current_subtask\":\"Inspecting request construction, storage behavior, and API endpoint guidance.\",\"document_or_thread_identity_hash\":\"62b2660192df9253\",\"execution_state\":\"reviewing\",\"hypothesis_id\":\"unrelated-logs-api-review\",\"immediate_user_operation\":\"Clicked and scrolled the main content, then switched applications.\",\"last_meaningful_progress\":\"The Logs view and adjacent chat reached guidance about request construction, storage flags, and Responses API endpoint verification.\",\"likely_primary_task\":\"Reviewing Logs and chat guidance for API request and storage behavior.\",\"observed_surface\":\"Helium displays a Logs Responses list beside a chat discussing request construction, storage settings, and Responses API verification.\",\"possible_next_action\":null,\"relationship_to_prior\":\"unrelated_or_unknown\",\"return_anchor_record_id\":null,\"semantic_effect_of_operation\":\"The active surface changed to the Logs and chat inspection view, with new content appearing after the transition.\",\"supersedes_thread_id\":null,\"surface_identity_hash\":\"13d8c187e66cfa13\",\"task_object\":null,\"unfinished_state\":\"The Logs and chat material remains open for continued inspection.\",\"waiting_on\":null}],\"missing_evidence\":[\"No task object is grounded by the selected evidence.\",\"No user-authored plan key supports a next action.\",\"No waiting party is grounded.\"],\"policy_notes\":[\"Detected typing bursts lack a focused editable element and are marked uncommitted.\",\"Passive chat and Logs text support the review topic but do not establish a specific implementation action.\"],\"resolution_status\":\"ambiguous\",\"schema\":\"smalltalk.task_truth_model_output.v2\"}"
+        }
+      ],
+      "phase": "final_answer",
+      "role": "assistant"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "presence_penalty": 0.0,
+  "previous_response_id": null,
+  "prompt_cache_key": null,
+  "prompt_cache_retention": "24h",
+  "reasoning": {
+    "context": "all_turns",
+    "effort": "medium",
+    "mode": "standard",
+    "summary": null
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "store": true,
+  "temperature": 1.0,
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "description": null,
+      "name": "smalltalk_task_truth_resolution",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "hypotheses": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_identity": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "Helium",
+                        "net.imput.helium"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "claim_evidence": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "app_identity": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "current_actor": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "current_subtask": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "document_or_thread_identity_hash": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "execution_state": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "immediate_user_operation": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "last_meaningful_progress": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "likely_primary_task": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "observed_surface": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "possible_next_action": {
+                      "type": "null"
+                    },
+                    "relationship_to_prior": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "semantic_effect_of_operation": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0136",
+                                  "evidence_0137"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "surface_identity_hash": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "task_object": {
+                      "type": "null"
+                    },
+                    "unfinished_state": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "waiting_on": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "claim": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "confidence": {
+                              "maximum": 1,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "evidence_refs": {
+                              "items": {
+                                "enum": [
+                                  "evidence_0001",
+                                  "evidence_0002",
+                                  "evidence_0003",
+                                  "evidence_0004",
+                                  "evidence_0005",
+                                  "evidence_0006",
+                                  "evidence_0007",
+                                  "evidence_0008",
+                                  "evidence_0009",
+                                  "evidence_0010",
+                                  "evidence_0011",
+                                  "evidence_0012",
+                                  "evidence_0013",
+                                  "evidence_0014",
+                                  "evidence_0015",
+                                  "evidence_0016",
+                                  "evidence_0017",
+                                  "evidence_0018",
+                                  "evidence_0019",
+                                  "evidence_0020",
+                                  "evidence_0021",
+                                  "evidence_0022",
+                                  "evidence_0023",
+                                  "evidence_0024",
+                                  "evidence_0025",
+                                  "evidence_0026",
+                                  "evidence_0027",
+                                  "evidence_0028",
+                                  "evidence_0029",
+                                  "evidence_0030",
+                                  "evidence_0031",
+                                  "evidence_0032",
+                                  "evidence_0033",
+                                  "evidence_0034",
+                                  "evidence_0035",
+                                  "evidence_0036",
+                                  "evidence_0037",
+                                  "evidence_0038",
+                                  "evidence_0039",
+                                  "evidence_0040",
+                                  "evidence_0041",
+                                  "evidence_0042",
+                                  "evidence_0043",
+                                  "evidence_0044",
+                                  "evidence_0045",
+                                  "evidence_0046",
+                                  "evidence_0047",
+                                  "evidence_0048",
+                                  "evidence_0049",
+                                  "evidence_0050",
+                                  "evidence_0051",
+                                  "evidence_0052",
+                                  "evidence_0053",
+                                  "evidence_0054",
+                                  "evidence_0055",
+                                  "evidence_0056",
+                                  "evidence_0057",
+                                  "evidence_0058",
+                                  "evidence_0059",
+                                  "evidence_0060",
+                                  "evidence_0061",
+                                  "evidence_0062",
+                                  "evidence_0063",
+                                  "evidence_0064",
+                                  "evidence_0065",
+                                  "evidence_0066",
+                                  "evidence_0067",
+                                  "evidence_0068",
+                                  "evidence_0069",
+                                  "evidence_0070",
+                                  "evidence_0071",
+                                  "evidence_0072",
+                                  "evidence_0073",
+                                  "evidence_0074",
+                                  "evidence_0075",
+                                  "evidence_0076",
+                                  "evidence_0077",
+                                  "evidence_0078",
+                                  "evidence_0079",
+                                  "evidence_0080",
+                                  "evidence_0081",
+                                  "evidence_0082",
+                                  "evidence_0083",
+                                  "evidence_0084",
+                                  "evidence_0085",
+                                  "evidence_0086",
+                                  "evidence_0087",
+                                  "evidence_0088",
+                                  "evidence_0089",
+                                  "evidence_0090",
+                                  "evidence_0091",
+                                  "evidence_0092",
+                                  "evidence_0093",
+                                  "evidence_0094",
+                                  "evidence_0095",
+                                  "evidence_0096",
+                                  "evidence_0097",
+                                  "evidence_0098",
+                                  "evidence_0099",
+                                  "evidence_0100",
+                                  "evidence_0101",
+                                  "evidence_0102",
+                                  "evidence_0103",
+                                  "evidence_0104",
+                                  "evidence_0105",
+                                  "evidence_0106",
+                                  "evidence_0107",
+                                  "evidence_0108",
+                                  "evidence_0109",
+                                  "evidence_0110",
+                                  "evidence_0111",
+                                  "evidence_0112",
+                                  "evidence_0113",
+                                  "evidence_0114",
+                                  "evidence_0115",
+                                  "evidence_0116",
+                                  "evidence_0117",
+                                  "evidence_0118",
+                                  "evidence_0119",
+                                  "evidence_0120",
+                                  "evidence_0121",
+                                  "evidence_0122",
+                                  "evidence_0123",
+                                  "evidence_0124",
+                                  "evidence_0125",
+                                  "evidence_0126",
+                                  "evidence_0127",
+                                  "evidence_0128",
+                                  "evidence_0129",
+                                  "evidence_0130",
+                                  "evidence_0131",
+                                  "evidence_0132",
+                                  "evidence_0133",
+                                  "evidence_0134",
+                                  "evidence_0135",
+                                  "evidence_0136",
+                                  "evidence_0137",
+                                  "evidence_0138",
+                                  "evidence_0139"
+                                ],
+                                "type": "string"
+                              },
+                              "maxItems": 8,
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "claim",
+                            "evidence_refs",
+                            "confidence"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "observed_surface",
+                    "immediate_user_operation",
+                    "semantic_effect_of_operation",
+                    "current_subtask",
+                    "likely_primary_task",
+                    "task_object",
+                    "app_identity",
+                    "surface_identity_hash",
+                    "document_or_thread_identity_hash",
+                    "execution_state",
+                    "current_actor",
+                    "waiting_on",
+                    "last_meaningful_progress",
+                    "unfinished_state",
+                    "possible_next_action",
+                    "relationship_to_prior"
+                  ],
+                  "type": "object"
+                },
+                "confidence": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "confidence_by_field": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "app_identity": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "current_actor": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "current_subtask": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "document_or_thread_identity_hash": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "execution_state": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "immediate_user_operation": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "last_meaningful_progress": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "likely_primary_task": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "observed_surface": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "possible_next_action": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "relationship_to_prior": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "semantic_effect_of_operation": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "surface_identity_hash": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "task_object": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "unfinished_state": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "waiting_on": {
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "observed_surface",
+                    "immediate_user_operation",
+                    "semantic_effect_of_operation",
+                    "current_subtask",
+                    "likely_primary_task",
+                    "task_object",
+                    "app_identity",
+                    "surface_identity_hash",
+                    "document_or_thread_identity_hash",
+                    "execution_state",
+                    "current_actor",
+                    "waiting_on",
+                    "last_meaningful_progress",
+                    "unfinished_state",
+                    "possible_next_action",
+                    "relationship_to_prior"
+                  ],
+                  "type": "object"
+                },
+                "continuity_identity_token": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "thread-identity-ec4216077e4c4a84"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "continuity_thread_id": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "task-thread-1defae7d7666a5d4"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "continuity_thread_revision": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        10
+                      ],
+                      "type": "integer"
+                    }
+                  ]
+                },
+                "contradictions": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "evidence_refs": {
+                        "items": {
+                          "enum": [
+                            "evidence_0001",
+                            "evidence_0002",
+                            "evidence_0003",
+                            "evidence_0004",
+                            "evidence_0005",
+                            "evidence_0006",
+                            "evidence_0007",
+                            "evidence_0008",
+                            "evidence_0009",
+                            "evidence_0010",
+                            "evidence_0011",
+                            "evidence_0012",
+                            "evidence_0013",
+                            "evidence_0014",
+                            "evidence_0015",
+                            "evidence_0016",
+                            "evidence_0017",
+                            "evidence_0018",
+                            "evidence_0019",
+                            "evidence_0020",
+                            "evidence_0021",
+                            "evidence_0022",
+                            "evidence_0023",
+                            "evidence_0024",
+                            "evidence_0025",
+                            "evidence_0026",
+                            "evidence_0027",
+                            "evidence_0028",
+                            "evidence_0029",
+                            "evidence_0030",
+                            "evidence_0031",
+                            "evidence_0032",
+                            "evidence_0033",
+                            "evidence_0034",
+                            "evidence_0035",
+                            "evidence_0036",
+                            "evidence_0037",
+                            "evidence_0038",
+                            "evidence_0039",
+                            "evidence_0040",
+                            "evidence_0041",
+                            "evidence_0042",
+                            "evidence_0043",
+                            "evidence_0044",
+                            "evidence_0045",
+                            "evidence_0046",
+                            "evidence_0047",
+                            "evidence_0048",
+                            "evidence_0049",
+                            "evidence_0050",
+                            "evidence_0051",
+                            "evidence_0052",
+                            "evidence_0053",
+                            "evidence_0054",
+                            "evidence_0055",
+                            "evidence_0056",
+                            "evidence_0057",
+                            "evidence_0058",
+                            "evidence_0059",
+                            "evidence_0060",
+                            "evidence_0061",
+                            "evidence_0062",
+                            "evidence_0063",
+                            "evidence_0064",
+                            "evidence_0065",
+                            "evidence_0066",
+                            "evidence_0067",
+                            "evidence_0068",
+                            "evidence_0069",
+                            "evidence_0070",
+                            "evidence_0071",
+                            "evidence_0072",
+                            "evidence_0073",
+                            "evidence_0074",
+                            "evidence_0075",
+                            "evidence_0076",
+                            "evidence_0077",
+                            "evidence_0078",
+                            "evidence_0079",
+                            "evidence_0080",
+                            "evidence_0081",
+                            "evidence_0082",
+                            "evidence_0083",
+                            "evidence_0084",
+                            "evidence_0085",
+                            "evidence_0086",
+                            "evidence_0087",
+                            "evidence_0088",
+                            "evidence_0089",
+                            "evidence_0090",
+                            "evidence_0091",
+                            "evidence_0092",
+                            "evidence_0093",
+                            "evidence_0094",
+                            "evidence_0095",
+                            "evidence_0096",
+                            "evidence_0097",
+                            "evidence_0098",
+                            "evidence_0099",
+                            "evidence_0100",
+                            "evidence_0101",
+                            "evidence_0102",
+                            "evidence_0103",
+                            "evidence_0104",
+                            "evidence_0105",
+                            "evidence_0106",
+                            "evidence_0107",
+                            "evidence_0108",
+                            "evidence_0109",
+                            "evidence_0110",
+                            "evidence_0111",
+                            "evidence_0112",
+                            "evidence_0113",
+                            "evidence_0114",
+                            "evidence_0115",
+                            "evidence_0116",
+                            "evidence_0117",
+                            "evidence_0118",
+                            "evidence_0119",
+                            "evidence_0120",
+                            "evidence_0121",
+                            "evidence_0122",
+                            "evidence_0123",
+                            "evidence_0124",
+                            "evidence_0125",
+                            "evidence_0126",
+                            "evidence_0127",
+                            "evidence_0128",
+                            "evidence_0129",
+                            "evidence_0130",
+                            "evidence_0131",
+                            "evidence_0132",
+                            "evidence_0133",
+                            "evidence_0134",
+                            "evidence_0135",
+                            "evidence_0136",
+                            "evidence_0137",
+                            "evidence_0138",
+                            "evidence_0139"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 8,
+                        "type": "array"
+                      },
+                      "field": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "field",
+                      "reason",
+                      "evidence_refs"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 12,
+                  "type": "array"
+                },
+                "current_actor": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "user",
+                        "assistant_or_agent",
+                        "application",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "current_subtask": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 140,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "document_or_thread_identity_hash": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "62b2660192df9253"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "execution_state": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "active",
+                        "composing",
+                        "editing",
+                        "reviewing",
+                        "waiting",
+                        "debugging",
+                        "searching",
+                        "comparing",
+                        "blocked",
+                        "interrupted",
+                        "suspended",
+                        "completed",
+                        "superseded",
+                        "idle_after_progress",
+                        "unclear"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "hypothesis_id": {
+                  "type": "string"
+                },
+                "immediate_user_operation": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 180,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "last_meaningful_progress": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 220,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "likely_primary_task": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 140,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "observed_surface": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 240,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "possible_next_action": {
+                  "type": "null"
+                },
+                "relationship_to_prior": {
+                  "enum": [
+                    "continuation",
+                    "supporting_research",
+                    "verification",
+                    "temporary_detour",
+                    "interruption",
+                    "new_task",
+                    "return_to_prior_task",
+                    "unrelated_or_unknown"
+                  ],
+                  "type": "string"
+                },
+                "return_anchor_record_id": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "414:browser_url"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "semantic_effect_of_operation": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 180,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "supersedes_thread_id": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "task-thread-1defae7d7666a5d4"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "surface_identity_hash": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "13d8c187e66cfa13"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                },
+                "task_object": {
+                  "type": "null"
+                },
+                "unfinished_state": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 220,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "waiting_on": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "user",
+                        "assistant_or_agent",
+                        "application",
+                        "external",
+                        "nothing",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "hypothesis_id",
+                "observed_surface",
+                "immediate_user_operation",
+                "semantic_effect_of_operation",
+                "current_subtask",
+                "likely_primary_task",
+                "task_object",
+                "app_identity",
+                "surface_identity_hash",
+                "document_or_thread_identity_hash",
+                "execution_state",
+                "current_actor",
+                "waiting_on",
+                "last_meaningful_progress",
+                "unfinished_state",
+                "possible_next_action",
+                "relationship_to_prior",
+                "continuity_thread_id",
+                "continuity_thread_revision",
+                "continuity_identity_token",
+                "supersedes_thread_id",
+                "return_anchor_record_id",
+                "claim_evidence",
+                "contradictions",
+                "confidence_by_field",
+                "confidence"
+              ],
+              "type": "object"
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "missing_evidence": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "type": "array"
+          },
+          "policy_notes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "type": "array"
+          },
+          "resolution_status": {
+            "enum": [
+              "resolved",
+              "ambiguous",
+              "insufficient_evidence",
+              "privacy_blocked",
+              "model_unavailable",
+              "provider_failure",
+              "invalid_response",
+              "verification_rejected"
+            ],
+            "type": "string"
+          },
+          "schema": {
+            "enum": [
+              "smalltalk.task_truth_model_output.v2"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "resolution_status",
+          "hypotheses",
+          "missing_evidence",
+          "policy_notes"
+        ],
+        "type": "object"
+      },
+      "strict": true
+    },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tool_usage": {
+    "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 0
+      },
+      "total_tokens": 0
+    },
+    "web_search": {
+      "num_requests": 0
+    }
+  },
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 0.98,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 53301,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+    },
+    "output_tokens": 3455,
+    "output_tokens_details": {
+      "reasoning_tokens": 1261
+    },
+    "total_tokens": 56756
+  },
+  "user": null,
+  "metadata": {}
+}

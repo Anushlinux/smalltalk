@@ -9173,7 +9173,7 @@ fn build_openai_resume_request(
 
     Ok(serde_json::json!({
         "model": model,
-        "store": false,
+        "store": crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens": 2400,
         "text": {
             "format": {
@@ -31745,7 +31745,10 @@ mod tests {
         let request = build_openai_resume_request("gpt-test", &result, None).unwrap();
         let request_json = serde_json::to_string(&request).unwrap();
 
-        assert_eq!(request.get("store").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            request.get("store").and_then(Value::as_bool),
+            Some(crate::continuation::openai_response_storage_enabled())
+        );
         assert_eq!(
             request
                 .get("text")
