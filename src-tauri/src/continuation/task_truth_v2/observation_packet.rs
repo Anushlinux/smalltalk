@@ -9,6 +9,7 @@ use super::super::{
 
 pub(crate) const OBSERVATION_PACKET_SCHEMA_V2: &str = "smalltalk.observation_packet.v2";
 const MAX_KEYFRAMES: usize = 4;
+const MAX_SURFACE_VISITS: usize = 8;
 const MAX_ELEMENTS: usize = 160;
 const MAX_CAUSAL_EVENTS: usize = 96;
 const MAX_NOTES: usize = 32;
@@ -140,6 +141,23 @@ pub(crate) struct KeyframeReferenceV2 {
     pub(crate) selection_reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SurfaceVisitV2 {
+    pub(crate) sequence_index: usize,
+    pub(crate) app_label: String,
+    pub(crate) site_hostname: Option<String>,
+    pub(crate) first_observed_at_ms: i64,
+    pub(crate) last_observed_at_ms: i64,
+    pub(crate) is_current: bool,
+    pub(crate) revisited: bool,
+    pub(crate) private: bool,
+    pub(crate) interaction_count: usize,
+    pub(crate) frame_count: usize,
+    pub(crate) engagement_score: i64,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) representative_frame: Option<KeyframeReferenceV2>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ActiveSurfaceIdentityV2 {
     pub(crate) app_name: Option<String>,
@@ -235,6 +253,8 @@ pub(crate) struct ObservationPacketV2 {
     pub(crate) active_surface: ActiveSurfaceIdentityV2,
     pub(crate) current_frame: KeyframeReferenceV2,
     pub(crate) semantic_keyframes: Vec<KeyframeReferenceV2>,
+    #[serde(default)]
+    pub(crate) surface_timeline: Vec<SurfaceVisitV2>,
     pub(crate) canonical_elements: Vec<CanonicalElementV2>,
     pub(crate) focused_element_ids: Vec<String>,
     pub(crate) editable_element_ids: Vec<String>,
@@ -455,10 +475,36 @@ fn is_diagnostic_surface(frame: &EvidenceFrame) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     let app = frame.app_name.as_deref().unwrap_or("").to_ascii_lowercase();
-    bundle == "com.openai.codex"
-        || bundle == "com.smalltalk.app"
-        || app == "smalltalk"
-        || app == "chatgpt"
+    // Codex is sometimes used to diagnose Smalltalk, but it is also a normal
+    // user workspace. Only Smalltalk's own UI is categorically self-evidence.
+    bundle == "com.smalltalk.app" || app == "smalltalk"
+}
+
+fn event_matches_frame_surface(
+    frame: &EvidenceFrame,
+    event: &super::super::EvidenceUiEvent,
+) -> bool {
+    let frame_bundle = frame
+        .app_bundle_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let event_bundle = event
+        .app_bundle_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(frame_bundle), Some(event_bundle)) = (frame_bundle, event_bundle) {
+        if !frame_bundle.eq_ignore_ascii_case(event_bundle) {
+            return false;
+        }
+    }
+    if let (Some(frame_window), Some(event_window)) = (frame.window_id, event.window_id) {
+        if frame_window != event_window {
+            return false;
+        }
+    }
+    true
 }
 
 fn has_structured_work_surface_evidence(frame: &EvidenceFrame) -> bool {
@@ -469,6 +515,35 @@ fn has_structured_work_surface_evidence(frame: &EvidenceFrame) -> bool {
                 || context.repo_path.is_some()
                 || context.focused_object.is_some()
         })
+}
+
+fn browser_origin_key(frame: &EvidenceFrame) -> Option<String> {
+    let raw = frame.browser_url.as_deref()?.trim();
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority)
+    }
+}
+
+fn frame_has_visual(frame: &EvidenceFrame) -> bool {
+    frame
+        .active_window_crop_path
+        .as_deref()
+        .or(frame.full_screenshot_path.as_deref())
+        .is_some_and(|path| !path.trim().is_empty())
 }
 
 fn boundary_reasons(frame: &EvidenceFrame) -> Vec<String> {
@@ -489,7 +564,11 @@ fn boundary_reasons(frame: &EvidenceFrame) -> Vec<String> {
             reasons.insert(reason.to_string());
         }
     }
-    for event in &frame.ui_events {
+    for event in frame
+        .ui_events
+        .iter()
+        .filter(|event| event_matches_frame_surface(frame, event))
+    {
         let kind = event.event_type.to_ascii_lowercase();
         if kind.contains("switch") || kind.contains("focus") {
             reasons.insert("surface_switch_boundary".into());
@@ -600,6 +679,50 @@ fn select_keyframes(
             vec!["reserved_recent_structured_support_surface".into()],
         ));
     }
+    // Browser activity often contains a short detour with several pages on
+    // the same app/window. Reserve the most recent different origin and the
+    // first frame on the current origin after it. Otherwise four newer pages
+    // from the detour can crowd the task-bearing page out of the packet before
+    // request-time boundary selection has a chance to inspect it.
+    if selected.len() < MAX_KEYFRAMES {
+        if let (Some(current), Some(current_origin)) =
+            (frames.last(), frames.last().and_then(browser_origin_key))
+        {
+            if let Some(context) = frames.iter().rev().find(|frame| {
+                frame.id != current.id
+                    && !is_private_status(frame.privacy_status.as_deref())
+                    && !is_diagnostic_surface(frame)
+                    && frame_has_visual(frame)
+                    && browser_origin_key(frame).is_some_and(|origin| origin != current_origin)
+            }) {
+                if !selected.iter().any(|item| item.frame_id == context.id) {
+                    selected.push(keyframe_reference(
+                        context,
+                        EvidencePartitionV2::Support,
+                        vec!["reserved_recent_distinct_browser_origin".into()],
+                    ));
+                }
+                if selected.len() < MAX_KEYFRAMES {
+                    if let Some(entry) = frames.iter().find(|frame| {
+                        frame.captured_at > context.captured_at
+                            && frame.id != current.id
+                            && browser_origin_key(frame).as_deref() == Some(current_origin.as_str())
+                    }) {
+                        if !selected.iter().any(|item| item.frame_id == entry.id) {
+                            selected.push(keyframe_reference(
+                                entry,
+                                partitions
+                                    .get(&entry.id)
+                                    .copied()
+                                    .unwrap_or(EvidencePartitionV2::Prior),
+                                vec!["entry_to_current_browser_origin".into()],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     for (frame, mut reasons, _) in scored {
         if selected.len() >= MAX_KEYFRAMES {
             break;
@@ -640,6 +763,209 @@ fn select_keyframes(
     }
     selected.sort_by_key(|item| (item.observed_at_ms, item.frame_id.clone()));
     selected
+}
+
+fn safe_surface_label(value: Option<&str>) -> String {
+    let normalized = value
+        .unwrap_or("Unknown application")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = if normalized.trim().is_empty() {
+        "Unknown application".to_string()
+    } else {
+        normalized
+    };
+    normalized.chars().take(80).collect()
+}
+
+fn surface_visit_key(frame: &EvidenceFrame) -> String {
+    let app = frame
+        .app_bundle_id
+        .as_deref()
+        .or(frame.app_name.as_deref())
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase();
+    if is_private_status(frame.privacy_status.as_deref()) {
+        return format!("private:{app}");
+    }
+    if let Some(hostname) = browser_origin_key(frame) {
+        return format!("browser:{app}:{hostname}");
+    }
+    format!("app:{app}")
+}
+
+fn visit_is_transient_browser_chrome(frames: &[&EvidenceFrame]) -> bool {
+    !frames.is_empty()
+        && frames
+            .iter()
+            .all(|frame| browser_origin_key(frame).is_none())
+        && frames.iter().all(|frame| {
+            frame
+                .window_name
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("new tab")
+        })
+        && frames.iter().all(|frame| {
+            frame
+                .ui_events
+                .iter()
+                .all(|event| !event_matches_frame_surface(frame, event))
+        })
+        && frames
+            .iter()
+            .all(|frame| frame.typing_bursts.iter().all(|burst| !burst.committed))
+}
+
+fn build_surface_timeline(
+    frames: &[EvidenceFrame],
+    current_frame_id: &str,
+    cutoff_ms: i64,
+) -> Vec<SurfaceVisitV2> {
+    let mut ordered = frames
+        .iter()
+        .filter(|frame| frame.captured_at <= cutoff_ms)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|frame| (frame.captured_at, frame.id.clone()));
+
+    let mut groups = Vec::<(String, Vec<&EvidenceFrame>)>::new();
+    let mut hidden_separator = false;
+    for frame in ordered {
+        // A hidden self frame is not emitted, but it is a real departure. It
+        // must break adjacency so A -> Smalltalk -> A remains two visits.
+        if is_diagnostic_surface(frame) {
+            hidden_separator = true;
+            continue;
+        }
+        let key = surface_visit_key(frame);
+        if !hidden_separator
+            && groups
+                .last()
+                .is_some_and(|(existing_key, _)| existing_key == &key)
+        {
+            groups.last_mut().expect("group exists").1.push(frame);
+        } else {
+            groups.push((key, vec![frame]));
+        }
+        hidden_separator = false;
+    }
+
+    let mut seen_keys = BTreeSet::new();
+    let mut visits = groups
+        .into_iter()
+        .filter_map(|(key, frames)| {
+            let first = *frames.first()?;
+            let last = *frames.last()?;
+            let private = frames
+                .iter()
+                .any(|frame| is_private_status(frame.privacy_status.as_deref()));
+            if !private && visit_is_transient_browser_chrome(&frames) {
+                return None;
+            }
+            let revisited = !seen_keys.insert(key.clone());
+            let mut event_ids = frames
+                .iter()
+                .flat_map(|frame| {
+                    frame
+                        .ui_events
+                        .iter()
+                        .filter(|event| event_matches_frame_surface(frame, event))
+                        .map(|event| event.id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            for frame in &frames {
+                for burst in frame.typing_bursts.iter().filter(|burst| burst.committed) {
+                    event_ids.insert(burst.id.clone());
+                }
+            }
+            let interaction_count = event_ids.len();
+            let dwell_ms = last.captured_at.saturating_sub(first.captured_at);
+            let engagement_score = (interaction_count as i64 * 1_000)
+                + (dwell_ms.clamp(0, 30 * 60 * 1_000) / 1_000 * 10)
+                + (frames.len() as i64 * 50);
+            let representative_frame = if private {
+                None
+            } else {
+                frames
+                    .iter()
+                    .map(|frame| {
+                        let reference = keyframe_reference(
+                            frame,
+                            if frame.id == current_frame_id {
+                                EvidencePartitionV2::Current
+                            } else {
+                                EvidencePartitionV2::Support
+                            },
+                            vec!["session_surface_representative".into()],
+                        );
+                        let activity = frame
+                            .ui_events
+                            .iter()
+                            .filter(|event| event_matches_frame_surface(frame, event))
+                            .count()
+                            + frame
+                                .typing_bursts
+                                .iter()
+                                .filter(|burst| burst.committed)
+                                .count();
+                        (reference, activity)
+                    })
+                    .max_by_key(|(reference, activity)| {
+                        (
+                            reference.model_eligible,
+                            *activity,
+                            reference.observed_at_ms,
+                            reference.frame_id.clone(),
+                        )
+                    })
+                    .map(|(reference, _)| reference)
+            };
+            let app_label = if private {
+                "Private activity".into()
+            } else {
+                safe_surface_label(last.app_name.as_deref().or(first.app_name.as_deref()))
+            };
+            let site_hostname = (!private)
+                .then(|| {
+                    frames
+                        .iter()
+                        .rev()
+                        .find_map(|frame| browser_origin_key(frame))
+                })
+                .flatten();
+            let mut evidence_refs = BTreeSet::new();
+            evidence_refs.insert(first.id.clone());
+            evidence_refs.insert(last.id.clone());
+            if let Some(representative) = representative_frame.as_ref() {
+                evidence_refs.insert(representative.frame_id.clone());
+            }
+            Some(SurfaceVisitV2 {
+                sequence_index: 0,
+                app_label,
+                site_hostname,
+                first_observed_at_ms: first.captured_at,
+                last_observed_at_ms: last.captured_at,
+                is_current: frames.iter().any(|frame| frame.id == current_frame_id),
+                revisited,
+                private,
+                interaction_count,
+                frame_count: frames.len(),
+                engagement_score,
+                evidence_refs: evidence_refs.into_iter().collect(),
+                representative_frame,
+            })
+        })
+        .collect::<Vec<_>>();
+    if visits.len() > MAX_SURFACE_VISITS {
+        visits.drain(..visits.len() - MAX_SURFACE_VISITS);
+    }
+    for (index, visit) in visits.iter_mut().enumerate() {
+        visit.sequence_index = index + 1;
+    }
+    visits
 }
 
 fn rect_overlap(left: Option<&PacketBoundsV2>, right: Option<&PacketBoundsV2>) -> bool {
@@ -1042,6 +1368,9 @@ fn causal_events(
             .copied()
             .unwrap_or(EvidencePartitionV2::Background);
         for event in &frame.ui_events {
+            if !event_matches_frame_surface(frame, event) {
+                continue;
+            }
             let kind = event.event_type.to_ascii_lowercase();
             let point_target = event.x.zip(event.y).and_then(|(x, y)| {
                 elements
@@ -1372,6 +1701,10 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
         .iter()
         .filter_map(|frame| {
             let diff = frame.frame_diff.as_ref()?;
+            let aligned_transition = frame.transition.as_ref().filter(|transition| {
+                transition.pre_frame_id.as_deref() == diff.from_frame_id.as_deref()
+                    && transition.post_frame_id.as_deref() == diff.to_frame_id.as_deref()
+            });
             let mut observable_changes = Vec::new();
             let added_content = json_list_has_values(diff.added_text_hashes.as_deref());
             let removed_content = json_list_has_values(diff.removed_text_hashes.as_deref());
@@ -1389,16 +1722,14 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
             {
                 observable_changes.push(format!("visual_or_semantic_change:{kind}"));
             }
-            if let Some(kind) = frame
-                .transition
-                .as_ref()
-                .and_then(|transition| transition.transition_type.as_deref())
+            if let Some(kind) =
+                aligned_transition.and_then(|transition| transition.transition_type.as_deref())
             {
                 observable_changes.push(format!("transition:{kind}"));
             }
             observable_changes.sort();
             observable_changes.dedup();
-            let causal_event_ids = events
+            let mut causal_event_ids = events
                 .iter()
                 .filter(|event| {
                     event.target_frame_id.as_deref() == diff.to_frame_id.as_deref()
@@ -1406,6 +1737,8 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
                 })
                 .map(|event| event.event_id.clone())
                 .collect::<Vec<_>>();
+            causal_event_ids.sort();
+            causal_event_ids.dedup();
             let source_conflicts = if explicit_no_change && (added_content || removed_content) {
                 vec!["diff_kind_no_change_conflicts_with_text_hash_delta".into()]
             } else {
@@ -1422,9 +1755,7 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
                 diff_kind: diff.diff_type.clone(),
                 changed_regions: changed_regions(diff.changed_region_json.as_deref().or_else(
                     || {
-                        frame
-                            .transition
-                            .as_ref()
+                        aligned_transition
                             .and_then(|transition| transition.changed_region_json.as_deref())
                     },
                 )),
@@ -1432,10 +1763,7 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
                 observable_changes,
                 source_agreement: [
                     frame.frame_diff.as_ref().map(|_| "frame_diff".to_string()),
-                    frame
-                        .transition
-                        .as_ref()
-                        .map(|_| "event_transition".to_string()),
+                    aligned_transition.map(|_| "event_transition".to_string()),
                 ]
                 .into_iter()
                 .flatten()
@@ -1532,6 +1860,14 @@ pub(super) fn build_observation_packet(
     } else {
         non_diagnostic_frames
     };
+    let timeline_current = packet_frames
+        .last()
+        .expect("non-diagnostic packet frames are non-empty");
+    let surface_timeline = build_surface_timeline(
+        input_frames,
+        &timeline_current.id,
+        timeline_current.captured_at,
+    );
     let dropped_frame_count = packet_frames.len().saturating_sub(24);
     let frames = &packet_frames[dropped_frame_count..];
     let current = frames.last().expect("bounded frame window is non-empty");
@@ -1557,6 +1893,15 @@ pub(super) fn build_observation_packet(
         &mut frame_accounting,
     );
     let frame_changes = semantic_deltas(frames, &causal_events);
+    let action_surface_ownership_mismatch_count = frames
+        .iter()
+        .flat_map(|frame| {
+            frame
+                .ui_events
+                .iter()
+                .filter(|event| !event_matches_frame_surface(frame, event))
+        })
+        .count();
     let capture_trigger_ids = frames
         .iter()
         .filter_map(|frame| frame.trigger.as_ref().map(|trigger| trigger.id.clone()))
@@ -1596,9 +1941,30 @@ pub(super) fn build_observation_packet(
             .or_default()
             .push(frame_id.clone());
     }
-    let private_count = semantic_keyframes
+    let private_visit_count = surface_timeline
         .iter()
-        .filter(|keyframe| !keyframe.model_eligible)
+        .filter(|visit| visit.private)
+        .count();
+    let ownership_rejected_count = surface_timeline
+        .iter()
+        .filter_map(|visit| visit.representative_frame.as_ref())
+        .filter(|frame| {
+            frame
+                .image_rejection_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.contains("ownership") || reason.contains("coordinate_mapping")
+                })
+        })
+        .count();
+    let missing_image_count = surface_timeline
+        .iter()
+        .filter(|visit| !visit.private)
+        .filter(|visit| {
+            visit.representative_frame.as_ref().is_none_or(|frame| {
+                frame.image_rejection_reason.as_deref() == Some("no_readable_image_asset")
+            })
+        })
         .count();
     let mut missing_source_notes = Vec::new();
     if current.content_units.is_empty() {
@@ -1619,8 +1985,18 @@ pub(super) fn build_observation_packet(
     if current.trigger.is_none() {
         missing_source_notes.push("current_frame_missing_capture_trigger".into());
     }
-    if private_count > 0 {
-        missing_source_notes.push("private_keyframe_model_ineligible".into());
+    if private_visit_count > 0 {
+        missing_source_notes.push(format!(
+            "surface_images_private_excluded:{private_visit_count}"
+        ));
+    }
+    if ownership_rejected_count > 0 {
+        missing_source_notes.push(format!(
+            "surface_images_ownership_rejected:{ownership_rejected_count}"
+        ));
+    }
+    if missing_image_count > 0 {
+        missing_source_notes.push(format!("surface_images_missing_crop:{missing_image_count}"));
     }
     if dropped_frame_count > 0 {
         missing_source_notes.push(format!(
@@ -1630,6 +2006,11 @@ pub(super) fn build_observation_packet(
     if diagnostic_frame_count > 0 && diagnostic_frame_count < input_frames.len() {
         missing_source_notes.push(format!(
             "diagnostic_self_frames_excluded:{diagnostic_frame_count}"
+        ));
+    }
+    if action_surface_ownership_mismatch_count > 0 {
+        missing_source_notes.push(format!(
+            "action_surface_ownership_mismatch_excluded:{action_surface_ownership_mismatch_count}"
         ));
     }
     missing_source_notes.truncate(MAX_NOTES);
@@ -1662,6 +2043,7 @@ pub(super) fn build_observation_packet(
         },
         current_frame,
         semantic_keyframes,
+        surface_timeline,
         canonical_elements,
         focused_element_ids,
         editable_element_ids,
@@ -1685,7 +2067,7 @@ pub(super) fn build_observation_packet(
         })
         .collect(),
         previous_valid_snapshot_id,
-        evidence_quality: if private_count > 0 {
+        evidence_quality: if private_visit_count > 0 {
             "privacy_limited".into()
         } else if frames.len() >= 2 {
             "bounded_multisource".into()
@@ -1877,6 +2259,228 @@ mod tests {
     }
 
     #[test]
+    fn session_surface_timeline_preserves_live_shaped_context_and_returns() {
+        let mut chatgpt = frame("489", 1_000, "surface_change");
+        chatgpt.app_name = Some("ChatGPT".into());
+        chatgpt.app_bundle_id = Some("com.openai.chat".into());
+        chatgpt.window_name = Some("Private conversation title".into());
+
+        let browser = |id: &str, at: i64, url: &str, title: &str| {
+            let mut value = frame(id, at, "surface_change");
+            value.app_name = Some("Helium".into());
+            value.app_bundle_id = Some("net.imput.helium".into());
+            value.browser_url = Some(url.into());
+            value.window_name = Some(title.into());
+            value
+        };
+        let devfolio = browser(
+            "490",
+            2_000,
+            "https://devfolio.co/application/private-path?draft=secret",
+            "Sensitive application title",
+        );
+        let google_first = browser(
+            "492",
+            3_000,
+            "https://www.google.com/search?q=private+query",
+            "Private query - Google Search",
+        );
+        let mut google_adjacent = browser(
+            "493",
+            4_000,
+            "https://google.com/search?q=another+private+query",
+            "Another private query",
+        );
+        google_adjacent
+            .ui_events
+            .push(ui_event("google-scroll", "scroll", 3_900, None, None));
+        let devfolio_return = browser(
+            "497",
+            5_000,
+            "https://devfolio.co/application/return",
+            "Sensitive application title",
+        );
+        let logs_list = browser(
+            "498",
+            6_000,
+            "https://platform.openai.com/logs?project=secret",
+            "Logs - OpenAI Platform",
+        );
+        let blank_response = browser(
+            "499",
+            7_000,
+            "https://platform.openai.com/logs/resp_secret",
+            "Logs - resp_secret",
+        );
+
+        let packet = build_observation_packet(
+            &[
+                chatgpt,
+                devfolio,
+                google_first,
+                google_adjacent,
+                devfolio_return,
+                logs_list,
+                blank_response,
+            ],
+            "watermark-live-shaped",
+            None,
+        )
+        .unwrap();
+
+        let chronology = packet
+            .surface_timeline
+            .iter()
+            .map(|visit| {
+                (
+                    visit.app_label.as_str(),
+                    visit.site_hostname.as_deref(),
+                    visit.revisited,
+                    visit.is_current,
+                    visit.frame_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chronology,
+            vec![
+                ("ChatGPT", None, false, false, 1),
+                ("Helium", Some("devfolio.co"), false, false, 1),
+                ("Helium", Some("google.com"), false, false, 2),
+                ("Helium", Some("devfolio.co"), true, false, 1),
+                ("Helium", Some("platform.openai.com"), false, true, 2),
+            ]
+        );
+        let serialized = serde_json::to_string(&packet).unwrap();
+        assert!(!serialized.contains("private-path"));
+        assert!(!serialized.contains("private+query"));
+        assert!(!serialized.contains("Sensitive application title"));
+        assert!(!serialized.contains("resp_secret"));
+    }
+
+    #[test]
+    fn codex_is_a_work_surface_and_preserves_browser_departure_and_return() {
+        let browser = |id: &str, at: i64| {
+            let mut value = frame(id, at, "surface_change");
+            value.app_name = Some("Helium".into());
+            value.app_bundle_id = Some("net.imput.helium".into());
+            value.browser_url = Some("https://developers.openai.com/prompt-caching".into());
+            value
+        };
+        let first_docs = browser("docs-first", 1_000);
+        let mut codex = frame("codex-work", 2_000, "typing");
+        codex.app_name = Some("Codex".into());
+        codex.app_bundle_id = Some("com.openai.codex".into());
+        codex.window_id = Some(2);
+        let final_docs = browser("docs-return", 3_000);
+
+        let packet = build_observation_packet(
+            &[first_docs, codex, final_docs],
+            "watermark-codex-work",
+            None,
+        )
+        .unwrap();
+        assert_eq!(packet.surface_timeline.len(), 3);
+        assert_eq!(
+            packet.surface_timeline[0].site_hostname.as_deref(),
+            Some("developers.openai.com")
+        );
+        assert_eq!(packet.surface_timeline[1].app_label, "Codex");
+        assert!(packet.surface_timeline[1].representative_frame.is_some());
+        assert_eq!(
+            packet.surface_timeline[2].site_hostname.as_deref(),
+            Some("developers.openai.com")
+        );
+        assert!(packet.surface_timeline[2].revisited);
+        assert!(packet.surface_timeline[2].is_current);
+    }
+
+    #[test]
+    fn hidden_smalltalk_frame_is_a_chronology_separator() {
+        let browser = |id: &str, at: i64| {
+            let mut value = frame(id, at, "surface_change");
+            value.app_name = Some("Helium".into());
+            value.app_bundle_id = Some("net.imput.helium".into());
+            value.browser_url = Some("https://developers.openai.com/prompt-caching".into());
+            value
+        };
+        let first_docs = browser("docs-first", 1_000);
+        let mut smalltalk = frame("smalltalk-self", 2_000, "manual");
+        smalltalk.app_name = Some("Smalltalk".into());
+        smalltalk.app_bundle_id = Some("com.smalltalk.app".into());
+        smalltalk.window_id = Some(2);
+        let final_docs = browser("docs-return", 3_000);
+
+        let packet = build_observation_packet(
+            &[first_docs, smalltalk, final_docs],
+            "watermark-self-separator",
+            None,
+        )
+        .unwrap();
+        assert_eq!(packet.surface_timeline.len(), 2);
+        assert!(!packet.surface_timeline[0].revisited);
+        assert!(packet.surface_timeline[1].revisited);
+        assert!(packet.surface_timeline[1].is_current);
+    }
+
+    #[test]
+    fn cross_application_event_is_not_attributed_to_the_post_frame_surface() {
+        let mut helium = frame("helium-post", 2_000, "manual");
+        helium.app_name = Some("Helium".into());
+        helium.app_bundle_id = Some("net.imput.helium".into());
+        helium.window_id = Some(3);
+        let mut codex_scroll = ui_event("codex-scroll", "scroll", 1_900, None, None);
+        codex_scroll.app_bundle_id = Some("com.openai.codex".into());
+        codex_scroll.window_id = Some(2);
+        helium.ui_events.push(codex_scroll);
+
+        let packet = build_observation_packet(&[helium], "watermark-event-owner", None).unwrap();
+        assert_eq!(packet.surface_timeline[0].interaction_count, 0);
+        assert!(packet.causal_events.is_empty());
+        assert!(packet
+            .missing_source_notes
+            .iter()
+            .any(|note| { note == "action_surface_ownership_mismatch_excluded:1" }));
+    }
+
+    #[test]
+    fn surface_timeline_caps_visits_and_redacts_private_activity_deterministically() {
+        let mut frames = (0..10)
+            .map(|index| {
+                let mut value = frame(
+                    &format!("frame-{index}"),
+                    index as i64 * 1_000,
+                    "surface_change",
+                );
+                value.app_name = Some("Helium".into());
+                value.app_bundle_id = Some("net.imput.helium".into());
+                value.browser_url = Some(format!(
+                    "https://site-{index}.example/private/path?token=secret"
+                ));
+                value
+            })
+            .collect::<Vec<_>>();
+        frames[8].privacy_status = Some("private".into());
+
+        let first = build_observation_packet(&frames, "watermark-capped", None).unwrap();
+        let second = build_observation_packet(&frames, "watermark-capped", None).unwrap();
+        assert_eq!(first.surface_timeline, second.surface_timeline);
+        assert_eq!(first.surface_timeline.len(), MAX_SURFACE_VISITS);
+        assert_eq!(
+            first.surface_timeline[0].site_hostname.as_deref(),
+            Some("site-2.example")
+        );
+        let private = first
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.private)
+            .expect("private visit survives as a generic local fact");
+        assert_eq!(private.app_label, "Private activity");
+        assert!(private.site_hostname.is_none());
+        assert!(private.representative_frame.is_none());
+    }
+
+    #[test]
     fn recent_structured_cross_app_surface_keeps_a_reserved_support_keyframe() {
         let mut code = frame("code", 1_000, "periodic");
         code.app_name = Some("Code".into());
@@ -1924,6 +2528,83 @@ mod tests {
         assert!(code_keyframe
             .selection_reasons
             .contains(&"reserved_recent_structured_support_surface".into()));
+    }
+
+    #[test]
+    fn browser_detour_pressure_keeps_prior_origin_and_current_origin_entry() {
+        let browser_frame = |id: &str, observed_at_ms: i64, url: &str, title: &str| {
+            let mut value = frame(id, observed_at_ms, "surface_change");
+            value.app_name = Some("Helium".into());
+            value.app_bundle_id = Some("net.imput.helium".into());
+            value.browser_url = Some(url.into());
+            value.window_name = Some(title.into());
+            value
+        };
+        let devfolio = browser_frame(
+            "devfolio",
+            1_000,
+            "https://devfolio.co/application",
+            "Hackathon application",
+        );
+        let x_entry = browser_frame("x-entry", 2_000, "https://x.com/home", "Home / X");
+        let mut x_post = browser_frame("x-post", 3_000, "https://x.com/post/1", "Post / X");
+        x_post.frame_diff = Some(EvidenceFrameDiff {
+            from_frame_id: Some("x-entry".into()),
+            to_frame_id: Some("x-post".into()),
+            diff_type: Some("navigated_surface".into()),
+            changed_region_json: None,
+            added_text_hashes: Some("[\"post\"]".into()),
+            removed_text_hashes: None,
+            summary: None,
+        });
+        let mut x_profile =
+            browser_frame("x-profile", 4_000, "https://x.com/profile", "Profile / X");
+        x_profile.frame_diff = Some(EvidenceFrameDiff {
+            from_frame_id: Some("x-post".into()),
+            to_frame_id: Some("x-profile".into()),
+            diff_type: Some("navigated_surface".into()),
+            changed_region_json: None,
+            added_text_hashes: Some("[\"profile\"]".into()),
+            removed_text_hashes: None,
+            summary: None,
+        });
+        let mut x_reply = browser_frame("x-reply", 5_000, "https://x.com/reply", "Reply / X");
+        x_reply.frame_diff = Some(EvidenceFrameDiff {
+            from_frame_id: Some("x-profile".into()),
+            to_frame_id: Some("x-reply".into()),
+            diff_type: Some("navigated_surface".into()),
+            changed_region_json: None,
+            added_text_hashes: Some("[\"reply\"]".into()),
+            removed_text_hashes: None,
+            summary: None,
+        });
+        let current = browser_frame("current", 6_000, "https://x.com/home", "Home / X");
+
+        let packet = build_observation_packet(
+            &[devfolio, x_entry, x_post, x_profile, x_reply, current],
+            "watermark",
+            None,
+        )
+        .unwrap();
+        let ids = packet
+            .semantic_keyframes
+            .iter()
+            .map(|keyframe| keyframe.frame_id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(packet.semantic_keyframes.len(), MAX_KEYFRAMES);
+        assert!(ids.contains("current"));
+        assert!(ids.contains("devfolio"));
+        assert!(ids.contains("x-entry"));
+        let context = packet
+            .semantic_keyframes
+            .iter()
+            .find(|keyframe| keyframe.frame_id == "devfolio")
+            .unwrap();
+        assert_eq!(context.partition, EvidencePartitionV2::Support);
+        assert!(context
+            .selection_reasons
+            .contains(&"reserved_recent_distinct_browser_origin".into()));
     }
 
     #[test]
@@ -2341,6 +3022,49 @@ mod tests {
             .source_conflicts
             .iter()
             .any(|reason| reason == "diff_kind_no_change_conflicts_with_text_hash_delta"));
+    }
+
+    #[test]
+    fn outgoing_transition_cannot_contaminate_the_incoming_frame_delta() {
+        let prior = frame("prior", 1_000, "periodic");
+        let mut current = frame("current", 2_000, "manual");
+        current.previous_frame_id = Some("prior".into());
+        current.frame_diff = Some(EvidenceFrameDiff {
+            from_frame_id: Some("prior".into()),
+            to_frame_id: Some("current".into()),
+            diff_type: Some("content_changed".into()),
+            changed_region_json: None,
+            added_text_hashes: Some("[\"new-content\"]".into()),
+            removed_text_hashes: None,
+            summary: None,
+        });
+        current.transition = Some(EvidenceTransition {
+            id: "outgoing-transition".into(),
+            primary_event_id: None,
+            transition_type: Some("switched_app".into()),
+            summary: None,
+            confidence: Some(0.9),
+            pre_frame_id: Some("current".into()),
+            post_frame_id: Some("future".into()),
+            changed_region_json: None,
+        });
+
+        let packet = build_observation_packet(&[prior, current], "watermark", None).unwrap();
+        let delta = packet
+            .frame_changes
+            .iter()
+            .find(|delta| delta.next_frame_id == "current")
+            .unwrap();
+
+        assert!(delta
+            .observable_changes
+            .iter()
+            .any(|change| change == "content_appeared"));
+        assert!(!delta
+            .observable_changes
+            .iter()
+            .any(|change| change == "transition:switched_app"));
+        assert_eq!(delta.source_agreement, vec!["frame_diff"]);
     }
 
     #[test]

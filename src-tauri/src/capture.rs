@@ -609,6 +609,7 @@ struct AccessibilityNode {
 const EVENT_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const ISLAND_EVENT_STATUS_INTERVAL: Duration = Duration::from_millis(900);
 const MIN_IMPORTANT_CAPTURE_INTERVAL: Duration = Duration::from_secs(4);
+const MIN_SURFACE_CHANGE_CAPTURE_INTERVAL: Duration = Duration::from_secs(4);
 const MIN_LOW_VALUE_CAPTURE_INTERVAL: Duration = Duration::from_secs(45);
 const MAX_TYPING_POST_FRAME_ASSOCIATION_DELAY_MS: i64 = 60_000;
 const AUTHORITATIVE_TYPING_ASSOCIATION_CONFIDENCE: f64 = 0.96;
@@ -16062,7 +16063,7 @@ fn queue_event_trigger(
         return Ok(());
     }
 
-    let (capture_trigger, settle_delay) = match normalize_event_trigger(&event.event_type) {
+    let (mut capture_trigger, mut settle_delay) = match normalize_event_trigger(&event.event_type) {
         Some(value) => value,
         None => return Ok(()),
     };
@@ -16082,6 +16083,16 @@ fn queue_event_trigger(
     record_event_side_effects(&conn, session_id, &event, typing_burst)?;
 
     let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
+    // A browser page, document, tab, or window can change many seconds before
+    // the next ordinary event-burst capture. Treat an observed owned-surface
+    // identity change as a bounded capture boundary instead of coalescing it
+    // with scroll and Accessibility noise for the full 45-second interval.
+    // The stored screenshot remains subject to the normal privacy and rolling
+    // capture-budget checks.
+    if event_indicates_surface_change(&conn, session_id, &event)? {
+        capture_trigger = "surface_change".to_string();
+        settle_delay = Duration::from_millis(300);
+    }
     let now = now_millis();
     if let Some(existing) = pending.as_mut() {
         existing.caused_by_event_ids.push(event.id.clone());
@@ -16261,6 +16272,7 @@ fn capture_interval_for_trigger(trigger: &str) -> Duration {
         "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard" => {
             MIN_IMPORTANT_CAPTURE_INTERVAL
         }
+        "surface_change" => MIN_SURFACE_CHANGE_CAPTURE_INTERVAL,
         "idle" => IDLE_CAPTURE_INTERVAL,
         "typing_pause" | "scroll_stop" | "click" | "accessibility_change" | "event_burst" => {
             MIN_LOW_VALUE_CAPTURE_INTERVAL
@@ -16274,8 +16286,9 @@ fn capture_trigger_priority(trigger: &str) -> u8 {
         // These boundaries identify a foreground/surface change. Demoting one
         // into a generic event burst can delay the only truthful pre-Continue
         // frame by the 45-second low-value interval.
-        "app_switch" => 4,
-        "window_focus" => 3,
+        "app_switch" => 5,
+        "window_focus" => 4,
+        "surface_change" => 3,
         "clipboard" => 2,
         "typing_pause" | "scroll_stop" | "click" | "accessibility_change" => 1,
         _ => 0,
@@ -16324,6 +16337,80 @@ fn latest_frame_id_for_session_from_conn(
     )
     .optional()
     .map_err(to_string)
+}
+
+fn event_indicates_surface_change(
+    conn: &Connection,
+    session_id: &str,
+    event: &UiEventRecord,
+) -> Result<bool, String> {
+    if !matches!(
+        event.event_type.as_str(),
+        "click" | "ax_notification" | "accessibility_change"
+    ) {
+        return Ok(false);
+    }
+    if matches!(
+        ui_event_payload_string(event, "notification").as_deref(),
+        Some("AXValueChanged" | "AXSelectedTextChanged" | "AXWindowMoved" | "AXWindowResized")
+    ) {
+        return Ok(false);
+    }
+    let event_title = event
+        .window_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    if event_title.is_none() && event.window_id.is_none() {
+        return Ok(false);
+    }
+
+    let latest = conn
+        .query_row(
+            "SELECT app_bundle_id, app_name, window_id, window_name
+             FROM frames
+             WHERE session_id = ?1
+             ORDER BY captured_at DESC
+             LIMIT 1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some((frame_bundle_id, frame_app_name, frame_window_id, frame_window_title)) = latest
+    else {
+        return Ok(false);
+    };
+
+    let same_app = match (event.app_bundle_id.as_deref(), frame_bundle_id.as_deref()) {
+        (Some(left), Some(right)) => left == right,
+        _ => named_identity_matches(event.app_name.as_deref(), frame_app_name.as_deref()),
+    };
+    if !same_app {
+        // A cross-application edge belongs to the existing app-switch path.
+        return Ok(false);
+    }
+
+    let changed_window = event
+        .window_id
+        .zip(frame_window_id)
+        .is_some_and(|(left, right)| left != right);
+    let changed_title = event_title
+        .zip(
+            frame_window_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty()),
+        )
+        .is_some_and(|(left, right)| !left.eq_ignore_ascii_case(right));
+    Ok(changed_window || changed_title)
 }
 
 fn insert_ui_event(
@@ -16967,6 +17054,7 @@ fn classify_transition_type(
     }
     match trigger_type {
         "app_switch" => return Ok("switched_app".to_string()),
+        "surface_change" => return Ok("navigated_surface".to_string()),
         "scroll_stop" => return Ok("scrolled_to_new_section".to_string()),
         "typing_pause" => return Ok("entered_input".to_string()),
         "clipboard" => return Ok("copying_evidence".to_string()),
@@ -18274,6 +18362,7 @@ fn persist_frame_diff(
     let diff_type = match capture_trigger {
         "scroll_stop" => "scrolled_to_new_section",
         "app_switch" => "switched_app",
+        "surface_change" => "navigated_surface",
         "typing_pause" => "entered_input",
         _ => {
             if previous.as_ref().map(|p| (&p.0, &p.1, &p.2))
@@ -29343,6 +29432,75 @@ mod tests {
             )),
             MIN_IMPORTANT_CAPTURE_INTERVAL
         );
+    }
+
+    #[test]
+    fn same_app_surface_identity_change_gets_a_bounded_capture_boundary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, window_name, focused,
+               capture_trigger, created_at, app_bundle_id, window_id, privacy_status
+             ) VALUES (
+               'session-a',1000,'surface.png','Helium','Home / X - Helium',1,
+               'session_start',1000,'net.imput.helium',42,'normal'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let changed_page = UiEventRecord {
+            event_type: "ax_notification".into(),
+            app_bundle_id: Some("net.imput.helium".into()),
+            app_name: Some("Helium".into()),
+            window_id: Some(42),
+            window_title: Some("Build Anything (@buildanythingso) / X - Helium".into()),
+            payload: Some(serde_json::json!({"notification":"AXTitleChanged"})),
+            ..Default::default()
+        };
+        assert!(event_indicates_surface_change(&conn, "session-a", &changed_page).unwrap());
+        assert_eq!(
+            merge_pending_capture_trigger("accessibility_change", "surface_change"),
+            "surface_change"
+        );
+        assert_eq!(
+            capture_interval_for_trigger("surface_change"),
+            MIN_SURFACE_CHANGE_CAPTURE_INTERVAL
+        );
+        assert!(MIN_SURFACE_CHANGE_CAPTURE_INTERVAL < MIN_LOW_VALUE_CAPTURE_INTERVAL);
+        assert!(!is_important_capture_trigger("surface_change"));
+
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, window_name, focused,
+               capture_trigger, created_at, app_bundle_id, window_id, privacy_status
+             ) VALUES (
+               'session-a',2000,'reply.png','Helium',
+               'Build Anything (@buildanythingso) / X - Helium',1,
+               'surface_change',2000,'net.imput.helium',42,'normal'
+             )",
+            [],
+        )
+        .unwrap();
+        let returned_home = UiEventRecord {
+            window_title: Some("Home / X - Helium".into()),
+            ..changed_page.clone()
+        };
+        assert!(event_indicates_surface_change(&conn, "session-a", &returned_home).unwrap());
+
+        let same_page = UiEventRecord {
+            window_title: Some("Build Anything (@buildanythingso) / X - Helium".into()),
+            ..changed_page.clone()
+        };
+        assert!(!event_indicates_surface_change(&conn, "session-a", &same_page).unwrap());
+
+        let editor_value_change = UiEventRecord {
+            window_title: Some("Different title".into()),
+            payload: Some(serde_json::json!({"notification":"AXValueChanged"})),
+            ..changed_page
+        };
+        assert!(!event_indicates_surface_change(&conn, "session-a", &editor_value_change).unwrap());
     }
 
     #[test]

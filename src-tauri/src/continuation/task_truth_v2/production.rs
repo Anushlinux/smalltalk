@@ -13,7 +13,7 @@ use super::selection::SNAPSHOT_SELECTION_POLICY_V1;
 use super::task_snapshot::{TaskSnapshotV2, TASK_SNAPSHOT_SCHEMA_V2};
 use super::verifier::TASK_TRUTH_VERIFIER_VERSION;
 
-pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v2";
+pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v4";
 pub(crate) const TASK_TRUTH_AUTHORITY_POLICY_V1: &str =
     "smalltalk.model_first_task_truth_authority_policy.v1";
 
@@ -105,6 +105,26 @@ pub struct TaskTruthAtomicIdentityV1 {
     pub correction_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TaskTruthRecentContextV1 {
+    pub sequence_index: usize,
+    pub app_label: String,
+    pub site_hostname: Option<String>,
+    pub first_observed_at_ms: i64,
+    pub last_observed_at_ms: i64,
+    pub is_current: bool,
+    pub revisited: bool,
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub semantic_role: Option<String>,
+    #[serde(default)]
+    pub role_confidence: Option<f64>,
+    #[serde(default)]
+    pub relationship_to_primary_task: Option<String>,
+    #[serde(default)]
+    pub role_evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskTruthPublicAnswerV1 {
     pub schema: String,
@@ -124,6 +144,8 @@ pub struct TaskTruthPublicAnswerV1 {
     pub next_action: Option<String>,
     pub where_summary: Option<String>,
     pub relationship_to_prior: String,
+    #[serde(default)]
+    pub recent_context: Vec<TaskTruthRecentContextV1>,
     pub alternative_hypotheses: Vec<TaskTruthAlternativeV1>,
     pub direct_return_target: Option<ContinueReturnTarget>,
     pub evidence_preview: Option<ContinueEvidencePreview>,
@@ -166,6 +188,7 @@ impl Default for TaskTruthPublicAnswerV1 {
             next_action: None,
             where_summary: None,
             relationship_to_prior: "unrelated_or_unknown".into(),
+            recent_context: Vec::new(),
             alternative_hypotheses: Vec::new(),
             direct_return_target: None,
             evidence_preview: None,
@@ -806,13 +829,21 @@ fn enforce_model_first_semantic_authority(answer: &mut TaskTruthPublicAnswerV1) 
     clear_unsupported_semantics(answer, reason);
     Some(reason.into())
 }
-
 #[derive(Debug)]
 struct PftuProbePublicResult {
     answer: Option<TaskTruthPublicAnswerV1>,
     diagnostic: TaskTruthInferenceDiagnosticV1,
 }
 
+#[derive(Debug)]
+struct PersistedCorrectionProjection {
+    snapshot: TaskSnapshotV2,
+    answer_id: String,
+    correction_fingerprint: String,
+    target_binding_id: Option<String>,
+    current_frame_id: String,
+    cutoff_observed_at_ms: i64,
+}
 #[allow(clippy::type_complexity)]
 fn pftu_probe_public_result(
     conn: &Connection,
@@ -827,7 +858,7 @@ fn pftu_probe_public_result(
                     support_slot_map_json, admitted_output_json,
                     validation_issues_json, input_tokens, output_tokens,
                     total_tokens, estimated_cost_usd, latency_ms,
-                    parsed_response
+                    parsed_response, provider_post_count
              FROM task_truth_v2_semantic_probe_runs
              WHERE decision_id=?1
              ORDER BY created_at_ms DESC LIMIT 1",
@@ -853,6 +884,7 @@ fn pftu_probe_public_result(
                     row.get::<_, Option<f64>>(16)?,
                     row.get::<_, i64>(17)?,
                     row.get::<_, i64>(18)? != 0,
+                    row.get::<_, i64>(19)?.max(0) as usize,
                 ))
             },
         )
@@ -878,6 +910,7 @@ fn pftu_probe_public_result(
         estimated_cost_usd,
         latency_ms,
         parsed_response,
+        provider_post_count,
     )) = row
     else {
         return Ok(None);
@@ -897,11 +930,61 @@ fn pftu_probe_public_result(
             serde_json::from_str::<BTreeMap<String, super::semantic_probe::SupportSlot>>(raw).ok()
         })
         .unwrap_or_default();
+    let recent_context = request_audit
+        .as_ref()
+        .map(|audit| {
+            audit
+                .surface_timeline
+                .iter()
+                .map(|visit| {
+                    let visit_id = if visit.visit_id.trim().is_empty() {
+                        format!("T{}_VISIT", visit.sequence_index)
+                    } else {
+                        visit.visit_id.clone()
+                    };
+                    let role = output
+                        .as_ref()
+                        .and_then(|output| output.visit_roles.get(&visit_id));
+                    TaskTruthRecentContextV1 {
+                        sequence_index: visit.sequence_index,
+                        app_label: if visit.private {
+                            "Private activity".into()
+                        } else {
+                            visit.app_label.clone()
+                        },
+                        site_hostname: (!visit.private)
+                            .then(|| visit.site_hostname.clone())
+                            .flatten(),
+                        first_observed_at_ms: visit.first_observed_at_ms,
+                        last_observed_at_ms: visit.last_observed_at_ms,
+                        is_current: visit.is_current,
+                        revisited: visit.revisited,
+                        evidence_refs: visit.evidence_refs.clone(),
+                        semantic_role: role.map(|role| role.role.label().into()),
+                        role_confidence: role.map(|role| role.confidence),
+                        relationship_to_primary_task: role
+                            .filter(|role| !role.relationship_to_primary_task.is_empty())
+                            .map(|role| role.relationship_to_primary_task.clone()),
+                        role_evidence_refs: role
+                            .into_iter()
+                            .flat_map(|role| role.support_slots.iter())
+                            .filter_map(|slot_id| slots.get(slot_id))
+                            .map(|slot| format!("{}:{}", slot.source_kind, slot.record_id))
+                            .collect(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let has_visible_semantics = output.as_ref().is_some_and(|output| {
         output.primary_task.is_some()
             || output.current_step.is_some()
             || output.last_progress.is_some()
             || output.unfinished_state.is_some()
+            || output
+                .visit_roles
+                .values()
+                .any(|role| role.role != super::semantic_probe::ProbeSurfaceRole::Unclear)
     });
     let identity_seed = serde_json::json!({
         "decision_id": decision_id,
@@ -976,6 +1059,11 @@ fn pftu_probe_public_result(
         } else {
             "unresolved"
         };
+        let current_relationship = recent_context
+            .iter()
+            .find(|visit| visit.is_current)
+            .and_then(|visit| visit.semantic_role.clone())
+            .unwrap_or_else(|| "unrelated_or_unknown".into());
         TaskTruthPublicAnswerV1 {
             task_basis: if output.primary_task.is_some() {
                 "explicit_goal"
@@ -987,12 +1075,13 @@ fn pftu_probe_public_result(
             current_subtask: output.current_step.clone(),
             current_activity: TaskTruthCurrentActivityV1 {
                 current_subtask: output.current_step.clone(),
-                relationship_to_primary: "unrelated_or_unknown".into(),
+                relationship_to_primary: current_relationship,
                 ..Default::default()
             },
             task_summary: output.primary_task.clone(),
             last_meaningful_progress: output.last_progress.clone(),
             unfinished_state: output.unfinished_state.clone(),
+            recent_context: recent_context.clone(),
             field_support,
             evidence_preview: preview_frame_id.map(|frame_id| ContinueEvidencePreview {
                 schema: "smalltalk.continue_evidence_preview.v1".into(),
@@ -1020,17 +1109,49 @@ fn pftu_probe_public_result(
                 session_id: session_id.clone(),
                 task_thread_id,
                 task_thread_revision: has_visible_semantics.then_some(1),
-                task_snapshot_id: snapshot_id,
+                task_snapshot_id: snapshot_id.clone(),
                 snapshot_revision: 1,
                 selected_hypothesis_id,
                 model_request_id: provider_request_id.clone().or(request_id.clone()),
-                model_response_id: Some(response_identity),
+                model_response_id: Some(response_identity.clone()),
                 observation_packet_id: packet_id.clone(),
                 evidence_watermark: evidence_watermark.clone(),
                 correction_fingerprint: String::new(),
             },
             ..Default::default()
         }
+    });
+    let answer = answer.or_else(|| {
+        (!recent_context.is_empty()).then(|| TaskTruthPublicAnswerV1 {
+            task_resolution_status: "unresolved".into(),
+            recent_context: recent_context.clone(),
+            task_understanding_source: "unresolved".into(),
+            wording_source: "deterministic".into(),
+            target_selection_source: "strict_local_policy".into(),
+            snapshot_id: snapshot_id.clone(),
+            snapshot_revision: 1,
+            evidence_watermark: evidence_watermark.clone(),
+            semantic_source: "unresolved".into(),
+            provider_name: Some("openai".into()),
+            provider_model: response_model.clone().or(Some(configured_model.clone())),
+            request_id: provider_request_id.clone().or(request_id.clone()),
+            response_id: provider_response_id.clone(),
+            inference_status: diagnostic_status.clone(),
+            atomic_identity: TaskTruthAtomicIdentityV1 {
+                session_id: session_id.clone(),
+                task_thread_id: None,
+                task_thread_revision: None,
+                task_snapshot_id: snapshot_id.clone(),
+                snapshot_revision: 1,
+                selected_hypothesis_id: None,
+                model_request_id: provider_request_id.clone().or(request_id.clone()),
+                model_response_id: Some(response_identity.clone()),
+                observation_packet_id: packet_id.clone(),
+                evidence_watermark: evidence_watermark.clone(),
+                correction_fingerprint: String::new(),
+            },
+            ..Default::default()
+        })
     });
 
     let diagnostic = TaskTruthInferenceDiagnosticV1 {
@@ -1054,7 +1175,7 @@ fn pftu_probe_public_result(
         request_id,
         provider_request_id,
         response_id: provider_response_id,
-        provider_attempt_count: usize::from(parsed_response || request_audit.is_some()),
+        provider_attempt_count: provider_post_count,
         latency_ms,
         image_count: request_audit
             .as_ref()
@@ -1085,6 +1206,7 @@ fn pftu_probe_public_result(
     Ok(Some(PftuProbePublicResult { answer, diagnostic }))
 }
 
+#[allow(dead_code)]
 fn visible_legacy_model_answer(
     conn: &Connection,
     decision_id: &str,
@@ -1469,6 +1591,7 @@ fn public_answer(snapshot: &TaskSnapshotV2) -> TaskTruthPublicAnswerV1 {
         task_object: snapshot.task_object.clone(),
         last_meaningful_progress: snapshot.last_meaningful_progress.clone(),
         unfinished_state: snapshot.unfinished_step.clone(),
+        recent_context: Vec::new(),
         execution_state: snapshot.execution_state.clone(),
         next_action: snapshot.next_action.clone(),
         where_summary: snapshot.app_identity.clone(),
@@ -1892,35 +2015,23 @@ pub(crate) fn production_decision_for_attempt(
     {
         reason_codes.push("pftu_model_answer_routed_to_public_contract".into());
     }
-    let visible_legacy_answer = decision_id
-        .map(|decision_id| visible_legacy_model_answer(conn, decision_id))
-        .transpose()?
-        .flatten();
+    // A decision-bound manual Continue may only expose the compact provider
+    // result. Background/read-only projection can still read an older verified
+    // snapshot, but the legacy full-packet model output cannot replace a
+    // missing or rejected compact answer.
     let mut answer = pftu_probe_result
         .as_ref()
         .and_then(|result| result.answer.clone())
-        .or_else(|| answer_snapshot.map(public_answer));
+        .or_else(|| {
+            decision_id
+                .is_none()
+                .then(|| answer_snapshot.map(public_answer))
+                .flatten()
+        });
     if let Some(answer) = answer.as_mut() {
         apply_scoped_feedback(conn, answer)?;
         if let Some(reason) = enforce_model_first_semantic_authority(answer) {
             reason_codes.push(reason);
-        }
-    }
-    let answer_was_erased = answer.as_ref().is_none_or(|answer| {
-        answer.task_summary.is_none()
-            && answer.current_subtask.is_none()
-            && answer.last_meaningful_progress.is_none()
-            && answer.unfinished_state.is_none()
-            && answer.next_action.is_none()
-    });
-    if pftu_probe_result.is_none() && answer_was_erased {
-        if let Some(mut visible_answer) = visible_legacy_answer {
-            apply_scoped_feedback(conn, &mut visible_answer)?;
-            if let Some(reason) = enforce_model_first_semantic_authority(&mut visible_answer) {
-                reason_codes.push(reason);
-            }
-            reason_codes.push("verification_limited_model_answer_kept_visible".into());
-            answer = Some(visible_answer);
         }
     }
     let diagnostic_packet_id = attempt_packet_id.or_else(|| {
@@ -2123,7 +2234,6 @@ pub(crate) fn strict_target_owner(
     }
     Ok(Some((thread_id.to_string(), thread_revision)))
 }
-
 pub(crate) fn persist_decision_contract(
     conn: &Connection,
     decision_id: &str,
@@ -2236,6 +2346,7 @@ mod tests {
             active_surface: current_frame.surface_identity.clone(),
             current_frame: current_frame.clone(),
             semantic_keyframes: vec![current_frame],
+            surface_timeline: Vec::new(),
             canonical_elements: Vec::new(),
             focused_element_ids: Vec::new(),
             editable_element_ids: Vec::new(),
@@ -2305,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_production_decision_uses_the_exact_attempt_packet() {
+    fn manual_production_decision_never_promotes_legacy_full_packet_semantics() {
         let conn = Connection::open_in_memory().unwrap();
         checkpoint::ensure_schema(&conn).unwrap();
 
@@ -2394,12 +2505,13 @@ mod tests {
         )
         .unwrap();
         let answer = decision.answer.unwrap();
-        assert_eq!(
-            answer.atomic_identity.observation_packet_id,
-            "packet-feedback"
-        );
-        assert_eq!(answer.snapshot_id, "snapshot-attempt");
-        assert_eq!(answer.response_id.as_deref(), Some("response-attempt"));
+        assert_eq!(answer.task_resolution_status, "unresolved");
+        assert!(answer.task_summary.is_none());
+        assert_eq!(answer.atomic_identity.observation_packet_id, "");
+        assert!(decision
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "typed_unresolved_model_first_answer"));
         let diagnostic = decision.inference_diagnostic.unwrap();
         assert_eq!(diagnostic.provider, "openai");
         assert_eq!(diagnostic.response_id.as_deref(), Some("response-attempt"));
@@ -3207,6 +3319,7 @@ mod tests {
     #[test]
     fn parsed_pftu_model_answer_is_public_even_without_an_open_target() {
         let conn = Connection::open_in_memory().unwrap();
+        checkpoint::ensure_schema(&conn).unwrap();
         super::super::semantic_probe::ensure_schema(&conn).unwrap();
         let armed_case = super::super::semantic_probe::ArmedProbeCase {
             case_id: "case-visible".into(),
@@ -3232,6 +3345,28 @@ mod tests {
             current_step: Some("Routing the PFTU response into the public answer".into()),
             last_progress: Some("The paid provider response was parsed".into()),
             unfinished_state: Some("React and the island still need the same answer".into()),
+            visit_roles: BTreeMap::from([
+                (
+                    "T1_VISIT".into(),
+                    super::super::semantic_probe::ProbeVisitRole {
+                        role: super::super::semantic_probe::ProbeSurfaceRole::PrimaryWork,
+                        confidence: 0.94,
+                        support_slots: vec!["T1_CONTEXT_IMAGE".into()],
+                        relationship_to_primary_task: "This screen contains the primary work."
+                            .into(),
+                    },
+                ),
+                (
+                    "T3_VISIT".into(),
+                    super::super::semantic_probe::ProbeVisitRole {
+                        role: super::super::semantic_probe::ProbeSurfaceRole::DetourOrUnrelated,
+                        confidence: 0.81,
+                        support_slots: vec!["B1_IMAGE_AFTER".into()],
+                        relationship_to_primary_task:
+                            "This is the current detour from the primary work.".into(),
+                    },
+                ),
+            ]),
             support_slots_by_field: BTreeMap::from([
                 ("primary_task".into(), Vec::new()),
                 ("current_step".into(), Vec::new()),
@@ -3247,20 +3382,80 @@ mod tests {
             ]),
             status: super::super::semantic_probe::ProbeResolutionStatus::Resolved,
         };
+        let request_audit = serde_json::json!({
+            "request_schema": "smalltalk.pftu_01.semantic_probe_request.v3",
+            "request_id": "request-local",
+            "model": "gpt-test",
+            "boundary_count": 1,
+            "image_count": 4,
+            "image_bytes": 100,
+            "structured_bytes": 1000,
+            "estimated_text_tokens": 250,
+            "max_text_bytes": 24576,
+            "max_estimated_text_tokens": 6144,
+            "output_contract_field_count": 6,
+            "supplied_image_slots": ["T1_CONTEXT_IMAGE", "B1_IMAGE_AFTER"],
+            "missing_evidence": [],
+            "surface_timeline": [
+                {
+                    "visit_id": "T1_VISIT",
+                    "sequence_index": 1,
+                    "app_label": "ChatGPT",
+                    "site_hostname": null,
+                    "first_observed_at_ms": 100,
+                    "last_observed_at_ms": 200,
+                    "is_current": false,
+                    "revisited": false,
+                    "private": false,
+                    "image_slot": "T1_CONTEXT_IMAGE",
+                    "evidence_refs": ["frame-489"]
+                },
+                {
+                    "visit_id": "T2_VISIT",
+                    "sequence_index": 2,
+                    "app_label": "Private activity",
+                    "site_hostname": null,
+                    "first_observed_at_ms": 300,
+                    "last_observed_at_ms": 400,
+                    "is_current": false,
+                    "revisited": false,
+                    "private": true,
+                    "image_slot": null,
+                    "evidence_refs": ["frame-private"]
+                },
+                {
+                    "visit_id": "T3_VISIT",
+                    "sequence_index": 3,
+                    "app_label": "Helium",
+                    "site_hostname": "platform.openai.com",
+                    "first_observed_at_ms": 500,
+                    "last_observed_at_ms": 600,
+                    "is_current": true,
+                    "revisited": false,
+                    "private": false,
+                    "image_slot": "B1_IMAGE_AFTER",
+                    "evidence_refs": ["frame-499"]
+                }
+            ]
+        });
         conn.execute(
             "INSERT INTO task_truth_v2_semantic_probe_runs (
                run_id, case_id, decision_id, session_id, packet_id,
                evidence_watermark, model, diagnostic_status, request_id,
                provider_request_id, response_id, response_model,
-               cited_support_slots_json, admitted_output_json,
-               validation_issues_json, latency_ms, parsed_response, created_at_ms
+               request_audit_json, cited_support_slots_json, admitted_output_json,
+               validation_issues_json, latency_ms, parsed_response,
+               provider_post_count, created_at_ms
              ) VALUES (
                'run-visible','case-visible','decision-visible','session-visible',
                'packet-visible','watermark-visible','gpt-test','success',
                'request-local','request-provider','response-provider','gpt-test',
-               '{}',?1,'[]',321,1,1000
+               ?1,'{}',?2,'[]',321,1,1,1000
              )",
-            [serde_json::to_string(&output).unwrap()],
+            [
+                serde_json::to_string(&request_audit).unwrap(),
+                serde_json::to_string(&output).unwrap(),
+            ],
         )
         .unwrap();
 
@@ -3279,6 +3474,27 @@ mod tests {
         );
         assert!(answer.direct_return_target.is_none());
         assert_eq!(answer.response_id.as_deref(), Some("response-provider"));
+        assert_eq!(answer.recent_context.len(), 3);
+        assert_eq!(answer.schema, "smalltalk.task_truth_public_answer.v4");
+        assert_eq!(answer.recent_context[0].app_label, "ChatGPT");
+        assert_eq!(
+            answer.recent_context[0].semantic_role.as_deref(),
+            Some("primary_work")
+        );
+        assert_eq!(answer.recent_context[1].app_label, "Private activity");
+        assert!(answer.recent_context[1].site_hostname.is_none());
+        assert_eq!(
+            answer.recent_context[2].site_hostname.as_deref(),
+            Some("platform.openai.com")
+        );
+        assert_eq!(
+            answer.recent_context[2].semantic_role.as_deref(),
+            Some("detour_or_unrelated")
+        );
+        assert_eq!(
+            answer.current_activity.relationship_to_primary,
+            "detour_or_unrelated"
+        );
         assert_eq!(result.diagnostic.status, "success");
         assert_eq!(result.diagnostic.provider_attempt_count, 1);
         assert_eq!(enforce_model_first_semantic_authority(&mut answer), None);
@@ -3287,6 +3503,24 @@ mod tests {
             Some("Fix Continue so GPT answers stay visible"),
             "target safety and provenance validation must not erase the model answer"
         );
+
+        let decision = production_decision_for_attempt(
+            &conn,
+            Some("session-visible"),
+            true,
+            Some("decision-visible"),
+        )
+        .expect("project exact compact result through production");
+        let answer = decision.answer.expect("compact result must be public");
+        assert_eq!(
+            answer.task_summary.as_deref(),
+            Some("Fix Continue so GPT answers stay visible")
+        );
+        assert_eq!(answer.response_id.as_deref(), Some("response-provider"));
+        assert!(decision
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "pftu_model_answer_routed_to_public_contract"));
     }
 
     #[test]
@@ -3314,6 +3548,118 @@ mod tests {
         assert_eq!(
             answer.task_summary.as_deref(),
             Some("Keep the parsed GPT answer visible")
+        );
+    }
+
+    #[test]
+    fn old_public_answer_rows_deserialize_without_recent_context() {
+        let mut legacy = serde_json::to_value(TaskTruthPublicAnswerV1::default()).unwrap();
+        legacy["schema"] = serde_json::json!("smalltalk.task_truth_public_answer.v2");
+        legacy
+            .as_object_mut()
+            .expect("public answer object")
+            .remove("recent_context");
+
+        let restored: TaskTruthPublicAnswerV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.schema, "smalltalk.task_truth_public_answer.v2");
+        assert!(restored.recent_context.is_empty());
+
+        let mut v3 = serde_json::to_value(TaskTruthPublicAnswerV1::default()).unwrap();
+        v3["schema"] = serde_json::json!("smalltalk.task_truth_public_answer.v3");
+        v3["recent_context"] = serde_json::json!([{
+            "sequence_index": 1,
+            "app_label": "Helium",
+            "site_hostname": "developers.openai.com",
+            "first_observed_at_ms": 100,
+            "last_observed_at_ms": 200,
+            "is_current": true,
+            "revisited": false,
+            "evidence_refs": ["frame-1"]
+        }]);
+        let restored_v3: TaskTruthPublicAnswerV1 = serde_json::from_value(v3).unwrap();
+        assert_eq!(restored_v3.recent_context.len(), 1);
+        assert!(restored_v3.recent_context[0].semantic_role.is_none());
+        assert!(restored_v3.recent_context[0].role_evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn unresolved_probe_still_projects_factual_recent_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::semantic_probe::ensure_schema(&conn).unwrap();
+        super::super::semantic_probe::arm_case(
+            &conn,
+            &super::super::semantic_probe::ArmedProbeCase {
+                case_id: "case-unresolved".into(),
+                case_kind: "recent_context_without_semantics".into(),
+                held_back: false,
+                expected_recorded_at_ms: 1,
+                expected_primary_task: None,
+                expected_current_step: None,
+                expected_last_progress: None,
+                expected_unfinished_state: None,
+                recoverable_by_field: BTreeMap::from([
+                    ("primary_task".into(), false),
+                    ("current_step".into(), false),
+                    ("last_progress".into(), false),
+                    ("unfinished_state".into(), false),
+                ]),
+            },
+        )
+        .unwrap();
+        let request_audit = serde_json::json!({
+            "request_schema": "smalltalk.pftu_01.semantic_probe_request.v2",
+            "request_id": "request-unresolved",
+            "model": "gpt-test",
+            "boundary_count": 1,
+            "image_count": 1,
+            "image_bytes": 10,
+            "structured_bytes": 100,
+            "estimated_text_tokens": 25,
+            "max_text_bytes": 24576,
+            "max_estimated_text_tokens": 6144,
+            "output_contract_field_count": 4,
+            "supplied_image_slots": ["B1_IMAGE_AFTER"],
+            "missing_evidence": [],
+            "surface_timeline": [{
+                "sequence_index": 1,
+                "app_label": "Helium",
+                "site_hostname": "platform.openai.com",
+                "first_observed_at_ms": 500,
+                "last_observed_at_ms": 600,
+                "is_current": true,
+                "revisited": false,
+                "private": false,
+                "image_slot": "B1_IMAGE_AFTER",
+                "evidence_refs": ["frame-499"]
+            }]
+        });
+        conn.execute(
+            "INSERT INTO task_truth_v2_semantic_probe_runs (
+               run_id, case_id, decision_id, session_id, packet_id,
+               evidence_watermark, model, diagnostic_status, request_id,
+               request_audit_json, cited_support_slots_json,
+               validation_issues_json, latency_ms, parsed_response,
+               provider_post_count, created_at_ms
+             ) VALUES (
+               'run-unresolved','case-unresolved','decision-unresolved','session-unresolved',
+               'packet-unresolved','watermark-unresolved','gpt-test','provider_no_usable_output',
+               'request-unresolved',?1,'{}','[]',50,0,1,1000
+             )",
+            [serde_json::to_string(&request_audit).unwrap()],
+        )
+        .unwrap();
+
+        let result = pftu_probe_public_result(&conn, "decision-unresolved")
+            .unwrap()
+            .expect("probe result");
+        let answer = result.answer.expect("factual context answer");
+        assert_eq!(result.diagnostic.status, "provider_no_usable_output");
+        assert_eq!(answer.task_resolution_status, "unresolved");
+        assert!(answer.task_summary.is_none());
+        assert_eq!(answer.recent_context.len(), 1);
+        assert_eq!(
+            answer.recent_context[0].site_hostname.as_deref(),
+            Some("platform.openai.com")
         );
     }
 }

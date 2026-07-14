@@ -1054,6 +1054,7 @@ mod tests {
             },
             current_frame: current.clone(),
             semantic_keyframes: vec![old, current],
+            surface_timeline: Vec::new(),
             canonical_elements: vec![
                 element(
                     "element-user",

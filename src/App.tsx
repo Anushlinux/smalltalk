@@ -20,6 +20,7 @@ import {
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   normalizeTaskResolutionStatus,
+  recentContextForPresentation,
   selectPrimaryTaskHeadline,
   type ContinueAlternativeHypothesis,
   type ContinueCurrentTaskTurnSummary,
@@ -1664,8 +1665,8 @@ function App() {
           mode: options.forceRebuild === true ? "rebuild" : "normal",
           session_id: status.active_session?.id || status.latest_session?.id || null,
           rebuild_layers: options.forceRebuild === true,
-          micro_inference_enabled: true,
-          activity_recap_model_enabled: trigger === "manual",
+          micro_inference_enabled: false,
+          activity_recap_model_enabled: false,
           max_candidates_for_model: 5,
           audit_output_enabled: auditMode === "full",
           audit_mode: auditMode,
@@ -4187,6 +4188,7 @@ function ContinuationAnswer({
   onContinue: () => void;
   onOpenTarget: () => void;
   onInspectEvidence: () => void;
+  onUseAlternative: (candidate: ContinueCandidateSummary) => void;
   onRecordFeedback: (
     feedbackKind: string,
     options?: {
@@ -4196,7 +4198,6 @@ function ContinuationAnswer({
       taskHypothesisId?: string | null;
     },
   ) => void;
-  onUseAlternative: (candidate: ContinueCandidateSummary) => void;
 }) {
   const taskTruthAnswer = authoritativeTaskTruthAnswer(decision);
   const taskTruthDiagnostic = decision?.task_truth_v2?.inference_diagnostic || null;
@@ -4226,6 +4227,7 @@ function ContinuationAnswer({
     ? cardTaskTruthAnswer.direct_return_target || null
     : decision?.resume_work_target || decision?.return_target || null;
   const actionState = decision ? getContinueCardActionState(decision) : null;
+  const isThinCurrentWork = actionState?.kind === "thin_current_work";
   const noClearCurrentTask = cardTaskTruthAnswer
     ? cardTaskTruthAnswer.task_resolution_status === "unresolved"
     : Boolean(
@@ -4234,7 +4236,6 @@ function ContinuationAnswer({
         && !hasSupportedWorkTruth(decision),
       );
   const canOpenResumeTarget = actionState?.kind === "openable_return_target";
-  const isThinCurrentWork = actionState?.kind === "thin_current_work";
   const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
   const lowConfidence = cardTaskTruthAnswer
     ? noClearCurrentTask
@@ -4251,6 +4252,7 @@ function ContinuationAnswer({
     : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const taskTruthAlternatives = cardTaskTruthAnswer?.alternative_hypotheses || [];
+  const recentTaskContext = recentContextForPresentation(cardTaskTruthAnswer);
   const taskTruthActionState = actionState || {
     kind: "no_clear_continuation",
     label: "Inspect evidence",
@@ -4404,6 +4406,42 @@ function ContinuationAnswer({
           </div>
         ) : null}
 
+        {recentTaskContext.length > 0 ? (
+          <div className="answer-memory-section" aria-label="Recent context">
+            <span className="answer-section-label">Recent context</span>
+            <div className="answer-context-list">
+              {recentTaskContext.map((visit) => {
+                const surface = [visit.app_label, visit.site_hostname]
+                  .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
+                  .join(" · ");
+                const state = visit.is_current
+                  ? "Current"
+                  : visit.revisited
+                    ? "Returned later"
+                    : "Visited";
+                const roleLabels: Record<string, string> = {
+                  primary_work: "Primary work",
+                  supporting_work: "Supporting work",
+                  detour_or_unrelated: "Detour or unrelated",
+                  unclear: "Role unclear",
+                };
+                const semanticRole = visit.semantic_role
+                  ? roleLabels[visit.semantic_role] || "Role unclear"
+                  : "";
+                return (
+                  <p key={`${visit.sequence_index}-${visit.first_observed_at_ms}-${surface}`}>
+                    <strong>{surface || "Observed activity"}</strong> · {state}
+                    {semanticRole ? ` · ${semanticRole}` : ""}
+                    {visit.relationship_to_primary_task ? (
+                      <small>{visit.relationship_to_primary_task}</small>
+                    ) : null}
+                  </p>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
         {lastStateLine || nextActionLine ? <div className="answer-state">
           {lastStateLine ? <div>
             <span>State</span>
@@ -4538,16 +4576,6 @@ function ContinuationAnswer({
               <button
                 className="secondary-button"
                 type="button"
-                disabled={busyAction !== null || alternatives.length === 0}
-                onClick={() => {
-                  setAlternativesOpen((open) => !open);
-                }}
-              >
-                {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
                 disabled={busyAction !== null}
                 onClick={() => recordAndClose(
                   taskTruthAnswer ? "supporting_work" : "artifact_only_evidence",
@@ -4603,12 +4631,23 @@ function ContinuationAnswer({
               >
                 Reactivate this task
               </button> : null}
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={busyAction !== null || alternatives.length === 0}
+                onClick={() => {
+                  setAlternativesOpen((open) => !open);
+                }}
+              >
+                {alternativesOpen ? "Hide alternatives" : "Show alternatives"}
+              </button>
             </div>
           ) : null}
           {feedbackStatus ? (
             <p className="correction-feedback" role="status">{feedbackStatus}</p>
           ) : null}
         </div> : null}
+
 
         {visibleAlternatives.length > 0 ? (
           <div className="alternative-list" aria-label="Alternative continuations">
@@ -5919,6 +5958,10 @@ function buildTaskTruthProductStateCopy(
           interruption: "This interrupted the primary task without completing it.",
           new_task: "This appears to be a separate new task.",
           return_to_prior_task: "This returns to the earlier primary task.",
+          primary_work: "This is the primary work.",
+          supporting_work: "This supports the primary work.",
+          detour_or_unrelated: "This appears to be a detour or unrelated work.",
+          unclear: "Its relationship to the primary work is unclear.",
           unrelated_or_unknown: "Its relationship to the earlier task is not clear.",
           unknown: "Its relationship to the earlier task is not clear.",
         };

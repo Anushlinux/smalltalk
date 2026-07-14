@@ -778,6 +778,14 @@ h3 {
   min-width: 0;
 }
 
+.answer-section-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
 .answer-context-list {
   display: grid;
   gap: 7px;
@@ -804,6 +812,19 @@ h3 {
   border-radius: 999px;
   background: var(--violet);
   content: "";
+}
+
+.answer-context-list strong {
+  color: var(--ink);
+  font-weight: 720;
+}
+
+.answer-context-list small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .answer-confidence {

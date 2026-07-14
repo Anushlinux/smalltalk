@@ -152,6 +152,32 @@ private struct IslandSemanticAlternative: Decodable, Equatable {
     }
 }
 
+private struct IslandSemanticRecentContext: Decodable, Equatable {
+    var sequenceIndex: Int
+    var appLabel: String
+    var siteHostname: String?
+    var firstObservedAtMs: Int64
+    var lastObservedAtMs: Int64
+    var isCurrent: Bool
+    var revisited: Bool
+    var semanticRole: String?
+    var roleConfidence: Double?
+    var relationshipToPrimaryTask: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sequenceIndex = "sequence_index"
+        case appLabel = "app_label"
+        case siteHostname = "site_hostname"
+        case firstObservedAtMs = "first_observed_at_ms"
+        case lastObservedAtMs = "last_observed_at_ms"
+        case isCurrent = "is_current"
+        case revisited
+        case semanticRole = "semantic_role"
+        case roleConfidence = "role_confidence"
+        case relationshipToPrimaryTask = "relationship_to_primary_task"
+    }
+}
+
 private struct IslandSemanticAnswer: Decodable, Equatable {
     var schema: String
     var taskResolutionStatus: String
@@ -164,6 +190,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
     var nextAction: String?
     var whereSummary: String?
     var relationshipToPrior: String
+    var recentContext: [IslandSemanticRecentContext]?
     var alternativeHypotheses: [IslandSemanticAlternative]
     var inferenceStatus: String?
     var atomicIdentity: IslandSemanticAtomicIdentity
@@ -180,6 +207,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
         case nextAction = "next_action"
         case whereSummary = "where_summary"
         case relationshipToPrior = "relationship_to_prior"
+        case recentContext = "recent_context"
         case alternativeHypotheses = "alternative_hypotheses"
         case inferenceStatus = "inference_status"
         case atomicIdentity = "atomic_identity"
@@ -1151,6 +1179,8 @@ private struct SessionIslandView: View {
         return [
             "disabled", "credentials_missing", "model_unavailable", "timeout",
             "provider_error", "provider_failure", "request_invalid", "invalid_response",
+            "provider_unavailable", "provider_rejected", "provider_no_usable_output",
+            "structured_parse_failure", "support_slot_validation_failure",
         ].contains(status)
     }
 
@@ -1168,7 +1198,8 @@ private struct SessionIslandView: View {
             return activity
         }
         let whereLine = trimmed(continueState.activityWhere).nonEmpty
-        let contextLine = trimmed(continueState.recentContextSummary).nonEmpty
+        let contextLine = recentSemanticContextLine
+            ?? trimmed(continueState.recentContextSummary).nonEmpty
         if let whereLine, let contextLine {
             return "\(whereLine) · \(contextLine)"
         }
@@ -1181,6 +1212,38 @@ private struct SessionIslandView: View {
 
     private var activityStateLine: String? {
         trimmed(continueState.activityState).nonEmpty
+    }
+
+    private var recentSemanticContextLine: String? {
+        guard let visits = continueState.semanticAnswer?.recentContext, !visits.isEmpty else {
+            return nil
+        }
+        let visible = Array(visits.suffix(4))
+        let labels = visible.compactMap { visit -> String? in
+            let app = trimmed(visit.appLabel)
+            let host = trimmed(visit.siteHostname)
+            let surface: String?
+            if !app.isEmpty && !host.isEmpty && app.caseInsensitiveCompare(host) != .orderedSame {
+                surface = "\(app) · \(host)"
+            } else {
+                surface = app.nonEmpty ?? host.nonEmpty
+            }
+            guard let surface else { return nil }
+            let role: String
+            switch trimmed(visit.semanticRole).lowercased() {
+            case "primary_work": role = "Primary work"
+            case "supporting_work": role = "Supporting work"
+            case "detour_or_unrelated": role = "Detour or unrelated"
+            case "unclear": role = "Role unclear"
+            default: role = ""
+            }
+            return role.isEmpty ? surface : "\(surface) · \(role)"
+        }
+        guard !labels.isEmpty else { return nil }
+        let more = visits.count > visible.count
+            ? " → +\(visits.count - visible.count) more in Smalltalk"
+            : ""
+        return labels.joined(separator: " → ") + more
     }
 
     private var nextActionLine: String? {
@@ -1498,6 +1561,9 @@ private struct SessionIslandView: View {
                 }
                 if let currentActivityLine {
                     ContinueDetailRow(label: "Currently", value: currentActivityLine, scale: scale)
+                }
+                if let recentSemanticContextLine {
+                    ContinueDetailRow(label: "Recent", value: recentSemanticContextLine, scale: scale)
                 }
                 if let activityStateLine {
                     ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)

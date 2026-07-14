@@ -9,20 +9,26 @@ use super::observation_packet::{
     is_private_status, AuthorshipStatusV2, EvidencePartitionV2, ObservationPacketV2, RegionRoleV2,
 };
 
-pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v1";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v1";
+pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v3";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
 const MAX_IMAGES: usize = 4;
 const MAX_TEXT_BYTES: usize = 24 * 1024;
 const MAX_ESTIMATED_TEXT_TOKENS: usize = 6_144;
+// The Responses API counts model reasoning and the final structured JSON
+// against the same output budget. The response contract can contain four
+// semantic fields plus one role object for each of the four supplied images.
+// The former 1,200-token limit was exhausted before that JSON was complete.
+const MAX_OUTPUT_TOKENS: usize = 6_000;
 const MAX_OBSERVATIONS_PER_BOUNDARY: usize = 6;
 const MAX_ACTIONS_PER_BOUNDARY: usize = 4;
 const MAX_DELTAS_PER_BOUNDARY: usize = 3;
 const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
 const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
 const MAX_ARMED_CASE_AGE_MS: i64 = 15 * 60 * 1_000;
+const MANUAL_PROVIDER_RETRIES: u32 = 0;
 const SEMANTIC_FIELDS: [&str; 4] = [
     "primary_task",
     "current_step",
@@ -36,6 +42,35 @@ pub(crate) enum ProbeResolutionStatus {
     Resolved,
     PartlyResolved,
     Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeSurfaceRole {
+    PrimaryWork,
+    SupportingWork,
+    DetourOrUnrelated,
+    Unclear,
+}
+
+impl ProbeSurfaceRole {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryWork => "primary_work",
+            Self::SupportingWork => "supporting_work",
+            Self::DetourOrUnrelated => "detour_or_unrelated",
+            Self::Unclear => "unclear",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProbeVisitRole {
+    pub(crate) role: ProbeSurfaceRole,
+    pub(crate) confidence: f64,
+    pub(crate) support_slots: Vec<String>,
+    pub(crate) relationship_to_primary_task: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +91,7 @@ pub(crate) enum ProbeDiagnosticStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SupportCategory {
+    ContextImage,
     ImageBefore,
     ImageAfter,
     UserAction,
@@ -71,6 +107,8 @@ pub(crate) struct ProbeModelOutput {
     pub(crate) current_step: Option<String>,
     pub(crate) last_progress: Option<String>,
     pub(crate) unfinished_state: Option<String>,
+    #[serde(default)]
+    pub(crate) visit_roles: BTreeMap<String, ProbeVisitRole>,
     pub(crate) support_slots_by_field: BTreeMap<String, Vec<String>>,
     pub(crate) missing_evidence: Vec<String>,
     pub(crate) confidence_by_field: BTreeMap<String, f64>,
@@ -105,6 +143,8 @@ pub(crate) struct ProbeRequestAudit {
     pub(crate) estimated_text_tokens: usize,
     pub(crate) max_text_bytes: usize,
     pub(crate) max_estimated_text_tokens: usize,
+    #[serde(default)]
+    pub(crate) max_output_tokens: usize,
     pub(crate) output_contract_field_count: usize,
     pub(crate) supplied_image_slots: Vec<String>,
     pub(crate) missing_evidence: Vec<String>,
@@ -126,6 +166,34 @@ pub(crate) struct ProbeRequestAudit {
     pub(crate) excluded_late_records_by_kind: BTreeMap<String, usize>,
     #[serde(default)]
     pub(crate) excluded_nonsemantic_records_by_kind: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) surface_timeline: Vec<ProbeSurfaceVisitAudit>,
+    #[serde(default)]
+    pub(crate) image_selection_reasons: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) omitted_surface_visit_count: usize,
+    #[serde(default)]
+    pub(crate) image_exclusions_by_reason: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProbeSurfaceVisitAudit {
+    #[serde(default)]
+    pub(crate) visit_id: String,
+    pub(crate) sequence_index: usize,
+    pub(crate) app_label: String,
+    pub(crate) site_hostname: Option<String>,
+    pub(crate) first_observed_at_ms: i64,
+    pub(crate) last_observed_at_ms: i64,
+    pub(crate) is_current: bool,
+    pub(crate) revisited: bool,
+    pub(crate) private: bool,
+    pub(crate) image_slot: Option<String>,
+    #[serde(default)]
+    pub(crate) image_omission_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) representative_frame_reasons: Vec<String>,
+    pub(crate) evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +217,8 @@ pub(crate) struct ProbeAttempt {
     pub(crate) latency_ms: i64,
     pub(crate) output_bytes: Option<usize>,
     pub(crate) parsed_response: bool,
+    #[serde(default)]
+    pub(crate) provider_post_count: usize,
     pub(crate) cited_support_slots_before_admission: BTreeMap<String, Vec<String>>,
     pub(crate) admitted_output: Option<ProbeModelOutput>,
     pub(crate) validation_issues: Vec<String>,
@@ -179,9 +249,24 @@ struct RequestSlot<'a> {
 #[derive(Debug, Clone, Serialize)]
 struct RequestBoundary<'a> {
     boundary_index: usize,
+    chronology_role: &'a str,
     selection_reason: &'a str,
     surface_relation: &'a str,
+    observed_transition: String,
     slots: Vec<RequestSlot<'a>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestSurfaceVisit<'a> {
+    visit_id: String,
+    sequence_index: usize,
+    app_label: &'a str,
+    site_hostname: Option<&'a str>,
+    first_observed_at_ms: i64,
+    last_observed_at_ms: i64,
+    is_current: bool,
+    revisited: bool,
+    image_slot: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +298,24 @@ fn fingerprint<T: Serialize>(value: &T) -> String {
     super::super::stable_hash(&bytes)
 }
 
+fn physical_frame_fingerprint(frame: &super::observation_packet::KeyframeReferenceV2) -> String {
+    fingerprint(&json!({
+        "frame_id": frame.frame_id,
+        "observed_at_ms": frame.observed_at_ms,
+        "surface_identity": frame.surface_identity,
+        "surface_ownership_confidence": frame.surface_ownership_confidence,
+        "privacy_status": frame.privacy_status,
+        "model_eligible": frame.model_eligible,
+        "image_source_kind": frame.image_source_kind,
+        "image_scope": frame.image_scope,
+        "image_width": frame.image_width,
+        "image_height": frame.image_height,
+        "image_rejection_reason": frame.image_rejection_reason,
+        "crop_pixels": frame.crop_pixels,
+        "local_image_handle_hash": frame.local_image_handle_hash,
+    }))
+}
+
 fn slot_name(boundary: usize, suffix: &str) -> String {
     format!("B{boundary}_{suffix}")
 }
@@ -221,13 +324,42 @@ fn insert_slot(slots: &mut BTreeMap<String, SupportSlot>, slot: SupportSlot) {
     slots.insert(slot.slot.clone(), slot);
 }
 
-fn frame_time(packet: &ObservationPacketV2, frame_id: &str) -> Option<i64> {
+fn find_packet_frame<'a>(
+    packet: &'a ObservationPacketV2,
+    frame_id: &str,
+) -> Option<&'a super::observation_packet::KeyframeReferenceV2> {
     packet
         .semantic_keyframes
         .iter()
         .chain(std::iter::once(&packet.current_frame))
+        .chain(
+            packet
+                .surface_timeline
+                .iter()
+                .filter_map(|visit| visit.representative_frame.as_ref()),
+        )
         .find(|frame| frame.frame_id == frame_id)
-        .map(|frame| frame.observed_at_ms)
+}
+
+fn packet_frame_variants<'a>(
+    packet: &'a ObservationPacketV2,
+    frame_id: &'a str,
+) -> impl Iterator<Item = &'a super::observation_packet::KeyframeReferenceV2> + 'a {
+    packet
+        .semantic_keyframes
+        .iter()
+        .chain(std::iter::once(&packet.current_frame))
+        .chain(
+            packet
+                .surface_timeline
+                .iter()
+                .filter_map(|visit| visit.representative_frame.as_ref()),
+        )
+        .filter(move |frame| frame.frame_id == frame_id)
+}
+
+fn frame_time(packet: &ObservationPacketV2, frame_id: &str) -> Option<i64> {
+    find_packet_frame(packet, frame_id).map(|frame| frame.observed_at_ms)
 }
 
 fn same_surface(
@@ -258,6 +390,49 @@ fn same_surface(
         || (left_identity.window_id.is_some()
             && left_identity.window_id == right_identity.window_id);
     same_app && same_owned_object
+}
+
+fn same_application(
+    left: &super::observation_packet::KeyframeReferenceV2,
+    right: &super::observation_packet::KeyframeReferenceV2,
+) -> bool {
+    left.surface_identity.app_bundle_id.is_some()
+        && left.surface_identity.app_bundle_id == right.surface_identity.app_bundle_id
+}
+
+fn continued_activity_on_surface(
+    packet: &ObservationPacketV2,
+    frame: &super::observation_packet::KeyframeReferenceV2,
+    cutoff: i64,
+) -> bool {
+    packet.causal_events.iter().any(|event| {
+        event.observed_at_ms >= frame.observed_at_ms
+            && event.observed_at_ms <= cutoff
+            && event.app_bundle_id.is_some()
+            && event.app_bundle_id == frame.surface_identity.app_bundle_id
+            && event_is_meaningful(packet, event, cutoff)
+    })
+}
+
+fn observed_boundary_transition(boundary: &SelectedBoundary) -> String {
+    let Some(first) = boundary.frames.first() else {
+        return "No readable screen was available for this boundary.".into();
+    };
+    let Some(last) = boundary.frames.last() else {
+        return "No readable screen was available for this boundary.".into();
+    };
+    if first.frame_id == last.frame_id {
+        return "One screen represents this point in the chronology.".into();
+    }
+    if same_surface(first, last) {
+        "The before and after screens remain on the same app surface while the visible state changes."
+            .into()
+    } else if same_application(first, last) {
+        "The user moved to a different page, document, or window within the same application."
+            .into()
+    } else {
+        "The foreground application changed between the before and after screens.".into()
+    }
 }
 
 fn event_has_material_result(
@@ -291,13 +466,15 @@ fn event_is_meaningful(
     if event.observed_at_ms > cutoff || event.grounding_confidence < 0.5 {
         return false;
     }
-    if event
-        .target_frame_id
-        .as_deref()
-        .and_then(|frame_id| frame_time(packet, frame_id))
-        .is_some_and(|time| time > cutoff)
-    {
-        return false;
+    if let Some(target_frame_id) = event.target_frame_id.as_deref() {
+        let Some(target_time) = frame_time(packet, target_frame_id) else {
+            // An unrepresented target cannot be proven to precede the manual
+            // cutoff. Fail closed instead of treating an unknown edge as safe.
+            return false;
+        };
+        if target_time > cutoff {
+            return false;
+        }
     }
     let kind = event.event_kind.trim().to_ascii_lowercase();
     let source = event.source.trim().to_ascii_lowercase();
@@ -460,10 +637,62 @@ fn selected_boundaries(
             && event_is_meaningful(packet, event, cutoff)
             && event_has_material_result(packet, event, cutoff)
     });
+    let current_frame_ids = current_frames
+        .iter()
+        .map(|frame| frame.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
 
-    let earlier = if current_boundary_has_grounded_result {
-        None
-    } else {
+    // A local scroll or click can prove that the current screen changed, but
+    // it cannot prove that the current screen contains enough task context.
+    // Preserve one recent transition into the current surface when the user
+    // continued acting there. This keeps a compact view of detours, returns,
+    // and supporting surfaces instead of reducing every request to two nearly
+    // identical final screenshots.
+    let surface_transition_context = packet
+        .frame_changes
+        .iter()
+        .filter(|delta| !delta.no_observable_change)
+        .filter_map(|delta| {
+            let prior = delta.prior_frame_id.as_deref().and_then(frame_by_id)?;
+            let next = frame_by_id(&delta.next_frame_id)?;
+            if next.observed_at_ms > current_start
+                || !same_surface(&next, current)
+                || same_surface(&prior, &next)
+                || (current_frame_ids.contains(prior.frame_id.as_str())
+                    && current_frame_ids.contains(next.frame_id.as_str()))
+            {
+                return None;
+            }
+            let context_is_grounded = delta_has_grounded_cause(packet, delta, cutoff)
+                || continued_activity_on_surface(packet, &next, cutoff);
+            if !context_is_grounded {
+                return None;
+            }
+            let returned_to_prior_surface = eligible_frames.iter().any(|frame| {
+                frame.observed_at_ms < prior.observed_at_ms && same_surface(frame, current)
+            });
+            Some(SelectedBoundary {
+                selection_reason: if returned_to_prior_surface {
+                    "return_to_prior_surface"
+                } else {
+                    "recent_surface_transition_with_activity"
+                }
+                .into(),
+                surface_relation: "transition_into_current_surface".into(),
+                frames: vec![prior, next],
+            })
+        })
+        .max_by_key(|boundary| {
+            boundary
+                .frames
+                .last()
+                .map(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
+        });
+
+    let earlier = surface_transition_context.or_else(|| {
+        if current_boundary_has_grounded_result {
+            return None;
+        }
         packet
             .frame_changes
             .iter()
@@ -486,7 +715,7 @@ fn selected_boundaries(
                     .last()
                     .map(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
             })
-    };
+    });
 
     let current_boundary = SelectedBoundary {
         selection_reason: "current_manual_boundary".into(),
@@ -516,6 +745,170 @@ fn element_is_probe_eligible(element: &super::observation_packet::CanonicalEleme
             || !element.causal_evidence_refs.is_empty())
 }
 
+fn action_slot_summary(
+    packet: &ObservationPacketV2,
+    event: &super::observation_packet::CausalEventV2,
+    cutoff: i64,
+) -> String {
+    let kind = event.event_kind.trim().to_ascii_lowercase();
+    let result = event_has_material_result(packet, event, cutoff);
+    let result_sentence = if result {
+        " A later captured screen shows an observable result."
+    } else {
+        " No distinct observable result was captured."
+    };
+    let action = if kind.contains("scroll") {
+        "The user scrolled on this surface.".to_string()
+    } else if kind.contains("click") {
+        if event.target_element_id.is_some() {
+            "The user clicked a captured control or content region.".to_string()
+        } else {
+            "The user clicked, but the clicked target was not reliably identified.".to_string()
+        }
+    } else if kind.contains("app_switch") {
+        "The foreground application changed, followed by activity on the new surface.".to_string()
+    } else if kind.contains("navigation") {
+        "The user navigated to a different visible surface.".to_string()
+    } else if kind.contains("command") || kind.contains("terminal") {
+        "The user committed or ran a command.".to_string()
+    } else if kind.contains("typing") || event.committed == Some(true) {
+        "The user committed text input.".to_string()
+    } else {
+        let readable_kind = kind.replace('_', " ").replace('-', " ");
+        format!("The user performed a {readable_kind} action.")
+    };
+    format!("{action}{result_sentence}")
+}
+
+fn delta_slot_summary(
+    packet: &ObservationPacketV2,
+    delta: &super::observation_packet::FrameChangeV2,
+) -> String {
+    let prior = delta
+        .prior_frame_id
+        .as_deref()
+        .and_then(|frame_id| find_packet_frame(packet, frame_id));
+    let next = find_packet_frame(packet, &delta.next_frame_id);
+    let visible_content_changed = delta
+        .observable_changes
+        .iter()
+        .any(|change| matches!(change.as_str(), "content_appeared" | "content_disappeared"))
+        || !delta.changed_regions.is_empty();
+
+    match (prior, next) {
+        (Some(prior), Some(next)) if !same_application(prior, next) => {
+            "The foreground application changed between the two captured screens.".into()
+        }
+        (Some(prior), Some(next)) if !same_surface(prior, next) => {
+            "The user moved to a different page, document, or window within the same application."
+                .into()
+        }
+        (Some(_), Some(_)) if visible_content_changed => {
+            "The screen remained on the same surface while visible content changed.".into()
+        }
+        (Some(_), Some(_)) => "The captures remain on the same surface. Activity occurred between them, but the packet does not claim what that activity meant.".into(),
+        _ if visible_content_changed => {
+            "Visible content changed, but the packet cannot reliably name the surrounding surface transition.".into()
+        }
+        _ => "A state change was recorded, but its visible meaning is not reliably identified."
+            .into(),
+    }
+}
+
+fn surface_visit_identity(visit: &super::observation_packet::SurfaceVisitV2) -> String {
+    format!(
+        "{}|{}",
+        visit.app_label.trim().to_ascii_lowercase(),
+        visit
+            .site_hostname
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    )
+}
+
+fn selected_context_image_visits(
+    packet: &ObservationPacketV2,
+    cutoff: i64,
+) -> Vec<&super::observation_packet::SurfaceVisitV2> {
+    let current_identity = packet
+        .surface_timeline
+        .iter()
+        .find(|visit| visit.is_current)
+        .map(surface_visit_identity);
+    let mut best_by_surface = BTreeMap::<String, &super::observation_packet::SurfaceVisitV2>::new();
+    for visit in &packet.surface_timeline {
+        let identity = surface_visit_identity(visit);
+        let Some(frame) = visit.representative_frame.as_ref() else {
+            continue;
+        };
+        if visit.is_current
+            || visit.private
+            || current_identity.as_deref() == Some(identity.as_str())
+            || frame.observed_at_ms > cutoff
+            || !frame.model_eligible
+            || is_private_status(Some(&frame.privacy_status))
+        {
+            continue;
+        }
+        let replace = best_by_surface.get(&identity).is_none_or(|existing| {
+            (
+                visit.engagement_score,
+                visit.last_observed_at_ms,
+                visit.sequence_index,
+            ) > (
+                existing.engagement_score,
+                existing.last_observed_at_ms,
+                existing.sequence_index,
+            )
+        });
+        if replace {
+            best_by_surface.insert(identity, visit);
+        }
+    }
+    let mut selected = best_by_surface.into_values().collect::<Vec<_>>();
+    selected.sort_by_key(|visit| {
+        (
+            std::cmp::Reverse(visit.engagement_score),
+            std::cmp::Reverse(visit.last_observed_at_ms),
+            visit.sequence_index,
+        )
+    });
+    selected.truncate(MAX_IMAGES.saturating_sub(1));
+    selected.sort_by_key(|visit| visit.sequence_index);
+    selected
+}
+
+fn surface_image_omission_reason(
+    visit: &super::observation_packet::SurfaceVisitV2,
+    selected_image_frame_ids: &BTreeSet<&str>,
+) -> Option<&'static str> {
+    if visit.private {
+        return Some("private");
+    }
+    let Some(frame) = visit.representative_frame.as_ref() else {
+        return Some("missing_crop");
+    };
+    if selected_image_frame_ids.contains(frame.frame_id.as_str()) {
+        return None;
+    }
+    if frame.model_eligible {
+        return Some("budget_omitted");
+    }
+    let rejection = frame.image_rejection_reason.as_deref().unwrap_or("");
+    if rejection.contains("ownership") || rejection.contains("coordinate_mapping") {
+        Some("ownership_rejected")
+    } else if rejection.contains("crop")
+        || rejection.contains("image")
+        || rejection.contains("readable")
+    {
+        Some("missing_crop")
+    } else {
+        Some("model_ineligible")
+    }
+}
+
 fn build_slots(
     packet: &ObservationPacketV2,
     boundaries: &[SelectedBoundary],
@@ -528,6 +921,13 @@ fn build_slots(
         .iter()
         .map(|frame| frame.frame_id.as_str())
         .chain(std::iter::once(packet.current_frame.frame_id.as_str()))
+        .chain(
+            packet
+                .surface_timeline
+                .iter()
+                .filter_map(|visit| visit.representative_frame.as_ref())
+                .map(|frame| frame.frame_id.as_str()),
+        )
         .collect::<BTreeSet<_>>()
         .len();
     audit.raw_candidate_counts = BTreeMap::from([
@@ -606,6 +1006,39 @@ fn build_slots(
         raw_reason_count.saturating_sub(reason_strings.len()),
     );
 
+    let context_image_visits = selected_context_image_visits(packet, cutoff);
+    let mut emitted_image_frame_ids = BTreeSet::new();
+    let mut emitted_observation_ids = BTreeSet::new();
+    let mut emitted_event_ids = BTreeSet::new();
+    let mut emitted_delta_ids = BTreeSet::new();
+    for visit in &context_image_visits {
+        let Some(frame) = visit.representative_frame.as_ref() else {
+            continue;
+        };
+        if !emitted_image_frame_ids.insert(frame.frame_id.clone()) {
+            continue;
+        }
+        insert_slot(
+            &mut slots,
+            SupportSlot {
+                slot: format!("T{}_CONTEXT_IMAGE", visit.sequence_index),
+                boundary_index: 0,
+                category: SupportCategory::ContextImage,
+                source_kind: "keyframe".into(),
+                record_id: frame.frame_id.clone(),
+                frame_id: Some(frame.frame_id.clone()),
+                content_hash: frame.local_image_handle_hash.clone(),
+                source_fingerprint: physical_frame_fingerprint(frame),
+                observed_at_ms: frame.observed_at_ms,
+                privacy_eligible: frame.model_eligible
+                    && !is_private_status(Some(&frame.privacy_status)),
+                ownership_eligible: true,
+                summary: "Representative screen from an earlier observed session surface.".into(),
+            },
+        );
+    }
+    let allow_current_before = context_image_visits.len() + 2 <= MAX_IMAGES;
+    let use_boundary_image_fallback = context_image_visits.is_empty();
     for (assignment_index, boundary) in boundaries.iter().enumerate() {
         let boundary_index = assignment_index + 1;
         let boundary_frames = &boundary.frames;
@@ -613,9 +1046,37 @@ fn build_slots(
             .iter()
             .map(|frame| frame.frame_id.as_str())
             .collect::<BTreeSet<_>>();
+        let boundary_start_ms = boundary_frames
+            .first()
+            .map(|frame| frame.observed_at_ms)
+            .unwrap_or(cutoff);
+        let boundary_end_ms = boundary_frames
+            .last()
+            .map(|frame| frame.observed_at_ms)
+            .unwrap_or(cutoff);
 
+        let is_current_boundary = assignment_index + 1 == boundaries.len();
         for (position, frame) in boundary_frames.iter().enumerate() {
-            let category = if boundary_frames.len() > 1 && position == 0 {
+            if !is_current_boundary && !use_boundary_image_fallback {
+                continue;
+            }
+            let is_current_frame = frame.frame_id == packet.current_frame.frame_id;
+            if !is_current_frame && !allow_current_before {
+                continue;
+            }
+            if !is_current_frame
+                && frame.local_image_handle_hash.is_some()
+                && frame.local_image_handle_hash == packet.current_frame.local_image_handle_hash
+            {
+                continue;
+            }
+            if !is_current_frame && emitted_image_frame_ids.len() >= MAX_IMAGES - 1 {
+                continue;
+            }
+            if !emitted_image_frame_ids.insert(frame.frame_id.clone()) {
+                continue;
+            }
+            let category = if !is_current_frame && boundary_frames.len() > 1 && position == 0 {
                 SupportCategory::ImageBefore
             } else {
                 SupportCategory::ImageAfter
@@ -635,14 +1096,18 @@ fn build_slots(
                     record_id: frame.frame_id.clone(),
                     frame_id: Some(frame.frame_id.clone()),
                     content_hash: frame.local_image_handle_hash.clone(),
-                    source_fingerprint: fingerprint(frame),
+                    source_fingerprint: physical_frame_fingerprint(frame),
                     observed_at_ms: frame.observed_at_ms,
                     privacy_eligible: frame.model_eligible
                         && !is_private_status(Some(&frame.privacy_status)),
                     ownership_eligible: true,
-                    summary:
-                        "chronologically ordered screen image selected for this Continue request"
-                            .into(),
+                    summary: if category == SupportCategory::ImageBefore {
+                        "Screen captured before this boundary's observed actions and visible change."
+                            .into()
+                    } else {
+                        "Screen captured after this boundary's observed actions and visible change."
+                            .into()
+                    },
                 },
             );
         }
@@ -681,6 +1146,7 @@ fn build_slots(
             }));
             observation_keys.insert(identity)
         });
+        observations.retain(|element| emitted_observation_ids.insert(element.element_id.clone()));
         *audit
             .deduplication_counts
             .entry("canonical_observation".into())
@@ -719,11 +1185,16 @@ fn build_slots(
             .causal_events
             .iter()
             .filter(|event| {
-                boundary_frame_ids.contains(event.frame_id.as_str())
-                    || event
-                        .target_frame_id
-                        .as_deref()
-                        .is_some_and(|frame_id| boundary_frame_ids.contains(frame_id))
+                if boundary_frames.len() > 1 {
+                    event.observed_at_ms > boundary_start_ms
+                        && event.observed_at_ms <= boundary_end_ms
+                } else {
+                    boundary_frame_ids.contains(event.frame_id.as_str())
+                        || event
+                            .target_frame_id
+                            .as_deref()
+                            .is_some_and(|frame_id| boundary_frame_ids.contains(frame_id))
+                }
             })
             .filter(|event| event_is_meaningful(packet, event, cutoff))
             .collect::<Vec<_>>();
@@ -742,6 +1213,7 @@ fn build_slots(
             }));
             action_keys.insert(identity)
         });
+        actions.retain(|event| emitted_event_ids.insert(event.event_id.clone()));
         *audit
             .deduplication_counts
             .entry("causal_event".into())
@@ -769,15 +1241,7 @@ fn build_slots(
                     observed_at_ms: event.observed_at_ms,
                     privacy_eligible: true,
                     ownership_eligible: true,
-                    summary: bounded_text(
-                        &format!(
-                            "user-grounded event={} committed={:?} observable_result={}",
-                            event.event_kind,
-                            event.committed,
-                            event_has_material_result(packet, event, cutoff)
-                        ),
-                        240,
-                    ),
+                    summary: bounded_text(&action_slot_summary(packet, event, cutoff), 240),
                 },
             );
         }
@@ -786,6 +1250,12 @@ fn build_slots(
             .frame_changes
             .iter()
             .filter(|delta| boundary_frame_ids.contains(delta.next_frame_id.as_str()))
+            .filter(|delta| {
+                delta
+                    .prior_frame_id
+                    .as_deref()
+                    .is_none_or(|frame_id| boundary_frame_ids.contains(frame_id))
+            })
             .filter(|delta| {
                 frame_time(packet, &delta.next_frame_id).is_some_and(|time| time <= cutoff)
             })
@@ -805,6 +1275,7 @@ fn build_slots(
             }));
             delta_keys.insert(identity)
         });
+        deltas.retain(|delta| emitted_delta_ids.insert(delta.delta_id.clone()));
         *audit
             .deduplication_counts
             .entry("semantic_delta".into())
@@ -824,20 +1295,16 @@ fn build_slots(
                     observed_at_ms: frame_time(packet, &delta.next_frame_id).unwrap_or(cutoff),
                     privacy_eligible: true,
                     ownership_eligible: true,
-                    summary: bounded_text(
-                        &format!(
-                            "change_kind={:?} observable_changes={:?}",
-                            delta.diff_kind, delta.observable_changes
-                        ),
-                        320,
-                    ),
+                    summary: bounded_text(&delta_slot_summary(packet, delta), 320),
                 },
             );
         }
     }
     for slot in slots.values() {
         let key = match slot.category {
-            SupportCategory::ImageBefore | SupportCategory::ImageAfter => "keyframe",
+            SupportCategory::ContextImage
+            | SupportCategory::ImageBefore
+            | SupportCategory::ImageAfter => "keyframe",
             SupportCategory::OwnedObservation => "canonical_observation",
             SupportCategory::UserAction => "causal_event",
             SupportCategory::Delta => "semantic_delta",
@@ -863,11 +1330,19 @@ fn build_slots(
     (slots, audit)
 }
 
-fn response_schema(slot_names: &[String]) -> Value {
+fn response_schema(
+    slots: &BTreeMap<String, SupportSlot>,
+    visits: &[RequestSurfaceVisit<'_>],
+) -> Value {
     let nullable_string = || json!({"anyOf":[{"type":"null"},{"type":"string","maxLength":320}]});
     let support_properties = SEMANTIC_FIELDS
         .iter()
         .map(|field| {
+            let slot_names = slots
+                .values()
+                .filter(|slot| semantic_support_allowed(field, slot.category))
+                .map(|slot| slot.slot.clone())
+                .collect::<Vec<_>>();
             (
                 (*field).to_string(),
                 json!({"type":"array","maxItems":6,"items":{"type":"string","enum":slot_names}}),
@@ -883,11 +1358,43 @@ fn response_schema(slot_names: &[String]) -> Value {
             )
         })
         .collect::<serde_json::Map<String, Value>>();
+    let all_semantic_slots = slots
+        .values()
+        .filter(|slot| slot.category != SupportCategory::SurfaceIdentity)
+        .map(|slot| slot.slot.clone())
+        .collect::<Vec<_>>();
+    let role_visits = visits
+        .iter()
+        .filter(|visit| visit.image_slot.is_some())
+        .collect::<Vec<_>>();
+    let role_required = role_visits
+        .iter()
+        .map(|visit| visit.visit_id.clone())
+        .collect::<Vec<_>>();
+    let role_properties = role_visits
+        .iter()
+        .map(|visit| {
+            (
+                visit.visit_id.clone(),
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["role","confidence","support_slots","relationship_to_primary_task"],
+                    "properties":{
+                        "role":{"type":"string","enum":["primary_work","supporting_work","detour_or_unrelated","unclear"]},
+                        "confidence":{"type":"number","minimum":0,"maximum":1},
+                        "support_slots":{"type":"array","minItems":1,"maxItems":6,"items":{"type":"string","enum":all_semantic_slots}},
+                        "relationship_to_primary_task":{"type":"string","minLength":1,"maxLength":240}
+                    }
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
     json!({
         "type":"object",
         "additionalProperties":false,
         "required":[
-            "primary_task","current_step","last_progress","unfinished_state",
+            "primary_task","current_step","last_progress","unfinished_state","visit_roles",
             "support_slots_by_field","missing_evidence","confidence_by_field","status"
         ],
         "properties":{
@@ -895,6 +1402,10 @@ fn response_schema(slot_names: &[String]) -> Value {
             "current_step":nullable_string(),
             "last_progress":nullable_string(),
             "unfinished_state":nullable_string(),
+            "visit_roles":{
+                "type":"object","additionalProperties":false,
+                "required":role_required,"properties":role_properties
+            },
             "support_slots_by_field":{
                 "type":"object","additionalProperties":false,
                 "required":SEMANTIC_FIELDS,"properties":support_properties
@@ -910,19 +1421,22 @@ fn response_schema(slot_names: &[String]) -> Value {
 }
 
 fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
-    SEMANTIC_FIELDS.contains(&field)
-        && matches!(
-            category,
-            SupportCategory::ImageBefore
-                | SupportCategory::ImageAfter
-                | SupportCategory::UserAction
-                | SupportCategory::Delta
-                | SupportCategory::OwnedObservation
-        )
+    if !SEMANTIC_FIELDS.contains(&field) {
+        return false;
+    }
+    match category {
+        SupportCategory::ContextImage => matches!(field, "primary_task" | "last_progress"),
+        SupportCategory::ImageBefore
+        | SupportCategory::ImageAfter
+        | SupportCategory::UserAction
+        | SupportCategory::Delta
+        | SupportCategory::OwnedObservation => true,
+        SupportCategory::SurfaceIdentity => false,
+    }
 }
 
 fn system_instruction() -> &'static str {
-    "Infer only four pieces of task meaning from the small chronological evidence packet: the primary task, current step, last meaningful progress, and unfinished state. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. On a passive page with only navigation or scroll evidence and no explicit user objective, primary_task must be null; current_step and last_progress may still name the concrete page section and observed navigation. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. Return strict JSON matching the supplied schema."
+    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -954,12 +1468,13 @@ fn request_category_caps_allowed(
 
 fn support_category_order(category: SupportCategory) -> u8 {
     match category {
-        SupportCategory::ImageBefore => 0,
-        SupportCategory::UserAction => 1,
-        SupportCategory::OwnedObservation => 2,
-        SupportCategory::Delta => 3,
-        SupportCategory::ImageAfter => 4,
-        SupportCategory::SurfaceIdentity => 5,
+        SupportCategory::ContextImage => 0,
+        SupportCategory::ImageBefore => 1,
+        SupportCategory::UserAction => 2,
+        SupportCategory::OwnedObservation => 3,
+        SupportCategory::Delta => 4,
+        SupportCategory::ImageAfter => 5,
+        SupportCategory::SurfaceIdentity => 6,
     }
 }
 
@@ -969,14 +1484,19 @@ pub(crate) fn build_probe_request(
 ) -> Result<ProbeRequest, (ProbeDiagnosticStatus, String)> {
     let boundaries = selected_boundaries(packet)?;
     let cutoff = packet.current_frame.observed_at_ms;
-    let mut frames = boundaries
-        .iter()
-        .flat_map(|boundary| boundary.frames.iter().cloned())
-        .collect::<Vec<_>>();
-    frames.sort_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()));
-    frames.dedup_by(|left, right| left.frame_id == right.frame_id);
     let (slots, mut slot_audit) = build_slots(packet, &boundaries, cutoff);
-    if !request_category_caps_allowed(boundaries.len(), frames.len(), &slots) {
+    let image_slot_count = slots
+        .values()
+        .filter(|slot| {
+            matches!(
+                slot.category,
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
+            )
+        })
+        .count();
+    if !request_category_caps_allowed(boundaries.len(), image_slot_count, &slots) {
         return Err((
             ProbeDiagnosticStatus::RequestNotBuilt,
             "probe_category_cap_exceeded".into(),
@@ -1005,10 +1525,57 @@ pub(crate) fn build_probe_request(
             });
             RequestBoundary {
                 boundary_index: index + 1,
+                chronology_role: if index + 1 == boundaries.len() {
+                    "current_at_continue"
+                } else {
+                    "earlier_context"
+                },
                 selection_reason: &boundary.selection_reason,
                 surface_relation: &boundary.surface_relation,
+                observed_transition: observed_boundary_transition(boundary),
                 slots: boundary_slots,
             }
+        })
+        .collect::<Vec<_>>();
+    let image_slot_by_frame = slots
+        .values()
+        .filter(|slot| {
+            matches!(
+                slot.category,
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
+            )
+        })
+        .map(|slot| (slot.record_id.as_str(), slot.slot.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let request_surface_timeline = packet
+        .surface_timeline
+        .iter()
+        .filter(|visit| !visit.private)
+        .map(|visit| RequestSurfaceVisit {
+            visit_id: format!("T{}_VISIT", visit.sequence_index),
+            sequence_index: visit.sequence_index,
+            app_label: &visit.app_label,
+            site_hostname: visit.site_hostname.as_deref(),
+            first_observed_at_ms: visit.first_observed_at_ms,
+            last_observed_at_ms: visit.last_observed_at_ms,
+            is_current: visit.is_current,
+            revisited: visit.revisited,
+            image_slot: visit
+                .representative_frame
+                .as_ref()
+                .and_then(|frame| image_slot_by_frame.get(frame.frame_id.as_str()).copied())
+                .or_else(|| {
+                    visit
+                        .is_current
+                        .then(|| {
+                            image_slot_by_frame
+                                .get(packet.current_frame.frame_id.as_str())
+                                .copied()
+                        })
+                        .flatten()
+                }),
         })
         .collect::<Vec<_>>();
     let mut missing_evidence = packet
@@ -1030,6 +1597,12 @@ pub(crate) fn build_probe_request(
     let structured = json!({
         "schema":PROBE_REQUEST_SCHEMA,
         "final_cutoff_ms":cutoff,
+        "reading_guide":{
+            "ordering":"Boundaries and slots are chronological. The final boundary is what was visible when Continue was invoked.",
+            "images":"context_image slots are representative earlier screens. image_before and image_after belong to the final causal boundary. Images are globally capped at four.",
+            "meaning":"The surface timeline is factual chronology only. App names and hostnames cannot establish the primary task or a visit role without cited visual or action evidence."
+        },
+        "recent_surface_timeline":&request_surface_timeline,
         "boundaries":request_boundaries,
         "missing_evidence":missing_evidence,
         "policy":{
@@ -1064,13 +1637,15 @@ pub(crate) fn build_probe_request(
         .filter(|slot| {
             matches!(
                 slot.category,
-                SupportCategory::ImageBefore | SupportCategory::ImageAfter
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
             )
         })
         .collect::<Vec<_>>();
     image_slots.sort_by_key(|slot| (slot.observed_at_ms, slot.slot.clone()));
     for slot in image_slots {
-        let Some(frame) = frames.iter().find(|frame| frame.frame_id == slot.record_id) else {
+        let Some(frame) = find_packet_frame(packet, &slot.record_id) else {
             continue;
         };
         let (bytes, mime) = model::read_model_image(frame).map_err(|reason| {
@@ -1107,20 +1682,98 @@ pub(crate) fn build_probe_request(
             .as_bytes()
         )
     );
-    let slot_names = slots
+    let selected_image_frame_ids = slots
         .values()
-        .filter(|slot| semantic_support_allowed("primary_task", slot.category))
-        .map(|slot| slot.slot.clone())
+        .filter(|slot| {
+            matches!(
+                slot.category,
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
+            )
+        })
+        .map(|slot| slot.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let surface_timeline = packet
+        .surface_timeline
+        .iter()
+        .map(|visit| ProbeSurfaceVisitAudit {
+            visit_id: format!("T{}_VISIT", visit.sequence_index),
+            sequence_index: visit.sequence_index,
+            app_label: if visit.private {
+                "Private activity".into()
+            } else {
+                visit.app_label.clone()
+            },
+            site_hostname: (!visit.private)
+                .then(|| visit.site_hostname.clone())
+                .flatten(),
+            first_observed_at_ms: visit.first_observed_at_ms,
+            last_observed_at_ms: visit.last_observed_at_ms,
+            is_current: visit.is_current,
+            revisited: visit.revisited,
+            private: visit.private,
+            image_slot: visit
+                .representative_frame
+                .as_ref()
+                .and_then(|frame| image_slot_by_frame.get(frame.frame_id.as_str()).copied())
+                .or_else(|| {
+                    visit
+                        .is_current
+                        .then(|| {
+                            image_slot_by_frame
+                                .get(packet.current_frame.frame_id.as_str())
+                                .copied()
+                        })
+                        .flatten()
+                })
+                .map(str::to_string),
+            image_omission_reason: surface_image_omission_reason(visit, &selected_image_frame_ids)
+                .map(str::to_string),
+            representative_frame_reasons: visit
+                .representative_frame
+                .as_ref()
+                .map(|frame| frame.selection_reasons.clone())
+                .unwrap_or_default(),
+            evidence_refs: visit.evidence_refs.clone(),
+        })
         .collect::<Vec<_>>();
+    let image_selection_reasons = slots
+        .values()
+        .filter_map(|slot| {
+            let reason = match slot.category {
+                SupportCategory::ContextImage => "engagement_ranked_distinct_surface",
+                SupportCategory::ImageBefore => {
+                    "current_boundary_before_when_visually_distinct_and_budget_available"
+                }
+                SupportCategory::ImageAfter => "reserved_current_frame",
+                _ => return None,
+            };
+            Some((slot.slot.clone(), reason.to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut image_exclusions_by_reason = BTreeMap::<String, usize>::new();
+    for visit in &packet.surface_timeline {
+        let reason = surface_image_omission_reason(visit, &selected_image_frame_ids);
+        if let Some(reason) = reason {
+            *image_exclusions_by_reason
+                .entry(reason.to_string())
+                .or_default() += 1;
+        }
+    }
+    let omitted_surface_visit_count = image_exclusions_by_reason
+        .get("budget_omitted")
+        .copied()
+        .unwrap_or(0);
     let body = json!({
         "model":model_name,
         "store":crate::continuation::openai_response_storage_enabled(),
-        "max_output_tokens":1200,
+        "max_output_tokens":MAX_OUTPUT_TOKENS,
         "text":{"format":{
             "type":"json_schema",
             "name":"smalltalk_pftu_01_semantic_probe",
             "strict":true,
-            "schema":response_schema(&slot_names)
+            "schema":response_schema(&slots, &request_surface_timeline)
         }},
         "input":[
             {"role":"system","content":[{"type":"input_text","text":system_instruction()}]},
@@ -1140,7 +1793,12 @@ pub(crate) fn build_probe_request(
             estimated_text_tokens,
             max_text_bytes: MAX_TEXT_BYTES,
             max_estimated_text_tokens: MAX_ESTIMATED_TEXT_TOKENS,
-            output_contract_field_count: SEMANTIC_FIELDS.len(),
+            max_output_tokens: MAX_OUTPUT_TOKENS,
+            output_contract_field_count: SEMANTIC_FIELDS.len()
+                + request_surface_timeline
+                    .iter()
+                    .filter(|visit| visit.image_slot.is_some())
+                    .count(),
             supplied_image_slots,
             missing_evidence,
             final_frame_id: packet.current_frame.frame_id.clone(),
@@ -1159,6 +1817,10 @@ pub(crate) fn build_probe_request(
             deduplication_counts: slot_audit.deduplication_counts,
             excluded_late_records_by_kind: slot_audit.excluded_late_records_by_kind,
             excluded_nonsemantic_records_by_kind: slot_audit.excluded_nonsemantic_records_by_kind,
+            surface_timeline,
+            image_selection_reasons,
+            omitted_surface_visit_count,
+            image_exclusions_by_reason,
         },
         slots,
     })
@@ -1263,22 +1925,17 @@ fn primary_task_is_generic(value: &str) -> bool {
 
 fn source_fingerprint_matches(packet: &ObservationPacketV2, slot: &SupportSlot) -> bool {
     match slot.source_kind.as_str() {
-        "keyframe" => packet
-            .semantic_keyframes
-            .iter()
-            .chain(std::iter::once(&packet.current_frame))
-            .find(|frame| frame.frame_id == slot.record_id)
-            .is_some_and(|frame| {
-                fingerprint(frame) == slot.source_fingerprint
-                    && frame.local_image_handle_hash == slot.content_hash
-                    && frame.model_eligible
-                    && !is_private_status(Some(&frame.privacy_status))
-            }),
-        "surface_identity" => packet
-            .semantic_keyframes
-            .iter()
-            .chain(std::iter::once(&packet.current_frame))
-            .find(|frame| frame.frame_id == slot.record_id)
+        "keyframe" => {
+            let variants = packet_frame_variants(packet, &slot.record_id).collect::<Vec<_>>();
+            !variants.is_empty()
+                && variants.iter().all(|frame| {
+                    physical_frame_fingerprint(frame) == slot.source_fingerprint
+                        && frame.local_image_handle_hash == slot.content_hash
+                        && frame.model_eligible
+                        && !is_private_status(Some(&frame.privacy_status))
+                })
+        }
+        "surface_identity" => find_packet_frame(packet, &slot.record_id)
             .is_some_and(|frame| fingerprint(&frame.surface_identity) == slot.source_fingerprint),
         "canonical_element" => packet
             .canonical_elements
@@ -1334,6 +1991,10 @@ fn slot_chronology_valid(
                         .as_deref()
                         .and_then(|frame_id| frame_time(packet, frame_id))
                         .is_none_or(|observed_at_ms| observed_at_ms <= cutoff)
+                    && event
+                        .target_frame_id
+                        .as_deref()
+                        .is_none_or(|frame_id| frame_time(packet, frame_id).is_some())
             }),
         "semantic_delta" => packet
             .frame_changes
@@ -1345,10 +2006,17 @@ fn slot_chronology_valid(
     }
 }
 
-fn request_has_primary_task_basis(packet: &ObservationPacketV2, request: &ProbeRequest) -> bool {
-    request
-        .slots
-        .values()
+fn request_has_primary_task_basis(
+    packet: &ObservationPacketV2,
+    request: &ProbeRequest,
+    cited_supports: &[String],
+) -> bool {
+    let cited_slots = cited_supports
+        .iter()
+        .filter_map(|support| request.slots.get(support))
+        .collect::<Vec<_>>();
+    let direct_basis = cited_slots
+        .iter()
         .any(|slot| match slot.source_kind.as_str() {
             "causal_event" => packet
                 .causal_events
@@ -1367,7 +2035,148 @@ fn request_has_primary_task_basis(packet: &ObservationPacketV2, request: &ProbeR
                         || !element.causal_evidence_refs.is_empty()
                 }),
             _ => false,
+        });
+    if direct_basis {
+        return true;
+    }
+
+    // A context image is selected from a distinct, engaged session surface.
+    // Local code does not assign task meaning to it, but Luna may cite the
+    // actual pixels when they visibly establish a concrete objective. The
+    // factual app/hostname timeline has no slot and therefore cannot satisfy
+    // this rule by itself.
+    if cited_slots
+        .iter()
+        .any(|slot| slot.category == SupportCategory::ContextImage)
+    {
+        return true;
+    }
+
+    // Local code cannot read an image semantically, but it can prove that an
+    // earlier image was selected through a grounded transition rather than
+    // mere recency. Permit Luna to use that image as primary-task evidence;
+    // the prompt still requires a concrete visible objective and citations.
+    let has_grounded_context_boundary =
+        request
+            .audit
+            .boundary_selection_reasons
+            .iter()
+            .any(|reason| {
+                matches!(
+                    reason.as_str(),
+                    "recent_surface_transition_with_activity"
+                        | "return_to_prior_surface"
+                        | "committed_action_with_result"
+                )
+            });
+    has_grounded_context_boundary
+        && cited_slots.iter().any(|slot| {
+            slot.boundary_index < request.audit.boundary_count
+                && matches!(
+                    slot.category,
+                    SupportCategory::ImageBefore
+                        | SupportCategory::ImageAfter
+                        | SupportCategory::OwnedObservation
+                )
         })
+}
+
+fn unclear_visit_role() -> ProbeVisitRole {
+    ProbeVisitRole {
+        role: ProbeSurfaceRole::Unclear,
+        confidence: 0.0,
+        support_slots: Vec::new(),
+        relationship_to_primary_task: String::new(),
+    }
+}
+
+fn admit_visit_roles(
+    packet: &ObservationPacketV2,
+    request: &ProbeRequest,
+    proposed: BTreeMap<String, ProbeVisitRole>,
+) -> (BTreeMap<String, ProbeVisitRole>, Vec<String>) {
+    let expected = request
+        .audit
+        .surface_timeline
+        .iter()
+        .filter(|visit| !visit.private && visit.image_slot.is_some())
+        .map(|visit| {
+            let visit_id = if visit.visit_id.trim().is_empty() {
+                format!("T{}_VISIT", visit.sequence_index)
+            } else {
+                visit.visit_id.clone()
+            };
+            (visit_id, visit)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected_ids = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let actual_ids = proposed.keys().cloned().collect::<BTreeSet<_>>();
+    let mut issues = Vec::new();
+    if expected_ids != actual_ids {
+        issues.push("visit_role_set_mismatch".into());
+    }
+
+    let mut admitted = BTreeMap::new();
+    for (visit_id, visit) in expected {
+        let Some(mut role) = proposed.get(&visit_id).cloned() else {
+            admitted.insert(visit_id.clone(), unclear_visit_role());
+            issues.push(format!("visit_role:{visit_id}:missing"));
+            continue;
+        };
+        let mut role_issues = Vec::new();
+        if !role.confidence.is_finite() || !(0.0..=1.0).contains(&role.confidence) {
+            role_issues.push("invalid_confidence");
+        }
+        let relationship = role.relationship_to_primary_task.trim();
+        if relationship.is_empty() || relationship.chars().count() > 240 {
+            role_issues.push("invalid_relationship_explanation");
+        }
+        role.support_slots.sort();
+        role.support_slots.dedup();
+        if role.support_slots.is_empty() {
+            role_issues.push("missing_support_slots");
+        }
+        if visit
+            .image_slot
+            .as_ref()
+            .is_none_or(|image_slot| !role.support_slots.contains(image_slot))
+        {
+            role_issues.push("missing_own_visit_image_slot");
+        }
+        for support in &role.support_slots {
+            match request.slots.get(support) {
+                None => role_issues.push("foreign_or_missing_slot"),
+                Some(slot)
+                    if !slot.privacy_eligible
+                        || !slot.ownership_eligible
+                        || !source_fingerprint_matches(packet, slot) =>
+                {
+                    role_issues.push("stale_or_ineligible_slot")
+                }
+                Some(slot) if slot.category == SupportCategory::SurfaceIdentity => {
+                    role_issues.push("slot_category_not_allowed_for_role")
+                }
+                Some(slot) if !slot_chronology_valid(packet, request, slot) => {
+                    role_issues.push("slot_chronology_invalid")
+                }
+                Some(_) => {}
+            }
+        }
+        if role_issues.is_empty() {
+            role.relationship_to_primary_task = relationship.to_string();
+            admitted.insert(visit_id, role);
+        } else {
+            role_issues.sort_unstable();
+            role_issues.dedup();
+            issues.extend(
+                role_issues
+                    .into_iter()
+                    .map(|reason| format!("visit_role:{visit_id}:{reason}")),
+            );
+            admitted.insert(visit_id, unclear_visit_role());
+        }
+    }
+    (admitted, issues)
 }
 
 pub(crate) fn admit_output(
@@ -1435,7 +2244,9 @@ pub(crate) fn admit_output(
             if field == "primary_task" && value.as_deref().is_some_and(primary_task_is_generic) {
                 field_issues.push("forbidden_generic_primary_task");
             }
-            if field == "primary_task" && !request_has_primary_task_basis(packet, request) {
+            if field == "primary_task"
+                && !request_has_primary_task_basis(packet, request, &supports)
+            {
                 field_issues.push("passive_evidence_cannot_establish_primary_task");
             }
             for support in &supports {
@@ -1475,6 +2286,12 @@ pub(crate) fn admit_output(
             output.support_slots_by_field.insert(field.into(), supports);
         }
     }
+
+    let (visit_roles, visit_role_issues) =
+        admit_visit_roles(packet, request, std::mem::take(&mut output.visit_roles));
+    output.visit_roles = visit_roles;
+    issues.extend(visit_role_issues);
+
     let admitted_count = SEMANTIC_FIELDS
         .iter()
         .filter(|field| field_value(&output, field).is_some())
@@ -1627,6 +2444,7 @@ pub(crate) fn run_probe(
                 latency_ms: started.elapsed().as_millis() as i64,
                 output_bytes: None,
                 parsed_response: false,
+                provider_post_count: 0,
                 cited_support_slots_before_admission: BTreeMap::new(),
                 admitted_output: None,
                 validation_issues: Vec::new(),
@@ -1652,6 +2470,7 @@ pub(crate) fn run_probe(
                     latency_ms: started.elapsed().as_millis() as i64,
                     output_bytes: None,
                     parsed_response: false,
+                    provider_post_count: 0,
                     cited_support_slots_before_admission: BTreeMap::new(),
                     admitted_output: None,
                     validation_issues: Vec::new(),
@@ -1677,6 +2496,7 @@ pub(crate) fn run_probe(
                 latency_ms: started.elapsed().as_millis() as i64,
                 output_bytes: None,
                 parsed_response: false,
+                provider_post_count: 0,
                 cited_support_slots_before_admission: BTreeMap::new(),
                 admitted_output: None,
                 validation_issues: Vec::new(),
@@ -1685,34 +2505,39 @@ pub(crate) fn run_probe(
             Some(slots),
         );
     };
-    let response =
-        match super::super::call_openai_responses_with_timeout(api_key, &request.body, 90, 1) {
-            Ok(response) => response,
-            Err(error) => {
-                let (diagnostic_status, failure_reason) = classify_transport_failure(&error);
-                return (
-                    ProbeAttempt {
-                        diagnostic_status,
-                        model: model_name.into(),
-                        request_id: Some(request.audit.request_id.clone()),
-                        provider_request_id: None,
-                        response_id: None,
-                        response_model: None,
-                        request_audit: Some(request.audit),
-                        usage: ProviderUsageV1::default(),
-                        estimated_cost_usd: None,
-                        latency_ms: started.elapsed().as_millis() as i64,
-                        output_bytes: None,
-                        parsed_response: false,
-                        cited_support_slots_before_admission: BTreeMap::new(),
-                        admitted_output: None,
-                        validation_issues: Vec::new(),
-                        failure_reason: Some(failure_reason),
-                    },
-                    Some(slots),
-                );
-            }
-        };
+    let response = match super::super::call_openai_responses_with_timeout(
+        api_key,
+        &request.body,
+        90,
+        MANUAL_PROVIDER_RETRIES,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let (diagnostic_status, failure_reason) = classify_transport_failure(&error);
+            return (
+                ProbeAttempt {
+                    diagnostic_status,
+                    model: model_name.into(),
+                    request_id: Some(request.audit.request_id.clone()),
+                    provider_request_id: None,
+                    response_id: None,
+                    response_model: None,
+                    request_audit: Some(request.audit),
+                    usage: ProviderUsageV1::default(),
+                    estimated_cost_usd: None,
+                    latency_ms: started.elapsed().as_millis() as i64,
+                    output_bytes: None,
+                    parsed_response: false,
+                    provider_post_count: 1,
+                    cited_support_slots_before_admission: BTreeMap::new(),
+                    admitted_output: None,
+                    validation_issues: Vec::new(),
+                    failure_reason: Some(failure_reason),
+                },
+                Some(slots),
+            );
+        }
+    };
     let metadata = model::provider_attempt_metadata(&response);
     match parse_probe_response(packet, &request, &response) {
         Ok((
@@ -1741,6 +2566,7 @@ pub(crate) fn run_probe(
                     latency_ms: started.elapsed().as_millis() as i64,
                     output_bytes: Some(output_bytes),
                     parsed_response: true,
+                    provider_post_count: 1,
                     cited_support_slots_before_admission,
                     admitted_output: Some(admitted_output),
                     validation_issues,
@@ -1763,6 +2589,7 @@ pub(crate) fn run_probe(
                 latency_ms: started.elapsed().as_millis() as i64,
                 output_bytes: None,
                 parsed_response: false,
+                provider_post_count: 1,
                 cited_support_slots_before_admission: BTreeMap::new(),
                 admitted_output: None,
                 validation_issues: Vec::new(),
@@ -1821,10 +2648,8 @@ pub(crate) fn probe_enabled() -> bool {
     )
 }
 
-/// Prompt 01 is an evidence-boundary proof. Prompt 03 owns the production
-/// authority cutover, so there is deliberately no runtime override here.
 pub(crate) fn public_authority_enabled() -> bool {
-    false
+    true
 }
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
@@ -1865,6 +2690,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
            latency_ms INTEGER NOT NULL,
            output_bytes INTEGER,
            parsed_response INTEGER NOT NULL,
+           provider_post_count INTEGER NOT NULL DEFAULT 0,
            created_at_ms INTEGER NOT NULL,
            FOREIGN KEY(case_id) REFERENCES task_truth_v2_semantic_probe_cases(case_id)
          );
@@ -1904,6 +2730,24 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "ALTER TABLE task_truth_v2_semantic_probe_runs
              ADD COLUMN evidence_watermark TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let has_provider_post_count_column = conn
+        .prepare("PRAGMA table_info(task_truth_v2_semantic_probe_runs)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|column| column == "provider_post_count");
+    if !has_provider_post_count_column {
+        conn.execute(
+            "ALTER TABLE task_truth_v2_semantic_probe_runs
+             ADD COLUMN provider_post_count INTEGER NOT NULL DEFAULT 0",
             [],
         )
         .map_err(|error| error.to_string())?;
@@ -2056,10 +2900,10 @@ fn persist_attempt(
            response_model, request_audit_json, support_slot_map_json,
            cited_support_slots_json, admitted_output_json, validation_issues_json, failure_reason,
            input_tokens, output_tokens, total_tokens, estimated_cost_usd,
-           latency_ms, output_bytes, parsed_response, created_at_ms
+           latency_ms, output_bytes, parsed_response, provider_post_count, created_at_ms
          ) VALUES (
            ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-           ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26
+           ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27
          )",
         params![
             run_id,
@@ -2101,6 +2945,7 @@ fn persist_attempt(
             attempt.latency_ms,
             attempt.output_bytes.map(|value| value as i64),
             i64::from(attempt.parsed_response),
+            attempt.provider_post_count as i64,
             created_at_ms,
         ],
     )
@@ -2114,6 +2959,62 @@ fn configured_model() -> Result<(Option<String>, String), String> {
     Ok((config.api_key, config.model))
 }
 
+fn decision_already_has_compact_run(conn: &Connection, decision_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM task_truth_v2_semantic_probe_runs WHERE decision_id=?1
+         )",
+        [decision_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(|error| error.to_string())
+}
+
+fn ensure_production_runtime_case(
+    conn: &Connection,
+    decision_id: &str,
+    now_ms: i64,
+) -> Result<String, String> {
+    let case_id = format!(
+        "production-runtime-{}",
+        super::super::stable_hash(decision_id.as_bytes())
+    );
+    let runtime_case = ArmedProbeCase {
+        case_id: case_id.clone(),
+        case_kind: "production_runtime".into(),
+        held_back: false,
+        expected_recorded_at_ms: now_ms.saturating_sub(1),
+        expected_primary_task: None,
+        expected_current_step: None,
+        expected_last_progress: None,
+        expected_unfinished_state: None,
+        recoverable_by_field: SEMANTIC_FIELDS
+            .iter()
+            .map(|field| ((*field).to_string(), false))
+            .collect(),
+    };
+    let expected_json = serde_json::to_string(&runtime_case).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO task_truth_v2_semantic_probe_cases (
+           case_id, case_kind, held_back, expected_recorded_at_ms, expected_json,
+           consumed_decision_id, consumed_at_ms, created_at_ms
+         ) VALUES (?1,'production_runtime',0,?2,?3,?4,?5,?5)
+         ON CONFLICT(case_id) DO UPDATE SET
+           consumed_decision_id=excluded.consumed_decision_id,
+           consumed_at_ms=excluded.consumed_at_ms",
+        params![
+            case_id,
+            runtime_case.expected_recorded_at_ms,
+            expected_json,
+            decision_id,
+            now_ms
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(case_id)
+}
+
 pub(crate) fn run_manual_probe(
     conn: &Connection,
     decision_id: &str,
@@ -2122,10 +3023,18 @@ pub(crate) fn run_manual_probe(
     preflight_failure: Option<&str>,
 ) -> Result<(), String> {
     ensure_schema(conn)?;
-    let case_id = configured_case_id().ok_or_else(|| "probe_case_id_not_configured".to_string())?;
-    let armed = load_armed_case(conn, &case_id)?;
+    if decision_already_has_compact_run(conn, decision_id)? {
+        return Ok(());
+    }
     let now_ms = super::super::current_time_millis();
-    validate_expected_timing(armed.expected_recorded_at_ms, now_ms)?;
+    let evaluation_case_id = probe_enabled().then(configured_case_id).flatten();
+    let case_id = if let Some(case_id) = evaluation_case_id.as_deref() {
+        let armed = load_armed_case(conn, case_id)?;
+        validate_expected_timing(armed.expected_recorded_at_ms, now_ms)?;
+        case_id.to_string()
+    } else {
+        ensure_production_runtime_case(conn, decision_id, now_ms)?
+    };
     let (api_key, model_name) = configured_model()?;
     let (attempt, slots) = if let Some(reason) = preflight_failure {
         let normalized = reason.to_ascii_lowercase();
@@ -2151,6 +3060,7 @@ pub(crate) fn run_manual_probe(
                 latency_ms: 0,
                 output_bytes: None,
                 parsed_response: false,
+                provider_post_count: 0,
                 cited_support_slots_before_admission: BTreeMap::new(),
                 admitted_output: None,
                 validation_issues: Vec::new(),
@@ -2173,13 +3083,15 @@ pub(crate) fn run_manual_probe(
         &attempt,
         slots.as_ref(),
     )?;
-    conn.execute(
-        "UPDATE task_truth_v2_semantic_probe_cases
-         SET consumed_decision_id=?1, consumed_at_ms=?2
-         WHERE case_id=?3 AND consumed_decision_id IS NULL",
-        params![decision_id, now_ms, case_id],
-    )
-    .map_err(|error| error.to_string())?;
+    if evaluation_case_id.is_some() {
+        conn.execute(
+            "UPDATE task_truth_v2_semantic_probe_cases
+             SET consumed_decision_id=?1, consumed_at_ms=?2
+             WHERE case_id=?3 AND consumed_decision_id IS NULL",
+            params![decision_id, now_ms, case_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -2669,9 +3581,10 @@ pub(crate) fn export_private_review_bundle(
                     r.validation_issues_json, r.failure_reason,
                     r.input_tokens, r.output_tokens, r.total_tokens,
                     r.estimated_cost_usd, r.latency_ms, r.output_bytes,
-                    r.parsed_response, r.created_at_ms
+                    r.parsed_response, r.provider_post_count, r.created_at_ms
              FROM task_truth_v2_semantic_probe_cases c
              LEFT JOIN task_truth_v2_semantic_probe_runs r ON r.case_id=c.case_id
+             WHERE c.case_kind <> 'production_runtime'
              ORDER BY c.case_id, r.created_at_ms, r.model",
         )
         .map_err(|error| error.to_string())?;
@@ -2701,7 +3614,8 @@ pub(crate) fn export_private_review_bundle(
                 "latency_ms":row.get::<_, Option<i64>>(20)?,
                 "output_bytes":row.get::<_, Option<i64>>(21)?,
                 "parsed_response":row.get::<_, Option<i64>>(22)?.map(|value| value != 0),
-                "response_recorded_at_ms":row.get::<_, Option<i64>>(23)?,
+                "provider_post_count":row.get::<_, Option<i64>>(23)?,
+                "response_recorded_at_ms":row.get::<_, Option<i64>>(24)?,
             }))
         })
         .map_err(|error| error.to_string())?
@@ -2729,7 +3643,7 @@ mod tests {
     use super::*;
     use crate::continuation::task_truth_v2::observation_packet::{
         ActiveSurfaceIdentityV2, CanonicalElementV2, CausalEventV2, FrameCapacityAccountingV2,
-        FrameChangeV2, KeyframeReferenceV2, PacketSizeAccountingV2,
+        FrameChangeV2, KeyframeReferenceV2, PacketSizeAccountingV2, SurfaceVisitV2,
     };
 
     fn image_file(id: usize) -> String {
@@ -2888,6 +3802,7 @@ mod tests {
             active_surface: surface(4),
             current_frame: current,
             semantic_keyframes: frames,
+            surface_timeline: Vec::new(),
             canonical_elements: (1..=4).map(element).collect(),
             focused_element_ids: vec!["element-4".into()],
             editable_element_ids: vec!["element-4".into()],
@@ -2927,6 +3842,63 @@ mod tests {
         }
     }
 
+    fn surface_visit(
+        sequence_index: usize,
+        app_label: &str,
+        hostname: Option<&str>,
+        frame: KeyframeReferenceV2,
+        engagement_score: i64,
+        is_current: bool,
+    ) -> SurfaceVisitV2 {
+        SurfaceVisitV2 {
+            sequence_index,
+            app_label: app_label.into(),
+            site_hostname: hostname.map(str::to_string),
+            first_observed_at_ms: frame.observed_at_ms,
+            last_observed_at_ms: frame.observed_at_ms,
+            is_current,
+            revisited: false,
+            private: false,
+            interaction_count: (engagement_score / 1_000).max(0) as usize,
+            frame_count: 1,
+            engagement_score,
+            evidence_refs: vec![frame.frame_id.clone()],
+            representative_frame: Some(frame),
+        }
+    }
+
+    fn live_shaped_session_packet() -> ObservationPacketV2 {
+        let mut packet = packet(false);
+        packet.surface_timeline = vec![
+            surface_visit(1, "ChatGPT", None, keyframe(1, false), 4_000, false),
+            surface_visit(
+                2,
+                "Helium",
+                Some("devfolio.co"),
+                keyframe(2, false),
+                3_000,
+                false,
+            ),
+            surface_visit(
+                3,
+                "Helium",
+                Some("google.com"),
+                keyframe(3, false),
+                2_000,
+                false,
+            ),
+            surface_visit(
+                4,
+                "Helium",
+                Some("platform.openai.com"),
+                keyframe(4, false),
+                100,
+                true,
+            ),
+        ];
+        packet
+    }
+
     fn latest_slot(request: &ProbeRequest, category: SupportCategory) -> String {
         request
             .slots
@@ -2938,11 +3910,39 @@ mod tests {
             .clone()
     }
 
+    fn visit_roles(request: &ProbeRequest) -> BTreeMap<String, ProbeVisitRole> {
+        request
+            .audit
+            .surface_timeline
+            .iter()
+            .filter_map(|visit| {
+                let image_slot = visit.image_slot.clone()?;
+                (!visit.private).then(|| {
+                    let visit_id = if visit.visit_id.is_empty() {
+                        format!("T{}_VISIT", visit.sequence_index)
+                    } else {
+                        visit.visit_id.clone()
+                    };
+                    (
+                        visit_id,
+                        ProbeVisitRole {
+                            role: ProbeSurfaceRole::Unclear,
+                            confidence: 0.5,
+                            support_slots: vec![image_slot],
+                            relationship_to_primary_task:
+                                "The image does not establish a stronger relationship.".into(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     fn output(primary: Option<&str>, request: &ProbeRequest) -> ProbeModelOutput {
         let values = BTreeMap::from([
             (
                 "primary_task".into(),
-                vec![latest_slot(request, SupportCategory::ImageAfter)],
+                vec![latest_slot(request, SupportCategory::UserAction)],
             ),
             (
                 "current_step".into(),
@@ -2962,6 +3962,7 @@ mod tests {
             current_step: Some("Add support-slot validation".into()),
             last_progress: Some("The probe request was compiled".into()),
             unfinished_state: Some("The real proof corpus remains to be run".into()),
+            visit_roles: visit_roles(request),
             support_slots_by_field: values,
             missing_evidence: Vec::new(),
             confidence_by_field: SEMANTIC_FIELDS
@@ -3003,6 +4004,210 @@ mod tests {
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn visually_duplicate_current_before_image_does_not_consume_the_budget() {
+        let mut packet = packet(false);
+        let current_hash = packet.current_frame.local_image_handle_hash.clone();
+        for frame in &mut packet.semantic_keyframes {
+            if frame.frame_id == "frame-3" {
+                frame.local_image_handle_hash = current_hash.clone();
+            }
+        }
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        assert_eq!(request.audit.image_count, 1);
+        assert_eq!(request.audit.supplied_image_slots, vec!["B1_IMAGE_AFTER"]);
+    }
+
+    #[test]
+    fn live_shaped_session_uses_context_images_instead_of_blank_final_before_bias() {
+        let packet = live_shaped_session_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+
+        assert_eq!(request.audit.request_schema, PROBE_REQUEST_SCHEMA);
+        assert_eq!(request.audit.image_count, MAX_IMAGES);
+        assert_eq!(request.audit.output_contract_field_count, 8);
+        assert_eq!(request.audit.max_output_tokens, MAX_OUTPUT_TOKENS);
+        assert_eq!(
+            request
+                .body
+                .get("max_output_tokens")
+                .and_then(Value::as_u64),
+            Some(MAX_OUTPUT_TOKENS as u64)
+        );
+        let mut legacy_audit = serde_json::to_value(&request.audit).unwrap();
+        legacy_audit
+            .as_object_mut()
+            .expect("request audit object")
+            .remove("max_output_tokens");
+        let restored_legacy_audit: ProbeRequestAudit =
+            serde_json::from_value(legacy_audit).unwrap();
+        assert_eq!(restored_legacy_audit.max_output_tokens, 0);
+        assert_eq!(request.audit.surface_timeline.len(), 4);
+        assert_eq!(
+            request
+                .slots
+                .values()
+                .filter(|slot| slot.category == SupportCategory::ContextImage)
+                .count(),
+            3
+        );
+        assert!(request
+            .slots
+            .values()
+            .any(|slot| slot.category == SupportCategory::ImageAfter));
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.category == SupportCategory::ImageBefore));
+
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        let structured: Value = serde_json::from_str(structured_text).unwrap();
+        let timeline = structured
+            .get("recent_surface_timeline")
+            .and_then(Value::as_array)
+            .expect("surface timeline");
+        assert_eq!(timeline.len(), 4);
+        assert_eq!(
+            timeline[0].get("app_label").and_then(Value::as_str),
+            Some("ChatGPT")
+        );
+        assert_eq!(
+            timeline[1].get("site_hostname").and_then(Value::as_str),
+            Some("devfolio.co")
+        );
+        assert_eq!(
+            timeline[2].get("site_hostname").and_then(Value::as_str),
+            Some("google.com")
+        );
+        assert_eq!(
+            timeline[3].get("site_hostname").and_then(Value::as_str),
+            Some("platform.openai.com")
+        );
+        assert!(!structured_text.contains("/logs/resp_"));
+        assert!(!structured_text.contains("?q="));
+        assert!(!structured_text.contains("page_title"));
+
+        let primary_slots = request
+            .body
+            .pointer("/text/format/schema/properties/support_slots_by_field/properties/primary_task/items/enum")
+            .and_then(Value::as_array)
+            .expect("primary task support slots");
+        assert!(primary_slots.iter().filter_map(Value::as_str).any(|slot| {
+            request
+                .slots
+                .get(slot)
+                .is_some_and(|support| support.category == SupportCategory::ContextImage)
+        }));
+    }
+
+    #[test]
+    fn incomplete_provider_response_is_rejected_as_a_transport_failure() {
+        let error = output_text(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output_text": "{\"primary_task\":\"cut off"
+        }))
+        .expect_err("an incomplete envelope must never be parsed as task truth");
+
+        assert_eq!(error.0, ProbeDiagnosticStatus::ProviderNoUsableOutput);
+        assert_eq!(error.1, "provider_response_incomplete");
+    }
+
+    #[test]
+    fn timeline_metadata_is_not_a_semantic_support_slot_and_private_visits_are_redacted() {
+        let mut packet = live_shaped_session_packet();
+        packet.surface_timeline[1].private = true;
+        packet.surface_timeline[1].app_label = "Sensitive Private App".into();
+        packet.surface_timeline[1].site_hostname = Some("secret.example".into());
+        packet.surface_timeline[1].representative_frame = None;
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        assert!(!structured_text.contains("Sensitive Private App"));
+        assert!(!structured_text.contains("secret.example"));
+        let private_audit = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.private)
+            .expect("private audit visit");
+        assert_eq!(private_audit.app_label, "Private activity");
+        assert!(private_audit.site_hostname.is_none());
+        assert_eq!(
+            private_audit.image_omission_reason.as_deref(),
+            Some("private")
+        );
+        assert_eq!(
+            request.audit.image_exclusions_by_reason.get("private"),
+            Some(&1)
+        );
+
+        let proposed = ProbeModelOutput {
+            primary_task: Some("A task guessed only from the app timeline".into()),
+            current_step: None,
+            last_progress: None,
+            unfinished_state: None,
+            visit_roles: BTreeMap::new(),
+            support_slots_by_field: BTreeMap::from([
+                ("primary_task".into(), Vec::new()),
+                ("current_step".into(), Vec::new()),
+                ("last_progress".into(), Vec::new()),
+                ("unfinished_state".into(), Vec::new()),
+            ]),
+            missing_evidence: Vec::new(),
+            confidence_by_field: BTreeMap::new(),
+            status: ProbeResolutionStatus::PartlyResolved,
+        };
+        let (admitted, issues) = admit_output(&packet, &request, proposed);
+        assert!(admitted.primary_task.is_none());
+        assert!(issues
+            .iter()
+            .any(|issue| { issue.contains("primary_task") && issue.contains("support") }));
+    }
+
+    #[test]
+    fn image_budget_omissions_are_typed_per_surface_visit() {
+        let mut packet = live_shaped_session_packet();
+        let mut extra = keyframe(2, false);
+        extra.frame_id = "frame-extra".into();
+        extra.observed_at_ms = 2_500;
+        extra.local_image_handle_hash = Some("image-hash-extra".into());
+        extra.ephemeral_local_image_path = Some(image_file(55));
+        packet.surface_timeline.insert(
+            3,
+            surface_visit(4, "Helium", Some("github.com"), extra, 1, false),
+        );
+        packet.surface_timeline[4].sequence_index = 5;
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let omitted = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.site_hostname.as_deref() == Some("github.com"))
+            .expect("omitted surface audit");
+        assert!(omitted.image_slot.is_none());
+        assert_eq!(
+            omitted.image_omission_reason.as_deref(),
+            Some("budget_omitted")
+        );
+        assert_eq!(request.audit.omitted_surface_visit_count, 1);
+        assert_eq!(
+            request
+                .audit
+                .image_exclusions_by_reason
+                .get("budget_omitted"),
+            Some(&1)
         );
     }
 
@@ -3098,6 +4303,22 @@ mod tests {
     }
 
     #[test]
+    fn unrepresented_target_frame_cannot_be_assumed_to_precede_the_cutoff() {
+        let mut packet = packet(false);
+        let mut event = event(4);
+        event.event_id = "event-with-unrepresented-target".into();
+        event.observed_at_ms = 3_950;
+        event.target_frame_id = Some("frame-not-in-packet".into());
+        packet.causal_events.push(event);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("build request");
+        assert!(!request
+            .slots
+            .values()
+            .any(|slot| slot.record_id == "event-with-unrepresented-target"));
+    }
+
+    #[test]
     fn passive_accessibility_notifications_never_become_user_action_slots() {
         let mut packet = packet(false);
         packet.causal_events.clear();
@@ -3183,6 +4404,153 @@ mod tests {
             request.audit.boundary_selection_reasons,
             vec!["current_manual_boundary"]
         );
+    }
+
+    #[test]
+    fn live_like_devfolio_to_x_scroll_keeps_context_and_sends_readable_evidence() {
+        let mut packet = packet(false);
+        let browser_surface = |page: &str| ActiveSurfaceIdentityV2 {
+            app_name: Some("Helium".into()),
+            app_bundle_id: Some("net.imput.helium".into()),
+            window_title_hash: Some(format!("title-{page}")),
+            window_id: None,
+            browser_url_hash: Some(format!("url-{page}")),
+            document_path_hash: None,
+        };
+        for (index, frame) in packet.semantic_keyframes.iter_mut().enumerate() {
+            frame.surface_identity = match index {
+                0 => browser_surface("wemakedevs"),
+                1 => browser_surface("devfolio-application"),
+                2 | 3 => browser_surface("x-home"),
+                _ => unreachable!(),
+            };
+            frame.partition = if index == 3 {
+                EvidencePartitionV2::Current
+            } else {
+                EvidencePartitionV2::Prior
+            };
+        }
+        packet.current_frame = packet.semantic_keyframes[3].clone();
+        packet.active_surface = packet.current_frame.surface_identity.clone();
+        packet.canonical_elements.clear();
+        packet.focused_element_ids.clear();
+        packet.editable_element_ids.clear();
+
+        let mut scroll = event(4);
+        scroll.event_id = "x-scroll".into();
+        scroll.event_kind = "scroll".into();
+        scroll.observed_at_ms = 3_900;
+        scroll.frame_id = "frame-4".into();
+        scroll.source_frame_id = "frame-3".into();
+        scroll.target_frame_id = Some("frame-4".into());
+        scroll.target_element_id = None;
+        scroll.app_bundle_id = Some("net.imput.helium".into());
+        scroll.semantic_delta_reference = Some("delta-4".into());
+        scroll.committed = None;
+        packet.causal_events = vec![scroll];
+
+        let mut entered_x = delta(3);
+        entered_x.prior_frame_id = Some("frame-2".into());
+        entered_x.next_frame_id = "frame-3".into();
+        entered_x.frame_id = "frame-3".into();
+        entered_x.diff_kind = Some("unknown".into());
+        entered_x.observable_changes = vec!["content_appeared".into()];
+        entered_x.causal_event_ids.clear();
+        let mut scrolled_x = delta(4);
+        scrolled_x.prior_frame_id = Some("frame-3".into());
+        scrolled_x.next_frame_id = "frame-4".into();
+        scrolled_x.frame_id = "frame-4".into();
+        scrolled_x.observable_changes = vec!["content_appeared".into()];
+        scrolled_x.causal_event_ids = vec!["x-scroll".into()];
+        packet.frame_changes = vec![entered_x, scrolled_x];
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("compact request");
+
+        assert_eq!(request.audit.boundary_count, 2);
+        assert_eq!(request.audit.image_count, 3);
+        assert_eq!(
+            request.audit.boundary_selection_reasons,
+            vec![
+                "recent_surface_transition_with_activity",
+                "current_manual_boundary"
+            ]
+        );
+        assert_eq!(
+            request
+                .slots
+                .values()
+                .filter(|slot| matches!(
+                    slot.category,
+                    SupportCategory::ImageBefore | SupportCategory::ImageAfter
+                ))
+                .map(|slot| slot.record_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["frame-2", "frame-3", "frame-4"])
+        );
+        let record_ids = request
+            .slots
+            .values()
+            .map(|slot| slot.record_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            record_ids.len(),
+            record_ids.iter().copied().collect::<BTreeSet<_>>().len()
+        );
+
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        assert!(structured_text.contains("earlier_context"));
+        assert!(structured_text.contains("current_at_continue"));
+        assert!(structured_text.contains("different page, document, or window"));
+        assert!(structured_text.contains("The user scrolled on this surface"));
+        assert!(!structured_text.contains("change_kind"));
+        assert!(!structured_text.contains("observable_changes"));
+        assert!(!structured_text.contains("committed=None"));
+        assert!(!structured_text.contains("transition:continuing_same_task"));
+
+        let earlier_image = request
+            .slots
+            .values()
+            .find(|slot| {
+                slot.boundary_index == 1
+                    && matches!(
+                        slot.category,
+                        SupportCategory::ImageBefore | SupportCategory::ImageAfter
+                    )
+            })
+            .unwrap()
+            .slot
+            .clone();
+        let proposed = ProbeModelOutput {
+            primary_task: Some("Complete the visible hackathon application".into()),
+            current_step: None,
+            last_progress: None,
+            unfinished_state: None,
+            visit_roles: visit_roles(&request),
+            support_slots_by_field: BTreeMap::from([
+                ("primary_task".into(), vec![earlier_image]),
+                ("current_step".into(), Vec::new()),
+                ("last_progress".into(), Vec::new()),
+                ("unfinished_state".into(), Vec::new()),
+            ]),
+            missing_evidence: Vec::new(),
+            confidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), 0.8))
+                .collect(),
+            status: ProbeResolutionStatus::PartlyResolved,
+        };
+        let (admitted, issues) = admit_output(&packet, &request, proposed);
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some("Complete the visible hackathon application")
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.contains("passive_evidence_cannot_establish_primary_task")));
     }
 
     #[test]
@@ -3349,7 +4717,8 @@ mod tests {
     #[test]
     fn runtime_probe_rejects_every_model_except_luna() {
         assert_eq!(configured_model_name(), DEFAULT_LUNA_MODEL);
-        assert!(!public_authority_enabled());
+        assert!(public_authority_enabled());
+        assert_eq!(MANUAL_PROVIDER_RETRIES, 0);
         let (attempt, slots) = run_probe(&packet(false), "gpt-5.6-sol", None);
         assert_eq!(
             attempt.diagnostic_status,
@@ -3360,6 +4729,74 @@ mod tests {
             Some("semantic_probe_requires_gpt_5_6_luna")
         );
         assert!(slots.is_none());
+    }
+
+    #[test]
+    fn production_runtime_case_needs_no_armed_input_and_one_decision_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("open database");
+        ensure_schema(&conn).expect("semantic probe schema");
+        let decision_id = "decision-production-compact";
+        let now_ms = super::super::super::current_time_millis();
+        let case_id = ensure_production_runtime_case(&conn, decision_id, now_ms)
+            .expect("create internal production case");
+        let case_kind: String = conn
+            .query_row(
+                "SELECT case_kind FROM task_truth_v2_semantic_probe_cases WHERE case_id=?1",
+                [case_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("read production case");
+        assert_eq!(case_kind, "production_runtime");
+
+        let attempt = ProbeAttempt {
+            diagnostic_status: ProbeDiagnosticStatus::RequestNotBuilt,
+            model: DEFAULT_LUNA_MODEL.into(),
+            request_id: None,
+            provider_request_id: None,
+            response_id: None,
+            response_model: None,
+            request_audit: None,
+            usage: ProviderUsageV1::default(),
+            estimated_cost_usd: None,
+            latency_ms: 0,
+            output_bytes: None,
+            parsed_response: false,
+            provider_post_count: 0,
+            cited_support_slots_before_admission: BTreeMap::new(),
+            admitted_output: None,
+            validation_issues: Vec::new(),
+            failure_reason: Some("test_preflight_failure".into()),
+        };
+        let packet = packet(false);
+        persist_attempt(
+            &conn,
+            &case_id,
+            decision_id,
+            packet.session_id.as_deref(),
+            &packet,
+            &attempt,
+            None,
+        )
+        .expect("persist compact run");
+
+        // This returns before loading any armed case or provider config. The
+        // exact decision already owns a compact run and cannot submit again.
+        run_manual_probe(
+            &conn,
+            decision_id,
+            packet.session_id.as_deref(),
+            &packet,
+            None,
+        )
+        .expect("reuse exact decision");
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_truth_v2_semantic_probe_runs WHERE decision_id=?1",
+                [decision_id],
+                |row| row.get(0),
+            )
+            .expect("count compact runs");
+        assert_eq!(run_count, 1);
     }
 
     #[test]
@@ -3431,11 +4868,10 @@ mod tests {
             .support_slots_by_field
             .insert("primary_task".into(), vec!["B1_IMAGE_BEFORE".into()]);
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(
-            admitted.primary_task.as_deref(),
-            Some("Implement the PFTU semantic probe")
-        );
+        assert!(admitted.primary_task.is_none());
+        assert!(issues.iter().any(|issue| {
+            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+        }));
     }
 
     #[test]
@@ -3478,6 +4914,135 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue == "unfinished_state:stale_or_ineligible_slot"));
+    }
+
+    #[test]
+    fn context_image_uses_physical_identity_not_selection_metadata() {
+        let mut packet = live_shaped_session_packet();
+        packet.semantic_keyframes[0].partition = EvidencePartitionV2::Background;
+        packet.semantic_keyframes[0].selection_reasons = vec!["semantic_keyframe_reason".into()];
+        packet.surface_timeline[0]
+            .representative_frame
+            .as_mut()
+            .expect("timeline representative")
+            .selection_reasons = vec!["session_surface_representative".into()];
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let context_slot = request
+            .slots
+            .values()
+            .find(|slot| slot.category == SupportCategory::ContextImage)
+            .expect("context image")
+            .slot
+            .clone();
+        let mut generated = output(Some("Audit the visible continuation contract"), &request);
+        generated
+            .support_slots_by_field
+            .insert("primary_task".into(), vec![context_slot]);
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some("Audit the visible continuation contract")
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue == "primary_task:stale_or_ineligible_slot"));
+    }
+
+    #[test]
+    fn conflicting_physical_variants_still_reject_the_context_slot() {
+        let mut packet = live_shaped_session_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let context_slot = request
+            .slots
+            .values()
+            .find(|slot| slot.category == SupportCategory::ContextImage)
+            .expect("context image")
+            .slot
+            .clone();
+        packet.semantic_keyframes[0].observed_at_ms += 1;
+        let mut generated = output(Some("Audit the visible continuation contract"), &request);
+        generated
+            .support_slots_by_field
+            .insert("primary_task".into(), vec![context_slot]);
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert!(admitted.primary_task.is_none());
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "primary_task:stale_or_ineligible_slot"));
+    }
+
+    #[test]
+    fn visit_role_schema_is_exact_and_bad_role_citations_are_field_local() {
+        let packet = live_shaped_session_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let schema_roles = request
+            .body
+            .pointer("/text/format/schema/properties/visit_roles/properties")
+            .and_then(Value::as_object)
+            .expect("visit role properties");
+        let required_roles = request
+            .body
+            .pointer("/text/format/schema/properties/visit_roles/required")
+            .and_then(Value::as_array)
+            .expect("required visit roles");
+        assert_eq!(schema_roles.len(), request.audit.image_count);
+        assert_eq!(required_roles.len(), request.audit.image_count);
+        assert!(schema_roles.contains_key("T1_VISIT"));
+        assert!(schema_roles.contains_key("T4_VISIT"));
+
+        let mut generated = output(Some("Audit the visible continuation contract"), &request);
+        let wrong_image = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.visit_id == "T2_VISIT")
+            .and_then(|visit| visit.image_slot.clone())
+            .expect("second visit image");
+        generated
+            .visit_roles
+            .get_mut("T1_VISIT")
+            .expect("first visit role")
+            .support_slots = vec![wrong_image];
+        generated
+            .visit_roles
+            .get_mut("T2_VISIT")
+            .expect("second visit role")
+            .role = ProbeSurfaceRole::SupportingWork;
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert_eq!(
+            admitted.visit_roles["T1_VISIT"].role,
+            ProbeSurfaceRole::Unclear
+        );
+        assert_eq!(admitted.visit_roles["T1_VISIT"].confidence, 0.0);
+        assert_eq!(
+            admitted.visit_roles["T2_VISIT"].role,
+            ProbeSurfaceRole::SupportingWork
+        );
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some("Audit the visible continuation contract")
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "visit_role:T1_VISIT:missing_own_visit_image_slot"));
+    }
+
+    #[test]
+    fn old_probe_output_without_visit_roles_still_deserializes() {
+        let mut legacy = serde_json::to_value(output(
+            Some("Implement the PFTU semantic probe"),
+            &build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request"),
+        ))
+        .unwrap();
+        legacy
+            .as_object_mut()
+            .expect("probe output")
+            .remove("visit_roles");
+        let restored: ProbeModelOutput = serde_json::from_value(legacy).unwrap();
+        assert!(restored.visit_roles.is_empty());
     }
 
     #[test]
@@ -3594,6 +5159,7 @@ mod tests {
             current_step: None,
             last_progress: None,
             unfinished_state: None,
+            visit_roles: BTreeMap::new(),
             support_slots_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), Vec::new()))
@@ -3614,6 +5180,27 @@ mod tests {
         let (admitted, issues) = admit_output(&packet, &request, generated);
         assert_eq!(admitted.primary_task, None);
         assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert!(issues.iter().any(|issue| {
+            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+        }));
+    }
+
+    #[test]
+    fn unrelated_action_cannot_justify_a_primary_task_cited_only_to_a_passive_image() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        assert!(request
+            .slots
+            .values()
+            .any(|slot| slot.category == SupportCategory::UserAction));
+        let passive_image = latest_slot(&request, SupportCategory::ImageAfter);
+        let mut generated = output(Some("Infer a purpose from the final screen"), &request);
+        generated
+            .support_slots_by_field
+            .insert("primary_task".into(), vec![passive_image]);
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+        assert!(admitted.primary_task.is_none());
         assert!(issues.iter().any(|issue| {
             issue == "primary_task:passive_evidence_cannot_establish_primary_task"
         }));
@@ -3733,6 +5320,7 @@ mod tests {
             ProbeDiagnosticStatus::ProviderUnavailable
         );
         assert!(!attempt.parsed_response);
+        assert_eq!(attempt.provider_post_count, 0);
         assert_eq!(attempt.admitted_output, None);
         assert_eq!(
             attempt.failure_reason.as_deref(),

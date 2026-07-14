@@ -56,6 +56,7 @@ pub(crate) struct MultimodalShadowAuditV1 {
     pub(crate) production_authority_changed: bool,
 }
 
+#[allow(dead_code)]
 fn multimodal_provider_enabled() -> bool {
     let configured = std::env::var("SMALLTALK_TASK_TRUTH_PROVIDER_MODE")
         .ok()
@@ -73,6 +74,7 @@ fn multimodal_provider_enabled() -> bool {
     })
 }
 
+#[allow(dead_code)]
 fn run_multimodal_shadow(
     packet: &observation_packet::ObservationPacketV2,
     prior: Option<&task_snapshot::TaskSnapshotV2>,
@@ -395,8 +397,31 @@ fn record_manual_continue_shadow_with_lookback(
                 .last()
                 .and_then(|frame| frame.session_id.as_deref())
                 .filter(|value| !value.trim().is_empty())
+        })
+        .map(str::to_string);
+    if let (Some(resolved_session_id), Some(cutoff_ms)) = (
+        resolved_session_id.as_deref(),
+        frames.last().map(|frame| frame.captured_at),
+    ) {
+        let context_frames =
+            super::load_session_surface_context_frames(conn, resolved_session_id, cutoff_ms)?;
+        let detailed_frame_ids = frames
+            .iter()
+            .map(|frame| frame.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        frames.extend(
+            context_frames
+                .into_iter()
+                .filter(|frame| !detailed_frame_ids.contains(&frame.id)),
+        );
+        frames.sort_by_key(|frame| {
+            (
+                frame.captured_at,
+                frame.id.parse::<i64>().unwrap_or(i64::MAX),
+            )
         });
-    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id)?;
+    }
+    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id.as_deref())?;
     let bounded_watermark = super::stable_hash(
         serde_json::json!({
             "schema": "smalltalk.task_truth_bounded_watermark.v1",
@@ -420,22 +445,17 @@ fn record_manual_continue_shadow_with_lookback(
         &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
     )?;
-    let semantic_probe_owns_attempt = semantic_probe::probe_enabled();
-    let semantic_probe_error = if semantic_probe_owns_attempt {
-        if let Err(error) = semantic_probe::run_manual_probe(
-            conn,
-            decision_id,
-            resolved_session_id,
-            &packet,
-            preflight_failure.as_deref(),
-        ) {
-            // A proof-path failure is persisted when possible and must never
-            // make the rest of Continue fail.
-            eprintln!("[pftu_01_probe] {error}");
-            Some(error)
-        } else {
-            None
-        }
+    let semantic_probe_error = if let Err(error) = semantic_probe::run_manual_probe(
+        conn,
+        decision_id,
+        resolved_session_id.as_deref(),
+        &packet,
+        preflight_failure.as_deref(),
+    ) {
+        // Compact inference failures must not crash Continue. The public
+        // projection below will return a typed unresolved answer instead.
+        eprintln!("[compact_semantic_continue] {error}");
+        Some(error)
     } else {
         None
     };
@@ -443,21 +463,17 @@ fn record_manual_continue_shadow_with_lookback(
         .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
         .unwrap_or_else(|| capture_to_packet_started.elapsed().as_millis() as i64);
     let legacy_turn = super::task_turn::selected_current_task_turn(conn)?;
-    let prior_threads = task_thread::load_prior_thread_contexts(conn, resolved_session_id, 6)?;
-    let (verified_snapshot, multimodal_audit) = if semantic_probe_owns_attempt {
-        // PFTU is one semantic authority for this explicit Continue boundary.
-        // Its persisted provider answer is projected into the public contract
-        // below. Never spend a second request on the legacy multimodal path and
-        // then replace the first answer with the legacy verifier's fallback.
-        let reason = semantic_probe_error
-            .as_deref()
-            .unwrap_or("pftu_semantic_probe_owns_manual_attempt");
-        (None, unresolved_manual_preflight_audit(reason))
-    } else if let Some(reason) = preflight_failure.as_deref() {
-        (None, unresolved_manual_preflight_audit(reason))
-    } else {
-        run_multimodal_shadow(&packet, prior.as_ref(), &prior_threads)
-    };
+    // Every explicit Continue has exactly one semantic authority: the compact
+    // Luna request persisted above. The legacy full-packet resolver remains
+    // available to offline evaluation code, but it is never called here.
+    let compact_attempt_reason = semantic_probe_error
+        .as_deref()
+        .or(preflight_failure.as_deref())
+        .unwrap_or("compact_semantic_continue_owns_manual_attempt");
+    let (verified_snapshot, multimodal_audit) = (
+        None,
+        unresolved_manual_preflight_audit(compact_attempt_reason),
+    );
     let snapshot = verified_snapshot.unwrap_or_else(|| {
         let reason = preflight_failure.clone().unwrap_or_else(|| {
             format!(
@@ -476,7 +492,7 @@ fn record_manual_continue_shadow_with_lookback(
     });
     let persistence_started = std::time::Instant::now();
     let boundary = task_thread::persist_boundary_atomic(conn, &packet, snapshot)?;
-    let snapshots = checkpoint::load_recent_snapshots(conn, resolved_session_id, 24)?;
+    let snapshots = checkpoint::load_recent_snapshots(conn, resolved_session_id.as_deref(), 24)?;
     // The manual Continue attempt is one atomic boundary. Its audit selection
     // must describe that boundary, not re-run selection over unrelated recent
     // snapshots from the same session.

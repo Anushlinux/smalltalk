@@ -9,6 +9,7 @@ import {
   getContinuePresentationActionState,
   inspectTargetCopy,
   isTaskInferenceUnavailable,
+  recentContextForPresentation,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
@@ -250,8 +251,31 @@ test("provider-failure unresolved answer remains usable without task identity", 
   });
 });
 
+test("recent context remains visible for resolved, partial, and unresolved answers", () => {
+  const visits = Array.from({ length: 10 }, (_, index) => ({
+    sequence_index: index + 1,
+    app_label: index === 1 ? "Private activity" : "Helium",
+    site_hostname: index === 1 ? null : `site-${index}.example`,
+    first_observed_at_ms: index * 100,
+    last_observed_at_ms: index * 100 + 50,
+    is_current: index === 9,
+    revisited: index > 4,
+    evidence_refs: [`frame-${index}`],
+  }));
+
+  for (const status of ["resolved", "partial", "unresolved"]) {
+    const decision = authoritativeDecision({ status });
+    decision.task_truth_v2.answer.recent_context = visits;
+    const answer = authoritativeTaskTruthAnswer(decision);
+    const visible = recentContextForPresentation(answer);
+    assert.equal(visible.length, 8);
+    assert.equal(visible[0].sequence_index, 1);
+    assert.equal(visible[1].app_label, "Private activity");
+  }
+});
+
 test("task inference availability names only actual provider availability failures", () => {
-  for (const status of ["model_unavailable", "provider_error", "provider_failure"]) {
+  for (const status of ["model_unavailable", "provider_error", "provider_failure", "provider_unavailable"]) {
     assert.equal(isTaskInferenceUnavailable(status), true, status);
   }
   for (const status of ["disabled", "credentials_missing", "timeout", "request_invalid", "invalid_response"]) {
@@ -288,6 +312,28 @@ test("task inference failures have distinct user-facing states and retry policy"
   );
   assert.equal(taskInferenceFailurePresentation("invalid_response").kind, "model_response_invalid");
   assert.equal(taskInferenceFailurePresentation("invalid_response").retryable, true);
+  assert.deepEqual(taskInferenceFailurePresentation("provider_no_usable_output"), {
+    kind: "provider_no_usable_output",
+    headline: "Cloud task inference did not return a usable answer",
+    detail: "The provider did not return one complete, valid task answer.",
+    retryable: true,
+  });
+  assert.equal(
+    taskInferenceFailurePresentation("structured_parse_failure").kind,
+    "model_response_invalid",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("support_slot_validation_failure").kind,
+    "evidence_verifier_rejected",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("provider_rejected").kind,
+    "provider_request_rejected",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("provider_unavailable").kind,
+    "provider_unavailable",
+  );
   assert.equal(
     taskInferenceFailurePresentation("success", "verification_rejected").kind,
     "evidence_verifier_rejected",

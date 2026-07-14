@@ -97,6 +97,21 @@ export type ContinueTaskTruthAlternative = {
   semantic_payload?: unknown | null;
 };
 
+export type ContinueTaskTruthRecentContext = {
+  sequence_index: number;
+  app_label: string;
+  site_hostname?: string | null;
+  first_observed_at_ms: number;
+  last_observed_at_ms: number;
+  is_current: boolean;
+  revisited: boolean;
+  evidence_refs?: string[];
+  semantic_role?: "primary_work" | "supporting_work" | "detour_or_unrelated" | "unclear" | null;
+  role_confidence?: number | null;
+  relationship_to_primary_task?: string | null;
+  role_evidence_refs?: string[];
+};
+
 export type ContinueTaskTruthAnswer = {
   schema: string;
   task_basis?: string | null;
@@ -120,6 +135,7 @@ export type ContinueTaskTruthAnswer = {
   next_action?: string | null;
   where_summary?: string | null;
   relationship_to_prior?: string | null;
+  recent_context?: ContinueTaskTruthRecentContext[];
   alternative_hypotheses: ContinueTaskTruthAlternative[];
   direct_return_target?: ContinueAdoptionTarget | null;
   evidence_preview?: {
@@ -251,6 +267,7 @@ export function isTaskInferenceUnavailable(status?: string | null) {
     "model_unavailable",
     "provider_error",
     "provider_failure",
+    "provider_unavailable",
   ].includes(normalizeToken(status));
 }
 
@@ -263,6 +280,7 @@ export type TaskInferenceFailureKind =
   | "provider_request_rejected"
   | "provider_failure"
   | "provider_unavailable"
+  | "provider_no_usable_output"
   | "model_response_invalid"
   | "evidence_verifier_rejected"
   | "insufficient_evidence";
@@ -288,10 +306,27 @@ export function taskInferenceFailurePresentation(
       retryable: true,
     };
   }
+  if (normalized === "support_slot_validation_failure") {
+    return {
+      kind: "evidence_verifier_rejected" as TaskInferenceFailureKind,
+      headline: "The proposed task did not match the captured evidence",
+      detail: "Cloud inference returned an answer, but its cited evidence did not pass local validation.",
+      retryable: true,
+    };
+  }
+  if (normalized === "provider_no_usable_output") {
+    return {
+      kind: "provider_no_usable_output" as TaskInferenceFailureKind,
+      headline: "Cloud task inference did not return a usable answer",
+      detail: "The provider did not return one complete, valid task answer.",
+      retryable: true,
+    };
+  }
   if ([
     "invalid_response",
     "invalid_atomic_identity",
     "missing_model_response_identity",
+    "structured_parse_failure",
     "unsupported_semantic_source",
   ].includes(normalized)) {
     return {
@@ -305,6 +340,7 @@ export function taskInferenceFailurePresentation(
   }
   if (
     normalized === "request_rejected"
+    || normalized === "provider_rejected"
     || (normalized === "request_invalid" && providerWasAttempted)
   ) {
     return {
@@ -347,6 +383,14 @@ export function taskInferenceFailurePresentation(
       kind: "model_unavailable" as TaskInferenceFailureKind,
       headline: "The configured inference model is unavailable",
       detail: "The provider could not use the configured model for this request.",
+      retryable: true,
+    };
+  }
+  if (normalized === "provider_unavailable") {
+    return {
+      kind: "provider_unavailable" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is unavailable",
+      detail: "Smalltalk could not complete the provider request. Check the provider configuration or try Continue again.",
       retryable: true,
     };
   }
@@ -468,6 +512,12 @@ export function authoritativeTaskTruthTarget(
 ) {
   const answer = authoritativeTaskTruthAnswer(decision);
   return answer ? answer.direct_return_target || null : null;
+}
+
+export function recentContextForPresentation(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  return (answer?.recent_context || []).slice(0, 8);
 }
 
 export function authoritativeTaskTruthActionState(

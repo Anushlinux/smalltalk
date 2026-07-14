@@ -1559,7 +1559,7 @@ impl Default for ContinueDecisionRequest {
             limit: Some(700),
             mode: Some("normal".to_string()),
             rebuild_layers: Some(false),
-            micro_inference_enabled: Some(true),
+            micro_inference_enabled: Some(false),
             activity_recap_model_enabled: Some(false),
             model: None,
             max_candidates_for_model: Some(5),
@@ -4397,8 +4397,11 @@ pub fn get_continue_decision(
         limit: request.limit.or(Some(700)),
         mode: request.mode.or(Some("normal".to_string())),
         rebuild_layers: request.rebuild_layers.or(Some(false)),
-        micro_inference_enabled: request.micro_inference_enabled.or(Some(true)),
-        activity_recap_model_enabled: request.activity_recap_model_enabled.or(Some(false)),
+        // The compact Luna boundary is the only cloud semantic path. These
+        // legacy model calls remain decodable for historical audits, but a
+        // normal, background, or startup Continue cannot execute them.
+        micro_inference_enabled: Some(false),
+        activity_recap_model_enabled: Some(false),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
@@ -28166,6 +28169,256 @@ fn load_evidence_frames(
     Ok(frames)
 }
 
+const MAX_SESSION_SURFACE_VISITS: usize = 8;
+
+fn privacy_status_is_private(status: Option<&str>) -> bool {
+    let normalized = status.unwrap_or("unknown").trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "private" | "blocked" | "secure" | "sensitive" | "denied" | "redacted"
+    ) || normalized.contains("private")
+        || normalized.contains("blocked")
+        || normalized.contains("secure")
+}
+
+fn session_surface_is_diagnostic(frame: &EvidenceFrame) -> bool {
+    let bundle = frame
+        .app_bundle_id
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let app = frame
+        .app_name
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // Codex can be the user's primary workspace. Only Smalltalk's own UI is
+    // categorically excluded from session evidence.
+    bundle == "com.smalltalk.app" || app == "smalltalk"
+}
+
+fn session_surface_key(frame: &EvidenceFrame) -> String {
+    let app = frame
+        .app_bundle_id
+        .as_deref()
+        .or(frame.app_name.as_deref())
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase();
+    if privacy_status_is_private(frame.privacy_status.as_deref()) {
+        return format!("private:{app}");
+    }
+    if let Some(host) = frame
+        .browser_url
+        .as_deref()
+        .and_then(session_browser_hostname)
+    {
+        return format!("browser:{app}:{}", host.to_ascii_lowercase());
+    }
+    format!("app:{app}")
+}
+
+fn session_browser_hostname(url: &str) -> Option<String> {
+    let raw = url.trim();
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let hostname = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    (!hostname.is_empty()).then_some(hostname)
+}
+
+fn session_surface_frame_score(frame: &EvidenceFrame) -> (i64, i64, i64) {
+    let trigger = frame.capture_trigger.to_ascii_lowercase();
+    let activity_weight = if trigger.contains("typing")
+        || trigger.contains("event_burst")
+        || trigger.contains("manual")
+        || trigger.contains("submit")
+    {
+        3
+    } else if trigger.contains("surface_change") || trigger.contains("app_switch") {
+        1
+    } else {
+        2
+    };
+    (
+        i64::from(!privacy_status_is_private(frame.privacy_status.as_deref())),
+        activity_weight,
+        frame.captured_at,
+    )
+}
+
+#[derive(Debug)]
+struct SessionSurfaceVisitAccumulator {
+    key: String,
+    first: EvidenceFrame,
+    last: EvidenceFrame,
+    representative: EvidenceFrame,
+    has_hostname: bool,
+    all_new_tab: bool,
+    grounded_interaction_hint: bool,
+    private: bool,
+}
+
+impl SessionSurfaceVisitAccumulator {
+    fn new(frame: EvidenceFrame) -> Self {
+        let has_hostname = frame
+            .browser_url
+            .as_deref()
+            .and_then(session_browser_hostname)
+            .is_some();
+        let all_new_tab = frame
+            .window_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("new tab");
+        let grounded_interaction_hint = session_frame_has_interaction_hint(&frame);
+        let private = privacy_status_is_private(frame.privacy_status.as_deref());
+        Self {
+            key: session_surface_key(&frame),
+            first: frame.clone(),
+            last: frame.clone(),
+            representative: frame,
+            has_hostname,
+            all_new_tab,
+            grounded_interaction_hint,
+            private,
+        }
+    }
+
+    fn push(&mut self, frame: EvidenceFrame) {
+        self.has_hostname |= frame
+            .browser_url
+            .as_deref()
+            .and_then(session_browser_hostname)
+            .is_some();
+        self.all_new_tab &= frame
+            .window_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("new tab");
+        self.grounded_interaction_hint |= session_frame_has_interaction_hint(&frame);
+        self.private |= privacy_status_is_private(frame.privacy_status.as_deref());
+        if session_surface_frame_score(&frame) > session_surface_frame_score(&self.representative) {
+            self.representative = frame.clone();
+        }
+        self.last = frame;
+    }
+
+    fn is_meaningful(&self) -> bool {
+        self.private || self.has_hostname || !self.all_new_tab || self.grounded_interaction_hint
+    }
+
+    fn selected_frames(self) -> Vec<EvidenceFrame> {
+        let mut selected = HashMap::new();
+        selected.insert(self.first.id.clone(), self.first);
+        selected.insert(self.last.id.clone(), self.last);
+        selected.insert(self.representative.id.clone(), self.representative);
+        selected.into_values().collect()
+    }
+}
+
+fn session_frame_has_interaction_hint(frame: &EvidenceFrame) -> bool {
+    let trigger = frame.capture_trigger.trim().to_ascii_lowercase();
+    ["click", "scroll", "typing", "submit", "event_burst"]
+        .iter()
+        .any(|signal| trigger.contains(signal))
+}
+
+/// Load a bounded set of lightweight frames that represents the current
+/// session's meaningful foreground-surface chronology. The ordinary evidence
+/// loader remains capped at 24 detailed frames. This pass streams metadata from
+/// session start through the exact cutoff, keeps only the latest eight visit
+/// summaries in memory, then hydrates screenshot ownership and event grounding
+/// for each visit's first, last, and representative frames.
+fn load_session_surface_context_frames(
+    conn: &Connection,
+    session_id: &str,
+    cutoff_ms: i64,
+) -> Result<Vec<EvidenceFrame>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT f.id, f.captured_at, f.app_name, f.window_name, f.browser_url,
+                    f.document_path, f.capture_trigger, f.text_source, f.full_text,
+                    f.content_hash, f.image_hash, f.privacy_status, f.app_bundle_id,
+                    f.previous_frame_id, f.session_id
+             FROM frames f
+             WHERE f.session_id = ?1 AND f.captured_at <= ?2
+             ORDER BY f.captured_at ASC, f.id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = statement
+        .query_map(params![session_id, cutoff_ms], evidence_frame_from_row)
+        .map_err(to_string)?;
+    let mut current_visit: Option<SessionSurfaceVisitAccumulator> = None;
+    let mut visits = std::collections::VecDeque::<SessionSurfaceVisitAccumulator>::new();
+    let retain_visit =
+        |visit: SessionSurfaceVisitAccumulator,
+         visits: &mut std::collections::VecDeque<SessionSurfaceVisitAccumulator>| {
+            if !visit.is_meaningful() {
+                return;
+            }
+            visits.push_back(visit);
+            if visits.len() > MAX_SESSION_SURFACE_VISITS {
+                visits.pop_front();
+            }
+        };
+    for row in rows {
+        let frame = row.map_err(to_string)?;
+        if session_surface_is_diagnostic(&frame) {
+            if let Some(previous) = current_visit.take() {
+                retain_visit(previous, &mut visits);
+            }
+            continue;
+        }
+        let key = session_surface_key(&frame);
+        if current_visit.as_ref().is_some_and(|visit| visit.key == key) {
+            current_visit.as_mut().expect("visit exists").push(frame);
+        } else {
+            if let Some(previous) = current_visit.take() {
+                retain_visit(previous, &mut visits);
+            }
+            current_visit = Some(SessionSurfaceVisitAccumulator::new(frame));
+        }
+    }
+    if let Some(previous) = current_visit {
+        retain_visit(previous, &mut visits);
+    }
+
+    let mut selected = visits
+        .into_iter()
+        .flat_map(SessionSurfaceVisitAccumulator::selected_frames)
+        .collect::<Vec<_>>();
+
+    for frame in &mut selected {
+        load_frame_capture_attribution(conn, frame)?;
+        frame.visible_windows = load_frame_visible_windows(conn, &frame.id)?;
+        frame.ui_events = load_frame_ui_events(conn, frame)?;
+        frame.trigger = load_frame_trigger(conn, &frame.id)?;
+        frame.transition = load_frame_transition(conn, &frame.id)?;
+        frame.frame_diff = load_frame_diff(conn, &frame.id)?;
+        frame.typing_bursts = load_frame_typing_bursts(conn, &frame.id, frame.captured_at)?;
+    }
+    selected.sort_by_key(|frame| {
+        (
+            frame.captured_at,
+            frame.id.parse::<i64>().unwrap_or(i64::MAX),
+        )
+    });
+    Ok(selected)
+}
+
 #[derive(Debug)]
 struct EventEvidenceRow {
     id: String,
@@ -28902,12 +29155,32 @@ fn load_frame_ui_events(
     if !table_exists(conn, "ui_events")? {
         return Ok(Vec::new());
     }
+    let previous_captured_at = frame
+        .previous_frame_id
+        .as_deref()
+        .map(|previous_frame_id| {
+            conn.query_row(
+                "SELECT captured_at FROM frames WHERE CAST(id AS TEXT) = ?1 LIMIT 1",
+                params![previous_frame_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(to_string)
+        })
+        .transpose()?
+        .flatten();
+    let belongs_to_incoming_edge = |event: &EvidenceUiEvent| {
+        event.ts_ms.is_some_and(|observed_at_ms| {
+            observed_at_ms <= frame.captured_at
+                && previous_captured_at.is_none_or(|previous_at_ms| observed_at_ms > previous_at_ms)
+        })
+    };
     let mut events = Vec::new();
     let mut seen = HashSet::new();
     if let Some(trigger) = &frame.trigger {
         for event_id in &trigger.caused_by_event_ids {
             if let Some(event) = load_ui_event_by_id(conn, event_id)? {
-                if seen.insert(event.id.clone()) {
+                if belongs_to_incoming_edge(&event) && seen.insert(event.id.clone()) {
                     events.push(event);
                 }
             }
@@ -28920,11 +29193,18 @@ fn load_frame_ui_events(
             "NULL".to_string()
         })
     };
+    // A captured frame is the post-state of the edge that led into it. Nearby
+    // events therefore belong only to (previous_frame, current_frame]. The old
+    // +/- 2.5 second window attached the same event to both adjacent frames and
+    // allowed actions after the manual cutoff to contaminate the cutoff frame.
+    let lower_bound_ms =
+        previous_captured_at.unwrap_or_else(|| frame.captured_at.saturating_sub(2_500));
     let sql = format!(
         "SELECT id, ts_ms, event_type, key_category, {}, {}, {}, {}, {}, {}, {}
              FROM ui_events
              WHERE (?1 IS NULL OR session_id = ?1)
-               AND ABS(ts_ms - ?2) <= 2500
+               AND ts_ms > ?2
+               AND ts_ms <= ?3
              ORDER BY ts_ms ASC
              LIMIT 12",
         event_column("x")?,
@@ -28938,7 +29218,11 @@ fn load_frame_ui_events(
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(
-            params![frame.session_id.as_deref(), frame.captured_at],
+            params![
+                frame.session_id.as_deref(),
+                lower_bound_ms,
+                frame.captured_at
+            ],
             |row| {
                 Ok(EvidenceUiEvent {
                     id: row.get(0)?,
@@ -28957,7 +29241,7 @@ fn load_frame_ui_events(
         )
         .map_err(to_string)?;
     for event in rows.collect::<Result<Vec<_>, _>>().map_err(to_string)? {
-        if seen.insert(event.id.clone()) {
+        if belongs_to_incoming_edge(&event) && seen.insert(event.id.clone()) {
             events.push(event);
         }
     }
@@ -29017,7 +29301,7 @@ fn load_frame_trigger(
     conn.query_row(
         "SELECT id, trigger_type, caused_by_event_ids
          FROM capture_triggers
-         WHERE post_frame_id = ?1 OR pre_frame_id = ?1
+         WHERE post_frame_id = ?1
          ORDER BY ts_ms DESC
          LIMIT 1",
         params![frame_id],
@@ -29050,7 +29334,7 @@ fn load_frame_transition(
         "SELECT id, primary_event_id, transition_type, summary, confidence,
                 pre_frame_id, post_frame_id, {changed_region_expr}
          FROM event_transitions
-         WHERE post_frame_id = ?1 OR pre_frame_id = ?1
+         WHERE post_frame_id = ?1
          ORDER BY ts_end_ms DESC
          LIMIT 1"
     );
@@ -48472,6 +48756,119 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn evidence_frame_owns_only_its_incoming_events_trigger_and_transition() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Helium",
+            "Earlier page",
+            Some("https://example.com/earlier"),
+            None,
+            "periodic",
+            "Earlier page",
+            Some("net.imput.helium"),
+            None,
+        );
+        insert_frame(
+            &conn,
+            2,
+            "Helium",
+            "Current page",
+            Some("https://example.com/current"),
+            None,
+            "accessibility_change",
+            "Current page",
+            Some("net.imput.helium"),
+            Some(1),
+        );
+        insert_frame(
+            &conn,
+            3,
+            "ChatGPT",
+            "ChatGPT",
+            None,
+            None,
+            "app_switch",
+            "Diagnostic surface",
+            Some("com.openai.codex"),
+            Some(2),
+        );
+        insert_ui_event(
+            &conn,
+            "event-into-2",
+            "session-a",
+            1_500,
+            "click",
+            "Helium",
+            "net.imput.helium",
+            "Current page",
+            None,
+        );
+        insert_ui_event(
+            &conn,
+            "event-after-2",
+            "session-a",
+            2_500,
+            "app_switch",
+            "ChatGPT",
+            "com.openai.codex",
+            "ChatGPT",
+            None,
+        );
+        insert_trigger_with_events(&conn, 2, &["event-into-2"]);
+        insert_trigger_with_events(&conn, 3, &["event-after-2"]);
+        conn.execute(
+            "INSERT INTO event_transitions (
+                id, session_id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
+                ts_start_ms, ts_end_ms, transition_type, confidence, summary
+             ) VALUES
+                ('transition-into-2','session-a','trigger-2','event-into-2','1','2',1400,2000,'navigation',0.9,'1 -> 2'),
+                ('transition-after-2','session-a','trigger-3','event-after-2','2','3',2400,3000,'switched_app',0.9,'2 -> 3')",
+            [],
+        )
+        .unwrap();
+
+        let frames = load_evidence_frames(
+            &conn,
+            &ContinueSecondLayerRebuildRequest {
+                start_frame_id: Some(1),
+                end_frame_id: Some(2),
+                session_id: Some("session-a".into()),
+                limit: Some(10),
+                lookback_ms: None,
+            },
+        )
+        .unwrap();
+        let current = frames.iter().find(|frame| frame.id == "2").unwrap();
+
+        assert_eq!(
+            current.trigger.as_ref().map(|trigger| trigger.id.as_str()),
+            Some("trigger-2")
+        );
+        assert_eq!(
+            current
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.post_frame_id.as_deref()),
+            Some("2")
+        );
+        assert_eq!(
+            current
+                .ui_events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-into-2"]
+        );
+        assert!(current
+            .ui_events
+            .iter()
+            .all(|event| event.ts_ms.is_some_and(|ts| ts <= current.captured_at)));
+    }
+
     fn action_kind_for_frame(conn: &Connection, frame_id: i64) -> String {
         conn.query_row(
             "SELECT action_kind FROM continue_task_actions WHERE frame_id = ?1",
@@ -52961,9 +53358,9 @@ mod tests {
     }
 
     #[test]
-    fn continue_decision_defaults_to_bounded_micro_inference() {
+    fn continue_decision_defaults_to_compact_semantic_inference_only() {
         let request = ContinueDecisionRequest::default();
-        assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.micro_inference_enabled, Some(false));
         assert_eq!(request.activity_recap_model_enabled, Some(false));
         assert_eq!(request.max_candidates_for_model, Some(5));
     }
