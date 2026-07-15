@@ -5031,6 +5031,43 @@ mod tests {
     }
 
     #[test]
+    fn browser_visits_can_be_primary_supporting_or_unclear() {
+        let packet = live_shaped_session_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let mut generated = output(
+            Some("Prepare the browser-based implementation plan"),
+            &request,
+        );
+        for (visit_id, role) in [
+            ("T2_VISIT", ProbeSurfaceRole::PrimaryWork),
+            ("T3_VISIT", ProbeSurfaceRole::SupportingWork),
+            ("T4_VISIT", ProbeSurfaceRole::Unclear),
+        ] {
+            generated
+                .visit_roles
+                .get_mut(visit_id)
+                .expect("browser visit role")
+                .role = role;
+        }
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+
+        assert_eq!(
+            admitted.visit_roles["T2_VISIT"].role,
+            ProbeSurfaceRole::PrimaryWork
+        );
+        assert_eq!(
+            admitted.visit_roles["T3_VISIT"].role,
+            ProbeSurfaceRole::SupportingWork
+        );
+        assert_eq!(
+            admitted.visit_roles["T4_VISIT"].role,
+            ProbeSurfaceRole::Unclear
+        );
+        assert!(!issues.iter().any(|issue| issue.starts_with("visit_role:")));
+    }
+
+    #[test]
     fn old_probe_output_without_visit_roles_still_deserializes() {
         let mut legacy = serde_json::to_value(output(
             Some("Implement the PFTU semantic probe"),

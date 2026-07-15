@@ -2621,6 +2621,55 @@ mod tests {
     }
 
     #[test]
+    fn normal_browser_frame_remains_visible_and_model_eligible() {
+        let image_path = std::env::temp_dir().join(format!(
+            "smalltalk-browser-evidence-{}.jpg",
+            std::process::id()
+        ));
+        std::fs::write(&image_path, b"browser-image").unwrap();
+        let mut browser = frame("browser-current", 1_000, "manual");
+        browser.app_name = Some("Helium".into());
+        browser.app_bundle_id = Some("net.imput.helium".into());
+        browser.window_name = Some("Home / X - Helium".into());
+        browser.browser_url = Some("https://x.com/home".into());
+        browser.active_window_crop_path = Some(image_path.to_string_lossy().to_string());
+        browser.privacy_status = Some("normal".into());
+        browser.content_units.push(content_unit(
+            "page-body",
+            "main_content",
+            "Browser work remains visible",
+            Rect {
+                x: 100.0,
+                y: 120.0,
+                w: 600.0,
+                h: 80.0,
+            },
+        ));
+
+        let packet = build_observation_packet(&[browser], "browser-watermark", None).unwrap();
+
+        assert!(packet.current_frame.model_eligible);
+        assert_eq!(
+            packet.current_frame.ephemeral_local_image_path.as_deref(),
+            Some(image_path.to_string_lossy().as_ref())
+        );
+        assert!(packet.semantic_keyframes.iter().any(|keyframe| {
+            keyframe.frame_id == "browser-current"
+                && keyframe.model_eligible
+                && keyframe.ephemeral_local_image_path.is_some()
+        }));
+        assert_eq!(packet.active_surface.app_name.as_deref(), Some("Helium"));
+        assert_eq!(packet.surface_timeline.len(), 1);
+        assert_eq!(packet.surface_timeline[0].app_label, "Helium");
+        assert_eq!(
+            packet.surface_timeline[0].site_hostname.as_deref(),
+            Some("x.com")
+        );
+        assert!(!packet.surface_timeline[0].private);
+        let _ = std::fs::remove_file(image_path);
+    }
+
+    #[test]
     fn ax_ocr_duplicates_merge_without_losing_conflict_or_provenance() {
         let bounds = Rect {
             x: 10.0,

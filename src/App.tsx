@@ -292,6 +292,7 @@ type ExclusionRule = {
   pattern: string;
   action: string;
   enabled: boolean;
+  origin: "system_default" | "user";
   created_at_ms: number;
 };
 
@@ -1247,8 +1248,8 @@ const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: st
     detail: "Continue can still answer from evidence already stored locally.",
   },
   private_or_excluded: {
-    label: "Not observing this app",
-    detail: "Smalltalk is respecting your privacy boundary here.",
+    label: "Excluded by your privacy settings",
+    detail: "This app or website matches an exclusion you control.",
   },
   needs_permission: {
     label: "Permission needed",
@@ -3763,6 +3764,7 @@ function PrivacyPanel({
           <ul>
             <li>App and window context</li>
             <li>Visible text when available</li>
+            <li>Browser pages unless you exclude the app or website</li>
             <li>Lightweight activity signals</li>
             <li>Derived workstream metadata</li>
           </ul>
@@ -3780,7 +3782,7 @@ function PrivacyPanel({
       </div>
 
       <div className="privacy-expanded-detail">
-        Smalltalk stores local work context such as app/window signals, visible text when available, evidence quality, and derived workstream metadata. It does not store raw typed characters or full clipboard contents.
+        Smalltalk includes browser screenshots, visible page text, URLs, and activity by default so browser work remains part of Continue. Add an app or website exclusion when you want that browser evidence omitted. Raw typed characters and full clipboard contents are never stored.
       </div>
 
       <div className="privacy-controls-grid" aria-label="Privacy controls">
@@ -3849,7 +3851,7 @@ function PrivacyPanel({
         <span>Current surface</span>
         <p>
           {hasCurrentApp
-            ? `${currentAppLabel || "This app"} can be excluded from future local memory.`
+            ? `${currentAppLabel || "This app"} is included in future local memory unless you exclude it.`
             : "Smalltalk has not observed an app that can be excluded yet."}
           {hasCurrentWebsite ? ` ${currentWebsiteLabel || "This website"} can also be excluded.` : ""}
         </p>
@@ -3866,7 +3868,10 @@ function PrivacyPanel({
               <li key={rule.id}>
                 <div>
                   <strong>{formatExclusionRule(rule)}</strong>
-                  <span>{formatExclusionAction(rule.action)}</span>
+                  <span>
+                    {rule.origin === "system_default" ? "Built-in" : "Added by you"}
+                    {` · ${formatExclusionAction(rule.action)}`}
+                  </span>
                 </div>
                 <button
                   className="text-button"

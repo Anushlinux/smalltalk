@@ -1,3 +1,4 @@
+use crate::capture_core::browser_adapter::is_browser_surface;
 use crate::capture_core::privacy::summarize_privacy_exclusions;
 use crate::capture_core::quality::{
     evaluate_surface,
@@ -14,6 +15,7 @@ use crate::continuation::enrichment::{
     WeakSurfaceClassification, WeakSurfaceClassificationInput, WeakSurfaceDomain,
     WeakSurfaceEnrichmentEventInput, WindowSnapshotLite,
 };
+use regex::RegexBuilder;
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
@@ -888,6 +890,8 @@ struct DetectedSensitiveRegion {
     confidence: f64,
     action_taken: String,
     metadata_json: Option<String>,
+    rule_id: Option<String>,
+    rule_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1129,6 +1133,8 @@ pub struct SensitiveRegionSummary {
     pub source: String,
     pub confidence: Option<f64>,
     pub action_taken: Option<String>,
+    pub rule_id: Option<String>,
+    pub rule_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1221,6 +1227,7 @@ pub struct ExclusionRule {
     pub pattern: String,
     pub action: String,
     pub enabled: bool,
+    pub origin: String,
     pub created_at_ms: i64,
 }
 
@@ -3169,14 +3176,21 @@ pub fn add_exclusion_rule(
     app: AppHandle,
     rule: ExclusionRuleInput,
 ) -> Result<ExclusionRule, String> {
+    validate_exclusion_rule(&rule.rule_type, &rule.pattern)?;
+    if !matches!(
+        rule.action.as_str(),
+        "skip_capture" | "store_redacted" | "never_send_to_ai"
+    ) {
+        return Err("unsupported privacy exclusion action".to_string());
+    }
     let conn = open_db(&app)?;
     let created_at_ms = now_millis();
     let id = next_id("rule");
     let enabled = rule.enabled.unwrap_or(true);
     conn.execute(
         "INSERT INTO exclusion_rules (
-            id, rule_type, pattern, action, enabled, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            id, rule_type, pattern, action, enabled, origin, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6)",
         params![
             id,
             rule.rule_type,
@@ -3193,6 +3207,7 @@ pub fn add_exclusion_rule(
         pattern: rule.pattern,
         action: rule.action,
         enabled,
+        origin: "user".to_string(),
         created_at_ms,
     })
 }
@@ -3214,7 +3229,7 @@ pub fn list_exclusion_rules(app: AppHandle) -> Result<Vec<ExclusionRule>, String
     let conn = open_db(&app)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, rule_type, pattern, action, enabled, created_at_ms
+            "SELECT id, rule_type, pattern, action, enabled, origin, created_at_ms
              FROM exclusion_rules
              ORDER BY created_at_ms ASC",
         )
@@ -3227,7 +3242,8 @@ pub fn list_exclusion_rules(app: AppHandle) -> Result<Vec<ExclusionRule>, String
                 pattern: row.get(2)?,
                 action: row.get(3)?,
                 enabled: row.get::<_, i64>(4)? == 1,
-                created_at_ms: row.get(5)?,
+                origin: row.get(5)?,
+                created_at_ms: row.get(6)?,
             })
         })
         .map_err(to_string)?;
@@ -10667,8 +10683,11 @@ fn route_eligibility_for_identity(
     if matches!(
         identity.canonical_surface_type.as_str(),
         "browser_tab" | "chat_conversation"
-    ) || is_browser_app(&identity.canonical_app.to_lowercase())
-    {
+    ) || is_browser_surface(
+        Some(&identity.canonical_app),
+        None,
+        frame.browser_url.as_deref(),
+    ) {
         return ResumeQueryRouteEligibility {
             url_allowed: true,
             reason: "captured URL matches a trusted browser/chat surface".to_string(),
@@ -10746,12 +10765,11 @@ fn resume_query_candidate_for_frame(
 
     let context = app_contexts.first();
     let mut missing_evidence = Vec::new();
-    let browser_surface = frame
-        .app_name
-        .as_deref()
-        .map(|app| is_browser_app(&app.to_lowercase()))
-        .unwrap_or(false)
-        || frame.browser_url.is_some();
+    let browser_surface = is_browser_surface(
+        frame.app_name.as_deref(),
+        frame.app_bundle_id.as_deref(),
+        frame.browser_url.as_deref(),
+    );
     let chrome_dominated = browser_surface
         && browser_chrome_dominated_export_text(frame, &compact_units, &content_units);
     if chrome_dominated {
@@ -11987,12 +12005,11 @@ fn browser_chrome_dominated_export_text(
     if !compact_units.is_empty() {
         return false;
     }
-    let browser_surface = frame
-        .app_name
-        .as_deref()
-        .map(|app| is_browser_app(&app.to_lowercase()))
-        .unwrap_or(false)
-        || frame.browser_url.is_some();
+    let browser_surface = is_browser_surface(
+        frame.app_name.as_deref(),
+        frame.app_bundle_id.as_deref(),
+        frame.browser_url.as_deref(),
+    );
     if !browser_surface {
         return false;
     }
@@ -13417,17 +13434,14 @@ fn quality_flags_for_cloud(candidate: &ResumeQueryCandidateFrame) -> Vec<String>
 }
 
 fn candidate_browser_surface(candidate: &ResumeQueryCandidateFrame) -> bool {
-    candidate.original.browser_url.is_some()
-        || candidate
-            .safe
-            .app_name
-            .as_deref()
-            .map(|app| is_browser_app(&app.to_lowercase()))
-            .unwrap_or(false)
-        || matches!(
-            candidate.surface_type.as_str(),
-            "browser_tab" | "chat_conversation"
-        )
+    is_browser_surface(
+        candidate.original.app_name.as_deref(),
+        candidate.original.app_bundle_id.as_deref(),
+        candidate.original.browser_url.as_deref(),
+    ) || matches!(
+        candidate.surface_type.as_str(),
+        "browser_tab" | "chat_conversation"
+    )
 }
 
 fn build_resume_query_transitions_from_conn(
@@ -18272,8 +18286,8 @@ fn persist_sensitive_regions(
         conn.execute(
             "INSERT INTO sensitive_regions (
                 id, frame_id, region_type, bounds_x, bounds_y, bounds_w, bounds_h,
-                source, confidence, action_taken, metadata_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                source, confidence, action_taken, metadata_json, rule_id, rule_origin
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 next_id("sens"),
                 frame_id.to_string(),
@@ -18286,6 +18300,8 @@ fn persist_sensitive_regions(
                 region.confidence,
                 region.action_taken,
                 region.metadata_json,
+                region.rule_id,
+                region.rule_origin,
             ],
         )
         .map_err(to_string)?;
@@ -18428,7 +18444,11 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
     if url.ends_with(".pdf") || url.contains("/pdf") {
         return ("pdf_browser_adapter", "pdf", 0.78);
     }
-    if is_browser_app(&app) {
+    if is_browser_surface(
+        Some(app_name),
+        None,
+        (!url.is_empty()).then_some(url.as_str()),
+    ) {
         return ("browser_adapter", "browser_tab", 0.82);
     }
     if app.contains("chatgpt") || app.contains("claude") || app.contains("perplexity") {
@@ -18468,14 +18488,6 @@ fn classify_app_context(app_name: &str, url: Option<&str>) -> (&'static str, &'s
         return ("notes_task_adapter", "notes_doc", 0.58);
     }
     ("generic_ax_adapter", "unknown", 0.44)
-}
-
-fn is_browser_app(app: &str) -> bool {
-    [
-        "safari", "chrome", "arc", "brave", "edge", "vivaldi", "opera", "chromium",
-    ]
-    .iter()
-    .any(|needle| app.contains(needle))
 }
 
 fn is_ai_chat_url(url: &str) -> bool {
@@ -20129,7 +20141,7 @@ fn query_sensitive_regions(
     let mut stmt = conn
         .prepare(
             "SELECT id, region_type, bounds_x, bounds_y, bounds_w, bounds_h,
-                    source, confidence, action_taken
+                    source, confidence, action_taken, rule_id, rule_origin
              FROM sensitive_regions
              WHERE frame_id = ?1",
         )
@@ -20146,6 +20158,8 @@ fn query_sensitive_regions(
                 source: row.get(6)?,
                 confidence: row.get(7)?,
                 action_taken: row.get(8)?,
+                rule_id: row.get(9)?,
+                rule_origin: row.get(10)?,
             })
         })
         .map_err(to_string)?;
@@ -20383,7 +20397,12 @@ fn validate_frame_consistency_inner(
             serde_json::json!({ "active_window_crop_path": frame.active_window_crop_path }),
         ));
     }
-    if is_browser_app(&app_name) && frame.browser_url.is_none() {
+    if is_browser_surface(
+        frame.app_name.as_deref(),
+        frame.app_bundle_id.as_deref(),
+        None,
+    ) && frame.browser_url.is_none()
+    {
         warnings.push(make_frame_quality_warning(
             &frame_key,
             "browser_url_missing",
@@ -27163,6 +27182,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           pattern TEXT NOT NULL,
           action TEXT NOT NULL,
           enabled INTEGER DEFAULT 1,
+          origin TEXT NOT NULL DEFAULT 'user',
           created_at_ms INTEGER NOT NULL
         );
 
@@ -27177,6 +27197,8 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           source TEXT NOT NULL,
           confidence REAL,
           action_taken TEXT,
+          rule_id TEXT,
+          rule_origin TEXT,
           metadata_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sensitive_regions_frame
@@ -27264,8 +27286,10 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     ensure_session_columns(conn)?;
     ensure_typing_burst_columns(conn)?;
     ensure_episode_columns(conn)?;
+    ensure_privacy_columns(conn)?;
     crate::continuation::ensure_continue_schema(conn)?;
     ensure_default_exclusion_rules(conn)?;
+    migrate_browser_privacy_policy_v1(conn)?;
     Ok(())
 }
 
@@ -27352,6 +27376,25 @@ fn ensure_content_unit_columns(conn: &Connection) -> Result<(), String> {
     ] {
         ensure_table_column(conn, "content_units", name, definition)?;
     }
+    Ok(())
+}
+
+fn ensure_privacy_columns(conn: &Connection) -> Result<(), String> {
+    ensure_table_column(
+        conn,
+        "exclusion_rules",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'user'",
+    )?;
+    conn.execute(
+        "UPDATE exclusion_rules
+         SET origin = 'system_default'
+         WHERE id LIKE 'default-%' AND origin != 'system_default'",
+        [],
+    )
+    .map_err(to_string)?;
+    ensure_table_column(conn, "sensitive_regions", "rule_id", "TEXT")?;
+    ensure_table_column(conn, "sensitive_regions", "rule_origin", "TEXT")?;
     Ok(())
 }
 
@@ -27608,10 +27651,6 @@ fn ensure_default_exclusion_rules(conn: &Connection) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(to_string)?;
-    if existing > 0 {
-        return Ok(());
-    }
-
     let created = now_millis();
     let defaults = [
         (
@@ -27635,20 +27674,113 @@ fn ensure_default_exclusion_rules(conn: &Connection) -> Result<(), String> {
         (
             "default-api-secrets",
             "content_regex",
-            "sk-[A-Za-z0-9]|api[_-]?key|token|secret",
+            r#"\bsk-[A-Za-z0-9_-]{16,}\b|\b(?:api[_ -]?key|access[_ -]?token|secret)\b\s*[:=]\s*[\"']?[A-Za-z0-9_./+=-]{12,}"#,
             "never_send_to_ai",
         ),
     ];
 
-    for (id, rule_type, pattern, action) in defaults {
+    if existing == 0 {
+        for (id, rule_type, pattern, action) in defaults {
+            conn.execute(
+                "INSERT OR IGNORE INTO exclusion_rules (
+                    id, rule_type, pattern, action, enabled, origin, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 'system_default', ?5)",
+                params![id, rule_type, pattern, action, created],
+            )
+            .map_err(to_string)?;
+        }
+    } else {
+        // Preserve a user's decision to remove a built-in rule. Only repair the
+        // legacy secret rule when that exact row is still present.
         conn.execute(
-            "INSERT OR IGNORE INTO exclusion_rules (
-                id, rule_type, pattern, action, enabled, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-            params![id, rule_type, pattern, action, created],
+            "UPDATE exclusion_rules
+             SET pattern = ?1, origin = 'system_default'
+             WHERE id = 'default-api-secrets'",
+            params![defaults[3].2],
         )
         .map_err(to_string)?;
     }
+    Ok(())
+}
+
+fn migrate_browser_privacy_policy_v1(conn: &Connection) -> Result<(), String> {
+    const MIGRATION_KEY: &str = "browser_privacy_policy_v1";
+    let already_applied = conn
+        .query_row(
+            "SELECT value FROM local_memory_maintenance WHERE key = ?1",
+            params![MIGRATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .as_deref()
+        == Some("complete");
+    if already_applied {
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, app_pid, app_bundle_id, app_name, window_id, window_name,
+                    browser_url, document_path, COALESCE(full_text, '')
+             FROM frames
+             WHERE COALESCE(privacy_status, 'normal') != 'normal'
+             ORDER BY id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                AccessibilityContext {
+                    app_pid: row.get(1)?,
+                    app_bundle_id: row.get(2)?,
+                    app_name: row.get(3)?,
+                    window_id: row.get(4)?,
+                    window_name: row.get(5)?,
+                    browser_url: row.get(6)?,
+                    document_path: row.get(7)?,
+                    text: row.get(8)?,
+                    ..Default::default()
+                },
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    drop(stmt);
+
+    for (frame_id, context) in rows {
+        if !is_browser_surface(
+            context.app_name.as_deref(),
+            context.app_bundle_id.as_deref(),
+            context.browser_url.as_deref(),
+        ) {
+            continue;
+        }
+        let decision = evaluate_privacy_decision(conn, &context)?;
+        conn.execute(
+            "DELETE FROM sensitive_regions WHERE frame_id = ?1",
+            params![frame_id.to_string()],
+        )
+        .map_err(to_string)?;
+        persist_sensitive_regions(conn, frame_id, &context, &decision)?;
+        conn.execute(
+            "UPDATE frames SET privacy_status = ?2 WHERE id = ?1",
+            params![frame_id, decision.status],
+        )
+        .map_err(to_string)?;
+    }
+
+    conn.execute(
+        "INSERT INTO local_memory_maintenance (key, value, updated_at_ms)
+         VALUES (?1, 'complete', ?2)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at_ms = excluded.updated_at_ms",
+        params![MIGRATION_KEY, now_millis()],
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
@@ -28344,6 +28476,45 @@ fn privacy_decision(
     context: &AccessibilityContext,
 ) -> Result<PrivacyDecision, String> {
     let conn = open_db(app)?;
+    evaluate_privacy_decision(&conn, context)
+}
+
+#[derive(Debug, Clone)]
+struct PrivacyRuleRecord {
+    id: String,
+    rule_type: String,
+    pattern: String,
+    action: String,
+    origin: String,
+}
+
+fn load_privacy_rules(conn: &Connection) -> Result<Vec<PrivacyRuleRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, rule_type, pattern, action, origin
+             FROM exclusion_rules
+             WHERE enabled = 1
+             ORDER BY created_at_ms ASC, id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PrivacyRuleRecord {
+                id: row.get(0)?,
+                rule_type: row.get(1)?,
+                pattern: row.get(2)?,
+                action: row.get(3)?,
+                origin: row.get(4)?,
+            })
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_string)
+}
+
+fn evaluate_privacy_decision(
+    conn: &Connection,
+    context: &AccessibilityContext,
+) -> Result<PrivacyDecision, String> {
     let mut decision = PrivacyDecision {
         skip_capture: false,
         status: "normal".to_string(),
@@ -28359,56 +28530,67 @@ fn privacy_decision(
     )
     .to_lowercase();
 
-    let mut stmt = conn
-        .prepare("SELECT rule_type, pattern, action FROM exclusion_rules WHERE enabled = 1")
-        .map_err(to_string)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(to_string)?;
+    let browser_surface = is_browser_surface(
+        context.app_name.as_deref(),
+        context.app_bundle_id.as_deref(),
+        context.browser_url.as_deref(),
+    );
 
-    for row in rows {
-        let (rule_type, pattern, action) = row.map_err(to_string)?;
-        let matched = match rule_type.as_str() {
-            "app_bundle" => pattern_match(
+    for rule in load_privacy_rules(conn)? {
+        // Browser evidence is first-class. Built-in heuristics cannot hide an
+        // entire browser frame; only a rule explicitly created by the user can.
+        if browser_surface && rule.origin == "system_default" {
+            continue;
+        }
+        let matched = match rule.rule_type.as_str() {
+            "app_bundle" => literal_alternative_match(
                 context
                     .app_bundle_id
                     .as_deref()
                     .or(context.app_name.as_deref()),
-                &pattern,
+                &rule.pattern,
             ),
-            "window_title_regex" => pattern_match(context.window_name.as_deref(), &pattern),
-            "url_regex" => pattern_match(context.browser_url.as_deref(), &pattern),
-            "content_regex" => pattern_match(Some(&context.text), &pattern),
-            _ => pattern_match(Some(&haystack), &pattern),
+            "window_title_regex" => {
+                regex_pattern_match(context.window_name.as_deref(), &rule.pattern)?
+            }
+            "url_regex" => regex_pattern_match(context.browser_url.as_deref(), &rule.pattern)?,
+            "content_regex" => regex_pattern_match(Some(&context.text), &rule.pattern)?,
+            _ => regex_pattern_match(Some(&haystack), &rule.pattern)?,
         };
         if matched {
-            if action == "skip_capture" {
+            if rule.action == "skip_capture" {
                 decision.skip_capture = true;
                 decision.status = "skipped_sensitive".to_string();
             } else {
                 decision.status = "redacted".to_string();
             }
             decision.regions.push(DetectedSensitiveRegion {
-                region_type: if action == "skip_capture" {
+                region_type: if rule.action == "skip_capture" {
                     "excluded_app".to_string()
                 } else {
                     "unknown_sensitive".to_string()
                 },
                 bounds: None,
-                source: "user_rule".to_string(),
+                source: "privacy_rule".to_string(),
                 confidence: 0.9,
-                action_taken: action,
+                action_taken: rule.action.clone(),
                 metadata_json: Some(
-                    serde_json::json!({ "rule_type": rule_type, "pattern": pattern }).to_string(),
+                    serde_json::json!({
+                        "rule_id": rule.id,
+                        "rule_origin": rule.origin,
+                        "rule_type": rule.rule_type,
+                        "pattern": rule.pattern
+                    })
+                    .to_string(),
                 ),
+                rule_id: Some(rule.id),
+                rule_origin: Some(rule.origin),
             });
         }
+    }
+
+    if browser_surface {
+        return Ok(decision);
     }
 
     let sensitive_patterns = [
@@ -28431,6 +28613,8 @@ fn privacy_decision(
                 confidence: 0.62,
                 action_taken: "redacted_text".to_string(),
                 metadata_json: None,
+                rule_id: None,
+                rule_origin: Some("system_default".to_string()),
             });
         }
     }
@@ -28438,7 +28622,7 @@ fn privacy_decision(
     Ok(decision)
 }
 
-fn pattern_match(value: Option<&str>, pattern: &str) -> bool {
+fn literal_alternative_match(value: Option<&str>, pattern: &str) -> bool {
     let Some(value) = value else {
         return false;
     };
@@ -28448,6 +28632,36 @@ fn pattern_match(value: Option<&str>, pattern: &str) -> bool {
         .map(|part| part.trim().to_lowercase())
         .filter(|part| !part.is_empty())
         .any(|part| value.contains(&part))
+}
+
+fn regex_pattern_match(value: Option<&str>, pattern: &str) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let regex = RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| format!("invalid privacy exclusion regex: {error}"))?;
+    Ok(regex.is_match(value))
+}
+
+fn validate_exclusion_rule(rule_type: &str, pattern: &str) -> Result<(), String> {
+    if !matches!(
+        rule_type,
+        "app_bundle" | "window_title_regex" | "url_regex" | "content_regex"
+    ) {
+        return Err("unsupported privacy exclusion rule type".to_string());
+    }
+    if pattern.trim().is_empty() {
+        return Err("privacy exclusion pattern cannot be empty".to_string());
+    }
+    if rule_type.ends_with("_regex") {
+        RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|error| format!("invalid privacy exclusion regex: {error}"))?;
+    }
+    Ok(())
 }
 
 fn collect_accessibility_context(paths: &CapturePaths) -> AccessibilityContext {
@@ -28676,7 +28890,6 @@ fn accessibility_is_thin(context: &AccessibilityContext) -> bool {
         "AXRadioButton",
     ];
 
-    let app = context.app_name.as_deref().unwrap_or("").to_lowercase();
     let window = context.window_name.as_deref().unwrap_or("").to_lowercase();
     let url = context.browser_url.as_deref().unwrap_or("").to_lowercase();
     if CANVAS_PATTERNS
@@ -28717,7 +28930,11 @@ fn accessibility_is_thin(context: &AccessibilityContext) -> bool {
         .map(|node| node.text.len())
         .sum();
 
-    let browser_like_surface = is_browser_app(&app) || !url.is_empty() || is_ai_chat_url(&url);
+    let browser_like_surface = is_browser_surface(
+        context.app_name.as_deref(),
+        context.app_bundle_id.as_deref(),
+        context.browser_url.as_deref(),
+    ) || is_ai_chat_url(&url);
     let repeated_window_title_chars: usize = context
         .nodes
         .iter()
@@ -37878,8 +38095,202 @@ mod tests {
             classify_app_context("Safari", Some("https://youtube.com/watch?v=1")).1,
             "media"
         );
+        assert_eq!(
+            classify_app_context("Helium", Some("https://x.com/home")).1,
+            "browser_tab"
+        );
+        assert_eq!(
+            classify_app_context("Unknown Web Shell", Some("https://example.com/docs")).1,
+            "browser_tab"
+        );
         assert_eq!(classify_app_context("Cursor", None).1, "code_editor");
         assert_eq!(classify_app_context("Warp", None).1, "terminal");
+    }
+
+    #[test]
+    fn automatic_privacy_rules_never_hide_browser_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let context = AccessibilityContext {
+            app_name: Some("Helium".into()),
+            app_bundle_id: Some("net.imput.helium".into()),
+            window_name: Some("API key and payment documentation".into()),
+            browser_url: Some("https://example.com/bank/checkout".into()),
+            text: "The documentation discusses a secret token and authentication.".into(),
+            ..Default::default()
+        };
+
+        let decision = evaluate_privacy_decision(&conn, &context).unwrap();
+
+        assert!(!decision.skip_capture);
+        assert_eq!(decision.status, "normal");
+        assert!(decision.regions.is_empty());
+    }
+
+    #[test]
+    fn explicit_user_browser_exclusion_still_wins() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO exclusion_rules (
+                id, rule_type, pattern, action, enabled, origin, created_at_ms
+             ) VALUES ('rule-user-x', 'url_regex', 'x\\.com', 'skip_capture', 1, 'user', 1)",
+            [],
+        )
+        .unwrap();
+        let context = AccessibilityContext {
+            app_name: Some("Helium".into()),
+            app_bundle_id: Some("net.imput.helium".into()),
+            browser_url: Some("https://x.com/home".into()),
+            text: "ordinary browser content".into(),
+            ..Default::default()
+        };
+
+        let decision = evaluate_privacy_decision(&conn, &context).unwrap();
+
+        assert!(decision.skip_capture);
+        assert_eq!(decision.status, "skipped_sensitive");
+        assert_eq!(decision.regions.len(), 1);
+        assert_eq!(decision.regions[0].rule_origin.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn non_browser_credential_shape_keeps_automatic_protection() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let harmless = AccessibilityContext {
+            app_name: Some("Notes".into()),
+            text: "Discuss the ordinary word secret without showing a credential.".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_privacy_decision(&conn, &harmless).unwrap().status,
+            "normal"
+        );
+
+        let credential = AccessibilityContext {
+            app_name: Some("Notes".into()),
+            text: "api key = abcdefghijklmnop123456".into(),
+            ..Default::default()
+        };
+        let decision = evaluate_privacy_decision(&conn, &credential).unwrap();
+        assert_eq!(decision.status, "redacted");
+        assert!(decision
+            .regions
+            .iter()
+            .any(|region| region.action_taken == "never_send_to_ai"));
+    }
+
+    #[test]
+    fn browser_privacy_migration_restores_automatic_legacy_redaction_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/browser-privacy-migration.jpg",
+            10,
+            "Helium",
+            "net.imput.helium",
+            "Home / X - Helium",
+            "https://x.com/home",
+            "browser_tab",
+            "ordinary page containing the word secret",
+            "phash-browser-privacy",
+            None,
+        );
+        conn.execute(
+            "UPDATE frames SET privacy_status = 'redacted' WHERE id = ?1",
+            params![frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sensitive_regions (
+                id, frame_id, region_type, source, confidence, action_taken, metadata_json
+             ) VALUES ('legacy-auto-region', ?1, 'unknown_sensitive', 'user_rule', 0.9,
+                       'never_send_to_ai', '{\"pattern\":\"secret\"}')",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM local_memory_maintenance WHERE key = 'browser_privacy_policy_v1'",
+            [],
+        )
+        .unwrap();
+
+        migrate_browser_privacy_policy_v1(&conn).unwrap();
+        migrate_browser_privacy_policy_v1(&conn).unwrap();
+
+        let status: String = conn
+            .query_row(
+                "SELECT privacy_status FROM frames WHERE id = ?1",
+                params![frame_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let region_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sensitive_regions WHERE frame_id = ?1",
+                params![frame_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "normal");
+        assert_eq!(region_count, 0);
+    }
+
+    #[test]
+    fn browser_privacy_migration_preserves_current_user_exclusion() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO exclusion_rules (
+                id, rule_type, pattern, action, enabled, origin, created_at_ms
+             ) VALUES ('rule-user-x', 'url_regex', 'x\\.com', 'skip_capture', 1, 'user', 1)",
+            [],
+        )
+        .unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/browser-user-exclusion-migration.jpg",
+            10,
+            "Helium",
+            "net.imput.helium",
+            "Home / X - Helium",
+            "https://x.com/home",
+            "browser_tab",
+            "ordinary page",
+            "phash-browser-user-exclusion",
+            None,
+        );
+        conn.execute(
+            "UPDATE frames SET privacy_status = 'redacted' WHERE id = ?1",
+            params![frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM local_memory_maintenance WHERE key = 'browser_privacy_policy_v1'",
+            [],
+        )
+        .unwrap();
+
+        migrate_browser_privacy_policy_v1(&conn).unwrap();
+
+        let (status, origin): (String, Option<String>) = conn
+            .query_row(
+                "SELECT f.privacy_status, sr.rule_origin
+                 FROM frames f
+                 LEFT JOIN sensitive_regions sr ON sr.frame_id = CAST(f.id AS TEXT)
+                 WHERE f.id = ?1",
+                params![frame_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped_sensitive");
+        assert_eq!(origin.as_deref(), Some("user"));
     }
 
     #[test]

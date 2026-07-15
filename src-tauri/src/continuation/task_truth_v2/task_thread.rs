@@ -421,7 +421,7 @@ fn plan_update(
     let relationship = snapshot.relation_to_prior.as_str();
     let creates_new = relationship == "new_task";
     let requires_continuity = matches!(
-            relationship,
+        relationship,
         "continuation"
             | "supporting_research"
             | "verification"

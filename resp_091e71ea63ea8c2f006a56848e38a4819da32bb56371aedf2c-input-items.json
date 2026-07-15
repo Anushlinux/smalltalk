@@ -1,0 +1,62 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "msg_091e71ea63ea8c2f006a56848e414c819dab3e890ab99bcb41",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
+        }
+      ],
+      "role": "system"
+    },
+    {
+      "id": "msg_091e71ea63ea8c2f006a56848e5438819d9aa3182e918a0699",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "{\"boundaries\":[{\"boundary_index\":1,\"chronology_role\":\"current_at_continue\",\"observed_transition\":\"One screen represents this point in the chronology.\",\"selection_reason\":\"current_manual_boundary\",\"slots\":[{\"category\":\"image_after\",\"observed_at_ms\":1784054921418,\"slot\":\"B1_IMAGE_AFTER\",\"summary\":\"Screen captured after this boundary's observed actions and visible change.\"}],\"surface_relation\":\"current_surface\"}],\"final_cutoff_ms\":1784054921418,\"missing_evidence\":[\"action_surface_ownership_mismatch_excluded:9\",\"diagnostic_self_frames_excluded:1\"],\"policy\":{\"background_upload\":false,\"explicit_continue_or_authorized_replay_only\":true,\"local_semantic_fallback\":false,\"production_authority\":false},\"reading_guide\":{\"images\":\"context_image slots are representative earlier screens. image_before and image_after belong to the final causal boundary. Images are globally capped at four.\",\"meaning\":\"The surface timeline is factual chronology only. App names and hostnames cannot establish the primary task or a visit role without cited visual or action evidence.\",\"ordering\":\"Boundaries and slots are chronological. The final boundary is what was visible when Continue was invoked.\"},\"recent_surface_timeline\":[{\"app_label\":\"Helium\",\"first_observed_at_ms\":1784054876433,\"image_slot\":\"T1_CONTEXT_IMAGE\",\"is_current\":false,\"last_observed_at_ms\":1784054907820,\"revisited\":false,\"sequence_index\":1,\"site_hostname\":\"platform.openai.com\",\"visit_id\":\"T1_VISIT\"},{\"app_label\":\"Code\",\"first_observed_at_ms\":1784054913435,\"image_slot\":\"T2_CONTEXT_IMAGE\",\"is_current\":false,\"last_observed_at_ms\":1784054913435,\"revisited\":false,\"sequence_index\":2,\"site_hostname\":null,\"visit_id\":\"T2_VISIT\"},{\"app_label\":\"ChatGPT\",\"first_observed_at_ms\":1784054918014,\"image_slot\":\"B1_IMAGE_AFTER\",\"is_current\":true,\"last_observed_at_ms\":1784054921418,\"revisited\":false,\"sequence_index\":3,\"site_hostname\":null,\"visit_id\":\"T3_VISIT\"}],\"schema\":\"smalltalk.pftu_01.semantic_probe_request.v3\"}"
+        },
+        {
+          "type": "input_text",
+          "text": "support_slot=T1_CONTEXT_IMAGE observed_at_ms=1784054907820"
+        },
+        {
+          "type": "input_image",
+          "detail": "high",
+          "file_id": null,
+          "image_url": null
+        },
+        {
+          "type": "input_text",
+          "text": "support_slot=T2_CONTEXT_IMAGE observed_at_ms=1784054913435"
+        },
+        {
+          "type": "input_image",
+          "detail": "high",
+          "file_id": null,
+          "image_url": null
+        },
+        {
+          "type": "input_text",
+          "text": "support_slot=B1_IMAGE_AFTER observed_at_ms=1784054921418"
+        },
+        {
+          "type": "input_image",
+          "detail": "high",
+          "file_id": null,
+          "image_url": null
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "first_id": "msg_091e71ea63ea8c2f006a56848e414c819dab3e890ab99bcb41",
+  "has_more": false,
+  "last_id": "msg_091e71ea63ea8c2f006a56848e5438819d9aa3182e918a0699"
+}
