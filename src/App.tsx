@@ -20,7 +20,6 @@ import {
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   normalizeTaskResolutionStatus,
-  recentContextForPresentation,
   selectPrimaryTaskHeadline,
   type ContinueAlternativeHypothesis,
   type ContinueCurrentTaskTurnSummary,
@@ -31,6 +30,10 @@ import {
   type ContinueTaskResolutionStatus,
   type ContinueTaskTruthAnswer,
 } from "./continuePresentation";
+import {
+  continueRequestErrorCopy,
+  withContinueRequestTimeout,
+} from "./continueRequest";
 import "./App.css";
 
 type CaptureFrame = {
@@ -1661,19 +1664,21 @@ function App() {
       setBreadcrumbStatus(null);
     }
     try {
-      const decision = await invoke<ContinueDecisionResult>("get_continue_decision", {
-        input: {
-          mode: options.forceRebuild === true ? "rebuild" : "normal",
-          session_id: status.active_session?.id || status.latest_session?.id || null,
-          rebuild_layers: options.forceRebuild === true,
-          micro_inference_enabled: false,
-          activity_recap_model_enabled: false,
-          max_candidates_for_model: 5,
-          audit_output_enabled: auditMode === "full",
-          audit_mode: auditMode,
-          request_trigger: trigger,
-        },
-      });
+      const decision = await withContinueRequestTimeout(
+        invoke<ContinueDecisionResult>("get_continue_decision", {
+          input: {
+            mode: options.forceRebuild === true ? "rebuild" : "normal",
+            session_id: status.active_session?.id || status.latest_session?.id || null,
+            rebuild_layers: options.forceRebuild === true,
+            micro_inference_enabled: false,
+            activity_recap_model_enabled: false,
+            max_candidates_for_model: 5,
+            audit_output_enabled: auditMode === "full",
+            audit_mode: auditMode,
+            request_trigger: trigger,
+          },
+        }),
+      );
       const adopted = await applyContinueDecision(decision, trigger);
       if (!adopted) return;
       await invoke("get_island_continue_state", {
@@ -1700,7 +1705,7 @@ function App() {
         );
         setBackgroundContinueError("Could not refresh Continue quietly. Keeping the previous answer.");
       } else {
-        setContinueError(`Continue failed: ${String(err)}`);
+        setContinueError(continueRequestErrorCopy(err));
       }
     } finally {
       if (continueRequestInFlightRef.current === trigger) {
@@ -4257,7 +4262,6 @@ function ContinuationAnswer({
     : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const taskTruthAlternatives = cardTaskTruthAnswer?.alternative_hypotheses || [];
-  const recentTaskContext = recentContextForPresentation(cardTaskTruthAnswer);
   const taskTruthActionState = actionState || {
     kind: "no_clear_continuation",
     label: "Inspect evidence",
@@ -4306,10 +4310,13 @@ function ContinuationAnswer({
         ? "Best available place to continue"
         : "Continue at"
   );
-  const openButtonLabel =
-    busyAction === "open_continue_target" && canOpenResumeTarget
+  const openButtonLabel = canOpenResumeTarget
+    ? busyAction === "open_continue_target"
       ? "Opening"
-      : actionState?.label || "Inspect evidence";
+      : actionState?.label || "Continue here"
+    : continueRefreshBusy
+      ? "Finding where to continue"
+      : "Try Continue again";
   const uncertaintyLine = productState?.uncertaintyLine || (
     targetLooksInternal
       ? "I saw the current focus, but I don't have a reliable return target yet."
@@ -4411,42 +4418,6 @@ function ContinuationAnswer({
           </div>
         ) : null}
 
-        {recentTaskContext.length > 0 ? (
-          <div className="answer-memory-section" aria-label="Recent context">
-            <span className="answer-section-label">Recent context</span>
-            <div className="answer-context-list">
-              {recentTaskContext.map((visit) => {
-                const surface = [visit.app_label, visit.site_hostname]
-                  .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
-                  .join(" · ");
-                const state = visit.is_current
-                  ? "Current"
-                  : visit.revisited
-                    ? "Returned later"
-                    : "Visited";
-                const roleLabels: Record<string, string> = {
-                  primary_work: "Primary work",
-                  supporting_work: "Supporting work",
-                  detour_or_unrelated: "Detour or unrelated",
-                  unclear: "Role unclear",
-                };
-                const semanticRole = visit.semantic_role
-                  ? roleLabels[visit.semantic_role] || "Role unclear"
-                  : "";
-                return (
-                  <p key={`${visit.sequence_index}-${visit.first_observed_at_ms}-${surface}`}>
-                    <strong>{surface || "Observed activity"}</strong> · {state}
-                    {semanticRole ? ` · ${semanticRole}` : ""}
-                    {visit.relationship_to_primary_task ? (
-                      <small>{visit.relationship_to_primary_task}</small>
-                    ) : null}
-                  </p>
-                );
-              })}
-            </div>
-          </div>
-        ) : null}
-
         {lastStateLine || nextActionLine ? <div className="answer-state">
           {lastStateLine ? <div>
             <span>State</span>
@@ -4480,9 +4451,9 @@ function ContinuationAnswer({
           <button
             className="primary-button"
             type="button"
-            disabled={busyAction !== null}
+            disabled={busyAction !== null || (!canOpenResumeTarget && continueRefreshBusy)}
             aria-busy={busyAction === "open_continue_target"}
-            onClick={canOpenResumeTarget ? onOpenTarget : onInspectEvidence}
+            onClick={canOpenResumeTarget ? onOpenTarget : onContinue}
           >
             {openButtonLabel}
           </button>
@@ -4494,21 +4465,23 @@ function ContinuationAnswer({
           >
             Why this answer?
           </button>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={busyAction !== null || continueRefreshBusy}
-            aria-busy={continueRefreshBusy}
-            onClick={onContinue}
-          >
-            {continueRefreshBusy
-              ? "Understanding your recent work…"
-              : taskInferenceFailure?.retryable
-                ? "Retry inference"
-                : freshness.stale
-                  ? "Refresh Continue"
-                  : "Refresh"}
-          </button>
+          {canOpenResumeTarget ? (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busyAction !== null || continueRefreshBusy}
+              aria-busy={continueRefreshBusy}
+              onClick={onContinue}
+            >
+              {continueRefreshBusy
+                ? "Understanding your recent work…"
+                : taskInferenceFailure?.retryable
+                  ? "Retry inference"
+                  : freshness.stale
+                    ? "Refresh Continue"
+                    : "Refresh"}
+            </button>
+          ) : null}
         </div>
 
         {taskTruthAlternatives.length > 0 ? (
@@ -5950,9 +5923,14 @@ function buildTaskTruthProductStateCopy(
       || answer.observed_surface
       || "",
   );
-  const relationship = normalizeToken(
-    answer.current_activity?.relationship_to_primary || answer.relationship_to_prior,
-  );
+  // A relationship such as `primary_work` is meaningless when no primary
+  // task survived evidence admission. Keep the current surface factual, but
+  // never let a stale role label turn it back into the task in product copy.
+  const relationship = taskLine
+    ? normalizeToken(
+        answer.current_activity?.relationship_to_primary || answer.relationship_to_prior,
+      )
+    : "unrelated_or_unknown";
   const currentActivityLine = currentActivity
     ? (() => {
         const relationshipCopy: Record<string, string> = {
@@ -6060,9 +6038,7 @@ function buildContinueProductStateCopy(
       heroLabel: NO_CLEAR_CURRENT_TASK_COPY.heroLabel,
       headline: NO_CLEAR_CURRENT_TASK_HEADLINE,
       targetBlockLabel: NO_CLEAR_CURRENT_TASK_COPY.targetBlockLabel,
-      targetLine: decision.evidence_preview
-        ? "Captured evidence is available to inspect"
-        : NO_CLEAR_CURRENT_TASK_COPY.targetLine,
+      targetLine: NO_CLEAR_CURRENT_TASK_COPY.targetLine,
       targetMeta: NO_CLEAR_CURRENT_TASK_COPY.targetMeta,
       lastStateLine: NO_CLEAR_CURRENT_TASK_COPY.lastStateLine,
       nextActionLine: NO_CLEAR_CURRENT_TASK_COPY.nextActionLine,

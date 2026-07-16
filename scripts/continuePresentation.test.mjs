@@ -274,6 +274,39 @@ test("recent context remains visible for resolved, partial, and unresolved answe
   }
 });
 
+test("field-limited model output remains visible instead of becoming the default state", () => {
+  const decision = authoritativeDecision({ status: "partial" });
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: null,
+    current_subtask: "Verify the repaired Continue output",
+    last_meaningful_progress: "The model response was parsed and locally admitted",
+    unfinished_state: "The visible Continue card still needs confirmation",
+    inference_status: "model_answer_visible_with_validation_limits",
+  });
+  decision.task_truth_v2.answer.field_support.task_summary = {
+    confidence: 0,
+    support_status: "unsupported",
+    evidence_refs: [],
+  };
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.task_resolution_status, "partial");
+  assert.equal(answer?.task_summary, null);
+  assert.equal(answer?.current_subtask, "Verify the repaired Continue output");
+  assert.equal(
+    answer?.last_meaningful_progress,
+    "The model response was parsed and locally admitted",
+  );
+  assert.equal(
+    answer?.unfinished_state,
+    "The visible Continue card still needs confirmation",
+  );
+  assert.deepEqual(authoritativeTaskTruthActionState(decision), {
+    kind: "thin_current_work",
+    label: "Inspect evidence",
+  });
+});
+
 test("task inference availability names only actual provider availability failures", () => {
   for (const status of ["model_unavailable", "provider_error", "provider_failure", "provider_unavailable"]) {
     assert.equal(isTaskInferenceUnavailable(status), true, status);
@@ -344,7 +377,7 @@ test("task inference failures have distinct user-facing states and retry policy"
   );
 });
 
-test("frame preview is inspect-only and contains no target-shaped action copy", () => {
+test("frame preview does not masquerade as a continuation target", () => {
   const action = getContinuePresentationActionState({
     decisionId: "decision",
     outputMode: "thin_continue",
@@ -361,8 +394,19 @@ test("frame preview is inspect-only and contains no target-shaped action copy", 
     appFocusOnly: false,
   });
   assert.equal(action.label, "Inspect evidence");
-  assert.equal(copy.targetLine, "Captured evidence is available to inspect");
+  assert.equal(copy.targetLine, "The task is understood, but no exact return point is ready");
+  assert.equal(copy.actionLabel, "Try Continue again");
   assert.doesNotMatch(JSON.stringify({ action, copy }), /Continue here|safest return point|open the work/i);
+});
+
+test("a known task without an attached target does not claim the observed page was missing", () => {
+  const copy = inspectTargetCopy({
+    taskKnown: true,
+    evidencePreviewAvailable: true,
+    appFocusOnly: false,
+  });
+  assert.equal(copy.targetLine, "The task is understood, but no exact return point is ready");
+  assert.doesNotMatch(copy.targetLine, /no verified page|was not found/i);
 });
 
 test("task-known target-null copy stays specific about task understanding", () => {

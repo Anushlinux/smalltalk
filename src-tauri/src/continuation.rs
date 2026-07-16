@@ -3165,6 +3165,13 @@ struct EvidenceFrameDiff {
 #[derive(Debug, Clone)]
 struct EvidenceTypingBurst {
     id: String,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_id: Option<i64>,
+    window_title: Option<String>,
+    char_count: i64,
     enter_count: i64,
     paste_count: i64,
     committed: bool,
@@ -29394,26 +29401,85 @@ fn load_frame_typing_bursts(
     if !table_exists(conn, "typing_bursts")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, enter_count, paste_count, committed, commit_signal
-             FROM typing_bursts
-             WHERE pre_frame_id = ?1
-                OR post_frame_id = ?1
-                OR (?2 BETWEEN started_at_ms - 250 AND ended_at_ms + 1500)
-             ORDER BY ended_at_ms DESC
-             LIMIT 8",
-        )
-        .map_err(to_string)?;
+    let columns = {
+        let mut schema = conn
+            .prepare("PRAGMA table_info(typing_bursts)")
+            .map_err(to_string)?;
+        let columns = schema
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(to_string)?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(to_string)?;
+        columns
+    };
+    if [
+        "started_at_ms",
+        "ended_at_ms",
+        "enter_count",
+        "paste_count",
+        "committed",
+        "commit_signal",
+        "pre_frame_id",
+        "post_frame_id",
+    ]
+    .iter()
+    .any(|column| !columns.contains(*column))
+    {
+        return Ok(Vec::new());
+    }
+    let app_bundle_expr = if columns.contains("app_bundle_id") {
+        "app_bundle_id"
+    } else {
+        "NULL"
+    };
+    let app_name_expr = if columns.contains("app_name") {
+        "app_name"
+    } else {
+        "NULL"
+    };
+    let window_id_expr = if columns.contains("window_id") {
+        "window_id"
+    } else {
+        "NULL"
+    };
+    let window_title_expr = if columns.contains("window_title") {
+        "window_title"
+    } else {
+        "NULL"
+    };
+    let char_count_expr = if columns.contains("char_count") {
+        "char_count"
+    } else {
+        "0"
+    };
+    let sql = format!(
+        "SELECT id, started_at_ms, ended_at_ms, {app_bundle_expr}, {app_name_expr},
+                {window_id_expr}, {window_title_expr}, {char_count_expr}, enter_count, paste_count,
+                committed, commit_signal
+         FROM typing_bursts
+         WHERE pre_frame_id = ?1
+            OR post_frame_id = ?1
+            OR (?2 BETWEEN started_at_ms - 250 AND ended_at_ms + 1500)
+         ORDER BY ended_at_ms DESC
+         LIMIT 8"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(params![frame_id, captured_at], |row| {
-            let committed: i64 = row.get(3)?;
+            let committed: i64 = row.get(10)?;
             Ok(EvidenceTypingBurst {
                 id: row.get(0)?,
-                enter_count: row.get(1)?,
-                paste_count: row.get(2)?,
+                started_at_ms: row.get(1)?,
+                ended_at_ms: row.get(2)?,
+                app_bundle_id: row.get(3)?,
+                app_name: row.get(4)?,
+                window_id: row.get(5)?,
+                window_title: row.get(6)?,
+                char_count: row.get(7)?,
+                enter_count: row.get(8)?,
+                paste_count: row.get(9)?,
                 committed: committed != 0,
-                commit_signal: row.get(4)?,
+                commit_signal: row.get(11)?,
             })
         })
         .map_err(to_string)?;

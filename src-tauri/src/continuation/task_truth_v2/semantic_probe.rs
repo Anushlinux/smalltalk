@@ -10,7 +10,7 @@ use super::observation_packet::{
 };
 
 pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v3";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v5";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
@@ -28,6 +28,10 @@ const MAX_DELTAS_PER_BOUNDARY: usize = 3;
 const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
 const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
 const MAX_ARMED_CASE_AGE_MS: i64 = 15 * 60 * 1_000;
+// An app switch immediately before the manual cutoff is evidence that the
+// foreground changed. It is not evidence that the new foreground became the
+// user's task. A confirming action on the new surface removes this safeguard.
+const MOMENTARY_APP_SWITCH_MAX_AGE_MS: i64 = 3_000;
 const MANUAL_PROVIDER_RETRIES: u32 = 0;
 const SEMANTIC_FIELDS: [&str; 4] = [
     "primary_task",
@@ -188,6 +192,18 @@ pub(crate) struct ProbeSurfaceVisitAudit {
     pub(crate) is_current: bool,
     pub(crate) revisited: bool,
     pub(crate) private: bool,
+    #[serde(default)]
+    pub(crate) interaction_count: usize,
+    #[serde(default)]
+    pub(crate) frame_count: usize,
+    #[serde(default)]
+    pub(crate) engagement_score: i64,
+    #[serde(default)]
+    pub(crate) observed_duration_ms: i64,
+    #[serde(default)]
+    pub(crate) committed_input: bool,
+    #[serde(default)]
+    pub(crate) carried_into_current_surface: bool,
     pub(crate) image_slot: Option<String>,
     #[serde(default)]
     pub(crate) image_omission_reason: Option<String>,
@@ -253,6 +269,7 @@ struct RequestBoundary<'a> {
     selection_reason: &'a str,
     surface_relation: &'a str,
     observed_transition: String,
+    prior_image_slot: Option<&'a str>,
     slots: Vec<RequestSlot<'a>>,
 }
 
@@ -266,6 +283,12 @@ struct RequestSurfaceVisit<'a> {
     last_observed_at_ms: i64,
     is_current: bool,
     revisited: bool,
+    interaction_count: usize,
+    frame_count: usize,
+    engagement_score: i64,
+    observed_duration_ms: i64,
+    committed_input: bool,
+    carried_into_current_surface: bool,
     image_slot: Option<&'a str>,
 }
 
@@ -412,6 +435,63 @@ fn continued_activity_on_surface(
             && event.app_bundle_id == frame.surface_identity.app_bundle_id
             && event_is_meaningful(packet, event, cutoff)
     })
+}
+
+fn momentary_app_switch_prior(
+    packet: &ObservationPacketV2,
+    current: &super::observation_packet::KeyframeReferenceV2,
+    cutoff: i64,
+) -> Option<super::observation_packet::KeyframeReferenceV2> {
+    packet
+        .causal_events
+        .iter()
+        .filter(|event| {
+            event.event_kind.to_ascii_lowercase().contains("app_switch")
+                && event.target_frame_id.as_deref() == Some(current.frame_id.as_str())
+                && event.observed_at_ms <= cutoff
+                && cutoff.saturating_sub(event.observed_at_ms) <= MOMENTARY_APP_SWITCH_MAX_AGE_MS
+                && event.app_bundle_id == current.surface_identity.app_bundle_id
+        })
+        .filter(|switch| {
+            !packet.causal_events.iter().any(|later| {
+                later.event_id != switch.event_id
+                    && later.observed_at_ms > switch.observed_at_ms
+                    && later.observed_at_ms <= cutoff
+                    && later.app_bundle_id == current.surface_identity.app_bundle_id
+                    && event_is_meaningful(packet, later, cutoff)
+            })
+        })
+        .filter_map(|event| find_packet_frame(packet, &event.source_frame_id))
+        .filter(|frame| {
+            frame.observed_at_ms <= cutoff
+                && frame.model_eligible
+                && !is_private_status(Some(&frame.privacy_status))
+                && !same_surface(frame, current)
+        })
+        .max_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
+        .cloned()
+}
+
+fn request_has_momentary_app_switch(request: &ProbeRequest) -> bool {
+    request
+        .audit
+        .boundary_selection_reasons
+        .last()
+        .is_some_and(|reason| reason == "momentary_app_switch_at_continue")
+}
+
+fn supports_only_momentary_current_boundary(request: &ProbeRequest, supports: &[String]) -> bool {
+    request_has_momentary_app_switch(request)
+        && !supports.is_empty()
+        && supports.iter().all(|support| {
+            request.slots.get(support).is_some_and(|slot| {
+                slot.boundary_index == request.audit.boundary_count
+                    && matches!(
+                        slot.category,
+                        SupportCategory::ImageAfter | SupportCategory::SurfaceIdentity
+                    )
+            })
+        })
 }
 
 fn observed_boundary_transition(boundary: &SelectedBoundary) -> String {
@@ -618,7 +698,19 @@ fn selected_boundaries(
                 .filter_map(|event| frame_by_id(&event.source_frame_id))
                 .max_by_key(|frame| (frame.observed_at_ms, frame.frame_id.clone()))
         });
-    let mut current_frames = direct_prior.into_iter().collect::<Vec<_>>();
+    // A low-confidence app-switch event must not be promoted into a task
+    // action. It is still useful negative evidence: it proves that the final
+    // screen may be a momentary foreground change. Keep its prior screen in
+    // the boundary even when that prior frame was packeted as background.
+    let momentary_prior = direct_prior
+        .is_none()
+        .then(|| momentary_app_switch_prior(packet, current, cutoff))
+        .flatten();
+    let current_is_momentary_switch = momentary_prior.is_some();
+    let mut current_frames = direct_prior
+        .into_iter()
+        .chain(momentary_prior)
+        .collect::<Vec<_>>();
     if !current_frames
         .iter()
         .any(|frame| frame.frame_id == current.frame_id)
@@ -718,8 +810,18 @@ fn selected_boundaries(
     });
 
     let current_boundary = SelectedBoundary {
-        selection_reason: "current_manual_boundary".into(),
-        surface_relation: "current_surface".into(),
+        selection_reason: if current_is_momentary_switch {
+            "momentary_app_switch_at_continue"
+        } else {
+            "current_manual_boundary"
+        }
+        .into(),
+        surface_relation: if current_is_momentary_switch {
+            "brief_unconfirmed_transition_from_prior_surface"
+        } else {
+            "current_surface"
+        }
+        .into(),
         frames: current_frames,
     };
     let mut boundaries = earlier.into_iter().collect::<Vec<_>>();
@@ -1425,7 +1527,11 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
         return false;
     }
     match category {
-        SupportCategory::ContextImage => matches!(field, "primary_task" | "last_progress"),
+        // An earlier context image may be the task-bearing screen when the
+        // final screen is a detour or an unconfirmed app switch. The model
+        // still has to cite visible evidence and primary-task admission still
+        // requires a concrete basis; the category alone grants no meaning.
+        SupportCategory::ContextImage => true,
         SupportCategory::ImageBefore
         | SupportCategory::ImageAfter
         | SupportCategory::UserAction
@@ -1436,7 +1542,7 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
 }
 
 fn system_instruction() -> &'static str {
-    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
+    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, a qualified primary task using words such as likely or appears to be is allowed if it cites the relevant source and current images; do not invent a narrower purpose than those images support. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -1523,16 +1629,42 @@ pub(crate) fn build_probe_request(
                     slot.slot,
                 )
             });
+            let prior_image_slot = boundary
+                .frames
+                .first()
+                .filter(|first| {
+                    boundary
+                        .frames
+                        .last()
+                        .is_some_and(|last| first.frame_id != last.frame_id)
+                })
+                .and_then(|first| {
+                    slots.values().find(|slot| {
+                        slot.record_id == first.frame_id
+                            && matches!(
+                                slot.category,
+                                SupportCategory::ContextImage
+                                    | SupportCategory::ImageBefore
+                                    | SupportCategory::ImageAfter
+                            )
+                    })
+                })
+                .map(|slot| slot.slot.as_str());
             RequestBoundary {
                 boundary_index: index + 1,
                 chronology_role: if index + 1 == boundaries.len() {
-                    "current_at_continue"
+                    if boundary.selection_reason == "momentary_app_switch_at_continue" {
+                        "visible_at_continue_not_task_confirmed"
+                    } else {
+                        "current_at_continue"
+                    }
                 } else {
                     "earlier_context"
                 },
                 selection_reason: &boundary.selection_reason,
                 surface_relation: &boundary.surface_relation,
                 observed_transition: observed_boundary_transition(boundary),
+                prior_image_slot,
                 slots: boundary_slots,
             }
         })
@@ -1562,6 +1694,14 @@ pub(crate) fn build_probe_request(
             last_observed_at_ms: visit.last_observed_at_ms,
             is_current: visit.is_current,
             revisited: visit.revisited,
+            interaction_count: visit.interaction_count,
+            frame_count: visit.frame_count,
+            engagement_score: visit.engagement_score,
+            observed_duration_ms: visit
+                .last_observed_at_ms
+                .saturating_sub(visit.first_observed_at_ms),
+            committed_input: visit.committed_input,
+            carried_into_current_surface: visit.carried_into_current_surface,
             image_slot: visit
                 .representative_frame
                 .as_ref()
@@ -1600,7 +1740,8 @@ pub(crate) fn build_probe_request(
         "reading_guide":{
             "ordering":"Boundaries and slots are chronological. The final boundary is what was visible when Continue was invoked.",
             "images":"context_image slots are representative earlier screens. image_before and image_after belong to the final causal boundary. Images are globally capped at four.",
-            "meaning":"The surface timeline is factual chronology only. App names and hostnames cannot establish the primary task or a visit role without cited visual or action evidence."
+            "meaning":"The surface timeline is factual chronology only. App names and hostnames cannot establish the primary task or a visit role without cited visual or action evidence. carried_into_current_surface is a locally verified visible source carry, and committed_input contains no typed characters. Interaction and duration values are bounded factual signals, not task labels.",
+            "momentary_switch":"A boundary marked momentary_app_switch_at_continue means the foreground changed immediately before Continue without a confirming action on the new surface. The new surface must not replace stronger earlier task evidence merely because it is final."
         },
         "recent_surface_timeline":&request_surface_timeline,
         "boundaries":request_boundaries,
@@ -1713,6 +1854,14 @@ pub(crate) fn build_probe_request(
             is_current: visit.is_current,
             revisited: visit.revisited,
             private: visit.private,
+            interaction_count: visit.interaction_count,
+            frame_count: visit.frame_count,
+            engagement_score: visit.engagement_score,
+            observed_duration_ms: visit
+                .last_observed_at_ms
+                .saturating_sub(visit.first_observed_at_ms),
+            committed_input: visit.committed_input,
+            carried_into_current_surface: visit.carried_into_current_surface,
             image_slot: visit
                 .representative_frame
                 .as_ref()
@@ -2118,6 +2267,11 @@ fn admit_visit_roles(
 
     let mut admitted = BTreeMap::new();
     for (visit_id, visit) in expected {
+        if visit.app_label.eq_ignore_ascii_case("smalltalk") {
+            admitted.insert(visit_id.clone(), unclear_visit_role());
+            issues.push(format!("visit_role:{visit_id}:diagnostic_self_surface"));
+            continue;
+        }
         let Some(mut role) = proposed.get(&visit_id).cloned() else {
             admitted.insert(visit_id.clone(), unclear_visit_role());
             issues.push(format!("visit_role:{visit_id}:missing"));
@@ -2185,6 +2339,7 @@ pub(crate) fn admit_output(
     mut output: ProbeModelOutput,
 ) -> (ProbeModelOutput, Vec<String>) {
     let mut issues = Vec::new();
+    let mut primary_task_rejected_as_passive = false;
     let expected_fields = SEMANTIC_FIELDS.into_iter().collect::<BTreeSet<_>>();
     let actual_support_fields = output
         .support_slots_by_field
@@ -2270,6 +2425,11 @@ pub(crate) fn admit_output(
             }
         }
         if !field_issues.is_empty() {
+            if field == "primary_task"
+                && field_issues.contains(&"passive_evidence_cannot_establish_primary_task")
+            {
+                primary_task_rejected_as_passive = true;
+            }
             field_issues.sort_unstable();
             field_issues.dedup();
             issues.extend(
@@ -2287,16 +2447,77 @@ pub(crate) fn admit_output(
         }
     }
 
+    // The four semantic fields describe one task state. If the proposed task
+    // was rejected because it came only from a momentary final screen, do not
+    // keep progress and unfinished-state claims derived from that same screen.
+    // Those claims would merely restate visible agent output as user work.
+    if primary_task_rejected_as_passive {
+        for field in ["current_step", "last_progress", "unfinished_state"] {
+            let supports = output
+                .support_slots_by_field
+                .get(field)
+                .cloned()
+                .unwrap_or_default();
+            if field_value(&output, field).is_some()
+                && supports_only_momentary_current_boundary(request, &supports)
+            {
+                set_field_value(&mut output, field, None);
+                output
+                    .support_slots_by_field
+                    .insert(field.into(), Vec::new());
+                output.confidence_by_field.insert(field.into(), 0.0);
+                issues.push(format!(
+                    "{field}:depends_on_rejected_momentary_primary_task"
+                ));
+            }
+        }
+    }
+
     let (visit_roles, visit_role_issues) =
         admit_visit_roles(packet, request, std::mem::take(&mut output.visit_roles));
     output.visit_roles = visit_roles;
     issues.extend(visit_role_issues);
 
+    if output.primary_task.is_none() {
+        for (visit_id, role) in &mut output.visit_roles {
+            if role.role != ProbeSurfaceRole::Unclear {
+                *role = unclear_visit_role();
+                issues.push(format!("visit_role:{visit_id}:primary_task_not_admitted"));
+            }
+        }
+    } else if request_has_momentary_app_switch(request) {
+        let current_visit_id = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.is_current)
+            .map(|visit| {
+                if visit.visit_id.trim().is_empty() {
+                    format!("T{}_VISIT", visit.sequence_index)
+                } else {
+                    visit.visit_id.clone()
+                }
+            });
+        if let Some(current_visit_id) = current_visit_id {
+            if let Some(role) = output.visit_roles.get_mut(&current_visit_id) {
+                if matches!(
+                    role.role,
+                    ProbeSurfaceRole::PrimaryWork | ProbeSurfaceRole::SupportingWork
+                ) {
+                    *role = unclear_visit_role();
+                    issues.push(format!(
+                        "visit_role:{current_visit_id}:momentary_switch_not_confirmed_as_work"
+                    ));
+                }
+            }
+        }
+    }
+
     let admitted_count = SEMANTIC_FIELDS
         .iter()
         .filter(|field| field_value(&output, field).is_some())
         .count();
-    output.status = if admitted_count == 0 {
+    output.status = if output.primary_task.is_none() || admitted_count == 0 {
         ProbeResolutionStatus::Unresolved
     } else if admitted_count == SEMANTIC_FIELDS.len()
         && output.primary_task.is_some()
@@ -3862,6 +4083,8 @@ mod tests {
             interaction_count: (engagement_score / 1_000).max(0) as usize,
             frame_count: 1,
             engagement_score,
+            committed_input: false,
+            carried_into_current_surface: false,
             evidence_refs: vec![frame.frame_id.clone()],
             representative_frame: Some(frame),
         }
@@ -3896,6 +4119,174 @@ mod tests {
                 true,
             ),
         ];
+        packet
+    }
+
+    fn named_frame(
+        id: usize,
+        observed_at_ms: i64,
+        partition: EvidencePartitionV2,
+        app_name: &str,
+        app_bundle_id: &str,
+        window_id: Option<i64>,
+        browser_url_hash: Option<&str>,
+    ) -> KeyframeReferenceV2 {
+        let mut frame = keyframe(id, false);
+        frame.frame_id = id.to_string();
+        frame.observed_at_ms = observed_at_ms;
+        frame.partition = partition;
+        frame.surface_identity = ActiveSurfaceIdentityV2 {
+            app_name: Some(app_name.into()),
+            app_bundle_id: Some(app_bundle_id.into()),
+            window_title_hash: Some(format!("window-{id}")),
+            window_id,
+            browser_url_hash: browser_url_hash.map(str::to_string),
+            document_path_hash: None,
+        };
+        frame.selection_reasons = vec![if partition == EvidencePartitionV2::Current {
+            "current_frame".into()
+        } else {
+            "session_surface_representative".into()
+        }];
+        frame
+    }
+
+    fn inkling_brief_codex_switch_packet() -> ObservationPacketV2 {
+        let inkling_start = named_frame(
+            53,
+            1_784_162_167_715,
+            EvidencePartitionV2::Background,
+            "Helium",
+            "net.imput.helium",
+            None,
+            Some("thinking-machines-inkling"),
+        );
+        let inkling_end = named_frame(
+            54,
+            1_784_162_214_112,
+            EvidencePartitionV2::Support,
+            "Helium",
+            "net.imput.helium",
+            None,
+            Some("thinking-machines-inkling"),
+        );
+        let chat_background = named_frame(
+            55,
+            1_784_162_223_195,
+            EvidencePartitionV2::Background,
+            "Helium",
+            "net.imput.helium",
+            None,
+            Some("chatgpt-inkling-for-smalltalk"),
+        );
+        let mut chat_support = chat_background.clone();
+        chat_support.partition = EvidencePartitionV2::Support;
+        let current = named_frame(
+            56,
+            1_784_162_228_635,
+            EvidencePartitionV2::Current,
+            "ChatGPT",
+            "com.openai.codex",
+            Some(747_444),
+            None,
+        );
+
+        let mut switch = event(56);
+        switch.event_id = "evt-brief-switch".into();
+        switch.event_kind = "app_switch".into();
+        switch.observed_at_ms = 1_784_162_228_159;
+        switch.frame_id = "56".into();
+        switch.source_frame_id = "55".into();
+        switch.target_frame_id = Some("56".into());
+        switch.target_element_id = None;
+        switch.target_region = None;
+        switch.focused_element_after = None;
+        switch.window_id = Some(747_444);
+        switch.app_bundle_id = Some("com.openai.codex".into());
+        switch.semantic_delta_reference = Some("delta:56".into());
+        switch.grounding_confidence = 0.2;
+        switch.committed = None;
+        switch.partition = EvidencePartitionV2::Current;
+
+        let mut switch_delta = delta(56);
+        switch_delta.delta_id = "delta:56".into();
+        switch_delta.frame_id = "56".into();
+        switch_delta.prior_frame_id = Some("55".into());
+        switch_delta.next_frame_id = "56".into();
+        switch_delta.diff_kind = Some("application_changed".into());
+        switch_delta.observable_changes = vec!["foreground application changed".into()];
+        switch_delta.causal_event_ids = vec![switch.event_id.clone()];
+
+        let mut packet = packet(false);
+        packet.packet_id = "packet-inkling-brief-codex-switch".into();
+        packet.observed_at_ms = current.observed_at_ms;
+        packet.active_surface = current.surface_identity.clone();
+        packet.current_frame = current.clone();
+        packet.semantic_keyframes = vec![
+            inkling_start.clone(),
+            inkling_end.clone(),
+            chat_background,
+            current.clone(),
+        ];
+        packet.surface_timeline = vec![
+            SurfaceVisitV2 {
+                sequence_index: 1,
+                app_label: "Helium".into(),
+                site_hostname: Some("thinkingmachines.ai".into()),
+                first_observed_at_ms: inkling_start.observed_at_ms,
+                last_observed_at_ms: inkling_end.observed_at_ms,
+                is_current: false,
+                revisited: false,
+                private: false,
+                interaction_count: 65,
+                frame_count: 2,
+                engagement_score: 65_560,
+                committed_input: false,
+                carried_into_current_surface: false,
+                evidence_refs: vec!["53".into(), "54".into()],
+                representative_frame: Some(inkling_end),
+            },
+            SurfaceVisitV2 {
+                sequence_index: 2,
+                app_label: "Helium".into(),
+                site_hostname: Some("chatgpt.com".into()),
+                first_observed_at_ms: chat_support.observed_at_ms,
+                last_observed_at_ms: chat_support.observed_at_ms,
+                is_current: false,
+                revisited: false,
+                private: false,
+                interaction_count: 18,
+                frame_count: 1,
+                engagement_score: 18_050,
+                committed_input: false,
+                carried_into_current_surface: false,
+                evidence_refs: vec!["55".into()],
+                representative_frame: Some(chat_support),
+            },
+            SurfaceVisitV2 {
+                sequence_index: 3,
+                app_label: "ChatGPT".into(),
+                site_hostname: None,
+                first_observed_at_ms: current.observed_at_ms,
+                last_observed_at_ms: current.observed_at_ms,
+                is_current: true,
+                revisited: false,
+                private: false,
+                interaction_count: 1,
+                frame_count: 1,
+                engagement_score: 1_050,
+                committed_input: false,
+                carried_into_current_surface: false,
+                evidence_refs: vec!["56".into()],
+                representative_frame: Some(current),
+            },
+        ];
+        packet.canonical_elements.clear();
+        packet.focused_element_ids.clear();
+        packet.editable_element_ids.clear();
+        packet.causal_events = vec![switch];
+        packet.frame_changes = vec![switch_delta];
+        packet.missing_source_notes = vec!["action_surface_ownership_mismatch_excluded:3".into()];
         packet
     }
 
@@ -4105,6 +4496,285 @@ mod tests {
                 .get(slot)
                 .is_some_and(|support| support.category == SupportCategory::ContextImage)
         }));
+    }
+
+    #[test]
+    fn inkling_fixture_marks_the_final_codex_frame_as_a_momentary_switch() {
+        let packet = inkling_brief_codex_switch_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+
+        assert_eq!(
+            request.audit.boundary_selection_reasons,
+            vec!["momentary_app_switch_at_continue"]
+        );
+        assert_eq!(
+            request.audit.supplied_image_slots,
+            vec!["T1_CONTEXT_IMAGE", "T2_CONTEXT_IMAGE", "B1_IMAGE_AFTER"]
+        );
+
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        let structured: Value = serde_json::from_str(structured_text).unwrap();
+        let boundary = structured.pointer("/boundaries/0").expect("final boundary");
+        assert_eq!(
+            boundary.get("chronology_role").and_then(Value::as_str),
+            Some("visible_at_continue_not_task_confirmed")
+        );
+        assert_eq!(
+            boundary.get("prior_image_slot").and_then(Value::as_str),
+            Some("T2_CONTEXT_IMAGE")
+        );
+        assert_eq!(
+            boundary.get("surface_relation").and_then(Value::as_str),
+            Some("brief_unconfirmed_transition_from_prior_surface")
+        );
+
+        let timeline = structured
+            .get("recent_surface_timeline")
+            .and_then(Value::as_array)
+            .expect("surface timeline");
+        assert_eq!(timeline[0]["interaction_count"], json!(65));
+        assert_eq!(timeline[0]["engagement_score"], json!(65_560));
+        assert_eq!(timeline[0]["observed_duration_ms"], json!(46_397));
+        assert_eq!(timeline[1]["interaction_count"], json!(18));
+        assert_eq!(timeline[2]["interaction_count"], json!(1));
+        assert_eq!(timeline[2]["engagement_score"], json!(1_050));
+        assert!(structured_text.contains("must not replace stronger earlier task evidence"));
+    }
+
+    #[test]
+    fn confirmed_work_after_switch_removes_the_momentary_safeguard() {
+        let mut packet = inkling_brief_codex_switch_packet();
+        let mut confirmed = event(57);
+        confirmed.event_id = "evt-confirmed-codex-input".into();
+        confirmed.event_kind = "typing_commit".into();
+        confirmed.observed_at_ms = packet.observed_at_ms - 100;
+        confirmed.frame_id = "56".into();
+        confirmed.source_frame_id = "56".into();
+        confirmed.target_frame_id = Some("56".into());
+        confirmed.target_element_id = None;
+        confirmed.target_region = Some(RegionRoleV2::ComposerEditor);
+        confirmed.window_id = Some(747_444);
+        confirmed.app_bundle_id = Some("com.openai.codex".into());
+        confirmed.semantic_delta_reference = None;
+        confirmed.grounding_confidence = 0.95;
+        confirmed.committed = Some(true);
+        confirmed.partition = EvidencePartitionV2::Current;
+        packet.causal_events.push(confirmed);
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+
+        assert_eq!(
+            request.audit.boundary_selection_reasons,
+            vec!["current_manual_boundary"]
+        );
+    }
+
+    #[test]
+    fn inkling_fixture_rejects_codex_only_task_state_and_primary_role() {
+        let packet = inkling_brief_codex_switch_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let current_slot = latest_slot(&request, SupportCategory::ImageAfter);
+        let mut roles = visit_roles(&request);
+        roles.get_mut("T1_VISIT").unwrap().role = ProbeSurfaceRole::DetourOrUnrelated;
+        roles.get_mut("T2_VISIT").unwrap().role = ProbeSurfaceRole::DetourOrUnrelated;
+        roles.get_mut("T3_VISIT").unwrap().role = ProbeSurfaceRole::PrimaryWork;
+        let proposed = ProbeModelOutput {
+            primary_task: Some(
+                "Fix Continue so a stalled capture process does not spin indefinitely".into(),
+            ),
+            current_step: Some("Reviewing the completed capture-stall fix in Codex".into()),
+            last_progress: Some("The capture-stall fix passed its checks".into()),
+            unfinished_state: Some("The Codex response continues below the viewport".into()),
+            visit_roles: roles,
+            support_slots_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), vec![current_slot.clone()]))
+                .collect(),
+            missing_evidence: Vec::new(),
+            confidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), 0.99))
+                .collect(),
+            status: ProbeResolutionStatus::Resolved,
+        };
+
+        let (admitted, issues) = admit_output(&packet, &request, proposed);
+
+        assert!(admitted.primary_task.is_none());
+        assert!(admitted.current_step.is_none());
+        assert!(admitted.last_progress.is_none());
+        assert!(admitted.unfinished_state.is_none());
+        assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert!(admitted
+            .visit_roles
+            .values()
+            .all(|role| role.role == ProbeSurfaceRole::Unclear));
+        assert!(issues.iter().any(|issue| {
+            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+        }));
+        assert!(issues
+            .iter()
+            .any(|issue| { issue == "current_step:depends_on_rejected_momentary_primary_task" }));
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "visit_role:T3_VISIT:primary_task_not_admitted"));
+    }
+
+    #[test]
+    fn inkling_fixture_admits_browser_task_and_keeps_codex_as_detour() {
+        let packet = inkling_brief_codex_switch_packet();
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let source_slot = request.audit.surface_timeline[0]
+            .image_slot
+            .clone()
+            .expect("Inkling image");
+        let chat_slot = request.audit.surface_timeline[1]
+            .image_slot
+            .clone()
+            .expect("Smalltalk chat image");
+        let mut roles = visit_roles(&request);
+        roles.get_mut("T1_VISIT").unwrap().role = ProbeSurfaceRole::SupportingWork;
+        roles.get_mut("T2_VISIT").unwrap().role = ProbeSurfaceRole::PrimaryWork;
+        roles.get_mut("T3_VISIT").unwrap().role = ProbeSurfaceRole::DetourOrUnrelated;
+        let proposed = ProbeModelOutput {
+            primary_task: Some(
+                "Assess whether Thinking Machines' Inkling model could improve Smalltalk task recovery"
+                    .into(),
+            ),
+            current_step: Some(
+                "Comparing Inkling's capabilities with Smalltalk's task-recovery requirements"
+                    .into(),
+            ),
+            last_progress: Some(
+                "The Smalltalk chat identified a task-recovery model as the strongest use"
+                    .into(),
+            ),
+            unfinished_state: Some(
+                "The model choice and integration approach are still being evaluated".into(),
+            ),
+            visit_roles: roles,
+            support_slots_by_field: BTreeMap::from([
+                (
+                    "primary_task".into(),
+                    vec![source_slot.clone(), chat_slot.clone()],
+                ),
+                ("current_step".into(), vec![chat_slot.clone()]),
+                ("last_progress".into(), vec![chat_slot.clone()]),
+                ("unfinished_state".into(), vec![chat_slot]),
+            ]),
+            missing_evidence: Vec::new(),
+            confidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), 0.9))
+                .collect(),
+            status: ProbeResolutionStatus::Resolved,
+        };
+
+        let (admitted, issues) = admit_output(&packet, &request, proposed);
+
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some(
+                "Assess whether Thinking Machines' Inkling model could improve Smalltalk task recovery"
+            )
+        );
+        assert_eq!(admitted.status, ProbeResolutionStatus::Resolved);
+        assert_eq!(
+            admitted.visit_roles["T2_VISIT"].role,
+            ProbeSurfaceRole::PrimaryWork
+        );
+        assert_eq!(
+            admitted.visit_roles["T3_VISIT"].role,
+            ProbeSurfaceRole::DetourOrUnrelated
+        );
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn request_transports_verified_source_carry_and_committed_input_without_text() {
+        let mut packet = live_shaped_session_packet();
+        packet.surface_timeline[1].carried_into_current_surface = true;
+        packet.surface_timeline[3].committed_input = true;
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let structured_text = request
+            .body
+            .pointer("/input/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("structured request text");
+        let structured: Value = serde_json::from_str(structured_text).unwrap();
+        let timeline = structured
+            .get("recent_surface_timeline")
+            .and_then(Value::as_array)
+            .expect("surface timeline");
+
+        assert_eq!(
+            timeline[1]
+                .get("carried_into_current_surface")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            timeline[3].get("committed_input").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(structured_text.contains("devfolio.co"));
+        assert!(!structured_text.contains("typed_characters"));
+        assert!(!structured_text.contains("raw_text"));
+        assert!(request.audit.surface_timeline[1].carried_into_current_surface);
+        assert!(request.audit.surface_timeline[3].committed_input);
+    }
+
+    #[test]
+    fn thinking_machines_to_smalltalk_chat_task_survives_local_admission() {
+        let mut packet = live_shaped_session_packet();
+        packet.surface_timeline[1].site_hostname = Some("thinkingmachines.ai".into());
+        packet.surface_timeline[1].carried_into_current_surface = true;
+        packet.surface_timeline[3].site_hostname = Some("chatgpt.com".into());
+        packet.surface_timeline[3].committed_input = true;
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let source_slot = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.site_hostname.as_deref() == Some("thinkingmachines.ai"))
+            .and_then(|visit| visit.image_slot.clone())
+            .expect("source article image slot");
+        let current_slot = request
+            .audit
+            .surface_timeline
+            .iter()
+            .find(|visit| visit.is_current)
+            .and_then(|visit| visit.image_slot.clone())
+            .expect("current chat image slot");
+        let action_slot = latest_slot(&request, SupportCategory::UserAction);
+        let mut generated = output(
+            Some(
+                "Likely assessing whether Thinking Machines' Inkling model could be useful for Smalltalk",
+            ),
+            &request,
+        );
+        generated.support_slots_by_field.insert(
+            "primary_task".into(),
+            vec![source_slot, current_slot, action_slot],
+        );
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some(
+                "Likely assessing whether Thinking Machines' Inkling model could be useful for Smalltalk"
+            )
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.starts_with("primary_task:")));
     }
 
     #[test]
@@ -5068,6 +5738,30 @@ mod tests {
     }
 
     #[test]
+    fn smalltalk_self_visit_can_never_be_admitted_as_primary_work() {
+        let mut packet = live_shaped_session_packet();
+        packet.surface_timeline[3].app_label = "Smalltalk".into();
+        packet.surface_timeline[3].site_hostname = None;
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let mut generated = output(Some("Improve Smalltalk Continue"), &request);
+        generated
+            .visit_roles
+            .get_mut("T4_VISIT")
+            .expect("self visit role")
+            .role = ProbeSurfaceRole::PrimaryWork;
+
+        let (admitted, issues) = admit_output(&packet, &request, generated);
+
+        assert_eq!(
+            admitted.visit_roles["T4_VISIT"].role,
+            ProbeSurfaceRole::Unclear
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "visit_role:T4_VISIT:diagnostic_self_surface"));
+    }
+
+    #[test]
     fn old_probe_output_without_visit_roles_still_deserializes() {
         let mut legacy = serde_json::to_value(output(
             Some("Implement the PFTU semantic probe"),
@@ -5384,6 +6078,10 @@ mod tests {
         let instruction = system_instruction();
         assert!(instruction.contains("Never rewrite the purpose of visible page content"));
         assert!(instruction.contains("primary_task must be null"));
+        assert!(instruction.contains("carried_into_current_surface"));
+        assert!(instruction.contains("committed_input"));
+        assert!(instruction.contains("a qualified primary task"));
+        assert!(instruction.contains("do not invent a narrower purpose"));
     }
 
     #[test]

@@ -154,6 +154,10 @@ pub(crate) struct SurfaceVisitV2 {
     pub(crate) interaction_count: usize,
     pub(crate) frame_count: usize,
     pub(crate) engagement_score: i64,
+    #[serde(default)]
+    pub(crate) committed_input: bool,
+    #[serde(default)]
+    pub(crate) carried_into_current_surface: bool,
     pub(crate) evidence_refs: Vec<String>,
     pub(crate) representative_frame: Option<KeyframeReferenceV2>,
 }
@@ -280,6 +284,8 @@ pub(crate) fn is_private_status(status: Option<&str>) -> bool {
     ) || status.contains("private")
         || status.contains("blocked")
         || status.contains("secure")
+        || status.contains("diagnostic_self")
+        || status.contains("identity_conflict")
 }
 
 fn hash_optional(value: Option<&str>) -> Option<String> {
@@ -477,7 +483,22 @@ fn is_diagnostic_surface(frame: &EvidenceFrame) -> bool {
     let app = frame.app_name.as_deref().unwrap_or("").to_ascii_lowercase();
     // Codex is sometimes used to diagnose Smalltalk, but it is also a normal
     // user workspace. Only Smalltalk's own UI is categorically self-evidence.
-    bundle == "com.smalltalk.app" || app == "smalltalk"
+    if bundle == "com.smalltalk.app" || app == "smalltalk" {
+        return true;
+    }
+    let captured_window_owner = frame.window_id.and_then(|window_id| {
+        frame
+            .visible_windows
+            .iter()
+            .find(|window| window.cg_window_id == Some(window_id))
+    });
+    captured_window_owner.is_some_and(|window| {
+        window.bundle_id.as_deref() == Some("com.smalltalk.app")
+            || window
+                .owner_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"))
+    })
 }
 
 fn event_matches_frame_surface(
@@ -505,6 +526,36 @@ fn event_matches_frame_surface(
         }
     }
     true
+}
+
+fn typing_burst_matches_frame_surface(
+    frame: &EvidenceFrame,
+    burst: &super::super::EvidenceTypingBurst,
+) -> bool {
+    let same_app = match (
+        burst.app_bundle_id.as_deref(),
+        frame.app_bundle_id.as_deref(),
+    ) {
+        (Some(expected), Some(actual)) if !expected.trim().is_empty() => {
+            expected.eq_ignore_ascii_case(actual)
+        }
+        _ => match (burst.app_name.as_deref(), frame.app_name.as_deref()) {
+            (Some(expected), Some(actual)) if !expected.trim().is_empty() => {
+                expected.eq_ignore_ascii_case(actual)
+            }
+            _ => false,
+        },
+    };
+    let same_window = match (burst.window_id, frame.window_id) {
+        (Some(expected), Some(actual)) if expected > 0 && actual > 0 => expected == actual,
+        _ => match (burst.window_title.as_deref(), frame.window_name.as_deref()) {
+            (Some(expected), Some(actual)) if !expected.trim().is_empty() => {
+                expected.trim().eq_ignore_ascii_case(actual.trim())
+            }
+            _ => false,
+        },
+    };
+    same_app && same_window
 }
 
 fn has_structured_work_surface_evidence(frame: &EvidenceFrame) -> bool {
@@ -815,9 +866,12 @@ fn visit_is_transient_browser_chrome(frames: &[&EvidenceFrame]) -> bool {
                 .iter()
                 .all(|event| !event_matches_frame_surface(frame, event))
         })
-        && frames
-            .iter()
-            .all(|frame| frame.typing_bursts.iter().all(|burst| !burst.committed))
+        && frames.iter().all(|frame| {
+            frame
+                .typing_bursts
+                .iter()
+                .all(|burst| !burst.committed || !typing_burst_matches_frame_surface(frame, burst))
+        })
 }
 
 fn build_surface_timeline(
@@ -825,6 +879,44 @@ fn build_surface_timeline(
     current_frame_id: &str,
     cutoff_ms: i64,
 ) -> Vec<SurfaceVisitV2> {
+    let current_frame = frames.iter().find(|frame| frame.id == current_frame_id);
+    let current_is_chat = current_frame.is_some_and(|frame| {
+        !is_private_status(frame.privacy_status.as_deref())
+            && frame
+                .app_contexts
+                .iter()
+                .any(|context| context.object_type == "chat_conversation")
+    });
+    let current_visible_content = current_frame
+        .into_iter()
+        .flat_map(|frame| frame.content_units.iter())
+        .filter(|unit| {
+            let Some(frame) = current_frame else {
+                return false;
+            };
+            let hint = format!(
+                "{} {}",
+                unit.unit_type,
+                unit.semantic_role.as_deref().unwrap_or("")
+            );
+            let page_content = !matches!(
+                role_for(&hint),
+                RegionRoleV2::BrowserChrome | RegionRoleV2::Navigation | RegionRoleV2::Toolbar
+            );
+            let foreground_owned = foreground_ownership(
+                frame,
+                unit.ownership_kind.as_deref(),
+                unit.owner_window_id,
+                unit.owner_bundle_id.as_deref(),
+                &unit.quality_flags,
+            )
+            .0;
+            page_content && foreground_owned
+        })
+        .filter_map(|unit| unit.text.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
     let mut ordered = frames
         .iter()
         .filter(|frame| frame.captured_at <= cutoff_ms)
@@ -877,11 +969,20 @@ fn build_surface_timeline(
                 })
                 .collect::<BTreeSet<_>>();
             for frame in &frames {
-                for burst in frame.typing_bursts.iter().filter(|burst| burst.committed) {
+                for burst in frame.typing_bursts.iter().filter(|burst| {
+                    burst.committed && typing_burst_matches_frame_surface(frame, burst)
+                }) {
                     event_ids.insert(burst.id.clone());
                 }
             }
             let interaction_count = event_ids.len();
+            let committed_input = frames.iter().any(|frame| {
+                frame.typing_bursts.iter().any(|burst| {
+                    burst.committed
+                        && burst.ended_at_ms <= cutoff_ms
+                        && typing_burst_matches_frame_surface(frame, burst)
+                })
+            });
             let dwell_ms = last.captured_at.saturating_sub(first.captured_at);
             let engagement_score = (interaction_count as i64 * 1_000)
                 + (dwell_ms.clamp(0, 30 * 60 * 1_000) / 1_000 * 10)
@@ -909,7 +1010,10 @@ fn build_surface_timeline(
                             + frame
                                 .typing_bursts
                                 .iter()
-                                .filter(|burst| burst.committed)
+                                .filter(|burst| {
+                                    burst.committed
+                                        && typing_burst_matches_frame_surface(frame, burst)
+                                })
                                 .count();
                         (reference, activity)
                     })
@@ -936,6 +1040,12 @@ fn build_surface_timeline(
                         .find_map(|frame| browser_origin_key(frame))
                 })
                 .flatten();
+            let carried_into_current_surface = !private
+                && current_is_chat
+                && !frames.iter().any(|frame| frame.id == current_frame_id)
+                && site_hostname.as_deref().is_some_and(|hostname| {
+                    current_visible_content.contains(&hostname.to_ascii_lowercase())
+                });
             let mut evidence_refs = BTreeSet::new();
             evidence_refs.insert(first.id.clone());
             evidence_refs.insert(last.id.clone());
@@ -954,6 +1064,8 @@ fn build_surface_timeline(
                 interaction_count,
                 frame_count: frames.len(),
                 engagement_score,
+                committed_input,
+                carried_into_current_surface,
                 evidence_refs: evidence_refs.into_iter().collect(),
                 representative_frame,
             })
@@ -1523,16 +1635,25 @@ fn causal_events(
             });
         }
         for burst in &frame.typing_bursts {
-            let focused = elements.iter().find(|element| {
-                element.frame_id == frame.id && element.focused && element.editable
-            });
+            let same_surface = typing_burst_matches_frame_surface(frame, burst);
+            let focused = same_surface
+                .then(|| {
+                    elements.iter().find(|element| {
+                        element.frame_id == frame.id && element.focused && element.editable
+                    })
+                })
+                .flatten();
+            let surface_grounded_commit = focused.is_none()
+                && burst.committed
+                && same_surface
+                && (burst.char_count > 0 || burst.enter_count > 0 || burst.paste_count > 0);
             all_events.push(CausalEventV2 {
                 event_id: burst.id.clone(),
                 event_kind: burst
                     .commit_signal
                     .clone()
                     .unwrap_or_else(|| "typing_burst".into()),
-                observed_at_ms: frame.captured_at,
+                observed_at_ms: burst.ended_at_ms.max(burst.started_at_ms),
                 frame_id: frame.id.clone(),
                 source_frame_id: frame
                     .transition
@@ -1566,9 +1687,20 @@ fn causal_events(
                     .as_ref()
                     .and_then(|transition| transition.post_frame_id.clone()),
                 semantic_delta_reference: Some(format!("delta:{}", frame.id)),
-                grounding_confidence: if focused.is_some() { 0.9 } else { 0.35 },
+                grounding_confidence: if focused.is_some() {
+                    0.9
+                } else if surface_grounded_commit {
+                    0.68
+                } else {
+                    0.35
+                },
                 missing_evidence: if focused.is_some() {
                     Vec::new()
+                } else if surface_grounded_commit {
+                    vec![
+                        "focused_editable_element_missing".into(),
+                        "typing_grounded_to_exact_app_and_window_only".into(),
+                    ]
                 } else {
                     vec!["focused_editable_element_missing".into()]
                 },
@@ -2190,6 +2322,13 @@ mod tests {
         let mut current = frame("2", 2_000, "submit");
         current.typing_bursts.push(EvidenceTypingBurst {
             id: "burst-1".into(),
+            started_at_ms: 1_900,
+            ended_at_ms: 1_950,
+            app_bundle_id: Some("com.example.test".into()),
+            app_name: Some("Test App".into()),
+            window_id: Some(1),
+            window_title: Some("Window".into()),
+            char_count: 8,
             enter_count: 1,
             paste_count: 0,
             committed: true,
@@ -2396,6 +2535,110 @@ mod tests {
     }
 
     #[test]
+    fn surface_timeline_records_source_carried_into_chat_without_typed_characters() {
+        let mut source = frame("source", 1_000, "app_switch");
+        source.app_name = Some("Helium".into());
+        source.window_name = Some("Inkling - Helium".into());
+        source.app_bundle_id = Some("net.imput.helium".into());
+        source.browser_url = Some("https://thinkingmachines.ai/news/introducing-inkling/".into());
+
+        let mut chat = frame("chat", 2_000, "manual");
+        chat.app_name = Some("Helium".into());
+        chat.window_name = Some("ChatGPT - smalltalk - Helium".into());
+        chat.app_bundle_id = Some("net.imput.helium".into());
+        chat.browser_url = Some("https://chatgpt.com/project/smalltalk".into());
+        chat.app_contexts
+            .push(super::super::super::EvidenceAppContext {
+                id: "chat-context".into(),
+                adapter_id: "ai_chat_url_adapter".into(),
+                object_type: "chat_conversation".into(),
+                primary_id: None,
+                title: Some("ChatGPT - smalltalk".into()),
+                url: chat.browser_url.clone(),
+                file_path: None,
+                repo_path: None,
+                selected_text: None,
+                focused_object: None,
+                confidence: Some(0.9),
+            });
+        chat.content_units.push(EvidenceContentUnit {
+            id: "carried-source".into(),
+            source: "ax".into(),
+            unit_type: "unknown".into(),
+            semantic_role: Some("main_content".into()),
+            text: Some("https://thinkingmachines.ai/news/introducing-inkling/".into()),
+            text_hash: Some("safe-hash".into()),
+            confidence: Some(0.9),
+            ocr_span_ids: Vec::new(),
+            bounds: None,
+            source_scope: Some("active_window".into()),
+            ownership_kind: Some("active_window".into()),
+            ownership_confidence: Some(0.9),
+            active_artifact_match_confidence: Some(0.9),
+            owner_window_id: Some(1),
+            owner_bundle_id: Some("net.imput.helium".into()),
+            quality_flags: Vec::new(),
+        });
+        chat.typing_bursts.push(EvidenceTypingBurst {
+            id: "committed-chat-input".into(),
+            started_at_ms: 1_800,
+            ended_at_ms: 1_900,
+            app_bundle_id: Some("net.imput.helium".into()),
+            app_name: Some("Helium".into()),
+            window_id: Some(1),
+            window_title: Some("ChatGPT - smalltalk - Helium".into()),
+            char_count: 12,
+            enter_count: 1,
+            paste_count: 0,
+            committed: true,
+            commit_signal: Some("enter".into()),
+        });
+
+        let packet = build_observation_packet(&[source, chat], "watermark", None).unwrap();
+        assert_eq!(packet.surface_timeline.len(), 2);
+        assert!(packet.surface_timeline[0].carried_into_current_surface);
+        assert!(packet.surface_timeline[1].committed_input);
+        let serialized = serde_json::to_string(&packet).unwrap();
+        assert!(serialized.contains("thinkingmachines.ai"));
+        assert!(!serialized.contains("typed_characters"));
+    }
+
+    #[test]
+    fn committed_input_from_another_window_cannot_promote_the_current_visit() {
+        let mut chat = frame("chat", 2_000, "manual");
+        chat.app_name = Some("Helium".into());
+        chat.window_name = Some("ChatGPT - smalltalk - Helium".into());
+        chat.app_bundle_id = Some("net.imput.helium".into());
+        chat.window_id = Some(17);
+        chat.browser_url = Some("https://chatgpt.com/project/smalltalk".into());
+        chat.typing_bursts.push(EvidenceTypingBurst {
+            id: "other-window-commit".into(),
+            started_at_ms: 1_800,
+            ended_at_ms: 1_900,
+            app_bundle_id: Some("com.openai.codex".into()),
+            app_name: Some("Codex".into()),
+            window_id: Some(99),
+            window_title: Some("Different task".into()),
+            char_count: 24,
+            enter_count: 1,
+            paste_count: 0,
+            committed: true,
+            commit_signal: Some("enter".into()),
+        });
+
+        let packet = build_observation_packet(&[chat], "watermark", None).unwrap();
+
+        assert!(!packet.surface_timeline[0].committed_input);
+        let event = packet
+            .causal_events
+            .iter()
+            .find(|event| event.event_id == "other-window-commit")
+            .unwrap();
+        assert_eq!(event.grounding_confidence, 0.35);
+        assert!(event.target_element_id.is_none());
+    }
+
+    #[test]
     fn hidden_smalltalk_frame_is_a_chronology_separator() {
         let browser = |id: &str, at: i64| {
             let mut value = frame(id, at, "surface_change");
@@ -2528,6 +2771,52 @@ mod tests {
         assert!(code_keyframe
             .selection_reasons
             .contains(&"reserved_recent_structured_support_surface".into()));
+    }
+
+    #[test]
+    fn smalltalk_owned_window_is_excluded_even_when_frame_claims_helium() {
+        let mut browser = frame("verified-browser", 1_000, "surface_change");
+        browser.app_name = Some("Helium".into());
+        browser.app_bundle_id = Some("net.imput.helium".into());
+        browser.browser_url = Some("https://chatgpt.com/c/example".into());
+        browser.window_id = Some(42);
+
+        let mut poisoned = frame("poisoned-manual", 2_000, "manual");
+        poisoned.app_name = Some("Helium".into());
+        poisoned.app_bundle_id = Some("net.imput.helium".into());
+        poisoned.window_name = Some("ChatGPT - smalltalk - Helium".into());
+        poisoned.window_id = Some(7);
+        poisoned.visible_windows = vec![EvidenceWindow {
+            id: "window-smalltalk".into(),
+            cg_window_id: Some(7),
+            owner_name: Some("smalltalk".into()),
+            bundle_id: None,
+            window_title: Some("smalltalk".into()),
+            layer: Some(0),
+            alpha: Some(1.0),
+            is_onscreen: true,
+            is_active: true,
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            },
+        }];
+
+        let packet =
+            build_observation_packet(&[browser, poisoned], "watermark-owner-conflict", None)
+                .unwrap();
+
+        assert_eq!(packet.current_frame.frame_id, "verified-browser");
+        assert!(packet
+            .surface_timeline
+            .iter()
+            .all(|visit| !visit.evidence_refs.contains(&"poisoned-manual".to_string())));
+        assert!(packet
+            .missing_source_notes
+            .iter()
+            .any(|note| note == "diagnostic_self_frames_excluded:1"));
     }
 
     #[test]
@@ -3143,6 +3432,13 @@ mod tests {
         });
         current.typing_bursts.push(EvidenceTypingBurst {
             id: "burst".into(),
+            started_at_ms: 900,
+            ended_at_ms: 950,
+            app_bundle_id: Some("com.example.test".into()),
+            app_name: Some("Test App".into()),
+            window_id: Some(1),
+            window_title: Some("Window".into()),
+            char_count: 8,
             enter_count: 1,
             paste_count: 0,
             committed: true,
@@ -3157,6 +3453,48 @@ mod tests {
         assert!(event.target_element_id.is_some());
         assert_eq!(event.target_frame_id.as_deref(), Some("post"));
         assert!(!serde_json::to_string(event).unwrap().contains("raw_text"));
+    }
+
+    #[test]
+    fn committed_typing_without_ax_focus_is_grounded_to_the_exact_surface() {
+        let mut current = frame("current", 1_000, "manual");
+        current.app_name = Some("Helium".into());
+        current.app_bundle_id = Some("net.imput.helium".into());
+        current.window_id = Some(17);
+        current.window_name = Some("ChatGPT - smalltalk - Helium".into());
+        current.typing_bursts.push(EvidenceTypingBurst {
+            id: "surface-commit".into(),
+            started_at_ms: 900,
+            ended_at_ms: 950,
+            app_bundle_id: Some("net.imput.helium".into()),
+            app_name: Some("Helium".into()),
+            window_id: Some(17),
+            window_title: Some("ChatGPT - smalltalk - Helium".into()),
+            char_count: 24,
+            enter_count: 1,
+            paste_count: 0,
+            committed: true,
+            commit_signal: Some("enter".into()),
+        });
+
+        let packet = build_observation_packet(&[current], "watermark", None).unwrap();
+        let event = packet
+            .causal_events
+            .iter()
+            .find(|event| event.event_id == "surface-commit")
+            .unwrap();
+
+        assert_eq!(event.grounding_confidence, 0.68);
+        assert_eq!(event.committed, Some(true));
+        assert_eq!(event.observed_at_ms, 950);
+        assert!(event.target_element_id.is_none());
+        assert!(event
+            .missing_evidence
+            .iter()
+            .any(|reason| reason == "typing_grounded_to_exact_app_and_window_only"));
+        let serialized = serde_json::to_string(event).unwrap();
+        assert!(!serialized.contains("raw_text"));
+        assert!(!serialized.contains("typed_characters"));
     }
 
     #[test]

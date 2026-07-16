@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs",
+    "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs scripts/continueRequest.test.mjs",
     "test:webview": "npm run test:continue-presentation",
     "preview": "vite preview",
     "tauri": "tauri",

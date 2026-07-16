@@ -28,7 +28,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,6 +41,11 @@ mod swift_helpers;
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SCK_HELPER_TIMEOUT: Duration = Duration::from_secs(12);
+const CAPTURE_HELPER_TIMEOUT: Duration = Duration::from_secs(8);
+const MANUAL_CAPTURE_PERMIT_TIMEOUT: Duration = Duration::from_secs(3);
+const MANUAL_CONTINUE_PERMIT_TIMEOUT: Duration = Duration::from_secs(8);
+const BACKGROUND_CONTINUE_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const INTERRUPTED_CAPTURE_TRIGGER_GRACE_MS: i64 = 30_000;
 const SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX: &str =
     "screen_capture_permission_requested_at_ms";
 const SCREEN_CAPTURE_SETTINGS_HINT: &str =
@@ -745,6 +750,8 @@ struct ScreenshotCapture {
     display_id: Option<String>,
     window_id: Option<i64>,
     bundle_id: Option<String>,
+    owner_pid: Option<i64>,
+    owner_name: Option<String>,
     width: Option<i64>,
     height: Option<i64>,
     filter_summary_json: Option<String>,
@@ -2418,6 +2425,8 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
         }
     }
 
+    recover_interrupted_capture_triggers(&open_db(&app)?, now_millis())?;
+
     let permission = screen_capture_permission_status(&app)?;
     if !permission.granted {
         return Err(screen_capture_permission_start_error(&permission));
@@ -3716,6 +3725,7 @@ const MANUAL_CONTINUE_EVENT_RECENCY_MS: i64 = 60_000;
 #[derive(Debug, Clone)]
 struct ManualContinueExternalEvent {
     ts_ms: i64,
+    app_pid: Option<i64>,
     app_bundle_id: Option<String>,
     app_name: Option<String>,
     window_id: Option<i64>,
@@ -3725,6 +3735,7 @@ struct ManualContinueExternalEvent {
 #[derive(Debug, Clone)]
 struct ManualContinueCaptureExpectation {
     app_bundle_id: Option<String>,
+    app_name: Option<String>,
     window_id: Option<i64>,
 }
 
@@ -3734,7 +3745,7 @@ fn latest_manual_continue_external_event(
     pressed_at_ms: i64,
 ) -> Result<Option<ManualContinueExternalEvent>, String> {
     conn.query_row(
-        "SELECT ts_ms, app_bundle_id, app_name, window_id, window_title
+        "SELECT ts_ms, app_pid, app_bundle_id, app_name, window_id, window_title
          FROM ui_events
          WHERE session_id = ?1
            AND event_type IN ('app_switch','window_focus','click','scroll','key_down','clipboard')
@@ -3754,10 +3765,11 @@ fn latest_manual_continue_external_event(
         |row| {
             Ok(ManualContinueExternalEvent {
                 ts_ms: row.get(0)?,
-                app_bundle_id: row.get(1)?,
-                app_name: row.get(2)?,
-                window_id: row.get(3)?,
-                window_title: row.get(4)?,
+                app_pid: row.get(1)?,
+                app_bundle_id: row.get(2)?,
+                app_name: row.get(3)?,
+                window_id: row.get(4)?,
+                window_title: row.get(5)?,
             })
         },
     )
@@ -3766,37 +3778,79 @@ fn latest_manual_continue_external_event(
 }
 
 fn privacy_status_allows_manual_continue_frame(status: Option<&str>) -> bool {
+    let status = status.unwrap_or("normal").trim().to_ascii_lowercase();
     !matches!(
-        status
-            .unwrap_or("normal")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
+        status.as_str(),
         "private" | "excluded" | "blocked" | "sensitive"
-    )
+    ) && !status.contains("diagnostic_self")
+        && !status.contains("identity_conflict")
 }
 
-fn manual_continue_anchor_once(
+fn normalized_manual_continue_window_title(value: &str, app_name: Option<&str>) -> String {
+    let clean = |text: &str| {
+        text.chars()
+            .filter(|character| {
+                !matches!(
+                    character,
+                    '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'
+                        | '\u{202b}'
+                        | '\u{202c}'
+                        | '\u{202d}'
+                        | '\u{202e}'
+                        | '\u{2066}'
+                        | '\u{2067}'
+                        | '\u{2068}'
+                        | '\u{2069}'
+                )
+            })
+            .collect::<String>()
+            .trim()
+            .to_lowercase()
+    };
+    let mut title = clean(value);
+    let Some(app_name) = app_name.map(clean).filter(|value| !value.is_empty()) else {
+        return title;
+    };
+    for separator in [" - ", " — ", " – ", " | "] {
+        let suffix = format!("{separator}{app_name}");
+        if title.ends_with(&suffix) {
+            title.truncate(title.len().saturating_sub(suffix.len()));
+            return title.trim().to_string();
+        }
+    }
+    title
+}
+
+fn manual_continue_window_titles_match(
+    expected: &str,
+    actual: &str,
+    app_name: Option<&str>,
+) -> bool {
+    normalized_manual_continue_window_title(expected, app_name)
+        == normalized_manual_continue_window_title(actual, app_name)
+}
+
+fn manual_continue_anchor_since(
     conn: &Connection,
     session_id: &str,
     event: Option<&ManualContinueExternalEvent>,
+    minimum_captured_at: i64,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
-    let minimum_captured_at = event
-        .map(|event| event.ts_ms)
-        .unwrap_or_else(|| now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS));
     let mut stmt = conn
         .prepare(
-            "SELECT CAST(id AS TEXT), app_bundle_id, app_name, window_id,
+            "SELECT CAST(id AS TEXT), app_bundle_id, app_name, window_id, window_name,
                     privacy_status, active_window_crop_path, full_screenshot_path
              FROM frames
-             WHERE session_id = ?1 AND captured_at >= ?2
+             WHERE session_id = ?1 AND captured_at BETWEEN ?2 AND ?3
              ORDER BY captured_at DESC, id DESC
              LIMIT 24",
         )
         .map_err(to_string)?;
     let rows = stmt
-        .query_map(params![session_id, minimum_captured_at], |row| {
+        .query_map(params![session_id, minimum_captured_at, now_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -3805,13 +3859,14 @@ fn manual_continue_anchor_once(
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(to_string)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
     Ok(rows.into_iter().find_map(
-        |(frame_id, bundle_id, app_name, window_id, privacy, crop, full)| {
+        |(frame_id, bundle_id, app_name, window_id, window_name, privacy, crop, full)| {
             let is_smalltalk = bundle_id.as_deref() == Some(SMALLTALK_BUNDLE_ID)
                 || app_name
                     .as_deref()
@@ -3842,35 +3897,129 @@ fn manual_continue_anchor_once(
                 (Some(expected), Some(actual)) if expected > 0 && actual > 0 => expected == actual,
                 _ => true,
             };
-            (app_matches && window_matches).then_some(frame_id)
+            let title_matches = match (
+                event
+                    .window_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                window_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                (Some(expected), Some(actual)) => {
+                    manual_continue_window_titles_match(expected, actual, event.app_name.as_deref())
+                }
+                _ => true,
+            };
+            (app_matches && window_matches && title_matches).then_some(frame_id)
         },
     ))
+}
+
+fn manual_continue_anchor_once(
+    conn: &Connection,
+    session_id: &str,
+    event: Option<&ManualContinueExternalEvent>,
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    let minimum_captured_at = event
+        .map(|event| event.ts_ms)
+        .unwrap_or_else(|| now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS));
+    manual_continue_anchor_since(conn, session_id, event, minimum_captured_at, now_ms)
+}
+
+fn recent_manual_continue_fallback_anchor(
+    conn: &Connection,
+    session_id: &str,
+    event: &ManualContinueExternalEvent,
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    manual_continue_anchor_since(
+        conn,
+        session_id,
+        Some(event),
+        now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS),
+        now_ms,
+    )
 }
 
 fn manual_continue_capture_identity_matches(
     expected: &ManualContinueCaptureExpectation,
     capture: &ScreenshotCapture,
 ) -> bool {
+    let is_smalltalk = capture.bundle_id.as_deref() == Some(SMALLTALK_BUNDLE_ID)
+        || capture
+            .owner_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"));
+    if is_smalltalk {
+        return false;
+    }
     let window_matches = expected
         .window_id
         .map(|window_id| capture.window_id == Some(window_id))
         .unwrap_or(true);
-    let bundle_matches = expected
+    let app_matches = expected
         .app_bundle_id
         .as_deref()
         .filter(|bundle_id| !bundle_id.trim().is_empty())
-        .map(|bundle_id| capture.bundle_id.as_deref() == Some(bundle_id))
-        .unwrap_or(true);
-    window_matches && bundle_matches
+        .map(|bundle_id| {
+            capture.bundle_id.as_deref() == Some(bundle_id)
+                || (capture.bundle_id.is_none()
+                    && expected.app_name.as_deref().is_some_and(|expected_name| {
+                        capture.owner_name.as_deref().is_some_and(|actual_name| {
+                            expected_name.eq_ignore_ascii_case(actual_name)
+                        })
+                    }))
+        })
+        .unwrap_or_else(|| {
+            expected.app_name.as_deref().is_none_or(|expected_name| {
+                capture
+                    .owner_name
+                    .as_deref()
+                    .is_some_and(|actual_name| expected_name.eq_ignore_ascii_case(actual_name))
+            })
+        });
+    window_matches && app_matches
+}
+
+fn annotate_capture_with_window_owner(
+    capture: &mut ScreenshotCapture,
+    snapshot: Option<&WindowSnapshotPayload>,
+) {
+    let Some(window_id) = capture.window_id else {
+        return;
+    };
+    let Some(window) = snapshot
+        .into_iter()
+        .flat_map(|snapshot| snapshot.windows.iter())
+        .find(|window| window.cg_window_id == Some(window_id))
+    else {
+        return;
+    };
+    capture.bundle_id = window.bundle_id.clone();
+    capture.owner_pid = window.owner_pid;
+    capture.owner_name = window.owner_name.clone();
+}
+
+fn resolve_capture_window_id(
+    context_window_id: Option<i64>,
+    snapshot: Option<&WindowSnapshotPayload>,
+    manual_external_target: bool,
+) -> Option<i64> {
+    if manual_external_target {
+        context_window_id
+    } else {
+        context_window_id.or_else(|| snapshot.and_then(|snapshot| snapshot.active_window_id))
+    }
 }
 
 fn resolve_manual_continue_window_id(
     event: &ManualContinueExternalEvent,
     snapshot: Option<&WindowSnapshotPayload>,
 ) -> Option<i64> {
-    if let Some(window_id) = event.window_id.filter(|value| *value > 0) {
-        return Some(window_id);
-    }
     let expected_bundle = event
         .app_bundle_id
         .as_deref()
@@ -3880,20 +4029,52 @@ fn resolve_manual_continue_window_id(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let matches = snapshot?
+    let expected_app = event
+        .app_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidate_matches = |window: &WindowPayload| {
+        let is_smalltalk = window.bundle_id.as_deref() == Some(SMALLTALK_BUNDLE_ID)
+            || window
+                .owner_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"));
+        if is_smalltalk {
+            return false;
+        }
+        let app_matches = expected_bundle
+            .map(|bundle| window.bundle_id.as_deref() == Some(bundle))
+            .unwrap_or_else(|| {
+                expected_app.is_some_and(|app| {
+                    window
+                        .owner_name
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(app))
+                })
+            });
+        let title_matches = expected_title
+            .map(|title| {
+                window.window_title.as_deref().is_some_and(|actual| {
+                    manual_continue_window_titles_match(title, actual, expected_app)
+                })
+            })
+            .unwrap_or(true);
+        app_matches && title_matches
+    };
+    let snapshot = snapshot?;
+    if let Some(window_id) = event.window_id.filter(|value| *value > 0) {
+        return snapshot
+            .windows
+            .iter()
+            .find(|window| window.cg_window_id == Some(window_id) && candidate_matches(window))
+            .and_then(|window| window.cg_window_id);
+    }
+    let matches = snapshot
         .windows
         .iter()
         .filter(|window| window.is_onscreen.unwrap_or(false) && window.layer.unwrap_or(0) == 0)
-        .filter(|window| {
-            expected_bundle
-                .map(|bundle| window.bundle_id.as_deref() == Some(bundle))
-                .unwrap_or(true)
-        })
-        .filter(|window| {
-            expected_title
-                .map(|title| window.window_title.as_deref().map(str::trim) == Some(title))
-                .unwrap_or(true)
-        })
+        .filter(|window| candidate_matches(window))
         .filter_map(|window| window.cg_window_id.filter(|value| *value > 0))
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -3935,6 +4116,7 @@ fn capture_manual_continue_external_frame(
         false,
     )?;
     let context = AccessibilityContext {
+        app_pid: event.app_pid,
         app_bundle_id: event.app_bundle_id.clone(),
         app_name: event.app_name.clone(),
         window_id: target_window_id,
@@ -3944,6 +4126,7 @@ fn capture_manual_continue_external_frame(
     };
     let expectation = ManualContinueCaptureExpectation {
         app_bundle_id: event.app_bundle_id.clone(),
+        app_name: event.app_name.clone(),
         window_id: target_window_id,
     };
     let outcome = match capture_frame(
@@ -3994,7 +4177,17 @@ fn resolve_manual_continue_frame(
         return Ok(frame_id);
     }
     let event = event.ok_or_else(|| "manual_continue_recent_external_event_missing".to_string())?;
-    capture_manual_continue_external_frame(app, session_id, &event)
+    match capture_manual_continue_external_frame(app, session_id, &event) {
+        Ok(frame_id) => Ok(frame_id),
+        Err(capture_error) => {
+            if let Some(frame_id) =
+                recent_manual_continue_fallback_anchor(conn, session_id, &event, pressed_at_ms)?
+            {
+                return Ok(frame_id);
+            }
+            Err(capture_error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -4042,7 +4235,13 @@ pub fn get_continue_decision(
     // Screenshot capture must remain allowed while the preflight waits for the
     // exact persisted external frame. Only acquire the Continue permit after
     // that boundary is established or has failed closed.
-    let _continue_permit = crate::workload::governor().acquire(work_class)?;
+    let continue_permit_timeout = if work_class == crate::workload::WorkClass::ManualContinue {
+        MANUAL_CONTINUE_PERMIT_TIMEOUT
+    } else {
+        BACKGROUND_CONTINUE_PERMIT_TIMEOUT
+    };
+    let _continue_permit =
+        crate::workload::governor().acquire_with_timeout(work_class, continue_permit_timeout)?;
     let effective_mode = crate::continuation::effective_continue_decision_mode(
         request.mode.as_deref(),
         request.rebuild_layers.unwrap_or(false),
@@ -16701,6 +16900,18 @@ fn insert_system_capture_trigger(
     Ok(trigger.id)
 }
 
+fn recover_interrupted_capture_triggers(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE capture_triggers
+         SET status = 'failed',
+             error = COALESCE(error, 'capture_interrupted_before_completion')
+         WHERE status = 'scheduled'
+           AND ts_ms < ?1",
+        params![now_ms.saturating_sub(INTERRUPTED_CAPTURE_TRIGGER_GRACE_MS)],
+    )
+    .map_err(to_string)
+}
+
 fn insert_capture_trigger(
     conn: &Connection,
     session_id: &str,
@@ -17184,8 +17395,14 @@ fn capture_frame(
     previous_frame_id: Option<&str>,
     manual_continue_expectation: Option<&ManualContinueCaptureExpectation>,
 ) -> Result<CaptureOutcome, String> {
-    let _capture_permit =
-        crate::workload::governor().acquire(crate::workload::WorkClass::ScreenshotCapture)?;
+    let _capture_permit = if capture_trigger == "manual_continue_boundary" {
+        crate::workload::governor().acquire_with_timeout(
+            crate::workload::WorkClass::ScreenshotCapture,
+            MANUAL_CAPTURE_PERMIT_TIMEOUT,
+        )?
+    } else {
+        crate::workload::governor().acquire(crate::workload::WorkClass::ScreenshotCapture)?
+    };
     let paths = capture_paths(app)?;
     fs::create_dir_all(&paths.snapshot_dir).map_err(to_string)?;
     ensure_db(app)?;
@@ -17238,18 +17455,22 @@ fn capture_frame(
     }
 
     let window_snapshot = collect_window_snapshot(&paths).ok();
-    let mut active_window_id = context.window_id.or_else(|| {
-        window_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.active_window_id)
-    });
+    // A manual Continue request targets the last verified external surface.
+    // Once Smalltalk is frontmost, the current active window is Smalltalk and
+    // must never be substituted for a missing external target.
+    let mut active_window_id = resolve_capture_window_id(
+        context.window_id,
+        window_snapshot.as_ref(),
+        manual_continue_expectation.is_some(),
+    );
 
     let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
     let full_capture = capture_screenshot(&paths, &conn, &snapshot_path)?;
     let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
     let image_hash = stable_hash_bytes(&image_bytes);
     let image_dimensions = jpeg_dimensions(&image_bytes);
-    let active_window_capture = if let Some(window_id) = active_window_id {
+    let mut active_window_capture_error = None;
+    let mut active_window_capture = if let Some(window_id) = active_window_id {
         let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
         match capture_window_screenshot(
             &paths,
@@ -17259,7 +17480,10 @@ fn capture_frame(
             context.app_bundle_id.as_deref(),
         ) {
             Ok(capture) => Some((crop_path, capture)),
-            Err(_) => None,
+            Err(error) => {
+                active_window_capture_error = Some(error);
+                None
+            }
         }
     } else if let Some(expected_bundle) = manual_continue_expectation
         .and_then(|expected| expected.app_bundle_id.as_deref())
@@ -17278,15 +17502,27 @@ fn capture_frame(
                 active_window_id = capture.window_id;
                 Some((crop_path, capture))
             }
-            Err(_) => None,
+            Err(failure) => {
+                active_window_capture_error = Some(failure.message);
+                None
+            }
         }
     } else {
         None
     };
+    if let Some((_, capture)) = active_window_capture.as_mut() {
+        annotate_capture_with_window_owner(capture, window_snapshot.as_ref());
+    }
     if let Some(expectation) = manual_continue_expectation {
         let Some((crop_path, capture)) = active_window_capture.as_ref() else {
             let _ = fs::remove_file(&snapshot_path);
-            return Err("manual Continue external window capture unavailable".to_string());
+            return Err(active_window_capture_error
+                .map(|error| {
+                    format!("manual Continue external window capture unavailable: {error}")
+                })
+                .unwrap_or_else(|| {
+                    "manual Continue external window capture unavailable".to_string()
+                }));
         };
         if !manual_continue_capture_identity_matches(expectation, capture) {
             let _ = fs::remove_file(&snapshot_path);
@@ -17357,9 +17593,13 @@ fn capture_frame(
         }),
         window_id: active_window_id,
         app_pid: context.app_pid.or_else(|| {
-            window_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.active_app_pid)
+            if manual_continue_expectation.is_none() {
+                window_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.active_app_pid)
+            } else {
+                None
+            }
         }),
         app_bundle_id: context.app_bundle_id.clone().or_else(|| {
             window_snapshot
@@ -27290,6 +27530,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     crate::continuation::ensure_continue_schema(conn)?;
     ensure_default_exclusion_rules(conn)?;
     migrate_browser_privacy_policy_v1(conn)?;
+    migrate_manual_continue_capture_integrity_v1(conn)?;
     Ok(())
 }
 
@@ -27784,6 +28025,123 @@ fn migrate_browser_privacy_policy_v1(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn migrate_manual_continue_capture_integrity_v1(conn: &Connection) -> Result<(), String> {
+    const MIGRATION_KEY: &str = "manual_continue_capture_integrity_v1";
+    let already_applied = conn
+        .query_row(
+            "SELECT value FROM local_memory_maintenance WHERE key = ?1",
+            params![MIGRATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .as_deref()
+        == Some("complete");
+    if already_applied {
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT CAST(f.id AS TEXT)
+             FROM frames f
+             JOIN window_snapshots s ON CAST(s.frame_id AS TEXT) = CAST(f.id AS TEXT)
+             JOIN windows w ON w.window_snapshot_id = s.id
+                           AND w.cg_window_id = f.window_id
+             WHERE f.capture_trigger = 'manual_continue_boundary'
+               AND (lower(COALESCE(w.owner_name, '')) = 'smalltalk'
+                    OR w.bundle_id = ?1)
+               AND COALESCE(f.app_bundle_id, '') != ?1
+               AND lower(COALESCE(f.app_name, '')) != 'smalltalk'",
+        )
+        .map_err(to_string)?;
+    let frame_ids = stmt
+        .query_map(params![SMALLTALK_BUNDLE_ID], |row| row.get::<_, String>(0))
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    drop(stmt);
+
+    for frame_id in frame_ids {
+        conn.execute(
+            "UPDATE frames
+             SET privacy_status = 'diagnostic_self_misattributed'
+             WHERE CAST(id AS TEXT) = ?1",
+            params![frame_id],
+        )
+        .map_err(to_string)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO frame_quality_warnings (
+                id, frame_id, warning_type, severity, message, evidence_json, created_at_ms
+             ) VALUES (?1, ?2, 'manual_continue_identity_conflict', 'critical',
+                       'Manual Continue captured a Smalltalk-owned window with external app metadata.',
+                       ?3, ?4)",
+            params![
+                format!("quality-manual-identity-{frame_id}"),
+                frame_id,
+                serde_json::json!({
+                    "frame_id": frame_id,
+                    "disposition": "diagnostic_self_misattributed",
+                })
+                .to_string(),
+                now_millis(),
+            ],
+        )
+        .map_err(to_string)?;
+
+        if table_exists_in_capture(conn, "task_truth_v2_semantic_probe_runs")? {
+            let pattern = format!("%\"record_id\":\"{frame_id}\"%");
+            let mut decisions = conn
+                .prepare(
+                    "SELECT DISTINCT decision_id
+                     FROM task_truth_v2_semantic_probe_runs
+                     WHERE support_slot_map_json LIKE ?1",
+                )
+                .map_err(to_string)?
+                .query_map(params![pattern], |row| row.get::<_, String>(0))
+                .map_err(to_string)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(to_string)?;
+            decisions.sort();
+            decisions.dedup();
+            conn.execute(
+                "UPDATE task_truth_v2_semantic_probe_runs
+                 SET diagnostic_status = 'invalidated_identity_conflict',
+                     admitted_output_json = NULL,
+                     failure_reason = 'manual_continue_identity_conflict',
+                     validation_issues_json = '[\"manual_continue_identity_conflict\"]'
+                 WHERE support_slot_map_json LIKE ?1",
+                params![pattern],
+            )
+            .map_err(to_string)?;
+            if table_exists_in_capture(conn, "continue_decisions")? {
+                for decision_id in decisions {
+                    conn.execute(
+                        "UPDATE continue_decisions
+                         SET validation_status = 'identity_conflict_invalidated',
+                             work_truth_json = NULL,
+                             evidence_watermark_hash = NULL
+                         WHERE id = ?1",
+                        params![decision_id],
+                    )
+                    .map_err(to_string)?;
+                }
+            }
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO local_memory_maintenance (key, value, updated_at_ms)
+         VALUES (?1, 'complete', ?2)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at_ms = excluded.updated_at_ms",
+        params![MIGRATION_KEY, now_millis()],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
 fn capture_paths(app: &AppHandle) -> Result<CapturePaths, String> {
     let root_dir = app
         .path()
@@ -27902,7 +28260,11 @@ fn capture_core_graphics_in_process(
         provider: "core_graphics_in_process".into(),
         display_id: (mode != "active_window").then(|| CGDisplay::main().id.to_string()),
         window_id: target_window_id,
-        bundle_id: target_bundle_id.map(str::to_string),
+        // The requested bundle is not observed identity. The caller annotates
+        // this capture from the CGWindow snapshot before trusting it.
+        bundle_id: None,
+        owner_pid: None,
+        owner_name: None,
         width: Some(width),
         height: Some(height),
         filter_summary_json: serde_json::to_string(&serde_json::json!({
@@ -28031,9 +28393,8 @@ fn capture_window_screenshot(
 ) -> Result<ScreenshotCapture, String> {
     #[cfg(target_os = "macos")]
     {
-        let _ = paths;
         let started = Instant::now();
-        return match capture_core_graphics_in_process(
+        let core_graphics_error = match capture_core_graphics_in_process(
             "active_window",
             path,
             Some(window_id),
@@ -28049,7 +28410,7 @@ fn capture_window_screenshot(
                     HelperExitCategory::Success,
                     false,
                 )?;
-                Ok(capture)
+                return Ok(capture);
             }
             Err(error) => {
                 record_sck_operation(
@@ -28060,13 +28421,9 @@ fn capture_window_screenshot(
                     HelperExitCategory::LaunchFailure,
                     false,
                 )?;
-                Err(error)
+                error
             }
         };
-    }
-
-    #[allow(unreachable_code)]
-    if cfg!(target_os = "macos") {
         let decision = sck_provider_health()
             .lock()
             .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
@@ -28089,7 +28446,11 @@ fn capture_window_screenshot(
                 HelperExitCategory::CircuitBreakerSkip,
                 fallback_used,
             )?;
-            return fallback;
+            return fallback.map_err(|cli_error| {
+                format!(
+                    "Core Graphics active-window capture failed: {core_graphics_error}; ScreenCaptureKit was unavailable; screencapture fallback failed: {cli_error}"
+                )
+            });
         }
         match capture_sck_screenshot(
             paths,
@@ -28153,15 +28514,19 @@ fn capture_window_screenshot(
                 )?;
                 return fallback.map_err(|cli_error| {
                     format!(
-                        "ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
-                        failure.message, cli_error
+                        "Core Graphics active-window capture failed: {}; ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
+                        core_graphics_error, failure.message, cli_error
                     )
                 });
             }
         }
     }
 
-    capture_window_screenshot_cli(window_id, path)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (paths, conn, target_bundle_id);
+        capture_window_screenshot_cli(window_id, path)
+    }
 }
 
 fn capture_sck_screenshot(
@@ -28199,6 +28564,8 @@ fn capture_sck_screenshot(
             display_id: response.captured_display_id,
             window_id: response.captured_window_id,
             bundle_id: response.captured_bundle_id,
+            owner_pid: None,
+            owner_name: None,
             width: response.width,
             height: response.height,
             filter_summary_json: response.filter_summary_json,
@@ -28233,6 +28600,72 @@ fn capture_sck_screenshot(
         },
         duration_ms: execution.duration_ms,
         message,
+    })
+}
+
+fn run_command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    let started = Instant::now();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label} failed to start: {error}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Err(error) => {
+                wait_error = Some(error.to_string());
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if timed_out {
+        return Err(format!(
+            "{label} timed out after {} ms",
+            timeout.as_millis()
+        ));
+    }
+    if let Some(error) = wait_error {
+        return Err(format!("{label} failed while waiting: {error}"));
+    }
+    let status = status.ok_or_else(|| format!("{label} exited without a status"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -28335,13 +28768,19 @@ fn record_sck_operation(
 }
 
 fn capture_screenshot_cli(path: &Path) -> Result<ScreenshotCapture, String> {
-    let output = Command::new("/usr/sbin/screencapture")
-        .arg("-x")
-        .arg("-t")
-        .arg("jpg")
-        .arg(path)
-        .output()
-        .map_err(|error| format!("screencapture failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        Command::new("/usr/sbin/screencapture")
+            .arg("-x")
+            .arg("-t")
+            .arg("jpg")
+            .arg(path),
+        CAPTURE_HELPER_TIMEOUT,
+        "screencapture",
+    )
+    .map_err(|error| {
+        let _ = fs::remove_file(path);
+        error
+    })?;
 
     if output.status.success() && path.exists() {
         Ok(screenshot_capture_from_file("screencapture_cli", path))
@@ -28356,15 +28795,21 @@ fn capture_screenshot_cli(path: &Path) -> Result<ScreenshotCapture, String> {
 }
 
 fn capture_window_screenshot_cli(window_id: i64, path: &Path) -> Result<ScreenshotCapture, String> {
-    let output = Command::new("/usr/sbin/screencapture")
-        .arg("-x")
-        .arg("-t")
-        .arg("jpg")
-        .arg("-l")
-        .arg(window_id.to_string())
-        .arg(path)
-        .output()
-        .map_err(|error| format!("window screencapture failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        Command::new("/usr/sbin/screencapture")
+            .arg("-x")
+            .arg("-t")
+            .arg("jpg")
+            .arg("-l")
+            .arg(window_id.to_string())
+            .arg(path),
+        CAPTURE_HELPER_TIMEOUT,
+        "window screencapture",
+    )
+    .map_err(|error| {
+        let _ = fs::remove_file(path);
+        error
+    })?;
 
     if output.status.success() && path.exists() {
         let mut capture = screenshot_capture_from_file("screencapture_cli", path);
@@ -28455,9 +28900,11 @@ fn collect_window_snapshot(_paths: &CapturePaths) -> Result<WindowSnapshotPayloa
     }
 
     let helper_path = swift_helpers::resolve("window_snapshot")?;
-    let output = Command::new(helper_path)
-        .output()
-        .map_err(|error| format!("window snapshot helper failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        &mut Command::new(helper_path),
+        CAPTURE_HELPER_TIMEOUT,
+        "window snapshot helper",
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -28699,9 +29146,11 @@ fn collect_accessibility_context_native(
     }
 
     let helper_path = swift_helpers::resolve("accessibility_snapshot")?;
-    let output = Command::new(helper_path)
-        .output()
-        .map_err(|error| format!("accessibility helper failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        &mut Command::new(helper_path),
+        CAPTURE_HELPER_TIMEOUT,
+        "accessibility helper",
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut context = parse_accessibility_output(&stdout);
@@ -28721,10 +29170,13 @@ fn collect_accessibility_context_native(
 }
 
 fn collect_accessibility_context_applescript() -> AccessibilityContext {
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(ACCESSIBILITY_SCRIPT)
-        .output();
+    let output = run_command_output_with_timeout(
+        Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(ACCESSIBILITY_SCRIPT),
+        CAPTURE_HELPER_TIMEOUT,
+        "accessibility AppleScript",
+    );
 
     let output = match output {
         Ok(output) => output,
@@ -29005,10 +29457,11 @@ fn run_ocr(paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String>
 
 fn run_vision_ocr(_paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
     let helper_path = swift_helpers::resolve("vision_ocr")?;
-    let output = Command::new(&helper_path)
-        .arg(image_path)
-        .output()
-        .map_err(|error| format!("vision helper failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        Command::new(&helper_path).arg(image_path),
+        CAPTURE_HELPER_TIMEOUT,
+        "vision OCR helper",
+    )?;
     parse_vision_output(output, "AppleVision")
 }
 
@@ -29047,11 +29500,11 @@ fn parse_vision_output(output: std::process::Output, engine: &str) -> Result<Ocr
 }
 
 fn run_tesseract(image_path: &Path) -> Result<OcrOutput, String> {
-    let output = Command::new("tesseract")
-        .arg(image_path)
-        .arg("stdout")
-        .output()
-        .map_err(|error| format!("tesseract failed to start: {}", error))?;
+    let output = run_command_output_with_timeout(
+        Command::new("tesseract").arg(image_path).arg("stdout"),
+        CAPTURE_HELPER_TIMEOUT,
+        "tesseract",
+    )?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -29787,6 +30240,56 @@ mod tests {
     }
 
     #[test]
+    fn manual_continue_can_fall_back_to_a_recent_matching_external_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let readable_image = std::env::temp_dir().join(format!(
+            "smalltalk-manual-fallback-anchor-{}-helium.png",
+            std::process::id()
+        ));
+        fs::write(&readable_image, b"test-image").unwrap();
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, window_name, focused,
+               capture_trigger, created_at, app_bundle_id, privacy_status,
+               full_screenshot_path
+             ) VALUES ('session-a',950,?1,'Helium','Usage - OpenAI API',1,
+                       'surface_change',950,'net.imput.helium','normal',?1)",
+            params![readable_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let event = ManualContinueExternalEvent {
+            ts_ms: 1_000,
+            app_pid: Some(100),
+            app_bundle_id: Some("net.imput.helium".to_string()),
+            app_name: Some("Helium".to_string()),
+            window_id: None,
+            window_title: Some("Usage - OpenAI API - Helium".to_string()),
+        };
+
+        assert!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_100)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            recent_manual_continue_fallback_anchor(&conn, "session-a", &event, 1_100).unwrap(),
+            Some("1".to_string())
+        );
+
+        let different_page = ManualContinueExternalEvent {
+            window_title: Some("Logs - OpenAI API - Helium".to_string()),
+            ..event
+        };
+        assert!(
+            recent_manual_continue_fallback_anchor(&conn, "session-a", &different_page, 1_100)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_file(readable_image);
+    }
+
+    #[test]
     fn manual_continue_anchor_rejects_private_or_wrong_task_surface_frames() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -29832,6 +30335,7 @@ mod tests {
     fn manual_continue_target_capture_requires_exact_available_identity() {
         let exact = ManualContinueCaptureExpectation {
             app_bundle_id: Some("net.imput.helium".to_string()),
+            app_name: Some("Helium".to_string()),
             window_id: Some(42),
         };
         assert!(manual_continue_capture_identity_matches(
@@ -29854,7 +30358,8 @@ mod tests {
             &exact,
             &ScreenshotCapture {
                 window_id: Some(42),
-                bundle_id: Some("com.smalltalk.app".to_string()),
+                bundle_id: Some("net.imput.helium".to_string()),
+                owner_name: Some("smalltalk".to_string()),
                 ..ScreenshotCapture::default()
             }
         ));
@@ -29864,6 +30369,7 @@ mod tests {
     fn manual_continue_target_capture_supports_verified_bundle_when_window_id_is_missing() {
         let bundle_only = ManualContinueCaptureExpectation {
             app_bundle_id: Some("net.imput.helium".to_string()),
+            app_name: Some("Helium".to_string()),
             window_id: None,
         };
         assert!(manual_continue_capture_identity_matches(
@@ -29885,13 +30391,68 @@ mod tests {
     }
 
     #[test]
+    fn manual_continue_never_falls_back_to_the_current_smalltalk_window() {
+        let snapshot = WindowSnapshotPayload {
+            ts_ms: 1_100,
+            active_window_id: Some(7),
+            active_app_pid: Some(200),
+            active_app_bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+            screen_count: 1,
+            windows: Vec::new(),
+        };
+
+        assert_eq!(resolve_capture_window_id(None, Some(&snapshot), true), None);
+        assert_eq!(
+            resolve_capture_window_id(None, Some(&snapshot), false),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn observed_window_owner_overrides_requested_capture_identity() {
+        let snapshot = WindowSnapshotPayload {
+            ts_ms: 1_100,
+            active_window_id: Some(7),
+            active_app_pid: Some(200),
+            active_app_bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+            screen_count: 1,
+            windows: vec![WindowPayload {
+                cg_window_id: Some(7),
+                owner_pid: Some(200),
+                owner_name: Some("smalltalk".to_string()),
+                bundle_id: Some(SMALLTALK_BUNDLE_ID.to_string()),
+                window_title: Some("smalltalk".to_string()),
+                layer: Some(0),
+                alpha: Some(1.0),
+                is_onscreen: Some(true),
+                is_active: true,
+                bounds: None,
+                workspace: None,
+                raw: HashMap::new(),
+            }],
+        };
+        let mut capture = ScreenshotCapture {
+            window_id: Some(7),
+            bundle_id: Some("net.imput.helium".to_string()),
+            ..ScreenshotCapture::default()
+        };
+
+        annotate_capture_with_window_owner(&mut capture, Some(&snapshot));
+
+        assert_eq!(capture.bundle_id.as_deref(), Some(SMALLTALK_BUNDLE_ID));
+        assert_eq!(capture.owner_name.as_deref(), Some("smalltalk"));
+        assert_eq!(capture.owner_pid, Some(200));
+    }
+
+    #[test]
     fn manual_continue_resolves_unique_bundle_and_title_to_a_window_id() {
         let event = ManualContinueExternalEvent {
             ts_ms: 1_000,
+            app_pid: Some(100),
             app_bundle_id: Some("net.imput.helium".to_string()),
             app_name: Some("Helium".to_string()),
             window_id: None,
-            window_title: Some("Tool Annotations Charter".to_string()),
+            window_title: Some("Tool Annotations Charter - Helium".to_string()),
         };
         let snapshot = WindowSnapshotPayload {
             ts_ms: 1_100,
@@ -30410,6 +30971,57 @@ mod tests {
         ] {
             assert!(columns.contains(column), "missing typing_bursts.{column}");
         }
+    }
+
+    #[test]
+    fn startup_recovery_fails_only_abandoned_scheduled_capture_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO capture_triggers (
+                id, ts_ms, trigger_type, caused_by_event_ids, settle_delay_ms,
+                dedupe_policy, status
+             ) VALUES
+                ('abandoned', 1000, 'app_switch', '[]', 300, 'event_bucket', 'scheduled'),
+                ('recent', 15000, 'click', '[]', 300, 'event_bucket', 'scheduled'),
+                ('complete', 1000, 'surface_change', '[]', 300, 'event_bucket', 'captured');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_interrupted_capture_triggers(&conn, 40_000).unwrap(),
+            1
+        );
+        let abandoned: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error FROM capture_triggers WHERE id = 'abandoned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(abandoned.0, "failed");
+        assert_eq!(
+            abandoned.1.as_deref(),
+            Some("capture_interrupted_before_completion")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM capture_triggers WHERE id = 'recent'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "scheduled"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM capture_triggers WHERE id = 'complete'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "captured"
+        );
     }
 
     #[test]
@@ -38294,6 +38906,131 @@ mod tests {
     }
 
     #[test]
+    fn manual_continue_integrity_migration_quarantines_misattributed_self_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session = insert_numbered_test_session(&conn);
+        let frame_id = insert_resume_test_frame(
+            &conn,
+            &session.id,
+            "/tmp/manual-self-misattributed.jpg",
+            10,
+            "Helium",
+            "net.imput.helium",
+            "ChatGPT - smalltalk - Helium",
+            "",
+            "browser_tab",
+            "Smalltalk Continue result",
+            "phash-manual-self",
+            None,
+        );
+        conn.execute(
+            "UPDATE frames
+             SET capture_trigger = 'manual_continue_boundary', window_id = 7,
+                 privacy_status = 'normal'
+             WHERE id = ?1",
+            params![frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO window_snapshots (
+                id, frame_id, ts_ms, active_window_id, active_app_pid,
+                active_app_bundle_id, screen_count, raw_json
+             ) VALUES ('snapshot-poisoned', ?1, 11, 7, 200, NULL, 1, '{}')",
+            params![frame_id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO windows (
+                id, window_snapshot_id, cg_window_id, owner_pid, owner_name,
+                bundle_id, window_title, layer, alpha, is_onscreen, is_active,
+                bounds_x, bounds_y, bounds_w, bounds_h, workspace, raw_json
+             ) VALUES ('window-poisoned', 'snapshot-poisoned', 7, 200, 'smalltalk',
+                       NULL, 'smalltalk', 0, 1.0, 1, 1,
+                       0.0, 0.0, 800.0, 600.0, NULL, '{}')",
+            [],
+        )
+        .unwrap();
+        crate::continuation::task_truth_v2::semantic_probe::ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO task_truth_v2_semantic_probe_cases (
+                case_id, case_kind, held_back, expected_recorded_at_ms,
+                expected_json, created_at_ms
+             ) VALUES ('case-poisoned', 'production', 0, 10, '{}', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continue_decisions (
+                id, requested_at_ms, source, confidence, validation_status,
+                evidence_watermark_hash
+             ) VALUES ('decision-poisoned', 12, 'task_truth_v2', 0.9, 'valid', 'watermark')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_truth_v2_semantic_probe_runs (
+                run_id, case_id, decision_id, packet_id, model, diagnostic_status,
+                support_slot_map_json, admitted_output_json, validation_issues_json,
+                latency_ms, parsed_response, created_at_ms
+             ) VALUES ('run-poisoned', 'case-poisoned', 'decision-poisoned', 'packet-poisoned',
+                       'test-model', 'success', ?1, '{\"primary_task\":\"wrong\"}', '[]',
+                       1, 1, 12)",
+            params![format!(
+                "{{\"B1_IMAGE_AFTER\":{{\"record_id\":\"{frame_id}\"}}}}"
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM local_memory_maintenance
+             WHERE key = 'manual_continue_capture_integrity_v1'",
+            [],
+        )
+        .unwrap();
+
+        migrate_manual_continue_capture_integrity_v1(&conn).unwrap();
+        migrate_manual_continue_capture_integrity_v1(&conn).unwrap();
+
+        let status: String = conn
+            .query_row(
+                "SELECT privacy_status FROM frames WHERE id = ?1",
+                params![frame_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frame_quality_warnings
+                 WHERE frame_id = ?1 AND warning_type = 'manual_continue_identity_conflict'",
+                params![frame_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (run_status, admitted_output): (String, Option<String>) = conn
+            .query_row(
+                "SELECT diagnostic_status, admitted_output_json
+                 FROM task_truth_v2_semantic_probe_runs WHERE run_id = 'run-poisoned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (decision_status, watermark): (String, Option<String>) = conn
+            .query_row(
+                "SELECT validation_status, evidence_watermark_hash
+                 FROM continue_decisions WHERE id = 'decision-poisoned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "diagnostic_self_misattributed");
+        assert_eq!(warnings, 1);
+        assert_eq!(run_status, "invalidated_identity_conflict");
+        assert!(admitted_output.is_none());
+        assert_eq!(decision_status, "identity_conflict_invalidated");
+        assert!(watermark.is_none());
+    }
+
+    #[test]
     fn frame_consistency_warning_persists_for_browser_without_url() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -39509,6 +40246,33 @@ mod tests {
         let started = Instant::now();
         let result = run_sck_helper(&mut command, Duration::from_millis(40));
         assert_eq!(result.category, HelperExitCategory::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bounded_command_output_returns_completed_output() {
+        let output = run_command_output_with_timeout(
+            Command::new("/usr/bin/printf").arg("ready"),
+            Duration::from_secs(1),
+            "test helper",
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ready");
+    }
+
+    #[test]
+    fn bounded_command_output_kills_a_stuck_helper() {
+        let started = Instant::now();
+        let error = run_command_output_with_timeout(
+            Command::new("/bin/sleep").arg("5"),
+            Duration::from_millis(40),
+            "test helper",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "test helper timed out after 40 ms");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

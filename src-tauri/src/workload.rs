@@ -152,6 +152,22 @@ impl Drop for Permit<'_> {
 
 impl WorkloadGovernor {
     pub fn acquire(&self, class: WorkClass) -> Result<Permit<'_>, String> {
+        self.acquire_inner(class, None)
+    }
+
+    pub fn acquire_with_timeout(
+        &self,
+        class: WorkClass,
+        timeout: std::time::Duration,
+    ) -> Result<Permit<'_>, String> {
+        self.acquire_inner(class, Some(timeout))
+    }
+
+    fn acquire_inner(
+        &self,
+        class: WorkClass,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Permit<'_>, String> {
         let group = class.group();
         if group.is_none() {
             return Ok(Permit {
@@ -176,6 +192,7 @@ impl WorkloadGovernor {
             class,
             priority: class.priority(),
         });
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
             if state.shutting_down {
                 state.queue.retain(|w| w.id != id);
@@ -201,10 +218,34 @@ impl WorkloadGovernor {
                     failed: false,
                 });
             }
-            state = self
-                .changed
-                .wait(state)
-                .map_err(|_| "workload governor wait poisoned".to_string())?;
+            if let Some(deadline) = deadline {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    state.queue.retain(|w| w.id != id);
+                    state.cancelled_or_superseded += 1;
+                    return Err(format!(
+                        "workload governor timed out waiting for {}",
+                        format!("{class:?}").to_lowercase()
+                    ));
+                };
+                let (next_state, wait_result) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| "workload governor wait poisoned".to_string())?;
+                state = next_state;
+                if wait_result.timed_out() {
+                    state.queue.retain(|w| w.id != id);
+                    state.cancelled_or_superseded += 1;
+                    return Err(format!(
+                        "workload governor timed out waiting for {}",
+                        format!("{class:?}").to_lowercase()
+                    ));
+                }
+            } else {
+                state = self
+                    .changed
+                    .wait(state)
+                    .map_err(|_| "workload governor wait poisoned".to_string())?;
+            }
         }
     }
 
@@ -263,9 +304,13 @@ fn allowed_with_active(active: &BTreeMap<Group, WorkClass>, class: WorkClass) ->
         return false;
     }
     match class {
-        WorkClass::ManualContinue | WorkClass::IslandRefresh => {
-            !active.contains_key(&Group::Capture)
-        }
+        // Manual Continue establishes its capture boundary before it asks for
+        // this permit. If a background capture is still winding down, the
+        // decision can safely read the last committed SQLite snapshot while
+        // that capture finishes. New capture work remains blocked once Manual
+        // Continue owns the Continue group.
+        WorkClass::ManualContinue => true,
+        WorkClass::IslandRefresh => !active.contains_key(&Group::Capture),
         WorkClass::BackgroundContinue => {
             !active.contains_key(&Group::Capture)
                 && !active.contains_key(&Group::Audit)
@@ -364,5 +409,39 @@ mod tests {
         let g = WorkloadGovernor::default();
         g.shutdown();
         assert!(g.acquire(WorkClass::BackgroundContinue).is_err());
+    }
+
+    #[test]
+    fn timed_acquire_removes_a_waiter_instead_of_waiting_forever() {
+        let g = WorkloadGovernor::default();
+        let _held = g.acquire(WorkClass::BackgroundContinue).unwrap();
+
+        let error = g
+            .acquire_with_timeout(WorkClass::ManualContinue, Duration::from_millis(10))
+            .err()
+            .expect("manual Continue should time out");
+
+        assert_eq!(
+            error,
+            "workload governor timed out waiting for manualcontinue"
+        );
+        assert_eq!(g.diagnostics().queued_operation_count, 0);
+        assert_eq!(g.diagnostics().cancelled_or_superseded_requests, 1);
+    }
+
+    #[test]
+    fn manual_continue_can_use_committed_evidence_while_background_capture_finishes() {
+        let g = WorkloadGovernor::default();
+        let _capture = g.acquire(WorkClass::ScreenshotCapture).unwrap();
+
+        let manual = g
+            .acquire_with_timeout(WorkClass::ManualContinue, Duration::from_millis(10))
+            .expect("manual Continue should not wait behind an active capture");
+
+        assert_eq!(
+            g.diagnostics().active_operations,
+            vec!["manualcontinue", "screenshotcapture"]
+        );
+        drop(manual);
     }
 }

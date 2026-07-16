@@ -844,6 +844,16 @@ struct PersistedCorrectionProjection {
     current_frame_id: String,
     cutoff_observed_at_ms: i64,
 }
+
+/// A semantic probe can reject one unsupported field while still preserving
+/// the other fields that passed local evidence admission. Only these two run
+/// states are allowed to project the persisted admitted output. Transport,
+/// parse, privacy, human-rejection, and maintenance-invalidation states remain
+/// categorically ineligible even if a stale JSON value is present.
+fn probe_status_allows_admitted_output(status: &str) -> bool {
+    matches!(status, "success" | "support_slot_validation_failure")
+}
+
 #[allow(clippy::type_complexity)]
 fn pftu_probe_public_result(
     conn: &Connection,
@@ -921,9 +931,21 @@ fn pftu_probe_public_result(
         .and_then(|raw| serde_json::from_str::<super::semantic_probe::ProbeRequestAudit>(raw).ok());
     let validation_issues =
         serde_json::from_str::<Vec<String>>(&validation_issues_json).unwrap_or_default();
-    let output = admitted_output_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<super::semantic_probe::ProbeModelOutput>(raw).ok());
+    let primary_task_rejected = validation_issues
+        .iter()
+        .any(|issue| issue.starts_with("primary_task:"));
+    let output = probe_status_allows_admitted_output(&diagnostic_status)
+        .then(|| {
+            admitted_output_json.as_deref().and_then(|raw| {
+                serde_json::from_str::<super::semantic_probe::ProbeModelOutput>(raw).ok()
+            })
+        })
+        .flatten()
+        // A task answer is atomic at the product surface. Field-local
+        // validation may preserve diagnostic facts, but if the primary task
+        // itself was rejected those facts must not be projected as a public
+        // continuation state or semantic visit roles.
+        .filter(|_| !primary_task_rejected);
     let slots = support_slot_map_json
         .as_deref()
         .and_then(|raw| {
@@ -1457,18 +1479,44 @@ fn visible_legacy_model_answer(
 fn typed_unresolved_answer(
     session_id: Option<&str>,
     diagnostic: Option<&TaskTruthInferenceDiagnosticV1>,
+    boundary_snapshot: Option<&TaskSnapshotV2>,
+    boundary_packet_id: Option<&str>,
 ) -> TaskTruthPublicAnswerV1 {
     let inference_status = diagnostic
         .map(|diagnostic| diagnostic.status.clone())
         .unwrap_or_else(|| "no_verified_snapshot".into());
+    let observation_packet_id = boundary_packet_id
+        .or_else(|| boundary_snapshot.map(|snapshot| snapshot.packet_id.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let task_snapshot_id = boundary_snapshot
+        .map(|snapshot| snapshot.snapshot_id.clone())
+        .unwrap_or_default();
+    let snapshot_revision = boundary_snapshot
+        .map(|snapshot| snapshot.revision)
+        .unwrap_or_default();
+    let evidence_watermark = boundary_snapshot
+        .map(|snapshot| snapshot.evidence_watermark.clone())
+        .unwrap_or_default();
     TaskTruthPublicAnswerV1 {
         inference_status,
         provider_name: diagnostic.map(|diagnostic| diagnostic.provider.clone()),
         provider_model: diagnostic.map(|diagnostic| diagnostic.model.clone()),
         request_id: diagnostic.and_then(|diagnostic| diagnostic.request_id.clone()),
         response_id: diagnostic.and_then(|diagnostic| diagnostic.response_id.clone()),
+        snapshot_id: task_snapshot_id.clone(),
+        snapshot_revision,
+        evidence_watermark: evidence_watermark.clone(),
         atomic_identity: TaskTruthAtomicIdentityV1 {
-            session_id: session_id.map(str::to_string),
+            session_id: boundary_snapshot
+                .and_then(|snapshot| snapshot.session_id.clone())
+                .or_else(|| session_id.map(str::to_string)),
+            task_snapshot_id,
+            snapshot_revision,
+            model_request_id: diagnostic.and_then(|diagnostic| diagnostic.request_id.clone()),
+            model_response_id: diagnostic.and_then(|diagnostic| diagnostic.response_id.clone()),
+            observation_packet_id,
+            evidence_watermark,
             ..Default::default()
         },
         ..Default::default()
@@ -2053,6 +2101,8 @@ pub(crate) fn production_decision_for_attempt(
         answer = Some(typed_unresolved_answer(
             session_id,
             inference_diagnostic.as_ref(),
+            answer_snapshot,
+            diagnostic_packet_id,
         ));
     }
     let release_report_fingerprint = release_report_identity(release_gate_source.as_deref());
@@ -2504,17 +2554,57 @@ mod tests {
             Some("decision-attempt"),
         )
         .unwrap();
-        let answer = decision.answer.unwrap();
+        persist_decision_contract(&conn, "decision-attempt", &decision).unwrap();
+        let answer = decision.answer.as_ref().unwrap();
         assert_eq!(answer.task_resolution_status, "unresolved");
         assert!(answer.task_summary.is_none());
-        assert_eq!(answer.atomic_identity.observation_packet_id, "");
+        assert_eq!(
+            answer.atomic_identity.observation_packet_id,
+            "packet-feedback"
+        );
+        assert_eq!(answer.atomic_identity.task_snapshot_id, "snapshot-attempt");
+        assert_eq!(answer.atomic_identity.snapshot_revision, 3);
+        assert_eq!(
+            answer.atomic_identity.evidence_watermark,
+            packet.evidence_watermark
+        );
+        assert_eq!(
+            answer.atomic_identity.model_request_id.as_deref(),
+            Some("request-attempt")
+        );
+        assert_eq!(
+            answer.atomic_identity.model_response_id.as_deref(),
+            Some("response-attempt")
+        );
         assert!(decision
             .reason_codes
             .iter()
             .any(|reason| reason == "typed_unresolved_model_first_answer"));
-        let diagnostic = decision.inference_diagnostic.unwrap();
+        let diagnostic = decision.inference_diagnostic.as_ref().unwrap();
         assert_eq!(diagnostic.provider, "openai");
         assert_eq!(diagnostic.response_id.as_deref(), Some("response-attempt"));
+        let persisted_identity = conn
+            .query_row(
+                "SELECT observation_packet_id, snapshot_id, snapshot_revision,
+                        model_request_id, model_response_id
+                 FROM task_truth_v2_decision_contracts WHERE decision_id=?1",
+                params!["decision-attempt"],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(persisted_identity.0.as_deref(), Some("packet-feedback"));
+        assert_eq!(persisted_identity.1.as_deref(), Some("snapshot-attempt"));
+        assert_eq!(persisted_identity.2, Some(3));
+        assert_eq!(persisted_identity.3.as_deref(), Some("request-attempt"));
+        assert_eq!(persisted_identity.4.as_deref(), Some("response-attempt"));
     }
 
     #[test]
@@ -3521,6 +3611,131 @@ mod tests {
             .reason_codes
             .iter()
             .any(|reason| reason == "pftu_model_answer_routed_to_public_contract"));
+
+        // A non-primary unsupported field remains field-local. Keep the task
+        // and the other admitted fields visible.
+        let mut field_limited_output = output.clone();
+        field_limited_output.current_step = None;
+        field_limited_output.status =
+            super::super::semantic_probe::ProbeResolutionStatus::PartlyResolved;
+        conn.execute(
+            "UPDATE task_truth_v2_semantic_probe_runs
+             SET diagnostic_status='support_slot_validation_failure',
+                 admitted_output_json=?2,
+                 validation_issues_json='[\"current_step:unsupported\"]'
+             WHERE decision_id=?1",
+            params![
+                "decision-visible",
+                serde_json::to_string(&field_limited_output).unwrap()
+            ],
+        )
+        .unwrap();
+        let field_limited = pftu_probe_public_result(&conn, "decision-visible")
+            .unwrap()
+            .expect("field-limited result")
+            .answer
+            .expect("supported fields must remain public");
+        assert_eq!(field_limited.task_resolution_status, "partial");
+        assert_eq!(
+            field_limited.task_summary.as_deref(),
+            Some("Fix Continue so GPT answers stay visible")
+        );
+        assert!(field_limited.current_subtask.is_none());
+        assert_eq!(
+            field_limited.last_meaningful_progress.as_deref(),
+            Some("The paid provider response was parsed")
+        );
+        assert_eq!(
+            field_limited.unfinished_state.as_deref(),
+            Some("React and the island still need the same answer")
+        );
+        assert_eq!(
+            field_limited.inference_status,
+            "model_answer_visible_with_validation_limits"
+        );
+        let field_limited_decision = production_decision_for_attempt(
+            &conn,
+            Some("session-visible"),
+            true,
+            Some("decision-visible"),
+        )
+        .expect("project field-limited output through the production decision");
+        let field_limited_public = field_limited_decision
+            .answer
+            .expect("production must preserve the supported fields");
+        assert_eq!(field_limited_public.task_resolution_status, "partial");
+        assert_eq!(
+            field_limited_public.task_summary.as_deref(),
+            Some("Fix Continue so GPT answers stay visible")
+        );
+        assert!(field_limited_public.current_subtask.is_none());
+        assert_eq!(
+            field_limited_public.last_meaningful_progress.as_deref(),
+            Some("The paid provider response was parsed")
+        );
+        assert_eq!(
+            field_limited_public.unfinished_state.as_deref(),
+            Some("React and the island still need the same answer")
+        );
+
+        // The primary task is the anchor for every public continuation field.
+        // If that field is rejected, diagnostic fragments and visit roles must
+        // not reconstruct the same bad task on the product surface.
+        let mut primary_rejected_output = output.clone();
+        primary_rejected_output.primary_task = None;
+        primary_rejected_output.status =
+            super::super::semantic_probe::ProbeResolutionStatus::Unresolved;
+        conn.execute(
+            "UPDATE task_truth_v2_semantic_probe_runs
+             SET diagnostic_status='support_slot_validation_failure',
+                 admitted_output_json=?2,
+                 validation_issues_json='[\"primary_task:passive_evidence_cannot_establish_primary_task\"]'
+             WHERE decision_id=?1",
+            params![
+                "decision-visible",
+                serde_json::to_string(&primary_rejected_output).unwrap()
+            ],
+        )
+        .unwrap();
+        let primary_rejected = pftu_probe_public_result(&conn, "decision-visible")
+            .unwrap()
+            .expect("rejected task remains diagnostically inspectable")
+            .answer
+            .expect("factual timeline remains public");
+        assert_eq!(primary_rejected.task_resolution_status, "unresolved");
+        assert!(primary_rejected.task_summary.is_none());
+        assert!(primary_rejected.current_subtask.is_none());
+        assert!(primary_rejected.last_meaningful_progress.is_none());
+        assert!(primary_rejected.unfinished_state.is_none());
+        assert!(primary_rejected
+            .recent_context
+            .iter()
+            .all(|visit| visit.semantic_role.is_none()));
+
+        // Maintenance invalidation is categorically different from a
+        // field-local rejection. A stale admitted JSON value must not leak
+        // after the packet identity has been invalidated.
+        conn.execute(
+            "UPDATE task_truth_v2_semantic_probe_runs
+             SET diagnostic_status='invalidated_identity_conflict'
+             WHERE decision_id=?1",
+            ["decision-visible"],
+        )
+        .unwrap();
+        let invalidated = pftu_probe_public_result(&conn, "decision-visible")
+            .unwrap()
+            .expect("invalidated diagnostic remains inspectable");
+        let invalidated_answer = invalidated
+            .answer
+            .expect("factual timeline remains inspectable");
+        assert_eq!(
+            invalidated.diagnostic.status,
+            "invalidated_identity_conflict"
+        );
+        assert_eq!(invalidated_answer.task_resolution_status, "unresolved");
+        assert!(invalidated_answer.current_subtask.is_none());
+        assert!(invalidated_answer.last_meaningful_progress.is_none());
+        assert!(invalidated_answer.unfinished_state.is_none());
     }
 
     #[test]

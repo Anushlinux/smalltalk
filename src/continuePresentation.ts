@@ -215,15 +215,15 @@ export type ContinueAdoptionComparison = {
   reasonCodes: string[];
 };
 
-export const NO_CLEAR_CURRENT_TASK_HEADLINE = "The exact task could not be determined";
+export const NO_CLEAR_CURRENT_TASK_HEADLINE = "I couldn't determine where to resume";
 
 export const NO_CLEAR_CURRENT_TASK_COPY = {
-  heroLabel: "Recent activity was captured",
-  targetBlockLabel: "Evidence available",
-  targetLine: "Recent activity is available to inspect",
-  targetMeta: "The current evidence does not support one exact task or return location.",
-  lastStateLine: "No current task state is supported by the available evidence.",
-  nextActionLine: "Inspect the recent evidence or keep working until the task becomes clear.",
+  heroLabel: "No safe continuation yet",
+  targetBlockLabel: "What to do",
+  targetLine: "Return to the work you want to continue, then try Continue again",
+  targetMeta: "Smalltalk did not find a verified page, conversation, or file to reopen.",
+  lastStateLine: "Your recent activity did not establish one safe continuation point.",
+  nextActionLine: "Keep the work surface visible briefly before trying again.",
   uncertaintyLine:
     "Smalltalk will not turn older activity into a current task without supporting evidence.",
 } as const;
@@ -579,11 +579,11 @@ export function getContinuePresentationActionState(
 }
 
 export function inspectTargetCopy(input: InspectTargetCopyInput) {
-  const targetLine = input.evidencePreviewAvailable
-    ? "Captured evidence is available to inspect"
+  const targetLine = input.taskKnown
+    ? "The task is understood, but no exact return point is ready"
     : input.appFocusOnly
       ? "The app is known, but the exact page, conversation, or file is unavailable"
-      : "No direct page or file locator is available";
+      : "No exact return point is ready";
   const targetMeta = input.targetNote?.trim() || (
     input.taskKnown
       ? "I know the task, but I do not have a direct page or file locator."
@@ -593,7 +593,7 @@ export function inspectTargetCopy(input: InspectTargetCopyInput) {
     targetBlockLabel: "Exact location unavailable",
     targetLine,
     targetMeta,
-    actionLabel: "Inspect evidence" as const,
+    actionLabel: "Try Continue again" as const,
   };
 }
 
