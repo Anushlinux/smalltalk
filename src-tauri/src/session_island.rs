@@ -1927,7 +1927,7 @@ fn stop_capture_from_island() {
 
     thread::spawn(move || {
         let state = app.state::<crate::capture::CaptureState>();
-        match crate::capture::stop_capture(app.clone(), state) {
+        match crate::capture::stop_capture_impl(app.clone(), state.inner()) {
             Ok(output) => {
                 let _ = app.emit("capture-status", output.status.clone());
             }

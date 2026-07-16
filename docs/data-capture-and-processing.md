@@ -21,7 +21,7 @@ The native capture system is controlled through Tauri commands exposed from `src
 
 ### Capture Triggers
 
-When background capture starts, the worker immediately attempts an initial manual capture. After that, it listens for native UI events and falls back to periodic idle capture.
+When background capture starts, the worker immediately attempts a `session_start` capture. After that, it listens for native UI events and falls back to a 120-second idle capture.
 
 The trigger priority is:
 
@@ -36,24 +36,20 @@ Native events are produced by the Swift helper embedded from `src-tauri/scripts/
 | `app_switch` | `app_switch` | 300 ms |
 | `window_focus` | `window_focus` | 300 ms |
 | `accessibility_change` | `accessibility_change` | 300 ms |
-| `click` | `click` | 200 ms |
-| `key_down` | `typing_pause` | 500 ms |
-| `scroll` | `scroll_stop` | 400 ms |
-| `clipboard` | `clipboard` | 200 ms |
+| `click` | `click` | 220 ms |
+| `key_down` | `typing_pause` | 850 ms |
+| `scroll` | `scroll_stop` | 500 ms |
+| `clipboard` | `clipboard` | 220 ms |
 
 Only one pending event trigger is kept at a time. A newer trigger replaces the previous pending trigger before capture. Captures are also rate-limited by `MIN_CAPTURE_INTERVAL`, so frequent UI events collapse into fewer stored frames.
 
 ### Screenshot Capture
 
-Every native frame starts with a screenshot. The app calls macOS `screencapture` directly:
+Every native frame starts with an isolated ScreenCaptureKit one-shot sidecar request. Screen-image acquisition never runs inside the Tauri process. The image is written under the app capture data directory, grouped by day, and hashes into `image_hash` for deduplication.
 
-```text
-/usr/sbin/screencapture -x -t jpg <snapshot_path>
-```
+For active-window evidence, the sidecar validates the current window and its display intersection, captures the display, and crops using `SCStreamConfiguration.sourceRect`. It does not use the crash-prone desktop-independent-window filter. `/usr/sbin/screencapture` is retained only as a bounded fallback, and stored provider metadata says `screencapture_cli` when that fallback produced the image.
 
-The image is written under the app capture data directory, grouped by day. The screenshot file name uses the capture timestamp and ends in `_main.jpg`. After writing, Smalltalk hashes the screenshot bytes into `image_hash`; this hash is used for deduplication.
-
-If `screencapture` fails, the capture fails with a message that usually points to missing Screen Recording permission.
+All screenshot, Accessibility, window-snapshot, Vision, Tesseract, and AppleScript processes use the same bounded runner. Timeout or Stop kills the full helper process group and reaps the child before returning.
 
 ### Accessibility Capture
 
@@ -124,7 +120,8 @@ Native capture data is stored under the app local data directory in a `capture` 
 
 - `snapshots/`: day-bucketed screenshot JPG files.
 - `smalltalk-capture.sqlite`: SQLite database.
-- `helpers/`: generated Swift helper source/binaries for Accessibility, OCR, and event capture.
+- Development helpers: stable binaries under `src-tauri/target/<profile>/smalltalk-capture-sidecars/`.
+- Packaged helpers: signed sidecars under the application bundle's `Contents/MacOS` directory.
 
 The SQLite database stores:
 
@@ -338,3 +335,17 @@ The native Tauri capture store is local: screenshots, Accessibility text, OCR te
 The browser extension keeps raw session evidence in browser extension storage. OpenAI does not receive the raw extension store. It receives only the compact, sanitized dossier through the local proxy at `http://localhost:8787/api/resume`.
 
 The OpenAI API key lives in the local proxy environment, not in the browser extension. If the proxy or API key is unavailable, the extension reports an error instead of pretending an AI resume card was generated.
+
+## Native bounded runtime pipeline
+
+The native MVP does not use the browser-extension pipeline described above. `capture_events.swift` emits privacy-safe event metadata into a Rust transport with three finite lanes: 64 high-value slots, 96 normal slots, and 160 coalescible pressure slots. Low-value traffic cannot occupy the high-value reservation.
+
+Swift collapses native scroll and Accessibility callback floods. Rust applies the authoritative transport policy for scroll, Accessibility changes, repeated keys, ordinary character-category keys, and repeated clicks. Both layers use the same 650 millisecond scroll window and 900 or 1,800 millisecond Accessibility windows. Rust adds aggregate count and first/last timestamps without adding typed characters.
+
+The capture loop receives one event, drains at most 31 more events or 12 milliseconds of queue work, and persists the batch in one short transaction. A continuously busy producer therefore yields to cancellation, pending capture settlement, and the 120-second idle boundary. SQLite busy waits are capped and retries are finite.
+
+Schema initialization is generation-aware. Startup, reset, database replacement, and path changes are initialization boundaries. Ordinary event, frame, status, and Continue paths do not run schema creation or migration. The capture worker owns one event-ingest connection for its generation.
+
+Pending capture triggers retain at most 128 causal event identifiers. When more events contribute, the trigger stores total, retained, and omitted counts using `smalltalk.capture_trigger_causal_aggregation.v1`. High-value events remain protected by retention policy. This prevents a long typing or interaction burst from becoming an unbounded in-memory or SQLite JSON array.
+
+See `docs/runtime-stability-harness.md` for measurement commands and `docs/runtime-stability-policy-v1.json` for release thresholds.

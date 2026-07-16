@@ -10,6 +10,7 @@ import {
   inspectTargetCopy,
   isTaskInferenceUnavailable,
   recentContextForPresentation,
+  recentContextRoleLabel,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
@@ -272,6 +273,14 @@ test("recent context remains visible for resolved, partial, and unresolved answe
     assert.equal(visible[0].sequence_index, 1);
     assert.equal(visible[1].app_label, "Private activity");
   }
+});
+
+test("recent context roles use concise user-facing labels", () => {
+  assert.equal(recentContextRoleLabel("primary_work"), "Primary work");
+  assert.equal(recentContextRoleLabel("supporting_work"), "Supporting work");
+  assert.equal(recentContextRoleLabel("detour_or_unrelated"), "Detour or unrelated");
+  assert.equal(recentContextRoleLabel("unclear"), "Relationship unclear");
+  assert.equal(recentContextRoleLabel(null), null);
 });
 
 test("field-limited model output remains visible instead of becoming the default state", () => {

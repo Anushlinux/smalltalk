@@ -8,10 +8,14 @@ mod workload;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            capture::initialize_runtime_database(app.handle()).map_err(std::io::Error::other)?;
+            session_island::init_session_island(app.handle().clone());
+            capture::start_runtime_soak_harness(app.handle().clone())
+                .map_err(std::io::Error::other)?;
             #[cfg(debug_assertions)]
             eprintln!(
                 "[pftu_dev] model={} probe_enabled={} case={}",
@@ -21,7 +25,6 @@ pub fn run() {
                     .as_deref()
                     .unwrap_or("none")
             );
-            session_island::init_session_island(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -84,8 +87,33 @@ pub fn run() {
             capture::list_exclusion_rules,
             capture::delete_recent_captures,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.run(move |app, event| match event {
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            use std::sync::atomic::Ordering;
+
+            // The first exit request is converted into bounded asynchronous
+            // capture shutdown. The second request is issued by `exit` after
+            // cleanup and is allowed through without blocking the UI thread.
+            if !shutdown_started.swap(true, Ordering::AcqRel) {
+                api.prevent_exit();
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    capture::shutdown_audit_executor();
+                    workload::shutdown();
+                    if let Err(error) = capture::shutdown_capture(&app) {
+                        eprintln!("[capture] bounded shutdown reported: {error}");
+                    }
+                    app.exit(code.unwrap_or(0));
+                });
+            }
+        }
+        tauri::RunEvent::Exit => session_island::shutdown_session_island(),
+        _ => {}
+    });
 }
 
 /// Public, side-effect-bounded entry point used by the repository accuracy CLI.

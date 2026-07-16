@@ -22,6 +22,7 @@ src-tauri/binaries/*-apple-darwin
 
 reference/
 
+output/
 
 
 cloud_resume_exports/

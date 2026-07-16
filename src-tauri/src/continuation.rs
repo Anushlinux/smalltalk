@@ -62,7 +62,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
-pub const CONTINUE_SCHEMA_VERSION: i64 = 9;
+pub const CONTINUE_SCHEMA_VERSION: i64 = 10;
 
 const FEEDBACK_INFERENCE_MIN_AGE_MS: i64 = 2 * 60 * 1000;
 const FEEDBACK_ACCEPTED_MIN_DWELL_MS: i64 = 30 * 1000;
@@ -4367,7 +4367,7 @@ fn latest_evidence_session_id(conn: &Connection) -> Result<Option<String>, Strin
 }
 
 fn continue_decision_id_for_request(
-    decision_watermark: i64,
+    evidence_identity: &str,
     selected_candidate_id: Option<&str>,
     current_focus_frame_id: Option<&str>,
     validation_status: &str,
@@ -4378,7 +4378,7 @@ fn continue_decision_id_for_request(
         stable_hash(
             format!(
                 "{}:{}:{}:{}:{}",
-                decision_watermark,
+                evidence_identity,
                 selected_candidate_id.unwrap_or("none"),
                 current_focus_frame_id.unwrap_or("none"),
                 validation_status,
@@ -5679,18 +5679,12 @@ pub fn get_continue_decision(
     }
     continue_dossier.stale_target_suppression = Some(stale_target_suppression.clone());
     continue_dossier.active_current_work_unresolved = active_current_work_unresolved.clone();
-    let decision_watermark = Some(evidence_freshness_ledger.decision_watermark_ms)
-        .or(current_watermark
-            .latest_semantic_moment_at_ms
-            .or(current_watermark.latest_frame_at_ms)
-            .or(current_watermark.latest_ui_event_at_ms))
-        .unwrap_or(requested_at_ms);
     let decision_id = cached_meta
         .as_ref()
         .map(|cached| cached.decision_id.clone())
         .unwrap_or_else(|| {
             continue_decision_id_for_request(
-                decision_watermark,
+                &current_watermark.hash,
                 selected.as_ref().map(|candidate| candidate.id.as_str()),
                 current_focus.as_ref().map(|focus| focus.frame_id.as_str()),
                 &validation_status,
@@ -10264,8 +10258,11 @@ fn build_continue_evidence_watermark(
         "latest_material_evidence_probe_id": latest_evidence_probe_id,
         "latest_material_evidence_probe_at_ms": latest_evidence_probe_at_ms,
         "latest_boundary_revision": latest_boundary_revision,
-        "latest_memory_cell_at_ms": latest_memory_cell_at_ms,
-        "latest_memory_edge_at_ms": latest_memory_edge_at_ms,
+        // Memory cells and edges are derived from Continue decisions. Including
+        // their write timestamps here makes a decision invalidate its own
+        // cache identity and creates one new decision on every startup.
+        // Feedback, observations, task actions, and semantic graph material
+        // remain independent invalidators.
         "latest_surface_snapshot_id": latest_surface_snapshot_id,
         "latest_surface_snapshot_at_ms": latest_surface_snapshot_at_ms,
         "latest_app_activity_segment_id": latest_app_activity_segment_id,
@@ -22866,6 +22863,12 @@ fn infer_feedback_for_decision(
                 Some(open_event.source.as_str()),
             )
             .map(Some);
+        }
+        if target_artifact_id.is_none() {
+            // A no-clear Continue with no target cannot be meaningfully
+            // "ignored". Writing inferred negative feedback here creates a
+            // self-sustaining startup loop even when no user evidence changed.
+            return Ok(None);
         }
         return insert_feedback_event(
             conn,
@@ -39693,6 +39696,23 @@ fn current_time_millis() -> i64 {
 }
 
 pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
+    let schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .map_err(to_string)?;
+    let expected_marker = format!("continue_runtime_schema_version_{schema_version}");
+    let schema_is_current = conn
+        .query_row(
+            "SELECT name FROM continue_schema_migrations WHERE version = 10",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|marker| marker.as_deref() == Some(expected_marker.as_str()))
+        .unwrap_or(false);
+    if schema_is_current {
+        return Ok(());
+    }
+
     ensure_weak_surface_enrichment_schema(conn)?;
     conn.execute_batch(
         "
@@ -41214,6 +41234,21 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     task_turn_evidence::ensure_task_turn_evidence_schema(conn)?;
     task_turn::ensure_task_turn_schema(conn)?;
     task_truth_v2::ensure_shadow_schema(conn)?;
+    let initialized_schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .map_err(to_string)?;
+    conn.execute(
+        "INSERT INTO continue_schema_migrations (version, name, applied_at_ms)
+         VALUES (10, ?1, ?2)
+         ON CONFLICT(version) DO UPDATE SET
+           name = excluded.name,
+           applied_at_ms = excluded.applied_at_ms",
+        params![
+            format!("continue_runtime_schema_version_{initialized_schema_version}"),
+            current_time_millis()
+        ],
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
@@ -41431,32 +41466,90 @@ mod tests {
     use rusqlite::params;
 
     #[test]
+    fn initialized_continue_schema_is_query_only_until_schema_generation_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let initialized_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let initialized_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        ensure_continue_schema(&conn).unwrap();
+
+        let repeated_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let repeated_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repeated_version, initialized_version);
+        assert_eq!(repeated_marker, initialized_marker);
+
+        conn.execute_batch("CREATE TABLE external_schema_change (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let refreshed_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let refreshed_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(refreshed_version > repeated_version);
+        assert_eq!(
+            refreshed_marker,
+            format!("continue_runtime_schema_version_{refreshed_version}")
+        );
+    }
+
+    #[test]
     fn manual_continue_attempts_never_reuse_a_cached_decision_identity() {
         let normal_a = continue_decision_id_for_request(
-            100,
+            "watermark-a",
             Some("candidate"),
             Some("frame"),
             "supported",
             None,
         );
         let normal_b = continue_decision_id_for_request(
-            100,
+            "watermark-a",
             Some("candidate"),
             Some("frame"),
             "supported",
             None,
         );
         assert_eq!(normal_a, normal_b);
+        let normal_changed = continue_decision_id_for_request(
+            "watermark-b",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        assert_ne!(normal_a, normal_changed);
 
         let manual_a = continue_decision_id_for_request(
-            100,
+            "watermark-a",
             Some("candidate"),
             Some("frame"),
             "supported",
             Some(1_000),
         );
         let manual_b = continue_decision_id_for_request(
-            100,
+            "watermark-a",
             Some("candidate"),
             Some("frame"),
             "supported",
@@ -43206,6 +43299,71 @@ mod tests {
             events[0].target_artifact_id.as_deref(),
             Some("artifact-wrong")
         );
+    }
+
+    #[test]
+    fn p1_no_target_decision_does_not_infer_ignored_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET requested_at_ms = ?1,
+                 return_target_artifact_id = NULL,
+                 current_focus_artifact_id = NULL
+             WHERE id = 'decision-p4'",
+            params![current_time_millis() - 120_000],
+        )
+        .unwrap();
+
+        let event = infer_feedback_for_decision(&conn, "decision-p4", 60_000).unwrap();
+
+        assert!(event.is_none());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM continue_feedback_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn decision_derived_memory_timestamp_churn_does_not_change_evidence_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "INSERT INTO continue_memory_cells (
+                id, memory_type, summary, source_anchor_json, created_at_ms,
+                last_seen_at_ms, confidence, importance, decay_score,
+                redaction_level, created_by, updated_at_ms
+             ) VALUES (
+                'memory-derived', 'decision_summary', 'bounded fixture', '{}',
+                1, 1, 0.5, 0.5, 1.0, 'safe', 'continue_decision', 1
+             )",
+            [],
+        )
+        .unwrap();
+        let before = build_continue_evidence_watermark(&conn, None).unwrap();
+
+        conn.execute(
+            "UPDATE continue_memory_cells SET updated_at_ms = updated_at_ms + 10000",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continue_memory_edges SET updated_at_ms = updated_at_ms + 10000",
+            [],
+        )
+        .unwrap();
+        let after = build_continue_evidence_watermark(&conn, None).unwrap();
+
+        assert_ne!(
+            before.latest_memory_cell_at_ms,
+            after.latest_memory_cell_at_ms
+        );
+        assert_eq!(before.hash, after.hash);
     }
 
     #[test]

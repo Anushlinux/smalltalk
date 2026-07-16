@@ -520,6 +520,23 @@ export function recentContextForPresentation(
   return (answer?.recent_context || []).slice(0, 8);
 }
 
+export function recentContextRoleLabel(
+  role?: ContinueTaskTruthRecentContext["semantic_role"],
+) {
+  switch (role) {
+    case "primary_work":
+      return "Primary work";
+    case "supporting_work":
+      return "Supporting work";
+    case "detour_or_unrelated":
+      return "Detour or unrelated";
+    case "unclear":
+      return "Relationship unclear";
+    default:
+      return null;
+  }
+}
+
 export function authoritativeTaskTruthActionState(
   decision?: ContinueAdoptionComparableDecision | null,
 ): ContinuePresentationActionState | null {

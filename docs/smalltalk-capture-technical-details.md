@@ -1,6 +1,6 @@
 # Smalltalk Capture Technical Details
 
-Last updated: 2026-06-25
+Last updated: 2026-07-16
 
 This document explains what the current Smalltalk desktop app captures, how capture is triggered, how each capture is processed, what is stored locally, what is exported for resume inference, and what is intentionally not captured.
 
@@ -27,8 +27,8 @@ Smalltalk does not capture audio, microphone input, meetings, speaker identity, 
 3. While the session is running, native macOS events are stored in `ui_events` and coalesced into capture triggers.
 4. Each trigger waits a short settle delay before capture so the UI can finish changing.
 5. The user can force an immediate `manual` capture with `capture_once`.
-6. The capture worker uses `idle` capture as a fallback every 10 seconds when no useful event capture has happened recently.
-7. On stop, `stop_capture` stops the worker, marks the session stopped, and builds a compact resume-query bundle under `resume_query_exports/`.
+6. The capture worker uses `idle` capture as a fallback every 120 seconds when no useful event capture has happened recently.
+7. On stop, `stop_capture` cancels the active helper, waits at most two seconds for worker cleanup, marks the session stopped, and builds a compact resume-query bundle under `resume_query_exports/`.
 
 ## Runtime Storage
 
@@ -38,7 +38,6 @@ Live native capture data is stored in the Tauri app-data directory:
 ~/Library/Application Support/com.smalltalk.app/capture/
   smalltalk-capture.sqlite
   snapshots/
-  helpers/
   safe-ai-exports/
 ```
 
@@ -70,7 +69,7 @@ Smalltalk is event-driven first and idle-driven second.
 | Keyboard input pauses | `typing_pause` | listen-only `CGEvent` key-down category | 850 ms | yes |
 | Scroll activity settles | `scroll_stop` | listen-only `CGEvent` scroll-wheel event | 500 ms | yes |
 | Clipboard changes | `clipboard` | `NSPasteboard.general.changeCount` polling | 220 ms | yes |
-| No recent stored event frame | `idle` | capture worker timer | 10 sec interval | yes |
+| No recent stored event frame | `idle` | capture worker timer | 120 sec interval | yes |
 
 Only one pending event bucket is kept at a time. If several events arrive before the settle delay expires, their event ids are merged into one `capture_triggers.caused_by_event_ids` JSON array. If the merged events have different trigger types, the trigger becomes `event_burst`.
 
@@ -78,7 +77,7 @@ Captures are also rate-limited by `MIN_CAPTURE_INTERVAL = 600 ms`.
 
 ## Native Event Helper
 
-The event helper is `src-tauri/scripts/capture_events.swift`. Rust compiles and runs it from the app-data `helpers/` directory.
+The event helper is `src-tauri/scripts/capture_events.swift`. In development, Cargo installs it in the stable `target/<profile>/smalltalk-capture-sidecars/` directory. In an app bundle, Tauri installs and signs it beside the main executable under `Contents/MacOS`.
 
 It emits newline-delimited JSON events containing:
 
@@ -106,8 +105,8 @@ Each stored frame goes through this pipeline:
 5. Apply privacy and exclusion rules.
 6. If privacy says `skip_capture`, return without storing a frame.
 7. Collect a window graph snapshot.
-8. Capture a full-screen JPEG screenshot using macOS `screencapture`.
-9. Capture an active-window JPEG crop if a CoreGraphics window id is available.
+8. Ask the isolated ScreenCaptureKit sidecar for a full-screen JPEG. Use bounded `/usr/sbin/screencapture` only as a truthful fallback.
+9. If a validated Core Graphics window id is available, ask the sidecar to capture the intersecting display and crop it to the active-window rectangle.
 10. Hash the full screenshot bytes into `image_hash`.
 11. Determine image dimensions from the JPEG bytes.
 12. Decide whether Accessibility text is strong or thin.
@@ -136,7 +135,7 @@ The full screenshot is saved under:
 <app_data_dir>/capture/snapshots/day-<bucket>/<timestamp>_full.jpg
 ```
 
-When a window id is known, Smalltalk also attempts:
+When a window id is known, Smalltalk also attempts active-window evidence. The sidecar validates that the window is live, visible, layer zero, finite, non-empty, and intersecting an available display. It then captures that display and applies a validated source rectangle. It does not construct the known-crashing desktop-independent-window filter.
 
 ```text
 ScreenCaptureKit SCScreenshotManager active-window capture
@@ -150,7 +149,9 @@ That active-window crop is saved as:
 
 The frame records screenshot paths, image hash, perceptual-hash placeholder value, dimensions, scope, provider, display id, window id, app pid, and bundle id.
 
-Current `capture_provider` is `screen_capture_kit` when the one-shot SCK helper succeeds. The legacy `/usr/sbin/screencapture` path remains a fallback and records `screencapture_cli`.
+Current `capture_provider` is `screen_capture_kit` when the one-shot sidecar succeeds. The bounded `/usr/sbin/screencapture` path remains a fallback and records `screencapture_cli`. The main Tauri process contains no in-process screen-image acquisition path.
+
+Every one-shot capture helper runs in its own process group. The shared runner enforces absolute executable paths, bounded arguments, bounded output, cancellation, deadline termination, and unconditional child reaping. Deadlines are six seconds for ScreenCaptureKit display and active-window capture, five seconds for the command-line screenshot fallback, four seconds for Accessibility, three seconds for its AppleScript fallback, two seconds for the window snapshot, and eight seconds each for Vision and Tesseract OCR. Stop cancellation interrupts these deadlines immediately.
 
 Current `scope` is:
 
@@ -768,19 +769,38 @@ The native app can infer browser URL/title/text through Accessibility, AppleScri
 
 Capture quality depends on macOS permissions and available tools:
 
-- Screen Recording permission is required for `screencapture`.
+- Screen Recording permission is required for ScreenCaptureKit and the command-line fallback.
 - Accessibility permission is required for AX helpers and System Events fallback.
 - Input Monitoring may be required for global event taps.
 - Apple Vision is used for OCR on macOS.
 - Tesseract is optional fallback if installed on `PATH`.
-- Swift helpers are compiled into the app-data `helpers/` directory with `/usr/bin/swiftc`.
+- Development Swift sidecars use a stable profile path under `target/<profile>/smalltalk-capture-sidecars/`.
+- Packaged sidecars live under `Contents/MacOS` and are nested code signed with the app. Release packaging requires the verified certificate-backed build path, so the helper does not trade crash isolation for a changing packaged permission identity.
 
 If a permission is missing, the frame may still store partial evidence or diagnostic errors, but screenshot, event, Accessibility, or OCR signal may be absent.
 
 ## Current Implementation Boundaries
 
 - The active capture system is local-first and SQLite-backed.
+- Capture runtime state is explicit: `stopped`, `starting`, `running`, `degraded`, `stopping`, or `failed`.
+- Provider health is independent for display capture, active-window capture, Accessibility, window snapshots, and OCR. A bad provider cools down without disabling unrelated evidence sources.
+- App shutdown uses the same bounded cancellation and cleanup path as Stop.
 - Most raw capture stays in the app-data capture directory.
 - Model-facing paths go through safe export or resume-query bundle construction.
 - The current stop path builds `resume_query_exports/.../resume-query-bundle.json`; it does not currently produce the older exhaustive repo-root `output/session-XXX` artifact.
 - The native path is cross-app, but browser semantics are weaker than a browser extension because it relies on Accessibility, OCR, and browser URL metadata instead of DOM instrumentation.
+
+## Runtime pressure and lifecycle limits
+
+- Event transport capacity is 320: 64 high-value, 96 normal, and 160 pressure entries.
+- One loop turn persists no more than 32 events and drains for no more than 12 milliseconds before checking other runtime work.
+- Source and ingest coalescing share the documented scroll and Accessibility windows. Rust additionally bounds repeated key, character-category key, and click pressure.
+- A pending trigger retains 128 causal event ids and a versioned total/omitted aggregate.
+- Database schema work runs once per file generation. Reset and replacement explicitly invalidate the generation.
+- The capture worker owns one event-ingest connection. Event writes are atomic batches with three bounded busy attempts. The ordinary SQLite busy timeout is 750 milliseconds rather than 30 seconds.
+- Workload queue capacity is 48 with class-specific sublimits, deadlines, cancellation, and shutdown wake-up.
+- Continue is single-flight across main card, native island, startup, background, and manual paths. Manual requests supersede queued background work.
+- Full audit export is manual-only and has one worker plus one pending slot. Maintenance has one owner and one pending request.
+- Status reads maintained counters and a lightweight frame projection. Heavy frame content is loaded only through explicit evidence commands.
+- The React status heartbeat is 60 seconds while recording and 120 seconds while idle. Event emissions provide normal updates.
+- The developer-only harness and report paths are defined in `docs/runtime-stability-harness.md`.

@@ -15,33 +15,51 @@ use crate::continuation::enrichment::{
     WeakSurfaceClassification, WeakSurfaceClassificationInput, WeakSurfaceDomain,
     WeakSurfaceEnrichmentEventInput, WindowSnapshotLite,
 };
+use process_runner::{
+    configure_process_group, find_absolute_command, record_managed_child_started,
+    record_managed_child_stopped, run_process, terminate_and_reap, CancellationToken,
+    ProcessExitCategory, ProcessSpec,
+};
+use provider_health::{AttemptDecision, OperationClass};
 use regex::RegexBuilder;
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod event_pipeline;
+mod fault_injection;
+mod process_runner;
+mod provider_health;
+mod runtime_stability;
 mod swift_helpers;
 
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-const SCK_HELPER_TIMEOUT: Duration = Duration::from_secs(12);
-const CAPTURE_HELPER_TIMEOUT: Duration = Duration::from_secs(8);
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
+const SCK_DISPLAY_DEADLINE: Duration = Duration::from_secs(6);
+const SCK_ACTIVE_WINDOW_DEADLINE: Duration = Duration::from_secs(6);
+const ACCESSIBILITY_DEADLINE: Duration = Duration::from_secs(4);
+const ACCESSIBILITY_APPLESCRIPT_DEADLINE: Duration = Duration::from_secs(3);
+const WINDOW_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
+const VISION_OCR_DEADLINE: Duration = Duration::from_secs(8);
+const TESSERACT_DEADLINE: Duration = Duration::from_secs(8);
+const SCREENCAPTURE_DEADLINE: Duration = Duration::from_secs(5);
+const STOP_COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
 const MANUAL_CAPTURE_PERMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MANUAL_CONTINUE_PERMIT_TIMEOUT: Duration = Duration::from_secs(8);
 const BACKGROUND_CONTINUE_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,10 +68,6 @@ const SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX: &str =
     "screen_capture_permission_requested_at_ms";
 const SCREEN_CAPTURE_SETTINGS_HINT: &str =
     "System Settings > Privacy & Security > Screen & System Audio Recording";
-// One recovery probe is allowed after this boundary. Starting a new capture
-// session resets the breaker immediately.
-const SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-static SCK_PROVIDER_HEALTH: OnceLock<Mutex<CaptureProviderCircuitBreaker>> = OnceLock::new();
 static SCREEN_CAPTURE_IDENTITY: OnceLock<ScreenCapturePermissionIdentity> = OnceLock::new();
 const ACCESSIBILITY_SCRIPT: &str = r#"
 on replaceText(sourceText, oldText, newText)
@@ -196,6 +210,46 @@ end tell
 "#;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static SCHEMA_INITIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static MIGRATION_EXECUTION_COUNT: AtomicU64 = AtomicU64::new(0);
+static DATABASE_BUSY_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static DATABASE_BUSY_TIME_MS: AtomicU64 = AtomicU64::new(0);
+static DATABASE_LIFECYCLE: OnceLock<Mutex<DatabaseLifecycle>> = OnceLock::new();
+static STATUS_METRICS: OnceLock<Mutex<StatusMetrics>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InitializedDatabase {
+    generation: u64,
+    identity: DatabaseFileIdentity,
+}
+
+#[derive(Debug, Default)]
+struct DatabaseLifecycle {
+    next_generation: u64,
+    initialized: HashMap<PathBuf, InitializedDatabase>,
+}
+
+#[derive(Debug, Default)]
+struct StatusMetrics {
+    latency_us: std::collections::VecDeque<u64>,
+    last_response_bytes: u64,
+    max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StatusMetricsSnapshot {
+    pub sample_count: u64,
+    pub p50_latency_us: u64,
+    pub p95_latency_us: u64,
+    pub last_response_bytes: u64,
+    pub max_response_bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct CaptureState {
@@ -210,11 +264,91 @@ impl Default for CaptureState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaptureRuntimePhase {
+    Stopped,
+    Starting,
+    Running,
+    Degraded,
+    Stopping,
+    Failed,
+}
+
+impl Default for CaptureRuntimePhase {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+impl CaptureRuntimePhase {
+    fn is_publicly_running(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Degraded)
+    }
+
+    fn owns_worker(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Degraded | Self::Stopping
+        )
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Stopping => "stopping",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerExit {
+    panicked: bool,
+    session_finalized: bool,
+}
+
+#[derive(Debug, Default)]
+struct WorkerCompletion {
+    result: Mutex<Option<WorkerExit>>,
+    changed: Condvar,
+}
+
+impl WorkerCompletion {
+    fn complete(&self, result: WorkerExit) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<WorkerExit> {
+        let result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if result.is_some() {
+            return *result;
+        }
+        let (result, _) = self
+            .changed
+            .wait_timeout_while(result, timeout, |result| result.is_none())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *result
+    }
+}
+
 #[derive(Debug, Default)]
 struct CaptureRuntime {
-    running: bool,
-    stop_signal: Option<Arc<AtomicBool>>,
+    phase: CaptureRuntimePhase,
+    worker_generation: u64,
+    stop_signal: Option<CancellationToken>,
     worker: Option<JoinHandle<()>>,
+    worker_completion: Option<Arc<WorkerCompletion>>,
     last_error: Option<String>,
     last_frame: Option<CaptureFrame>,
     active_session_id: Option<String>,
@@ -223,10 +357,53 @@ struct CaptureRuntime {
     started_at: Option<i64>,
     skipped_samples: i64,
     last_skipped_at: Option<i64>,
+    last_stop_latency_ms: Option<i64>,
+    worker_panic_count: u64,
+    event_pipeline: Option<Arc<event_pipeline::EventPipeline>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeLifecycleSnapshot {
+    phase: CaptureRuntimePhase,
+    worker_generation: u64,
+    last_stop_latency_ms: Option<i64>,
+    worker_panic_count: u64,
+    event_pipeline: event_pipeline::EventPipelineDiagnostics,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeDiagnostics {
+    pub capture_runtime_state: String,
+    pub worker_generation: u64,
+    pub current_operation_class: Option<String>,
+    pub current_operation_started_at_ms: Option<i64>,
+    pub last_operation_class: Option<String>,
+    pub last_operation_duration_ms: Option<i64>,
+    pub helper_launches: u64,
+    pub helper_successes: u64,
+    pub helper_timeouts: u64,
+    pub helper_timeouts_reaped: u64,
+    pub helper_cancellations: u64,
+    pub helper_abnormal_exits: u64,
+    pub helper_output_limit_failures: u64,
+    pub helper_launch_failures: u64,
+    pub active_child_processes: u64,
+    pub last_safe_error_category: Option<String>,
+    pub stop_latency_ms: Option<i64>,
+    pub worker_panic_count: u64,
+    pub provider_health: std::collections::BTreeMap<String, String>,
+    pub provider_by_operation: std::collections::BTreeMap<String, String>,
+    pub fallback_counts_by_operation: std::collections::BTreeMap<String, u64>,
+    pub provider_circuit_breaker_opens: u64,
+    pub provider_recovery_probes: u64,
+    pub event_pipeline: event_pipeline::EventPipelineDiagnostics,
+    pub schema_initialization_count: u64,
+    pub migration_execution_count: u64,
+    pub database_busy_retry_count: u64,
+    pub database_busy_time_ms: u64,
+    pub database_generation: u64,
+    pub audit_executor: AuditExecutorDiagnostics,
+    pub status_metrics: StatusMetricsSnapshot,
     pub workload: crate::workload::WorkloadDiagnostics,
     pub events_received: i64,
     pub events_dropped_at_source: i64,
@@ -646,6 +823,7 @@ const LOCAL_SIGNAL_BUCKET_WINDOW_MS: i64 = 30_000;
 const LOCAL_SIGNAL_RECENT_WINDOW_MS: i64 = 20 * 60 * 1000;
 const MAX_LOCAL_SIGNAL_EVENTS: i64 = 600;
 const MAX_VISIBLE_SIGNAL_MOMENTS: i64 = 48;
+const MAX_TRIGGER_CAUSAL_EVENT_IDS: usize = 128;
 
 #[derive(Debug, Clone, Default)]
 struct AccessibilityContext {
@@ -779,32 +957,7 @@ struct SckScreenshotResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelperExitCategory {
-    Success,
-    StructuredHelperError,
-    InvalidResponse,
-    NonZeroExit,
-    AbnormalTermination,
-    Timeout,
-    LaunchFailure,
-    CircuitBreakerSkip,
-}
-
-impl HelperExitCategory {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::StructuredHelperError => "structured_helper_error",
-            Self::InvalidResponse => "invalid_response",
-            Self::NonZeroExit => "non_zero_exit",
-            Self::AbnormalTermination => "signal_or_abnormal_termination",
-            Self::Timeout => "timeout",
-            Self::LaunchFailure => "launch_failure",
-            Self::CircuitBreakerSkip => "circuit_breaker_skip",
-        }
-    }
-}
+type HelperExitCategory = ProcessExitCategory;
 
 #[derive(Debug)]
 struct HelperExecutionResult {
@@ -819,67 +972,6 @@ struct SckCaptureFailure {
     category: HelperExitCategory,
     duration_ms: i64,
     message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CircuitBreakerDecision {
-    NormalAttempt,
-    RecoveryProbe,
-    Skip,
-}
-
-#[derive(Debug, Default)]
-struct CaptureProviderCircuitBreaker {
-    active_window_opened_at: Option<Instant>,
-    active_window_recovery_probe_used: bool,
-}
-
-impl CaptureProviderCircuitBreaker {
-    fn active_window_decision(&mut self, now: Instant) -> CircuitBreakerDecision {
-        let Some(opened_at) = self.active_window_opened_at else {
-            return CircuitBreakerDecision::NormalAttempt;
-        };
-        if !self.active_window_recovery_probe_used
-            && now.saturating_duration_since(opened_at) >= SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN
-        {
-            self.active_window_recovery_probe_used = true;
-            CircuitBreakerDecision::RecoveryProbe
-        } else {
-            CircuitBreakerDecision::Skip
-        }
-    }
-
-    fn record_active_window_abnormal_exit(&mut self, now: Instant) -> bool {
-        let newly_opened = self.active_window_opened_at.is_none();
-        self.active_window_opened_at = Some(now);
-        self.active_window_recovery_probe_used = false;
-        newly_opened
-    }
-
-    fn record_active_window_success(&mut self) {
-        self.active_window_opened_at = None;
-        self.active_window_recovery_probe_used = false;
-    }
-
-    fn reset_for_new_session(&mut self) {
-        self.record_active_window_success();
-    }
-
-    fn active_window_state(&self) -> &'static str {
-        if self.active_window_opened_at.is_some() {
-            if self.active_window_recovery_probe_used {
-                "open_probe_used"
-            } else {
-                "open_cooldown"
-            }
-        } else {
-            "closed"
-        }
-    }
-}
-
-fn sck_provider_health() -> &'static Mutex<CaptureProviderCircuitBreaker> {
-    SCK_PROVIDER_HEALTH.get_or_init(|| Mutex::new(CaptureProviderCircuitBreaker::default()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -958,6 +1050,8 @@ struct PendingTrigger {
     id: String,
     capture_trigger: String,
     caused_by_event_ids: Vec<String>,
+    caused_event_count: u64,
+    omitted_event_count: u64,
     pre_frame_id: Option<String>,
     settle_delay_ms: i64,
     ready_at: Instant,
@@ -2035,9 +2129,9 @@ pub struct ScreenCapturePermissionStatus {
 }
 
 struct CaptureEventSource {
-    child: Child,
+    child: Option<Child>,
     reader: Option<JoinHandle<()>>,
-    rx: Receiver<String>,
+    pipeline: Arc<event_pipeline::EventPipeline>,
 }
 
 fn screen_capture_permission_presentation(
@@ -2411,25 +2505,50 @@ impl SemanticFingerprint {
 
 #[tauri::command]
 pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<CaptureStatus, String> {
+    start_capture_impl(app, state.inner())
+}
+
+fn start_capture_impl(app: AppHandle, state: &CaptureState) -> Result<CaptureStatus, String> {
     ensure_db(&app)?;
 
-    {
-        let runtime = lock_runtime(state.inner())?;
-        if runtime.running {
-            let status = capture_status(app, state)?;
+    let generation = {
+        let mut runtime = lock_runtime(state)?;
+        if runtime.phase.owns_worker() || runtime.worker.is_some() {
+            if runtime.phase == CaptureRuntimePhase::Stopping {
+                return Err(
+                    "capture is stopping; wait for cleanup before starting again".to_string(),
+                );
+            }
+            drop(runtime);
+            let status = capture_status_snapshot_inner(&app, &state.inner)?;
             crate::session_island::update_session_island_from_status(
                 &status,
                 crate::session_island::SessionIslandState::RecordingCompact,
             );
             return Ok(status);
         }
+        runtime.worker_generation = runtime.worker_generation.saturating_add(1);
+        runtime.phase = CaptureRuntimePhase::Starting;
+        runtime.last_error = None;
+        runtime.worker_generation
+    };
+
+    if let Err(error) = recover_interrupted_capture_triggers(&open_db(&app)?, now_millis()) {
+        fail_capture_start(state, generation, &error);
+        return Err(error);
     }
 
-    recover_interrupted_capture_triggers(&open_db(&app)?, now_millis())?;
-
-    let permission = screen_capture_permission_status(&app)?;
+    let permission = match screen_capture_permission_status(&app) {
+        Ok(permission) => permission,
+        Err(error) => {
+            fail_capture_start(state, generation, &error);
+            return Err(error);
+        }
+    };
     if !permission.granted {
-        return Err(screen_capture_permission_start_error(&permission));
+        let error = screen_capture_permission_start_error(&permission);
+        fail_capture_start(state, generation, &error);
+        return Err(error);
     }
 
     crate::session_island::update_session_island(
@@ -2437,35 +2556,104 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
     );
     crate::session_island::show_session_island();
 
-    let session = create_capture_session(&app)?;
-    sck_provider_health()
-        .lock()
-        .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
-        .reset_for_new_session();
+    let session = match create_capture_session(&app) {
+        Ok(session) => session,
+        Err(error) => {
+            fail_capture_start(state, generation, &error);
+            return Err(error);
+        }
+    };
+    let session_id = session.id.clone();
+    provider_health::with_registry(provider_health::ProviderHealthRegistry::reset_for_new_session);
+
+    let stop_signal = CancellationToken::default();
+    let thread_stop = stop_signal.clone();
+    let thread_app = app.clone();
+    let thread_state = state.inner.clone();
+    let thread_session_id = session_id.clone();
+    let completion = Arc::new(WorkerCompletion::default());
+    let thread_completion = completion.clone();
+    let (start_gate_tx, start_gate_rx) = mpsc::sync_channel::<()>(0);
+    let worker = match thread::Builder::new()
+        .name(format!("capture-worker-{generation}"))
+        .spawn(move || {
+            if start_gate_rx.recv().is_err() {
+                return;
+            }
+            run_capture_worker(
+                thread_app,
+                thread_state,
+                thread_stop,
+                thread_session_id,
+                generation,
+                thread_completion,
+            );
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let message = format!("failed to create capture worker: {error}");
+            let _ = finalize_capture_session(&app, &session_id, "failed");
+            fail_capture_start(state, generation, &message);
+            return Err(message);
+        }
+    };
 
     {
-        let mut runtime = lock_runtime(state.inner())?;
-        let stop_signal = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop_signal.clone();
-        let thread_app = app.clone();
-        let thread_state = state.inner.clone();
-        let thread_session_id = session.id.clone();
-
-        runtime.running = true;
+        let mut runtime = lock_runtime(state)?;
+        if runtime.worker_generation != generation || runtime.phase != CaptureRuntimePhase::Starting
+        {
+            stop_signal.cancel();
+            drop(start_gate_tx);
+            drop(runtime);
+            let _ = worker.join();
+            let _ = finalize_capture_session(&app, &session_id, "failed");
+            return Err("capture start was superseded before worker registration".to_string());
+        }
         runtime.started_at = Some(session.started_at);
         runtime.last_error = None;
         runtime.skipped_samples = 0;
         runtime.last_skipped_at = None;
-        runtime.active_session_id = Some(session.id.clone());
+        runtime.active_session_id = Some(session_id.clone());
         runtime.last_session = Some(session);
         runtime.last_export = None;
         runtime.stop_signal = Some(stop_signal);
-        runtime.worker = Some(thread::spawn(move || {
-            capture_loop(thread_app, thread_state, thread_stop, thread_session_id);
-        }));
+        runtime.worker_completion = Some(completion);
+        runtime.worker = Some(worker);
+    }
+    if start_gate_tx.send(()).is_err() {
+        let message = "capture worker failed before startup completed".to_string();
+        let worker = {
+            let mut runtime = lock_runtime(state)?;
+            runtime.phase = CaptureRuntimePhase::Failed;
+            runtime.started_at = None;
+            runtime.last_error = Some(message.clone());
+            runtime.active_session_id = None;
+            runtime.stop_signal = None;
+            runtime.worker_completion = None;
+            runtime.worker.take()
+        };
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+        if let Ok(finalized) = finalize_capture_session(&app, &session_id, "failed") {
+            if let Ok(mut runtime) = lock_runtime(state) {
+                runtime.last_session = Some(finalized);
+            }
+        }
+        crate::session_island::update_session_island(
+            crate::session_island::SessionIslandSnapshot::error(message.clone()),
+        );
+        return Err(message);
+    }
+    {
+        let mut runtime = lock_runtime(state)?;
+        if runtime.worker_generation == generation && runtime.phase == CaptureRuntimePhase::Starting
+        {
+            runtime.phase = CaptureRuntimePhase::Running;
+        }
     }
 
-    let status = capture_status(app.clone(), state)?;
+    let status = capture_status_snapshot_inner(&app, &state.inner)?;
     crate::session_island::update_session_island_from_status(
         &status,
         crate::session_island::SessionIslandState::RecordingCompact,
@@ -2474,11 +2662,21 @@ pub fn start_capture(app: AppHandle, state: State<CaptureState>) -> Result<Captu
 }
 
 #[tauri::command]
-pub fn stop_capture(
+pub async fn stop_capture(
     app: AppHandle,
-    state: State<CaptureState>,
+    state: State<'_, CaptureState>,
 ) -> Result<StopCaptureOutput, String> {
-    if let Ok(status) = capture_status_snapshot(&app, &state) {
+    let capture_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || stop_capture_impl(app, &capture_state))
+        .await
+        .map_err(|error| format!("capture Stop task failed: {error}"))?
+}
+
+pub(crate) fn stop_capture_impl(
+    app: AppHandle,
+    state: &CaptureState,
+) -> Result<StopCaptureOutput, String> {
+    if let Ok(status) = capture_status_snapshot_inner(&app, &state.inner) {
         crate::session_island::update_session_island_from_status(
             &status,
             crate::session_island::SessionIslandState::Processing,
@@ -2486,11 +2684,11 @@ pub fn stop_capture(
     }
 
     let session_id = {
-        let runtime = lock_runtime(state.inner())?;
+        let runtime = lock_runtime(state)?;
         runtime.active_session_id.clone()
     };
 
-    stop_runtime(state.inner())?;
+    stop_runtime(state)?;
 
     if let Ok(conn) = open_db(&app) {
         let _ = maybe_run_runtime_maintenance(&conn, true);
@@ -2499,9 +2697,9 @@ pub fn stop_capture(
     let mut stopped_session = None;
     let mut resume_query = None;
     if let Some(session_id) = session_id {
-        let session = finish_capture_session(&app, &session_id)?;
+        let session = load_capture_session_for_status(&open_db(&app)?, &session_id)?;
         {
-            let mut runtime = lock_runtime(state.inner())?;
+            let mut runtime = lock_runtime(state)?;
             runtime.active_session_id = None;
             runtime.last_session = Some(session.clone());
             runtime.last_export = None;
@@ -2540,7 +2738,7 @@ pub fn stop_capture(
                             "Stopped capture, but failed to save resume trail: {}",
                             error
                         );
-                        update_error(&state.inner().inner, message.clone());
+                        update_error(&state.inner, message.clone());
                         crate::session_island::update_session_island(
                             crate::session_island::SessionIslandSnapshot::error(message.clone()),
                         );
@@ -2551,7 +2749,7 @@ pub fn stop_capture(
         };
     }
 
-    let status = capture_status(app.clone(), state)?;
+    let status = capture_status_snapshot_inner(&app, &state.inner)?;
     crate::session_island::update_session_island_from_status(
         &status,
         crate::session_island::SessionIslandState::StoppedToast,
@@ -2591,12 +2789,13 @@ fn is_thin_resume_trail_error(error: &str) -> bool {
 
 #[tauri::command]
 pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<CaptureFrame, String> {
-    let session_id = {
+    let (session_id, cancellation) = {
         let runtime = lock_runtime(state.inner())?;
-        runtime
+        let session_id = runtime
             .active_session_id
             .clone()
-            .ok_or_else(|| "start a session before capturing a manual frame".to_string())?
+            .ok_or_else(|| "start a session before capturing a manual frame".to_string())?;
+        (session_id, runtime.stop_signal.clone())
     };
     let pre_frame_id = latest_frame_id_for_session(&app, &session_id)
         .ok()
@@ -2612,7 +2811,7 @@ pub fn capture_once(app: AppHandle, state: State<CaptureState>) -> Result<Captur
         None,
         None,
         None,
-        None,
+        cancellation.as_ref(),
         Some(&trigger_id),
         pre_frame_id.as_deref(),
         None,
@@ -2652,7 +2851,7 @@ pub fn delete_all_frames(
 
     {
         let mut runtime = lock_runtime(state.inner())?;
-        runtime.running = false;
+        runtime.phase = CaptureRuntimePhase::Stopped;
         runtime.started_at = None;
         runtime.last_error = None;
         runtime.last_frame = None;
@@ -2714,7 +2913,7 @@ pub fn dev_reset_local_memory(
 
     {
         let mut runtime = lock_runtime(state.inner())?;
-        runtime.running = false;
+        runtime.phase = CaptureRuntimePhase::Stopped;
         runtime.started_at = None;
         runtime.last_error = None;
         runtime.last_frame = None;
@@ -2852,11 +3051,11 @@ pub fn start_native_capture(
 }
 
 #[tauri::command]
-pub fn stop_native_capture(
+pub async fn stop_native_capture(
     app: AppHandle,
-    state: State<CaptureState>,
+    state: State<'_, CaptureState>,
 ) -> Result<CaptureStatus, String> {
-    Ok(stop_capture(app, state)?.status)
+    Ok(stop_capture(app, state).await?.status)
 }
 
 #[tauri::command]
@@ -4101,7 +4300,7 @@ fn capture_manual_continue_external_frame(
         return Err("manual_continue_external_surface_is_smalltalk".to_string());
     }
     let paths = capture_paths(app)?;
-    let window_snapshot = collect_window_snapshot(&paths).ok();
+    let window_snapshot = collect_window_snapshot(&paths, WINDOW_SNAPSHOT_DEADLINE, None).ok();
     let target_window_id = resolve_manual_continue_window_id(event, window_snapshot.as_ref());
     if target_window_id.is_none() && expected_bundle.is_none() {
         return Err("manual_continue_external_surface_identity_missing".to_string());
@@ -4210,28 +4409,34 @@ pub fn get_continue_decision(
         _ => crate::workload::WorkClass::BackgroundContinue,
     };
     request.manual_continue_started_at_ms = (trigger == "manual").then_some(now_millis());
-    let conn = open_db(&app)?;
-    // Every native caller, including startup/background/island paths, shares one
-    // explicit session-scope contract. React normally supplies this value. Native
-    // callers resolve the latest capture session here rather than silently running
-    // an all-session query.
-    if request.session_id.is_none() {
-        request.session_id = latest_session_id(&conn)?;
-    }
     request.manual_continue_frame_id = None;
     request.manual_continue_preflight_failure = None;
-    if trigger == "manual" {
-        match request.session_id.as_deref() {
-            Some(session_id) => match resolve_manual_continue_frame(&app, &conn, session_id) {
-                Ok(frame_id) => request.manual_continue_frame_id = Some(frame_id),
-                Err(reason) => request.manual_continue_preflight_failure = Some(reason),
-            },
-            None => {
-                request.manual_continue_preflight_failure =
-                    Some("manual_continue_session_scope_missing".to_string())
+    let material_watermark = {
+        let preflight_conn = open_db(&app)?;
+        // Resolve scope and manual capture before admission. The connection is
+        // dropped before this request can wait in the workload queue.
+        if request.session_id.is_none() {
+            request.session_id = latest_session_id(&preflight_conn)?;
+        }
+        if trigger == "manual" {
+            match request.session_id.as_deref() {
+                Some(session_id) => {
+                    match resolve_manual_continue_frame(&app, &preflight_conn, session_id) {
+                        Ok(frame_id) => request.manual_continue_frame_id = Some(frame_id),
+                        Err(reason) => request.manual_continue_preflight_failure = Some(reason),
+                    }
+                }
+                None => {
+                    request.manual_continue_preflight_failure =
+                        Some("manual_continue_session_scope_missing".to_string())
+                }
             }
         }
-    }
+        crate::continuation::current_continue_evidence_watermark_hash(
+            &preflight_conn,
+            request.session_id.as_deref(),
+        )?
+    };
     // Screenshot capture must remain allowed while the preflight waits for the
     // exact persisted external frame. Only acquire the Continue permit after
     // that boundary is established or has failed closed.
@@ -4240,8 +4445,21 @@ pub fn get_continue_decision(
     } else {
         BACKGROUND_CONTINUE_PERMIT_TIMEOUT
     };
-    let _continue_permit =
-        crate::workload::governor().acquire_with_timeout(work_class, continue_permit_timeout)?;
+    let request_identity = format!(
+        "{}:{}:{}",
+        trigger,
+        request.session_id.as_deref().unwrap_or("no_session"),
+        material_watermark
+    );
+    let continue_permit = crate::workload::governor().acquire_request(
+        crate::workload::WorkRequest::new(work_class)
+            .identity(request_identity)
+            .deadline(continue_permit_timeout),
+    )?;
+    if continue_permit.is_cancelled() {
+        return Err("Continue request was superseded before computation".to_string());
+    }
+    let conn = open_db(&app)?;
     let effective_mode = crate::continuation::effective_continue_decision_mode(
         request.mode.as_deref(),
         request.rebuild_layers.unwrap_or(false),
@@ -4255,6 +4473,9 @@ pub fn get_continue_decision(
         }
     }
     let mut result = crate::continuation::get_continue_decision(&conn, request.clone())?;
+    if continue_permit.is_cancelled() {
+        return Err("background Continue result superseded by a newer manual request".to_string());
+    }
     if let Some((probe_request, sufficiency)) =
         crate::continuation::build_need_more_evidence_request_from_decision(&conn, &result)?
     {
@@ -4279,6 +4500,9 @@ pub fn get_continue_decision(
             &probe_request,
             &probe_result,
         )?;
+        if continue_permit.is_cancelled() {
+            return Err("background Continue probe superseded before rerun".to_string());
+        }
         let reran_decision = crate::continuation::probe_result_allows_rerun(&probe_result);
         let rerun_reason = if probe_result.stale_result {
             "stale_result_isolated"
@@ -4355,10 +4579,12 @@ pub fn get_continue_decision(
             eprintln!("[mfti_04_performance] total finalization failed: {error}");
         }
     }
-    if matches!(
-        crate::continuation::effective_continue_audit_mode(&request),
-        crate::continuation::ContinueAuditMode::MftiReview
-    ) {
+    if request.request_trigger.as_deref() == Some("manual")
+        && matches!(
+            crate::continuation::effective_continue_audit_mode(&request),
+            crate::continuation::ContinueAuditMode::MftiReview
+        )
+    {
         if let Err(error) =
             crate::continuation::task_truth_v2::review::write_mfti_review_artifact(&conn, &result)
         {
@@ -4369,10 +4595,11 @@ pub fn get_continue_decision(
 }
 
 fn continue_output_audit_enabled(request: &crate::continuation::ContinueDecisionRequest) -> bool {
-    matches!(
-        crate::continuation::effective_continue_audit_mode(request),
-        crate::continuation::ContinueAuditMode::Full
-    )
+    request.request_trigger.as_deref() == Some("manual")
+        && matches!(
+            crate::continuation::effective_continue_audit_mode(request),
+            crate::continuation::ContinueAuditMode::Full
+        )
 }
 
 fn run_continue_evidence_probes(
@@ -4634,27 +4861,23 @@ fn collect_accessibility_context_with_timeout(
             true,
         );
     }
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(collect_accessibility_context(&paths));
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(context) => (context, false),
-        Err(RecvTimeoutError::Timeout) => (
-            AccessibilityContext {
-                error: Some("accessibility_probe_timed_out".to_string()),
-                ..AccessibilityContext::default()
-            },
-            true,
-        ),
-        Err(RecvTimeoutError::Disconnected) => (
-            AccessibilityContext {
-                error: Some("accessibility_probe_disconnected".to_string()),
-                ..AccessibilityContext::default()
-            },
-            false,
-        ),
-    }
+    // The old wrapper abandoned a detached thread after recv_timeout. The
+    // bounded runner now owns the real child deadline, kill, and reap path.
+    let native_deadline = timeout.min(ACCESSIBILITY_DEADLINE) / 2;
+    let fallback_deadline = timeout
+        .saturating_sub(native_deadline)
+        .min(ACCESSIBILITY_APPLESCRIPT_DEADLINE);
+    let context = collect_accessibility_context_bounded(
+        &paths,
+        native_deadline.max(Duration::from_millis(1)),
+        fallback_deadline.max(Duration::from_millis(1)),
+        None,
+    );
+    let timed_out = context
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("timeout") || error.contains("timed out"));
+    (context, timed_out)
 }
 
 fn collect_window_snapshot_with_timeout(
@@ -4664,15 +4887,8 @@ fn collect_window_snapshot_with_timeout(
     if timeout.is_zero() {
         return Err("window_graph_probe_timed_out".to_string());
     }
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(collect_window_snapshot(&paths));
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result.map(|snapshot| (snapshot, false)),
-        Err(RecvTimeoutError::Timeout) => Err("window_graph_probe_timed_out".to_string()),
-        Err(RecvTimeoutError::Disconnected) => Err("window_graph_probe_disconnected".to_string()),
-    }
+    collect_window_snapshot(&paths, timeout.min(WINDOW_SNAPSHOT_DEADLINE), None)
+        .map(|snapshot| (snapshot, false))
 }
 
 #[tauri::command]
@@ -4703,6 +4919,50 @@ struct ContinueOutputAuditPlan {
     folder_name: String,
     final_dir: PathBuf,
 }
+
+#[derive(Debug)]
+struct ContinueAuditJob {
+    identity: String,
+    db_path: PathBuf,
+    request: crate::continuation::ContinueDecisionRequest,
+    effective_mode: String,
+    result: crate::continuation::ContinueDecisionResult,
+    plan: ContinueOutputAuditPlan,
+    cancellation: crate::workload::WorkCancellationToken,
+}
+
+#[derive(Debug, Default)]
+struct AuditExecutorState {
+    active_identity: Option<String>,
+    active_cancellation: Option<crate::workload::WorkCancellationToken>,
+    pending: Option<ContinueAuditJob>,
+    submitted: u64,
+    completed: u64,
+    failed: u64,
+    coalesced: u64,
+    superseded: u64,
+    shutting_down: bool,
+}
+
+struct AuditExecutor {
+    state: Arc<(Mutex<AuditExecutorState>, Condvar)>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AuditExecutorDiagnostics {
+    pub active: bool,
+    pub queued: u64,
+    pub queue_capacity: u64,
+    pub submitted: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub coalesced: u64,
+    pub superseded: u64,
+    pub shutting_down: bool,
+}
+
+static AUDIT_EXECUTOR: OnceLock<AuditExecutor> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 struct ContinueEvidenceClosure {
@@ -15986,12 +16246,99 @@ fn distraction_score(human: &Value, model_output: &Value) -> f64 {
     token_jaccard(&expected, &actual)
 }
 
+fn fail_capture_start(state: &CaptureState, generation: u64, error: &str) {
+    let mut runtime = state
+        .inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runtime.worker_generation == generation && runtime.phase == CaptureRuntimePhase::Starting {
+        runtime.phase = CaptureRuntimePhase::Failed;
+        runtime.last_error = Some(error.to_string());
+        runtime.started_at = None;
+        runtime.stop_signal = None;
+        runtime.worker_completion = None;
+        runtime.worker = None;
+    }
+}
+
+fn run_capture_worker(
+    app: AppHandle,
+    state: Arc<Mutex<CaptureRuntime>>,
+    stop_signal: CancellationToken,
+    session_id: String,
+    generation: u64,
+    completion: Arc<WorkerCompletion>,
+) {
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        capture_loop(
+            app.clone(),
+            state.clone(),
+            stop_signal.clone(),
+            session_id.clone(),
+        );
+    }))
+    .is_err();
+
+    let final_status = if panicked { "failed" } else { "stopped" };
+    let finalized_session = finalize_capture_session(&app, &session_id, final_status);
+    let session_finalized = finalized_session.is_ok();
+    let finalization_error = finalized_session.as_ref().err().cloned();
+
+    {
+        let mut runtime = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.worker_generation == generation {
+            runtime.phase = if panicked || finalization_error.is_some() {
+                CaptureRuntimePhase::Failed
+            } else {
+                CaptureRuntimePhase::Stopped
+            };
+            runtime.started_at = None;
+            runtime.stop_signal = None;
+            runtime.worker_completion = None;
+            runtime.worker.take();
+            runtime.event_pipeline.take();
+            runtime.active_session_id = None;
+            if let Ok(session) = finalized_session {
+                runtime.last_session = Some(session);
+            }
+            if panicked {
+                runtime.worker_panic_count = runtime.worker_panic_count.saturating_add(1);
+                runtime.last_error =
+                    Some("capture worker panicked; state was repaired".to_string());
+            } else if let Some(error) = finalization_error {
+                runtime.last_error = Some(format!("capture session finalization failed: {error}"));
+            }
+        }
+    }
+
+    if let Ok(status) = capture_status_snapshot_inner(&app, &state) {
+        let _ = app.emit("capture-status", status.clone());
+        let island_state = if status.running {
+            crate::session_island::SessionIslandState::RecordingCompact
+        } else if panicked || !session_finalized {
+            crate::session_island::SessionIslandState::Error
+        } else {
+            crate::session_island::SessionIslandState::Ready
+        };
+        crate::session_island::update_session_island_from_status(&status, island_state);
+    }
+    // Completion is the worker's final observable action. Stop cannot return
+    // while cleanup or status repair is still running.
+    completion.complete(WorkerExit {
+        panicked,
+        session_finalized,
+    });
+}
+
 fn capture_loop(
     app: AppHandle,
     state: Arc<Mutex<CaptureRuntime>>,
-    stop_signal: Arc<AtomicBool>,
+    stop_signal: CancellationToken,
     session_id: String,
 ) {
+    fault_injection::panic_if_requested("capture_worker");
     let mut last_idle_capture = Instant::now();
     let mut last_capture_at = Instant::now()
         .checked_sub(MIN_IMPORTANT_CAPTURE_INTERVAL)
@@ -16003,15 +16350,27 @@ fn capture_loop(
     let mut typing_burst = TypingBurstState::default();
     let mut event_ingest_gate = EventIngestGate::default();
     let mut last_island_event_status_at: Option<Instant> = None;
-    let mut event_source = match capture_paths(&app)
-        .and_then(|paths| start_capture_event_source(&paths))
-    {
+    // The capture worker owns this connection for its whole generation. Event
+    // batches use it directly, so ordinary input no longer opens a connection
+    // or re-enters database initialization per event.
+    let event_conn = open_db(&app);
+    let event_source_result = match event_conn.as_ref() {
+        Ok(_) => capture_paths(&app).and_then(|paths| start_capture_event_source(&paths)),
+        Err(error) => Err(error.clone()),
+    };
+    let mut event_source = match event_source_result {
         Ok(source) => Some(source),
         Err(error) => {
             update_error_and_island(&app, &state, format!("event source unavailable: {}", error));
             None
         }
     };
+    if let Some(source) = event_source.as_ref() {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .event_pipeline = Some(source.pipeline.clone());
+    }
 
     if capture_and_emit(
         &app,
@@ -16031,46 +16390,53 @@ fn capture_loop(
         last_capture_at = Instant::now();
     }
 
-    while !stop_signal.load(Ordering::Relaxed) {
+    while !stop_signal.is_cancelled() {
+        let mut raw_event_batch = Vec::with_capacity(event_pipeline::MAX_DRAIN_COUNT + 1);
         if let Some(source) = event_source.as_ref() {
-            match source.rx.recv_timeout(EVENT_LOOP_WAKE_INTERVAL) {
-                Ok(raw_trigger) => {
-                    if let Err(error) = queue_event_trigger(
-                        &app,
-                        &session_id,
-                        &mut pending_trigger,
-                        &mut typing_burst,
-                        &mut event_ingest_gate,
-                        &raw_trigger,
-                    ) {
-                        update_error_and_island(&app, &state, error);
-                    } else {
-                        refresh_island_after_event(&app, &state, &mut last_island_event_status_at);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    update_error_and_island(&app, &state, "event source stopped".to_string());
-                    event_source = None;
-                }
+            if let Some(raw_trigger) = source.pipeline.recv_timeout(EVENT_LOOP_WAKE_INTERVAL) {
+                raw_event_batch.push(raw_trigger);
+            } else if source.pipeline.diagnostics().shutdown {
+                update_error_and_island(&app, &state, "event source stopped".to_string());
             }
         } else {
             thread::sleep(EVENT_LOOP_WAKE_INTERVAL);
         }
 
         if let Some(source) = event_source.as_ref() {
-            while let Ok(raw_trigger) = source.rx.try_recv() {
-                if let Err(error) = queue_event_trigger(
-                    &app,
+            source.pipeline.drain_bounded(|raw_trigger| {
+                raw_event_batch.push(raw_trigger);
+            });
+        }
+
+        if !raw_event_batch.is_empty() && !stop_signal.is_cancelled() {
+            let result = event_conn.as_ref().map_err(Clone::clone).and_then(|conn| {
+                persist_event_batch_with_retry(
+                    conn,
                     &session_id,
+                    &raw_event_batch,
+                    &stop_signal,
                     &mut pending_trigger,
                     &mut typing_burst,
                     &mut event_ingest_gate,
-                    &raw_trigger,
-                ) {
-                    update_error_and_island(&app, &state, error);
-                } else {
+                )
+            });
+            match result {
+                Ok(()) => {
                     refresh_island_after_event(&app, &state, &mut last_island_event_status_at);
+                }
+                Err(error) => update_error_and_island(&app, &state, error),
+            }
+        }
+
+        if event_source
+            .as_ref()
+            .is_some_and(|source| source.pipeline.diagnostics().shutdown)
+        {
+            if let Some(source) = event_source.take() {
+                if source.pipeline.diagnostics().queue_depth == 0 {
+                    source.shutdown();
+                } else {
+                    event_source = Some(source);
                 }
             }
         }
@@ -16145,17 +16511,6 @@ fn capture_loop(
     if let Some(source) = event_source {
         source.shutdown();
     }
-
-    if let Ok(mut runtime) = state.lock() {
-        runtime.running = false;
-        runtime.started_at = None;
-        runtime.stop_signal = None;
-    }
-
-    let _ = app.emit(
-        "capture-status",
-        capture_status_snapshot_inner(&app, &state),
-    );
 }
 
 fn capture_and_emit(
@@ -16167,7 +16522,7 @@ fn capture_and_emit(
     previous_image_hash: &mut Option<String>,
     previous_content_hash: &mut Option<String>,
     previous_semantic_fingerprint: &mut Option<SemanticFingerprint>,
-    stop_signal: &AtomicBool,
+    stop_signal: &CancellationToken,
     capture_trigger_id: Option<String>,
     pre_frame_id: Option<String>,
 ) -> Result<bool, String> {
@@ -16246,8 +16601,94 @@ fn refresh_island_after_event(
     }
 }
 
+const EVENT_BATCH_MAX_COUNT: usize = 32;
+const EVENT_BATCH_BUSY_RETRIES: usize = 3;
+
+fn persist_event_batch_with_retry(
+    conn: &Connection,
+    session_id: &str,
+    raw_events: &[String],
+    cancellation: &CancellationToken,
+    pending: &mut Option<PendingTrigger>,
+    typing_burst: &mut TypingBurstState,
+    event_ingest_gate: &mut EventIngestGate,
+) -> Result<(), String> {
+    if raw_events.len() > EVENT_BATCH_MAX_COUNT {
+        return Err(format!(
+            "event batch exceeded configured maximum: {} > {}",
+            raw_events.len(),
+            EVENT_BATCH_MAX_COUNT
+        ));
+    }
+
+    let mut last_error = None;
+    for attempt in 0..EVENT_BATCH_BUSY_RETRIES {
+        if cancellation.is_cancelled() {
+            return Err("event batch cancelled before persistence".to_string());
+        }
+        let mut next_pending = pending.clone();
+        let mut next_typing_burst = typing_burst.clone();
+        let mut next_ingest_gate = event_ingest_gate.clone();
+        let attempt_started = Instant::now();
+        let result = (|| -> Result<(), String> {
+            let tx = conn.unchecked_transaction().map_err(to_string)?;
+            for raw_event in raw_events {
+                if cancellation.is_cancelled() {
+                    return Err("event batch cancelled during persistence".to_string());
+                }
+                queue_event_trigger(
+                    &tx,
+                    session_id,
+                    &mut next_pending,
+                    &mut next_typing_burst,
+                    &mut next_ingest_gate,
+                    raw_event,
+                )?;
+            }
+            tx.commit().map_err(to_string)
+        })();
+
+        match result {
+            Ok(()) => {
+                *pending = next_pending;
+                *typing_burst = next_typing_burst;
+                *event_ingest_gate = next_ingest_gate;
+                run_event_ingest_maintenance_diagnostic_only(conn);
+                return Ok(());
+            }
+            Err(error)
+                if sqlite_error_is_busy(&error) && attempt + 1 < EVENT_BATCH_BUSY_RETRIES =>
+            {
+                DATABASE_BUSY_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                DATABASE_BUSY_TIME_MS.fetch_add(
+                    attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                last_error = Some(error);
+                let backoff = Duration::from_millis(15_u64 << attempt);
+                let backoff_started = Instant::now();
+                while backoff_started.elapsed() < backoff {
+                    if cancellation.is_cancelled() {
+                        return Err("event batch cancelled during SQLite backoff".to_string());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "event batch retry budget exhausted".to_string()))
+}
+
+fn sqlite_error_is_busy(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("database is locked")
+        || error.contains("database table is locked")
+        || error.contains("database busy")
+}
+
 fn queue_event_trigger(
-    app: &AppHandle,
+    conn: &Connection,
     session_id: &str,
     pending: &mut Option<PendingTrigger>,
     typing_burst: &mut TypingBurstState,
@@ -16258,8 +16699,7 @@ fn queue_event_trigger(
         return Ok(());
     };
 
-    let conn = open_db(app)?;
-    increment_maintenance_counter(&conn, "events_received", 1)?;
+    increment_maintenance_counter(conn, "events_received", 1)?;
 
     if event.event_type == "helper_started" {
         return Ok(());
@@ -16271,7 +16711,22 @@ fn queue_event_trigger(
                 .and_then(Value::as_str)
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
-            record_maintenance_value(&conn, "events_dropped_at_source", &dropped.to_string())?;
+            record_maintenance_value(conn, "events_dropped_at_source", &dropped.to_string())?;
+        }
+        return Ok(());
+    }
+    if event.event_type == "pipeline_diagnostics" {
+        if let Some(payload) = event.payload.as_ref() {
+            for (payload_key, maintenance_key) in [
+                ("dropped_pressure", "events_dropped_pipeline_pressure"),
+                ("dropped_normal", "events_dropped_pipeline_normal"),
+                ("dropped_high", "events_dropped_pipeline_high"),
+                ("coalesced", "events_coalesced_pipeline"),
+            ] {
+                if let Some(value) = payload.get(payload_key).and_then(Value::as_str) {
+                    record_maintenance_value(conn, maintenance_key, value)?;
+                }
+            }
         }
         return Ok(());
     }
@@ -16282,40 +16737,47 @@ fn queue_event_trigger(
     };
 
     if event_ingest_gate.should_drop(&event) {
-        increment_maintenance_counter(&conn, "events_dropped_at_ingest", 1)?;
+        increment_maintenance_counter(conn, "events_dropped_at_ingest", 1)?;
         return Ok(());
     }
 
     if event.id.is_empty() {
         event.id = next_id("evt");
     }
-    insert_ui_event(&conn, session_id, &event)?;
-    increment_maintenance_counter(&conn, "events_aggregated", 1)?;
-    increment_maintenance_counter(&conn, "events_persisted", 1)?;
-    run_event_ingest_maintenance_diagnostic_only(&conn);
-    record_event_side_effects(&conn, session_id, &event, typing_burst)?;
+    insert_ui_event(conn, session_id, &event)?;
+    increment_maintenance_counter(conn, "events_aggregated", 1)?;
+    increment_maintenance_counter(conn, "events_persisted", 1)?;
+    record_event_side_effects(conn, session_id, &event, typing_burst)?;
 
-    let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
+    let pre_frame_id = latest_frame_id_for_session_from_conn(conn, session_id)?;
     // A browser page, document, tab, or window can change many seconds before
     // the next ordinary event-burst capture. Treat an observed owned-surface
     // identity change as a bounded capture boundary instead of coalescing it
     // with scroll and Accessibility noise for the full 45-second interval.
     // The stored screenshot remains subject to the normal privacy and rolling
     // capture-budget checks.
-    if event_indicates_surface_change(&conn, session_id, &event)? {
+    if event_indicates_surface_change(conn, session_id, &event)? {
         capture_trigger = "surface_change".to_string();
         settle_delay = Duration::from_millis(300);
     }
     let now = now_millis();
     if let Some(existing) = pending.as_mut() {
-        existing.caused_by_event_ids.push(event.id.clone());
+        existing.caused_event_count = existing.caused_event_count.saturating_add(1);
+        if existing.caused_by_event_ids.len() < MAX_TRIGGER_CAUSAL_EVENT_IDS {
+            existing.caused_by_event_ids.push(event.id.clone());
+        } else {
+            existing.omitted_event_count = existing.omitted_event_count.saturating_add(1);
+            if let Some(latest) = existing.caused_by_event_ids.last_mut() {
+                *latest = event.id.clone();
+            }
+        }
         existing.ready_at = Instant::now() + settle_delay;
         existing.settle_delay_ms = settle_delay.as_millis() as i64;
         if existing.capture_trigger != capture_trigger {
             existing.capture_trigger =
                 merge_pending_capture_trigger(&existing.capture_trigger, &capture_trigger);
         }
-        update_capture_trigger_events(&conn, existing)?;
+        update_capture_trigger_events(conn, existing)?;
         return Ok(());
     }
 
@@ -16323,12 +16785,14 @@ fn queue_event_trigger(
         id: next_id("trg"),
         capture_trigger,
         caused_by_event_ids: vec![event.id.clone()],
+        caused_event_count: 1,
+        omitted_event_count: 0,
         pre_frame_id,
         settle_delay_ms: settle_delay.as_millis() as i64,
         ready_at: Instant::now() + settle_delay,
     };
     let _ = record_weak_surface_enrichment_for_event(
-        &conn,
+        conn,
         WeakSurfaceEnrichmentEventInput {
             session_id: Some(session_id.to_string()),
             observed_at_ms: event.ts_ms,
@@ -16344,8 +16808,8 @@ fn queue_event_trigger(
             force_attempt: false,
         },
     );
-    insert_capture_trigger(&conn, session_id, &trigger, now, false, "event_bucket")?;
-    increment_maintenance_counter(&conn, "events_promoted_to_capture", 1)?;
+    insert_capture_trigger(conn, session_id, &trigger, now, false, "event_bucket")?;
+    increment_maintenance_counter(conn, "events_promoted_to_capture", 1)?;
     *pending = Some(trigger);
     Ok(())
 }
@@ -16476,15 +16940,16 @@ fn normalize_event_trigger(event_type: &str) -> Option<(String, Duration)> {
         "key_down" => Some(("typing_pause".to_string(), Duration::from_millis(850))),
         "scroll" => Some(("scroll_stop".to_string(), Duration::from_millis(500))),
         "clipboard" => Some(("clipboard".to_string(), Duration::from_millis(220))),
+        "error" => Some(("error".to_string(), Duration::from_millis(220))),
+        "permission_change" => Some(("permission_change".to_string(), Duration::from_millis(220))),
         _ => None,
     }
 }
 
 fn capture_interval_for_trigger(trigger: &str) -> Duration {
     match trigger {
-        "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard" => {
-            MIN_IMPORTANT_CAPTURE_INTERVAL
-        }
+        "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard" | "error"
+        | "permission_change" => MIN_IMPORTANT_CAPTURE_INTERVAL,
         "surface_change" => MIN_SURFACE_CHANGE_CAPTURE_INTERVAL,
         "idle" => IDLE_CAPTURE_INTERVAL,
         "typing_pause" | "scroll_stop" | "click" | "accessibility_change" | "event_burst" => {
@@ -16503,6 +16968,7 @@ fn capture_trigger_priority(trigger: &str) -> u8 {
         "window_focus" => 4,
         "surface_change" => 3,
         "clipboard" => 2,
+        "error" | "permission_change" => 2,
         "typing_pause" | "scroll_stop" | "click" | "accessibility_change" => 1,
         _ => 0,
     }
@@ -16631,14 +17097,18 @@ fn insert_ui_event(
     session_id: &str,
     event: &UiEventRecord,
 ) -> Result<(), String> {
-    conn.execute(
-        "INSERT OR IGNORE INTO ui_events (
+    let mut statement = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO ui_events (
             id, ts_ms, event_type, app_pid, app_bundle_id, app_name, window_id,
             window_title, x, y, button, scroll_dx, scroll_dy, key_category,
             modifier_flags, is_repeat, payload_json, created_at_ms, session_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                    ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![
+        )
+        .map_err(to_string)?;
+    let inserted = statement
+        .execute(params![
             event.id,
             event.ts_ms,
             event.event_type,
@@ -16658,9 +17128,17 @@ fn insert_ui_event(
             event.payload.as_ref().map(Value::to_string),
             now_millis(),
             session_id,
-        ],
-    )
-    .map_err(to_string)?;
+        ])
+        .map_err(to_string)?;
+    if inserted > 0 {
+        conn.execute(
+            "UPDATE capture_sessions
+             SET event_count = event_count + 1
+             WHERE id = ?1",
+            params![session_id],
+        )
+        .map_err(to_string)?;
+    }
     Ok(())
 }
 
@@ -16885,6 +17363,8 @@ fn insert_system_capture_trigger(
         id: next_id("trg"),
         capture_trigger: trigger_type.to_string(),
         caused_by_event_ids: Vec::new(),
+        caused_event_count: 0,
+        omitted_event_count: 0,
         pre_frame_id,
         settle_delay_ms: 0,
         ready_at: Instant::now(),
@@ -16923,8 +17403,9 @@ fn insert_capture_trigger(
     conn.execute(
         "INSERT OR REPLACE INTO capture_triggers (
             id, ts_ms, trigger_type, caused_by_event_ids, settle_delay_ms,
-            rate_limited, dedupe_policy, pre_frame_id, status, session_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'scheduled', ?9)",
+            rate_limited, dedupe_policy, pre_frame_id, status, session_id,
+            caused_event_count, omitted_event_count, aggregation_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'scheduled', ?9, ?10, ?11, ?12)",
         params![
             trigger.id,
             ts_ms,
@@ -16935,6 +17416,9 @@ fn insert_capture_trigger(
             dedupe_policy,
             trigger.pre_frame_id,
             session_id,
+            trigger.caused_event_count as i64,
+            trigger.omitted_event_count as i64,
+            trigger_aggregation_json(trigger),
         ],
     )
     .map_err(to_string)?;
@@ -16949,17 +17433,35 @@ fn update_capture_trigger_events(
         "UPDATE capture_triggers
          SET trigger_type = ?2,
              caused_by_event_ids = ?3,
-             settle_delay_ms = ?4
+             settle_delay_ms = ?4,
+             caused_event_count = ?5,
+             omitted_event_count = ?6,
+             aggregation_json = ?7
          WHERE id = ?1",
         params![
             trigger.id,
             trigger.capture_trigger,
             serde_json::to_string(&trigger.caused_by_event_ids).map_err(to_string)?,
             trigger.settle_delay_ms,
+            trigger.caused_event_count as i64,
+            trigger.omitted_event_count as i64,
+            trigger_aggregation_json(trigger),
         ],
     )
     .map_err(to_string)?;
     Ok(())
+}
+
+fn trigger_aggregation_json(trigger: &PendingTrigger) -> String {
+    serde_json::json!({
+        "schema": "smalltalk.capture_trigger_causal_aggregation.v1",
+        "policy": "first_and_latest_bounded_sample",
+        "maximum_retained_event_ids": MAX_TRIGGER_CAUSAL_EVENT_IDS,
+        "total_event_count": trigger.caused_event_count,
+        "retained_event_count": trigger.caused_by_event_ids.len(),
+        "omitted_event_count": trigger.omitted_event_count,
+    })
+    .to_string()
 }
 
 fn finalize_capture_trigger_by_id(
@@ -17030,28 +17532,40 @@ fn finalize_capture_trigger_by_id(
     )?;
     let summary = transition_summary(&trigger_type, &transition_type, stored);
 
-    conn.execute(
-        "INSERT OR IGNORE INTO event_transitions (
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO event_transitions (
             id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
             ts_start_ms, ts_end_ms, transition_type, confidence, summary,
             changed_region_json, session_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            next_id("tx"),
-            trigger_id,
-            primary_event_id,
-            pre_frame_id,
-            post_frame_id,
-            ts_ms,
-            now_millis(),
-            transition_type,
-            0.68_f64,
-            summary,
-            "{}",
-            session_id,
-        ],
-    )
-    .map_err(to_string)?;
+            params![
+                next_id("tx"),
+                trigger_id,
+                primary_event_id,
+                pre_frame_id,
+                post_frame_id,
+                ts_ms,
+                now_millis(),
+                transition_type,
+                0.68_f64,
+                summary,
+                "{}",
+                session_id.as_deref(),
+            ],
+        )
+        .map_err(to_string)?;
+    if inserted > 0 {
+        if let Some(session_id) = session_id.as_deref() {
+            conn.execute(
+                "UPDATE capture_sessions
+                 SET transition_count = transition_count + 1
+                 WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(to_string)?;
+        }
+    }
     Ok(())
 }
 
@@ -17344,40 +17858,60 @@ fn start_capture_event_source(_paths: &CapturePaths) -> Result<CaptureEventSourc
     }
 
     let helper_path = swift_helpers::resolve("capture_events")?;
-    let mut child = Command::new(helper_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+    let mut command = Command::new(helper_path);
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("capture event helper failed to start: {}", error))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "capture event helper did not expose stdout".to_string())?;
-    let (tx, rx) = mpsc::channel();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap(&mut child);
+            return Err("capture event helper did not expose stdout".to_string());
+        }
+    };
+    let pipeline = event_pipeline::EventPipeline::shared();
+    let reader_pipeline = pipeline.clone();
     let reader = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
+            if !reader_pipeline.push(line) && reader_pipeline.diagnostics().shutdown {
                 break;
             }
         }
+        reader_pipeline.shutdown();
     });
+    record_managed_child_started();
 
     Ok(CaptureEventSource {
-        child,
+        child: Some(child),
         reader: Some(reader),
-        rx,
+        pipeline,
     })
 }
 
 impl CaptureEventSource {
     fn shutdown(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
+        self.pipeline.shutdown();
+        if let Some(mut child) = self.child.take() {
+            terminate_and_reap(&mut child);
+            record_managed_child_stopped();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+impl Drop for CaptureEventSource {
+    fn drop(&mut self) {
+        self.shutdown_inner();
     }
 }
 
@@ -17390,7 +17924,7 @@ fn capture_frame(
     previous_content_hash: Option<&str>,
     precollected_context: Option<AccessibilityContext>,
     previous_semantic_fingerprint: Option<&SemanticFingerprint>,
-    cancellation: Option<&AtomicBool>,
+    cancellation: Option<&CancellationToken>,
     capture_trigger_id: Option<&str>,
     previous_frame_id: Option<&str>,
     manual_continue_expectation: Option<&ManualContinueCaptureExpectation>,
@@ -17412,7 +17946,9 @@ fn capture_frame(
     let day_dir = paths.snapshot_dir.join(day);
     fs::create_dir_all(&day_dir).map_err(to_string)?;
 
-    let context = precollected_context.unwrap_or_else(|| collect_accessibility_context(&paths));
+    fault_injection::cancellation_checkpoint("before_accessibility", cancellation)?;
+    let context =
+        precollected_context.unwrap_or_else(|| collect_accessibility_context(&paths, cancellation));
     let semantic_fingerprint = SemanticFingerprint::from_context(&context);
     let privacy = privacy_decision(app, &context)?;
     if privacy.skip_capture {
@@ -17454,7 +17990,9 @@ fn capture_frame(
         });
     }
 
-    let window_snapshot = collect_window_snapshot(&paths).ok();
+    fault_injection::cancellation_checkpoint("before_window_snapshot", cancellation)?;
+    let window_snapshot =
+        collect_window_snapshot(&paths, WINDOW_SNAPSHOT_DEADLINE, cancellation).ok();
     // A manual Continue request targets the last verified external surface.
     // Once Smalltalk is frontmost, the current active window is Smalltalk and
     // must never be substituted for a missing external target.
@@ -17464,8 +18002,9 @@ fn capture_frame(
         manual_continue_expectation.is_some(),
     );
 
+    fault_injection::cancellation_checkpoint("before_screenshot", cancellation)?;
     let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
-    let full_capture = capture_screenshot(&paths, &conn, &snapshot_path)?;
+    let full_capture = capture_screenshot(&paths, &conn, &snapshot_path, cancellation)?;
     let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
     let image_hash = stable_hash_bytes(&image_bytes);
     let image_dimensions = jpeg_dimensions(&image_bytes);
@@ -17478,6 +18017,7 @@ fn capture_frame(
             window_id,
             &crop_path,
             context.app_bundle_id.as_deref(),
+            cancellation,
         ) {
             Ok(capture) => Some((crop_path, capture)),
             Err(error) => {
@@ -17497,6 +18037,7 @@ fn capture_frame(
             None,
             Some(expected_bundle),
             false,
+            cancellation,
         ) {
             Ok(capture) => {
                 active_window_id = capture.window_id;
@@ -17534,7 +18075,7 @@ fn capture_frame(
         .as_ref()
         .map(|(path, _)| path.to_path_buf());
 
-    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         let _ = fs::remove_file(&snapshot_path);
         if let Some(path) = active_window_crop_path.as_ref() {
             let _ = fs::remove_file(path);
@@ -17643,9 +18184,10 @@ fn capture_frame(
     } else {
         "active_display"
     };
+    fault_injection::cancellation_checkpoint("before_ocr", cancellation)?;
     let ocr = if accessibility_text.is_none() || a11y_is_thin {
         increment_maintenance_counter(&conn, "ocr_runs", 1)?;
-        run_ocr(&paths, ocr_source_path).unwrap_or_else(|error| OcrOutput {
+        run_ocr(&paths, ocr_source_path, cancellation).unwrap_or_else(|error| OcrOutput {
             error: Some(error),
             ..OcrOutput::default()
         })
@@ -17675,7 +18217,7 @@ fn capture_frame(
     let full_text = full_text.or(legacy_full_text);
     let content_hash = text_resolution.active_content_hash.clone();
 
-    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         let _ = fs::remove_file(&snapshot_path);
         if let Some(path) = active_window_crop_path.as_ref() {
             let _ = fs::remove_file(path);
@@ -17709,7 +18251,7 @@ fn capture_frame(
         });
     }
 
-    if cancellation.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         let _ = fs::remove_file(&snapshot_path);
         if let Some(path) = active_window_crop_path.as_ref() {
             let _ = fs::remove_file(path);
@@ -17723,89 +18265,152 @@ fn capture_frame(
         });
     }
 
-    conn.execute(
-        INSERT_FRAME_SQL,
-        params![
-            captured_at,
-            snapshot_path.to_string_lossy().to_string(),
-            context.app_name.clone(),
-            context.window_name.clone(),
-            context.browser_url.clone(),
-            context.document_path.clone(),
-            true,
-            capture_trigger,
-            text_source,
-            accessibility_text.clone(),
-            accessibility_tree_json,
-            full_text.clone(),
-            content_hash.clone(),
-            image_hash,
-            captured_at,
-            metadata.capture_provider,
-            metadata.scope,
-            metadata.display_id,
-            metadata.window_id,
-            metadata.app_pid,
-            metadata.app_bundle_id,
-            metadata.screen_scale,
+    fault_injection::cancellation_checkpoint("before_persistence", cancellation)?;
+    conn.busy_timeout(Duration::from_millis(500))
+        .map_err(to_string)?;
+    let persistence_result = (|| -> Result<i64, String> {
+        // One short write transaction means Stop can wait on at most one
+        // 500 ms SQLite busy boundary. Cancellation checks between evidence
+        // groups then roll the transaction back instead of leaving a partial
+        // frame or waiting through a series of independent busy timeouts.
+        let tx = conn.unchecked_transaction().map_err(to_string)?;
+        tx.execute(
+            INSERT_FRAME_SQL,
+            params![
+                captured_at,
+                snapshot_path.to_string_lossy().to_string(),
+                context.app_name.clone(),
+                context.window_name.clone(),
+                context.browser_url.clone(),
+                context.document_path.clone(),
+                true,
+                capture_trigger,
+                text_source,
+                accessibility_text.clone(),
+                accessibility_tree_json,
+                full_text.clone(),
+                content_hash.clone(),
+                image_hash,
+                captured_at,
+                metadata.capture_provider,
+                metadata.scope,
+                metadata.display_id,
+                metadata.window_id,
+                metadata.app_pid,
+                metadata.app_bundle_id,
+                metadata.screen_scale,
+                metadata.pixel_width,
+                metadata.pixel_height,
+                metadata.full_screenshot_path,
+                metadata.active_window_crop_path,
+                metadata.active_element_crop_path,
+                metadata.phash,
+                metadata.privacy_status,
+                capture_trigger_id,
+                previous_frame_id,
+                session_id,
+                metadata.sck_display_id,
+                metadata.sck_window_id,
+                metadata.sck_owning_bundle_id,
+                metadata.sck_filter_summary_json,
+                metadata.sck_configuration_summary_json,
+                metadata.sck_frame_metadata_json,
+                metadata.sck_capture_mode,
+                metadata.sck_audio_policy,
+            ],
+        )
+        .map_err(to_string)?;
+
+        let frame_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE capture_sessions
+             SET frame_count = frame_count + 1
+             WHERE id = ?1",
+            params![session_id],
+        )
+        .map_err(to_string)?;
+        capture_persistence_checkpoint(cancellation)?;
+        if let Some(provider) = metadata.active_window_capture_provider.as_deref() {
+            tx.execute(
+                "UPDATE frames SET active_window_capture_provider = ?2 WHERE id = ?1",
+                params![frame_id, provider],
+            )
+            .map_err(to_string)?;
+        }
+        persist_frame_text_resolution(&tx, frame_id, &text_resolution)?;
+        capture_persistence_checkpoint(cancellation)?;
+
+        let mut ocr_text_for_fts = None;
+        if let Some(text) = ocr_text.as_ref() {
+            ocr_text_for_fts = Some(text.clone());
+            tx.execute(
+                "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![frame_id, text, ocr.text_json, ocr.engine],
+            )
+            .map_err(to_string)?;
+        }
+        if let Some(snapshot) = window_snapshot.as_ref() {
+            persist_window_snapshot(&tx, frame_id, snapshot)?;
+        }
+        capture_persistence_checkpoint(cancellation)?;
+
+        let ax_node_ids = persist_ax_nodes(&tx, frame_id, &context)?;
+        capture_persistence_checkpoint(cancellation)?;
+        let ocr_span_ids = persist_ocr_spans(&tx, frame_id, &ocr, &ocr_span_drafts)?;
+        persist_app_contexts(&tx, frame_id, &context)?;
+        capture_persistence_checkpoint(cancellation)?;
+        persist_content_units(
+            &tx,
+            frame_id,
+            &context,
+            &ax_node_ids,
+            &ocr_span_ids,
             metadata.pixel_width,
             metadata.pixel_height,
-            metadata.full_screenshot_path,
-            metadata.active_window_crop_path,
-            metadata.active_element_crop_path,
-            metadata.phash,
-            metadata.privacy_status,
-            capture_trigger_id,
-            previous_frame_id,
-            session_id,
-            metadata.sck_display_id,
-            metadata.sck_window_id,
-            metadata.sck_owning_bundle_id,
-            metadata.sck_filter_summary_json,
-            metadata.sck_configuration_summary_json,
-            metadata.sck_frame_metadata_json,
-            metadata.sck_capture_mode,
-            metadata.sck_audio_policy,
-        ],
-    )
-    .map_err(to_string)?;
-
-    let frame_id = conn.last_insert_rowid();
-    if let Some(provider) = metadata.active_window_capture_provider.as_deref() {
-        conn.execute(
-            "UPDATE frames SET active_window_capture_provider = ?2 WHERE id = ?1",
-            params![frame_id, provider],
+        )?;
+        let content_unit_count = tx
+            .query_row(
+                "SELECT COUNT(*) FROM content_units WHERE frame_id = ?1",
+                params![frame_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(to_string)?;
+        tx.execute(
+            "UPDATE capture_sessions
+             SET content_unit_count = content_unit_count + ?2
+             WHERE id = ?1",
+            params![session_id, content_unit_count],
         )
         .map_err(to_string)?;
-    }
-    persist_frame_text_resolution(&conn, frame_id, &text_resolution)?;
-    let mut ocr_text_for_fts = None;
-    if let Some(text) = ocr_text {
-        ocr_text_for_fts = Some(text.clone());
-        conn.execute(
-            "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![frame_id, text, ocr.text_json, ocr.engine],
-        )
-        .map_err(to_string)?;
-    }
-    if let Some(snapshot) = window_snapshot.as_ref() {
-        persist_window_snapshot(&conn, frame_id, snapshot)?;
-    }
-    let ax_node_ids = persist_ax_nodes(&conn, frame_id, &context)?;
-    let ocr_span_ids = persist_ocr_spans(&conn, frame_id, &ocr, &ocr_span_drafts)?;
-    persist_app_contexts(&conn, frame_id, &context)?;
-    persist_content_units(
-        &conn,
-        frame_id,
-        &context,
-        &ax_node_ids,
-        &ocr_span_ids,
-        metadata.pixel_width,
-        metadata.pixel_height,
-    )?;
-    persist_sensitive_regions(&conn, frame_id, &context, &privacy)?;
-    persist_presence_sample(&conn, session_id, &context)?;
+        persist_sensitive_regions(&tx, frame_id, &context, &privacy)?;
+        persist_presence_sample(&tx, session_id, &context)?;
+        capture_persistence_checkpoint(cancellation)?;
+        if let Some(previous) = previous_frame_id {
+            persist_frame_diff(
+                &tx,
+                session_id,
+                previous,
+                &frame_id.to_string(),
+                capture_trigger,
+                full_text.as_deref(),
+                ocr_text_for_fts.as_deref(),
+            )?;
+        }
+        capture_persistence_checkpoint(cancellation)?;
+        tx.commit().map_err(to_string)?;
+        Ok(frame_id)
+    })();
+    let frame_id = match persistence_result {
+        Ok(frame_id) => frame_id,
+        Err(error) => {
+            let _ = fs::remove_file(&snapshot_path);
+            if let Some(path) = active_window_crop_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
     let stored_frame = CaptureFrame {
         id: frame_id,
         captured_at,
@@ -17850,33 +18455,24 @@ fn capture_frame(
         sck_audio_policy: metadata.sck_audio_policy.clone(),
     };
     let _ = validate_frame_consistency_inner(&conn, &stored_frame);
-    let frame_key = frame_id.to_string();
-    let enrichment_ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap_or_default();
-    let enrichment_ocr_spans = query_ocr_spans(&conn, &frame_key).unwrap_or_default();
-    let enrichment_content_units =
-        query_content_units_for_frame(&conn, &frame_key).unwrap_or_default();
-    let enrichment_app_contexts = query_app_contexts(&conn, &frame_key).unwrap_or_default();
-    let enrichment_events = query_events_for_frame(&conn, &stored_frame).unwrap_or_default();
-    let _ = persist_frame_surface_enrichment(
-        &conn,
-        &stored_frame,
-        &enrichment_content_units,
-        &enrichment_app_contexts,
-        &enrichment_ax_nodes,
-        &enrichment_ocr_spans,
-        &enrichment_events,
-        window_snapshot.as_ref(),
-    );
-    if let Some(previous) = previous_frame_id {
-        persist_frame_diff(
+    if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+        let frame_key = frame_id.to_string();
+        let enrichment_ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap_or_default();
+        let enrichment_ocr_spans = query_ocr_spans(&conn, &frame_key).unwrap_or_default();
+        let enrichment_content_units =
+            query_content_units_for_frame(&conn, &frame_key).unwrap_or_default();
+        let enrichment_app_contexts = query_app_contexts(&conn, &frame_key).unwrap_or_default();
+        let enrichment_events = query_events_for_frame(&conn, &stored_frame).unwrap_or_default();
+        let _ = persist_frame_surface_enrichment(
             &conn,
-            session_id,
-            previous,
-            &frame_id.to_string(),
-            capture_trigger,
-            full_text.as_deref(),
-            ocr_text_for_fts.as_deref(),
-        )?;
+            &stored_frame,
+            &enrichment_content_units,
+            &enrichment_app_contexts,
+            &enrichment_ax_nodes,
+            &enrichment_ocr_spans,
+            &enrichment_events,
+            window_snapshot.as_ref(),
+        );
     }
 
     let mut frame =
@@ -17901,6 +18497,14 @@ fn capture_frame(
         semantic_fingerprint,
         skip_reason: None,
     })
+}
+
+fn capture_persistence_checkpoint(cancellation: Option<&CancellationToken>) -> Result<(), String> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        Err("capture cancelled during persistence".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn persist_window_snapshot(
@@ -19415,7 +20019,13 @@ fn is_manual_or_start_capture(capture_trigger: &str) -> bool {
 fn is_important_capture_trigger(capture_trigger: &str) -> bool {
     matches!(
         capture_trigger,
-        "manual" | "session_start" | "app_switch" | "window_focus" | "clipboard"
+        "manual"
+            | "session_start"
+            | "app_switch"
+            | "window_focus"
+            | "clipboard"
+            | "error"
+            | "permission_change"
     )
 }
 
@@ -19493,13 +20103,14 @@ fn capture_status_snapshot_inner(
     app: &AppHandle,
     runtime_state: &Arc<Mutex<CaptureRuntime>>,
 ) -> Result<CaptureStatus, String> {
+    let status_started = Instant::now();
     let paths = capture_paths(app)?;
     let conn = open_readonly_db(app).ok();
 
     let runtime = runtime_state
         .lock()
-        .map_err(|_| "capture runtime lock poisoned".to_string())?;
-    let running = runtime.running;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let running = runtime.phase.is_publicly_running();
     let started_at = runtime.started_at;
     let last_error = runtime.last_error.clone();
     let runtime_latest_frame = runtime.last_frame.clone();
@@ -19507,6 +20118,17 @@ fn capture_status_snapshot_inner(
     let runtime_last_export = runtime.last_export.clone();
     let skipped_samples = runtime.skipped_samples;
     let last_skipped_at = runtime.last_skipped_at;
+    let lifecycle = RuntimeLifecycleSnapshot {
+        phase: runtime.phase,
+        worker_generation: runtime.worker_generation,
+        last_stop_latency_ms: runtime.last_stop_latency_ms,
+        worker_panic_count: runtime.worker_panic_count,
+        event_pipeline: runtime
+            .event_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.diagnostics())
+            .unwrap_or_default(),
+    };
     drop(runtime);
 
     let active_session = conn.as_ref().and_then(|conn| {
@@ -19546,7 +20168,7 @@ fn capture_status_snapshot_inner(
         .and_then(|conn| local_signal_count(conn, scoped_session_id).ok())
         .unwrap_or(counts.frames);
 
-    Ok(CaptureStatus {
+    let mut status = CaptureStatus {
         running,
         frame_count: counts.frames,
         recent_app_labels,
@@ -19568,8 +20190,53 @@ fn capture_status_snapshot_inner(
         screenshot_tool: Path::new("/usr/sbin/screencapture").exists(),
         accessibility_tool: Path::new("/usr/bin/osascript").exists(),
         ocr_tool: swift_helpers::available("vision_ocr") || command_in_path("tesseract"),
-        runtime_diagnostics: runtime_diagnostics_from_conn(conn.as_ref()),
-    })
+        runtime_diagnostics: runtime_diagnostics_from_conn(conn.as_ref(), Some(lifecycle)),
+    };
+    let response_bytes = serde_json::to_vec(&status)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    record_status_metrics(status_started.elapsed(), response_bytes);
+    status.runtime_diagnostics.status_metrics = status_metrics_snapshot();
+    Ok(status)
+}
+
+fn record_status_metrics(latency: Duration, response_bytes: u64) {
+    let mut metrics = STATUS_METRICS
+        .get_or_init(|| Mutex::new(StatusMetrics::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metrics
+        .latency_us
+        .push_back(latency.as_micros().min(u64::MAX as u128) as u64);
+    while metrics.latency_us.len() > 256 {
+        metrics.latency_us.pop_front();
+    }
+    metrics.last_response_bytes = response_bytes;
+    metrics.max_response_bytes = metrics.max_response_bytes.max(response_bytes);
+}
+
+fn status_metrics_snapshot() -> StatusMetricsSnapshot {
+    let Some(metrics) = STATUS_METRICS.get() else {
+        return StatusMetricsSnapshot::default();
+    };
+    let metrics = metrics
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut sorted = metrics.latency_us.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    StatusMetricsSnapshot {
+        sample_count: sorted.len() as u64,
+        p50_latency_us: sorted
+            .get((sorted.len().saturating_sub(1)) * 50 / 100)
+            .copied()
+            .unwrap_or(0),
+        p95_latency_us: sorted
+            .get((sorted.len().saturating_sub(1)) * 95 / 100)
+            .copied()
+            .unwrap_or(0),
+        last_response_bytes: metrics.last_response_bytes,
+        max_response_bytes: metrics.max_response_bytes,
+    }
 }
 
 fn recent_app_labels(conn: &Connection, session_id: Option<&str>) -> Result<Vec<String>, String> {
@@ -19585,52 +20252,106 @@ fn latest_status_frame(
     session_id: Option<&str>,
 ) -> Result<Option<CaptureFrame>, String> {
     let sql = match session_id {
-        Some(_) => format!(
-            "SELECT {}
+        Some(_) => {
+            "SELECT id, captured_at, app_name, window_name, focused,
+                    capture_trigger, text_source, content_hash, image_hash,
+                    capture_provider, active_window_capture_provider, scope,
+                    display_id, window_id, app_pid, app_bundle_id, screen_scale,
+                    pixel_width, pixel_height, privacy_status, capture_trigger_id,
+                    previous_frame_id, session_id, sck_capture_mode
              FROM frames
              WHERE session_id = ?1
              ORDER BY captured_at DESC, id DESC
-             LIMIT 1",
-            FRAME_COLUMNS
-        ),
-        None => format!(
-            "SELECT {}
+             LIMIT 1"
+        }
+        None => {
+            "SELECT id, captured_at, app_name, window_name, focused,
+                    capture_trigger, text_source, content_hash, image_hash,
+                    capture_provider, active_window_capture_provider, scope,
+                    display_id, window_id, app_pid, app_bundle_id, screen_scale,
+                    pixel_width, pixel_height, privacy_status, capture_trigger_id,
+                    previous_frame_id, session_id, sck_capture_mode
              FROM frames
              ORDER BY captured_at DESC, id DESC
-             LIMIT 1",
-            FRAME_COLUMNS
-        ),
+             LIMIT 1"
+        }
     };
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     if let Some(session_id) = session_id {
-        stmt.query_row(params![session_id], frame_from_row)
+        stmt.query_row(params![session_id], status_frame_from_row)
             .optional()
             .map_err(to_string)
     } else {
-        stmt.query_row([], frame_from_row)
+        stmt.query_row([], status_frame_from_row)
             .optional()
             .map_err(to_string)
     }
+}
+
+fn status_frame_from_row(row: &Row<'_>) -> rusqlite::Result<CaptureFrame> {
+    Ok(CaptureFrame {
+        id: row.get(0)?,
+        captured_at: row.get(1)?,
+        snapshot_path: String::new(),
+        app_name: row.get(2)?,
+        window_name: row.get(3)?,
+        browser_url: None,
+        document_path: None,
+        focused: row.get(4)?,
+        capture_trigger: row.get(5)?,
+        text_source: row.get(6)?,
+        accessibility_text: None,
+        accessibility_tree_json: None,
+        full_text: None,
+        content_hash: row.get(7)?,
+        image_hash: row.get(8)?,
+        capture_provider: row.get(9)?,
+        active_window_capture_provider: row.get(10)?,
+        scope: row.get(11)?,
+        display_id: row.get(12)?,
+        window_id: row.get(13)?,
+        app_pid: row.get(14)?,
+        app_bundle_id: row.get(15)?,
+        screen_scale: row.get(16)?,
+        pixel_width: row.get(17)?,
+        pixel_height: row.get(18)?,
+        full_screenshot_path: None,
+        active_window_crop_path: None,
+        active_element_crop_path: None,
+        phash: None,
+        privacy_status: row.get(19)?,
+        capture_trigger_id: row.get(20)?,
+        previous_frame_id: row.get(21)?,
+        session_id: row.get(22)?,
+        sck_display_id: None,
+        sck_window_id: None,
+        sck_owning_bundle_id: None,
+        sck_filter_summary_json: None,
+        sck_configuration_summary_json: None,
+        sck_frame_metadata_json: None,
+        sck_capture_mode: row.get(23)?,
+        sck_audio_policy: None,
+    })
 }
 
 fn recent_event_app_labels(
     conn: &Connection,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    if !table_exists_in_capture(conn, "ui_events")?
-        || !table_has_column(conn, "ui_events", "app_name")?
-    {
-        return Ok(Vec::new());
-    }
     let sql = match session_id {
         Some(_) => {
             "SELECT app_name
              FROM (
                SELECT app_name, MAX(ts_ms) AS latest_ts
-               FROM ui_events
-               WHERE session_id = ?1
-                 AND app_name IS NOT NULL
-                 AND TRIM(app_name) != ''
+               FROM (
+                 SELECT app_name, ts_ms
+                 FROM ui_events
+                 WHERE session_id = ?1
+                   AND app_name IS NOT NULL
+                   AND TRIM(app_name) != ''
+                 ORDER BY ts_ms DESC
+                 LIMIT 256
+               )
                GROUP BY LOWER(TRIM(app_name))
                ORDER BY latest_ts DESC
                LIMIT 5
@@ -19641,9 +20362,14 @@ fn recent_event_app_labels(
             "SELECT app_name
              FROM (
                SELECT app_name, MAX(ts_ms) AS latest_ts
-               FROM ui_events
-               WHERE app_name IS NOT NULL
-                 AND TRIM(app_name) != ''
+               FROM (
+                 SELECT app_name, ts_ms
+                 FROM ui_events
+                 WHERE app_name IS NOT NULL
+                   AND TRIM(app_name) != ''
+                 ORDER BY ts_ms DESC
+                 LIMIT 256
+               )
                GROUP BY LOWER(TRIM(app_name))
                ORDER BY latest_ts DESC
                LIMIT 5
@@ -19752,17 +20478,8 @@ fn local_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64
 }
 
 fn event_signal_count(conn: &Connection, session_id: Option<&str>) -> Result<i64, String> {
-    if !table_exists_in_capture(conn, "ui_events")? {
-        return Ok(0);
-    }
-    let has_app_name = table_has_column(conn, "ui_events", "app_name")?;
-    let has_window_title = table_has_column(conn, "ui_events", "window_title")?;
-    let app_expr = if has_app_name { "app_name" } else { "NULL" };
-    let window_expr = if has_window_title {
-        "window_title"
-    } else {
-        "NULL"
-    };
+    let app_expr = "app_name";
+    let window_expr = "window_title";
     let sql = match session_id {
         Some(_) => format!(
             "SELECT ts_ms, event_type, key_category, {}, {}
@@ -20976,27 +21693,50 @@ fn create_capture_session(app: &AppHandle) -> Result<CaptureSession, String> {
     load_capture_session(&conn, &id)
 }
 
-fn finish_capture_session(app: &AppHandle, session_id: &str) -> Result<CaptureSession, String> {
+fn finalize_capture_session(
+    app: &AppHandle,
+    session_id: &str,
+    final_status: &str,
+) -> Result<CaptureSession, String> {
     let conn = open_db(app)?;
+    finalize_capture_session_from_conn(&conn, session_id, final_status)
+}
+
+fn finalize_capture_session_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    final_status: &str,
+) -> Result<CaptureSession, String> {
+    if !matches!(final_status, "stopped" | "failed") {
+        return Err("invalid final capture-session status".to_string());
+    }
+    // Stop has a two-second contract. Finalization uses a short busy bound so
+    // a contended writer cannot hold the capture worker past that boundary.
+    conn.busy_timeout(Duration::from_millis(500))
+        .map_err(to_string)?;
     let stopped_at = now_millis();
     conn.execute(
         "UPDATE capture_sessions
-         SET status = 'stopped',
+         SET status = ?3,
              stopped_at_ms = COALESCE(stopped_at_ms, ?2)
-         WHERE id = ?1",
-        params![session_id, stopped_at],
+         WHERE id = ?1
+           AND status = 'running'",
+        params![session_id, stopped_at, final_status],
     )
     .map_err(to_string)?;
-    refresh_session_counts(&conn, session_id)?;
+    let counts = session_status_counts(conn, session_id)?;
     conn.execute(
         "UPDATE capture_sessions
-         SET export_path = NULL
+         SET export_path = NULL,
+             frame_count = ?2,
+             event_count = ?3,
+             transition_count = ?4
          WHERE id = ?1",
-        params![session_id],
+        params![session_id, counts.frames, counts.events, counts.transitions,],
     )
     .map_err(to_string)?;
 
-    load_capture_session(&conn, session_id)
+    load_capture_session_for_status(conn, session_id)
 }
 
 fn next_session_sequence(conn: &Connection) -> Result<i64, String> {
@@ -21080,6 +21820,7 @@ fn load_capture_session_for_status(
     Ok(session)
 }
 
+#[cfg(test)]
 fn refresh_session_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
     let counts = session_counts(conn, session_id)?;
     conn.execute(
@@ -21102,35 +21843,22 @@ fn refresh_session_counts(conn: &Connection, session_id: &str) -> Result<Session
 }
 
 fn session_status_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
-    let content_units = conn
-        .query_row(
-            "SELECT content_unit_count
-             FROM capture_sessions
-             WHERE id = ?1",
-            params![session_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    Ok(SessionCounts {
-        frames: session_count_query(
-            conn,
-            "SELECT COUNT(*) FROM frames WHERE session_id = ?1",
-            session_id,
-        )?,
-        events: session_count_query(
-            conn,
-            "SELECT COUNT(*) FROM ui_events WHERE session_id = ?1",
-            session_id,
-        )?,
-        transitions: session_count_query(
-            conn,
-            "SELECT COUNT(*) FROM event_transitions WHERE session_id = ?1",
-            session_id,
-        )?,
-        content_units,
-        ..SessionCounts::default()
-    })
+    conn.query_row(
+        "SELECT frame_count, event_count, transition_count, content_unit_count
+         FROM capture_sessions
+         WHERE id = ?1",
+        params![session_id],
+        |row| {
+            Ok(SessionCounts {
+                frames: row.get(0)?,
+                events: row.get(1)?,
+                transitions: row.get(2)?,
+                content_units: row.get(3)?,
+                ..SessionCounts::default()
+            })
+        },
+    )
+    .map_err(to_string)
 }
 
 fn session_counts(conn: &Connection, session_id: &str) -> Result<SessionCounts, String> {
@@ -21319,6 +22047,169 @@ const CONTINUE_OUTPUT_LAYER_TABLES: &[&str] = &[
 
 const CONTINUE_OUTPUT_CANDIDATE_TABLES: &[&str] = &["continue_candidates", "continue_decisions"];
 
+fn audit_executor() -> &'static AuditExecutor {
+    AUDIT_EXECUTOR.get_or_init(|| {
+        let state = Arc::new((Mutex::new(AuditExecutorState::default()), Condvar::new()));
+        let worker_state = state.clone();
+        let worker = thread::Builder::new()
+            .name("smalltalk-audit-executor".to_string())
+            .spawn(move || audit_executor_loop(worker_state))
+            .ok();
+        AuditExecutor {
+            state,
+            worker: Mutex::new(worker),
+        }
+    })
+}
+
+impl AuditExecutor {
+    fn schedule(&self, job: ContinueAuditJob) -> bool {
+        if self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutting_down {
+            return false;
+        }
+        if state.active_identity.as_deref() == Some(job.identity.as_str())
+            || state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.identity == job.identity)
+        {
+            state.coalesced = state.coalesced.saturating_add(1);
+            return true;
+        }
+        if let Some(previous) = state.pending.replace(job) {
+            previous.cancellation.cancel();
+            state.superseded = state.superseded.saturating_add(1);
+        }
+        state.submitted = state.submitted.saturating_add(1);
+        changed.notify_one();
+        true
+    }
+
+    fn diagnostics(&self) -> AuditExecutorDiagnostics {
+        let state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        AuditExecutorDiagnostics {
+            active: state.active_identity.is_some(),
+            queued: u64::from(state.pending.is_some()),
+            queue_capacity: 1,
+            submitted: state.submitted,
+            completed: state.completed,
+            failed: state.failed,
+            coalesced: state.coalesced,
+            superseded: state.superseded,
+            shutting_down: state.shutting_down,
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.shutting_down = true;
+        if let Some(cancellation) = state.active_cancellation.as_ref() {
+            cancellation.cancel();
+        }
+        if let Some(pending) = state.pending.take() {
+            pending.cancellation.cancel();
+            state.superseded = state.superseded.saturating_add(1);
+        }
+        changed.notify_all();
+    }
+}
+
+fn audit_executor_loop(shared: Arc<(Mutex<AuditExecutorState>, Condvar)>) {
+    loop {
+        let job = {
+            let (lock, changed) = &*shared;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while state.pending.is_none() && !state.shutting_down {
+                state = changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if state.shutting_down && state.pending.is_none() {
+                return;
+            }
+            let job = state.pending.take();
+            if let Some(job) = job.as_ref() {
+                state.active_identity = Some(job.identity.clone());
+                state.active_cancellation = Some(job.cancellation.clone());
+            }
+            job
+        };
+        let Some(mut job) = job else {
+            continue;
+        };
+        let work_request =
+            crate::workload::WorkRequest::new(crate::workload::WorkClass::AuditExport)
+                .identity(job.identity.clone())
+                .deadline(Duration::from_secs(2))
+                .cancellation(job.cancellation.clone());
+        let export_result = match crate::workload::governor().acquire_request(work_request) {
+            Ok(mut permit) if !permit.is_cancelled() => {
+                let result = (|| -> Result<(), String> {
+                    let conn = open_db_at_path(&job.db_path, true)?;
+                    export_continue_output_audit_to_plan(
+                        &conn,
+                        &job.request,
+                        &job.effective_mode,
+                        &mut job.result,
+                        &job.plan,
+                    )
+                    .map(|_| ())
+                })();
+                if result.is_err() {
+                    permit.mark_failed();
+                }
+                result
+            }
+            Ok(_) => Err("audit export cancelled before execution".to_string()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = export_result.as_ref() {
+            eprintln!("[continue_output_audit] failed: {error}");
+            if let Ok(conn) = open_db_at_path(&job.db_path, true) {
+                let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
+            }
+        }
+        let (lock, changed) = &*shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_identity = None;
+        state.active_cancellation = None;
+        if export_result.is_ok() {
+            state.completed = state.completed.saturating_add(1);
+        } else {
+            state.failed = state.failed.saturating_add(1);
+        }
+        changed.notify_all();
+    }
+}
+
+pub(crate) fn shutdown_audit_executor() {
+    if let Some(executor) = AUDIT_EXECUTOR.get() {
+        executor.shutdown();
+    }
+}
+
+fn audit_executor_diagnostics() -> AuditExecutorDiagnostics {
+    AUDIT_EXECUTOR
+        .get()
+        .map(AuditExecutor::diagnostics)
+        .unwrap_or_default()
+}
+
 fn schedule_continue_output_audit(
     conn: &Connection,
     app: &AppHandle,
@@ -21341,38 +22232,20 @@ fn schedule_continue_output_audit(
     };
 
     let db_path = capture_paths(app)?.db_path;
-    let request = request.clone();
-    let effective_mode = effective_mode.to_string();
     let mut audit_result = result.clone();
     audit_result.continue_output_path = Some(summary.path.clone());
-    thread::spawn(move || {
-        let mut permit =
-            match crate::workload::governor().acquire(crate::workload::WorkClass::AuditExport) {
-                Ok(permit) => permit,
-                Err(error) => {
-                    eprintln!("[continue_output_audit] cancelled: {}", error);
-                    return;
-                }
-            };
-        let export_result = (|| -> Result<(), String> {
-            let conn = open_db_at_path(&db_path, true)?;
-            export_continue_output_audit_to_plan(
-                &conn,
-                &request,
-                &effective_mode,
-                &mut audit_result,
-                &plan,
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = export_result {
-            permit.mark_failed();
-            eprintln!("[continue_output_audit] failed: {}", error);
-            if let Ok(conn) = open_db_at_path(&db_path, true) {
-                let _ = increment_maintenance_counter(&conn, "continue_output_audit_failures", 1);
-            }
-        }
+    let scheduled = audit_executor().schedule(ContinueAuditJob {
+        identity: result.decision_id.clone(),
+        db_path,
+        request: request.clone(),
+        effective_mode: effective_mode.to_string(),
+        result: audit_result,
+        plan,
+        cancellation: crate::workload::WorkCancellationToken::default(),
     });
+    if !scheduled {
+        return Err("bounded audit executor is unavailable or shutting down".to_string());
+    }
 
     Ok(summary)
 }
@@ -25866,8 +26739,21 @@ where
 }
 
 fn ensure_db(app: &AppHandle) -> Result<(), String> {
-    let conn = open_db(app)?;
-    init_db(&conn)
+    let paths = capture_paths(app)?;
+    ensure_database_initialized(&paths)
+}
+
+pub(crate) fn initialize_runtime_database(app: &AppHandle) -> Result<(), String> {
+    ensure_db(app)
+}
+
+pub(crate) fn start_runtime_soak_harness(app: AppHandle) -> Result<(), String> {
+    if runtime_stability::auto_start_capture_requested() {
+        let state = app.state::<CaptureState>();
+        start_capture_impl(app.clone(), state.inner())?;
+    }
+    runtime_stability::start_if_requested(app);
+    Ok(())
 }
 
 fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
@@ -26074,7 +26960,7 @@ fn local_memory_diagnostics(app: &AppHandle) -> Result<LocalMemoryDiagnostics, S
             max_retained_low_value_ui_events: MAX_RETAINED_LOW_VALUE_UI_EVENTS,
             max_diagnostic_rows_per_cleanup: MAX_STORED_DIAGNOSTIC_ROWS_PER_CLEANUP,
         },
-        runtime_diagnostics: runtime_diagnostics_from_conn(Some(&conn)),
+        runtime_diagnostics: runtime_diagnostics_from_conn(Some(&conn), None),
     })
 }
 
@@ -26488,6 +27374,11 @@ fn maybe_run_runtime_maintenance(
 }
 
 fn run_event_ingest_maintenance_diagnostic_only(conn: &Connection) {
+    let Ok(_permit) =
+        crate::workload::governor().try_acquire(crate::workload::WorkClass::MaintenanceCleanup)
+    else {
+        return;
+    };
     if let Err(error) = maybe_run_runtime_maintenance(conn, false) {
         let _ = increment_maintenance_counter(conn, "runtime_maintenance_failure_count", 1);
         let _ = record_maintenance_value(conn, "runtime_maintenance_last_error", &error);
@@ -26720,9 +27611,6 @@ fn max_i64(conn: &Connection, table: &str, column: &str) -> Result<Option<i64>, 
 }
 
 fn maintenance_value(conn: &Connection, key: &str) -> Result<Option<String>, String> {
-    if !table_exists_in_capture(conn, "local_memory_maintenance")? {
-        return Ok(None);
-    }
     conn.query_row(
         "SELECT value FROM local_memory_maintenance WHERE key = ?1",
         params![key],
@@ -26757,99 +27645,173 @@ fn increment_maintenance_counter(conn: &Connection, key: &str, delta: i64) -> Re
     Ok(next)
 }
 
-fn runtime_diagnostics_from_conn(conn: Option<&Connection>) -> RuntimeDiagnostics {
+fn maintenance_snapshot(conn: &Connection) -> Result<HashMap<String, String>, String> {
+    let mut statement = conn
+        .prepare_cached("SELECT key, value FROM local_memory_maintenance")
+        .map_err(to_string)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(to_string)?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(to_string)
+}
+
+fn runtime_diagnostics_from_conn(
+    conn: Option<&Connection>,
+    lifecycle: Option<RuntimeLifecycleSnapshot>,
+) -> RuntimeDiagnostics {
+    let process = process_runner::diagnostics_snapshot();
+    let provider = provider_health::with_registry(|health| health.diagnostics());
+    let lifecycle = lifecycle.unwrap_or_default();
     let Some(conn) = conn else {
-        return RuntimeDiagnostics::default();
+        return RuntimeDiagnostics {
+            capture_runtime_state: lifecycle.phase.as_str().to_string(),
+            worker_generation: lifecycle.worker_generation,
+            current_operation_class: process.current_operation_class,
+            current_operation_started_at_ms: process.current_operation_started_at_ms,
+            last_operation_class: process.last_operation_class,
+            last_operation_duration_ms: process.last_operation_duration_ms,
+            helper_launches: process.helper_launches,
+            helper_successes: process.helper_successes,
+            helper_timeouts: process.helper_timeouts,
+            helper_timeouts_reaped: process.helper_timeouts_reaped,
+            helper_cancellations: process.helper_cancellations,
+            helper_abnormal_exits: process.helper_abnormal_exits,
+            helper_output_limit_failures: process.helper_output_limit_failures,
+            helper_launch_failures: process.helper_launch_failures,
+            active_child_processes: process.active_child_processes,
+            last_safe_error_category: process.last_safe_error_category,
+            stop_latency_ms: lifecycle.last_stop_latency_ms,
+            worker_panic_count: lifecycle.worker_panic_count,
+            provider_health: provider.states,
+            provider_by_operation: provider.providers,
+            fallback_counts_by_operation: provider.fallback_counts,
+            provider_circuit_breaker_opens: provider.circuit_breaker_opens,
+            provider_recovery_probes: provider.recovery_probes,
+            event_pipeline: lifecycle.event_pipeline,
+            schema_initialization_count: SCHEMA_INITIALIZATION_COUNT.load(Ordering::Relaxed),
+            migration_execution_count: MIGRATION_EXECUTION_COUNT.load(Ordering::Relaxed),
+            database_busy_retry_count: DATABASE_BUSY_RETRY_COUNT.load(Ordering::Relaxed),
+            database_busy_time_ms: DATABASE_BUSY_TIME_MS.load(Ordering::Relaxed),
+            database_generation: current_database_generation(),
+            audit_executor: audit_executor_diagnostics(),
+            status_metrics: status_metrics_snapshot(),
+            workload: crate::workload::governor().diagnostics(),
+            ..RuntimeDiagnostics::default()
+        };
+    };
+    let maintenance = maintenance_snapshot(conn).unwrap_or_default();
+    let snapshot_value =
+        |key: &str| -> Result<Option<String>, String> { Ok(maintenance.get(key).cloned()) };
+    let snapshot_i64 = |key: &str| -> Result<i64, String> {
+        Ok(maintenance
+            .get(key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0))
     };
     RuntimeDiagnostics {
+        capture_runtime_state: lifecycle.phase.as_str().to_string(),
+        worker_generation: lifecycle.worker_generation,
+        current_operation_class: process.current_operation_class,
+        current_operation_started_at_ms: process.current_operation_started_at_ms,
+        last_operation_class: process.last_operation_class,
+        last_operation_duration_ms: process.last_operation_duration_ms,
+        helper_launches: process.helper_launches,
+        helper_successes: process.helper_successes,
+        helper_timeouts: process.helper_timeouts,
+        helper_timeouts_reaped: process.helper_timeouts_reaped,
+        helper_cancellations: process.helper_cancellations,
+        helper_abnormal_exits: process.helper_abnormal_exits,
+        helper_output_limit_failures: process.helper_output_limit_failures,
+        helper_launch_failures: process.helper_launch_failures,
+        active_child_processes: process.active_child_processes,
+        last_safe_error_category: process.last_safe_error_category,
+        stop_latency_ms: lifecycle.last_stop_latency_ms,
+        worker_panic_count: lifecycle.worker_panic_count,
+        provider_health: provider.states,
+        provider_by_operation: provider.providers,
+        fallback_counts_by_operation: provider.fallback_counts,
+        provider_circuit_breaker_opens: provider.circuit_breaker_opens,
+        provider_recovery_probes: provider.recovery_probes,
+        event_pipeline: lifecycle.event_pipeline,
+        schema_initialization_count: SCHEMA_INITIALIZATION_COUNT.load(Ordering::Relaxed),
+        migration_execution_count: MIGRATION_EXECUTION_COUNT.load(Ordering::Relaxed),
+        database_busy_retry_count: DATABASE_BUSY_RETRY_COUNT.load(Ordering::Relaxed),
+        database_busy_time_ms: DATABASE_BUSY_TIME_MS.load(Ordering::Relaxed),
+        database_generation: current_database_generation(),
+        audit_executor: audit_executor_diagnostics(),
+        status_metrics: status_metrics_snapshot(),
         workload: crate::workload::governor().diagnostics(),
-        events_received: maintenance_i64(conn, "events_received").unwrap_or(0),
-        events_dropped_at_source: maintenance_i64(conn, "events_dropped_at_source").unwrap_or(0),
-        events_dropped_at_ingest: maintenance_i64(conn, "events_dropped_at_ingest").unwrap_or(0),
-        events_persisted: maintenance_i64(conn, "events_persisted").unwrap_or(0),
-        events_promoted_to_capture: maintenance_i64(conn, "events_promoted_to_capture")
+        events_received: snapshot_i64("events_received").unwrap_or(0),
+        events_dropped_at_source: snapshot_i64("events_dropped_at_source").unwrap_or(0),
+        events_dropped_at_ingest: snapshot_i64("events_dropped_at_ingest").unwrap_or(0),
+        events_persisted: snapshot_i64("events_persisted").unwrap_or(0),
+        events_promoted_to_capture: snapshot_i64("events_promoted_to_capture").unwrap_or(0),
+        heavy_captures_stored: snapshot_i64("heavy_captures_stored").unwrap_or(0),
+        heavy_captures_skipped: snapshot_i64("heavy_captures_skipped").unwrap_or(0),
+        heavy_captures_skipped_budget: snapshot_i64("heavy_captures_skipped_budget").unwrap_or(0),
+        heavy_captures_skipped_dedupe: snapshot_i64("heavy_captures_skipped_dedupe").unwrap_or(0),
+        heavy_captures_skipped_privacy: snapshot_i64("heavy_captures_skipped_privacy").unwrap_or(0),
+        heavy_captures_skipped_cancellation: snapshot_i64("heavy_captures_skipped_cancellation")
             .unwrap_or(0),
-        heavy_captures_stored: maintenance_i64(conn, "heavy_captures_stored").unwrap_or(0),
-        heavy_captures_skipped: maintenance_i64(conn, "heavy_captures_skipped").unwrap_or(0),
-        heavy_captures_skipped_budget: maintenance_i64(conn, "heavy_captures_skipped_budget")
-            .unwrap_or(0),
-        heavy_captures_skipped_dedupe: maintenance_i64(conn, "heavy_captures_skipped_dedupe")
-            .unwrap_or(0),
-        heavy_captures_skipped_privacy: maintenance_i64(conn, "heavy_captures_skipped_privacy")
-            .unwrap_or(0),
-        heavy_captures_skipped_cancellation: maintenance_i64(
-            conn,
-            "heavy_captures_skipped_cancellation",
-        )
-        .unwrap_or(0),
-        heavy_captures_skipped_smalltalk_self: maintenance_i64(
-            conn,
+        heavy_captures_skipped_smalltalk_self: snapshot_i64(
             "heavy_captures_skipped_smalltalk_self",
         )
         .unwrap_or(0),
-        events_aggregated: maintenance_i64(conn, "events_aggregated").unwrap_or(0),
-        ocr_runs: maintenance_i64(conn, "ocr_runs").unwrap_or(0),
-        ax_snapshots: maintenance_i64(conn, "ax_snapshots").unwrap_or(0),
-        continue_normal_calls: maintenance_i64(conn, "continue_normal_calls").unwrap_or(0),
-        continue_rebuild_calls: maintenance_i64(conn, "continue_rebuild_calls").unwrap_or(0),
-        decision_cache_hits: maintenance_i64(conn, "decision_cache_hits").unwrap_or(0),
-        continue_output_audit_failures: maintenance_i64(conn, "continue_output_audit_failures")
+        events_aggregated: snapshot_i64("events_aggregated").unwrap_or(0),
+        ocr_runs: snapshot_i64("ocr_runs").unwrap_or(0),
+        ax_snapshots: snapshot_i64("ax_snapshots").unwrap_or(0),
+        continue_normal_calls: snapshot_i64("continue_normal_calls").unwrap_or(0),
+        continue_rebuild_calls: snapshot_i64("continue_rebuild_calls").unwrap_or(0),
+        decision_cache_hits: snapshot_i64("decision_cache_hits").unwrap_or(0),
+        continue_output_audit_failures: snapshot_i64("continue_output_audit_failures").unwrap_or(0),
+        weak_surface_enrichment_attempts: snapshot_i64("weak_surface_enrichment_attempts")
             .unwrap_or(0),
-        weak_surface_enrichment_attempts: maintenance_i64(conn, "weak_surface_enrichment_attempts")
-            .unwrap_or(0),
-        weak_surface_enrichment_success_strong: maintenance_i64(
-            conn,
+        weak_surface_enrichment_success_strong: snapshot_i64(
             "weak_surface_enrichment_success_strong",
         )
         .unwrap_or(0),
-        weak_surface_enrichment_success_medium: maintenance_i64(
-            conn,
+        weak_surface_enrichment_success_medium: snapshot_i64(
             "weak_surface_enrichment_success_medium",
         )
         .unwrap_or(0),
-        weak_surface_enrichment_success_thin: maintenance_i64(
-            conn,
-            "weak_surface_enrichment_success_thin",
-        )
-        .unwrap_or(0),
-        weak_surface_enrichment_skipped_privacy: maintenance_i64(
-            conn,
+        weak_surface_enrichment_success_thin: snapshot_i64("weak_surface_enrichment_success_thin")
+            .unwrap_or(0),
+        weak_surface_enrichment_skipped_privacy: snapshot_i64(
             "weak_surface_enrichment_skipped_privacy",
         )
         .unwrap_or(0),
-        weak_surface_enrichment_skipped_budget: maintenance_i64(
-            conn,
+        weak_surface_enrichment_skipped_budget: snapshot_i64(
             "weak_surface_enrichment_skipped_budget",
         )
         .unwrap_or(0),
-        weak_surface_enrichment_failed: maintenance_i64(conn, "weak_surface_enrichment_failed")
-            .unwrap_or(0),
-        latest_weak_surface_attempt: maintenance_value(conn, "latest_weak_surface_attempt")
+        weak_surface_enrichment_failed: snapshot_i64("weak_surface_enrichment_failed").unwrap_or(0),
+        latest_weak_surface_attempt: snapshot_value("latest_weak_surface_attempt").unwrap_or(None),
+        latest_weak_surface_snapshot_id: snapshot_value("latest_weak_surface_snapshot_id")
             .unwrap_or(None),
-        latest_weak_surface_snapshot_id: maintenance_value(conn, "latest_weak_surface_snapshot_id")
-            .unwrap_or(None),
-        sck_display_successes: maintenance_i64(conn, "sck_display_successes").unwrap_or(0),
-        sck_active_window_successes: maintenance_i64(conn, "sck_active_window_successes")
+        sck_display_successes: snapshot_i64("sck_display_successes").unwrap_or(0),
+        sck_active_window_successes: snapshot_i64("sck_active_window_successes").unwrap_or(0),
+        sck_active_window_abnormal_exits: snapshot_i64("sck_active_window_abnormal_exits")
             .unwrap_or(0),
-        sck_active_window_abnormal_exits: maintenance_i64(conn, "sck_active_window_abnormal_exits")
-            .unwrap_or(0),
-        sck_timeouts: maintenance_i64(conn, "sck_timeouts").unwrap_or(0),
-        sck_circuit_breaker_opens: maintenance_i64(conn, "sck_circuit_breaker_opens").unwrap_or(0),
-        screencapture_fallbacks: maintenance_i64(conn, "screencapture_fallbacks").unwrap_or(0),
-        latest_sck_capture_mode: maintenance_value(conn, "latest_sck_capture_mode").unwrap_or(None),
-        latest_sck_provider: maintenance_value(conn, "latest_sck_provider").unwrap_or(None),
-        latest_sck_duration_ms: maintenance_value(conn, "latest_sck_duration_ms")
+        sck_timeouts: snapshot_i64("sck_timeouts").unwrap_or(0),
+        sck_circuit_breaker_opens: snapshot_i64("sck_circuit_breaker_opens").unwrap_or(0),
+        screencapture_fallbacks: snapshot_i64("screencapture_fallbacks").unwrap_or(0),
+        latest_sck_capture_mode: snapshot_value("latest_sck_capture_mode").unwrap_or(None),
+        latest_sck_provider: snapshot_value("latest_sck_provider").unwrap_or(None),
+        latest_sck_duration_ms: snapshot_value("latest_sck_duration_ms")
             .unwrap_or(None)
             .and_then(|value| value.parse().ok()),
-        latest_sck_exit_category: maintenance_value(conn, "latest_sck_exit_category")
-            .unwrap_or(None),
-        latest_sck_fallback_used: maintenance_value(conn, "latest_sck_fallback_used")
+        latest_sck_exit_category: snapshot_value("latest_sck_exit_category").unwrap_or(None),
+        latest_sck_fallback_used: snapshot_value("latest_sck_fallback_used")
             .unwrap_or(None)
             .and_then(|value| value.parse().ok()),
-        sck_active_window_circuit_breaker_state: sck_provider_health()
-            .lock()
-            .map(|health| health.active_window_state().to_string())
-            .unwrap_or_else(|_| "unavailable".to_string()),
+        sck_active_window_circuit_breaker_state: provider_health::with_registry(|health| {
+            health
+                .state_label(OperationClass::ActiveWindowScreenshot)
+                .to_string()
+        }),
     }
 }
 
@@ -26863,12 +27825,6 @@ fn table_exists_in_capture(conn: &Connection, table: &str) -> Result<bool, Strin
     )
     .map(|exists| exists != 0)
     .map_err(to_string)
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
-    Ok(table_columns(conn, table)?
-        .iter()
-        .any(|existing| existing == column))
 }
 
 #[cfg(test)]
@@ -26933,9 +27889,11 @@ fn row_count(conn: &Connection, table: &str) -> Result<i64, String> {
 }
 
 fn replace_capture_db(paths: &CapturePaths) -> Result<(), String> {
+    invalidate_database_generation(&paths.db_path);
     drop_capture_db_files(&paths.db_path)?;
     let conn = open_db_at_path(&paths.db_path, true)?;
     init_db(&conn)?;
+    register_initialized_database(&paths.db_path)?;
     ensure_capture_db_empty(&conn)
 }
 
@@ -26992,9 +27950,109 @@ fn clear_directory_contents(dir: &Path) -> Result<(), String> {
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let paths = capture_paths(app)?;
     fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
+    ensure_database_initialized(&paths)?;
+    open_db_at_path(&paths.db_path, true)
+}
+
+fn database_lifecycle() -> &'static Mutex<DatabaseLifecycle> {
+    DATABASE_LIFECYCLE.get_or_init(|| Mutex::new(DatabaseLifecycle::default()))
+}
+
+fn database_file_identity(path: &Path) -> Result<Option<DatabaseFileIdentity>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(DatabaseFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Some(DatabaseFileIdentity {
+            device: 0,
+            inode: metadata.len(),
+        }))
+    }
+}
+
+fn ensure_database_initialized(paths: &CapturePaths) -> Result<(), String> {
+    fs::create_dir_all(&paths.root_dir).map_err(to_string)?;
+    let identity = database_file_identity(&paths.db_path)?;
+    let mut lifecycle = database_lifecycle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if identity.is_some_and(|identity| {
+        lifecycle
+            .initialized
+            .get(&paths.db_path)
+            .is_some_and(|entry| entry.identity == identity)
+    }) {
+        return Ok(());
+    }
+
+    // Initialization is serialized only at the rare startup/replacement
+    // boundary. Ordinary connections never execute schema discovery or DDL.
     let conn = open_db_at_path(&paths.db_path, true)?;
     init_db(&conn)?;
-    Ok(conn)
+    SCHEMA_INITIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    MIGRATION_EXECUTION_COUNT.fetch_add(1, Ordering::Relaxed);
+    let initialized_identity = database_file_identity(&paths.db_path)?
+        .ok_or_else(|| "database initialization did not create a database file".to_string())?;
+    lifecycle.next_generation = lifecycle.next_generation.saturating_add(1);
+    let generation = lifecycle.next_generation;
+    lifecycle.initialized.insert(
+        paths.db_path.clone(),
+        InitializedDatabase {
+            generation,
+            identity: initialized_identity,
+        },
+    );
+    Ok(())
+}
+
+fn register_initialized_database(path: &Path) -> Result<(), String> {
+    let identity = database_file_identity(path)?
+        .ok_or_else(|| "initialized database file is missing".to_string())?;
+    let mut lifecycle = database_lifecycle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    lifecycle.next_generation = lifecycle.next_generation.saturating_add(1);
+    let generation = lifecycle.next_generation;
+    lifecycle.initialized.insert(
+        path.to_path_buf(),
+        InitializedDatabase {
+            generation,
+            identity,
+        },
+    );
+    SCHEMA_INITIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    MIGRATION_EXECUTION_COUNT.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn invalidate_database_generation(path: &Path) {
+    database_lifecycle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .initialized
+        .remove(path);
+}
+
+fn current_database_generation() -> u64 {
+    database_lifecycle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .initialized
+        .values()
+        .map(|entry| entry.generation)
+        .max()
+        .unwrap_or(0)
 }
 
 fn open_db_at_path(db_path: &Path, writable: bool) -> Result<Connection, String> {
@@ -27129,7 +28187,10 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           pre_frame_id TEXT,
           post_frame_id TEXT,
           status TEXT NOT NULL,
-          error TEXT
+          error TEXT,
+          caused_event_count INTEGER NOT NULL DEFAULT 0,
+          omitted_event_count INTEGER NOT NULL DEFAULT 0,
+          aggregation_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_capture_triggers_session_ts
           ON capture_triggers(session_id, ts_ms);
@@ -27686,6 +28747,51 @@ fn ensure_session_columns(conn: &Connection) -> Result<(), String> {
     for table in tables {
         ensure_table_column(conn, table, "session_id", "TEXT")?;
     }
+    for (column, definition) in [
+        ("caused_event_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("omitted_event_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("aggregation_json", "TEXT"),
+    ] {
+        ensure_table_column(conn, "capture_triggers", column, definition)?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ui_events_session_ts
+           ON ui_events(session_id, ts_ms DESC);
+         CREATE INDEX IF NOT EXISTS idx_frames_session_captured
+           ON frames(session_id, captured_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_event_transitions_session_ts
+           ON event_transitions(session_id, ts_end_ms DESC);",
+    )
+    .map_err(to_string)?;
+
+    let counter_backfill_complete = conn
+        .query_row(
+            "SELECT value FROM local_memory_maintenance
+             WHERE key = 'status_counter_backfill_v1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .as_deref()
+        == Some("complete");
+    if !counter_backfill_complete {
+        conn.execute_batch(
+            "UPDATE capture_sessions
+             SET frame_count = (SELECT COUNT(*) FROM frames WHERE frames.session_id = capture_sessions.id),
+                 event_count = (SELECT COUNT(*) FROM ui_events WHERE ui_events.session_id = capture_sessions.id),
+                 transition_count = (SELECT COUNT(*) FROM event_transitions WHERE event_transitions.session_id = capture_sessions.id),
+                 content_unit_count = (
+                   SELECT COUNT(*) FROM content_units
+                   WHERE content_units.frame_id IN (
+                     SELECT CAST(frames.id AS TEXT) FROM frames
+                     WHERE frames.session_id = capture_sessions.id
+                   )
+                 );",
+        )
+        .map_err(to_string)?;
+        record_maintenance_value(conn, "status_counter_backfill_v1", "complete")?;
+    }
     Ok(())
 }
 
@@ -28155,233 +29261,109 @@ fn capture_paths(app: &AppHandle) -> Result<CapturePaths, String> {
     })
 }
 
-#[cfg(target_os = "macos")]
-fn write_cg_image(image: &core_graphics::image::CGImage, path: &Path) -> Result<(), String> {
-    use core_foundation::base::{CFRelease, TCFType};
-    use core_foundation::string::CFString;
-    use core_foundation::url::CFURL;
-    use foreign_types::ForeignType;
-    use std::ffi::c_void;
-
-    type CGImageDestinationRef = *mut c_void;
-    #[link(name = "ImageIO", kind = "framework")]
-    extern "C" {
-        fn CGImageDestinationCreateWithURL(
-            url: core_foundation::url::CFURLRef,
-            type_identifier: core_foundation::string::CFStringRef,
-            count: usize,
-            options: core_foundation::dictionary::CFDictionaryRef,
-        ) -> CGImageDestinationRef;
-        fn CGImageDestinationAddImage(
-            destination: CGImageDestinationRef,
-            image: core_graphics::sys::CGImageRef,
-            properties: core_foundation::dictionary::CFDictionaryRef,
-        );
-        fn CGImageDestinationFinalize(destination: CGImageDestinationRef) -> bool;
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(to_string)?;
-    }
-    let url = CFURL::from_path(path, false)
-        .ok_or_else(|| "failed to create image destination URL".to_string())?;
-    let image_type = CFString::new("public.jpeg");
-    let destination = unsafe {
-        CGImageDestinationCreateWithURL(
-            url.as_concrete_TypeRef(),
-            image_type.as_concrete_TypeRef(),
-            1,
-            std::ptr::null(),
-        )
-    };
-    if destination.is_null() {
-        return Err("failed to create in-process JPEG destination".into());
-    }
-    unsafe {
-        CGImageDestinationAddImage(destination, image.as_ptr(), std::ptr::null());
-    }
-    let finalized = unsafe { CGImageDestinationFinalize(destination) };
-    unsafe {
-        CFRelease(destination.cast());
-    }
-    if !finalized || !path.is_file() {
-        let _ = fs::remove_file(path);
-        return Err("failed to finalize in-process JPEG".into());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn capture_core_graphics_in_process(
-    mode: &str,
-    path: &Path,
-    target_window_id: Option<i64>,
-    target_bundle_id: Option<&str>,
-) -> Result<ScreenshotCapture, String> {
-    use core_graphics::access::ScreenCaptureAccess;
-    use core_graphics::display::CGDisplay;
-    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
-    use core_graphics::window::{
-        create_image, kCGWindowImageBestResolution, kCGWindowImageBoundsIgnoreFraming,
-        kCGWindowListOptionIncludingWindow,
-    };
-
-    // This check never opens System Settings or requests permission. The app
-    // uses only the permission already granted to its own bundle identity.
-    if !ScreenCaptureAccess.preflight() {
-        return Err("main_app_screen_capture_permission_unavailable".into());
-    }
-    let image = if mode == "active_window" {
-        let window_id = target_window_id
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| "active window id was unavailable".to_string())?;
-        let null_bounds = CGRect::new(
-            &CGPoint::new(f64::INFINITY, f64::INFINITY),
-            &CGSize::new(0.0, 0.0),
-        );
-        create_image(
-            null_bounds,
-            kCGWindowListOptionIncludingWindow,
-            window_id,
-            kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
-        )
-        .ok_or_else(|| "in-process active-window capture returned no image".to_string())?
-    } else {
-        CGDisplay::main()
-            .image()
-            .ok_or_else(|| "in-process display capture returned no image".to_string())?
-    };
-    let width = image.width() as i64;
-    let height = image.height() as i64;
-    write_cg_image(&image, path)?;
-    let permission_identity = running_screen_capture_identity();
-    Ok(ScreenshotCapture {
-        provider: "core_graphics_in_process".into(),
-        display_id: (mode != "active_window").then(|| CGDisplay::main().id.to_string()),
-        window_id: target_window_id,
-        // The requested bundle is not observed identity. The caller annotates
-        // this capture from the CGWindow snapshot before trusting it.
-        bundle_id: None,
-        owner_pid: None,
-        owner_name: None,
-        width: Some(width),
-        height: Some(height),
-        filter_summary_json: serde_json::to_string(&serde_json::json!({
-            "scope": mode,
-            "runs_in_permission_bearing_app_process": true,
-            "target_window_id": target_window_id,
-            "target_bundle_id": target_bundle_id,
-        }))
-        .ok(),
-        configuration_summary_json: serde_json::to_string(&serde_json::json!({
-            "profile": if mode == "active_window" { "active_window_still" } else { "display_still" },
-            "width": width,
-            "height": height,
-            "captures_audio": false,
-            "shows_cursor": false,
-        }))
-        .ok(),
-        frame_metadata_json: serde_json::to_string(&serde_json::json!({
-            "provider": "core_graphics_in_process",
-            "permission_identity": permission_identity,
-        }))
-        .ok(),
-        capture_mode: Some("screenshot".into()),
-        audio_policy: Some("disabled".into()),
-        helper_duration_ms: None,
-    })
-}
-
 fn capture_screenshot(
     paths: &CapturePaths,
     conn: &Connection,
     path: &Path,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ScreenshotCapture, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = paths;
-        let started = Instant::now();
-        return match capture_core_graphics_in_process("display", path, None, None) {
-            Ok(capture) => {
-                increment_maintenance_counter(conn, "in_process_display_successes", 1)?;
-                record_sck_operation(
-                    conn,
-                    "display",
-                    "core_graphics_in_process",
-                    started.elapsed().as_millis() as i64,
-                    HelperExitCategory::Success,
-                    false,
-                )?;
-                Ok(capture)
-            }
-            Err(error) => {
-                record_sck_operation(
-                    conn,
-                    "display",
-                    "core_graphics_in_process",
-                    started.elapsed().as_millis() as i64,
-                    HelperExitCategory::LaunchFailure,
-                    false,
-                )?;
-                Err(error)
-            }
-        };
-    }
-
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (paths, conn);
-        return capture_screenshot_cli(path);
+        return capture_screenshot_cli(path, cancellation);
     }
 
-    #[allow(unreachable_code)]
-    if cfg!(target_os = "macos") {
-        match capture_sck_screenshot(paths, "display", path, None, None, false) {
-            Ok(capture) => {
-                increment_maintenance_counter(conn, "sck_display_successes", 1)?;
-                record_sck_operation(
-                    conn,
-                    "display",
-                    "screen_capture_kit",
-                    capture.helper_duration_ms.unwrap_or(0),
-                    HelperExitCategory::Success,
-                    false,
-                )?;
-                return Ok(capture);
-            }
-            Err(failure) => {
-                if failure.category == HelperExitCategory::Timeout {
-                    increment_maintenance_counter(conn, "sck_timeouts", 1)?;
+    #[cfg(target_os = "macos")]
+    {
+        let decision = provider_health::with_registry(|health| {
+            health.decision(OperationClass::FullDisplayScreenshot, Instant::now())
+        });
+        if decision != AttemptDecision::Skip {
+            match capture_sck_screenshot(paths, "display", path, None, None, false, cancellation) {
+                Ok(capture) => {
+                    provider_health::with_registry(|health| {
+                        health.record_success(OperationClass::FullDisplayScreenshot);
+                        health.record_provider(
+                            OperationClass::FullDisplayScreenshot,
+                            "screen_capture_kit",
+                            false,
+                        );
+                    });
+                    increment_maintenance_counter(conn, "sck_display_successes", 1)?;
+                    record_sck_operation(
+                        conn,
+                        "display",
+                        "screen_capture_kit",
+                        capture.helper_duration_ms.unwrap_or(0),
+                        HelperExitCategory::Success,
+                        false,
+                    )?;
+                    return Ok(capture);
                 }
-                let fallback = capture_screenshot_cli(path);
-                let fallback_used = fallback.is_ok();
-                if fallback_used {
-                    increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
-                }
-                record_sck_operation(
-                    conn,
-                    "display",
+                Err(failure) => {
+                    if failure.category == HelperExitCategory::Cancelled {
+                        return Err(failure.message);
+                    }
+                    record_provider_failure(conn, OperationClass::FullDisplayScreenshot, &failure)?;
+                    let fallback = capture_screenshot_cli(path, cancellation);
+                    let fallback_used = fallback.is_ok();
                     if fallback_used {
-                        "screencapture_cli"
-                    } else {
-                        "screen_capture_kit"
-                    },
-                    failure.duration_ms,
-                    failure.category,
-                    fallback_used,
-                )?;
-                return fallback.map_err(|cli_error| {
-                    format!(
-                        "ScreenCaptureKit failed: {}; screencapture fallback failed: {}",
-                        failure.message, cli_error
-                    )
-                });
+                        provider_health::with_registry(|health| {
+                            health.record_provider(
+                                OperationClass::FullDisplayScreenshot,
+                                "screencapture_cli",
+                                true,
+                            )
+                        });
+                        increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
+                    }
+                    record_sck_operation(
+                        conn,
+                        "display",
+                        if fallback_used {
+                            "screencapture_cli"
+                        } else {
+                            "screen_capture_kit"
+                        },
+                        failure.duration_ms,
+                        failure.category,
+                        fallback_used,
+                    )?;
+                    return fallback.map_err(|fallback_error| {
+                        format!(
+                            "ScreenCaptureKit display capture failed: {}; screencapture fallback failed: {}",
+                            failure.message, fallback_error
+                        )
+                    });
+                }
             }
         }
+        let fallback = capture_screenshot_cli(path, cancellation);
+        let fallback_used = fallback.is_ok();
+        if fallback_used {
+            provider_health::with_registry(|health| {
+                health.record_provider(
+                    OperationClass::FullDisplayScreenshot,
+                    "screencapture_cli",
+                    true,
+                )
+            });
+            increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
+        }
+        record_sck_operation(
+            conn,
+            "display",
+            if fallback_used {
+                "screencapture_cli"
+            } else {
+                "screen_capture_kit"
+            },
+            0,
+            HelperExitCategory::StructuredHelperError,
+            fallback_used,
+        )?;
+        fallback.map_err(|error| format!("display provider breaker open; {error}"))
     }
-
-    capture_screenshot_cli(path)
 }
 
 fn capture_window_screenshot(
@@ -28390,48 +29372,24 @@ fn capture_window_screenshot(
     window_id: i64,
     path: &Path,
     target_bundle_id: Option<&str>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ScreenshotCapture, String> {
     #[cfg(target_os = "macos")]
     {
-        let started = Instant::now();
-        let core_graphics_error = match capture_core_graphics_in_process(
-            "active_window",
-            path,
-            Some(window_id),
-            target_bundle_id,
-        ) {
-            Ok(capture) => {
-                increment_maintenance_counter(conn, "in_process_active_window_successes", 1)?;
-                record_sck_operation(
-                    conn,
-                    "active_window",
-                    "core_graphics_in_process",
-                    started.elapsed().as_millis() as i64,
-                    HelperExitCategory::Success,
-                    false,
-                )?;
-                return Ok(capture);
-            }
-            Err(error) => {
-                record_sck_operation(
-                    conn,
-                    "active_window",
-                    "core_graphics_in_process",
-                    started.elapsed().as_millis() as i64,
-                    HelperExitCategory::LaunchFailure,
-                    false,
-                )?;
-                error
-            }
-        };
-        let decision = sck_provider_health()
-            .lock()
-            .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
-            .active_window_decision(Instant::now());
-        if decision == CircuitBreakerDecision::Skip {
-            let fallback = capture_window_screenshot_cli(window_id, path);
+        let decision = provider_health::with_registry(|health| {
+            health.decision(OperationClass::ActiveWindowScreenshot, Instant::now())
+        });
+        if decision == AttemptDecision::Skip {
+            let fallback = capture_window_screenshot_cli(window_id, path, cancellation);
             let fallback_used = fallback.is_ok();
             if fallback_used {
+                provider_health::with_registry(|health| {
+                    health.record_provider(
+                        OperationClass::ActiveWindowScreenshot,
+                        "screencapture_cli",
+                        true,
+                    )
+                });
                 increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
             }
             record_sck_operation(
@@ -28443,12 +29401,12 @@ fn capture_window_screenshot(
                     "screen_capture_kit"
                 },
                 0,
-                HelperExitCategory::CircuitBreakerSkip,
+                HelperExitCategory::StructuredHelperError,
                 fallback_used,
             )?;
             return fallback.map_err(|cli_error| {
                 format!(
-                    "Core Graphics active-window capture failed: {core_graphics_error}; ScreenCaptureKit was unavailable; screencapture fallback failed: {cli_error}"
+                    "active-window provider breaker open; screencapture fallback failed: {cli_error}"
                 )
             });
         }
@@ -28459,12 +29417,17 @@ fn capture_window_screenshot(
             Some(window_id),
             target_bundle_id,
             false,
+            cancellation,
         ) {
             Ok(capture) => {
-                sck_provider_health()
-                    .lock()
-                    .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
-                    .record_active_window_success();
+                provider_health::with_registry(|health| {
+                    health.record_success(OperationClass::ActiveWindowScreenshot);
+                    health.record_provider(
+                        OperationClass::ActiveWindowScreenshot,
+                        "screen_capture_kit",
+                        false,
+                    );
+                });
                 increment_maintenance_counter(conn, "sck_active_window_successes", 1)?;
                 record_sck_operation(
                     conn,
@@ -28477,27 +29440,20 @@ fn capture_window_screenshot(
                 return Ok(capture);
             }
             Err(failure) => {
-                if matches!(
-                    failure.category,
-                    HelperExitCategory::AbnormalTermination | HelperExitCategory::Timeout
-                ) {
-                    if failure.category == HelperExitCategory::AbnormalTermination {
-                        increment_maintenance_counter(conn, "sck_active_window_abnormal_exits", 1)?;
-                    }
-                    if failure.category == HelperExitCategory::Timeout {
-                        increment_maintenance_counter(conn, "sck_timeouts", 1)?;
-                    }
-                    let opened = sck_provider_health()
-                        .lock()
-                        .map_err(|_| "ScreenCaptureKit provider health lock poisoned".to_string())?
-                        .record_active_window_abnormal_exit(Instant::now());
-                    if opened {
-                        increment_maintenance_counter(conn, "sck_circuit_breaker_opens", 1)?;
-                    }
+                if failure.category == HelperExitCategory::Cancelled {
+                    return Err(failure.message);
                 }
-                let fallback = capture_window_screenshot_cli(window_id, path);
+                record_provider_failure(conn, OperationClass::ActiveWindowScreenshot, &failure)?;
+                let fallback = capture_window_screenshot_cli(window_id, path, cancellation);
                 let fallback_used = fallback.is_ok();
                 if fallback_used {
+                    provider_health::with_registry(|health| {
+                        health.record_provider(
+                            OperationClass::ActiveWindowScreenshot,
+                            "screencapture_cli",
+                            true,
+                        )
+                    });
                     increment_maintenance_counter(conn, "screencapture_fallbacks", 1)?;
                 }
                 record_sck_operation(
@@ -28514,8 +29470,8 @@ fn capture_window_screenshot(
                 )?;
                 return fallback.map_err(|cli_error| {
                     format!(
-                        "Core Graphics active-window capture failed: {}; ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
-                        core_graphics_error, failure.message, cli_error
+                        "ScreenCaptureKit active-window capture failed: {}; screencapture fallback failed: {}",
+                        failure.message, cli_error
                     )
                 });
             }
@@ -28525,8 +29481,27 @@ fn capture_window_screenshot(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (paths, conn, target_bundle_id);
-        capture_window_screenshot_cli(window_id, path)
+        capture_window_screenshot_cli(window_id, path, cancellation)
     }
+}
+
+fn sck_screenshot_request(
+    mode: &str,
+    path: &Path,
+    target_window_id: Option<i64>,
+    target_bundle_id: Option<&str>,
+    include_cursor: bool,
+) -> Value {
+    serde_json::json!({
+        "mode": mode,
+        "target_window_id": target_window_id,
+        "target_bundle_id": target_bundle_id,
+        "exclude_bundle_ids": ["com.smalltalk.app"],
+        "exclude_process_ids": [std::process::id()],
+        "output_path": path.to_string_lossy(),
+        "quality": 0.82,
+        "include_cursor": include_cursor
+    })
 }
 
 fn capture_sck_screenshot(
@@ -28536,6 +29511,7 @@ fn capture_sck_screenshot(
     target_window_id: Option<i64>,
     target_bundle_id: Option<&str>,
     include_cursor: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ScreenshotCapture, SckCaptureFailure> {
     let started = Instant::now();
     let helper_path =
@@ -28544,21 +29520,41 @@ fn capture_sck_screenshot(
             duration_ms: started.elapsed().as_millis() as i64,
             message,
         })?;
-    let request = serde_json::json!({
-        "mode": mode,
-        "target_window_id": target_window_id,
-        "target_bundle_id": target_bundle_id,
-        "exclude_bundle_ids": ["com.smalltalk.app"],
-        "output_path": path.to_string_lossy(),
-        "quality": 0.82,
-        "include_cursor": include_cursor
-    });
+    let request = sck_screenshot_request(
+        mode,
+        path,
+        target_window_id,
+        target_bundle_id,
+        include_cursor,
+    );
     let mut command = Command::new(helper_path);
     command.arg(request.to_string());
-    let execution = run_sck_helper(&mut command, SCK_HELPER_TIMEOUT);
+    let deadline = if mode == "active_window" {
+        SCK_ACTIVE_WINDOW_DEADLINE
+    } else {
+        SCK_DISPLAY_DEADLINE
+    };
+    let no_cancellation = CancellationToken::default();
+    let operation = if mode == "active_window" {
+        "screencapturekit_active_window"
+    } else {
+        "screencapturekit_full_display"
+    };
+    let execution = run_sck_helper_with_cancellation(
+        operation,
+        &mut command,
+        deadline,
+        cancellation.unwrap_or(&no_cancellation),
+    );
 
     if execution.category == HelperExitCategory::Success && path.exists() {
-        let response = execution.response.expect("successful helper has response");
+        let Some(response) = execution.response else {
+            return Err(SckCaptureFailure {
+                category: HelperExitCategory::InvalidResponse,
+                duration_ms: execution.duration_ms,
+                message: "ScreenCaptureKit helper success had no response".to_string(),
+            });
+        };
         return Ok(ScreenshotCapture {
             provider: response.provider,
             display_id: response.captured_display_id,
@@ -28603,132 +29599,33 @@ fn capture_sck_screenshot(
     })
 }
 
-fn run_command_output_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-    label: &str,
-) -> Result<Output, String> {
-    let started = Instant::now();
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("{label} failed to start: {error}"))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-
-    let mut timed_out = false;
-    let mut wait_error = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
-            }
-            Err(error) => {
-                wait_error = Some(error.to_string());
-                let _ = child.kill();
-                break child.wait().ok();
-            }
-        }
-    };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    if timed_out {
-        return Err(format!(
-            "{label} timed out after {} ms",
-            timeout.as_millis()
-        ));
-    }
-    if let Some(error) = wait_error {
-        return Err(format!("{label} failed while waiting: {error}"));
-    }
-    let status = status.ok_or_else(|| format!("{label} exited without a status"))?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+#[cfg(test)]
+fn run_sck_helper(command: &mut Command, timeout: Duration) -> HelperExecutionResult {
+    run_sck_helper_with_cancellation(
+        "screencapturekit_test",
+        command,
+        timeout,
+        &CancellationToken::default(),
+    )
 }
 
-fn run_sck_helper(command: &mut Command, timeout: Duration) -> HelperExecutionResult {
-    let started = Instant::now();
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return HelperExecutionResult {
-                category: HelperExitCategory::LaunchFailure,
-                response: None,
-                stderr: error.to_string(),
-                duration_ms: started.elapsed().as_millis() as i64,
-            }
-        }
-    };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
-            }
-            Err(_) => {
-                let _ = child.kill();
-                break child.wait().ok();
-            }
-        }
-    };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default())
-        .trim()
-        .to_string();
-    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+fn run_sck_helper_with_cancellation(
+    operation: &'static str,
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> HelperExecutionResult {
+    let program = PathBuf::from(command.get_program());
+    let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+    let mut output = run_process(
+        ProcessSpec::new(operation, program, timeout)
+            .args(args)
+            .output_limits(256 * 1024, 64 * 1024),
+        cancellation,
+    );
+    let stdout = output.stdout_text();
     let response = serde_json::from_str::<SckScreenshotResponse>(&stdout).ok();
-    let category = if timed_out {
-        HelperExitCategory::Timeout
-    } else if status.as_ref().and_then(|status| status.signal()).is_some() {
-        HelperExitCategory::AbnormalTermination
-    } else if status.as_ref().is_some_and(|status| status.success()) {
+    let category = if output.category == HelperExitCategory::Success {
         match response.as_ref() {
             Some(response) if response.ok => HelperExitCategory::Success,
             Some(_) => HelperExitCategory::StructuredHelperError,
@@ -28737,14 +29634,53 @@ fn run_sck_helper(command: &mut Command, timeout: Duration) -> HelperExecutionRe
     } else if response.as_ref().is_some_and(|response| !response.ok) {
         HelperExitCategory::StructuredHelperError
     } else {
-        HelperExitCategory::NonZeroExit
+        output.category
     };
+    output.reclassify(category);
     HelperExecutionResult {
         category,
         response,
-        stderr,
-        duration_ms: started.elapsed().as_millis() as i64,
+        stderr: output.stderr_text(),
+        duration_ms: output.duration_ms,
     }
+}
+
+fn record_provider_failure(
+    conn: &Connection,
+    operation: OperationClass,
+    failure: &SckCaptureFailure,
+) -> Result<(), String> {
+    if failure.category == HelperExitCategory::Timeout {
+        increment_maintenance_counter(conn, "sck_timeouts", 1)?;
+    }
+    if failure.category == HelperExitCategory::SignalOrAbnormalTermination {
+        increment_maintenance_counter(conn, "sck_active_window_abnormal_exits", 1)?;
+    }
+    let severe = matches!(
+        failure.category,
+        HelperExitCategory::SignalOrAbnormalTermination
+            | HelperExitCategory::Timeout
+            | HelperExitCategory::OutputLimitExceeded
+    );
+    let opened = provider_health::with_registry(|health| {
+        health.record_failure(operation, Instant::now(), severe)
+    });
+    if opened {
+        increment_maintenance_counter(conn, "sck_circuit_breaker_opens", 1)?;
+    }
+    Ok(())
+}
+
+fn record_non_screenshot_provider_failure(operation: OperationClass, category: HelperExitCategory) {
+    let severe = matches!(
+        category,
+        HelperExitCategory::SignalOrAbnormalTermination
+            | HelperExitCategory::Timeout
+            | HelperExitCategory::OutputLimitExceeded
+    );
+    provider_health::with_registry(|health| {
+        health.record_failure(operation, Instant::now(), severe);
+    });
 }
 
 fn record_sck_operation(
@@ -28767,58 +29703,79 @@ fn record_sck_operation(
     Ok(())
 }
 
-fn capture_screenshot_cli(path: &Path) -> Result<ScreenshotCapture, String> {
-    let output = run_command_output_with_timeout(
-        Command::new("/usr/sbin/screencapture")
-            .arg("-x")
-            .arg("-t")
-            .arg("jpg")
-            .arg(path),
-        CAPTURE_HELPER_TIMEOUT,
-        "screencapture",
-    )
-    .map_err(|error| {
-        let _ = fs::remove_file(path);
-        error
-    })?;
+fn capture_screenshot_cli(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ScreenshotCapture, String> {
+    let no_cancellation = CancellationToken::default();
+    let output = run_process(
+        ProcessSpec::new(
+            "screencapture_display_fallback",
+            "/usr/sbin/screencapture",
+            SCREENCAPTURE_DEADLINE,
+        )
+        .args([
+            OsString::from("-x"),
+            OsString::from("-t"),
+            OsString::from("jpg"),
+            path.as_os_str().to_os_string(),
+        ])
+        .output_limits(16 * 1024, 64 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
 
-    if output.status.success() && path.exists() {
+    if output.success() && path.exists() {
         Ok(screenshot_capture_from_file("screencapture_cli", path))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_file(path);
+        let stderr = output.stderr_text();
         Err(if stderr.is_empty() {
-            "screencapture failed; Screen Recording permission may be missing".to_string()
+            format!(
+                "screencapture failed ({}); Screen Recording permission may be missing",
+                output.category.as_str()
+            )
         } else {
             stderr
         })
     }
 }
 
-fn capture_window_screenshot_cli(window_id: i64, path: &Path) -> Result<ScreenshotCapture, String> {
-    let output = run_command_output_with_timeout(
-        Command::new("/usr/sbin/screencapture")
-            .arg("-x")
-            .arg("-t")
-            .arg("jpg")
-            .arg("-l")
-            .arg(window_id.to_string())
-            .arg(path),
-        CAPTURE_HELPER_TIMEOUT,
-        "window screencapture",
-    )
-    .map_err(|error| {
-        let _ = fs::remove_file(path);
-        error
-    })?;
+fn capture_window_screenshot_cli(
+    window_id: i64,
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ScreenshotCapture, String> {
+    let no_cancellation = CancellationToken::default();
+    let output = run_process(
+        ProcessSpec::new(
+            "screencapture_active_window_fallback",
+            "/usr/sbin/screencapture",
+            SCREENCAPTURE_DEADLINE,
+        )
+        .args([
+            OsString::from("-x"),
+            OsString::from("-t"),
+            OsString::from("jpg"),
+            OsString::from("-l"),
+            OsString::from(window_id.to_string()),
+            path.as_os_str().to_os_string(),
+        ])
+        .output_limits(16 * 1024, 64 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
 
-    if output.status.success() && path.exists() {
+    if output.success() && path.exists() {
         let mut capture = screenshot_capture_from_file("screencapture_cli", path);
         capture.window_id = Some(window_id);
         Ok(capture)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_file(path);
+        let stderr = output.stderr_text();
         Err(if stderr.is_empty() {
-            "active-window crop failed".to_string()
+            format!(
+                "active-window screencapture failed ({})",
+                output.category.as_str()
+            )
         } else {
             stderr
         })
@@ -28894,28 +29851,67 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(i64, i64)> {
     None
 }
 
-fn collect_window_snapshot(_paths: &CapturePaths) -> Result<WindowSnapshotPayload, String> {
+fn collect_window_snapshot(
+    _paths: &CapturePaths,
+    deadline: Duration,
+    cancellation: Option<&CancellationToken>,
+) -> Result<WindowSnapshotPayload, String> {
     if !cfg!(target_os = "macos") {
         return Err("window graph capture is only implemented for macOS".to_string());
     }
 
-    let helper_path = swift_helpers::resolve("window_snapshot")?;
-    let output = run_command_output_with_timeout(
-        &mut Command::new(helper_path),
-        CAPTURE_HELPER_TIMEOUT,
-        "window snapshot helper",
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let decision = provider_health::with_registry(|health| {
+        health.decision(OperationClass::WindowSnapshot, Instant::now())
+    });
+    if decision == AttemptDecision::Skip {
+        return Err("window snapshot provider is cooling down".to_string());
+    }
+
+    let helper_path = swift_helpers::resolve("window_snapshot").map_err(|error| {
+        record_non_screenshot_provider_failure(
+            OperationClass::WindowSnapshot,
+            HelperExitCategory::LaunchFailure,
+        );
+        error
+    })?;
+    let no_cancellation = CancellationToken::default();
+    let mut output = run_process(
+        ProcessSpec::new("window_snapshot", helper_path, deadline)
+            .output_limits(4 * 1024 * 1024, 128 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
+    if !output.success() {
+        record_non_screenshot_provider_failure(OperationClass::WindowSnapshot, output.category);
+        let stderr = output.stderr_text();
         return Err(if stderr.is_empty() {
-            "window snapshot helper failed".to_string()
+            format!(
+                "window snapshot helper failed ({})",
+                output.category.as_str()
+            )
         } else {
             stderr
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).map_err(to_string)
+    let parsed = serde_json::from_slice::<WindowSnapshotPayload>(&output.stdout)
+        .map_err(|error| format!("window snapshot invalid response: {error}"));
+    match parsed {
+        Ok(snapshot) => {
+            provider_health::with_registry(|health| {
+                health.record_success(OperationClass::WindowSnapshot);
+                health.record_provider(OperationClass::WindowSnapshot, "swift_sidecar", false);
+            });
+            Ok(snapshot)
+        }
+        Err(error) => {
+            output.reclassify(HelperExitCategory::InvalidResponse);
+            record_non_screenshot_provider_failure(
+                OperationClass::WindowSnapshot,
+                HelperExitCategory::InvalidResponse,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn privacy_decision(
@@ -29111,19 +30107,53 @@ fn validate_exclusion_rule(rule_type: &str, pattern: &str) -> Result<(), String>
     Ok(())
 }
 
-fn collect_accessibility_context(paths: &CapturePaths) -> AccessibilityContext {
-    match collect_accessibility_context_native(paths) {
+fn collect_accessibility_context(
+    paths: &CapturePaths,
+    cancellation: Option<&CancellationToken>,
+) -> AccessibilityContext {
+    collect_accessibility_context_bounded(
+        paths,
+        ACCESSIBILITY_DEADLINE,
+        ACCESSIBILITY_APPLESCRIPT_DEADLINE,
+        cancellation,
+    )
+}
+
+fn collect_accessibility_context_bounded(
+    paths: &CapturePaths,
+    native_deadline: Duration,
+    fallback_deadline: Duration,
+    cancellation: Option<&CancellationToken>,
+) -> AccessibilityContext {
+    let decision = provider_health::with_registry(|health| {
+        health.decision(OperationClass::AccessibilitySnapshot, Instant::now())
+    });
+    if decision == AttemptDecision::Skip {
+        return collect_accessibility_context_applescript(fallback_deadline, cancellation);
+    }
+    match collect_accessibility_context_native(paths, native_deadline, cancellation) {
         Ok(context) if context_has_accessibility_signal(&context) => return context,
         Ok(context) if context.error.is_none() => return context,
         Ok(native_context) => {
-            let mut fallback = collect_accessibility_context_applescript();
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return native_context;
+            }
+            let mut fallback =
+                collect_accessibility_context_applescript(fallback_deadline, cancellation);
             if !context_has_accessibility_signal(&fallback) {
                 fallback.error = native_context.error.or(fallback.error);
             }
             fallback
         }
         Err(native_error) => {
-            let mut fallback = collect_accessibility_context_applescript();
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return AccessibilityContext {
+                    error: Some(native_error),
+                    ..AccessibilityContext::default()
+                };
+            }
+            let mut fallback =
+                collect_accessibility_context_applescript(fallback_deadline, cancellation);
             if !context_has_accessibility_signal(&fallback) {
                 fallback.error = Some(match fallback.error {
                     Some(fallback_error) => format!(
@@ -29140,27 +30170,55 @@ fn collect_accessibility_context(paths: &CapturePaths) -> AccessibilityContext {
 
 fn collect_accessibility_context_native(
     _paths: &CapturePaths,
+    deadline: Duration,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<AccessibilityContext, String> {
     if !cfg!(target_os = "macos") {
         return Err("native accessibility capture is only implemented for macOS".to_string());
     }
 
-    let helper_path = swift_helpers::resolve("accessibility_snapshot")?;
-    let output = run_command_output_with_timeout(
-        &mut Command::new(helper_path),
-        CAPTURE_HELPER_TIMEOUT,
-        "accessibility helper",
-    )?;
+    let helper_path = swift_helpers::resolve("accessibility_snapshot").map_err(|error| {
+        record_non_screenshot_provider_failure(
+            OperationClass::AccessibilitySnapshot,
+            HelperExitCategory::LaunchFailure,
+        );
+        error
+    })?;
+    let no_cancellation = CancellationToken::default();
+    let mut output = run_process(
+        ProcessSpec::new("accessibility_snapshot", helper_path, deadline)
+            .output_limits(8 * 1024 * 1024, 128 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut context = parse_accessibility_output(&stdout);
-    if output.status.success() {
+    let mut context = parse_accessibility_output(&output.stdout_text());
+    if output.success() && context.error.is_none() && context_has_accessibility_signal(&context) {
+        provider_health::with_registry(|health| {
+            health.record_success(OperationClass::AccessibilitySnapshot);
+            health.record_provider(
+                OperationClass::AccessibilitySnapshot,
+                "swift_sidecar",
+                false,
+            );
+        });
         Ok(context)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.success() {
+            let category = if context.error.is_some() {
+                HelperExitCategory::StructuredHelperError
+            } else {
+                HelperExitCategory::InvalidResponse
+            };
+            output.reclassify(category);
+        }
+        record_non_screenshot_provider_failure(
+            OperationClass::AccessibilitySnapshot,
+            output.category,
+        );
+        let stderr = output.stderr_text();
         if context.error.is_none() {
             context.error = Some(if stderr.is_empty() {
-                "accessibility helper failed".to_string()
+                format!("accessibility helper failed ({})", output.category.as_str())
             } else {
                 stderr
             });
@@ -29169,34 +30227,49 @@ fn collect_accessibility_context_native(
     }
 }
 
-fn collect_accessibility_context_applescript() -> AccessibilityContext {
-    let output = run_command_output_with_timeout(
-        Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(ACCESSIBILITY_SCRIPT),
-        CAPTURE_HELPER_TIMEOUT,
-        "accessibility AppleScript",
+fn collect_accessibility_context_applescript(
+    deadline: Duration,
+    cancellation: Option<&CancellationToken>,
+) -> AccessibilityContext {
+    let no_cancellation = CancellationToken::default();
+    let mut output = run_process(
+        ProcessSpec::new(
+            "accessibility_applescript_fallback",
+            "/usr/bin/osascript",
+            deadline,
+        )
+        .args([OsString::from("-e"), OsString::from(ACCESSIBILITY_SCRIPT)])
+        .output_limits(8 * 1024 * 1024, 128 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
     );
 
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return AccessibilityContext {
-                error: Some(format!("osascript failed to start: {}", error)),
-                ..AccessibilityContext::default()
-            }
-        }
-    };
-
-    if !output.status.success() {
+    if !output.success() {
         return AccessibilityContext {
-            error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            error: Some(if output.stderr_text().is_empty() {
+                format!(
+                    "accessibility AppleScript failed ({})",
+                    output.category.as_str()
+                )
+            } else {
+                output.stderr_text()
+            }),
             ..AccessibilityContext::default()
         };
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_accessibility_output(&stdout)
+    let context = parse_accessibility_output(&output.stdout_text());
+    if !context_has_accessibility_signal(&context) && context.error.is_none() {
+        output.reclassify(HelperExitCategory::InvalidResponse);
+    } else if context_has_accessibility_signal(&context) {
+        provider_health::with_registry(|health| {
+            health.record_provider(
+                OperationClass::AccessibilitySnapshot,
+                "applescript_fallback",
+                true,
+            )
+        });
+    }
+    context
 }
 
 fn context_has_accessibility_signal(context: &AccessibilityContext) -> bool {
@@ -29433,50 +30506,96 @@ fn titleish_text(text: &str, window_title: &str) -> bool {
                 && text_terms(text).len() <= text_terms(window_title).len() + 6))
 }
 
-fn run_ocr(paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
+fn run_ocr(
+    paths: &CapturePaths,
+    image_path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<OcrOutput, String> {
     if cfg!(target_os = "macos") {
-        match run_vision_ocr(paths, image_path) {
+        let decision = provider_health::with_registry(|health| {
+            health.decision(OperationClass::Ocr, Instant::now())
+        });
+        if decision == AttemptDecision::Skip {
+            return run_tesseract(image_path, cancellation).map_err(|fallback_error| {
+                format!("Vision OCR provider is cooling down; {fallback_error}")
+            });
+        }
+        match run_vision_ocr(paths, image_path, cancellation) {
             Ok(output) if !output.text.trim().is_empty() => return Ok(output),
             Ok(output) => {
                 if command_in_path("tesseract") {
-                    return run_tesseract(image_path).or(Ok(output));
+                    return run_tesseract(image_path, cancellation).or(Ok(output));
                 }
                 return Ok(output);
             }
             Err(error) => {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(error);
+                }
                 if command_in_path("tesseract") {
-                    return run_tesseract(image_path);
+                    return run_tesseract(image_path, cancellation);
                 }
                 return Err(error);
             }
         }
     }
 
-    run_tesseract(image_path)
+    run_tesseract(image_path, cancellation)
 }
 
-fn run_vision_ocr(_paths: &CapturePaths, image_path: &Path) -> Result<OcrOutput, String> {
-    let helper_path = swift_helpers::resolve("vision_ocr")?;
-    let output = run_command_output_with_timeout(
-        Command::new(&helper_path).arg(image_path),
-        CAPTURE_HELPER_TIMEOUT,
-        "vision OCR helper",
-    )?;
-    parse_vision_output(output, "AppleVision")
-}
-
-fn parse_vision_output(output: std::process::Output, engine: &str) -> Result<OcrOutput, String> {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn run_vision_ocr(
+    _paths: &CapturePaths,
+    image_path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<OcrOutput, String> {
+    let helper_path = swift_helpers::resolve("vision_ocr").map_err(|error| {
+        record_non_screenshot_provider_failure(
+            OperationClass::Ocr,
+            HelperExitCategory::LaunchFailure,
+        );
+        error
+    })?;
+    let no_cancellation = CancellationToken::default();
+    let mut output = run_process(
+        ProcessSpec::new("vision_ocr", helper_path, VISION_OCR_DEADLINE)
+            .arg(image_path.as_os_str().to_os_string())
+            .output_limits(8 * 1024 * 1024, 128 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
+    if !output.success() {
+        record_non_screenshot_provider_failure(OperationClass::Ocr, output.category);
+        let stderr = output.stderr_text();
         return Err(if stderr.is_empty() {
-            "vision OCR failed".to_string()
+            format!("Vision OCR failed ({})", output.category.as_str())
         } else {
             stderr
         });
     }
+    let parsed = parse_vision_output(&output, "AppleVision");
+    match parsed {
+        Ok(result) => {
+            provider_health::with_registry(|health| {
+                health.record_success(OperationClass::Ocr);
+                health.record_provider(OperationClass::Ocr, "apple_vision_sidecar", false);
+            });
+            Ok(result)
+        }
+        Err(error) => {
+            output.reclassify(HelperExitCategory::InvalidResponse);
+            record_non_screenshot_provider_failure(
+                OperationClass::Ocr,
+                HelperExitCategory::InvalidResponse,
+            );
+            Err(error)
+        }
+    }
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let payload: Value = serde_json::from_str(stdout.trim()).map_err(to_string)?;
+fn parse_vision_output(
+    output: &process_runner::ProcessOutput,
+    engine: &str,
+) -> Result<OcrOutput, String> {
+    let payload: Value = serde_json::from_slice(&output.stdout).map_err(to_string)?;
     let text = payload
         .get("text")
         .and_then(Value::as_str)
@@ -29499,19 +30618,37 @@ fn parse_vision_output(output: std::process::Output, engine: &str) -> Result<Ocr
     })
 }
 
-fn run_tesseract(image_path: &Path) -> Result<OcrOutput, String> {
-    let output = run_command_output_with_timeout(
-        Command::new("tesseract").arg(image_path).arg("stdout"),
-        CAPTURE_HELPER_TIMEOUT,
-        "tesseract",
-    )?;
+fn run_tesseract(
+    image_path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<OcrOutput, String> {
+    let tesseract = find_absolute_command("tesseract")
+        .ok_or_else(|| "tesseract is not installed".to_string())?;
+    let no_cancellation = CancellationToken::default();
+    let output = run_process(
+        ProcessSpec::new("tesseract_ocr_fallback", tesseract, TESSERACT_DEADLINE)
+            .args([
+                image_path.as_os_str().to_os_string(),
+                OsString::from("stdout"),
+            ])
+            .output_limits(8 * 1024 * 1024, 128 * 1024),
+        cancellation.unwrap_or(&no_cancellation),
+    );
 
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    if !output.success() {
+        let stderr = output.stderr_text();
+        return Err(if stderr.is_empty() {
+            format!("tesseract failed ({})", output.category.as_str())
+        } else {
+            stderr
+        });
     }
 
+    provider_health::with_registry(|health| {
+        health.record_provider(OperationClass::Ocr, "tesseract", true)
+    });
     Ok(OcrOutput {
-        text: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        text: output.stdout_text(),
         text_json: "[]".to_string(),
         engine: "Tesseract".to_string(),
         error: None,
@@ -29519,60 +30656,121 @@ fn run_tesseract(image_path: &Path) -> Result<OcrOutput, String> {
 }
 
 fn command_in_path(name: &str) -> bool {
-    Command::new("/usr/bin/which")
-        .arg(name)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    find_absolute_command(name).is_some()
 }
 
 fn lock_runtime(state: &CaptureState) -> Result<std::sync::MutexGuard<'_, CaptureRuntime>, String> {
-    state
+    Ok(state
         .inner
         .lock()
-        .map_err(|_| "capture runtime lock poisoned".to_string())
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
-fn stop_runtime(state: &CaptureState) -> Result<(), String> {
-    let handle = {
+fn stop_runtime(state: &CaptureState) -> Result<WorkerExit, String> {
+    let started = Instant::now();
+    let (stop_signal, completion) = {
         let mut runtime = lock_runtime(state)?;
-        if let Some(stop_signal) = runtime.stop_signal.take() {
-            stop_signal.store(true, Ordering::Relaxed);
+        if !runtime.phase.owns_worker() && runtime.worker.is_none() {
+            runtime.phase = if runtime.phase == CaptureRuntimePhase::Failed {
+                CaptureRuntimePhase::Failed
+            } else {
+                CaptureRuntimePhase::Stopped
+            };
+            runtime.started_at = None;
+            runtime.last_stop_latency_ms = Some(0);
+            return Ok(WorkerExit {
+                panicked: false,
+                session_finalized: true,
+            });
         }
-        runtime.running = false;
-        runtime.started_at = None;
-        runtime.worker.take()
+        if runtime.phase != CaptureRuntimePhase::Stopping {
+            runtime.phase = CaptureRuntimePhase::Stopping;
+        }
+        (
+            runtime.stop_signal.clone(),
+            runtime.worker_completion.clone(),
+        )
     };
 
-    if let Some(handle) = handle {
-        handle
-            .join()
-            .map_err(|_| "capture worker panicked while stopping".to_string())?;
+    if let Some(stop_signal) = stop_signal {
+        stop_signal.cancel();
+    }
+    let Some(completion) = completion else {
+        let mut runtime = lock_runtime(state)?;
+        runtime.phase = CaptureRuntimePhase::Failed;
+        runtime.last_error = Some("capture worker had no completion signal".to_string());
+        return Err("capture worker had no completion signal".to_string());
+    };
+    let result = completion.wait(STOP_COMPLETION_DEADLINE);
+    let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    {
+        let mut runtime = lock_runtime(state)?;
+        runtime.last_stop_latency_ms = Some(latency_ms);
+        if result.is_none() {
+            runtime.phase = CaptureRuntimePhase::Failed;
+            runtime.last_error = Some(format!(
+                "capture Stop exceeded {} ms; worker remains blocked from restart until cleanup",
+                STOP_COMPLETION_DEADLINE.as_millis()
+            ));
+        }
+    }
+    let result = result.ok_or_else(|| {
+        format!(
+            "capture Stop timed out after {} ms",
+            STOP_COMPLETION_DEADLINE.as_millis()
+        )
+    })?;
+    if result.panicked {
+        return Err("capture worker panicked; cleanup completed safely".to_string());
+    }
+    if !result.session_finalized {
+        return Err("capture stopped but session finalization failed".to_string());
     }
 
-    Ok(())
+    Ok(result)
+}
+
+pub(crate) fn shutdown_capture<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<CaptureState>();
+    stop_runtime(state.inner()).map(|_| ())
 }
 
 fn update_success(state: &Arc<Mutex<CaptureRuntime>>, frame: CaptureFrame) {
-    if let Ok(mut runtime) = state.lock() {
+    let mut runtime = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runtime.phase.owns_worker() && runtime.phase != CaptureRuntimePhase::Stopping {
+        let fallback_used = frame.capture_provider.as_deref() == Some("screencapture_cli")
+            || frame.active_window_capture_provider.as_deref() == Some("screencapture_cli");
+        runtime.phase = if fallback_used {
+            CaptureRuntimePhase::Degraded
+        } else {
+            CaptureRuntimePhase::Running
+        };
         runtime.last_error = None;
         runtime.last_frame = Some(frame);
     }
 }
 
 fn update_error(state: &Arc<Mutex<CaptureRuntime>>, error: String) {
-    if let Ok(mut runtime) = state.lock() {
-        runtime.last_error = Some(error);
+    let mut runtime = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runtime.phase.owns_worker() && runtime.phase != CaptureRuntimePhase::Stopping {
+        runtime.phase = CaptureRuntimePhase::Degraded;
     }
+    runtime.last_error = Some(error);
 }
 
 fn update_error_and_island(app: &AppHandle, state: &Arc<Mutex<CaptureRuntime>>, error: String) {
     update_error(state, error);
     if let Ok(status) = capture_status_snapshot_inner(app, state) {
-        crate::session_island::update_session_island_from_status(
-            &status,
-            crate::session_island::SessionIslandState::Error,
-        );
+        let island_state = if status.running {
+            crate::session_island::SessionIslandState::RecordingCompact
+        } else {
+            crate::session_island::SessionIslandState::Error
+        };
+        crate::session_island::update_session_island_from_status(&status, island_state);
     }
 }
 
@@ -29719,6 +30917,256 @@ mod tests {
             document_path: None,
             text_hash: text_hash.map(str::to_string),
         }
+    }
+
+    fn temporary_capture_paths(label: &str) -> CapturePaths {
+        let root_dir = std::env::temp_dir().join(format!(
+            "smalltalk-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        CapturePaths {
+            snapshot_dir: root_dir.join("snapshots"),
+            db_path: root_dir.join("capture.sqlite"),
+            root_dir,
+        }
+    }
+
+    #[test]
+    fn database_generation_initializes_once_and_event_load_does_not_run_schema_work() {
+        let paths = temporary_capture_paths("db-generation");
+        ensure_database_initialized(&paths).unwrap();
+        let initialized_generation = database_lifecycle()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .initialized
+            .get(&paths.db_path)
+            .map(|entry| entry.generation)
+            .expect("test database should have an initialized generation");
+        for _ in 0..1_000 {
+            ensure_database_initialized(&paths).unwrap();
+        }
+        assert_eq!(
+            database_lifecycle()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .initialized
+                .get(&paths.db_path)
+                .map(|entry| entry.generation),
+            Some(initialized_generation)
+        );
+
+        let conn = open_db_at_path(&paths.db_path, true).unwrap();
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, created_at_ms
+             ) VALUES ('event-load', 1, 1, 'running', 1)",
+            [],
+        )
+        .unwrap();
+        let cancellation = CancellationToken::default();
+        let mut pending = None;
+        let mut typing = TypingBurstState::default();
+        let mut gate = EventIngestGate::default();
+        for batch in 0..100 {
+            let events = (0..EVENT_BATCH_MAX_COUNT)
+                .map(|index| {
+                    serde_json::json!({
+                        "ts_ms": batch * 100_000 + index * 300,
+                        "event_type": "click",
+                        "app_bundle_id": "com.example.editor",
+                        "app_name": "Editor",
+                        "window_title": format!("fixture-{batch}-{index}"),
+                        "button": "left"
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
+            persist_event_batch_with_retry(
+                &conn,
+                "event-load",
+                &events,
+                &cancellation,
+                &mut pending,
+                &mut typing,
+                &mut gate,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            database_lifecycle()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .initialized
+                .get(&paths.db_path)
+                .map(|entry| entry.generation),
+            Some(initialized_generation)
+        );
+        assert_eq!(row_count(&conn, "ui_events").unwrap(), 3_200);
+        let pending = pending.expect("event load should retain one bounded capture trigger");
+        assert_eq!(
+            pending.caused_by_event_ids.len(),
+            MAX_TRIGGER_CAUSAL_EVENT_IDS
+        );
+        assert_eq!(pending.caused_event_count, 3_200);
+        assert_eq!(
+            pending.omitted_event_count,
+            3_200 - MAX_TRIGGER_CAUSAL_EVENT_IDS as u64
+        );
+        let (stored_total, stored_omitted, aggregation): (i64, i64, String) = conn
+            .query_row(
+                "SELECT caused_event_count, omitted_event_count, aggregation_json
+                 FROM capture_triggers WHERE id = ?1",
+                params![pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_total, 3_200);
+        assert_eq!(stored_omitted, 3_072);
+        assert!(aggregation.contains("smalltalk.capture_trigger_causal_aggregation.v1"));
+        drop(conn);
+        invalidate_database_generation(&paths.db_path);
+        let _ = fs::remove_dir_all(&paths.root_dir);
+    }
+
+    #[test]
+    fn event_batch_busy_retry_is_bounded_and_rolls_back() {
+        let paths = temporary_capture_paths("event-busy");
+        ensure_database_initialized(&paths).unwrap();
+        let locking = open_db_at_path(&paths.db_path, true).unwrap();
+        let writer = open_db_at_path(&paths.db_path, true).unwrap();
+        writer.busy_timeout(Duration::from_millis(1)).unwrap();
+        locking
+            .execute(
+                "INSERT INTO capture_sessions (
+                    id, sequence, started_at_ms, status, created_at_ms
+                 ) VALUES ('busy-session', 1, 1, 'running', 1)",
+                [],
+            )
+            .unwrap();
+        locking.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let cancellation = CancellationToken::default();
+        let mut pending = None;
+        let mut typing = TypingBurstState::default();
+        let mut gate = EventIngestGate::default();
+        let error = persist_event_batch_with_retry(
+            &writer,
+            "busy-session",
+            &[serde_json::json!({
+                "ts_ms": 10,
+                "event_type": "app_switch",
+                "app_bundle_id": "com.example.editor"
+            })
+            .to_string()],
+            &cancellation,
+            &mut pending,
+            &mut typing,
+            &mut gate,
+        )
+        .unwrap_err();
+        assert!(sqlite_error_is_busy(&error));
+        locking.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(row_count(&writer, "ui_events").unwrap(), 0);
+        drop(writer);
+        drop(locking);
+        invalidate_database_generation(&paths.db_path);
+        let _ = fs::remove_dir_all(&paths.root_dir);
+    }
+
+    #[test]
+    fn large_database_status_queries_and_payload_remain_bounded() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, frame_count, event_count,
+                transition_count, content_unit_count, created_at_ms
+             ) VALUES ('large-status', 1, 1, 'running', 1, 50000, 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE numbers(value) AS (
+               SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 50000
+             )
+             INSERT INTO ui_events (
+               id, session_id, ts_ms, event_type, app_name, window_title, created_at_ms
+             )
+             SELECT 'event-' || value, 'large-status', value * 10,
+                    CASE WHEN value % 20 = 0 THEN 'app_switch' ELSE 'scroll' END,
+                    'Editor', 'Bounded status fixture', value * 10
+             FROM numbers;
+             INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, window_name,
+               focused, capture_trigger, full_text, created_at
+             ) VALUES (
+               'large-status', 500001, '/private/fixture.png', 'Editor',
+               'Bounded status fixture', 1, 'app_switch',
+               replace(hex(zeroblob(524288)), '00', 'x'), 500001
+             );",
+        )
+        .unwrap();
+
+        let mut samples_us = Vec::new();
+        let mut response_bytes = 0_usize;
+        for _ in 0..25 {
+            let started = Instant::now();
+            let counts = session_status_counts(&conn, "large-status").unwrap();
+            let labels = recent_app_labels(&conn, Some("large-status")).unwrap();
+            let signals = local_signal_count(&conn, Some("large-status")).unwrap();
+            let frame = latest_status_frame(&conn, Some("large-status"))
+                .unwrap()
+                .unwrap();
+            samples_us.push(started.elapsed().as_micros() as u64);
+            response_bytes = serde_json::to_vec(&(counts.frames, labels, signals, &frame))
+                .unwrap()
+                .len();
+            assert!(frame.full_text.is_none());
+            assert!(frame.accessibility_text.is_none());
+            assert!(frame.accessibility_tree_json.is_none());
+        }
+        samples_us.sort_unstable();
+        let p50 = samples_us[(samples_us.len() - 1) * 50 / 100];
+        let p95 = samples_us[(samples_us.len() - 1) * 95 / 100];
+        eprintln!(
+            "large_status_fixture rows=50000 p50_us={p50} p95_us={p95} response_bytes={response_bytes}"
+        );
+        assert!(p95 < 250_000, "p95 status latency was {p95} us");
+        assert!(
+            response_bytes < 16 * 1024,
+            "status payload was {response_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn prompt_01_helper_timeout_remains_isolated_under_event_pipeline_pressure() {
+        let pipeline = event_pipeline::EventPipeline::default();
+        for index in 0..20_000 {
+            pipeline.push(
+                serde_json::json!({
+                    "ts_ms": index * 20,
+                    "event_type": "scroll",
+                    "app_bundle_id": "com.example.browser",
+                    "window_title": "bounded pressure fixture",
+                    "scroll_dy": 1
+                })
+                .to_string(),
+            );
+        }
+        let output = run_process(
+            ProcessSpec::new(
+                "pressure_timeout_probe",
+                "/bin/sleep",
+                Duration::from_millis(20),
+            )
+            .arg("5"),
+            &CancellationToken::default(),
+        );
+        assert_eq!(output.category, ProcessExitCategory::Timeout);
+        let diagnostics = pipeline.diagnostics();
+        assert!(diagnostics.queue_depth <= diagnostics.queue_capacity);
+        assert!(diagnostics.high_water_mark <= diagnostics.queue_capacity);
+        pipeline.shutdown();
     }
 
     #[test]
@@ -30083,6 +31531,48 @@ mod tests {
             capture_interval_for_trigger("accessibility_change"),
             MIN_LOW_VALUE_CAPTURE_INTERVAL
         );
+    }
+
+    #[test]
+    fn fail_safe_runtime_preserves_initial_event_and_idle_cadence() {
+        assert_eq!(
+            capture_interval_for_trigger("session_start"),
+            MIN_IMPORTANT_CAPTURE_INTERVAL
+        );
+        assert_eq!(
+            capture_interval_for_trigger("app_switch"),
+            MIN_IMPORTANT_CAPTURE_INTERVAL
+        );
+        assert_eq!(IDLE_CAPTURE_INTERVAL, Duration::from_secs(120));
+        assert_eq!(
+            capture_interval_for_trigger("idle"),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn public_running_state_matches_only_live_worker_phases() {
+        for phase in [
+            CaptureRuntimePhase::Starting,
+            CaptureRuntimePhase::Running,
+            CaptureRuntimePhase::Degraded,
+        ] {
+            assert!(phase.is_publicly_running());
+        }
+        for phase in [
+            CaptureRuntimePhase::Stopped,
+            CaptureRuntimePhase::Stopping,
+            CaptureRuntimePhase::Failed,
+        ] {
+            assert!(!phase.is_publicly_running());
+        }
+    }
+
+    #[test]
+    fn ocr_failure_preserves_usable_accessibility_evidence() {
+        let (source, text) = resolve_text(Some("visible editor text"), None, false);
+        assert_eq!(source.as_deref(), Some("accessibility"));
+        assert_eq!(text.as_deref(), Some("visible editor text"));
     }
 
     #[test]
@@ -31415,42 +32905,133 @@ mod tests {
     }
 
     #[test]
-    fn stop_runtime_signals_and_joins_worker_before_returning() {
-        let state = CaptureState::default();
-        let stop_signal = Arc::new(AtomicBool::new(false));
-        let worker_started = Arc::new(AtomicBool::new(false));
-        let worker_finished = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop_signal.clone();
-        let thread_started = worker_started.clone();
-        let thread_finished = worker_finished.clone();
+    fn worker_completion_wait_is_bounded_and_observes_cleanup() {
+        let completion = Arc::new(WorkerCompletion::default());
+        assert!(completion.wait(Duration::from_millis(1)).is_none());
+
+        let thread_completion = completion.clone();
         let worker = thread::spawn(move || {
-            thread_started.store(true, Ordering::SeqCst);
-            while !thread_stop.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(1));
-            }
-            thread_finished.store(true, Ordering::SeqCst);
+            thread_completion.complete(WorkerExit {
+                panicked: false,
+                session_finalized: true,
+            });
         });
 
+        let result = completion
+            .wait(Duration::from_secs(1))
+            .expect("worker cleanup should publish completion");
+        worker.join().unwrap();
+        assert!(!result.panicked);
+        assert!(result.session_finalized);
+    }
+
+    #[test]
+    fn cancelled_persistence_checkpoint_rolls_back_atomic_write() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE persistence_probe (value INTEGER NOT NULL);")
+            .unwrap();
+        let cancellation = CancellationToken::default();
+
+        let result = (|| -> Result<(), String> {
+            let tx = conn.unchecked_transaction().map_err(to_string)?;
+            tx.execute("INSERT INTO persistence_probe (value) VALUES (1)", [])
+                .map_err(to_string)?;
+            cancellation.cancel();
+            capture_persistence_checkpoint(Some(&cancellation))?;
+            tx.commit().map_err(to_string)
+        })();
+
+        assert_eq!(result.unwrap_err(), "capture cancelled during persistence");
+        let persisted = conn
+            .query_row("SELECT COUNT(*) FROM persistence_probe", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+
+    #[test]
+    fn session_finalization_is_idempotent_and_allows_a_clean_new_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, created_at_ms
+             ) VALUES ('failed-session', 1, 100, 'running', 100)",
+            [],
+        )
+        .unwrap();
+
+        let first = finalize_capture_session_from_conn(&conn, "failed-session", "failed").unwrap();
+        let first_stopped_at = first.stopped_at;
+        let repeated =
+            finalize_capture_session_from_conn(&conn, "failed-session", "failed").unwrap();
+        assert_eq!(repeated.status, "failed");
+        assert_eq!(repeated.stopped_at, first_stopped_at);
+
+        conn.execute(
+            "INSERT INTO capture_sessions (
+                id, sequence, started_at_ms, status, created_at_ms
+             ) VALUES ('clean-session', 2, 200, 'running', 200)",
+            [],
+        )
+        .unwrap();
+        let clean = finalize_capture_session_from_conn(&conn, "clean-session", "stopped").unwrap();
+        assert_eq!(clean.status, "stopped");
+        assert!(clean.stopped_at.is_some());
+    }
+
+    #[test]
+    fn app_shutdown_with_active_helper_uses_bounded_stop_and_clears_worker() {
+        let state = CaptureState::default();
+        let cancellation = CancellationToken::default();
+        let completion = Arc::new(WorkerCompletion::default());
+        let thread_cancellation = cancellation.clone();
+        let thread_completion = completion.clone();
+        let thread_state = state.inner.clone();
+        let worker = thread::spawn(move || {
+            let output = run_process(
+                ProcessSpec::new("window_snapshot", "/bin/sleep", Duration::from_secs(20))
+                    .arg("30"),
+                &thread_cancellation,
+            );
+            assert_eq!(output.category, HelperExitCategory::Cancelled);
+            {
+                let mut runtime = thread_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                runtime.phase = CaptureRuntimePhase::Stopped;
+                runtime.started_at = None;
+                runtime.stop_signal = None;
+                runtime.worker_completion = None;
+                runtime.worker.take();
+            }
+            thread_completion.complete(WorkerExit {
+                panicked: false,
+                session_finalized: true,
+            });
+        });
         {
             let mut runtime = lock_runtime(&state).unwrap();
-            runtime.running = true;
+            runtime.phase = CaptureRuntimePhase::Running;
             runtime.started_at = Some(1);
-            runtime.stop_signal = Some(stop_signal);
+            runtime.stop_signal = Some(cancellation);
+            runtime.worker_completion = Some(completion);
             runtime.worker = Some(worker);
         }
 
-        while !worker_started.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(1));
-        }
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let started = Instant::now();
+        shutdown_capture(app.handle()).unwrap();
 
-        stop_runtime(&state).unwrap();
-
-        assert!(worker_finished.load(Ordering::SeqCst));
+        assert!(started.elapsed() < STOP_COMPLETION_DEADLINE);
         let runtime = lock_runtime(&state).unwrap();
-        assert!(!runtime.running);
-        assert!(runtime.started_at.is_none());
-        assert!(runtime.stop_signal.is_none());
+        assert_eq!(runtime.phase, CaptureRuntimePhase::Stopped);
         assert!(runtime.worker.is_none());
+        assert!(runtime.stop_signal.is_none());
     }
 
     fn insert_test_frame(conn: &Connection, snapshot_path: &str) -> i64 {
@@ -39498,6 +41079,13 @@ mod tests {
 
         let session = insert_numbered_test_session(&conn);
         insert_export_test_frame(&conn, &session.id, &image_path.to_string_lossy());
+        conn.execute(
+            "UPDATE capture_sessions
+             SET frame_count = 1, event_count = 1, transition_count = 1
+             WHERE id = ?1",
+            params![session.id],
+        )
+        .unwrap();
 
         let status_session = load_capture_session_for_status(&conn, &session.id).unwrap();
         assert_eq!(status_session.counts.frames, 1);
@@ -39578,11 +41166,19 @@ mod tests {
         let background = crate::continuation::ContinueDecisionRequest::default();
         assert!(!continue_output_audit_enabled(&background));
 
-        let explicit = crate::continuation::ContinueDecisionRequest {
+        let background_explicit = crate::continuation::ContinueDecisionRequest {
             audit_output_enabled: Some(true),
+            request_trigger: Some("background".to_string()),
             ..Default::default()
         };
-        assert!(continue_output_audit_enabled(&explicit));
+        assert!(!continue_output_audit_enabled(&background_explicit));
+
+        let manual_forensic = crate::continuation::ContinueDecisionRequest {
+            audit_mode: Some(crate::continuation::ContinueAuditMode::Full),
+            request_trigger: Some("manual".to_string()),
+            ..Default::default()
+        };
+        assert!(continue_output_audit_enabled(&manual_forensic));
     }
 
     #[test]
@@ -40192,6 +41788,30 @@ mod tests {
         .to_string()
     }
 
+    #[test]
+    fn sck_request_excludes_the_running_smalltalk_process() {
+        let request = sck_screenshot_request(
+            "active_window",
+            Path::new("/tmp/smalltalk-sck-test.jpg"),
+            Some(42),
+            Some("com.openai.codex"),
+            false,
+        );
+
+        assert_eq!(
+            request
+                .pointer("/exclude_process_ids/0")
+                .and_then(Value::as_u64),
+            Some(std::process::id() as u64)
+        );
+        assert_eq!(
+            request
+                .pointer("/exclude_bundle_ids/0")
+                .and_then(Value::as_str),
+            Some("com.smalltalk.app")
+        );
+    }
+
     fn shell_printing(value: &str, exit_code: i32) -> Command {
         let mut command = Command::new("/bin/sh");
         command
@@ -40236,7 +41856,10 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg("kill -TERM $$");
         let result = run_sck_helper(&mut command, Duration::from_secs(1));
-        assert_eq!(result.category, HelperExitCategory::AbnormalTermination);
+        assert_eq!(
+            result.category,
+            HelperExitCategory::SignalOrAbnormalTermination
+        );
     }
 
     #[test]
@@ -40247,76 +41870,6 @@ mod tests {
         let result = run_sck_helper(&mut command, Duration::from_millis(40));
         assert_eq!(result.category, HelperExitCategory::Timeout);
         assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn bounded_command_output_returns_completed_output() {
-        let output = run_command_output_with_timeout(
-            Command::new("/usr/bin/printf").arg("ready"),
-            Duration::from_secs(1),
-            "test helper",
-        )
-        .unwrap();
-
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "ready");
-    }
-
-    #[test]
-    fn bounded_command_output_kills_a_stuck_helper() {
-        let started = Instant::now();
-        let error = run_command_output_with_timeout(
-            Command::new("/bin/sleep").arg("5"),
-            Duration::from_millis(40),
-            "test helper",
-        )
-        .unwrap_err();
-
-        assert_eq!(error, "test helper timed out after 40 ms");
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn sck_active_window_circuit_breaker_skips_until_recovery_boundary() {
-        let start = Instant::now();
-        let mut breaker = CaptureProviderCircuitBreaker::default();
-        assert_eq!(
-            breaker.active_window_decision(start),
-            CircuitBreakerDecision::NormalAttempt
-        );
-        assert!(breaker.record_active_window_abnormal_exit(start));
-        assert_eq!(
-            breaker.active_window_decision(start + Duration::from_secs(60)),
-            CircuitBreakerDecision::Skip
-        );
-        assert_eq!(
-            breaker.active_window_decision(start + SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN),
-            CircuitBreakerDecision::RecoveryProbe
-        );
-        assert_eq!(
-            breaker.active_window_decision(
-                start + SCK_ACTIVE_WINDOW_RECOVERY_COOLDOWN + Duration::from_secs(1)
-            ),
-            CircuitBreakerDecision::Skip
-        );
-        breaker.reset_for_new_session();
-        assert_eq!(
-            breaker.active_window_decision(start),
-            CircuitBreakerDecision::NormalAttempt
-        );
-    }
-
-    #[test]
-    fn sck_active_window_failure_does_not_disable_display_provider() {
-        let start = Instant::now();
-        let mut breaker = CaptureProviderCircuitBreaker::default();
-        breaker.record_active_window_abnormal_exit(start);
-        assert_eq!(
-            breaker.active_window_decision(start),
-            CircuitBreakerDecision::Skip
-        );
-        // Display capture has no breaker state and therefore remains eligible.
-        assert_eq!(breaker.active_window_state(), "open_cooldown");
     }
 
     #[test]

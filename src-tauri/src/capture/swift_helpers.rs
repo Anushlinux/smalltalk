@@ -25,11 +25,11 @@ pub(super) fn resolve(name: &str) -> Result<PathBuf, String> {
     // Contents/MacOS and signs them as nested code with the app bundle.
     if let Ok(executable) = std::env::current_exe() {
         if let Some(directory) = executable.parent() {
-            let sidecar = directory.join(name);
-            if sidecar.is_file() {
-                return Ok(sidecar);
-            }
             if is_bundle_macos_directory(directory) {
+                let sidecar = directory.join(name);
+                if sidecar.is_file() {
+                    return Ok(sidecar);
+                }
                 return Err(format!(
                     "signed app bundle is missing required Swift sidecar: {name}"
                 ));
@@ -37,9 +37,18 @@ pub(super) fn resolve(name: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // Cargo builds compile the same helpers into OUT_DIR. This path supports
-    // unit tests and `tauri dev`; customer bundles must resolve the signed
-    // Contents/MacOS sidecar above.
+    // Cargo installs development helpers into one profile-stable directory.
+    // OUT_DIR is deliberately only a final fallback because its hash changes
+    // across rebuilds and would create a moving Screen Recording identity.
+    if let Some(directory) = option_env!("SMALLTALK_DEV_HELPER_DIR") {
+        let stable_helper = Path::new(directory).join(name);
+        if stable_helper.is_file() {
+            return Ok(stable_helper);
+        }
+    }
+
+    // This fallback supports unusual Cargo test layouts. Packaged builds must
+    // have returned the signed Contents/MacOS sidecar above.
     let build_helper = Path::new(env!("OUT_DIR")).join("swift-helpers").join(name);
     if build_helper.is_file() {
         return Ok(build_helper);
@@ -69,6 +78,17 @@ mod tests {
             let bytes = fs::read(path).expect("helper bytes");
             assert!(bytes.len() > 4);
             assert_eq!(&bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+        }
+    }
+
+    #[test]
+    fn development_helpers_resolve_from_the_profile_stable_directory() {
+        let stable_directory = Path::new(
+            option_env!("SMALLTALK_DEV_HELPER_DIR")
+                .expect("macOS build must publish a stable development helper directory"),
+        );
+        for name in HELPER_NAMES {
+            assert_eq!(resolve(name).unwrap(), stable_directory.join(name));
         }
     }
 

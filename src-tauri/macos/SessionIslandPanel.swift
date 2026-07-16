@@ -628,13 +628,19 @@ private final class AnimationTick: ObservableObject {
     static let shared = AnimationTick()
     @Published var value = 0.0
     private var timer: Timer?
+    private let interval: TimeInterval = 1.0 / 20.0
 
     func start() {
         guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        // The island only uses this clock for slow status breathing, tape
+        // scanning, and short evidence pulses. A 20 Hz clock keeps those
+        // movements fluid without forcing the always-visible native surface
+        // to redraw at display refresh rate while the user is doing no work.
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
-            value += 1.0 / 60.0
-            objectWillChange.send()
+            // @Published already emits objectWillChange. Sending it again
+            // caused two complete SwiftUI invalidations for every timer tick.
+            value += interval
         }
         RunLoop.main.add(timer!, forMode: .common)
     }

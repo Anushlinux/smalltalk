@@ -16,6 +16,8 @@ import {
   getContinuePresentationActionState,
   inspectTargetCopy,
   isDirectPresentationTargetOpenable,
+  recentContextForPresentation,
+  recentContextRoleLabel,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
@@ -29,6 +31,7 @@ import {
   type ContinuePresentationActionState,
   type ContinueTaskResolutionStatus,
   type ContinueTaskTruthAnswer,
+  type ContinueTaskTruthRecentContext,
 } from "./continuePresentation";
 import {
   continueRequestErrorCopy,
@@ -129,12 +132,78 @@ type StopCaptureOutput = {
 };
 
 type RuntimeDiagnostics = {
+  capture_runtime_state: string;
+  worker_generation: number;
+  current_operation_class?: string | null;
+  current_operation_started_at_ms?: number | null;
+  last_operation_class?: string | null;
+  last_operation_duration_ms?: number | null;
+  helper_launches: number;
+  helper_successes: number;
+  helper_timeouts: number;
+  helper_timeouts_reaped: number;
+  helper_cancellations: number;
+  helper_abnormal_exits: number;
+  helper_output_limit_failures: number;
+  helper_launch_failures: number;
+  active_child_processes: number;
+  last_safe_error_category?: string | null;
+  stop_latency_ms?: number | null;
+  worker_panic_count: number;
+  provider_health: Record<string, string>;
+  provider_by_operation: Record<string, string>;
+  fallback_counts_by_operation: Record<string, number>;
+  provider_circuit_breaker_opens: number;
+  provider_recovery_probes: number;
+  event_pipeline: {
+    queue_depth: number;
+    queue_capacity: number;
+    high_queue_depth: number;
+    normal_queue_depth: number;
+    pressure_queue_depth: number;
+    high_water_mark: number;
+    coalesced_count: number;
+    dropped_count: number;
+    dropped_pressure_count: number;
+    dropped_normal_count: number;
+    dropped_high_count: number;
+    shutdown: boolean;
+  };
+  schema_initialization_count: number;
+  migration_execution_count: number;
+  database_busy_retry_count: number;
+  database_busy_time_ms: number;
+  database_generation: number;
+  audit_executor: {
+    active: boolean;
+    queued: number;
+    queue_capacity: number;
+    submitted: number;
+    completed: number;
+    failed: number;
+    coalesced: number;
+    superseded: number;
+    shutting_down: boolean;
+  };
+  status_metrics: {
+    sample_count: number;
+    p50_latency_us: number;
+    p95_latency_us: number;
+    last_response_bytes: number;
+    max_response_bytes: number;
+  };
   workload: {
     active_operations: string[];
     queued_operation_count: number;
+    queue_capacity: number;
+    queue_high_water_mark: number;
+    queued_by_class: Record<string, number>;
+    queue_capacity_by_class: Record<string, number>;
+    rejected_by_class: Record<string, number>;
     coalesced_requests: number;
     cancelled_or_superseded_requests: number;
     background_decisions_avoided: number;
+    shutting_down: boolean;
     duration_percentiles_ms: Record<string, { p50: number; p95: number }>;
   };
   heavy_captures_stored: number;
@@ -1230,8 +1299,10 @@ const RECENT_MEMORY_DELETE_RANGE_MS = 60 * 60 * 1000;
 const BACKGROUND_CONTINUE_VISIBLE_DEBOUNCE_MS = 5000;
 const BACKGROUND_CONTINUE_IDLE_DEBOUNCE_MS = 30000;
 const BACKGROUND_CONTINUE_MIN_INTERVAL_MS = 60000;
-const STATUS_HEARTBEAT_RUNNING_MS = 15000;
-const STATUS_HEARTBEAT_IDLE_MS = 30000;
+// Capture and session changes arrive through Tauri events. This slow heartbeat
+// is recovery insurance for a missed event, not the main work scheduler.
+const STATUS_HEARTBEAT_RUNNING_MS = 60000;
+const STATUS_HEARTBEAT_IDLE_MS = 120000;
 
 const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: string }> = {
   off: {
@@ -1269,12 +1340,78 @@ const memoryProductCopy: Record<MemoryProductStatus, { label: string; detail: st
 };
 
 const emptyRuntimeDiagnostics: RuntimeDiagnostics = {
+  capture_runtime_state: "stopped",
+  worker_generation: 0,
+  current_operation_class: null,
+  current_operation_started_at_ms: null,
+  last_operation_class: null,
+  last_operation_duration_ms: null,
+  helper_launches: 0,
+  helper_successes: 0,
+  helper_timeouts: 0,
+  helper_timeouts_reaped: 0,
+  helper_cancellations: 0,
+  helper_abnormal_exits: 0,
+  helper_output_limit_failures: 0,
+  helper_launch_failures: 0,
+  active_child_processes: 0,
+  last_safe_error_category: null,
+  stop_latency_ms: null,
+  worker_panic_count: 0,
+  provider_health: {},
+  provider_by_operation: {},
+  fallback_counts_by_operation: {},
+  provider_circuit_breaker_opens: 0,
+  provider_recovery_probes: 0,
+  event_pipeline: {
+    queue_depth: 0,
+    queue_capacity: 320,
+    high_queue_depth: 0,
+    normal_queue_depth: 0,
+    pressure_queue_depth: 0,
+    high_water_mark: 0,
+    coalesced_count: 0,
+    dropped_count: 0,
+    dropped_pressure_count: 0,
+    dropped_normal_count: 0,
+    dropped_high_count: 0,
+    shutdown: false,
+  },
+  schema_initialization_count: 0,
+  migration_execution_count: 0,
+  database_busy_retry_count: 0,
+  database_busy_time_ms: 0,
+  database_generation: 0,
+  audit_executor: {
+    active: false,
+    queued: 0,
+    queue_capacity: 1,
+    submitted: 0,
+    completed: 0,
+    failed: 0,
+    coalesced: 0,
+    superseded: 0,
+    shutting_down: false,
+  },
+  status_metrics: {
+    sample_count: 0,
+    p50_latency_us: 0,
+    p95_latency_us: 0,
+    last_response_bytes: 0,
+    max_response_bytes: 0,
+  },
   workload: {
     active_operations: [],
     queued_operation_count: 0,
+    queue_capacity: 48,
+    queue_high_water_mark: 0,
+    queued_by_class: {},
+    queue_capacity_by_class: {},
+    rejected_by_class: {},
     coalesced_requests: 0,
     cancelled_or_superseded_requests: 0,
     background_decisions_avoided: 0,
+    shutting_down: false,
     duration_percentiles_ms: {},
   },
   heavy_captures_stored: 0,
@@ -1394,22 +1531,36 @@ function App() {
   const continueRequestInFlightRef = useRef<ContinueRequestTrigger | null>(null);
   const continueDecisionRef = useRef<ContinueDecisionResult | null>(null);
   const continueDecisionTriggerRef = useRef<ContinueRequestTrigger | null>(null);
+  const statusRef = useRef(status);
+  const continueMemoryRef = useRef(continueMemory);
+  const selectedFrameRef = useRef(selectedFrame);
   const lastBackgroundContinueAttemptRef = useRef(0);
   const failedBackgroundContinueSignatureRef = useRef<string | null>(null);
   const captureMenuRef = useRef<HTMLDetailsElement | null>(null);
   const isDeleting = busyAction === "delete_all_frames" || busyAction === "delete_recent_captures";
   const diagnosticsOpen = viewMode === "developer";
+  const diagnosticsOpenRef = useRef(diagnosticsOpen);
   const currentSession = status.active_session || status.latest_session || null;
   const currentSessionId = currentSession?.id || null;
+
+  // Tauri event listeners must stay registered across ordinary React state
+  // updates. The refs let their stable handlers read current state without
+  // making the subscription effect depend on frequently changing objects.
+  statusRef.current = status;
+  continueMemoryRef.current = continueMemory;
+  selectedFrameRef.current = selectedFrame;
+  diagnosticsOpenRef.current = diagnosticsOpen;
 
   const refreshStatus = useCallback(async (): Promise<CaptureStatus | null> => {
     const requestGeneration = storeGenerationRef.current;
     try {
       const nextStatus = await invoke<CaptureStatus>("capture_status");
       if (requestGeneration !== storeGenerationRef.current) return null;
+      statusRef.current = nextStatus;
       setStatus(nextStatus);
       setError(null);
-      if (!selectedFrame && nextStatus.latest_frame) {
+      if (!selectedFrameRef.current && nextStatus.latest_frame) {
+        selectedFrameRef.current = nextStatus.latest_frame;
         setSelectedFrame(nextStatus.latest_frame);
       }
       return nextStatus;
@@ -1417,7 +1568,7 @@ function App() {
       setError(String(err));
       return null;
     }
-  }, [selectedFrame]);
+  }, []);
 
   const refreshScreenCapturePermission = useCallback(async () => {
     try {
@@ -1435,6 +1586,7 @@ function App() {
   const refreshContinueMemory = useCallback(async (): Promise<ContinueMemoryStatus | null> => {
     try {
       const nextMemory = await invoke<ContinueMemoryStatus>("get_continue_memory_status");
+      continueMemoryRef.current = nextMemory;
       setContinueMemory(nextMemory);
       return nextMemory;
     } catch (err) {
@@ -1609,7 +1761,7 @@ function App() {
         ].slice(0, 8));
         if (challengerTrigger === "background") {
           failedBackgroundContinueSignatureRef.current = continueEvidenceSignature(
-            buildContinueEvidenceSnapshot(status, continueMemory),
+            buildContinueEvidenceSnapshot(statusRef.current, continueMemoryRef.current),
           );
           setBackgroundContinueError(
             "A quiet refresh returned a weaker answer. Keeping the stronger Continue answer.",
@@ -1630,15 +1782,15 @@ function App() {
         refreshStatus(),
         refreshContinueMemory(),
       ]);
-      const evidenceStatus = nextStatus || status;
-      const evidenceMemory = nextMemory || continueMemory;
+      const evidenceStatus = nextStatus || statusRef.current;
+      const evidenceMemory = nextMemory || continueMemoryRef.current;
       setContinueDecisionFrameCount(evidenceStatus.frame_count);
       setContinueDecisionEvidenceSnapshot(
         buildContinueEvidenceSnapshot(evidenceStatus, evidenceMemory),
       );
       return true;
     },
-    [continueMemory, refreshContinueMemory, refreshStatus, status],
+    [refreshContinueMemory, refreshStatus],
   );
 
   const runContinueDecision = useCallback(async (options: {
@@ -2662,11 +2814,12 @@ function App() {
 
     listen<CaptureFrame>("capture-frame", (event) => {
       void refreshStatus();
-      if (!selectedFrame) {
+      if (!selectedFrameRef.current) {
+        selectedFrameRef.current = event.payload;
         setSelectedFrame(event.payload);
       }
       void refreshContinueMemory();
-      if (diagnosticsOpen) {
+      if (diagnosticsOpenRef.current) {
         void refreshWorkstreams();
       }
     })
@@ -2680,8 +2833,9 @@ function App() {
       .catch((err) => setError(String(err)));
 
     listen<CaptureStatus>("capture-status", (event) => {
+      statusRef.current = event.payload;
       setStatus(event.payload);
-      if (diagnosticsOpen) {
+      if (diagnosticsOpenRef.current) {
         void refreshContinueMemory();
         void refreshWorkstreams();
       }
@@ -2716,8 +2870,6 @@ function App() {
     refreshContinueMemory,
     refreshWorkstreams,
     refreshStatus,
-    diagnosticsOpen,
-    selectedFrame,
   ]);
 
   return (
@@ -4168,6 +4320,29 @@ function freshnessBadgeLabel(
   return freshness.label;
 }
 
+function RecentContextVisit({ visit }: { visit: ContinueTaskTruthRecentContext }) {
+  const roleLabel = recentContextRoleLabel(visit.semantic_role);
+  const relationship = safeProductLine(visit.relationship_to_primary_task || "", "");
+  const marker = visit.is_current ? "Current" : visit.revisited ? "Returned" : null;
+
+  return (
+    <li className={visit.is_current ? "current" : undefined}>
+      <div className="answer-context-surface">
+        <strong>{visit.app_label}</strong>
+        {visit.site_hostname ? <span>{visit.site_hostname}</span> : null}
+      </div>
+      {roleLabel || relationship ? (
+        <small>
+          {roleLabel ? <b>{roleLabel}</b> : null}
+          {roleLabel && relationship ? <span aria-hidden="true"> · </span> : null}
+          {relationship}
+        </small>
+      ) : null}
+      {marker ? <em>{marker}</em> : null}
+    </li>
+  );
+}
+
 function ContinuationAnswer({
   decision,
   primaryMessage,
@@ -4262,6 +4437,7 @@ function ContinuationAnswer({
     : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const taskTruthAlternatives = cardTaskTruthAnswer?.alternative_hypotheses || [];
+  const recentContext = recentContextForPresentation(cardTaskTruthAnswer);
   const taskTruthActionState = actionState || {
     kind: "no_clear_continuation",
     label: "Inspect evidence",
@@ -4428,6 +4604,23 @@ function ContinuationAnswer({
             <strong>{nextActionLine}</strong>
           </div> : null}
         </div> : null}
+
+        {recentContext.length > 0 ? (
+          <section className="answer-memory-section" aria-labelledby="recent-trail-heading">
+            <div className="answer-section-heading">
+              <span className="answer-section-label" id="recent-trail-heading">Recent trail</span>
+              <small>Oldest to newest</small>
+            </div>
+            <ol className="answer-context-list">
+              {recentContext.map((visit) => (
+                <RecentContextVisit
+                  key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}
+                  visit={visit}
+                />
+              ))}
+            </ol>
+          </section>
+        ) : null}
 
         <div className="answer-target">
           <div>
