@@ -112,6 +112,14 @@ export type ContinueTaskTruthRecentContext = {
   role_evidence_refs?: string[];
 };
 
+export type ContinuePublicProjection = {
+  headline: string;
+  memoryLine: string | null;
+  resumeSurface: string | null;
+  openActionLabel: string;
+  exactTargetNote: string | null;
+};
+
 export type ContinueTaskTruthAnswer = {
   schema: string;
   task_basis?: string | null;
@@ -517,7 +525,136 @@ export function authoritativeTaskTruthTarget(
 export function recentContextForPresentation(
   answer?: ContinueTaskTruthAnswer | null,
 ) {
-  return (answer?.recent_context || []).slice(0, 8);
+  const visible: ContinueTaskTruthRecentContext[] = [];
+  for (const visit of answer?.recent_context || []) {
+    const previous = visible[visible.length - 1];
+    const sameSurface = previous
+      && recentContextSurfaceLabel(previous) === recentContextSurfaceLabel(visit);
+    const sameRole = previous?.semantic_role === visit.semantic_role;
+    const sameRelationship = (previous?.relationship_to_primary_task || "").trim()
+      === (visit.relationship_to_primary_task || "").trim();
+
+    if (sameSurface && sameRole && sameRelationship) {
+      visible[visible.length - 1] = {
+        ...previous,
+        ...visit,
+        first_observed_at_ms: previous.first_observed_at_ms,
+        evidence_refs: [
+          ...(previous.evidence_refs || []),
+          ...(visit.evidence_refs || []),
+        ],
+      };
+      continue;
+    }
+
+    visible.push(visit);
+  }
+  return visible.slice(-6);
+}
+
+export function recentContextSurfaceLabel(
+  visit: ContinueTaskTruthRecentContext,
+) {
+  const app = visit.app_label.trim();
+  const hostname = (visit.site_hostname || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
+  const appKey = app.toLowerCase();
+
+  if (appKey === "code" || appKey === "visual studio code") return "VS Code";
+  if (hostname === "thinkingmachines.ai") return "Thinking Machines";
+  if (hostname === "chatgpt.com") return "ChatGPT";
+  if (hostname === "platform.openai.com") return "OpenAI Platform";
+
+  const browserShells = ["helium", "safari", "google chrome", "chrome", "arc", "firefox"];
+  if (hostname && browserShells.includes(appKey)) {
+    const product = hostname.split(".")[0]?.replace(/[-_]+/g, " ") || hostname;
+    return product.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
+  return app || "Work surface";
+}
+
+export function buildContinuePublicProjection(
+  answer: ContinueTaskTruthAnswer,
+  targetOpenable: boolean,
+): ContinuePublicProjection {
+  const task = publicClause(answer.task_summary);
+  const currentStep = publicClause(answer.current_subtask);
+  const action = publicClause(answer.next_action || answer.unfinished_state);
+  const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
+  const surface = publicClause(answer.where_summary) || null;
+
+  const destination = surface ? ` in ${surface}` : "";
+  const actionClause = action
+    ? ` to ${lowerFirst(stripLeadingTo(action))}`
+    : task
+      ? ` with ${task}`
+      : "";
+  const taskClause = action && task ? ` for ${task}` : "";
+  const headline = task || action
+    ? sentence(`Continue${destination}${actionClause}${taskClause}`)
+    : sentence(currentStep || progress || "Continue");
+
+  const memoryParts = [
+    task ? `You were working on ${task}` : null,
+    !task && currentStep ? currentStep : null,
+    progress ? lowerFirst(progress) : null,
+  ].filter((part): part is string => Boolean(part));
+
+  const openActionLabel = targetOpenable
+    ? surface ? `Open ${surface}` : "Open continuation"
+    : answer.evidence_preview
+      ? surface ? `View ${surface} screen` : "View last screen"
+      : "Try Continue again";
+
+  return {
+    headline,
+    memoryLine: memoryParts.length ? sentence(memoryParts.join("; ")) : null,
+    resumeSurface: surface,
+    openActionLabel,
+    exactTargetNote: targetOpenable || !surface
+      ? null
+      : "Exact task link not captured",
+  };
+}
+
+export function hasVisibleTaskTruthSemantics(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  return [
+    answer?.task_summary,
+    answer?.task_object,
+    answer?.current_subtask,
+    answer?.observed_surface,
+    answer?.immediate_user_operation,
+    answer?.semantic_effect_of_operation,
+    answer?.last_meaningful_progress,
+    answer?.unfinished_state,
+    answer?.next_action,
+    answer?.where_summary,
+  ].some((value) => Boolean(value?.trim()));
+}
+
+function publicClause(value?: string | null) {
+  return (value || "")
+    .trim()
+    .replace(/[\s.!?;:]+$/, "")
+    .replace(/\s+/g, " ");
+}
+
+function stripLeadingTo(value: string) {
+  return value.replace(/^to\s+/i, "");
+}
+
+function lowerFirst(value: string) {
+  return value ? `${value.charAt(0).toLowerCase()}${value.slice(1)}` : value;
+}
+
+function sentence(value: string) {
+  const trimmed = value.trim();
+  return trimmed ? `${trimmed}${/[.!?]$/.test(trimmed) ? "" : "."}` : "Continue.";
 }
 
 export function recentContextRoleLabel(

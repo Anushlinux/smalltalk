@@ -5,12 +5,15 @@ import {
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
+  buildContinuePublicProjection,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
+  hasVisibleTaskTruthSemantics,
   inspectTargetCopy,
   isTaskInferenceUnavailable,
   recentContextForPresentation,
   recentContextRoleLabel,
+  recentContextSurfaceLabel,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
@@ -252,7 +255,7 @@ test("provider-failure unresolved answer remains usable without task identity", 
   });
 });
 
-test("recent context remains visible for resolved, partial, and unresolved answers", () => {
+test("recent context keeps the latest six meaningful visits for every answer state", () => {
   const visits = Array.from({ length: 10 }, (_, index) => ({
     sequence_index: index + 1,
     app_label: index === 1 ? "Private activity" : "Helium",
@@ -269,10 +272,69 @@ test("recent context remains visible for resolved, partial, and unresolved answe
     decision.task_truth_v2.answer.recent_context = visits;
     const answer = authoritativeTaskTruthAnswer(decision);
     const visible = recentContextForPresentation(answer);
-    assert.equal(visible.length, 8);
-    assert.equal(visible[0].sequence_index, 1);
-    assert.equal(visible[1].app_label, "Private activity");
+    assert.equal(visible.length, 6);
+    assert.equal(visible[0].sequence_index, 5);
+    assert.equal(visible.at(-1).sequence_index, 10);
   }
+});
+
+test("recent context compresses repeated shell visits without losing the latest state", () => {
+  const decision = authoritativeDecision();
+  decision.task_truth_v2.answer.recent_context = [
+    {
+      sequence_index: 1,
+      app_label: "Helium",
+      site_hostname: "thinkingmachines.ai",
+      first_observed_at_ms: 100,
+      last_observed_at_ms: 120,
+      is_current: false,
+      revisited: false,
+      semantic_role: "detour_or_unrelated",
+      relationship_to_primary_task: "Brief detour",
+      evidence_refs: ["frame-1"],
+    },
+    {
+      sequence_index: 2,
+      app_label: "Helium",
+      site_hostname: "thinkingmachines.ai",
+      first_observed_at_ms: 130,
+      last_observed_at_ms: 180,
+      is_current: false,
+      revisited: true,
+      semantic_role: "detour_or_unrelated",
+      relationship_to_primary_task: "Brief detour",
+      evidence_refs: ["frame-2"],
+    },
+  ];
+
+  const visible = recentContextForPresentation(authoritativeTaskTruthAnswer(decision));
+  assert.equal(visible.length, 1);
+  assert.equal(visible[0].sequence_index, 2);
+  assert.equal(visible[0].first_observed_at_ms, 100);
+  assert.deepEqual(visible[0].evidence_refs, ["frame-1", "frame-2"]);
+  assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
+});
+
+test("public projection gives one continuation instruction and one memory line", () => {
+  const decision = authoritativeDecision();
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: "Smalltalk's always-on repair",
+    where_summary: "Codex",
+    next_action: "Finish the two manual checks",
+    last_meaningful_progress: "The build and automated tests had already passed",
+    evidence_preview: { frame_id: "frame-1" },
+  });
+
+  assert.deepEqual(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false),
+    {
+      headline: "Continue in Codex to finish the two manual checks for Smalltalk's always-on repair.",
+      memoryLine: "You were working on Smalltalk's always-on repair; the build and automated tests had already passed.",
+      resumeSurface: "Codex",
+      openActionLabel: "View Codex screen",
+      exactTargetNote: "Exact task link not captured",
+    },
+  );
 });
 
 test("recent context roles use concise user-facing labels", () => {
@@ -290,6 +352,10 @@ test("field-limited model output remains visible instead of becoming the default
     current_subtask: "Verify the repaired Continue output",
     last_meaningful_progress: "The model response was parsed and locally admitted",
     unfinished_state: "The visible Continue card still needs confirmation",
+    next_action: null,
+    where_summary: null,
+    direct_return_target: null,
+    evidence_preview: null,
     inference_status: "model_answer_visible_with_validation_limits",
   });
   decision.task_truth_v2.answer.field_support.task_summary = {
@@ -314,6 +380,17 @@ test("field-limited model output remains visible instead of becoming the default
     kind: "thin_current_work",
     label: "Inspect evidence",
   });
+  assert.equal(hasVisibleTaskTruthSemantics(answer), true);
+  assert.deepEqual(
+    buildContinuePublicProjection(answer, false),
+    {
+      headline: "Continue to the visible Continue card still needs confirmation.",
+      memoryLine: "Verify the repaired Continue output; the model response was parsed and locally admitted.",
+      resumeSurface: null,
+      openActionLabel: "Try Continue again",
+      exactTargetNote: null,
+    },
+  );
 });
 
 test("task inference availability names only actual provider availability failures", () => {

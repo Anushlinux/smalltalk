@@ -12,12 +12,14 @@ import {
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthTarget,
+  buildContinuePublicProjection,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
+  hasVisibleTaskTruthSemantics,
   inspectTargetCopy,
   isDirectPresentationTargetOpenable,
   recentContextForPresentation,
-  recentContextRoleLabel,
+  recentContextSurfaceLabel,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
@@ -4321,26 +4323,58 @@ function freshnessBadgeLabel(
 }
 
 function RecentContextVisit({ visit }: { visit: ContinueTaskTruthRecentContext }) {
-  const roleLabel = recentContextRoleLabel(visit.semantic_role);
+  const surfaceLabel = recentContextSurfaceLabel(visit);
   const relationship = safeProductLine(visit.relationship_to_primary_task || "", "");
+  const activityLabel = relationship || {
+    primary_work: "Worked on the task",
+    supporting_work: "Supported the task",
+    detour_or_unrelated: "Brief detour",
+    unclear: "Recent work",
+  }[visit.semantic_role || "unclear"];
   const marker = visit.is_current ? "Current" : visit.revisited ? "Returned" : null;
 
   return (
-    <li className={visit.is_current ? "current" : undefined}>
-      <div className="answer-context-surface">
-        <strong>{visit.app_label}</strong>
-        {visit.site_hostname ? <span>{visit.site_hostname}</span> : null}
+    <li
+      className={[
+        visit.is_current ? "current" : "",
+        visit.semantic_role ? `role-${visit.semantic_role}` : "",
+      ].filter(Boolean).join(" ")}
+    >
+      <SurfaceGlyph label={surfaceLabel} />
+      <div className="answer-context-copy">
+        <div className="answer-context-surface">
+          <strong>{surfaceLabel}</strong>
+          {surfaceLabel === visit.app_label && visit.site_hostname ? <span>{visit.site_hostname}</span> : null}
+        </div>
+        <small>{activityLabel}</small>
       </div>
-      {roleLabel || relationship ? (
-        <small>
-          {roleLabel ? <b>{roleLabel}</b> : null}
-          {roleLabel && relationship ? <span aria-hidden="true"> · </span> : null}
-          {relationship}
-        </small>
-      ) : null}
       {marker ? <em>{marker}</em> : null}
     </li>
   );
+}
+
+function SurfaceGlyph({ label }: { label: string }) {
+  const normalized = label.toLowerCase();
+  const glyph = normalized.includes("vs code")
+    ? "VS"
+    : normalized.includes("thinking machines")
+      ? "TM"
+      : normalized.includes("openai")
+        ? "O"
+        : normalized.includes("codex")
+          ? "C"
+          : normalized.includes("chatgpt")
+            ? "C"
+            : label.split(/\s+/).slice(0, 2).map((word) => word[0]).join("").toUpperCase() || "•";
+  const tone = normalized.includes("vs code")
+    ? "code"
+    : normalized.includes("openai") || normalized.includes("codex") || normalized.includes("chatgpt")
+      ? "openai"
+      : normalized.includes("thinking machines")
+        ? "research"
+        : "neutral";
+
+  return <span className="surface-glyph" data-tone={tone} aria-hidden="true">{glyph}</span>;
 }
 
 function ContinuationAnswer({
@@ -4391,14 +4425,17 @@ function ContinuationAnswer({
       ? decision.task_truth_v2.answer
       : null;
   const cardTaskTruthAnswer = taskTruthAnswer || rawUnresolvedTaskTruthAnswer;
+  const hasVisibleSemanticAnswer = hasVisibleTaskTruthSemantics(cardTaskTruthAnswer);
   const taskInferenceFailureStatus = normalizeToken(taskTruthDiagnostic?.status) === "success"
     ? cardTaskTruthAnswer?.inference_status
     : taskTruthDiagnostic?.status || cardTaskTruthAnswer?.inference_status;
-  const taskInferenceFailed = cardTaskTruthAnswer?.task_resolution_status === "unresolved"
+  const taskInferenceFailed = !hasVisibleSemanticAnswer && (
+    cardTaskTruthAnswer?.task_resolution_status === "unresolved"
     || Boolean(
       taskTruthDiagnostic
       && normalizeToken(taskTruthDiagnostic.status) !== "success",
-    );
+    )
+  );
   const taskInferenceFailure = taskInferenceFailed
     ? taskInferenceFailurePresentation(
         taskInferenceFailureStatus,
@@ -4464,7 +4501,6 @@ function ContinuationAnswer({
     : productState?.lastStateLine
       || taskInferenceFailure?.detail
       || "No last meaningful state is clear yet.";
-  const nextActionLine = productState?.nextActionLine || "";
   const currentFocusLine = safeProductLine(
     productState?.currentFocusLine || (cardTaskTruthAnswer ? "" : stripCurrentFocusPrefix(
       safeProductLine(handoff?.current_focus_line || presentation?.currentFocus || "", ""),
@@ -4504,6 +4540,19 @@ function ContinuationAnswer({
           "",
         )
   );
+  const publicProjection = cardTaskTruthAnswer && hasVisibleSemanticAnswer
+    ? buildContinuePublicProjection(cardTaskTruthAnswer, canOpenResumeTarget)
+    : null;
+  const primaryActionShowsEvidence = Boolean(
+    publicProjection
+    && !canOpenResumeTarget
+    && cardTaskTruthAnswer?.evidence_preview,
+  );
+  const publicHeadline = publicProjection?.headline || workstreamLine;
+  const publicMemoryLine = publicProjection?.memoryLine || (
+    !noClearCurrentTask && lastStateLine ? sentenceCase(lastStateLine) : null
+  );
+  const publicActionLabel = publicProjection?.openActionLabel || openButtonLabel;
   useEffect(() => {
     setCorrectionOpen(false);
     setAlternativesOpen(false);
@@ -4567,43 +4616,75 @@ function ContinuationAnswer({
   return (
     <section className={`continue-card continuation-answer ${lowConfidence || targetLooksInternal ? "low-confidence" : ""}`} aria-label="Continue decision">
       <div className="answer-shell">
-        <div className="answer-eyebrow answer-provenance">
-          <span>{freshnessBadgeLabel(freshness, lowConfidence || targetLooksInternal)}</span>
-          {freshness.updatedAtLabel ? (
-            <span className="freshness-updated">{freshness.updatedAtLabel}</span>
-          ) : null}
+        <div className="answer-topline">
+          {publicProjection?.resumeSurface ? (
+            <div className="answer-destination">
+              <SurfaceGlyph label={publicProjection.resumeSurface} />
+              <div>
+                <span>Continue from</span>
+                <strong>{publicProjection.resumeSurface}</strong>
+              </div>
+            </div>
+          ) : <span />}
+          <div className="answer-eyebrow answer-provenance">
+            <span>{freshnessBadgeLabel(freshness, lowConfidence || targetLooksInternal)}</span>
+            {freshness.updatedAtLabel ? (
+              <span className="freshness-updated">{freshness.updatedAtLabel}</span>
+            ) : null}
+          </div>
         </div>
 
-        <div className="answer-hero">
-          <p>You were</p>
-          <h2>{workstreamLine}</h2>
-          {activityWhereLine ? (
-            <div className="answer-where">
-              <span>Where</span>
-              <strong>{activityWhereLine}</strong>
-            </div>
-          ) : null}
+        <div className="answer-hero answer-hero-public">
+          {!publicProjection ? <p>{noClearCurrentTask ? "Continue" : "You were"}</p> : null}
+          <h2>{publicHeadline}</h2>
+          {publicMemoryLine ? <p className="answer-memory-line">{publicMemoryLine}</p> : null}
         </div>
 
-        {currentFocusLine ? (
-          <div className="answer-state answer-current-activity">
-            <div>
-              <span>Currently</span>
-              <strong>{currentFocusLine}</strong>
-            </div>
+        {!publicProjection && activityWhereLine ? (
+          <div className="answer-where">
+            <span>Where</span>
+            <strong>{activityWhereLine}</strong>
           </div>
         ) : null}
 
-        {lastStateLine || nextActionLine ? <div className="answer-state">
-          {lastStateLine ? <div>
-            <span>State</span>
-            <strong>{lastStateLine}</strong>
-          </div> : null}
-          {nextActionLine ? <div>
-            <span>Next</span>
-            <strong>{nextActionLine}</strong>
-          </div> : null}
-        </div> : null}
+        <div className="answer-actions answer-primary-actions">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busyAction !== null || (!canOpenResumeTarget && !primaryActionShowsEvidence && continueRefreshBusy)}
+            aria-busy={busyAction === "open_continue_target"}
+            onClick={canOpenResumeTarget
+              ? onOpenTarget
+              : primaryActionShowsEvidence
+                ? onInspectEvidence
+                : onContinue}
+          >
+            {publicActionLabel}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busyAction !== null}
+            onClick={onInspectEvidence}
+          >
+            Why this?
+          </button>
+          {!noClearCurrentTask ? (
+            <button
+              className="text-button"
+              type="button"
+              disabled={busyAction !== null}
+              aria-expanded={correctionOpen}
+              onClick={() => setCorrectionOpen((open) => !open)}
+            >
+              Not right
+            </button>
+          ) : null}
+        </div>
+
+        {publicProjection?.exactTargetNote ? (
+          <p className="answer-target-note">{publicProjection.exactTargetNote}</p>
+        ) : null}
 
         {recentContext.length > 0 ? (
           <section className="answer-memory-section" aria-labelledby="recent-trail-heading">
@@ -4622,13 +4703,13 @@ function ContinuationAnswer({
           </section>
         ) : null}
 
-        <div className="answer-target">
+        {!publicProjection ? <div className="answer-target">
           <div>
             <span>{targetBlockLabel}</span>
             <strong>{targetLine}</strong>
             <small>{targetMeta}</small>
           </div>
-        </div>
+        </div> : null}
 
         {productState?.olderContextLine ? (
           <p className="answer-context">{productState.olderContextLine}</p>
@@ -4639,43 +4720,6 @@ function ContinuationAnswer({
             {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
           </p>
         ) : null}
-
-        <div className="answer-actions">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busyAction !== null || (!canOpenResumeTarget && continueRefreshBusy)}
-            aria-busy={busyAction === "open_continue_target"}
-            onClick={canOpenResumeTarget ? onOpenTarget : onContinue}
-          >
-            {openButtonLabel}
-          </button>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={busyAction !== null}
-            onClick={onInspectEvidence}
-          >
-            Why this answer?
-          </button>
-          {canOpenResumeTarget ? (
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={busyAction !== null || continueRefreshBusy}
-              aria-busy={continueRefreshBusy}
-              onClick={onContinue}
-            >
-              {continueRefreshBusy
-                ? "Understanding your recent work…"
-                : taskInferenceFailure?.retryable
-                  ? "Retry inference"
-                  : freshness.stale
-                    ? "Refresh Continue"
-                    : "Refresh"}
-            </button>
-          ) : null}
-        </div>
 
         {taskTruthAlternatives.length > 0 ? (
           <div className="alternative-list" aria-label="Possible task interpretations">
@@ -4722,14 +4766,6 @@ function ContinuationAnswer({
         ) : null}
 
         {!noClearCurrentTask ? <div className="continue-correction">
-          <button
-            className="text-button"
-            type="button"
-            disabled={busyAction !== null}
-            onClick={() => setCorrectionOpen((open) => !open)}
-          >
-            Not right
-          </button>
           {correctionOpen ? (
             <div className="continue-correction-panel" aria-label="Correction controls">
               <button
@@ -6151,6 +6187,7 @@ function buildTaskTruthProductStateCopy(
   });
 
   if (unresolved) {
+    const visibleSemantics = hasVisibleTaskTruthSemantics(answer);
     const failureStatus = normalizeToken(diagnostic?.status) === "success"
       ? answer.inference_status
       : diagnostic?.status || answer.inference_status;
@@ -6161,6 +6198,23 @@ function buildTaskTruthProductStateCopy(
       diagnostic?.image_count,
       diagnostic?.provider_attempt_count,
     );
+    if (visibleSemantics) {
+      return {
+        kind: "enriched_not_openable",
+        heroLabel: "Recent work",
+        headline: taskLine || currentActivity || stateLine || "Recent work was understood",
+        targetBlockLabel: inspectCopy.targetBlockLabel,
+        targetLine: "The understood work is ready to inspect",
+        targetMeta: "No exact page, conversation, or file was opened automatically.",
+        lastStateLine: stateLine || null,
+        nextActionLine: taskTruthStateProductLine(answer.next_action || answer.unfinished_state || "", "next"),
+        currentFocusLine: currentActivityLine,
+        uncertaintyLine:
+          "The model answer is shown. The broader task or exact return target did not pass the stricter local check.",
+        missingEvidenceLines: [],
+        statusPills: [],
+      };
+    }
     return {
       kind: "no_clear_continuation",
       heroLabel: NO_CLEAR_CURRENT_TASK_COPY.heroLabel,

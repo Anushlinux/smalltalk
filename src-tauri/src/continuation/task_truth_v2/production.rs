@@ -931,21 +931,13 @@ fn pftu_probe_public_result(
         .and_then(|raw| serde_json::from_str::<super::semantic_probe::ProbeRequestAudit>(raw).ok());
     let validation_issues =
         serde_json::from_str::<Vec<String>>(&validation_issues_json).unwrap_or_default();
-    let primary_task_rejected = validation_issues
-        .iter()
-        .any(|issue| issue.starts_with("primary_task:"));
     let output = probe_status_allows_admitted_output(&diagnostic_status)
         .then(|| {
             admitted_output_json.as_deref().and_then(|raw| {
                 serde_json::from_str::<super::semantic_probe::ProbeModelOutput>(raw).ok()
             })
         })
-        .flatten()
-        // A task answer is atomic at the product surface. Field-local
-        // validation may preserve diagnostic facts, but if the primary task
-        // itself was rejected those facts must not be projected as a public
-        // continuation state or semantic visit roles.
-        .filter(|_| !primary_task_rejected);
+        .flatten();
     let slots = support_slot_map_json
         .as_deref()
         .and_then(|raw| {
@@ -3678,11 +3670,13 @@ mod tests {
             Some("React and the island still need the same answer")
         );
 
-        // The primary task is the anchor for every public continuation field.
-        // If that field is rejected, diagnostic fragments and visit roles must
-        // not reconstruct the same bad task on the product surface.
+        // A rejected primary-task claim must stay rejected, but it must not
+        // erase other fields that independently passed local admission. The
+        // product can show those fields as a limited, inspect-only answer while
+        // still refusing to claim a broad task or open an exact target.
         let mut primary_rejected_output = output.clone();
         primary_rejected_output.primary_task = None;
+        primary_rejected_output.visit_roles.clear();
         primary_rejected_output.status =
             super::super::semantic_probe::ProbeResolutionStatus::Unresolved;
         conn.execute(
@@ -3704,9 +3698,18 @@ mod tests {
             .expect("factual timeline remains public");
         assert_eq!(primary_rejected.task_resolution_status, "unresolved");
         assert!(primary_rejected.task_summary.is_none());
-        assert!(primary_rejected.current_subtask.is_none());
-        assert!(primary_rejected.last_meaningful_progress.is_none());
-        assert!(primary_rejected.unfinished_state.is_none());
+        assert_eq!(
+            primary_rejected.current_subtask.as_deref(),
+            Some("Routing the PFTU response into the public answer")
+        );
+        assert_eq!(
+            primary_rejected.last_meaningful_progress.as_deref(),
+            Some("The paid provider response was parsed")
+        );
+        assert_eq!(
+            primary_rejected.unfinished_state.as_deref(),
+            Some("React and the island still need the same answer")
+        );
         assert!(primary_rejected
             .recent_context
             .iter()

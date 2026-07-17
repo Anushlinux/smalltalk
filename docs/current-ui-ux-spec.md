@@ -1,6 +1,6 @@
 # Smalltalk Current UI/UX Specification
 
-Last verified: 2026-07-07
+Last verified: 2026-07-17
 
 This document is the current UI/UX source of truth for Smalltalk as implemented in the live desktop codebase. It describes the product surface that exists now, not the ideal future product and not the older session-recorder UI model.
 
@@ -228,43 +228,25 @@ Additional states:
 
 The visual shell is `.answer-shell`:
 
-- Border radius: 6 px.
-- Padding: 34 px desktop, 24 px under 860 px, 20 px under 560 px.
-- Inner white/highlight border.
-- Warm white panel gradient.
+- The outer answer card uses a 24 px radius and fluid 24–48 px padding.
+- The surface is a restrained translucent material with a warm white gradient, 24 px backdrop blur, and a deeper shadow than the surrounding chrome.
+- The content remains one flow rather than a grid of competing report cards.
+- Reduced-transparency and increased-contrast preferences replace the material with a solid, more strongly bordered surface.
 
 ### 5.1 Empty State
 
 Rendered when `continueDecision` is null.
 
-Eyebrow text:
-
-- `Memory on` when memory is running.
-- `Evidence ready` when evidence exists.
-- `No local memory yet` when no evidence exists.
+Eyebrow text comes from the current `ContinueFreshnessPresentation` label.
 
 Small label above H2:
 
 - `Ready to answer` when evidence exists.
 - `Turn on local memory` when evidence does not exist.
 
-H2 text comes from `continuePrimaryMessage`:
+H2 text comes from `continuePrimaryMessage`. The normal empty states explain whether the user should turn on local memory, keep working while memory is on, or ask Continue from already captured evidence.
 
-- `Start local memory to make Continue useful.`
-- `Smalltalk is watching locally. Continue when there is enough evidence.`
-- `Ready to find where to continue.`
-- Or the selected workstream title when a decision exists elsewhere.
-
-Supporting body:
-
-- With evidence: `Continue can answer from local evidence without requiring you to stop or export anything first.`
-- Without evidence: `Smalltalk watches local context, keeps privacy boundaries visible, and gives one continuation when you ask.`
-
-Assurance list:
-
-- `Current focus stays separate from the return target.`
-- `Thin evidence is shown honestly.`
-- `Raw typed characters and full clipboard contents are excluded.`
+The supporting body is one short explanation. Privacy and local-memory details stay in the companion panel rather than repeating inside the empty answer card.
 
 Actions:
 
@@ -272,63 +254,35 @@ Actions:
   - Idle: `Find where to continue`
   - Busy: `Finding where to continue`
   - Calls `get_continue_decision` with `writeAudit: true`.
-- Secondary button appears only when there is no evidence:
-  - Idle: `Start local memory`
-  - Busy: `Starting`
-  - Calls `start_capture`.
+- When no local evidence exists and memory is off, the primary button becomes `Turn on local memory` and calls `start_capture`.
 
 ### 5.2 Decision State
 
 Rendered when `continueDecision` exists.
 
-Eyebrow:
+The authoritative Task Truth path is projected into a compact public answer by `buildContinuePublicProjection`.
 
-- `New local evidence since this answer` when stale.
-- `Best available answer` when low confidence or target text looks internal.
-- `Continue answer` otherwise.
+The visible hierarchy is fixed:
 
-Provenance pill:
+1. Destination identity, when `where_summary` is supported: `Continue from <surface>` with a local product glyph.
+2. Freshness pill: `Ready to continue`, `New evidence since this answer`, `Updating`, or `Best available answer`.
+3. One continuation sentence: `Continue in {surface} to {unfinished action} for {task}.`
+4. One memory line: `You were working on {task}; {last meaningful progress}.`
+5. Actions whose label reflects actual opening capability.
+6. A compact recent trail, oldest to newest.
 
-- `AI-assisted` when `decision.source === "cloud_micro_inference"` and `response_id` exists.
-- `Local fallback` when `decision.source === "local_fallback"`.
-- `Local only` otherwise.
+The UI no longer asks the user to assemble the answer from separate `Currently`, `State`, `Next`, and `Exact location unavailable` cards. Those semantic fields remain in the typed answer and evidence view, but the first screen composes them into one instruction and one state line.
 
-Provenance visual tone:
+When Task Truth is unresolved, the card does not synthesize this public projection. It preserves the typed failure presentation and honest retry/evidence behavior.
 
-- `ai`: blue/info styling.
-- `fallback`: warm warning styling.
-- `local`: neutral gray styling.
+Recent trail:
 
-Hero:
-
-- Small text: `You were working on`.
-- H2: user-facing workstream line.
-- The H2 is capped at `max-width: 18ch`, 46 px, `line-height: 1`.
-- Internal IDs are suppressed by `safeProductLine` and `isInternalFacingText`.
-
-Target block:
-
-- Label:
-  - `Best available place to continue` when low confidence.
-  - `Continue at` otherwise.
-- Strong line: target label.
-- Small line: target meta, such as artifact kind and openability.
-
-State grid:
-
-- `Last meaningful state`
-- `Next action`
-
-Why strip:
-
-- `.answer-why-strip`
-- Up to 3 chips from `handoff.why_this` or presentation decision reason.
-
-Current focus line:
-
-- Rendered only when current focus exists and differs from return target.
-- Text pattern: `Current focus: <strong>...</strong>`
-- This preserves the product doctrine that current focus and return target are not necessarily the same.
+- Shows at most the latest six meaningful visits.
+- Consecutive repeated visits to the same normalized product surface are collapsed when their semantic role and relationship are unchanged.
+- Browser shells are replaced by a product identity only when the hostname supports that mapping.
+- `Code` is displayed as `VS Code`; known OpenAI and Thinking Machines surfaces receive local glyph treatments.
+- Detours are visually muted, primary work stays at normal contrast, and the current item receives a stronger anchored glyph.
+- Role enum names are not rendered as the main explanation when an evidence-backed relationship label exists.
 
 Uncertainty line:
 
@@ -340,37 +294,30 @@ Uncertainty line:
 
 Primary action:
 
-- Button label:
-  - `Opening` while `open_resume_point` is busy.
-  - `Continue here` when target is directly openable.
-  - `Needs evidence` when target is not directly openable.
-- Disabled unless:
-  - `busyAction === null`
-  - target openability is `openable`
-  - target has a `browser_url` or `document_path`.
-- Calls `open_resume_point` with:
+- When an exact strict target exists, the button says `Open {surface}` and calls `open_resume_point` with:
   - `continue_decision_id`
   - `target_artifact_id`
   - `strict_continue_target: true`
+- When the task and semantic surface are understood but only a frame preview exists, the button says `View {surface} screen` and opens the evidence view.
+- When neither a strict target nor preview is available, the button says `Try Continue again` and requests a new explicit Continue decision.
+- Missing direct openability appears as the quiet note `Exact task link not captured`; it never replaces the useful continuation headline.
 
 Secondary actions:
 
 - `Why this?`
   - Opens `ContinueEvidencePanel`.
   - Loads the first evidence frame if possible.
-- `Refresh`
-  - Busy label: `Refreshing`
-  - Calls `get_continue_decision` with `writeAudit: true`.
 
 Correction control:
 
-- Text button: `Wrong target?`
+- Text button: `Not right`
 - Opens `.continue-correction-panel`.
 - Correction buttons:
-  - `Mark wrong target`
+  - `Not right`
   - `Show alternatives` / `Hide alternatives`
-  - `This was only evidence`
-  - `Ignore workstream`
+  - `This was supporting work`
+  - `This was unrelated`
+  - `Mark task complete` and `Reactivate this task` for authoritative Task Truth answers.
 - Feedback kinds sent to backend:
   - `rejected`
   - `artifact_only_evidence`
