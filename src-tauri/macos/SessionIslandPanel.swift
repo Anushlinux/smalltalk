@@ -9,6 +9,7 @@ private var gActionCallback: SmalltalkIslandActionCallback?
 
 private struct IslandSnapshot: Decodable {
     var state: String = "hidden"
+    var memoryActive = false
     var elapsedMs: Int64 = 0
     var frameCount: Int64 = 0
     var eventCount: Int64?
@@ -41,6 +42,7 @@ private struct IslandSnapshot: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case state
+        case memoryActive = "memory_active"
         case elapsedMs = "elapsed_ms"
         case frameCount = "frame_count"
         case eventCount = "event_count"
@@ -537,6 +539,17 @@ private enum IslandMotion {
         .timingCurve(0.23, 1, 0.32, 1, duration: reduceMotion ? 0.01 : 0.14)
     }
 
+    static func memoryContinuityMorph(_ reduceMotion: Bool) -> Animation? {
+        guard !reduceMotion else { return nil }
+        return .timingCurve(
+            0.77,
+            0,
+            0.175,
+            1,
+            duration: kWhisperFlowMicroAmbientTransitionDuration
+        )
+    }
+
     static func panelTimingFunction() -> CAMediaTimingFunction {
         CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
     }
@@ -551,6 +564,36 @@ private struct IslandMorphModifier: ViewModifier {
         content
             .opacity(opacity)
             .scaleEffect(scale, anchor: .top)
+    }
+}
+
+@available(macOS 13.0, *)
+private struct TopAnchoredCapsuleShape: Shape {
+    var width: CGFloat
+    var height: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(width, height) }
+        set {
+            width = newValue.first
+            height = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let clampedWidth = min(max(0, width), rect.width)
+        let clampedHeight = min(max(0, height), rect.height)
+        let capsuleRect = CGRect(
+            x: rect.midX - clampedWidth / 2,
+            y: rect.minY,
+            width: clampedWidth,
+            height: clampedHeight
+        )
+        return Path(
+            roundedRect: capsuleRect,
+            cornerRadius: clampedHeight / 2,
+            style: .continuous
+        )
     }
 }
 
@@ -570,17 +613,30 @@ private struct WhisperFlowPressButtonStyle: ButtonStyle {
     }
 }
 
-private let kWhisperFlowReadyPanelW: CGFloat = 187
-private let kWhisperFlowReadyPanelH: CGFloat = 49
-private let kWhisperFlowReadyW: CGFloat = 152
-private let kWhisperFlowReadyH: CGFloat = 30
-private let kWhisperFlowReadyActionW: CGFloat = 28
-private let kWhisperFlowReadyActionH: CGFloat = 24
-private let kWhisperFlowRecordingContentW: CGFloat = 107
-private let kWhisperFlowEvidenceTapeW: CGFloat = 92
-private let kWhisperFlowEvidenceTapeH: CGFloat = 18
-private let kWhisperFlowCapturePreviewEnabled = true
-private let kWhisperFlowRecorderCycleInterval: TimeInterval = 3.0
+private let kWhisperFlowCapturePanelW: CGFloat = 187
+private let kWhisperFlowCapturePanelH: CGFloat = 49
+private let kWhisperFlowCaptureW: CGFloat = 168
+private let kWhisperFlowCaptureH: CGFloat = 34
+private let kWhisperFlowCaptureActionW: CGFloat = 28
+private let kWhisperFlowCaptureActionH: CGFloat = 24
+private let kWhisperFlowCaptureContentW: CGFloat = 123
+private let kWhisperFlowDotMatrixSize: CGFloat = 11
+private let kWhisperFlowCaptureStatusLabelW: CGFloat = 108
+private let kWhisperFlowNotificationPanelW: CGFloat = 255
+private let kWhisperFlowNotificationPanelH: CGFloat = 61
+private let kWhisperFlowNotificationW: CGFloat = 236
+private let kWhisperFlowNotificationH: CGFloat = 46
+private let kWhisperFlowNotificationActionW: CGFloat = 32
+private let kWhisperFlowNotificationActionH: CGFloat = 28
+private let kWhisperFlowNotificationContentW: CGFloat = 175
+private let kWhisperFlowNotificationDotMatrixSize: CGFloat = 13
+private let kWhisperFlowNotificationStatusLabelW: CGFloat = 156
+private let kWhisperFlowNotificationFontSize: CGFloat = 14
+private let kWhisperFlowNotificationCountdownLineH: CGFloat = 2
+private let kWhisperFlowMemoryTransitionDuration: TimeInterval = 3.0
+private let kWhisperFlowAmbientHoverReturnDelay: TimeInterval = 1.0
+private let kWhisperFlowCountdownLineH: CGFloat = 1
+private let kWhisperFlowAmbientBodyHoverArmDelay: TimeInterval = 0.20
 private let kWhisperFlowAnswerSummaryPanelW: CGFloat = 187
 private let kWhisperFlowAnswerSummaryPanelH: CGFloat = 49
 private let kWhisperFlowAnswerSummaryW: CGFloat = 152
@@ -593,21 +649,31 @@ private let kWhisperFlowMicroPulseDuration: TimeInterval = 3.2
 private let kWhisperFlowMicroPulseScale: CGFloat = 1.018
 private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
 private let kWhisperFlowMorphDuration: TimeInterval = 0.18
+private let kWhisperFlowMicroAmbientTransitionDuration: TimeInterval = 0.18
+private let kWhisperFlowReducedMotionFadeDuration: TimeInterval = 0.12
 
 private enum WhisperFlowPresentation: Equatable {
     case micro
-    case recordingTape
+    case ambientMemory
     case answerSummary
     case answerExpanded
 }
 
 private enum WhisperFlowCaptureStatus: Equatable {
-    case recording
+    case active
     case starting
     case processing
     case inactive
     case suppressed
     case error
+}
+
+private enum WhisperFlowMemoryLifecyclePhase: Equatable {
+    case paused
+    case starting
+    case active
+    case stopping
+    case unavailable
 }
 
 private enum WhisperFlowPreview {
@@ -620,50 +686,543 @@ private enum WhisperFlowPreview {
 
 @available(macOS 13.0, *)
 private final class WhisperFlowIslandModel: ObservableObject {
-    @Published var presentation: WhisperFlowPresentation = .recordingTape
+    @Published var presentation: WhisperFlowPresentation = .micro
+    @Published var isPanelVisible = false
     @Published var memoryActive = false
+    @Published var memoryHasStarted = false
     @Published var microPulseActive = false
-    @Published var captureFrameCount: Int64 = 0
     @Published var capturePulseNonce: UInt64?
-    @Published var captureIndicationActive = kWhisperFlowCapturePreviewEnabled
-    @Published var captureStatus: WhisperFlowCaptureStatus = kWhisperFlowCapturePreviewEnabled
-        ? .recording
-        : .inactive
+    @Published var startingFeedbackNonce: UInt64?
+    @Published var captureStatus: WhisperFlowCaptureStatus = .inactive
+    @Published var memoryTransitionCountdownActive = false
+    @Published var memoryTransitionCountdownNonce: UInt64 = 0
+}
+
+@available(macOS 13.0, *)
+private final class DotMatrixIndicatorView: NSView {
+    private struct Configuration: Equatable {
+        let status: WhisperFlowCaptureStatus
+        let capturePulseNonce: UInt64?
+        let startingFeedbackNonce: UInt64?
+        let panelVisible: Bool
+        let reduceMotion: Bool
+        let restartInvited: Bool
+    }
+
+    private static let captureAnimationKey = "smalltalk.dot-matrix-capture"
+    private static let startingAnimationKey = "smalltalk.dot-matrix-starting"
+    private static let inactiveOpacity: Float = 0.15
+    private static let activeOpacity: Float = 0.82
+    private static let capturePulseDuration: TimeInterval = 0.72
+    private static let capturePulseCooldown: TimeInterval = 1.75
+    private static let startingDuration: TimeInterval = 0.60
+    private static let reducedMotionDuration: TimeInterval = 0.40
+    private static let gatherFraction: CGFloat = 0.32
+    private static let activePattern = Set([7, 11, 12, 13, 17])
+    private static let pausedPattern = Set([6, 8, 11, 13, 16, 18])
+    private static let filteredPattern = Set([1, 3, 5, 9, 10, 14, 16, 18, 22])
+    private static let errorPattern = Set([2, 7, 12, 22])
+    private static let restartPattern = Set([1, 6, 7, 11, 12, 13, 16, 17, 21])
+    private static let restartTransitionDuration: TimeInterval = 0.12
+
+    private let dotLayers: [CAShapeLayer]
+    private var configuration: Configuration?
+    private var restingPositions = Array(repeating: CGPoint.zero, count: 25)
+    private var hasCapturePulseBaseline = false
+    private var latestCapturePulseNonce: UInt64?
+    private var latestStartingFeedbackNonce: UInt64?
+    private var lastCapturePulseAt: CFTimeInterval?
+    private var pendingCapturePulseNonce: UInt64?
+    private var pendingCapturePulseWorkItem: DispatchWorkItem?
+    private var startingAnimationPending = false
+    private var startingAnimationHasRunForCurrentState = false
+    private var startingAnimationEndsAt: CFTimeInterval?
+
+    override init(frame frameRect: NSRect) {
+        var layers: [CAShapeLayer] = []
+        for _ in 0..<25 {
+            let dot = CAShapeLayer()
+            dot.backgroundColor = NSColor.white.cgColor
+            dot.opacity = Self.inactiveOpacity
+            layers.append(dot)
+        }
+        dotLayers = layers
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        for dot in dotLayers {
+            layer?.addSublayer(dot)
+        }
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        cancelAnimationsAndPendingPulse()
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func layout() {
+        super.layout()
+        let side = min(bounds.width, bounds.height)
+        let dotDiameter = side * 0.145
+        let gap = max(0, (side - dotDiameter * 5) / 4)
+        let originX = (bounds.width - side) / 2
+        let originY = (bounds.height - side) / 2
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for row in 0..<5 {
+            for column in 0..<5 {
+                let index = row * 5 + column
+                dotLayers[index].frame = CGRect(
+                    x: originX + CGFloat(column) * (dotDiameter + gap),
+                    y: originY + CGFloat(row) * (dotDiameter + gap),
+                    width: dotDiameter,
+                    height: dotDiameter
+                )
+                dotLayers[index].cornerRadius = dotDiameter / 2
+                dotLayers[index].contentsScale = window?.backingScaleFactor
+                    ?? NSScreen.main?.backingScaleFactor
+                    ?? 2
+                restingPositions[index] = dotLayers[index].position
+            }
+        }
+        CATransaction.commit()
+        applyStaticState()
+        if startingAnimationPending {
+            runStartingAnimation()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else {
+            cancelAnimationsAndPendingPulse()
+            return
+        }
+        applyStaticState()
+        if configuration?.status == .starting, !startingAnimationHasRunForCurrentState {
+            startingAnimationPending = true
+            runStartingAnimation()
+        }
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if superview == nil {
+            cancelAnimationsAndPendingPulse()
+        }
+    }
+
+    func configure(
+        status: WhisperFlowCaptureStatus,
+        capturePulseNonce: UInt64?,
+        startingFeedbackNonce: UInt64?,
+        panelVisible: Bool,
+        reduceMotion: Bool,
+        restartInvited: Bool
+    ) {
+        let next = Configuration(
+            status: status,
+            capturePulseNonce: capturePulseNonce,
+            startingFeedbackNonce: startingFeedbackNonce,
+            panelVisible: panelVisible,
+            reduceMotion: reduceMotion,
+            restartInvited: restartInvited
+        )
+        guard next != configuration else { return }
+        let previous = configuration
+        configuration = next
+
+        let statusChanged = previous?.status != status
+        let panelVisibilityChanged = previous?.panelVisible != panelVisible
+        let reduceMotionChanged = previous?.reduceMotion != reduceMotion
+        let preservesStartingAnimation = previous?.status == .starting &&
+            status == .active &&
+            !panelVisibilityChanged &&
+            !reduceMotionChanged
+
+        if panelVisibilityChanged || (statusChanged && !preservesStartingAnimation) {
+            removeLayerAnimations()
+            if statusChanged {
+                startingAnimationHasRunForCurrentState = false
+            }
+            startingAnimationEndsAt = nil
+            startingAnimationPending = status == .starting &&
+                panelVisible &&
+                !startingAnimationHasRunForCurrentState
+            if status != .active {
+                cancelPendingCapturePulse()
+            }
+            applyStaticState()
+            if startingAnimationPending, window != nil {
+                runStartingAnimation()
+            }
+        } else if reduceMotionChanged {
+            removeLayerAnimations()
+            startingAnimationEndsAt = nil
+            applyStaticState()
+        } else if preservesStartingAnimation,
+                  startingAnimationPending,
+                  window != nil {
+            runStartingAnimation()
+        } else if previous?.restartInvited != restartInvited {
+            applyRestartPatternTransition()
+        }
+
+        // A confirmed start event is controller-owned so it survives the
+        // matrix view being absent in micro. This lets a newly created active
+        // matrix play the activation even when `starting` already became
+        // `active` before SwiftUI constructed the view.
+        if let startingFeedbackNonce,
+           startingFeedbackNonce != latestStartingFeedbackNonce {
+            latestStartingFeedbackNonce = startingFeedbackNonce
+            if (status == .starting || status == .active),
+               panelVisible,
+               !startingAnimationHasRunForCurrentState {
+                startingAnimationPending = true
+                if window != nil {
+                    runStartingAnimation()
+                }
+            }
+        }
+
+        // Process capture events only after status cleanup. Otherwise a pulse
+        // started above can be removed later in this same configuration pass.
+        if !hasCapturePulseBaseline, let capturePulseNonce {
+            hasCapturePulseBaseline = true
+            latestCapturePulseNonce = capturePulseNonce
+        } else if let capturePulseNonce, capturePulseNonce != latestCapturePulseNonce {
+            latestCapturePulseNonce = capturePulseNonce
+            requestCapturePulse(capturePulseNonce)
+        }
+    }
+
+    private var shouldReduceMotion: Bool {
+        configuration?.reduceMotion == true ||
+            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func pattern(for status: WhisperFlowCaptureStatus) -> Set<Int> {
+        if status == .inactive, configuration?.restartInvited == true {
+            return Self.restartPattern
+        }
+        switch status {
+        case .active, .starting:
+            return Self.activePattern
+        case .processing, .inactive:
+            return Self.pausedPattern
+        case .suppressed:
+            return Self.filteredPattern
+        case .error:
+            return Self.errorPattern
+        }
+    }
+
+    private func requestCapturePulse(_ nonce: UInt64) {
+        guard let configuration,
+              configuration.status == .active,
+              configuration.panelVisible,
+              window != nil else { return }
+
+        let now = CACurrentMediaTime()
+        if startingAnimationPending {
+            pendingCapturePulseNonce = nonce
+            return
+        }
+
+        let cooldownReadyAt = lastCapturePulseAt.map {
+            $0 + Self.capturePulseCooldown
+        } ?? now
+        let startingReadyAt = startingAnimationEndsAt ?? now
+        let readyAt = max(cooldownReadyAt, startingReadyAt)
+        if now >= readyAt {
+            runCapturePulse(nonce)
+            return
+        }
+
+        pendingCapturePulseNonce = nonce
+        guard pendingCapturePulseWorkItem == nil else { return }
+        let delay = readyAt - now
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingCapturePulseWorkItem = nil
+            guard let pendingNonce = self.pendingCapturePulseNonce else { return }
+            self.pendingCapturePulseNonce = nil
+            guard self.configuration?.status == .active,
+                  self.configuration?.panelVisible == true,
+                  self.window != nil else { return }
+            self.requestCapturePulse(pendingNonce)
+        }
+        pendingCapturePulseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func runCapturePulse(_ nonce: UInt64) {
+        guard latestCapturePulseNonce == nonce || pendingCapturePulseNonce == nil else { return }
+        lastCapturePulseAt = CACurrentMediaTime()
+        removeLayerAnimations()
+        applyStaticState()
+
+        if shouldReduceMotion {
+            let center = dotLayers[12]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [Self.activeOpacity, 1.0, Self.activeOpacity]
+            animation.keyTimes = [0, 0.5, 1]
+            animation.duration = Self.reducedMotionDuration
+            animation.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+            center.add(animation, forKey: Self.captureAnimationKey)
+            return
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let center = restingPositions[12]
+        for (index, dot) in dotLayers.enumerated() {
+            let rest = restingPositions[index]
+            let gathered = CGPoint(
+                x: rest.x + (center.x - rest.x) * Self.gatherFraction,
+                y: rest.y + (center.y - rest.y) * Self.gatherFraction
+            )
+            let baseOpacity = staticOpacity(for: index)
+            let peakOpacity: Float = index == 12
+                ? 1.0
+                : Self.activePattern.contains(index) ? 0.95 : 0.55
+
+            let position = CAKeyframeAnimation(keyPath: "position")
+            position.values = [rest, gathered, rest]
+            position.keyTimes = [0, 0.45, 1]
+            position.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+
+            let opacity = CAKeyframeAnimation(keyPath: "opacity")
+            opacity.values = [baseOpacity, peakOpacity, baseOpacity]
+            opacity.keyTimes = [0, 0.45, 1]
+            opacity.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+
+            let group = CAAnimationGroup()
+            group.animations = [position, opacity]
+            group.duration = Self.capturePulseDuration
+            dot.position = rest
+            dot.opacity = baseOpacity
+            dot.add(group, forKey: Self.captureAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
+    private func runStartingAnimation() {
+        guard !startingAnimationHasRunForCurrentState else {
+            startingAnimationPending = false
+            return
+        }
+        guard bounds.width > 0, bounds.height > 0 else {
+            startingAnimationPending = true
+            return
+        }
+        startingAnimationPending = false
+        startingAnimationHasRunForCurrentState = true
+        removeLayerAnimations()
+        applyStaticState()
+        if shouldReduceMotion {
+            startingAnimationEndsAt = CACurrentMediaTime() + Self.reducedMotionDuration
+            let center = dotLayers[12]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [Self.inactiveOpacity, 1.0, Self.activeOpacity]
+            animation.keyTimes = [0, 0.5, 1]
+            animation.duration = Self.reducedMotionDuration
+            center.add(animation, forKey: Self.startingAnimationKey)
+            schedulePendingCapturePulseAfterStartingIfNeeded()
+            return
+        }
+
+        let center = restingPositions[12]
+        let sharedStartTime = CACurrentMediaTime() + 0.02
+        startingAnimationEndsAt = sharedStartTime + Self.startingDuration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for row in 0..<5 {
+            for column in 0..<5 {
+                let index = row * 5 + column
+                let dot = dotLayers[index]
+                let rest = restingPositions[index]
+                let gathered = CGPoint(
+                    x: rest.x + (center.x - rest.x) * 0.18,
+                    y: rest.y + (center.y - rest.y) * 0.18
+                )
+                let distance = abs(row - 2) + abs(column - 2)
+                let inwardDelay = TimeInterval(max(0, 4 - distance)) * 0.045
+                let baseOpacity = staticOpacity(for: index)
+
+                let position = CAKeyframeAnimation(keyPath: "position")
+                position.values = [rest, gathered, rest]
+                position.keyTimes = [0, 0.45, 1]
+                position.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                ]
+
+                let opacity = CAKeyframeAnimation(keyPath: "opacity")
+                opacity.values = [Self.inactiveOpacity, 0.72, baseOpacity]
+                opacity.keyTimes = [0, 0.45, 1]
+                opacity.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                ]
+
+                let group = CAAnimationGroup()
+                group.animations = [position, opacity]
+                group.duration = Self.startingDuration - inwardDelay
+                group.beginTime = sharedStartTime + inwardDelay
+                dot.position = rest
+                dot.opacity = baseOpacity
+                dot.add(group, forKey: Self.startingAnimationKey)
+            }
+        }
+        CATransaction.commit()
+        schedulePendingCapturePulseAfterStartingIfNeeded()
+    }
+
+    private func schedulePendingCapturePulseAfterStartingIfNeeded() {
+        guard configuration?.status == .active,
+              let pendingNonce = pendingCapturePulseNonce else { return }
+        requestCapturePulse(pendingNonce)
+    }
+
+    private func staticOpacity(for index: Int) -> Float {
+        let status = configuration?.status ?? .inactive
+        return pattern(for: status).contains(index) ? Self.activeOpacity : Self.inactiveOpacity
+    }
+
+    private func removeLayerAnimations() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            dot.removeAllAnimations()
+            dot.position = restingPositions[index]
+        }
+        CATransaction.commit()
+    }
+
+    private func applyStaticState() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            dot.position = restingPositions[index]
+            dot.opacity = staticOpacity(for: index)
+        }
+        CATransaction.commit()
+    }
+
+    private func applyRestartPatternTransition() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            let targetOpacity = staticOpacity(for: index)
+            let animation = CABasicAnimation(keyPath: "opacity")
+            animation.fromValue = dot.presentation()?.opacity ?? dot.opacity
+            animation.toValue = targetOpacity
+            animation.duration = Self.restartTransitionDuration
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            dot.opacity = targetOpacity
+            dot.add(animation, forKey: "smalltalk.dot-matrix-restart")
+        }
+        CATransaction.commit()
+    }
+
+    private func cancelPendingCapturePulse() {
+        pendingCapturePulseWorkItem?.cancel()
+        pendingCapturePulseWorkItem = nil
+        pendingCapturePulseNonce = nil
+    }
+
+    private func cancelAnimationsAndPendingPulse() {
+        cancelPendingCapturePulse()
+        startingAnimationEndsAt = nil
+        removeLayerAnimations()
+    }
+}
+
+@available(macOS 13.0, *)
+private struct DotMatrixIndicator: NSViewRepresentable {
+    let status: WhisperFlowCaptureStatus
+    let capturePulseNonce: UInt64?
+    let startingFeedbackNonce: UInt64?
+    let panelVisible: Bool
+    let reduceMotion: Bool
+    let restartInvited: Bool
+
+    func makeNSView(context: Context) -> DotMatrixIndicatorView {
+        DotMatrixIndicatorView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: DotMatrixIndicatorView, context: Context) {
+        nsView.configure(
+            status: status,
+            capturePulseNonce: capturePulseNonce,
+            startingFeedbackNonce: startingFeedbackNonce,
+            panelVisible: panelVisible,
+            reduceMotion: reduceMotion,
+            restartInvited: restartInvited
+        )
+    }
+
+    static func dismantleNSView(_ nsView: DotMatrixIndicatorView, coordinator: ()) {
+        nsView.configure(
+            status: .inactive,
+            capturePulseNonce: nil,
+            startingFeedbackNonce: nil,
+            panelVisible: false,
+            reduceMotion: true,
+            restartInvited: false
+        )
+    }
 }
 
 @available(macOS 13.0, *)
 private struct WhisperFlowIslandView: View {
     let scale: CGFloat
     @ObservedObject var model: WhisperFlowIslandModel
-    let onRevealRecorder: () -> Void
+    let onRevealAmbientMemory: () -> Void
+    let onMicroHover: (Bool) -> Void
     let onReadyAction: () -> Void
+    let onStartMemory: () -> Void
+    let onAmbientHover: (Bool) -> Void
+    let onAmbientBodyHover: (Bool) -> Void
     let onAnswerSummaryHover: (Bool) -> Void
     let onExpandAnswer: () -> Void
     let onCollapseAnswer: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var microPulseExpanded = false
-    @State private var recordingActionHovered = false
-    @State private var recorderCycleTextVisible = false
-    @State private var lastTapePulseNonce: UInt64?
-    @State private var tapePulseActive = false
-    @State private var tapePulseGeneration = 0
-    private let recorderCycleTimer = Timer.publish(
-        every: kWhisperFlowRecorderCycleInterval,
-        on: .main,
-        in: .common
-    ).autoconnect()
+    @State private var ambientBodyHovered = false
+    @State private var ambientBodyHoverArmed = false
+    @State private var blockedAmbientBodyHoverObserved = false
+    @State private var ambientCapsuleHovered = false
+    @State private var pausedRestartHovered = false
+    @State private var arrowHovered = false
+    @State private var memoryTransitionCountdownProgress: CGFloat = 0
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
     var body: some View {
         ZStack(alignment: .top) {
             switch model.presentation {
-            case .micro:
-                microView
-                    .transition(stateTransition(scale: 0.96))
-            case .recordingTape:
-                recordingTapeView
-                    .transition(stateTransition(scale: 0.96))
+            case .micro, .ambientMemory:
+                memoryContinuityView
             case .answerSummary:
                 answerSummaryView
                     .transition(.opacity)
@@ -678,74 +1237,104 @@ private struct WhisperFlowIslandView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private var microView: some View {
-        Button(action: onRevealRecorder) {
-            Capsule()
-                .fill(WhisperFlowPreview.surface)
-                .overlay(
-                    Capsule()
-                        .stroke(
-                            WhisperFlowPreview.outline.opacity(microOutlineOpacity),
-                            lineWidth: s(1)
-                        )
+    private var memoryContinuityView: some View {
+        let expanded = model.presentation == .ambientMemory
+        let visualWidth = expanded
+            ? ambientCapsuleWidth
+            : kBaseMicroVisualW * microScale
+        let visualHeight = expanded
+            ? ambientCapsuleHeight
+            : kBaseMicroVisualH * microScale
+
+        return ZStack(alignment: .top) {
+            TopAnchoredCapsuleShape(
+                width: s(visualWidth),
+                height: s(visualHeight)
+            )
+            .fill(WhisperFlowPreview.surface)
+            .allowsHitTesting(false)
+
+            TopAnchoredCapsuleShape(
+                width: s(visualWidth),
+                height: s(visualHeight)
+            )
+            .stroke(
+                WhisperFlowPreview.outline.opacity(
+                    expanded ? 1 : microOutlineOpacity
+                ),
+                lineWidth: s(1)
+            )
+            .allowsHitTesting(false)
+
+            ambientMemoryContent
+                .opacity(expanded ? 1 : 0)
+                .allowsHitTesting(expanded)
+                .accessibilityHidden(!expanded)
+                .animation(ambientContentAnimation(expanded: expanded), value: expanded)
+
+            microHitTarget
+                .opacity(expanded ? 0 : 1)
+                .allowsHitTesting(!expanded)
+                .accessibilityHidden(expanded)
+        }
+        .frame(
+            width: s(ambientPanelWidth),
+            height: s(ambientPanelHeight),
+            alignment: .top
+        )
+        .contentShape(Rectangle())
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: visualWidth
+        )
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: visualHeight
+        )
+        .onAppear {
+            handleMemoryPresentationChange(model.presentation)
+        }
+        .onChange(of: model.presentation) { presentation in
+            handleMemoryPresentationChange(presentation)
+        }
+        .onDisappear {
+            microPulseExpanded = false
+            cleanUpAmbientInteractionState()
+        }
+    }
+
+    private var microHitTarget: some View {
+        Button(action: onRevealAmbientMemory) {
+            Rectangle()
+                .fill(Color.clear)
+                .frame(
+                    width: s(kBaseMicroHitW),
+                    height: s(kBaseMicroHitH),
+                    alignment: .top
                 )
-                .frame(width: s(kBaseMicroVisualW), height: s(kBaseMicroVisualH))
-                .scaleEffect(microScale)
-                .frame(width: s(kBaseMicroHitW), height: s(kBaseMicroHitH))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(model.memoryActive ? "Smalltalk memory is active" : "Show Smalltalk")
-        .onHover { hovering in
-            if hovering {
-                onRevealRecorder()
-            }
-        }
-        .frame(
-            width: s(kWhisperFlowReadyPanelW),
-            height: s(kWhisperFlowReadyPanelH),
-            alignment: .center
-        )
-        .id("micro-\(model.microPulseActive)-\(reduceMotion)")
-        .onAppear(perform: refreshMicroPulse)
-        .onDisappear {
-            microPulseExpanded = false
-        }
+        .onHover(perform: onMicroHover)
     }
 
-    private var recordingTapeView: some View {
-        HStack(spacing: s(5)) {
-            ZStack(alignment: .leading) {
-                tapeTransportView
-                    .opacity(recorderTextVisible ? 0 : 1)
-
-                Text("What was I doing?")
-                    .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .opacity(recorderTextVisible ? 1 : 0)
-            }
-            .frame(
-                width: s(kWhisperFlowRecordingContentW),
-                height: s(kWhisperFlowReadyActionH),
-                alignment: .leading
-            )
-            .allowsHitTesting(false)
-            .animation(recordingContentAnimation, value: recorderTextVisible)
+    private var ambientMemoryContent: some View {
+        HStack(spacing: s(ambientControlSpacing)) {
+            ambientStatusRegion
 
             Button(action: onReadyAction) {
                 Image(systemName: "arrow.right")
-                    .font(.system(size: s(11), weight: .semibold))
+                    .font(.system(size: s(ambientArrowFontSize), weight: .semibold))
                     .foregroundColor(.white)
                     .frame(
-                        width: s(kWhisperFlowReadyActionW),
-                        height: s(kWhisperFlowReadyActionH)
+                        width: s(ambientActionWidth),
+                        height: s(ambientActionHeight)
                     )
                     .background(
                         Capsule()
                             .fill(
-                                recordingActionHovered
+                                arrowHovered
                                     ? Color(red: 58 / 255, green: 58 / 255, blue: 56 / 255)
                                     : WhisperFlowPreview.outline
                             )
@@ -754,221 +1343,391 @@ private struct WhisperFlowIslandView: View {
             }
             .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
             .accessibilityLabel("Show what I was doing")
+            .help("Show what I was doing")
             .onHover { hovering in
-                withAnimation(recordingContentAnimation) {
-                    recordingActionHovered = hovering
+                arrowHovered = hovering
+                if hovering {
+                    NSCursor.pointingHand.set()
+                } else {
+                    NSCursor.arrow.set()
                 }
             }
         }
-        .padding(.leading, s(8))
-        .padding(.trailing, s(4))
-        .frame(width: s(kWhisperFlowReadyW), height: s(kWhisperFlowReadyH))
-        .background(WhisperFlowPreview.surface)
-        .overlay(
-            Capsule()
-                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
-        )
-        .clipShape(Capsule())
+        .padding(.leading, s(ambientLeadingPadding))
+        .padding(.trailing, s(ambientTrailingPadding))
         .frame(
-            width: s(kWhisperFlowReadyPanelW),
-            height: s(kWhisperFlowReadyPanelH),
-            alignment: .center
+            width: s(ambientCapsuleWidth),
+            height: s(ambientCapsuleHeight)
         )
-        .contentShape(Rectangle())
+        .overlay(alignment: .bottomLeading) {
+            memoryTransitionCountdownLine
+        }
+        .clipShape(Capsule())
+        .contentShape(Capsule())
+        .onHover { hovering in
+            ambientCapsuleHovered = hovering
+            onAmbientHover(hovering)
+        }
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: model.memoryTransitionCountdownActive
+        )
         .accessibilityElement(children: .contain)
-        .onAppear {
-            lastTapePulseNonce = model.capturePulseNonce
-            recorderCycleTextVisible = false
+        .onChange(of: model.captureStatus) { status in
+            if status != .inactive {
+                pausedRestartHovered = false
+            }
+            ambientBodyHovered = false
+            onAmbientBodyHover(false)
+            if status == .active {
+                resetAmbientBodyHoverGate()
+            } else {
+                ambientBodyHoverArmed = false
+                blockedAmbientBodyHoverObserved = false
+            }
         }
-        .onDisappear {
-            recordingActionHovered = false
-            recorderCycleTextVisible = false
+        .onChange(of: model.memoryTransitionCountdownNonce) { _ in
+            refreshMemoryTransitionCountdown()
         }
-        .onChange(of: model.capturePulseNonce) { next in
-            handleTapePulse(next)
-        }
-        .onReceive(recorderCycleTimer) { _ in
-            guard !recordingActionHovered else { return }
-            withAnimation(recordingContentAnimation) {
-                recorderCycleTextVisible.toggle()
+        .onChange(of: model.memoryTransitionCountdownActive) { active in
+            if !active {
+                memoryTransitionCountdownProgress = 0
             }
         }
     }
 
-    private var recorderTextVisible: Bool {
-        recordingActionHovered || recorderCycleTextVisible
+    @ViewBuilder
+    private var ambientStatusRegion: some View {
+        if model.captureStatus == .inactive {
+            Button(action: onStartMemory) {
+                ambientStatusContent
+            }
+            .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+            .accessibilityLabel("Start memory")
+            .help("Start memory")
+            .onHover { hovering in
+                if hovering {
+                    pausedRestartHovered = true
+                    NSCursor.pointingHand.set()
+                } else {
+                    NSCursor.arrow.set()
+                    DispatchQueue.main.async {
+                        guard model.presentation == .ambientMemory,
+                              ambientCapsuleHovered,
+                              model.captureStatus == .inactive else { return }
+                        pausedRestartHovered = false
+                    }
+                }
+            }
+        } else {
+            ambientStatusContent
+                .onHover { hovering in
+                    if hovering {
+                        if ambientBodyHoverArmed {
+                            ambientBodyHovered = true
+                            onAmbientBodyHover(model.captureStatus == .active)
+                        } else {
+                            blockedAmbientBodyHoverObserved = true
+                        }
+                        NSCursor.arrow.set()
+                    } else {
+                        if blockedAmbientBodyHoverObserved {
+                            ambientBodyHoverArmed = true
+                            blockedAmbientBodyHoverObserved = false
+                        }
+                        // The parent capsule receives its hover-out in the same
+                        // event turn. Defer contraction so a dismissal can move
+                        // straight to micro without exposing normal medium first.
+                        DispatchQueue.main.async {
+                            guard model.presentation == .ambientMemory,
+                                  ambientCapsuleHovered else { return }
+                            ambientBodyHovered = false
+                            onAmbientBodyHover(false)
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(displayedStatusPhrase)
+        }
     }
 
-    private var tapeTransportView: some View {
-        evidenceTapeGlyph
-        .frame(
-            width: s(kWhisperFlowRecordingContentW),
-            height: s(kWhisperFlowReadyActionH),
-            alignment: .center
-        )
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(captureStatusText)
-    }
-
-    private var evidenceTapeGlyph: some View {
-        TimelineView(
-            .animation(
-                minimumInterval: 1.0 / 24.0,
-                paused: !model.captureIndicationActive || reduceMotion || recordingActionHovered
+    private var ambientStatusContent: some View {
+        HStack(spacing: s(ambientStatusSpacing)) {
+            DotMatrixIndicator(
+                status: model.captureStatus,
+                capturePulseNonce: model.capturePulseNonce,
+                startingFeedbackNonce: model.startingFeedbackNonce,
+                panelVisible: model.isPanelVisible,
+                reduceMotion: shouldReduceMotion,
+                restartInvited: pausedRestartHovered && model.captureStatus == .inactive
             )
-        ) { timeline in
-            Canvas { context, size in
-                drawEvidenceTape(
-                    context: &context,
-                    size: size,
-                    scanPhase: tapeScanPhase(at: timeline.date)
-                )
+            .frame(
+                width: s(ambientDotMatrixSize),
+                height: s(ambientDotMatrixSize)
+            )
+            .accessibilityHidden(true)
+
+            ZStack(alignment: .leading) {
+                Text(displayedStatusPhrase)
+                    .id(displayedStatusPhrase)
+                    .font(Brand.swiftUIFont(size: s(ambientFontSize), weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .transition(.opacity)
             }
             .frame(
-                width: s(kWhisperFlowEvidenceTapeW),
-                height: s(kWhisperFlowEvidenceTapeH)
+                width: s(ambientStatusLabelWidth),
+                height: s(ambientActionHeight),
+                alignment: .leading
             )
+            .clipped()
+            .animation(statusCopyAnimation, value: displayedStatusPhrase)
         }
-    }
-
-    private func drawEvidenceTape(
-        context: inout GraphicsContext,
-        size: CGSize,
-        scanPhase: Double
-    ) {
-        let lineWidth = max(1, s(1))
-        let railOpacity = model.captureIndicationActive ? 0.22 : 0.12
-        let railInset = max(1, s(1))
-
-        for railFraction in [0.28, 0.72] {
-            let y = round(size.height * railFraction)
-            context.fill(
-                Path(
-                    CGRect(
-                        x: railInset,
-                        y: y,
-                        width: max(0, size.width - railInset * 2),
-                        height: lineWidth
-                    )
-                ),
-                with: .color(Color.white.opacity(railOpacity))
-            )
-        }
-
-        drawFrameTicks(context: &context, size: size)
-
-        let scanX = round(max(railInset, min(size.width - railInset, scanPhase * size.width)))
-        context.fill(
-            Path(
-                CGRect(
-                    x: scanX,
-                    y: railInset,
-                    width: lineWidth,
-                    height: max(lineWidth, size.height - railInset * 2)
-                )
-            ),
-            with: .color(
-                Color.white.opacity(model.captureIndicationActive ? 0.78 : 0.28)
-            )
+        .frame(
+            width: s(ambientContentWidth),
+            height: s(ambientActionHeight),
+            alignment: .leading
         )
+        .contentShape(Rectangle())
     }
 
-    private func drawFrameTicks(context: inout GraphicsContext, size: CGSize) {
-        let previewFrameCount: Int64 = kWhisperFlowCapturePreviewEnabled ? 9 : 0
-        let count = max(previewFrameCount, model.captureFrameCount)
-        let tickCount = Int(min(count, 9))
-        guard tickCount > 0 else { return }
-
-        let first = count - Int64(tickCount) + 1
-        for offset in 0..<tickCount {
-            let frameOrdinal = first + Int64(offset)
-            let fraction = tickFraction(frameOrdinal)
-            let tickHeight = size.height * (0.30 + 0.08 * Double((frameOrdinal % 3 + 3) % 3))
-            let x = round(max(1, min(size.width - 2, fraction * size.width)))
-            let y = round((size.height - tickHeight) / 2)
-            let isNewest = offset == tickCount - 1
-            let opacity: Double
-            if isNewest {
-                opacity = model.captureIndicationActive
-                    ? tapePulseActive ? 0.98 : 0.68
-                    : 0.42
-            } else {
-                opacity = model.captureIndicationActive ? 0.32 + 0.06 * Double(offset % 3) : 0.20
-            }
-
-            context.fill(
-                Path(
-                    CGRect(
-                        x: x,
-                        y: y,
-                        width: max(1, s(1)),
-                        height: tickHeight
-                    )
-                ),
-                with: .color(Color.white.opacity(opacity))
+    private var memoryTransitionCountdownLine: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.88))
+            .frame(maxWidth: .infinity)
+            .frame(height: s(ambientCountdownLineHeight))
+            .scaleEffect(
+                x: model.memoryTransitionCountdownActive
+                    ? memoryTransitionCountdownProgress
+                    : 0,
+                y: 1,
+                anchor: .leading
             )
-        }
+            .allowsHitTesting(false)
     }
 
-    private func tapeScanPhase(at date: Date) -> Double {
-        guard model.captureIndicationActive else { return 0.38 }
-        guard !reduceMotion else { return 0.62 }
-
-        return (date.timeIntervalSinceReferenceDate / 5.5)
-            .truncatingRemainder(dividingBy: 1)
+    private var ambientCapsuleWidth: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationW
+            : kWhisperFlowCaptureW
     }
 
-    private func tickFraction(_ value: Int64) -> Double {
-        let raw = fmod(
-            Double(value) * 0.618_033_988_75 +
-                Double((value % 7 + 7) % 7) * 0.031,
-            1
-        )
-        return 0.08 + raw * 0.84
+    private var ambientCapsuleHeight: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationH
+            : kWhisperFlowCaptureH
     }
 
-    private var captureStatusText: String {
-        switch model.captureStatus {
-        case .recording:
-            return "Capturing screens"
-        case .starting:
-            return "Starting capture"
-        case .processing:
-            return "Saving capture"
-        case .inactive:
-            return "Capture paused"
-        case .suppressed:
-            return "Not capturing here"
-        case .error:
-            return "Capture issue"
-        }
+    private var ambientPanelWidth: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationPanelW
+            : kWhisperFlowCapturePanelW
     }
 
-    private var recordingContentAnimation: Animation {
-        .timingCurve(0.23, 1, 0.32, 1, duration: reduceMotion ? 0.12 : 0.14)
+    private var ambientPanelHeight: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationPanelH
+            : kWhisperFlowCapturePanelH
     }
 
-    private func handleTapePulse(_ next: UInt64?) {
-        guard next != nil, next != lastTapePulseNonce else {
-            lastTapePulseNonce = next
+    private var ambientContentWidth: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationContentW
+            : kWhisperFlowCaptureContentW
+    }
+
+    private var ambientStatusLabelWidth: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationStatusLabelW
+            : kWhisperFlowCaptureStatusLabelW
+    }
+
+    private var ambientActionWidth: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationActionW
+            : kWhisperFlowCaptureActionW
+    }
+
+    private var ambientActionHeight: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationActionH
+            : kWhisperFlowCaptureActionH
+    }
+
+    private var ambientDotMatrixSize: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationDotMatrixSize
+            : kWhisperFlowDotMatrixSize
+    }
+
+    private var ambientFontSize: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationFontSize
+            : 12
+    }
+
+    private var ambientCountdownLineHeight: CGFloat {
+        model.memoryTransitionCountdownActive
+            ? kWhisperFlowNotificationCountdownLineH
+            : kWhisperFlowCountdownLineH
+    }
+
+    private var ambientControlSpacing: CGFloat {
+        model.memoryTransitionCountdownActive ? 7 : 5
+    }
+
+    private var ambientStatusSpacing: CGFloat {
+        model.memoryTransitionCountdownActive ? 5 : 4
+    }
+
+    private var ambientLeadingPadding: CGFloat {
+        model.memoryTransitionCountdownActive ? 10 : 8
+    }
+
+    private var ambientTrailingPadding: CGFloat {
+        model.memoryTransitionCountdownActive ? 6 : 4
+    }
+
+    private var ambientArrowFontSize: CGFloat {
+        model.memoryTransitionCountdownActive ? 13 : 11
+    }
+
+    private func refreshMemoryTransitionCountdown() {
+        guard model.memoryTransitionCountdownActive else {
+            memoryTransitionCountdownProgress = 0
             return
         }
 
-        lastTapePulseNonce = next
-        guard model.captureIndicationActive else { return }
-        tapePulseGeneration += 1
-        let generation = tapePulseGeneration
-
-        withAnimation(reduceMotion ? .linear(duration: 0.08) : IslandMotion.quick(false)) {
-            tapePulseActive = true
+        var resetTransaction = Transaction()
+        resetTransaction.animation = nil
+        withTransaction(resetTransaction) {
+            memoryTransitionCountdownProgress = 1
         }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) {
-            guard generation == tapePulseGeneration else { return }
-            withAnimation(reduceMotion ? .linear(duration: 0.12) : IslandMotion.quick(false)) {
-                tapePulseActive = false
+        DispatchQueue.main.async {
+            guard model.memoryTransitionCountdownActive else { return }
+            withAnimation(.linear(duration: kWhisperFlowMemoryTransitionDuration)) {
+                memoryTransitionCountdownProgress = 0
             }
         }
+    }
+
+    private func prepareAmbientAppearance() {
+        var resetTransaction = Transaction()
+        resetTransaction.animation = nil
+        withTransaction(resetTransaction) {
+            ambientBodyHovered = false
+            ambientBodyHoverArmed = false
+            blockedAmbientBodyHoverObserved = false
+            ambientCapsuleHovered = false
+            pausedRestartHovered = false
+            arrowHovered = false
+        }
+        resetAmbientBodyHoverGate()
+        refreshMemoryTransitionCountdown()
+    }
+
+    private func ambientContentAnimation(expanded: Bool) -> Animation? {
+        if shouldReduceMotion {
+            return .easeOut(duration: kWhisperFlowReducedMotionFadeDuration)
+        }
+        return expanded
+            ? .easeOut(duration: 0.12).delay(0.04)
+            : .easeOut(duration: 0.10)
+    }
+
+    private func handleMemoryPresentationChange(
+        _ presentation: WhisperFlowPresentation
+    ) {
+        switch presentation {
+        case .micro:
+            arrowHovered = false
+            onAmbientHover(false)
+            NSCursor.arrow.set()
+            scheduleAmbientLocalStateCleanup()
+            refreshMicroPulse()
+        case .ambientMemory:
+            microPulseExpanded = false
+            prepareAmbientAppearance()
+        case .answerSummary, .answerExpanded:
+            break
+        }
+    }
+
+    private func cleanUpAmbientInteractionState() {
+        arrowHovered = false
+        ambientBodyHovered = false
+        ambientBodyHoverArmed = false
+        blockedAmbientBodyHoverObserved = false
+        ambientCapsuleHovered = false
+        pausedRestartHovered = false
+        onAmbientHover(false)
+        onAmbientBodyHover(false)
+        NSCursor.arrow.set()
+    }
+
+    private func resetAmbientBodyHoverGate() {
+        ambientBodyHoverArmed = false
+        blockedAmbientBodyHoverObserved = false
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + kWhisperFlowAmbientBodyHoverArmDelay
+        ) {
+            guard model.presentation == .ambientMemory,
+                  model.captureStatus == .active,
+                  !blockedAmbientBodyHoverObserved else { return }
+            ambientBodyHoverArmed = true
+        }
+    }
+
+    private func scheduleAmbientLocalStateCleanup() {
+        let delay = shouldReduceMotion ? 0 : kWhisperFlowMicroAmbientTransitionDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard model.presentation != .ambientMemory else { return }
+            ambientBodyHovered = false
+            ambientBodyHoverArmed = false
+            blockedAmbientBodyHoverObserved = false
+            ambientCapsuleHovered = false
+            pausedRestartHovered = false
+        }
+    }
+
+    private var shouldReduceMotion: Bool {
+        reduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private var displayedStatusPhrase: String {
+        switch model.captureStatus {
+        case .active:
+            return "Capturing context"
+        case .starting:
+            return "Starting memory…"
+        case .processing:
+            return "Pausing memory…"
+        case .inactive:
+            return model.memoryHasStarted ? "Memory paused" : "Start memory"
+        case .suppressed:
+            return "Not saving this app"
+        case .error:
+            return "Memory needs attention"
+        }
+    }
+
+    private var ambientMorphAnimation: Animation? {
+        guard !shouldReduceMotion else { return nil }
+        return .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: kWhisperFlowMorphDuration
+        )
+    }
+
+    private var statusCopyAnimation: Animation? {
+        if shouldReduceMotion {
+            return .easeOut(duration: 0.12)
+        }
+        return ambientMorphAnimation
     }
 
     private var answerSummaryView: some View {
@@ -996,7 +1755,7 @@ private struct WhisperFlowIslandView: View {
         .frame(
             width: s(kWhisperFlowAnswerSummaryPanelW),
             height: s(kWhisperFlowAnswerSummaryPanelH),
-            alignment: .center
+            alignment: .top
         )
         .contentShape(Rectangle())
         .onHover(perform: onAnswerSummaryHover)
@@ -1049,7 +1808,9 @@ private struct WhisperFlowIslandView: View {
             1,
             0.32,
             1,
-            duration: reduceMotion ? 0.01 : kWhisperFlowMorphDuration
+            duration: reduceMotion
+                ? kWhisperFlowReducedMotionFadeDuration
+                : kWhisperFlowMorphDuration
         )
     }
 
@@ -1106,18 +1867,29 @@ private final class SessionIslandController: NSObject {
     private var hostingView: NSHostingView<AnyView>?
     private var trackingView: IslandTrackingView?
     private let islandModel = WhisperFlowIslandModel()
-    private var presentation: WhisperFlowPresentation = .recordingTape
+    private var presentation: WhisperFlowPresentation = .micro
     private var visible = false
     private var snapshot = IslandSnapshot()
     private var metrics = OverlayMetrics()
     private var previousFrameCount: Int64?
-    private var previewMemoryActiveOverride = false
+    private var previousMemoryLifecyclePhase: WhisperFlowMemoryLifecyclePhase?
+    private var memoryHasStarted = false
+    private var ambientHovered = false
+    private var ambientBodyHovered = false
+    private var hoverRevealArmed = true
+    private var blockedMicroHoverObserved = false
     private var outsideGlobalClickMonitor: Any?
     private var outsideLocalClickMonitor: Any?
     private var answerRevealTimer: Timer?
     private var answerReturnTimer: Timer?
     private var answerReturnStartedAt: Date?
     private var answerReturnRemaining = kWhisperFlowAnswerReturnDelay
+    private var memoryTransitionTimer: Timer?
+    private var ambientHoverReturnTimer: Timer?
+    private var memoryTransitionCountdownActive = false
+    private var memoryTransitionCountdownNonce: UInt64 = 0
+    private var startingFeedbackNonceCounter: UInt64 = 0
+    private var activeStartingFeedbackNonce: UInt64?
 
     func initializeIfNeeded() {
         if panel == nil {
@@ -1137,30 +1909,30 @@ private final class SessionIslandController: NSObject {
             }
         }
 
+        if snapshot.memoryActive ||
+            snapshot.state == "starting" ||
+            snapshot.state == "processing" {
+            memoryHasStarted = true
+        }
+
         if snapshot.state == "hidden" {
             hide()
             return
         }
 
-        let recording = isRecording(snapshot.state)
-        let captureControlActive = recording || snapshot.state == "starting" || snapshot.state == "processing"
+        let captureControlActive = snapshot.memoryActive || snapshot.state == "starting"
         metrics.meetingActive = captureControlActive
 
         if let previousFrameCount {
             let delta = max(0, snapshot.frameCount - previousFrameCount)
-            metrics.screenActive = recording && delta > 0
-            metrics.captureFps = recording ? Double(delta) : 0
+            metrics.screenActive = snapshot.memoryActive && delta > 0
+            metrics.captureFps = snapshot.memoryActive ? Double(delta) : 0
         } else {
-            metrics.screenActive = recording
-            metrics.captureFps = recording ? 1 : 0
+            metrics.screenActive = snapshot.memoryActive
+            metrics.captureFps = snapshot.memoryActive ? 1 : 0
         }
         previousFrameCount = snapshot.frameCount
-
-        if presentation != .answerSummary,
-           presentation != .answerExpanded,
-           answerRevealTimer == nil {
-            setPresentation(.recordingTape)
-        }
+        observeMemoryLifecycleTransition()
 
         initializeIfNeeded()
         updateContent()
@@ -1171,14 +1943,25 @@ private final class SessionIslandController: NSObject {
     func show() {
         initializeIfNeeded()
         visible = true
+        if !islandModel.isPanelVisible {
+            islandModel.isPanelVisible = true
+        }
         updateOutsideClickMonitors()
         panel?.orderFrontRegardless()
     }
 
     func hide() {
         visible = false
-        presentation = .recordingTape
-        previewMemoryActiveOverride = false
+        if islandModel.isPanelVisible {
+            islandModel.isPanelVisible = false
+        }
+        presentation = .micro
+        previousMemoryLifecyclePhase = nil
+        activeStartingFeedbackNonce = nil
+        ambientHovered = false
+        ambientBodyHovered = false
+        hoverRevealArmed = true
+        blockedMicroHoverObserved = false
         cancelPreviewTimers()
         updateOutsideClickMonitors()
         DispatchQueue.main.async { [self] in
@@ -1203,36 +1986,28 @@ private final class SessionIslandController: NSObject {
     func shutdown() {
         cancelPreviewTimers()
         removeOutsideClickMonitors()
+        islandModel.isPanelVisible = false
         panel?.orderOut(nil)
         panel = nil
         hostingView = nil
         trackingView = nil
         visible = false
-        presentation = .recordingTape
-        previewMemoryActiveOverride = false
-    }
-
-    private func isRecording(_ state: String) -> Bool {
-        state == "recording_compact" || state == "recording_expanded"
+        presentation = .micro
+        previousMemoryLifecyclePhase = nil
+        memoryHasStarted = false
+        activeStartingFeedbackNonce = nil
+        ambientHovered = false
+        ambientBodyHovered = false
+        hoverRevealArmed = true
+        blockedMicroHoverObserved = false
     }
 
     private var memoryActive: Bool {
-        previewMemoryActiveOverride ||
-            isRecording(snapshot.state) ||
-            snapshot.state == "starting" ||
-            snapshot.state == "processing"
+        snapshot.memoryActive
     }
 
     private var microPulseActive: Bool {
-        captureIndicationActive
-    }
-
-    private var captureIndicationActive: Bool {
-        (
-            isRecording(snapshot.state) ||
-                snapshot.state == "starting" ||
-                snapshot.state == "processing"
-        ) && snapshotAllowsCaptureIndication
+        captureStatus == .active || captureStatus == .starting
     }
 
     private var captureStatus: WhisperFlowCaptureStatus {
@@ -1242,16 +2017,26 @@ private final class SessionIslandController: NSObject {
         if !snapshotAllowsCaptureIndication {
             return .suppressed
         }
-        switch snapshot.state {
-        case "recording_compact", "recording_expanded":
-            return .recording
-        case "starting":
+        if snapshot.state == "starting" {
             return .starting
-        case "processing":
-            return .processing
-        default:
-            return .inactive
         }
+        if snapshot.state == "processing" {
+            return .processing
+        }
+        return snapshot.memoryActive ? .active : .inactive
+    }
+
+    private var memoryLifecyclePhase: WhisperFlowMemoryLifecyclePhase {
+        if snapshot.state == "error" || snapshot.lastError != nil {
+            return .unavailable
+        }
+        if snapshot.state == "starting" {
+            return .starting
+        }
+        if snapshot.state == "processing" {
+            return .stopping
+        }
+        return snapshot.memoryActive ? .active : .paused
     }
 
     private var snapshotAllowsCaptureIndication: Bool {
@@ -1266,6 +2051,11 @@ private final class SessionIslandController: NSObject {
 
     private func setPresentation(_ nextPresentation: WhisperFlowPresentation) {
         let changed = presentation != nextPresentation
+        if nextPresentation != .ambientMemory {
+            cancelAmbientHoverReturn()
+            ambientHovered = false
+            ambientBodyHovered = false
+        }
         presentation = nextPresentation
 
         if changed {
@@ -1275,23 +2065,28 @@ private final class SessionIslandController: NSObject {
         }
     }
 
-    private func revealRecorder() {
-        setPresentation(.recordingTape)
+    private func revealAmbientMemory() {
+        setPresentation(.ambientMemory)
+    }
+
+    private func microHoverChanged(_ hovering: Bool) {
+        if !hoverRevealArmed {
+            if hovering {
+                blockedMicroHoverObserved = true
+            } else if blockedMicroHoverObserved {
+                hoverRevealArmed = true
+                blockedMicroHoverObserved = false
+            }
+            return
+        }
+        if !hovering {
+            return
+        }
+        revealAmbientMemory()
     }
 
     private func readyActionPreview() {
-        if memoryActive {
-            continuePreview()
-        } else {
-            startMemoryPreview()
-        }
-    }
-
-    private func startMemoryPreview() {
-        cancelPreviewTimers()
-        previewMemoryActiveOverride = true
-        setPresentation(.recordingTape)
-        updateContent()
+        continuePreview()
     }
 
     private func continuePreview() {
@@ -1321,7 +2116,8 @@ private final class SessionIslandController: NSObject {
 
     private func returnToDefaultPresentation() {
         cancelAnswerReturnTimer(resetRemaining: true)
-        setPresentation(.recordingTape)
+        cancelMemoryTransitionCountdown()
+        setPresentation(.micro)
     }
 
     private func answerSummaryHoverChanged(_ hovering: Bool) {
@@ -1329,6 +2125,120 @@ private final class SessionIslandController: NSObject {
             pauseAnswerReturnTimer()
         } else {
             resumeAnswerReturnTimer()
+        }
+    }
+
+    private func ambientBodyHoverChanged(_ hovering: Bool) {
+        let next = hovering && presentation == .ambientMemory && captureStatus == .active
+        guard ambientBodyHovered != next else { return }
+        ambientBodyHovered = next
+    }
+
+    private func ambientHoverChanged(_ hovering: Bool) {
+        ambientHovered = hovering
+        if hovering {
+            cancelAmbientHoverReturn()
+            return
+        }
+        guard presentation == .ambientMemory,
+              !memoryTransitionCountdownActive else { return }
+        scheduleAmbientHoverReturn()
+    }
+
+    private func scheduleAmbientHoverReturn() {
+        cancelAmbientHoverReturn()
+        let timer = Timer(
+            timeInterval: kWhisperFlowAmbientHoverReturnDelay,
+            repeats: false
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.presentation == .ambientMemory,
+                      !self.ambientHovered,
+                      !self.memoryTransitionCountdownActive else { return }
+                self.ambientHoverReturnTimer = nil
+                self.setPresentation(.micro)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ambientHoverReturnTimer = timer
+    }
+
+    private func cancelAmbientHoverReturn() {
+        ambientHoverReturnTimer?.invalidate()
+        ambientHoverReturnTimer = nil
+    }
+
+    private func observeMemoryLifecycleTransition() {
+        let current = memoryLifecyclePhase
+        guard let previous = previousMemoryLifecyclePhase else {
+            previousMemoryLifecyclePhase = current
+            return
+        }
+        previousMemoryLifecyclePhase = current
+
+        guard current != .unavailable,
+              captureStatus != .error,
+              captureStatus != .suppressed else { return }
+
+        let beganStarting = previous == .paused &&
+            (current == .starting || current == .active)
+        let beganStopping = (previous == .starting || previous == .active) &&
+            (current == .stopping || current == .paused)
+        guard beganStarting || beganStopping else { return }
+        beginMemoryTransitionCountdown(forMemoryStart: beganStarting)
+    }
+
+    private func beginMemoryTransitionCountdown(forMemoryStart: Bool) {
+        cancelAmbientHoverReturn()
+        cancelMemoryTransitionCountdown()
+        memoryTransitionCountdownActive = true
+        memoryTransitionCountdownNonce &+= 1
+        if forMemoryStart {
+            startingFeedbackNonceCounter &+= 1
+            activeStartingFeedbackNonce = startingFeedbackNonceCounter
+        }
+        let ambientWasAlreadyVisible = presentation == .ambientMemory
+        setPresentation(.ambientMemory)
+        updateContent()
+        if ambientWasAlreadyVisible {
+            positionPanel(preserveCurrentAnchor: true, animated: visible)
+        }
+
+        let nonce = memoryTransitionCountdownNonce
+        let timer = Timer(
+            timeInterval: kWhisperFlowMemoryTransitionDuration,
+            repeats: false
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.memoryTransitionCountdownActive,
+                      self.memoryTransitionCountdownNonce == nonce else { return }
+                self.memoryTransitionTimer = nil
+                self.memoryTransitionCountdownActive = false
+                self.activeStartingFeedbackNonce = nil
+                if self.ambientHovered {
+                    self.hoverRevealArmed = false
+                    self.blockedMicroHoverObserved = false
+                }
+                self.setPresentation(.micro)
+                self.updateContent()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        memoryTransitionTimer = timer
+    }
+
+    private func cancelMemoryTransitionCountdown() {
+        memoryTransitionTimer?.invalidate()
+        memoryTransitionTimer = nil
+        memoryTransitionCountdownActive = false
+        activeStartingFeedbackNonce = nil
+        if islandModel.memoryTransitionCountdownActive {
+            islandModel.memoryTransitionCountdownActive = false
+        }
+        if islandModel.startingFeedbackNonce != nil {
+            islandModel.startingFeedbackNonce = nil
         }
     }
 
@@ -1384,14 +2294,29 @@ private final class SessionIslandController: NSObject {
         answerRevealTimer?.invalidate()
         answerRevealTimer = nil
         cancelAnswerReturnTimer(resetRemaining: true)
+        cancelAmbientHoverReturn()
+        cancelMemoryTransitionCountdown()
     }
 
     private var targetPanelSize: NSSize {
         switch presentation {
-        case .micro, .recordingTape:
+        case .micro:
             return NSSize(
-                width: kWhisperFlowReadyPanelW * gOverlayScale,
-                height: kWhisperFlowReadyPanelH * gOverlayScale
+                width: kWhisperFlowCapturePanelW * gOverlayScale,
+                height: kWhisperFlowCapturePanelH * gOverlayScale
+            )
+        case .ambientMemory:
+            return NSSize(
+                width: (
+                    memoryTransitionCountdownActive
+                        ? kWhisperFlowNotificationPanelW
+                        : kWhisperFlowCapturePanelW
+                ) * gOverlayScale,
+                height: (
+                    memoryTransitionCountdownActive
+                        ? kWhisperFlowNotificationPanelH
+                        : kWhisperFlowCapturePanelH
+                ) * gOverlayScale
             )
         case .answerSummary:
             return NSSize(
@@ -1520,25 +2445,30 @@ private final class SessionIslandController: NSObject {
         if islandModel.memoryActive != memoryActive {
             islandModel.memoryActive = memoryActive
         }
+        if islandModel.memoryHasStarted != memoryHasStarted {
+            islandModel.memoryHasStarted = memoryHasStarted
+        }
         if islandModel.microPulseActive != microPulseActive {
             islandModel.microPulseActive = microPulseActive
         }
-        if islandModel.captureFrameCount != snapshot.frameCount {
-            islandModel.captureFrameCount = snapshot.frameCount
+        let resolvedCaptureStatus = captureStatus
+        if resolvedCaptureStatus != .active {
+            ambientBodyHovered = false
+        }
+        if islandModel.captureStatus != resolvedCaptureStatus {
+            islandModel.captureStatus = resolvedCaptureStatus
+        }
+        if islandModel.startingFeedbackNonce != activeStartingFeedbackNonce {
+            islandModel.startingFeedbackNonce = activeStartingFeedbackNonce
         }
         if islandModel.capturePulseNonce != snapshot.capturePulseNonce {
             islandModel.capturePulseNonce = snapshot.capturePulseNonce
         }
-        let displayedCaptureIndicationActive =
-            kWhisperFlowCapturePreviewEnabled || captureIndicationActive
-        if islandModel.captureIndicationActive != displayedCaptureIndicationActive {
-            islandModel.captureIndicationActive = displayedCaptureIndicationActive
+        if islandModel.memoryTransitionCountdownActive != memoryTransitionCountdownActive {
+            islandModel.memoryTransitionCountdownActive = memoryTransitionCountdownActive
         }
-        let displayedCaptureStatus: WhisperFlowCaptureStatus = kWhisperFlowCapturePreviewEnabled
-            ? .recording
-            : captureStatus
-        if islandModel.captureStatus != displayedCaptureStatus {
-            islandModel.captureStatus = displayedCaptureStatus
+        if islandModel.memoryTransitionCountdownNonce != memoryTransitionCountdownNonce {
+            islandModel.memoryTransitionCountdownNonce = memoryTransitionCountdownNonce
         }
 
         guard hostingView == nil else { return }
@@ -1546,11 +2476,23 @@ private final class SessionIslandController: NSObject {
         let view = WhisperFlowIslandView(
             scale: gOverlayScale,
             model: islandModel,
-            onRevealRecorder: { [weak self] in
-                self?.revealRecorder()
+            onRevealAmbientMemory: { [weak self] in
+                self?.revealAmbientMemory()
+            },
+            onMicroHover: { [weak self] hovering in
+                self?.microHoverChanged(hovering)
             },
             onReadyAction: { [weak self] in
                 self?.readyActionPreview()
+            },
+            onStartMemory: { [weak self] in
+                self?.handle(action: "start_memory")
+            },
+            onAmbientHover: { [weak self] hovering in
+                self?.ambientHoverChanged(hovering)
+            },
+            onAmbientBodyHover: { [weak self] hovering in
+                self?.ambientBodyHoverChanged(hovering)
             },
             onAnswerSummaryHover: { [weak self] hovering in
                 self?.answerSummaryHoverChanged(hovering)
@@ -1586,10 +2528,10 @@ private final class SessionIslandController: NSObject {
             setPresentation(.answerExpanded)
             sendAction("continue")
         case "start_memory":
-            setPresentation(.recordingTape)
+            setPresentation(.ambientMemory)
             sendAction("start_capture")
         case "pause_memory":
-            setPresentation(.recordingTape)
+            setPresentation(.ambientMemory)
             sendAction("stop_capture")
         case "reconstruct_trail":
             setPresentation(.answerExpanded)
@@ -1603,13 +2545,13 @@ private final class SessionIslandController: NSObject {
         case "open_expanded":
             setPresentation(.answerExpanded)
         case "toggle_meeting":
-            setPresentation(.recordingTape)
+            setPresentation(.ambientMemory)
             sendAction(metrics.meetingActive ? "stop_capture" : "start_capture")
         case "capture_once":
-            setPresentation(.recordingTape)
+            setPresentation(.ambientMemory)
             sendAction("capture_once")
         case "reveal_compact", "keep_compact":
-            revealRecorder()
+            revealAmbientMemory()
         case "close":
             setExpanded(false)
             sendAction("collapse")
@@ -1779,33 +2721,6 @@ private final class IslandTrackingView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        for trackingArea in trackingAreas {
-            removeTrackingArea(trackingArea)
-        }
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        ))
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        window?.disableCursorRects()
-        NSCursor.pointingHand.set()
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        NSCursor.pointingHand.set()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        window?.enableCursorRects()
-        NSCursor.arrow.set()
     }
 }
 
