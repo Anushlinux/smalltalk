@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import QuartzCore
 import SwiftUI
@@ -529,81 +530,15 @@ private enum Brand {
     static func swiftUIFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.system(size: size, weight: weight, design: .default)
     }
-
-    static func swiftUIMonoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        let name: String
-        switch weight {
-        case .medium:
-            name = "IBMPlexMono-Medium"
-        case .semibold, .bold:
-            name = "IBMPlexMono-SemiBold"
-        default:
-            name = "IBMPlexMono"
-        }
-        if NSFont(name: name, size: size) != nil {
-            return Font.custom(name, fixedSize: size)
-        }
-        return Font.system(size: size, weight: weight, design: .monospaced)
-    }
 }
 
 private enum IslandMotion {
     static func quick(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.25, 1, 0.5, 1, duration: reduceMotion ? 0.01 : 0.14)
-    }
-
-    static func settle(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.20, 0.88, 0.20, 1, duration: reduceMotion ? 0.01 : 0.26)
-    }
-
-    static func reveal(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.18, 0.92, 0.18, 1, duration: reduceMotion ? 0.01 : 0.34)
+        .timingCurve(0.23, 1, 0.32, 1, duration: reduceMotion ? 0.01 : 0.14)
     }
 
     static func panelTimingFunction() -> CAMediaTimingFunction {
-        CAMediaTimingFunction(controlPoints: 0.18, 0.92, 0.18, 1.0)
-    }
-
-    static func microTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.74, blur: 6, y: -3),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.82, blur: 7, y: 2),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
-    }
-
-    static func compactTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.72, blur: 8, y: 4),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.92, blur: 6, y: -2),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
-    }
-
-    static func expandedTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.88, blur: 8, y: -5),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.96, blur: 5, y: 3),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
+        CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
     }
 }
 
@@ -611,1386 +546,553 @@ private enum IslandMotion {
 private struct IslandMorphModifier: ViewModifier {
     let opacity: Double
     let scale: CGFloat
-    let blur: CGFloat
-    let y: CGFloat
 
     func body(content: Content) -> some View {
         content
             .opacity(opacity)
             .scaleEffect(scale, anchor: .top)
-            .blur(radius: blur)
-            .offset(y: y)
     }
 }
 
-@available(macOS 13.0, *)
-private final class AnimationTick: ObservableObject {
-    static let shared = AnimationTick()
-    @Published var value = 0.0
-    private var timer: Timer?
-    private let interval: TimeInterval = 1.0 / 20.0
-
-    func start() {
-        guard timer == nil else { return }
-        // The island only uses this clock for slow status breathing, tape
-        // scanning, and short evidence pulses. A 20 Hz clock keeps those
-        // movements fluid without forcing the always-visible native surface
-        // to redraw at display refresh rate while the user is doing no work.
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            // @Published already emits objectWillChange. Sending it again
-            // caused two complete SwiftUI invalidations for every timer tick.
-            value += interval
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-    }
-
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-    }
-}
-
-@available(macOS 13.0, *)
-private struct EvidenceTapeView: View {
-    let active: Bool
-    let processing: Bool
-    let error: Bool
-    let privateMode: Bool
-    let thinEvidence: Bool
-    let ready: Bool
-    let frameCount: Int64
-    let density: Double
-    let pulseNonce: UInt64?
-    let scale: CGFloat
-    let width: CGFloat
-    let height: CGFloat
-    let cornerRadius: CGFloat
-    let compact: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ObservedObject private var anim = AnimationTick.shared
-    @State private var lastPulseNonce: UInt64?
-    @State private var pulseStartedAt: Double?
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius * scale, style: .continuous)
-        let pulseAge = pulseStartedAt.map { max(0, anim.value - $0) } ?? 999
-        let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.46)
-        let pulseStrength = max(0, 1 - pulseProgress)
-        let heat = active && !reduceMotion ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
-
-        Canvas { context, size in
-            drawTape(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
-        }
-        .frame(width: width * scale, height: height * scale)
-        .background(
-            shape.fill(
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.018, green: 0.020, blue: 0.024).opacity(0.96),
-                        Color(red: 0.045, green: 0.048, blue: 0.056).opacity(0.94),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
-        )
-        .overlay(
-            shape.stroke(
-                tapeAccent.opacity(active || processing || error || thinEvidence || ready || privateMode ? 0.28 + 0.12 * heat : 0.10),
-                lineWidth: 0.7
-            )
-        )
-        .overlay(alignment: .top) {
-            shape
-                .stroke(Color.white.opacity(active || ready ? 0.08 : 0.055), lineWidth: 1)
-                .blur(radius: 0.25)
-                .offset(y: -0.5 * scale)
-        }
-        .overlay(
-            shape.fill(
-                tapeAccent.opacity(pulseStrength * (compact ? 0.13 : 0.11))
-            )
-        )
-        .shadow(
-            color: tapeAccent.opacity(active || ready || pulseStrength > 0 || error ? 0.10 + 0.06 * heat : 0),
-            radius: 9 * scale,
-            x: 0,
-            y: 0
-        )
-        .clipShape(shape)
-        .drawingGroup()
-        .onAppear {
-            lastPulseNonce = pulseNonce
-        }
-        .onChange(of: pulseNonce) { next in
-            guard next != nil, next != lastPulseNonce else {
-                lastPulseNonce = next
-                return
-            }
-            lastPulseNonce = next
-            pulseStartedAt = anim.value
-        }
-        .animation(IslandMotion.settle(reduceMotion), value: active)
-        .animation(IslandMotion.settle(reduceMotion), value: processing)
-        .animation(IslandMotion.settle(reduceMotion), value: error)
-        .animation(IslandMotion.settle(reduceMotion), value: privateMode)
-        .animation(IslandMotion.settle(reduceMotion), value: thinEvidence)
-        .animation(IslandMotion.settle(reduceMotion), value: ready)
-        .animation(IslandMotion.settle(reduceMotion), value: frameCount)
-    }
-
-    private var tapeAccent: Color {
-        if error {
-            return Color(red: 1.0, green: 0.62, blue: 0.24)
-        }
-        if thinEvidence || processing {
-            return Color(red: 1.0, green: 0.68, blue: 0.28)
-        }
-        if privateMode {
-            return Color.white.opacity(0.62)
-        }
-        if active || ready {
-            return active ? Color(red: 1.0, green: 0.22, blue: 0.16) : Color(red: 0.36, green: 0.84, blue: 0.68)
-        }
-        return Color.white.opacity(0.42)
-    }
-
-    private func drawTape(
-        context: inout GraphicsContext,
-        size: CGSize,
-        pulseStrength: Double,
-        heat: Double
-    ) {
-        let tick = anim.value
-        let tapeRect = CGRect(origin: .zero, size: size)
-        let accent = tapeAccent
-        let phase = scanPhase(tick)
-        let scanX = round(phase * size.width)
-
-        context.fill(Path(tapeRect), with: .color(.black.opacity(0.18)))
-
-        let rows = max(3, Int(round(density)))
-        for index in 1..<rows {
-            let offset = index % 2 == 0 ? 0.18 : -0.08
-            let y = round((Double(index) + offset) * size.height / Double(rows))
-            context.fill(
-                Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                with: .color(.white.opacity(active || ready ? 0.040 : 0.028))
-            )
-        }
-
-        let columns = max(4, Int(round(density + 2)))
-        for index in 1..<columns {
-            let skew = (index % 3 == 0 ? 0.30 : index % 2 == 0 ? -0.16 : 0.06)
-            let x = round((Double(index) + skew) * size.width / Double(columns))
-            context.fill(
-                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
-                with: .color(.white.opacity(active || ready ? 0.028 : 0.017))
-            )
-        }
-
-        if active || ready || pulseStrength > 0 {
-            let filledWidth = max(0, min(size.width, scanX))
-            context.fill(
-                Path(CGRect(x: 0, y: 0, width: filledWidth, height: size.height)),
-                with: .color(accent.opacity(active ? 0.035 + 0.025 * heat : 0.018 + 0.018 * pulseStrength))
-            )
-        }
-
-        drawFrameTicks(context: &context, size: size, accent: accent, pulseStrength: pulseStrength)
-
-        if active || ready || pulseStrength > 0 || processing {
-            let width = processing ? max(2, 2 * scale) : max(1, 1.2 * scale)
-            context.fill(
-                Path(CGRect(x: scanX, y: 1 * scale, width: width, height: max(1, size.height - 2 * scale))),
-                with: .color((processing ? Color.white : accent).opacity(processing ? 0.30 : 0.44 + 0.20 * heat))
-            )
-        }
-
-        if pulseStrength > 0 {
-            let bloomX = max(0, min(size.width - 2 * scale, scanX - 1 * scale))
-            let bloomRect = CGRect(
-                x: max(0, bloomX - size.width * 0.22),
-                y: 0,
-                width: min(size.width * 0.44, size.width),
-                height: size.height
-            )
-            let bloom = GraphicsContext.Shading.linearGradient(
-                Gradient(stops: [
-                    .init(color: .white.opacity(0), location: 0.0),
-                    .init(color: .white.opacity(0.24 * pulseStrength), location: 0.42),
-                    .init(color: accent.opacity(0.24 * pulseStrength), location: 0.58),
-                    .init(color: .white.opacity(0), location: 1.0),
-                ]),
-                startPoint: CGPoint(x: bloomRect.minX, y: bloomRect.midY),
-                endPoint: CGPoint(x: bloomRect.maxX, y: bloomRect.midY)
-            )
-            context.fill(Path(bloomRect), with: bloom)
-        }
-
-        if processing {
-            let shimmerPhase = reduceMotion ? 0.72 : fmod(tick * 0.82, 1.0)
-            let shimmerRect = CGRect(
-                x: shimmerPhase * (size.width + size.width * 0.32) - size.width * 0.28,
-                y: 0,
-                width: size.width * 0.28,
-                height: size.height
-            )
-            let shimmer = GraphicsContext.Shading.linearGradient(
-                Gradient(stops: [
-                    .init(color: .white.opacity(0), location: 0),
-                    .init(color: .white.opacity(0.18), location: 0.52),
-                    .init(color: .white.opacity(0), location: 1),
-                ]),
-                startPoint: CGPoint(x: shimmerRect.minX, y: shimmerRect.midY),
-                endPoint: CGPoint(x: shimmerRect.maxX, y: shimmerRect.midY)
-            )
-            context.fill(Path(shimmerRect), with: shimmer)
-        }
-
-        if error || privateMode {
-            let y = round(size.height * 0.63)
-            context.fill(
-                Path(CGRect(x: size.width * 0.12, y: y, width: size.width * 0.76, height: max(1, 1 * scale))),
-                with: .color(accent.opacity(error ? 0.50 : 0.36))
-            )
-            context.fill(
-                Path(CGRect(x: size.width * 0.58, y: max(0, y - 3 * scale), width: max(1, 1 * scale), height: min(size.height, 6 * scale))),
-                with: .color(accent.opacity(error ? 0.72 : 0.48))
-            )
-        }
-    }
-
-    private func drawFrameTicks(
-        context: inout GraphicsContext,
-        size: CGSize,
-        accent: Color,
-        pulseStrength: Double
-    ) {
-        let count = max(0, frameCount)
-        guard count > 0 else { return }
-        let tickCount = Int(min(count, compact ? 9 : 18))
-        let first = count - Int64(tickCount) + 1
-
-        for offset in 0..<tickCount {
-            let frameOrdinal = first + Int64(offset)
-            let fraction = tickFraction(frameOrdinal)
-            let tickHeight = size.height * (0.34 + 0.10 * Double((frameOrdinal % 3 + 3) % 3))
-            let x = round(max(1, min(size.width - 2, fraction * size.width)))
-            let y = round((size.height - tickHeight) / 2.0)
-            let isNewest = offset == tickCount - 1
-            let alpha = isNewest ? 0.55 + 0.32 * pulseStrength : 0.20 + 0.07 * Double(offset % 3)
-            let color = isNewest && (active || ready || pulseStrength > 0) ? accent.opacity(alpha) : Color.white.opacity(alpha)
-            context.fill(
-                Path(CGRect(x: x, y: y, width: max(1, 1 * scale), height: tickHeight)),
-                with: .color(color)
-            )
-        }
-    }
-
-    private func scanPhase(_ tick: Double) -> Double {
-        if processing {
-            return 0.78
-        }
-        if reduceMotion {
-            return active || ready ? 0.62 : 0.38
-        }
-        let speed = active ? 0.18 : ready ? 0.060 : 0.030
-        return fmod(tick * speed + (active ? 0.12 : 0.04), 1.0)
-    }
-
-    private func tickFraction(_ value: Int64) -> Double {
-        let raw = fmod(Double(value) * 0.61803398875 + Double((value % 7 + 7) % 7) * 0.031, 1.0)
-        return 0.08 + raw * 0.84
-    }
-}
-
-private let kBaseCollapsedW: CGFloat = 222
-private let kBaseCollapsedH: CGFloat = 48
 private let kBaseMicroHitW: CGFloat = 86
 private let kBaseMicroHitH: CGFloat = 24
 private let kBaseMicroVisualW: CGFloat = 58
 private let kBaseMicroVisualH: CGFloat = 10
-private let kBaseExpandedW: CGFloat = 520
-private let kBaseExpandedH: CGFloat = 304
-private let kAnimDur = 0.2
-private let kIdleMicroDelay: TimeInterval = 5.0
-private let kPanelFrameAnimDur = 0.32
-
-private enum IslandPresentation: Equatable {
-    case micro
-    case compact
-    case expanded
-}
 
 @available(macOS 13.0, *)
-private struct SessionIslandView: View {
-    let snapshot: IslandSnapshot
-    let metrics: OverlayMetrics
-    let scale: CGFloat
-    let onAction: (String) -> Void
-    let onContinueAction: (IslandAvailableAction) -> Void
-    @Binding var presentation: IslandPresentation
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ObservedObject private var anim = AnimationTick.shared
-    @State private var signalHovered = false
-
-    private func s(_ value: CGFloat) -> CGFloat { value * scale }
-
-    private var continueState: IslandContinueState {
-        snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
-    }
-
-    private var displayState: IslandDisplayState {
-        continueState.displayState
-    }
-
-    private var captureActive: Bool {
-        snapshot.state == "starting" ||
-            snapshot.state == "recording_compact" ||
-            snapshot.state == "recording_expanded" ||
-            displayState == .localMemoryWarming
-    }
-
-    private var signalReady: Bool {
-        displayState == .continueReady
-    }
-
-    private var signalThin: Bool {
-        displayState == .thinCurrentWork ||
-            displayState == .targetSuppressed ||
-            displayState == .supportBlocked ||
-            displayState == .inspectOnly ||
-            displayState == .noClearContinuation ||
-            displayState == .needsRefresh
-    }
-
-    private var signalPrivate: Bool {
-        isPrivateOrExcluded
-    }
-
-    private var isBusy: Bool {
-        displayState == .checkingContinue || snapshot.state == "starting" || snapshot.state == "processing"
-    }
-
-    private var isProcessing: Bool {
-        isBusy
-    }
-
-    private var hasError: Bool {
-        displayState == .error || snapshot.lastError != nil || snapshot.state == "error"
-    }
-
-    private var isPrivateOrExcluded: Bool {
-        snapshot.isSensitive || isPrivatePrivacyLabel(snapshot.privacyLabel)
-    }
-
-    private var primaryDisplayText: String {
-        switch displayState {
-        case .noLocalMemory:
-            return "Smalltalk"
-        case .localMemoryWarming:
-            return "Smalltalk Continue"
-        case .checkingContinue:
-            return "Checking Continue"
-        case .continueReady:
-            return "Continue"
-        case .thinCurrentWork:
-            return "Recent work seen"
-        case .targetSuppressed:
-            return "Continue needs more evidence"
-        case .supportBlocked:
-            return "Support surface seen"
-        case .needsRefresh:
-            return "Continue needs refresh"
-        case .inspectOnly:
-            return activitySummaryLine ?? currentActivityLine ?? "Continue answer"
-        case .noClearContinuation:
-            return taskInferenceUnavailable ? "Task inference unavailable" : "Exact task unavailable"
-        case .error:
-            return "Continue unavailable"
-        }
-    }
-
-    private var secondaryDisplayText: String {
-        switch displayState {
-        case .noLocalMemory:
-            return "Local memory is off"
-        case .localMemoryWarming:
-            return "Collecting local evidence"
-        case .checkingContinue:
-            return "Checking task and location"
-        case .continueReady:
-            return compactActivityLine ?? shortTargetTitle
-        case .thinCurrentWork, .targetSuppressed, .supportBlocked:
-            return compactUncertainActivityLine ?? "Exact return target is unclear"
-        case .needsRefresh:
-            return "Newer local evidence is available"
-        case .inspectOnly:
-            return currentActivityLine ?? compactUncertainActivityLine ?? "The answer is available to inspect"
-        case .noClearContinuation:
-            return taskInferenceUnavailable
-                ? "Recent activity was captured, but inference failed"
-                : compactUncertainActivityLine ?? "Evidence is available to inspect"
-        case .error:
-            return "Open Smalltalk to inspect local memory"
-        }
-    }
-
-    private var primaryActionLabel: String {
-        actionLabel(primaryContinueAction, compact: false)
-    }
-
-    private var compactActionLabel: String {
-        actionLabel(primaryContinueAction, compact: true)
-    }
-
-    private var secondaryActionLabel: String {
-        secondaryContinueAction.map { actionLabel($0, compact: false) } ?? "Open Smalltalk"
-    }
-
-    private var primaryActionDisabled: Bool {
-        !primaryContinueAction.enabled || primaryContinueAction.kind == .unknown
-    }
-
-    private var secondaryActionDisabled: Bool {
-        guard let action = secondaryContinueAction else { return true }
-        return !action.enabled || action.kind == .unknown
-    }
-
-    private var primaryContinueAction: IslandAvailableAction {
-        let priority: [IslandActionKind]
-        switch displayState {
-        case .continueReady:
-            priority = [.openContinueTarget, .inspectEvidence, .openSmalltalk, .refreshContinue]
-        case .needsRefresh, .checkingContinue:
-            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk]
-        case .thinCurrentWork, .targetSuppressed, .supportBlocked, .noClearContinuation:
-            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk, .captureEvidenceNow]
-        case .inspectOnly:
-            priority = [.inspectEvidence, .refreshContinue, .openSmalltalk]
-        case .noLocalMemory:
-            priority = [.startLocalMemory, .openSmalltalk]
-        case .localMemoryWarming:
-            priority = [.refreshContinue, .openSmalltalk, .captureEvidenceNow]
-        case .error:
-            priority = [.openSmalltalk]
-        }
-        return firstEnabledAction(in: priority)
-            ?? IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
-    }
-
-    private var secondaryContinueAction: IslandAvailableAction? {
-        let primary = primaryContinueAction
-        if displayState == .localMemoryWarming,
-           let updateEvidence = firstEnabledAction(in: [.captureEvidenceNow]),
-           updateEvidence.kind != primary.kind {
-            return updateEvidence
-        }
-        return continueState.availableActions.first { action in
-            action.enabled &&
-                action.kind != .unknown &&
-                action.kind != primary.kind &&
-                actionLabel(action, compact: false) != actionLabel(primary, compact: false)
-        }
-    }
-
-    private var semanticCorrectionActions: [IslandAvailableAction] {
-        continueState.availableActions.filter { action in
-            action.enabled && [
-                .chooseTaskAlternative,
-                .rejectSelectedTask,
-                .rejectTaskAlternative,
-                .markSupportingWork,
-                .markUnrelatedActivity,
-                .markTaskCompleted,
-                .reactivateTask,
-            ].contains(action.kind)
-        }
-    }
-
-    private func firstEnabledAction(in kinds: [IslandActionKind]) -> IslandAvailableAction? {
-        for kind in kinds {
-            if let action = continueState.availableActions.first(where: { $0.enabled && $0.kind == kind }) {
-                if kind == .openContinueTarget && trimmed(action.decisionId ?? continueState.decisionId).isEmpty {
-                    continue
-                }
-                return action
-            }
-        }
-        return nil
-    }
-
-    private func actionLabel(_ action: IslandAvailableAction, compact: Bool) -> String {
-        switch action.kind {
-        case .openContinueTarget:
-            return compact ? "Continue" : "Continue here"
-        case .markWrongTarget:
-            return compact ? "Not right" : "Not right"
-        case .markNotUseful:
-            return compact ? "Skip" : "Not useful"
-        case .chooseTaskAlternative:
-            return compact ? "Choose" : action.label
-        case .rejectSelectedTask, .rejectTaskAlternative:
-            return compact ? "Reject" : action.label
-        case .markSupportingWork, .markUnrelatedActivity, .markTaskCompleted, .reactivateTask:
-            return compact ? "Correct" : action.label
-        case .refreshContinue:
-            return compact ? "Refresh" : "Refresh"
-        case .inspectEvidence:
-            return compact ? "Inspect" : "Inspect evidence"
-        case .openSmalltalk:
-            return compact ? "Open" : "Open Smalltalk"
-        case .startLocalMemory:
-            return compact ? "Start" : "Start local memory"
-        case .captureEvidenceNow:
-            return compact ? "Update" : "Update local evidence"
-        case .unknown:
-            return compact ? "Open" : "Open Smalltalk"
-        }
-    }
-
-    private var trailMomentCount: Int64 {
-        max(0, snapshot.trailMomentCount ?? snapshot.frameCount)
-    }
-
-    private var trailAppCount: Int64 {
-        max(0, snapshot.trailAppCount ?? Int64(snapshot.trailLabels?.count ?? 0))
-    }
-
-    private var signalEvidenceCount: Int64 {
-        switch displayState {
-        case .checkingContinue, .continueReady, .thinCurrentWork, .targetSuppressed, .supportBlocked, .needsRefresh, .inspectOnly, .noClearContinuation:
-            return trailMomentCount
-        default:
-            return 0
-        }
-    }
-
-    private var shortTargetTitle: String {
-        trimmed(continueState.resumeWorkTarget?.title)
-            .nonEmpty
-            ?? trimmed(continueState.returnTarget?.title).nonEmpty
-            ?? "Return target ready"
-    }
-
-    private var activitySummaryLine: String? {
-        trimmed(continueState.semanticAnswer?.taskSummary).nonEmpty
-            ?? trimmed(continueState.activitySummary).nonEmpty
-    }
-
-    private var taskInferenceUnavailable: Bool {
-        let status = trimmed(continueState.semanticAnswer?.inferenceStatus).lowercased()
-        return [
-            "disabled", "credentials_missing", "model_unavailable", "timeout",
-            "provider_error", "provider_failure", "request_invalid", "invalid_response",
-            "provider_unavailable", "provider_rejected", "provider_no_usable_output",
-            "structured_parse_failure", "support_slot_validation_failure",
-        ].contains(status)
-    }
-
-    private var currentActivityLine: String? {
-        trimmed(continueState.currentActivity).nonEmpty
-    }
-
-    private var compactActivityLine: String? {
-        trimmed(continueState.activityLabel).nonEmpty
-            ?? trimmed(continueState.activitySummary).nonEmpty
-    }
-
-    private var compactUncertainActivityLine: String? {
-        if let activity = compactActivityLine {
-            return activity
-        }
-        let whereLine = trimmed(continueState.activityWhere).nonEmpty
-        let contextLine = recentSemanticContextLine
-            ?? trimmed(continueState.recentContextSummary).nonEmpty
-        if let whereLine, let contextLine {
-            return "\(whereLine) · \(contextLine)"
-        }
-        return whereLine ?? contextLine
-    }
-
-    private var activityWhereLine: String? {
-        trimmed(continueState.activityWhere).nonEmpty
-    }
-
-    private var activityStateLine: String? {
-        trimmed(continueState.activityState).nonEmpty
-    }
-
-    private var recentSemanticContextLine: String? {
-        guard let visits = continueState.semanticAnswer?.recentContext, !visits.isEmpty else {
-            return nil
-        }
-        let visible = Array(visits.suffix(4))
-        let labels = visible.compactMap { visit -> String? in
-            let app = trimmed(visit.appLabel)
-            let host = trimmed(visit.siteHostname)
-            let surface: String?
-            if !app.isEmpty && !host.isEmpty && app.caseInsensitiveCompare(host) != .orderedSame {
-                surface = "\(app) · \(host)"
-            } else {
-                surface = app.nonEmpty ?? host.nonEmpty
-            }
-            guard let surface else { return nil }
-            let role: String
-            switch trimmed(visit.semanticRole).lowercased() {
-            case "primary_work": role = "Primary work"
-            case "supporting_work": role = "Supporting work"
-            case "detour_or_unrelated": role = "Detour or unrelated"
-            case "unclear": role = "Role unclear"
-            default: role = ""
-            }
-            return role.isEmpty ? surface : "\(surface) · \(role)"
-        }
-        guard !labels.isEmpty else { return nil }
-        let more = visits.count > visible.count
-            ? " → +\(visits.count - visible.count) more in Smalltalk"
-            : ""
-        return labels.joined(separator: " → ") + more
-    }
-
-    private var nextActionLine: String? {
-        trimmed(continueState.nextAction).nonEmpty
-    }
-
-    private func trimmed(_ value: String?) -> String {
-        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
-    private func isPrivatePrivacyLabel(_ value: String?) -> Bool {
-        let label = trimmed(value).lowercased()
-        guard !label.isEmpty else { return false }
-        return !["normal", "ok", "allowed"].contains(label)
-    }
-
-    private var displayTrailLabels: [String] {
-        let labels = (snapshot.trailLabels ?? [])
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return Array(labels.suffix(4))
-    }
-
-    private var activeBreath: Double {
-        guard captureActive && !reduceMotion else { return 0 }
-        return 0.5 + 0.5 * sin(anim.value * 1.85)
-    }
-
-    private var signalColor: Color {
-        if hasError {
-            return Color(red: 1.0, green: 0.36, blue: 0.28)
-        }
-        if isPrivateOrExcluded {
-            return Color.white.opacity(0.64)
-        }
-        switch displayState {
-        case .needsRefresh, .thinCurrentWork, .targetSuppressed, .supportBlocked, .checkingContinue:
-            return Color(red: 1.0, green: 0.68, blue: 0.28)
-        case .localMemoryWarming, .continueReady:
-            return Color(red: 0.36, green: 0.84, blue: 0.68)
-        case .noLocalMemory, .inspectOnly, .noClearContinuation, .error:
-            return Color.white.opacity(0.42)
-        }
-    }
-
-    var body: some View {
-        ZStack {
-            switch presentation {
-            case .micro:
-                microView
-                    .transition(IslandMotion.microTransition(reduceMotion))
-            case .compact:
-                collapsedView
-                    .transition(IslandMotion.compactTransition(reduceMotion))
-            case .expanded:
-                expandedView
-                    .transition(IslandMotion.expandedTransition(reduceMotion))
-            }
-        }
-        .fixedSize()
-        .background(Color.clear)
-        .accessibilityLabel(accessibilityLabel)
-        .animation(IslandMotion.reveal(reduceMotion), value: presentation)
-        .animation(IslandMotion.settle(reduceMotion), value: primaryDisplayText)
-        .animation(IslandMotion.settle(reduceMotion), value: captureActive)
-        .animation(IslandMotion.settle(reduceMotion), value: metrics.screenActive)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    }
-
-    private var accessibilityLabel: String {
-        if isPrivateOrExcluded {
-            return "Smalltalk is not observing this app"
-        }
-        switch displayState {
-        case .noLocalMemory:
-            return "Smalltalk local memory is off"
-        case .localMemoryWarming:
-            return "Smalltalk is collecting local evidence"
-        case .checkingContinue:
-            return "Smalltalk is checking Continue"
-        case .continueReady:
-            return "Smalltalk Continue is ready"
-        case .thinCurrentWork:
-            return "Smalltalk saw recent work but the return target is unclear"
-        case .targetSuppressed:
-            return "Smalltalk needs more evidence before continuing"
-        case .supportBlocked:
-            return "Smalltalk saw a support surface but will not return there"
-        case .needsRefresh:
-            return "Smalltalk Continue needs refresh"
-        case .inspectOnly, .noClearContinuation:
-            return "Smalltalk has evidence to inspect but no safe return target"
-        case .error:
-            return "Smalltalk Continue is unavailable"
-        }
-    }
-
-    private var microView: some View {
-        Button {
-            presentation = .compact
-            onAction("reveal_compact")
-        } label: {
-            EvidenceTapeView(
-                active: captureActive,
-                processing: isProcessing,
-                error: hasError,
-                privateMode: signalPrivate,
-                thinEvidence: signalThin,
-                ready: signalReady,
-                frameCount: signalEvidenceCount,
-                density: 3,
-                pulseNonce: snapshot.capturePulseNonce,
-                scale: scale,
-                width: kBaseMicroVisualW,
-                height: kBaseMicroVisualH,
-                cornerRadius: 999,
-                compact: true
-            )
-                .shadow(color: .black.opacity(0.26), radius: s(4), x: 0, y: s(2))
-                .frame(width: kBaseMicroHitW * scale, height: kBaseMicroHitH * scale)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
-        .onHover { hovering in
-            if hovering {
-                presentation = .compact
-                onAction("reveal_compact")
-            }
-        }
-    }
-
-    private var collapsedView: some View {
-        HStack(spacing: s(7)) {
-            EvidenceTapeView(
-                active: captureActive,
-                processing: isProcessing,
-                error: hasError,
-                privateMode: signalPrivate,
-                thinEvidence: signalThin,
-                ready: signalReady,
-                frameCount: signalEvidenceCount,
-                density: 5,
-                pulseNonce: snapshot.capturePulseNonce,
-                scale: scale,
-                width: 34,
-                height: 24,
-                cornerRadius: 8,
-                compact: true
-            )
-            .frame(width: s(38), height: s(30))
-
-            VStack(alignment: .leading, spacing: s(1)) {
-                Text(primaryDisplayText)
-                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
-                    .foregroundColor(.white.opacity(0.92))
-                    .lineLimit(1)
-                    .monospacedDigit()
-                    .fixedSize(horizontal: true, vertical: false)
-                    .id("compact-primary-\(primaryDisplayText)")
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                Text(secondaryDisplayText)
-                    .font(Brand.swiftUIFont(size: s(10.5), weight: .medium))
-                    .foregroundColor(.white.opacity(0.54))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .id("compact-secondary-\(secondaryDisplayText)")
-                    .transition(.opacity)
-            }
-            .frame(width: s(106), alignment: .leading)
-
-            Spacer(minLength: s(2))
-
-            Button {
-                onContinueAction(primaryContinueAction)
-            } label: {
-                Text(compactActionLabel)
-                    .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
-                    .foregroundColor(.white.opacity(primaryActionDisabled ? 0.36 : signalHovered ? 0.96 : 0.78))
-                    .lineLimit(1)
-                    .frame(width: s(48), height: s(26))
-                    .background(
-                        Capsule()
-                            .fill(Color.white.opacity(primaryActionDisabled ? 0.035 : signalHovered ? 0.14 : 0.075))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(primaryActionDisabled ? 0.05 : signalHovered ? 0.18 : 0.09), lineWidth: 0.6)
-                    )
-                    .scaleEffect(signalHovered && !primaryActionDisabled && !reduceMotion ? 1.035 : 1)
-            }
-            .buttonStyle(.plain)
-            .disabled(primaryActionDisabled)
-            .frame(width: s(52), height: s(30))
-            .contentShape(Rectangle())
-            .accessibilityLabel(primaryActionLabel)
-            .onHover { hovering in
-                withAnimation(IslandMotion.quick(reduceMotion)) {
-                    signalHovered = hovering
-                }
-            }
-        }
-        .padding(.leading, s(7))
-        .padding(.trailing, s(7))
-        .frame(width: kBaseCollapsedW * scale, height: kBaseCollapsedH * scale)
-        .background(capsuleFill(active: captureActive))
-        .overlay(capsuleStroke(active: captureActive))
-        .overlay(alignment: .top) {
-            Capsule()
-                .fill(Color.white.opacity(captureActive ? 0.07 + 0.035 * activeBreath : 0.08))
-                .frame(height: max(1, 1 * scale))
-                .padding(.horizontal, s(18))
-                .padding(.top, s(1))
-                .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            Capsule()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.clear,
-                            signalColor.opacity(captureActive ? 0.08 + 0.04 * activeBreath : 0),
-                            Color.clear,
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: s(8))
-                .blur(radius: s(4))
-                .padding(.horizontal, s(20))
-                .allowsHitTesting(false)
-        }
-        .clipShape(Capsule())
-        .shadow(color: .black.opacity(0.24), radius: s(13), x: 0, y: s(7))
-        .shadow(color: signalColor.opacity(captureActive ? 0.08 + 0.025 * activeBreath : 0), radius: s(10), x: 0, y: 0)
-        .onHover { hovering in
-            if hovering {
-                onAction("keep_compact")
-            }
-        }
-    }
-
-    private var expandedView: some View {
-        VStack(alignment: .leading, spacing: s(13)) {
-            HStack(alignment: .center, spacing: s(11)) {
-                EvidenceTapeView(
-                    active: captureActive,
-                    processing: isProcessing,
-                    error: hasError,
-                    privateMode: signalPrivate,
-                    thinEvidence: signalThin,
-                    ready: signalReady,
-                    frameCount: signalEvidenceCount,
-                    density: 6,
-                    pulseNonce: snapshot.capturePulseNonce,
-                    scale: scale,
-                    width: 46,
-                    height: 32,
-                    cornerRadius: 10,
-                    compact: false
-                )
-                .frame(width: s(48), height: s(34))
-
-                VStack(alignment: .leading, spacing: s(3)) {
-                    Text(primaryDisplayText)
-                        .font(Brand.swiftUIFont(size: s(13.5), weight: .semibold))
-                        .foregroundColor(.white.opacity(0.94))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .monospacedDigit()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .id("expanded-primary-\(primaryDisplayText)")
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    Text(secondaryDisplayText)
-                        .font(Brand.swiftUIFont(size: s(11.5), weight: .medium))
-                        .foregroundColor(.white.opacity(0.58))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .transition(.opacity)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Spacer(minLength: s(8))
-
-                EvidenceTapeView(
-                    active: captureActive,
-                    processing: isProcessing,
-                    error: hasError,
-                    privateMode: signalPrivate,
-                    thinEvidence: signalThin,
-                    ready: signalReady,
-                    frameCount: signalEvidenceCount,
-                    density: 7,
-                    pulseNonce: snapshot.capturePulseNonce,
-                    scale: scale,
-                    width: 104,
-                    height: 30,
-                    cornerRadius: 7,
-                    compact: false
-                )
-                .frame(width: s(104), alignment: .trailing)
-            }
-
-            VStack(alignment: .leading, spacing: s(6)) {
-                if let activitySummaryLine {
-                    ContinueDetailRow(label: "You were", value: activitySummaryLine, scale: scale)
-                } else if taskInferenceUnavailable {
-                    ContinueDetailRow(
-                        label: "Task",
-                        value: "Inference is unavailable right now",
-                        scale: scale
-                    )
-                }
-                if let currentActivityLine {
-                    ContinueDetailRow(label: "Currently", value: currentActivityLine, scale: scale)
-                }
-                if let recentSemanticContextLine {
-                    ContinueDetailRow(label: "Recent", value: recentSemanticContextLine, scale: scale)
-                }
-                if let activityStateLine {
-                    ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)
-                }
-                if let nextActionLine {
-                    ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
-                }
-                if let activityWhereLine {
-                    ContinueDetailRow(label: "Where", value: activityWhereLine, scale: scale)
-                }
-            }
-            .padding(.horizontal, s(10))
-            .padding(.vertical, s(10))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                    .fill(Color.white.opacity(0.055))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                    .stroke(Color.white.opacity(0.075), lineWidth: 0.7)
-            )
-            .transition(.opacity.combined(with: .move(edge: .top)))
-
-            Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.02), Color.white.opacity(0.095), Color.white.opacity(0.02)],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: max(1, 1 * scale))
-                .padding(.horizontal, s(1))
-
-            HStack(spacing: s(9)) {
-                GlassActionButton(
-                    label: primaryActionLabel,
-                    scale: scale,
-                    prominent: true,
-                    disabled: primaryActionDisabled
-                ) {
-                    onContinueAction(primaryContinueAction)
-                }
-
-                GlassActionButton(
-                    label: secondaryActionLabel,
-                    scale: scale,
-                    prominent: false,
-                    disabled: secondaryActionDisabled
-                ) {
-                    if let secondaryContinueAction {
-                        onContinueAction(secondaryContinueAction)
-                    }
-                }
-
-                if !semanticCorrectionActions.isEmpty {
-                    Menu {
-                        ForEach(Array(semanticCorrectionActions.enumerated()), id: \.offset) { _, action in
-                            Button(action.label) {
-                                onContinueAction(action)
-                            }
-                        }
-                    } label: {
-                        Text("Correct")
-                            .font(Brand.swiftUIFont(size: s(11.5), weight: .semibold))
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                }
-            }
-        }
-        .padding(.horizontal, s(18))
-        .padding(.vertical, s(17))
-        .frame(width: kBaseExpandedW * scale, height: kBaseExpandedH * scale)
-        .background(expandedGlassFill(active: captureActive))
-        .overlay(expandedGlassStroke(active: captureActive))
-        .clipShape(RoundedRectangle(cornerRadius: s(18), style: .continuous))
-        .shadow(color: .black.opacity(0.34), radius: s(22), x: 0, y: s(12))
-        .shadow(color: signalColor.opacity(captureActive ? 0.10 + 0.035 * activeBreath : 0), radius: s(22), x: 0, y: 0)
-    }
-
-    private func capsuleFill(active: Bool) -> some ShapeStyle {
-        LinearGradient(
-            colors: active
-                ? [
-                    Color(red: 0.06, green: 0.15, blue: 0.13).opacity(0.98),
-                    Color(red: 0.055, green: 0.078, blue: 0.080).opacity(0.98),
-                ]
-                : [
-                    Color(red: 0.12, green: 0.125, blue: 0.135).opacity(0.98),
-                    Color(red: 0.075, green: 0.08, blue: 0.09).opacity(0.98),
-                ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
-    private func capsuleStroke(active: Bool) -> some View {
-        Capsule()
-            .stroke(
-                active ? signalColor.opacity(0.34) : Color.white.opacity(0.16),
-                lineWidth: 0.7
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.black.opacity(0.44), lineWidth: 1)
-                    .offset(y: s(0.5))
-                    .blur(radius: 0.4)
-            )
-    }
-
-    private func expandedGlassFill(active: Bool) -> some ShapeStyle {
-        LinearGradient(
-            colors: active
-                ? [
-                    Color(red: 0.055, green: 0.135, blue: 0.12).opacity(0.99),
-                    Color(red: 0.060, green: 0.072, blue: 0.080).opacity(0.99),
-                ]
-                : [
-                    Color(red: 0.115, green: 0.12, blue: 0.13).opacity(0.99),
-                    Color(red: 0.065, green: 0.07, blue: 0.08).opacity(0.99),
-                ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
-    private func expandedGlassStroke(active: Bool) -> some View {
-        let shape = RoundedRectangle(cornerRadius: s(18), style: .continuous)
-        return shape
-            .stroke(active ? signalColor.opacity(0.32) : Color.white.opacity(0.14), lineWidth: 0.8)
-            .overlay(
-                shape
-                    .stroke(Color.black.opacity(0.48), lineWidth: 1)
-                    .offset(y: s(0.5))
-                    .blur(radius: 0.5)
-            )
-            .overlay(alignment: .topLeading) {
-                shape
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    .frame(height: kBaseExpandedH * scale)
-                    .allowsHitTesting(false)
-            }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct ContinueDetailRow: View {
-    let label: String
-    let value: String
-    let scale: CGFloat
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
-            Text(label)
-                .font(Brand.swiftUIMonoFont(size: 8.5 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(0.48))
-                .lineLimit(1)
-                .frame(width: 82 * scale, alignment: .leading)
-
-            Text(value)
-                .font(Brand.swiftUIFont(size: 11 * scale, weight: .medium))
-                .foregroundColor(.white.opacity(0.74))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct LiveDot: View {
-    let active: Bool
-    let state: String
-    let scale: CGFloat
-    @ObservedObject private var anim = AnimationTick.shared
-
-    private var color: Color {
-        if state == "processing" || state == "stopped_toast" {
-            return Color(red: 1.0, green: 0.72, blue: 0.25)
-        }
-        if active {
-            return Color(red: 0.36, green: 0.84, blue: 0.68)
-        }
-        return .white.opacity(0.38)
-    }
-
-    var body: some View {
-        let pulse = active ? 0.68 + 0.32 * abs(sin(anim.value * 4.0)) : 1.0
-        Circle()
-            .fill(color.opacity(pulse))
-            .frame(width: 5 * scale, height: 5 * scale)
-            .overlay(
-                Circle()
-                    .stroke(color.opacity(active ? 0.32 : 0.12), lineWidth: 2 * scale)
-                    .scaleEffect(active ? 1.35 : 1)
-            )
-    }
-}
-
-@available(macOS 13.0, *)
-private struct IslandPressButtonStyle: ButtonStyle {
+private struct WhisperFlowPressButtonStyle: ButtonStyle {
     let reduceMotion: Bool
-    let pressedScale: CGFloat
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.96 : 1)
             .animation(IslandMotion.quick(reduceMotion), value: configuration.isPressed)
     }
 }
 
-@available(macOS 13.0, *)
-private struct EvidenceChip: View {
-    let label: String
-    let scale: CGFloat
+private let kWhisperFlowReadyPanelW: CGFloat = 187
+private let kWhisperFlowReadyPanelH: CGFloat = 49
+private let kWhisperFlowReadyW: CGFloat = 152
+private let kWhisperFlowReadyH: CGFloat = 30
+private let kWhisperFlowReadyActionW: CGFloat = 28
+private let kWhisperFlowReadyActionH: CGFloat = 24
+private let kWhisperFlowRecordingContentW: CGFloat = 107
+private let kWhisperFlowEvidenceTapeW: CGFloat = 92
+private let kWhisperFlowEvidenceTapeH: CGFloat = 18
+private let kWhisperFlowCapturePreviewEnabled = true
+private let kWhisperFlowRecorderCycleInterval: TimeInterval = 3.0
+private let kWhisperFlowAnswerSummaryPanelW: CGFloat = 187
+private let kWhisperFlowAnswerSummaryPanelH: CGFloat = 49
+private let kWhisperFlowAnswerSummaryW: CGFloat = 152
+private let kWhisperFlowAnswerSummaryH: CGFloat = 30
+private let kWhisperFlowAnswerExpandedW: CGFloat = 520
+private let kWhisperFlowAnswerExpandedH: CGFloat = 152
+private let kWhisperFlowAnswerRevealDelay: TimeInterval = 0.35
+private let kWhisperFlowAnswerReturnDelay: TimeInterval = 8.0
+private let kWhisperFlowMicroPulseDuration: TimeInterval = 3.2
+private let kWhisperFlowMicroPulseScale: CGFloat = 1.018
+private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
+private let kWhisperFlowMorphDuration: TimeInterval = 0.18
 
-    var body: some View {
-        Text(label)
-            .font(Brand.swiftUIMonoFont(size: 7.5 * scale, weight: .medium))
-            .foregroundColor(.white.opacity(0.58))
-            .lineLimit(1)
-            .fixedSize()
-            .padding(.horizontal, 5 * scale)
-            .frame(height: 14 * scale)
-            .background(
-                Capsule()
-                    .fill(Color.white.opacity(0.07))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
-            )
-    }
+private enum WhisperFlowPresentation: Equatable {
+    case micro
+    case recordingTape
+    case answerSummary
+    case answerExpanded
+}
+
+private enum WhisperFlowCaptureStatus: Equatable {
+    case recording
+    case starting
+    case processing
+    case inactive
+    case suppressed
+    case error
+}
+
+private enum WhisperFlowPreview {
+    static let title = "Island ready."
+    static let answer = "Continue refining the native floating island. Match the micro hover control, compact answer pill, and expanded answer layout to the WhisperFlow references before reconnecting memory or Continue behavior."
+    static let surface = Color(red: 0, green: 0, blue: 0)
+    static let outline = Color(red: 48 / 255, green: 48 / 255, blue: 47 / 255)
+    static let accent = Color(red: 245 / 255, green: 191 / 255, blue: 239 / 255)
 }
 
 @available(macOS 13.0, *)
-private struct TrailRouteView: View {
-    let labels: [String]
+private final class WhisperFlowIslandModel: ObservableObject {
+    @Published var presentation: WhisperFlowPresentation = .recordingTape
+    @Published var memoryActive = false
+    @Published var microPulseActive = false
+    @Published var captureFrameCount: Int64 = 0
+    @Published var capturePulseNonce: UInt64?
+    @Published var captureIndicationActive = kWhisperFlowCapturePreviewEnabled
+    @Published var captureStatus: WhisperFlowCaptureStatus = kWhisperFlowCapturePreviewEnabled
+        ? .recording
+        : .inactive
+}
+
+@available(macOS 13.0, *)
+private struct WhisperFlowIslandView: View {
     let scale: CGFloat
+    @ObservedObject var model: WhisperFlowIslandModel
+    let onRevealRecorder: () -> Void
+    let onReadyAction: () -> Void
+    let onAnswerSummaryHover: (Bool) -> Void
+    let onExpandAnswer: () -> Void
+    let onCollapseAnswer: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var microPulseExpanded = false
+    @State private var recordingActionHovered = false
+    @State private var recorderCycleTextVisible = false
+    @State private var lastTapePulseNonce: UInt64?
+    @State private var tapePulseActive = false
+    @State private var tapePulseGeneration = 0
+    private let recorderCycleTimer = Timer.publish(
+        every: kWhisperFlowRecorderCycleInterval,
+        on: .main,
+        in: .common
+    ).autoconnect()
+
+    private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
     var body: some View {
-        HStack(spacing: 5 * scale) {
-            ForEach(Array(labels.enumerated()), id: \.offset) { index, label in
-                Text(label)
-                    .font(Brand.swiftUIFont(size: 9.5 * scale, weight: index == labels.count - 1 ? .semibold : .medium))
-                    .foregroundColor(.white.opacity(index == labels.count - 1 ? 0.82 : 0.58))
+        ZStack(alignment: .top) {
+            switch model.presentation {
+            case .micro:
+                microView
+                    .transition(stateTransition(scale: 0.96))
+            case .recordingTape:
+                recordingTapeView
+                    .transition(stateTransition(scale: 0.96))
+            case .answerSummary:
+                answerSummaryView
+                    .transition(.opacity)
+            case .answerExpanded:
+                answerExpandedView
+                    .transition(stateTransition(scale: 0.97))
+            }
+        }
+        .fixedSize()
+        .background(Color.clear)
+        .animation(morphAnimation, value: model.presentation)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var microView: some View {
+        Button(action: onRevealRecorder) {
+            Capsule()
+                .fill(WhisperFlowPreview.surface)
+                .overlay(
+                    Capsule()
+                        .stroke(
+                            WhisperFlowPreview.outline.opacity(microOutlineOpacity),
+                            lineWidth: s(1)
+                        )
+                )
+                .frame(width: s(kBaseMicroVisualW), height: s(kBaseMicroVisualH))
+                .scaleEffect(microScale)
+                .frame(width: s(kBaseMicroHitW), height: s(kBaseMicroHitH))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(model.memoryActive ? "Smalltalk memory is active" : "Show Smalltalk")
+        .onHover { hovering in
+            if hovering {
+                onRevealRecorder()
+            }
+        }
+        .frame(
+            width: s(kWhisperFlowReadyPanelW),
+            height: s(kWhisperFlowReadyPanelH),
+            alignment: .center
+        )
+        .id("micro-\(model.microPulseActive)-\(reduceMotion)")
+        .onAppear(perform: refreshMicroPulse)
+        .onDisappear {
+            microPulseExpanded = false
+        }
+    }
+
+    private var recordingTapeView: some View {
+        HStack(spacing: s(5)) {
+            ZStack(alignment: .leading) {
+                tapeTransportView
+                    .opacity(recorderTextVisible ? 0 : 1)
+
+                Text("What was I doing?")
+                    .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
+                    .foregroundColor(.white)
                     .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 68 * scale, alignment: .leading)
-                    .padding(.horizontal, 7 * scale)
-                    .frame(height: 20 * scale)
+                    .fixedSize()
+                    .opacity(recorderTextVisible ? 1 : 0)
+            }
+            .frame(
+                width: s(kWhisperFlowRecordingContentW),
+                height: s(kWhisperFlowReadyActionH),
+                alignment: .leading
+            )
+            .allowsHitTesting(false)
+            .animation(recordingContentAnimation, value: recorderTextVisible)
+
+            Button(action: onReadyAction) {
+                Image(systemName: "arrow.right")
+                    .font(.system(size: s(11), weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(
+                        width: s(kWhisperFlowReadyActionW),
+                        height: s(kWhisperFlowReadyActionH)
+                    )
                     .background(
                         Capsule()
-                            .fill(Color.white.opacity(index == labels.count - 1 ? 0.085 : 0.045))
+                            .fill(
+                                recordingActionHovered
+                                    ? Color(red: 58 / 255, green: 58 / 255, blue: 56 / 255)
+                                    : WhisperFlowPreview.outline
+                            )
                     )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(index == labels.count - 1 ? 0.13 : 0.07), lineWidth: 0.6)
-                    )
-
-                if index < labels.count - 1 {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 6.5 * scale, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.30))
-                        .frame(width: 6 * scale)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+            .accessibilityLabel("Show what I was doing")
+            .onHover { hovering in
+                withAnimation(recordingContentAnimation) {
+                    recordingActionHovered = hovering
                 }
             }
         }
-        .frame(height: 20 * scale)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
-        .allowsHitTesting(false)
-    }
-}
-
-@available(macOS 13.0, *)
-private struct TextActionButton: View {
-    let label: String
-    let scale: CGFloat
-    let action: () -> Void
-    @State private var hovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(Brand.swiftUIMonoFont(size: 8 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(hovered ? 0.95 : 0.72))
-                .lineLimit(1)
-                .fixedSize()
-                .frame(width: 48 * scale, height: 26 * scale)
-                .background(
-                    Capsule()
-                        .fill(hovered ? Color.white.opacity(0.14) : Color.white.opacity(0.065))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(hovered ? 0.18 : 0.08), lineWidth: 0.5)
-                )
-                .contentShape(Capsule())
+        .padding(.leading, s(8))
+        .padding(.trailing, s(4))
+        .frame(width: s(kWhisperFlowReadyW), height: s(kWhisperFlowReadyH))
+        .background(WhisperFlowPreview.surface)
+        .overlay(
+            Capsule()
+                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
+        )
+        .clipShape(Capsule())
+        .frame(
+            width: s(kWhisperFlowReadyPanelW),
+            height: s(kWhisperFlowReadyPanelH),
+            alignment: .center
+        )
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .onAppear {
+            lastTapePulseNonce = model.capturePulseNonce
+            recorderCycleTextVisible = false
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct GlassActionButton: View {
-    let label: String
-    let scale: CGFloat
-    let prominent: Bool
-    let disabled: Bool
-    let action: () -> Void
-    @State private var hovered = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button {
-            if !disabled {
-                action()
-            }
-        } label: {
-            Text(label)
-                .font(Brand.swiftUIFont(size: 11 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(disabled ? 0.34 : prominent ? 0.92 : hovered ? 0.86 : 0.66))
-                .lineLimit(1)
-                .fixedSize()
-                .frame(maxWidth: .infinity)
-                .frame(height: 30 * scale)
-                .background(buttonFill)
-                .overlay(buttonStroke)
-                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
-                .contentShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
-                .scaleEffect(hovered && !disabled && !reduceMotion ? 1.015 : 1)
-                .shadow(
-                    color: prominent && !disabled
-                        ? Color.white.opacity(hovered ? 0.08 : 0.025)
-                        : Color.clear,
-                    radius: 7 * scale,
-                    x: 0,
-                    y: 0
-                )
+        .onDisappear {
+            recordingActionHovered = false
+            recorderCycleTextVisible = false
         }
-        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.965))
-        .disabled(disabled)
-        .onHover { hovering in
-            withAnimation(IslandMotion.quick(reduceMotion)) {
-                hovered = hovering
+        .onChange(of: model.capturePulseNonce) { next in
+            handleTapePulse(next)
+        }
+        .onReceive(recorderCycleTimer) { _ in
+            guard !recordingActionHovered else { return }
+            withAnimation(recordingContentAnimation) {
+                recorderCycleTextVisible.toggle()
             }
         }
     }
 
-    private var buttonFill: some View {
-        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-            .fill(
-                prominent
-                    ? Color.white.opacity(disabled ? 0.055 : hovered ? 0.16 : 0.115)
-                    : Color.white.opacity(disabled ? 0.025 : hovered ? 0.075 : 0.045)
+    private var recorderTextVisible: Bool {
+        recordingActionHovered || recorderCycleTextVisible
+    }
+
+    private var tapeTransportView: some View {
+        evidenceTapeGlyph
+        .frame(
+            width: s(kWhisperFlowRecordingContentW),
+            height: s(kWhisperFlowReadyActionH),
+            alignment: .center
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(captureStatusText)
+    }
+
+    private var evidenceTapeGlyph: some View {
+        TimelineView(
+            .animation(
+                minimumInterval: 1.0 / 24.0,
+                paused: !model.captureIndicationActive || reduceMotion || recordingActionHovered
             )
-    }
-
-    private var buttonStroke: some View {
-        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-            .stroke(Color.white.opacity(disabled ? 0.045 : prominent ? hovered ? 0.20 : 0.13 : hovered ? 0.13 : 0.075), lineWidth: 0.7)
-    }
-}
-
-@available(macOS 13.0, *)
-private struct PlayPauseButton: View {
-    let isActive: Bool
-    let scale: CGFloat
-    let disabled: Bool
-    let action: () -> Void
-    @State private var hovered = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button {
-            if !disabled {
-                action()
+        ) { timeline in
+            Canvas { context, size in
+                drawEvidenceTape(
+                    context: &context,
+                    size: size,
+                    scanPhase: tapeScanPhase(at: timeline.date)
+                )
             }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(
-                        isActive
-                            ? Color(red: 0.36, green: 0.84, blue: 0.68).opacity(disabled ? 0.38 : hovered ? 0.96 : 0.86)
-                            : Color.white.opacity(disabled ? 0.045 : hovered ? 0.12 : 0.075)
+            .frame(
+                width: s(kWhisperFlowEvidenceTapeW),
+                height: s(kWhisperFlowEvidenceTapeH)
+            )
+        }
+    }
+
+    private func drawEvidenceTape(
+        context: inout GraphicsContext,
+        size: CGSize,
+        scanPhase: Double
+    ) {
+        let lineWidth = max(1, s(1))
+        let railOpacity = model.captureIndicationActive ? 0.22 : 0.12
+        let railInset = max(1, s(1))
+
+        for railFraction in [0.28, 0.72] {
+            let y = round(size.height * railFraction)
+            context.fill(
+                Path(
+                    CGRect(
+                        x: railInset,
+                        y: y,
+                        width: max(0, size.width - railInset * 2),
+                        height: lineWidth
                     )
-                Circle()
-                    .stroke(Color.white.opacity(disabled ? 0.055 : isActive ? 0.22 : hovered ? 0.16 : 0.09), lineWidth: 0.6)
-
-                Image(systemName: isActive ? "pause.fill" : "play.fill")
-                    .font(.system(size: 9.5 * scale, weight: .semibold))
-                    .foregroundColor(disabled ? .white.opacity(0.32) : isActive ? .white.opacity(0.94) : (hovered ? .white.opacity(0.82) : .white.opacity(0.58)))
-                    .offset(x: isActive ? 0 : 0.7 * scale)
-                    .rotationEffect(.degrees(isActive || reduceMotion ? 0 : hovered ? -4 : 0))
-                    .animation(IslandMotion.quick(reduceMotion), value: isActive)
-            }
-            .frame(width: 28 * scale, height: 28 * scale)
-            .frame(width: 32 * scale, height: 32 * scale)
-            .contentShape(Circle())
-            .scaleEffect(hovered && !disabled && !reduceMotion ? 1.045 : 1)
-            .shadow(
-                color: isActive
-                    ? Color(red: 0.36, green: 0.84, blue: 0.68).opacity(hovered ? 0.28 : 0.16)
-                    : Color.white.opacity(hovered ? 0.08 : 0),
-                radius: 8 * scale,
-                x: 0,
-                y: 0
+                ),
+                with: .color(Color.white.opacity(railOpacity))
             )
         }
-        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.92))
-        .disabled(disabled)
-        .onHover { hovering in
-            withAnimation(IslandMotion.quick(reduceMotion)) {
-                hovered = hovering
+
+        drawFrameTicks(context: &context, size: size)
+
+        let scanX = round(max(railInset, min(size.width - railInset, scanPhase * size.width)))
+        context.fill(
+            Path(
+                CGRect(
+                    x: scanX,
+                    y: railInset,
+                    width: lineWidth,
+                    height: max(lineWidth, size.height - railInset * 2)
+                )
+            ),
+            with: .color(
+                Color.white.opacity(model.captureIndicationActive ? 0.78 : 0.28)
+            )
+        )
+    }
+
+    private func drawFrameTicks(context: inout GraphicsContext, size: CGSize) {
+        let previewFrameCount: Int64 = kWhisperFlowCapturePreviewEnabled ? 9 : 0
+        let count = max(previewFrameCount, model.captureFrameCount)
+        let tickCount = Int(min(count, 9))
+        guard tickCount > 0 else { return }
+
+        let first = count - Int64(tickCount) + 1
+        for offset in 0..<tickCount {
+            let frameOrdinal = first + Int64(offset)
+            let fraction = tickFraction(frameOrdinal)
+            let tickHeight = size.height * (0.30 + 0.08 * Double((frameOrdinal % 3 + 3) % 3))
+            let x = round(max(1, min(size.width - 2, fraction * size.width)))
+            let y = round((size.height - tickHeight) / 2)
+            let isNewest = offset == tickCount - 1
+            let opacity: Double
+            if isNewest {
+                opacity = model.captureIndicationActive
+                    ? tapePulseActive ? 0.98 : 0.68
+                    : 0.42
+            } else {
+                opacity = model.captureIndicationActive ? 0.32 + 0.06 * Double(offset % 3) : 0.20
+            }
+
+            context.fill(
+                Path(
+                    CGRect(
+                        x: x,
+                        y: y,
+                        width: max(1, s(1)),
+                        height: tickHeight
+                    )
+                ),
+                with: .color(Color.white.opacity(opacity))
+            )
+        }
+    }
+
+    private func tapeScanPhase(at date: Date) -> Double {
+        guard model.captureIndicationActive else { return 0.38 }
+        guard !reduceMotion else { return 0.62 }
+
+        return (date.timeIntervalSinceReferenceDate / 5.5)
+            .truncatingRemainder(dividingBy: 1)
+    }
+
+    private func tickFraction(_ value: Int64) -> Double {
+        let raw = fmod(
+            Double(value) * 0.618_033_988_75 +
+                Double((value % 7 + 7) % 7) * 0.031,
+            1
+        )
+        return 0.08 + raw * 0.84
+    }
+
+    private var captureStatusText: String {
+        switch model.captureStatus {
+        case .recording:
+            return "Capturing screens"
+        case .starting:
+            return "Starting capture"
+        case .processing:
+            return "Saving capture"
+        case .inactive:
+            return "Capture paused"
+        case .suppressed:
+            return "Not capturing here"
+        case .error:
+            return "Capture issue"
+        }
+    }
+
+    private var recordingContentAnimation: Animation {
+        .timingCurve(0.23, 1, 0.32, 1, duration: reduceMotion ? 0.12 : 0.14)
+    }
+
+    private func handleTapePulse(_ next: UInt64?) {
+        guard next != nil, next != lastTapePulseNonce else {
+            lastTapePulseNonce = next
+            return
+        }
+
+        lastTapePulseNonce = next
+        guard model.captureIndicationActive else { return }
+        tapePulseGeneration += 1
+        let generation = tapePulseGeneration
+
+        withAnimation(reduceMotion ? .linear(duration: 0.08) : IslandMotion.quick(false)) {
+            tapePulseActive = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) {
+            guard generation == tapePulseGeneration else { return }
+            withAnimation(reduceMotion ? .linear(duration: 0.12) : IslandMotion.quick(false)) {
+                tapePulseActive = false
             }
         }
-        .animation(IslandMotion.settle(reduceMotion), value: isActive)
+    }
+
+    private var answerSummaryView: some View {
+        HStack(spacing: s(2)) {
+            Text(WhisperFlowPreview.title)
+                .foregroundColor(.white)
+
+            Button(action: onExpandAnswer) {
+                Text("See more")
+                    .foregroundColor(WhisperFlowPreview.accent)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("See more of the island answer")
+        }
+        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+        .lineLimit(1)
+        .fixedSize()
+        .frame(width: s(kWhisperFlowAnswerSummaryW), height: s(kWhisperFlowAnswerSummaryH))
+        .background(WhisperFlowPreview.surface)
+        .overlay(
+            Capsule()
+                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
+        )
+        .clipShape(Capsule())
+        .frame(
+            width: s(kWhisperFlowAnswerSummaryPanelW),
+            height: s(kWhisperFlowAnswerSummaryPanelH),
+            alignment: .center
+        )
+        .contentShape(Rectangle())
+        .onHover(perform: onAnswerSummaryHover)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Island ready. See more")
+    }
+
+    private var answerExpandedView: some View {
+        VStack(alignment: .leading, spacing: s(18)) {
+            HStack(spacing: s(12)) {
+                Text(WhisperFlowPreview.title)
+                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer(minLength: s(12))
+
+                Button(action: onCollapseAnswer) {
+                    Text("See less")
+                        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                        .foregroundColor(WhisperFlowPreview.accent)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("See less of the island answer")
+            }
+
+            Text(WhisperFlowPreview.answer)
+                .font(Brand.swiftUIFont(size: s(14), weight: .regular))
+                .foregroundColor(.white)
+                .lineSpacing(s(3))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, s(24))
+        .padding(.vertical, s(20))
+        .frame(width: s(kWhisperFlowAnswerExpandedW), height: s(kWhisperFlowAnswerExpandedH))
+        .background(WhisperFlowPreview.surface)
+        .overlay(
+            RoundedRectangle(cornerRadius: s(24), style: .continuous)
+                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: s(24), style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+
+    private var morphAnimation: Animation {
+        .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: reduceMotion ? 0.01 : kWhisperFlowMorphDuration
+        )
+    }
+
+    private var microScale: CGFloat {
+        guard model.microPulseActive, !reduceMotion else { return 1 }
+        return microPulseExpanded ? kWhisperFlowMicroPulseScale : 1
+    }
+
+    private var microOutlineOpacity: Double {
+        guard model.microPulseActive, !reduceMotion else { return 1 }
+        return microPulseExpanded ? 1 : kWhisperFlowMicroPulseOutlineMinOpacity
+    }
+
+    private func refreshMicroPulse() {
+        microPulseExpanded = false
+        guard model.microPulseActive, !reduceMotion else { return }
+
+        DispatchQueue.main.async {
+            guard model.microPulseActive, !reduceMotion else { return }
+            withAnimation(
+                .timingCurve(
+                    0.77,
+                    0,
+                    0.175,
+                    1,
+                    duration: kWhisperFlowMicroPulseDuration / 2
+                )
+                    .repeatForever(autoreverses: true)
+            ) {
+                microPulseExpanded = true
+            }
+        }
+    }
+
+    private func stateTransition(scale: CGFloat) -> AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: scale),
+                identity: IslandMorphModifier(opacity: 1, scale: 1)
+            ),
+            removal: .opacity
+        )
     }
 }
 
@@ -2003,16 +1105,19 @@ private final class SessionIslandController: NSObject {
     private var panel: NSPanel?
     private var hostingView: NSHostingView<AnyView>?
     private var trackingView: IslandTrackingView?
-    private var presentation: IslandPresentation = .micro
+    private let islandModel = WhisperFlowIslandModel()
+    private var presentation: WhisperFlowPresentation = .recordingTape
     private var visible = false
     private var snapshot = IslandSnapshot()
     private var metrics = OverlayMetrics()
     private var previousFrameCount: Int64?
+    private var previewMemoryActiveOverride = false
     private var outsideGlobalClickMonitor: Any?
     private var outsideLocalClickMonitor: Any?
-    private var idleMicroTimer: Timer?
-    private var lastCompactRevealAt: Date?
-    private var suppressOpenExpandedUntil: Date?
+    private var answerRevealTimer: Timer?
+    private var answerReturnTimer: Timer?
+    private var answerReturnStartedAt: Date?
+    private var answerReturnRemaining = kWhisperFlowAnswerReturnDelay
 
     func initializeIfNeeded() {
         if panel == nil {
@@ -2023,8 +1128,6 @@ private final class SessionIslandController: NSObject {
     }
 
     func update(json: String) {
-        let wasMicroEligible = canUseMicro
-
         if let data = json.data(using: .utf8) {
             do {
                 snapshot = try JSONDecoder().decode(IslandSnapshot.self, from: data)
@@ -2053,16 +1156,10 @@ private final class SessionIslandController: NSObject {
         }
         previousFrameCount = snapshot.frameCount
 
-        if snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "stopped_toast" {
-            setPresentation(.compact, resetIdleTimer: false)
-        } else if canUseMicro {
-            if !wasMicroEligible && presentation == .compact {
-                scheduleMicroReturn()
-            }
-        } else if presentation == .micro {
-            setPresentation(.compact, resetIdleTimer: false)
-        } else {
-            cancelMicroReturn()
+        if presentation != .answerSummary,
+           presentation != .answerExpanded,
+           answerRevealTimer == nil {
+            setPresentation(.recordingTape)
         }
 
         initializeIfNeeded()
@@ -2076,15 +1173,14 @@ private final class SessionIslandController: NSObject {
         visible = true
         updateOutsideClickMonitors()
         panel?.orderFrontRegardless()
-        AnimationTick.shared.start()
     }
 
     func hide() {
         visible = false
-        presentation = .micro
-        cancelMicroReturn()
+        presentation = .recordingTape
+        previewMemoryActiveOverride = false
+        cancelPreviewTimers()
         updateOutsideClickMonitors()
-        AnimationTick.shared.stop()
         DispatchQueue.main.async { [self] in
             panel?.orderOut(nil)
             updateContent()
@@ -2092,7 +1188,11 @@ private final class SessionIslandController: NSObject {
     }
 
     func setExpanded(_ expanded: Bool) {
-        setPresentation(expanded ? .expanded : .compact)
+        if expanded {
+            expandAnswer()
+        } else {
+            showAnswerSummary()
+        }
     }
 
     func reposition() {
@@ -2101,118 +1201,208 @@ private final class SessionIslandController: NSObject {
     }
 
     func shutdown() {
-        AnimationTick.shared.stop()
-        cancelMicroReturn()
+        cancelPreviewTimers()
         removeOutsideClickMonitors()
         panel?.orderOut(nil)
         panel = nil
         hostingView = nil
         trackingView = nil
         visible = false
+        presentation = .recordingTape
+        previewMemoryActiveOverride = false
     }
 
     private func isRecording(_ state: String) -> Bool {
         state == "recording_compact" || state == "recording_expanded"
     }
 
-    private var canUseMicro: Bool {
-        snapshot.lastError == nil &&
-            (
-                snapshot.state == "ready" ||
-                    snapshot.state == "recording_compact" ||
-                    snapshot.state == "recording_expanded" ||
-                    snapshot.state == "resume_ready"
-            )
+    private var memoryActive: Bool {
+        previewMemoryActiveOverride ||
+            isRecording(snapshot.state) ||
+            snapshot.state == "starting" ||
+            snapshot.state == "processing"
     }
 
-    private func setPresentation(
-        _ nextPresentation: IslandPresentation,
-        resetIdleTimer: Bool = true
-    ) {
-        let normalized = normalizePresentation(nextPresentation)
-        let changed = presentation != normalized
-        presentation = normalized
+    private var microPulseActive: Bool {
+        captureIndicationActive
+    }
+
+    private var captureIndicationActive: Bool {
+        (
+            isRecording(snapshot.state) ||
+                snapshot.state == "starting" ||
+                snapshot.state == "processing"
+        ) && snapshotAllowsCaptureIndication
+    }
+
+    private var captureStatus: WhisperFlowCaptureStatus {
+        if snapshot.state == "error" || snapshot.lastError != nil {
+            return .error
+        }
+        if !snapshotAllowsCaptureIndication {
+            return .suppressed
+        }
+        switch snapshot.state {
+        case "recording_compact", "recording_expanded":
+            return .recording
+        case "starting":
+            return .starting
+        case "processing":
+            return .processing
+        default:
+            return .inactive
+        }
+    }
+
+    private var snapshotAllowsCaptureIndication: Bool {
+        guard snapshot.state != "hidden", snapshot.state != "error", !snapshot.isSensitive else {
+            return false
+        }
+        let privacyLabel = snapshot.privacyLabel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return privacyLabel.isEmpty || ["normal", "ok", "allowed"].contains(privacyLabel)
+    }
+
+    private func setPresentation(_ nextPresentation: WhisperFlowPresentation) {
+        let changed = presentation != nextPresentation
+        presentation = nextPresentation
 
         if changed {
             updateOutsideClickMonitors()
-            updateContent()
             positionPanel(preserveCurrentAnchor: true, animated: visible)
+            updateContent()
         }
+    }
 
-        if presentation == .compact && canUseMicro {
-            if resetIdleTimer || idleMicroTimer == nil {
-                scheduleMicroReturn()
-            }
+    private func revealRecorder() {
+        setPresentation(.recordingTape)
+    }
+
+    private func readyActionPreview() {
+        if memoryActive {
+            continuePreview()
         } else {
-            cancelMicroReturn()
+            startMemoryPreview()
         }
     }
 
-    private func normalizePresentation(_ nextPresentation: IslandPresentation) -> IslandPresentation {
-        if nextPresentation == .micro && !canUseMicro {
-            return .compact
-        }
-        return nextPresentation
+    private func startMemoryPreview() {
+        cancelPreviewTimers()
+        previewMemoryActiveOverride = true
+        setPresentation(.recordingTape)
+        updateContent()
     }
 
-    private func revealCompact() {
-        lastCompactRevealAt = Date()
-        setPresentation(.compact, resetIdleTimer: true)
-    }
+    private func continuePreview() {
+        cancelPreviewTimers()
+        setPresentation(.micro)
 
-    private func openExpandedFromCompact() {
-        if let suppressOpenExpandedUntil,
-           Date() < suppressOpenExpandedUntil {
-            revealCompact()
-            return
-        }
-        if let lastCompactRevealAt,
-           Date().timeIntervalSince(lastCompactRevealAt) < 0.25 {
-            revealCompact()
-            return
-        }
-        setPresentation(.expanded)
-    }
-
-    private func markPanelDragBegan() {
-        suppressOpenExpandedUntil = Date().addingTimeInterval(0.35)
-        revealCompact()
-    }
-
-    private func scheduleMicroReturn() {
-        guard canUseMicro, presentation == .compact else {
-            cancelMicroReturn()
-            return
-        }
-
-        cancelMicroReturn()
-        let timer = Timer(timeInterval: kIdleMicroDelay, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: kWhisperFlowAnswerRevealDelay, repeats: false) { [weak self] _ in
             DispatchQueue.main.async {
-                self?.returnToMicroIfIdle()
+                guard let self else { return }
+                self.answerRevealTimer = nil
+                self.showAnswerSummary()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
-        idleMicroTimer = timer
+        answerRevealTimer = timer
     }
 
-    private func cancelMicroReturn() {
-        idleMicroTimer?.invalidate()
-        idleMicroTimer = nil
+    private func showAnswerSummary() {
+        setPresentation(.answerSummary)
+        startAnswerReturnTimer()
     }
 
-    private func returnToMicroIfIdle() {
-        guard canUseMicro, presentation == .compact else { return }
-        setPresentation(.micro, resetIdleTimer: false)
+    private func expandAnswer() {
+        cancelAnswerReturnTimer(resetRemaining: true)
+        setPresentation(.answerExpanded)
+    }
+
+    private func returnToDefaultPresentation() {
+        cancelAnswerReturnTimer(resetRemaining: true)
+        setPresentation(.recordingTape)
+    }
+
+    private func answerSummaryHoverChanged(_ hovering: Bool) {
+        if hovering {
+            pauseAnswerReturnTimer()
+        } else {
+            resumeAnswerReturnTimer()
+        }
+    }
+
+    private func markPanelDragBegan() {
+        answerRevealTimer?.invalidate()
+        answerRevealTimer = nil
+    }
+
+    private func startAnswerReturnTimer() {
+        cancelAnswerReturnTimer(resetRemaining: true)
+        resumeAnswerReturnTimer()
+    }
+
+    private func pauseAnswerReturnTimer() {
+        guard presentation == .answerSummary else { return }
+        if let answerReturnStartedAt {
+            answerReturnRemaining = max(
+                0,
+                answerReturnRemaining - Date().timeIntervalSince(answerReturnStartedAt)
+            )
+        }
+        answerReturnTimer?.invalidate()
+        answerReturnTimer = nil
+        answerReturnStartedAt = nil
+    }
+
+    private func resumeAnswerReturnTimer() {
+        guard presentation == .answerSummary, answerReturnTimer == nil else { return }
+        let delay = max(0.05, answerReturnRemaining)
+        answerReturnStartedAt = Date()
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.presentation == .answerSummary else { return }
+                self.answerReturnTimer = nil
+                self.answerReturnStartedAt = nil
+                self.returnToDefaultPresentation()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        answerReturnTimer = timer
+    }
+
+    private func cancelAnswerReturnTimer(resetRemaining: Bool) {
+        answerReturnTimer?.invalidate()
+        answerReturnTimer = nil
+        answerReturnStartedAt = nil
+        if resetRemaining {
+            answerReturnRemaining = kWhisperFlowAnswerReturnDelay
+        }
+    }
+
+    private func cancelPreviewTimers() {
+        answerRevealTimer?.invalidate()
+        answerRevealTimer = nil
+        cancelAnswerReturnTimer(resetRemaining: true)
     }
 
     private var targetPanelSize: NSSize {
         switch presentation {
-        case .micro:
-            return NSSize(width: kBaseMicroHitW * gOverlayScale, height: kBaseMicroHitH * gOverlayScale)
-        case .compact:
-            return NSSize(width: kBaseCollapsedW * gOverlayScale, height: kBaseCollapsedH * gOverlayScale)
-        case .expanded:
-            return NSSize(width: kBaseExpandedW * gOverlayScale, height: kBaseExpandedH * gOverlayScale)
+        case .micro, .recordingTape:
+            return NSSize(
+                width: kWhisperFlowReadyPanelW * gOverlayScale,
+                height: kWhisperFlowReadyPanelH * gOverlayScale
+            )
+        case .answerSummary:
+            return NSSize(
+                width: kWhisperFlowAnswerSummaryPanelW * gOverlayScale,
+                height: kWhisperFlowAnswerSummaryPanelH * gOverlayScale
+            )
+        case .answerExpanded:
+            return NSSize(
+                width: kWhisperFlowAnswerExpandedW * gOverlayScale,
+                height: kWhisperFlowAnswerExpandedH * gOverlayScale
+            )
         }
     }
 
@@ -2313,7 +1503,7 @@ private final class SessionIslandController: NSObject {
         guard let panel else { return }
         if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = kPanelFrameAnimDur
+                context.duration = kWhisperFlowMorphDuration
                 context.timingFunction = IslandMotion.panelTimingFunction()
                 panel.animator().setFrame(frame, display: visible)
             }
@@ -2324,36 +1514,64 @@ private final class SessionIslandController: NSObject {
 
     private func updateContent() {
         guard let panel, let contentView = panel.contentView else { return }
-        let controller = self
-        let view = SessionIslandView(
-            snapshot: snapshot,
-            metrics: metrics,
+        if islandModel.presentation != presentation {
+            islandModel.presentation = presentation
+        }
+        if islandModel.memoryActive != memoryActive {
+            islandModel.memoryActive = memoryActive
+        }
+        if islandModel.microPulseActive != microPulseActive {
+            islandModel.microPulseActive = microPulseActive
+        }
+        if islandModel.captureFrameCount != snapshot.frameCount {
+            islandModel.captureFrameCount = snapshot.frameCount
+        }
+        if islandModel.capturePulseNonce != snapshot.capturePulseNonce {
+            islandModel.capturePulseNonce = snapshot.capturePulseNonce
+        }
+        let displayedCaptureIndicationActive =
+            kWhisperFlowCapturePreviewEnabled || captureIndicationActive
+        if islandModel.captureIndicationActive != displayedCaptureIndicationActive {
+            islandModel.captureIndicationActive = displayedCaptureIndicationActive
+        }
+        let displayedCaptureStatus: WhisperFlowCaptureStatus = kWhisperFlowCapturePreviewEnabled
+            ? .recording
+            : captureStatus
+        if islandModel.captureStatus != displayedCaptureStatus {
+            islandModel.captureStatus = displayedCaptureStatus
+        }
+
+        guard hostingView == nil else { return }
+
+        let view = WhisperFlowIslandView(
             scale: gOverlayScale,
-            onAction: { [weak self] action in
-                self?.handle(action: action)
+            model: islandModel,
+            onRevealRecorder: { [weak self] in
+                self?.revealRecorder()
             },
-            onContinueAction: { [weak self] action in
-                self?.handle(continueAction: action)
+            onReadyAction: { [weak self] in
+                self?.readyActionPreview()
             },
-            presentation: Binding(
-                get: { controller.presentation },
-                set: { controller.setPresentation($0) }
-            )
+            onAnswerSummaryHover: { [weak self] hovering in
+                self?.answerSummaryHoverChanged(hovering)
+            },
+            onExpandAnswer: { [weak self] in
+                self?.expandAnswer()
+            },
+            onCollapseAnswer: { [weak self] in
+                self?.showAnswerSummary()
+            }
         )
 
-        if let hostingView {
-            hostingView.rootView = AnyView(view)
-        } else {
-            let hosting = DraggableHostingView(rootView: AnyView(view))
-            hosting.onDragBegan = { [weak self] in
-                self?.markPanelDragBegan()
-            }
-            hosting.configureTransparentLayer()
-            hosting.frame = contentView.bounds
-            hosting.autoresizingMask = [.width, .height]
-            contentView.addSubview(hosting)
-            hostingView = hosting
+        let hosting = DraggableHostingView(rootView: AnyView(view))
+        hosting.onDragBegan = { [weak self] in
+            self?.markPanelDragBegan()
         }
+        hosting.configureTransparentLayer()
+        hosting.frame = contentView.bounds
+        hosting.autoresizingMask = [.width, .height]
+        contentView.addSubview(hosting)
+        hostingView = hosting
     }
 
     private func handle(action: String) {
@@ -2365,16 +1583,16 @@ private final class SessionIslandController: NSObject {
         case "open_search":
             sendAction("open_main_window")
         case "continue":
-            setPresentation(.expanded, resetIdleTimer: false)
+            setPresentation(.answerExpanded)
             sendAction("continue")
         case "start_memory":
-            revealCompact()
+            setPresentation(.recordingTape)
             sendAction("start_capture")
         case "pause_memory":
-            revealCompact()
+            setPresentation(.recordingTape)
             sendAction("stop_capture")
         case "reconstruct_trail":
-            setPresentation(.expanded, resetIdleTimer: false)
+            setPresentation(.answerExpanded)
             sendAction("continue")
         case "show_trail":
             sendAction("show_trail")
@@ -2383,15 +1601,15 @@ private final class SessionIslandController: NSObject {
         case "open_main_window":
             sendAction("open_main_window")
         case "open_expanded":
-            openExpandedFromCompact()
+            setPresentation(.answerExpanded)
         case "toggle_meeting":
-            revealCompact()
+            setPresentation(.recordingTape)
             sendAction(metrics.meetingActive ? "stop_capture" : "start_capture")
         case "capture_once":
-            revealCompact()
+            setPresentation(.recordingTape)
             sendAction("capture_once")
         case "reveal_compact", "keep_compact":
-            revealCompact()
+            revealRecorder()
         case "close":
             setExpanded(false)
             sendAction("collapse")
@@ -2403,9 +1621,9 @@ private final class SessionIslandController: NSObject {
     private func handle(continueAction action: IslandAvailableAction) {
         switch action.kind {
         case .openContinueTarget:
-            setPresentation(.expanded, resetIdleTimer: false)
+            setPresentation(.answerExpanded)
         case .refreshContinue, .markWrongTarget, .markNotUseful, .startLocalMemory, .captureEvidenceNow:
-            revealCompact()
+            setPresentation(.answerSummary)
         case .chooseTaskAlternative,
              .rejectSelectedTask,
              .rejectTaskAlternative,
@@ -2413,7 +1631,7 @@ private final class SessionIslandController: NSObject {
              .markUnrelatedActivity,
              .markTaskCompleted,
              .reactivateTask:
-            revealCompact()
+            setPresentation(.answerSummary)
         case .inspectEvidence, .openSmalltalk:
             break
         case .unknown:
@@ -2432,7 +1650,7 @@ private final class SessionIslandController: NSObject {
     }
 
     private func updateOutsideClickMonitors() {
-        if visible && presentation == .expanded {
+        if visible && (presentation == .answerSummary || presentation == .answerExpanded) {
             installOutsideClickMonitors()
         } else {
             removeOutsideClickMonitors()
@@ -2468,7 +1686,7 @@ private final class SessionIslandController: NSObject {
     }
 
     private func collapseIfOutside(_ event: NSEvent) {
-        guard presentation == .expanded, let panel else { return }
+        guard presentation == .answerSummary || presentation == .answerExpanded, let panel else { return }
         if event.window === panel {
             return
         }
@@ -2477,8 +1695,12 @@ private final class SessionIslandController: NSObject {
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.setExpanded(false)
-            self?.sendAction("collapse")
+            guard let self else { return }
+            if self.presentation == .answerExpanded {
+                self.showAnswerSummary()
+            } else if self.presentation == .answerSummary {
+                self.returnToDefaultPresentation()
+            }
         }
     }
 

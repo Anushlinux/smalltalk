@@ -2169,19 +2169,271 @@ mod tests {
     }
 
     #[test]
-    fn swift_action_contract_keeps_capture_secondary_to_continue() {
+    fn swift_visual_prototype_has_stable_recorder_motion_contract() {
         let source = include_str!("../macos/SessionIslandPanel.swift");
 
-        assert!(source.contains(
-            "case .localMemoryWarming:\n            priority = [.refreshContinue, .openSmalltalk, .captureEvidenceNow]"
+        for state in [
+            "case micro",
+            "case recordingTape",
+            "case answerSummary",
+            "case answerExpanded",
+        ] {
+            assert!(
+                source.contains(state),
+                "missing Swift prototype state {state:?}"
+            );
+        }
+        for copy in [
+            "What was I doing?",
+            "arrow.right",
+            "Island ready.",
+            "See more",
+            "See less",
+        ] {
+            assert!(
+                source.contains(copy),
+                "missing Swift prototype copy {copy:?}"
+            );
+        }
+        for token in [
+            "kBaseMicroVisualW: CGFloat = 58",
+            "kBaseMicroVisualH: CGFloat = 10",
+            "kWhisperFlowReadyPanelW: CGFloat = 187",
+            "kWhisperFlowReadyPanelH: CGFloat = 49",
+            "kWhisperFlowReadyW: CGFloat = 152",
+            "kWhisperFlowReadyH: CGFloat = 30",
+            "kWhisperFlowReadyActionW: CGFloat = 28",
+            "kWhisperFlowReadyActionH: CGFloat = 24",
+            "kWhisperFlowRecordingContentW: CGFloat = 107",
+            "kWhisperFlowEvidenceTapeW: CGFloat = 92",
+            "kWhisperFlowEvidenceTapeH: CGFloat = 18",
+            "kWhisperFlowCapturePreviewEnabled = true",
+            "kWhisperFlowRecorderCycleInterval: TimeInterval = 3.0",
+            "kWhisperFlowAnswerSummaryW: CGFloat = 152",
+            "kWhisperFlowAnswerSummaryH: CGFloat = 30",
+            "kWhisperFlowAnswerExpandedW: CGFloat = 520",
+            "kWhisperFlowAnswerExpandedH: CGFloat = 152",
+            "kWhisperFlowAnswerRevealDelay: TimeInterval = 0.35",
+            "kWhisperFlowAnswerReturnDelay: TimeInterval = 8.0",
+            "kWhisperFlowMicroPulseDuration: TimeInterval = 3.2",
+            "kWhisperFlowMicroPulseScale: CGFloat = 1.018",
+            "kWhisperFlowMicroPulseOutlineMinOpacity = 0.72",
+            "kWhisperFlowMorphDuration: TimeInterval = 0.18",
+        ] {
+            assert!(
+                source.contains(token),
+                "missing Swift prototype token {token:?}"
+            );
+        }
+
+        let start_preview = source
+            .split("private func startMemoryPreview()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func continuePreview()").next())
+            .expect("Swift prototype must keep a bounded startMemoryPreview implementation");
+        assert!(start_preview.contains("previewMemoryActiveOverride = true"));
+        assert!(start_preview.contains("setPresentation(.recordingTape)"));
+        assert!(!start_preview.contains("sendAction("));
+        assert!(!start_preview.contains("start_capture"));
+        assert!(!start_preview.contains("get_continue_decision"));
+
+        let continue_preview = source
+            .split("private func continuePreview()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func showAnswerSummary()").next())
+            .expect("Swift prototype must keep a bounded continuePreview implementation");
+        assert!(continue_preview.contains("setPresentation(.micro)"));
+        assert!(continue_preview.contains("showAnswerSummary()"));
+        assert!(!continue_preview.contains("sendAction("));
+        assert!(!continue_preview.contains("get_continue_decision"));
+
+        assert!(
+            source.contains("private var presentation: WhisperFlowPresentation = .recordingTape")
+        );
+        assert!(source
+            .contains("@Published var presentation: WhisperFlowPresentation = .recordingTape"));
+        assert!(source.contains("private func pauseAnswerReturnTimer()"));
+        assert!(source.contains("private func resumeAnswerReturnTimer()"));
+
+        let update = source
+            .split("func update(json: String)")
+            .nth(1)
+            .and_then(|suffix| suffix.split("func show()").next())
+            .expect("Swift prototype must keep a bounded snapshot update implementation");
+        assert!(update.contains("presentation != .answerSummary"));
+        assert!(update.contains("presentation != .answerExpanded"));
+        assert!(update.contains("answerRevealTimer == nil"));
+        assert!(update.contains("setPresentation(.recordingTape)"));
+        assert!(!update.contains("setPresentation(.micro)"));
+
+        let reveal_recorder = source
+            .split("private func revealRecorder()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func readyActionPreview").next())
+            .expect("Swift prototype must keep a bounded revealRecorder implementation");
+        assert!(reveal_recorder.contains("setPresentation(.recordingTape)"));
+
+        let micro_view = source
+            .split("private var microView: some View")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private var recordingTapeView: some View")
+                    .next()
+            })
+            .expect("Swift prototype must keep a bounded microView implementation");
+        assert!(micro_view.contains("Button(action: onRevealRecorder)"));
+        assert!(micro_view.contains("onRevealRecorder()"));
+        assert!(micro_view.contains("width: s(kWhisperFlowReadyPanelW)"));
+        assert!(micro_view.contains("height: s(kWhisperFlowReadyPanelH)"));
+
+        let recorder_view = source
+            .split("private var recordingTapeView: some View")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private var tapeTransportView: some View")
+                    .next()
+            })
+            .expect("Swift prototype must keep a bounded status-only recordingTapeView");
+        assert!(recorder_view.contains("Text(\"What was I doing?\")"));
+        assert!(recorder_view.contains("Button(action: onReadyAction)"));
+        assert!(recorder_view.contains("recordingActionHovered = hovering"));
+        assert!(recorder_view.contains("recorderTextVisible ? 0 : 1"));
+        assert!(recorder_view.contains("recorderTextVisible ? 1 : 0"));
+        assert!(recorder_view.contains(".onReceive(recorderCycleTimer)"));
+        assert!(recorder_view.contains("recorderCycleTextVisible.toggle()"));
+        assert!(recorder_view.contains("recordingContentAnimation"));
+        assert!(recorder_view.contains("padding(.leading, s(8))"));
+        assert!(!recorder_view.contains("onTapGesture"));
+        assert!(!recorder_view.contains("sendAction("));
+
+        let recorder_cycle = source
+            .split("private let recorderCycleTimer = Timer.publish(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func s(").next())
+            .expect("Swift prototype must keep a bounded three-second recorder content cycle");
+        assert!(recorder_cycle.contains("every: kWhisperFlowRecorderCycleInterval"));
+        assert!(recorder_cycle.contains("on: .main"));
+        assert!(recorder_cycle.contains("in: .common"));
+        assert!(recorder_cycle.contains(").autoconnect()"));
+        assert!(!source.contains("Task.sleep"));
+        assert!(!source.contains("runRecorderContentCycle"));
+
+        let tape_transport = source
+            .split("private var tapeTransportView: some View")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private var evidenceTapeGlyph: some View")
+                    .next()
+            })
+            .expect("Swift prototype must keep a bounded labeled evidence tape");
+        assert!(tape_transport.contains("evidenceTapeGlyph"));
+        assert!(tape_transport.contains("kWhisperFlowRecordingContentW"));
+        assert!(tape_transport.contains("alignment: .center"));
+        assert!(!tape_transport.contains("Text(captureStatusText)"));
+        assert!(!tape_transport.contains("Button("));
+        assert!(!tape_transport.contains(".onHover"));
+        assert!(!tape_transport.contains("onTapGesture"));
+        assert!(!tape_transport.contains("sendAction("));
+
+        let evidence_tape = source
+            .split("private var evidenceTapeGlyph: some View")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private var recordingContentAnimation").next())
+            .expect("Swift prototype must keep bounded evidence-tape motion");
+        assert!(evidence_tape.contains("TimelineView("));
+        assert!(evidence_tape.contains("minimumInterval: 1.0 / 24.0"));
+        assert!(evidence_tape.contains("!model.captureIndicationActive || reduceMotion"));
+        assert!(evidence_tape.contains("Canvas"));
+        assert!(evidence_tape.contains("drawEvidenceTape("));
+        assert!(evidence_tape.contains("drawFrameTicks("));
+        assert!(evidence_tape.contains("let tickCount = Int(min(count, 9))"));
+        assert!(evidence_tape.contains("tickFraction(frameOrdinal)"));
+        assert!(evidence_tape.contains("date.timeIntervalSinceReferenceDate / 5.5"));
+        assert!(evidence_tape.contains("guard !reduceMotion else { return 0.62 }"));
+        assert!(evidence_tape.contains(
+            "model.captureIndicationActive\n                    ? tapePulseActive ? 0.98"
         ));
+        assert!(source.contains("deadline: .now() + 0.46"));
+        assert!(source.contains("guard model.captureIndicationActive else { return }"));
+        assert!(source.contains("private enum WhisperFlowCaptureStatus: Equatable"));
         assert!(source.contains(
-            "if displayState == .localMemoryWarming,\n           let updateEvidence = firstEnabledAction(in: [.captureEvidenceNow])"
+            "@Published var captureIndicationActive = kWhisperFlowCapturePreviewEnabled"
         ));
-        assert!(source.contains("return compact ? \"Update\" : \"Update local evidence\""));
+        assert!(
+            source.contains(
+                "@Published var captureStatus: WhisperFlowCaptureStatus = kWhisperFlowCapturePreviewEnabled"
+            )
+        );
+        assert!(evidence_tape
+            .contains("let previewFrameCount: Int64 = kWhisperFlowCapturePreviewEnabled ? 9 : 0"));
+        assert!(!source.contains("ForEach(0..<8"));
+        assert!(!source.contains("signalBarHeight"));
+        assert!(!source.contains("signalBarOpacity"));
+        assert!(!source.contains("restingHeights"));
+        assert!(!source.contains("drawTapeReel"));
+        assert!(!source.contains("tapePath"));
+        assert!(!source.contains("headRect"));
+
+        let default_return = source
+            .split("private func returnToDefaultPresentation()")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private func answerSummaryHoverChanged")
+                    .next()
+            })
+            .expect("Swift prototype must keep a bounded default return implementation");
+        assert!(default_return.contains("setPresentation(.recordingTape)"));
+        assert!(!default_return.contains("setPresentation(.micro)"));
+
+        let panel_size = source
+            .split("private var targetPanelSize: NSSize")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func createPanel()").next())
+            .expect("Swift prototype must keep a bounded targetPanelSize implementation");
+        assert!(panel_size.contains("case .micro, .recordingTape:"));
+        assert!(panel_size.contains("kWhisperFlowReadyPanelW"));
+        assert!(panel_size.contains("kWhisperFlowReadyPanelH"));
+
+        assert!(source.contains("isRecording(snapshot.state) ||"));
+        assert!(source.contains("snapshot.state == \"starting\" ||"));
+        assert!(source.contains("snapshot.state == \"processing\""));
+        assert!(source.contains(") && snapshotAllowsCaptureIndication"));
+        assert!(source.contains("private var captureStatus: WhisperFlowCaptureStatus"));
+        assert!(source.contains("if !snapshotAllowsCaptureIndication"));
+        assert!(source.contains("kWhisperFlowCapturePreviewEnabled || captureIndicationActive"));
+        assert!(source
+            .contains("islandModel.captureIndicationActive = displayedCaptureIndicationActive"));
+        assert!(source.contains("islandModel.captureStatus = displayedCaptureStatus"));
         assert!(source.contains(
-            "case .inspectOnly:\n            priority = [.inspectEvidence, .refreshContinue, .openSmalltalk]"
+            "snapshot.state != \"hidden\", snapshot.state != \"error\", !snapshot.isSensitive"
         ));
+        assert!(source.contains("capturePulseNonce"));
+        assert!(source.contains("captureFrameCount"));
+        assert_eq!(source.matches("Text(\"What was I doing?\")").count(), 1);
+        assert!(!source.contains("case ready"));
+        assert!(!source.contains("private var readyView"));
+        assert!(!source.contains("readyActionHovered"));
+        assert!(!source.contains("onReadyHover"));
+        assert!(!source.contains("readyHoverChanged"));
+        assert!(!source.contains("setPresentation(.ready)"));
+        assert!(!source.contains("kWhisperFlowRecordingTapeDuration"));
+        assert!(!source.contains("recordingTapeReturnTimer"));
+        assert!(!source.contains("showRecordingTapeThenReturnToMicro"));
+        assert!(!source.contains("cancelRecordingTapeReturn"));
+        assert!(!source.contains("kWhisperFlowHoverReturnDelay"));
+        assert!(source.contains("private final class WhisperFlowIslandModel: ObservableObject"));
+        assert!(source.contains("@ObservedObject var model: WhisperFlowIslandModel"));
+        assert!(!source.contains("hostingView.rootView = AnyView(view)"));
+        assert!(!source.contains("Text(model.memoryActive ? \"Ready\""));
+        assert!(!source.contains("Text(memoryActive ? \"Continue\""));
+        assert!(!source.contains("case startPrompt"));
+        assert!(!source.contains("private struct SessionIslandView"));
+        assert!(!source.contains("private var collapsedView"));
+        assert!(!source.contains("private var expandedView"));
     }
 
     #[test]
