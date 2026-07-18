@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ImageIO
 import QuartzCore
 import SwiftUI
 
@@ -37,6 +38,7 @@ private struct IslandSnapshot: Decodable {
     var continueOpenable: Bool?
     var resumeWarning: String?
     var islandContinueState: IslandContinueState?
+    var visualCue: IslandVisualCue?
     var privacyLabel: String?
     var isSensitive: Bool = false
 
@@ -70,6 +72,7 @@ private struct IslandSnapshot: Decodable {
         case continueOpenable = "continue_openable"
         case resumeWarning = "resume_warning"
         case islandContinueState = "island_continue_state"
+        case visualCue = "visual_cue"
         case privacyLabel = "privacy_label"
         case isSensitive = "is_sensitive"
     }
@@ -80,6 +83,14 @@ private struct IslandSnapshot: Decodable {
         snapshot.lastError = "Continue state could not be decoded."
         snapshot.islandContinueState = IslandContinueState.errorFallback()
         return snapshot
+    }
+}
+
+private struct IslandVisualCue: Decodable, Equatable {
+    var imagePath: String
+
+    enum CodingKeys: String, CodingKey {
+        case imagePath = "image_path"
     }
 }
 
@@ -650,6 +661,12 @@ private let kWhisperFlowAnswerVerticalPadding: CGFloat = 20
 private let kWhisperFlowAnswerHeaderSpacing: CGFloat = 18
 private let kWhisperFlowAnswerRowSpacing: CGFloat = 14
 private let kWhisperFlowAnswerLabelValueSpacing: CGFloat = 5
+private let kWhisperFlowVisualCueCardGap: CGFloat = 8
+private let kWhisperFlowVisualCueCardRadius: CGFloat = 18
+private let kWhisperFlowVisualCuePadding: CGFloat = 12
+private let kWhisperFlowVisualCueTitleImageGap: CGFloat = 8
+private let kWhisperFlowVisualCueImageRadius: CGFloat = 12
+private let kWhisperFlowVisualCueImageMaxH: CGFloat = 220
 private let kWhisperFlowMicroPulseDuration: TimeInterval = 3.2
 private let kWhisperFlowMicroPulseScale: CGFloat = 1.018
 private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
@@ -793,8 +810,11 @@ private struct WhisperFlowAnswerLayout: Equatable {
         + kWhisperFlowAnswerSummaryPanelMarginW
     var expandedWidth: CGFloat = kWhisperFlowAnswerExpandedMinW
     var expandedHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+    var answerCardHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
     var contentViewportHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
         - kWhisperFlowAnswerVerticalPadding * 2
+    var visualCueCardHeight: CGFloat = 0
+    var visualCueImageHeight: CGFloat = 0
 }
 
 @available(macOS 13.0, *)
@@ -812,6 +832,8 @@ private final class WhisperFlowIslandModel: ObservableObject {
     @Published var continueGenerating = false
     @Published var answer: WhisperFlowAnswerContent?
     @Published var answerLayout = WhisperFlowAnswerLayout()
+    @Published var visualCueImage: NSImage? = nil
+    @Published var visualCuePresented = false
 }
 
 @available(macOS 13.0, *)
@@ -1378,6 +1400,7 @@ private struct WhisperFlowIslandView: View {
     let onAmbientBodyHover: (Bool) -> Void
     let onExpandAnswer: () -> Void
     let onCollapseAnswer: () -> Void
+    let onToggleVisualCue: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var microPulseExpanded = false
     @State private var ambientBodyHovered = false
@@ -1959,18 +1982,68 @@ private struct WhisperFlowIslandView: View {
     }
 
     private var answerExpandedView: some View {
+        VStack(alignment: .leading, spacing: s(kWhisperFlowVisualCueCardGap)) {
+            answerExpandedCard
+
+            if model.visualCuePresented,
+               let image = model.visualCueImage,
+               model.answerLayout.visualCueCardHeight > 0 {
+                visualCueCard(image)
+                    .transition(.opacity)
+            }
+        }
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.expandedHeight),
+            alignment: .top
+        )
+        .accessibilityElement(children: .contain)
+    }
+
+    private var answerExpandedCard: some View {
         let answer = model.answer ?? .unavailable
 
         return ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
-                HStack(spacing: s(12)) {
+                HStack(spacing: s(8)) {
                     Text(answer.title)
                         .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
                         .foregroundColor(.white)
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
 
-                    Spacer(minLength: s(12))
+                    Spacer(minLength: s(8))
+
+                    if model.visualCueImage != nil {
+                        Button(action: onToggleVisualCue) {
+                            Text("Visual cue")
+                                .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                .foregroundColor(WhisperFlowStyle.accent)
+                                .padding(.horizontal, s(8))
+                                .padding(.vertical, s(4))
+                                .background(
+                                    Capsule()
+                                        .fill(
+                                            WhisperFlowStyle.accent.opacity(
+                                                model.visualCuePresented ? 0.18 : 0.07
+                                            )
+                                        )
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(
+                                            model.visualCuePresented
+                                                ? WhisperFlowStyle.accent.opacity(0.48)
+                                                : WhisperFlowStyle.outline,
+                                            lineWidth: s(1)
+                                        )
+                                )
+                        }
+                        .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+                        .accessibilityLabel(
+                            model.visualCuePresented ? "Hide visual cue" : "Show visual cue"
+                        )
+                    }
 
                     Button(action: onCollapseAnswer) {
                         Text("See less")
@@ -2008,7 +2081,7 @@ private struct WhisperFlowIslandView: View {
         .padding(.vertical, s(kWhisperFlowAnswerVerticalPadding))
         .frame(
             width: s(model.answerLayout.expandedWidth),
-            height: s(model.answerLayout.expandedHeight),
+            height: s(model.answerLayout.answerCardHeight),
             alignment: .top
         )
         .background(WhisperFlowStyle.surface)
@@ -2017,6 +2090,53 @@ private struct WhisperFlowIslandView: View {
                 .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
         )
         .clipShape(RoundedRectangle(cornerRadius: s(24), style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+
+    private func visualCueCard(_ image: NSImage) -> some View {
+        VStack(alignment: .leading, spacing: s(kWhisperFlowVisualCueTitleImageGap)) {
+            Text("Visual cue")
+                .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                .foregroundColor(WhisperFlowStyle.accent)
+                .accessibilityLabel("Visual cue")
+
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: s(model.answerLayout.visualCueImageHeight),
+                    maxHeight: s(model.answerLayout.visualCueImageHeight),
+                    alignment: .center
+                )
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: s(kWhisperFlowVisualCueImageRadius),
+                        style: .continuous
+                    )
+                )
+                .accessibilityLabel("Full-screen evidence used for this answer")
+        }
+        .padding(s(kWhisperFlowVisualCuePadding))
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.visualCueCardHeight),
+            alignment: .topLeading
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowVisualCueCardRadius),
+                style: .continuous
+            )
+            .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowVisualCueCardRadius),
+                style: .continuous
+            )
+        )
         .accessibilityElement(children: .contain)
     }
 
@@ -2101,6 +2221,10 @@ private final class SessionIslandController: NSObject {
     private var continueRequestInFlight = false
     private var latchedAnswer: WhisperFlowAnswerContent?
     private var latchedDecisionId: String?
+    private var latchedVisualCue: IslandVisualCue?
+    private var visualCueImage: NSImage?
+    private var visualCuePresented = false
+    private var visualCueLoadNonce: UInt64 = 0
     private var answerLayout = WhisperFlowAnswerLayout()
     private var memoryTransitionTimer: Timer?
     private var ambientHoverReturnTimer: Timer?
@@ -2191,6 +2315,7 @@ private final class SessionIslandController: NSObject {
         continueRequestInFlight = false
         latchedAnswer = nil
         latchedDecisionId = nil
+        clearVisualCue()
         answerLayout = WhisperFlowAnswerLayout()
         cancelPresentationTimers()
         updateOutsideClickMonitors()
@@ -2234,6 +2359,7 @@ private final class SessionIslandController: NSObject {
         continueRequestInFlight = false
         latchedAnswer = nil
         latchedDecisionId = nil
+        clearVisualCue()
         answerLayout = WhisperFlowAnswerLayout()
     }
 
@@ -2333,6 +2459,7 @@ private final class SessionIslandController: NSObject {
         continueRequestInFlight = true
         latchedAnswer = nil
         latchedDecisionId = nil
+        clearVisualCue()
         answerLayout = WhisperFlowAnswerLayout()
         setPresentation(.generating)
         updateContent()
@@ -2347,12 +2474,80 @@ private final class SessionIslandController: NSObject {
     private func finishContinueRequest(with snapshot: IslandSnapshot) {
         continueRequestInFlight = false
         cancelMemoryTransitionCountdown()
+        clearVisualCue()
         let answer = WhisperFlowAnswerContent(snapshot: snapshot)
         latchedAnswer = answer
         latchedDecisionId = answer.decisionId
+        latchedVisualCue = snapshot.visualCue
         refreshAnswerLayout()
         setPresentation(.answerSummary)
         updateContent()
+        beginVisualCueLoad(for: snapshot.visualCue, decisionId: answer.decisionId)
+    }
+
+    private func clearVisualCue() {
+        visualCueLoadNonce &+= 1
+        latchedVisualCue = nil
+        visualCueImage = nil
+        visualCuePresented = false
+        if islandModel.visualCueImage != nil {
+            islandModel.visualCueImage = nil
+        }
+        if islandModel.visualCuePresented {
+            islandModel.visualCuePresented = false
+        }
+    }
+
+    private func beginVisualCueLoad(for cue: IslandVisualCue?, decisionId: String?) {
+        guard let cue,
+              !cue.imagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        visualCueLoadNonce &+= 1
+        let loadNonce = visualCueLoadNonce
+        let imagePath = cue.imagePath
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let data = try? Data(
+                contentsOf: URL(fileURLWithPath: imagePath),
+                options: [.mappedIfSafe]
+            ),
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let decodedImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                guard let self,
+                      self.visualCueLoadNonce == loadNonce,
+                      self.latchedDecisionId == decisionId,
+                      self.latchedVisualCue?.imagePath == imagePath else { return }
+
+                let image = NSImage(
+                    cgImage: decodedImage,
+                    size: NSSize(width: decodedImage.width, height: decodedImage.height)
+                )
+                self.visualCueImage = image
+                self.refreshAnswerLayout()
+
+                let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                if reduceMotion {
+                    self.updateContent()
+                } else {
+                    withAnimation(.easeOut(duration: kWhisperFlowReducedMotionFadeDuration)) {
+                        self.islandModel.visualCueImage = image
+                        self.islandModel.answerLayout = self.answerLayout
+                    }
+                }
+
+                if self.presentation == .answerExpanded {
+                    self.positionPanel(
+                        preserveCurrentAnchor: true,
+                        animated: self.visible && !reduceMotion
+                    )
+                }
+            }
+        }
     }
 
     private func refreshAnswerLayout() {
@@ -2407,7 +2602,10 @@ private final class SessionIslandController: NSObject {
         )
         let contentWidth = max(1, expandedWidth - kWhisperFlowAnswerHorizontalPadding * 2)
         let collapseWidth = measuredTextWidth("See less", font: collapseFont)
-        let titleWidth = max(1, contentWidth - collapseWidth - 18)
+        let cueButtonWidth = visualCueImage == nil
+            ? 0
+            : measuredTextWidth("Visual cue", font: labelFont) + 16 + 8
+        let titleWidth = max(1, contentWidth - collapseWidth - cueButtonWidth - 16)
         let titleHeight = measuredTextHeight(answer.title, font: titleFont, width: titleWidth)
         let headerHeight = max(20, titleHeight)
 
@@ -2427,7 +2625,7 @@ private final class SessionIslandController: NSObject {
         }
 
         let bodySpacing = answer.rows.isEmpty ? 0 : kWhisperFlowAnswerHeaderSpacing
-        let naturalHeight = max(
+        let naturalAnswerHeight = max(
             kWhisperFlowAnswerExpandedMinH,
             ceil(
                 kWhisperFlowAnswerVerticalPadding * 2
@@ -2436,14 +2634,59 @@ private final class SessionIslandController: NSObject {
                     + bodyHeight
             )
         )
-        let maximumHeight = max(
+        let maximumStackHeight = max(
             kWhisperFlowAnswerExpandedMinH,
             usableHeight * kWhisperFlowAnswerExpandedMaxScreenFraction
         )
-        let expandedHeight = min(naturalHeight, maximumHeight)
+        var answerCardHeight = min(naturalAnswerHeight, maximumStackHeight)
+        var visualCueCardHeight: CGFloat = 0
+        var visualCueImageHeight: CGFloat = 0
+
+        if visualCuePresented,
+           let image = visualCueImage,
+           image.size.width > 0,
+           image.size.height > 0 {
+            let cueContentWidth = max(
+                1,
+                expandedWidth - kWhisperFlowVisualCuePadding * 2
+            )
+            let titleHeight = measuredTextHeight(
+                "Visual cue",
+                font: labelFont,
+                width: cueContentWidth
+            )
+            let cueChromeHeight = kWhisperFlowVisualCuePadding * 2
+                + titleHeight
+                + kWhisperFlowVisualCueTitleImageGap
+            let naturalImageHeight = min(
+                kWhisperFlowVisualCueImageMaxH,
+                cueContentWidth * image.size.height / image.size.width
+            )
+            let imageRoomAfterMinimumAnswer = maximumStackHeight
+                - kWhisperFlowAnswerExpandedMinH
+                - kWhisperFlowVisualCueCardGap
+                - cueChromeHeight
+
+            if imageRoomAfterMinimumAnswer >= 1 {
+                visualCueImageHeight = min(naturalImageHeight, imageRoomAfterMinimumAnswer)
+                visualCueCardHeight = cueChromeHeight + visualCueImageHeight
+                let answerRoom = maximumStackHeight
+                    - kWhisperFlowVisualCueCardGap
+                    - visualCueCardHeight
+                answerCardHeight = min(
+                    naturalAnswerHeight,
+                    max(kWhisperFlowAnswerExpandedMinH, answerRoom)
+                )
+            }
+        }
+
+        let expandedHeight = answerCardHeight
+            + (visualCueCardHeight > 0
+                ? kWhisperFlowVisualCueCardGap + visualCueCardHeight
+                : 0)
         let contentViewportHeight = max(
             0,
-            expandedHeight - kWhisperFlowAnswerVerticalPadding * 2
+            answerCardHeight - kWhisperFlowAnswerVerticalPadding * 2
         )
 
         answerLayout = WhisperFlowAnswerLayout(
@@ -2451,7 +2694,10 @@ private final class SessionIslandController: NSObject {
             summaryPanelWidth: summaryWidth + kWhisperFlowAnswerSummaryPanelMarginW,
             expandedWidth: expandedWidth,
             expandedHeight: expandedHeight,
-            contentViewportHeight: contentViewportHeight
+            answerCardHeight: answerCardHeight,
+            contentViewportHeight: contentViewportHeight,
+            visualCueCardHeight: visualCueCardHeight,
+            visualCueImageHeight: visualCueImageHeight
         )
     }
 
@@ -2481,12 +2727,42 @@ private final class SessionIslandController: NSObject {
             returnToDefaultPresentation()
             return
         }
+        visualCuePresented = false
+        refreshAnswerLayout()
         setPresentation(.answerSummary)
     }
 
     private func expandAnswer() {
         guard latchedAnswer != nil else { return }
+        visualCuePresented = false
+        refreshAnswerLayout()
         setPresentation(.answerExpanded)
+    }
+
+    private func toggleVisualCue() {
+        guard presentation == .answerExpanded, visualCueImage != nil else { return }
+        visualCuePresented.toggle()
+        refreshAnswerLayout()
+
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        withAnimation(
+            .timingCurve(
+                0.23,
+                1,
+                0.32,
+                1,
+                duration: reduceMotion
+                    ? kWhisperFlowReducedMotionFadeDuration
+                    : kWhisperFlowMorphDuration
+            )
+        ) {
+            islandModel.visualCuePresented = visualCuePresented
+            islandModel.answerLayout = answerLayout
+        }
+        positionPanel(
+            preserveCurrentAnchor: true,
+            animated: visible && !reduceMotion
+        )
     }
 
     private func returnToDefaultPresentation() {
@@ -2797,6 +3073,12 @@ private final class SessionIslandController: NSObject {
         if islandModel.answerLayout != answerLayout {
             islandModel.answerLayout = answerLayout
         }
+        if islandModel.visualCueImage !== visualCueImage {
+            islandModel.visualCueImage = visualCueImage
+        }
+        if islandModel.visualCuePresented != visualCuePresented {
+            islandModel.visualCuePresented = visualCuePresented
+        }
 
         guard hostingView == nil else { return }
 
@@ -2826,6 +3108,9 @@ private final class SessionIslandController: NSObject {
             },
             onCollapseAnswer: { [weak self] in
                 self?.showAnswerSummary()
+            },
+            onToggleVisualCue: { [weak self] in
+                self?.toggleVisualCue()
             }
         )
 

@@ -155,7 +155,35 @@ The controller measures the exact strings with the same system-font sizes used b
 
 Short output therefore produces a small card. Longer output increases the width and natural height. If the measured content exceeds the height limit, the complete task summary and all semantic rows remain inside a vertical scroll view. Text values are not truncated or rewritten.
 
-The material remains black with the existing dark outline and pink field/action labels. `See less` returns to the compact summary. The first outside click from the expanded card also returns to the summary; it does not dismiss both levels at once.
+The material remains black with the existing dark outline and pink field/action labels. `See less` returns to the compact summary. The first outside click from the expanded result also returns to the summary; it does not dismiss both levels at once.
+
+### Answer-linked visual cue
+
+`See more` initially opens only the answer card. When the terminal semantic answer references a safe local evidence frame and the image decodes successfully, the answer header adds a compact `Visual cue` button. The screenshot remains hidden until the user explicitly selects that button.
+
+Selecting `Visual cue` attaches the screenshot card eight points below the answer card. Selecting the same control again hides it. Both surfaces remain inside the same native panel and therefore move, collapse, and preserve the top-center anchor together. `See less` and an outside click also hide the cue before the next expansion.
+
+Rust resolves only `semantic_answer.evidence_preview.frame_id` from that answer. The frame must:
+
+- Belong to the session in the semantic answer's atomic identity.
+- Have the exact privacy status `normal`.
+- Resolve to a readable file inside Smalltalk's capture directory.
+
+The cue prefers that frame's `full_screenshot_path`. It uses the same frame's `snapshot_path` only when the full-display path is absent. A missing, invalid, unreadable, sensitive, or cross-session frame produces no visual card. The system never substitutes the latest frame, an active-window crop, or a new screenshot.
+
+The attached card uses:
+
+- The exact title `Visual cue` in 11-point semibold pink text.
+- The same black material and `#30302F` outline.
+- An 18-point card radius and 12-point inner padding.
+- Eight points between the title and image.
+- A 12-point image radius.
+- Aspect-fit rendering of the full screenshot, with no cropping.
+- An image viewport capped at 220 points high.
+
+The optional card uses the same 320–640-point content-driven width as the answer. While hidden, it contributes no height to the expanded island. While visible, the whole stack stays within 70% of the usable screen height. When space is constrained, the screenshot viewport shrinks before the upper answer card is allowed below its existing 104-point minimum. Long answer text scrolls only inside the upper card; the lower cue remains fixed.
+
+The screenshot is read and decoded away from the main thread. A decoding failure silently omits both the button and cue without changing the answer. Clicking the button uses a short opacity entrance while the existing 180 ms top-anchored panel morph makes room. Reduce Motion keeps the state change but removes positional motion.
 
 ## 8. Answer latching and snapshot rules
 
@@ -164,6 +192,9 @@ The controller maintains separate internal state for:
 - Whether Continue is in flight.
 - The latched answer.
 - The latched decision ID.
+- The latched visual-cue path and decoded image.
+- Whether the user has explicitly revealed the cue.
+- An asynchronous image-load nonce used to reject stale completions.
 - The measured answer layout.
 
 The state flow is deliberately different from ordinary capture presentation:
@@ -172,7 +203,8 @@ The state flow is deliberately different from ordinary capture presentation:
 - Recording, capture count, privacy, and other status snapshots may update the controller's underlying snapshot, but they cannot replace the generating presentation.
 - `resume_ready` or `error` ends the active request and creates the latched answer.
 - Later capture/status snapshots do not rebuild the displayed answer from their app, window, or activity fields.
-- A new arrow request clears the old latch before dispatching Continue.
+- Later snapshots also cannot replace the answer-linked cue with a newer capture.
+- A new arrow request clears the old answer and cue latches before dispatching Continue.
 
 The decision ID is presentation state only. It does not change backend authority or strict target-opening policy.
 
@@ -208,6 +240,8 @@ VoiceOver behavior:
 - The matrix remains decorative and hidden from accessibility.
 - The compact answer announces the full title and `See more`.
 - The expanded answer exposes the title, each field label, each exact field value, and `See less`.
+- A decoded safe screenshot exposes a `Visual cue` button whose label announces whether it will show or hide the cue.
+- The cue card exposes `Visual cue`, and the image is described as `Full-screen evidence used for this answer`.
 
 ## 11. Outside click, dismissal, and persistence
 
@@ -216,6 +250,7 @@ Outside-click monitors exist only for the compact and expanded answer states.
 - Compact answer plus outside click: return to micro.
 - Expanded answer plus outside click: return to compact answer.
 - `See less`: return to compact answer.
+- `Visual cue`: toggle the optional screenshot card without changing the answer.
 - Click inside the panel: do nothing in the outside-click handler.
 
 There is no answer reveal timer and no answer return timer. Dismissing the presentation does not mutate the backend answer. Starting another explicit Continue request is the only path that clears the old latch for replacement.
@@ -234,6 +269,8 @@ This wiring does not change:
 - Capture commands or capture privacy behavior.
 - The React surface.
 
+The only backend interface addition is the internal optional `SessionIslandSnapshot.visual_cue` presentation field. It contains a validated local image path and does not alter `IslandContinueState`, `TaskTruthPublicAnswerV1`, a Tauri command, or any generated output.
+
 The incomplete PFTU release verdict is also unchanged. Connecting the island to the backend output is not a release-readiness claim.
 
 ## 13. Size reference
@@ -250,6 +287,10 @@ The incomplete PFTU release verdict is also unchanged. Connecting the island to 
 | Expanded minimum height | 104 pt |
 | Expanded maximum height | 70% of usable screen |
 | Expanded corner radius | 24 pt |
+| Answer-to-cue gap | 8 pt |
+| Visual-cue card radius | 18 pt |
+| Visual-cue image maximum height | 220 pt |
+| Visual-cue image radius | 12 pt |
 | Generating chase | 0.82 s per loop |
 | Main morph/frame duration | 0.18 s |
 | Drag threshold | 4 pt |
@@ -264,11 +305,17 @@ The Rust source-contract test now checks the native file for:
 - Concurrent-request prevention.
 - Generating state and Reduced Motion behavior.
 - Terminal answer latching and decision-ID storage.
+- Same-session, normal-privacy, capture-root-bounded visual-cue resolution.
+- Full-display preference with same-frame snapshot fallback only when the full path is absent.
+- Asynchronous cue decoding with decision, path, and load-nonce stale-result guards.
+- Explicit visual-cue button disclosure; the screenshot card contributes no height before that click.
 - Exact semantic-field order.
 - Absence of application/window/activity fallback construction.
 - Fixed compact height and adaptive compact width.
 - Content-measured expanded width and height.
 - Complete scrollable expanded output.
+- A fixed attached visual-cue card below the independently scrolling answer.
+- The 70% combined-stack height cap, 220-point image cap, and 104-point answer minimum.
 - Persistent results without reveal or auto-return timers.
 - Top-center panel anchoring.
 

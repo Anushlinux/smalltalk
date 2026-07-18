@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::os::raw::c_char;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -82,8 +84,14 @@ pub struct SessionIslandSnapshot {
     pub continue_openable: Option<bool>,
     pub resume_warning: Option<String>,
     pub island_continue_state: Option<IslandContinueState>,
+    pub visual_cue: Option<IslandVisualCue>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IslandVisualCue {
+    pub image_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -521,6 +529,7 @@ impl SessionIslandSnapshot {
             continue_openable: None,
             resume_warning: None,
             island_continue_state: None,
+            visual_cue: None,
             privacy_label: None,
             is_sensitive: false,
         }
@@ -828,6 +837,7 @@ fn snapshot_from_status(
         continue_openable: None,
         resume_warning: None,
         island_continue_state: None,
+        visual_cue: None,
         privacy_label,
         is_sensitive,
     };
@@ -1042,6 +1052,7 @@ fn continue_from_island() {
                 } else {
                     apply_island_continue_state_to_snapshot(&mut snapshot, &gateway_result.state);
                 }
+                snapshot.visual_cue = resolve_answer_visual_cue(&app, &snapshot);
                 update_session_island(snapshot);
                 show_session_island();
             }
@@ -1051,6 +1062,73 @@ fn continue_from_island() {
             }
         }
     });
+}
+
+fn resolve_answer_visual_cue(
+    app: &AppHandle,
+    snapshot: &SessionIslandSnapshot,
+) -> Option<IslandVisualCue> {
+    let answer = snapshot
+        .island_continue_state
+        .as_ref()?
+        .semantic_answer
+        .as_ref()?;
+    let expected_session_id = answer.atomic_identity.session_id.as_deref()?;
+    let frame_id = answer
+        .evidence_preview
+        .as_ref()?
+        .frame_id
+        .trim()
+        .parse()
+        .ok()?;
+    let frame = crate::capture::get_frame(app.clone(), frame_id).ok()??;
+    let capture_root = app.path().app_data_dir().ok()?.join("capture");
+
+    validated_visual_cue_path(
+        expected_session_id,
+        frame.session_id.as_deref(),
+        frame.privacy_status.as_deref(),
+        frame.full_screenshot_path.as_deref(),
+        &frame.snapshot_path,
+        &capture_root,
+    )
+    .map(|image_path| IslandVisualCue { image_path })
+}
+
+fn validated_visual_cue_path(
+    expected_session_id: &str,
+    frame_session_id: Option<&str>,
+    privacy_status: Option<&str>,
+    full_screenshot_path: Option<&str>,
+    snapshot_path: &str,
+    capture_root: &Path,
+) -> Option<String> {
+    let expected_session_id = expected_session_id.trim();
+    if expected_session_id.is_empty()
+        || frame_session_id.map(str::trim) != Some(expected_session_id)
+        || privacy_status.map(str::trim) != Some("normal")
+    {
+        return None;
+    }
+
+    let preferred_full_path = full_screenshot_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let image_path = preferred_full_path.unwrap_or_else(|| snapshot_path.trim());
+    if image_path.is_empty() {
+        return None;
+    }
+
+    let canonical_root = capture_root.canonicalize().ok()?;
+    let canonical_image = Path::new(image_path).canonicalize().ok()?;
+    if !canonical_image.starts_with(&canonical_root)
+        || !canonical_image.metadata().ok()?.is_file()
+        || File::open(&canonical_image).is_err()
+    {
+        return None;
+    }
+
+    Some(canonical_image.to_string_lossy().into_owned())
 }
 
 fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRequest {
@@ -1997,6 +2075,125 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn visual_cue_test_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "smalltalk-island-visual-cue-{name}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ))
+    }
+
+    #[test]
+    fn visual_cue_prefers_the_answer_frames_full_display_then_same_frame_snapshot() {
+        let root = visual_cue_test_root("preferred-path");
+        let snapshots = root.join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let full_path = snapshots.join("full.jpg");
+        let snapshot_path = snapshots.join("snapshot.jpg");
+        std::fs::write(&full_path, b"full display").unwrap();
+        std::fs::write(&snapshot_path, b"snapshot").unwrap();
+
+        let full = validated_visual_cue_path(
+            "session-a",
+            Some("session-a"),
+            Some("normal"),
+            Some(full_path.to_str().unwrap()),
+            snapshot_path.to_str().unwrap(),
+            &root,
+        );
+        assert_eq!(
+            full.as_deref(),
+            full_path
+                .canonicalize()
+                .ok()
+                .as_deref()
+                .and_then(Path::to_str)
+        );
+
+        let fallback = validated_visual_cue_path(
+            "session-a",
+            Some("session-a"),
+            Some("normal"),
+            None,
+            snapshot_path.to_str().unwrap(),
+            &root,
+        );
+        assert_eq!(
+            fallback.as_deref(),
+            snapshot_path
+                .canonicalize()
+                .ok()
+                .as_deref()
+                .and_then(Path::to_str)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn visual_cue_rejects_unsafe_or_unaligned_evidence_without_latest_fallback() {
+        let root = visual_cue_test_root("rejection");
+        let snapshots = root.join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let snapshot_path = snapshots.join("snapshot.jpg");
+        std::fs::write(&snapshot_path, b"snapshot").unwrap();
+        let missing_full = snapshots.join("missing-full.jpg");
+
+        for rejected in [
+            validated_visual_cue_path(
+                "session-a",
+                Some("session-b"),
+                Some("normal"),
+                None,
+                snapshot_path.to_str().unwrap(),
+                &root,
+            ),
+            validated_visual_cue_path(
+                "session-a",
+                Some("session-a"),
+                Some("sensitive"),
+                None,
+                snapshot_path.to_str().unwrap(),
+                &root,
+            ),
+            validated_visual_cue_path(
+                "session-a",
+                Some("session-a"),
+                None,
+                None,
+                snapshot_path.to_str().unwrap(),
+                &root,
+            ),
+            validated_visual_cue_path(
+                "session-a",
+                Some("session-a"),
+                Some("normal"),
+                Some(missing_full.to_str().unwrap()),
+                snapshot_path.to_str().unwrap(),
+                &root,
+            ),
+        ] {
+            assert!(rejected.is_none());
+        }
+
+        let outside_root = visual_cue_test_root("outside");
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let outside_path = outside_root.join("outside.jpg");
+        std::fs::write(&outside_path, b"outside").unwrap();
+        assert!(validated_visual_cue_path(
+            "session-a",
+            Some("session-a"),
+            Some("normal"),
+            None,
+            outside_path.to_str().unwrap(),
+            &root,
+        )
+        .is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside_root).unwrap();
+    }
+
     #[test]
     fn native_scoped_task_feedback_envelope_preserves_exact_identity() {
         let action: SessionIslandAction = serde_json::from_value(serde_json::json!({
@@ -2252,6 +2449,8 @@ mod tests {
             "Continue unavailable",
             "See more",
             "See less",
+            "Visual cue",
+            "Full-screen evidence used for this answer",
         ] {
             assert!(
                 source.contains(copy),
@@ -2763,6 +2962,17 @@ mod tests {
         assert!(answer_expanded.contains("ScrollView(.vertical, showsIndicators: true)"));
         assert!(answer_expanded.contains("width: s(model.answerLayout.expandedWidth)"));
         assert!(answer_expanded.contains("height: s(model.answerLayout.expandedHeight)"));
+        assert!(answer_expanded.contains("answerExpandedCard"));
+        assert!(answer_expanded.contains("visualCueCard(image)"));
+        assert!(answer_expanded.contains("if model.visualCuePresented"));
+        assert!(answer_expanded.contains("Button(action: onToggleVisualCue)"));
+        assert!(answer_expanded.contains("model.visualCueImage != nil"));
+        assert!(answer_expanded.contains("model.visualCuePresented ? \"Hide visual cue\""));
+        assert!(answer_expanded.contains("kWhisperFlowVisualCueCardGap"));
+        assert!(answer_expanded.contains("kWhisperFlowVisualCueCardRadius"));
+        assert!(answer_expanded.contains("kWhisperFlowVisualCueImageRadius"));
+        assert!(answer_expanded.contains(".aspectRatio(contentMode: .fit)"));
+        assert!(answer_expanded.contains(".transition(.opacity)"));
         assert!(answer_expanded.contains("height: s(model.answerLayout.contentViewportHeight)"));
 
         let adaptive_layout = source
@@ -2777,7 +2987,40 @@ mod tests {
         assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMaxW"));
         assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMinH"));
         assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMaxScreenFraction"));
+        assert!(adaptive_layout.contains("kWhisperFlowVisualCueImageMaxH"));
+        assert!(adaptive_layout.contains("if visualCuePresented"));
+        assert!(adaptive_layout.contains("imageRoomAfterMinimumAnswer"));
+        assert!(adaptive_layout.contains("visualCueCardHeight"));
         assert!(source.contains("options: [.usesLineFragmentOrigin, .usesFontLeading]"));
+
+        let cue_load = source
+            .split("private func beginVisualCueLoad(for cue: IslandVisualCue?")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func refreshAnswerLayout()").next())
+            .expect("Swift must decode the latched answer cue away from the main thread");
+        assert!(cue_load.contains("DispatchQueue.global(qos: .userInitiated).async"));
+        assert!(cue_load.contains("CGImageSourceCreateImageAtIndex"));
+        assert!(cue_load.contains("self.visualCueLoadNonce == loadNonce"));
+        assert!(cue_load.contains("self.latchedDecisionId == decisionId"));
+        assert!(cue_load.contains("self.latchedVisualCue?.imagePath == imagePath"));
+        assert!(cue_load.contains("accessibilityDisplayShouldReduceMotion"));
+        assert!(cue_load.contains("preserveCurrentAnchor: true"));
+
+        let cue_toggle = source
+            .split("private func toggleVisualCue()")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private func returnToDefaultPresentation()")
+                    .next()
+            })
+            .expect("Swift must reveal the visual cue only after an explicit button press");
+        assert!(cue_toggle.contains("visualCuePresented.toggle()"));
+        assert!(cue_toggle.contains("refreshAnswerLayout()"));
+        assert!(cue_toggle.contains("islandModel.visualCuePresented = visualCuePresented"));
+        assert!(cue_toggle.contains("accessibilityDisplayShouldReduceMotion"));
+        assert!(cue_toggle.contains("preserveCurrentAnchor: true"));
+        assert!(source.contains("@Published var visualCuePresented = false"));
 
         let panel_frame = source
             .split("private func resolvedPanelFrame(preserveCurrentAnchor: Bool)")
