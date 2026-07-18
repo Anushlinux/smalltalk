@@ -637,14 +637,19 @@ private let kWhisperFlowMemoryTransitionDuration: TimeInterval = 3.0
 private let kWhisperFlowAmbientHoverReturnDelay: TimeInterval = 1.0
 private let kWhisperFlowCountdownLineH: CGFloat = 1
 private let kWhisperFlowAmbientBodyHoverArmDelay: TimeInterval = 0.20
-private let kWhisperFlowAnswerSummaryPanelW: CGFloat = 187
 private let kWhisperFlowAnswerSummaryPanelH: CGFloat = 49
-private let kWhisperFlowAnswerSummaryW: CGFloat = 152
+private let kWhisperFlowAnswerSummaryMinW: CGFloat = 152
 private let kWhisperFlowAnswerSummaryH: CGFloat = 30
-private let kWhisperFlowAnswerExpandedW: CGFloat = 520
-private let kWhisperFlowAnswerExpandedH: CGFloat = 152
-private let kWhisperFlowAnswerRevealDelay: TimeInterval = 0.35
-private let kWhisperFlowAnswerReturnDelay: TimeInterval = 8.0
+private let kWhisperFlowAnswerSummaryPanelMarginW: CGFloat = 35
+private let kWhisperFlowAnswerExpandedMinW: CGFloat = 320
+private let kWhisperFlowAnswerExpandedMaxW: CGFloat = 640
+private let kWhisperFlowAnswerExpandedMinH: CGFloat = 104
+private let kWhisperFlowAnswerExpandedMaxScreenFraction: CGFloat = 0.70
+private let kWhisperFlowAnswerHorizontalPadding: CGFloat = 24
+private let kWhisperFlowAnswerVerticalPadding: CGFloat = 20
+private let kWhisperFlowAnswerHeaderSpacing: CGFloat = 18
+private let kWhisperFlowAnswerRowSpacing: CGFloat = 14
+private let kWhisperFlowAnswerLabelValueSpacing: CGFloat = 5
 private let kWhisperFlowMicroPulseDuration: TimeInterval = 3.2
 private let kWhisperFlowMicroPulseScale: CGFloat = 1.018
 private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
@@ -655,6 +660,7 @@ private let kWhisperFlowReducedMotionFadeDuration: TimeInterval = 0.12
 private enum WhisperFlowPresentation: Equatable {
     case micro
     case ambientMemory
+    case generating
     case answerSummary
     case answerExpanded
 }
@@ -663,6 +669,7 @@ private enum WhisperFlowCaptureStatus: Equatable {
     case active
     case starting
     case processing
+    case generating
     case inactive
     case suppressed
     case error
@@ -676,12 +683,118 @@ private enum WhisperFlowMemoryLifecyclePhase: Equatable {
     case unavailable
 }
 
-private enum WhisperFlowPreview {
-    static let title = "Island ready."
-    static let answer = "Continue refining the native floating island. Match the micro hover control, compact answer pill, and expanded answer layout to the WhisperFlow references before reconnecting memory or Continue behavior."
+private enum WhisperFlowStyle {
     static let surface = Color(red: 0, green: 0, blue: 0)
     static let outline = Color(red: 48 / 255, green: 48 / 255, blue: 47 / 255)
     static let accent = Color(red: 245 / 255, green: 191 / 255, blue: 239 / 255)
+}
+
+private struct WhisperFlowAnswerRow: Equatable {
+    let label: String
+    let value: String
+}
+
+private struct WhisperFlowAnswerContent: Equatable {
+    let decisionId: String?
+    let title: String
+    let rows: [WhisperFlowAnswerRow]
+
+    static let unavailable = WhisperFlowAnswerContent(
+        decisionId: nil,
+        title: "Continue unavailable",
+        rows: []
+    )
+
+    private init(decisionId: String?, title: String, rows: [WhisperFlowAnswerRow]) {
+        self.decisionId = decisionId
+        self.title = title
+        self.rows = rows
+    }
+
+    init(snapshot: IslandSnapshot) {
+        let state = snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
+        let answer = state.semanticAnswer
+        decisionId = state.decisionId ?? snapshot.continueDecisionId
+        title = Self.verbatim(answer?.taskSummary) ?? Self.fallbackTitle(for: state.displayState)
+
+        var nextRows: [WhisperFlowAnswerRow] = []
+        Self.append(&nextRows, label: "Task object", value: answer?.taskObject)
+        Self.append(
+            &nextRows,
+            label: "Current activity — observed surface",
+            value: answer?.currentActivity.observedSurface
+        )
+        Self.append(
+            &nextRows,
+            label: "Current activity — immediate operation",
+            value: answer?.currentActivity.immediateUserOperation
+        )
+        Self.append(
+            &nextRows,
+            label: "Current activity — operation effect",
+            value: answer?.currentActivity.semanticEffectOfOperation
+        )
+        Self.append(
+            &nextRows,
+            label: "Current activity — current subtask",
+            value: answer?.currentActivity.currentSubtask
+        )
+        Self.append(
+            &nextRows,
+            label: "Current activity — relationship to primary",
+            value: answer?.currentActivity.relationshipToPrimary
+        )
+        Self.append(&nextRows, label: "Last meaningful progress", value: answer?.lastMeaningfulProgress)
+        Self.append(&nextRows, label: "Unfinished state", value: answer?.unfinishedState)
+        Self.append(&nextRows, label: "Next action", value: answer?.nextAction ?? state.nextAction)
+        Self.append(&nextRows, label: "Where summary", value: answer?.whereSummary)
+        rows = nextRows
+    }
+
+    private static func append(
+        _ rows: inout [WhisperFlowAnswerRow],
+        label: String,
+        value: String?
+    ) {
+        guard let value = verbatim(value) else { return }
+        rows.append(WhisperFlowAnswerRow(label: label, value: value))
+    }
+
+    private static func verbatim(_ value: String?) -> String? {
+        guard let value,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
+    }
+
+    private static func fallbackTitle(for state: IslandDisplayState) -> String {
+        switch state {
+        case .error:
+            return "Continue unavailable"
+        case .noLocalMemory, .localMemoryWarming:
+            return "Not enough local memory"
+        case .needsRefresh:
+            return "Continue needs refreshing"
+        case .checkingContinue:
+            return "Generating answer…"
+        case .continueReady,
+             .thinCurrentWork,
+             .targetSuppressed,
+             .supportBlocked,
+             .inspectOnly,
+             .noClearContinuation:
+            return "Couldn’t recover the task"
+        }
+    }
+}
+
+private struct WhisperFlowAnswerLayout: Equatable {
+    var summaryWidth: CGFloat = kWhisperFlowAnswerSummaryMinW
+    var summaryPanelWidth: CGFloat = kWhisperFlowAnswerSummaryMinW
+        + kWhisperFlowAnswerSummaryPanelMarginW
+    var expandedWidth: CGFloat = kWhisperFlowAnswerExpandedMinW
+    var expandedHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+    var contentViewportHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+        - kWhisperFlowAnswerVerticalPadding * 2
 }
 
 @available(macOS 13.0, *)
@@ -696,6 +809,9 @@ private final class WhisperFlowIslandModel: ObservableObject {
     @Published var captureStatus: WhisperFlowCaptureStatus = .inactive
     @Published var memoryTransitionCountdownActive = false
     @Published var memoryTransitionCountdownNonce: UInt64 = 0
+    @Published var continueGenerating = false
+    @Published var answer: WhisperFlowAnswerContent?
+    @Published var answerLayout = WhisperFlowAnswerLayout()
 }
 
 @available(macOS 13.0, *)
@@ -711,6 +827,7 @@ private final class DotMatrixIndicatorView: NSView {
 
     private static let captureAnimationKey = "smalltalk.dot-matrix-capture"
     private static let startingAnimationKey = "smalltalk.dot-matrix-starting"
+    private static let generatingAnimationKey = "smalltalk.dot-matrix-generating"
     private static let inactiveOpacity: Float = 0.15
     private static let activeOpacity: Float = 0.82
     private static let capturePulseDuration: TimeInterval = 0.72
@@ -722,6 +839,11 @@ private final class DotMatrixIndicatorView: NSView {
     private static let pausedPattern = Set([6, 8, 11, 13, 16, 18])
     private static let filteredPattern = Set([1, 3, 5, 9, 10, 14, 16, 18, 22])
     private static let errorPattern = Set([2, 7, 12, 22])
+    private static let generatingPattern = Set([2, 3, 4, 9, 14])
+    private static let generatingPerimeter = [
+        20, 21, 22, 23, 24, 19, 14, 9, 4, 3, 2, 1, 0, 5, 10, 15,
+    ]
+    private static let generatingDuration: TimeInterval = 0.82
     private static let restartPattern = Set([1, 6, 7, 11, 12, 13, 16, 17, 21])
     private static let restartTransitionDuration: TimeInterval = 0.12
 
@@ -798,6 +920,8 @@ private final class DotMatrixIndicatorView: NSView {
         applyStaticState()
         if startingAnimationPending {
             runStartingAnimation()
+        } else if configuration?.status == .generating {
+            runGeneratingAnimation()
         }
     }
 
@@ -811,6 +935,8 @@ private final class DotMatrixIndicatorView: NSView {
         if configuration?.status == .starting, !startingAnimationHasRunForCurrentState {
             startingAnimationPending = true
             runStartingAnimation()
+        } else if configuration?.status == .generating {
+            runGeneratingAnimation()
         }
     }
 
@@ -864,11 +990,16 @@ private final class DotMatrixIndicatorView: NSView {
             applyStaticState()
             if startingAnimationPending, window != nil {
                 runStartingAnimation()
+            } else if status == .generating, window != nil {
+                runGeneratingAnimation()
             }
         } else if reduceMotionChanged {
             removeLayerAnimations()
             startingAnimationEndsAt = nil
             applyStaticState()
+            if status == .generating, window != nil {
+                runGeneratingAnimation()
+            }
         } else if preservesStartingAnimation,
                   startingAnimationPending,
                   window != nil {
@@ -919,6 +1050,8 @@ private final class DotMatrixIndicatorView: NSView {
             return Self.activePattern
         case .processing, .inactive:
             return Self.pausedPattern
+        case .generating:
+            return Self.generatingPattern
         case .suppressed:
             return Self.filteredPattern
         case .error:
@@ -1097,6 +1230,46 @@ private final class DotMatrixIndicatorView: NSView {
         schedulePendingCapturePulseAfterStartingIfNeeded()
     }
 
+    private func runGeneratingAnimation() {
+        guard configuration?.status == .generating,
+              configuration?.panelVisible == true,
+              window != nil else { return }
+        removeLayerAnimations()
+        applyStaticState()
+        guard !shouldReduceMotion else { return }
+
+        let sharedStartTime = CACurrentMediaTime()
+        let phaseStep = Self.generatingDuration
+            / TimeInterval(Self.generatingPerimeter.count)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (position, index) in Self.generatingPerimeter.enumerated() {
+            let dot = dotLayers[index]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [
+                Self.inactiveOpacity,
+                Self.inactiveOpacity,
+                1.0,
+                0.42,
+                Self.inactiveOpacity,
+            ]
+            animation.keyTimes = [0, 0.48, 0.58, 0.72, 1]
+            animation.duration = Self.generatingDuration
+            animation.beginTime = sharedStartTime
+            animation.timeOffset = TimeInterval(position) * phaseStep
+            animation.repeatCount = .infinity
+            animation.timingFunctions = [
+                CAMediaTimingFunction(name: .linear),
+                CAMediaTimingFunction(name: .linear),
+                CAMediaTimingFunction(name: .easeOut),
+                CAMediaTimingFunction(name: .linear),
+            ]
+            dot.opacity = Self.inactiveOpacity
+            dot.add(animation, forKey: Self.generatingAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
     private func schedulePendingCapturePulseAfterStartingIfNeeded() {
         guard configuration?.status == .active,
               let pendingNonce = pendingCapturePulseNonce else { return }
@@ -1203,7 +1376,6 @@ private struct WhisperFlowIslandView: View {
     let onStartMemory: () -> Void
     let onAmbientHover: (Bool) -> Void
     let onAmbientBodyHover: (Bool) -> Void
-    let onAnswerSummaryHover: (Bool) -> Void
     let onExpandAnswer: () -> Void
     let onCollapseAnswer: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1221,7 +1393,7 @@ private struct WhisperFlowIslandView: View {
     var body: some View {
         ZStack(alignment: .top) {
             switch model.presentation {
-            case .micro, .ambientMemory:
+            case .micro, .ambientMemory, .generating:
                 memoryContinuityView
             case .answerSummary:
                 answerSummaryView
@@ -1239,6 +1411,7 @@ private struct WhisperFlowIslandView: View {
 
     private var memoryContinuityView: some View {
         let expanded = model.presentation == .ambientMemory
+            || model.presentation == .generating
         let visualWidth = expanded
             ? ambientCapsuleWidth
             : kBaseMicroVisualW * microScale
@@ -1251,7 +1424,7 @@ private struct WhisperFlowIslandView: View {
                 width: s(visualWidth),
                 height: s(visualHeight)
             )
-            .fill(WhisperFlowPreview.surface)
+            .fill(WhisperFlowStyle.surface)
             .allowsHitTesting(false)
 
             TopAnchoredCapsuleShape(
@@ -1259,7 +1432,7 @@ private struct WhisperFlowIslandView: View {
                 height: s(visualHeight)
             )
             .stroke(
-                WhisperFlowPreview.outline.opacity(
+                WhisperFlowStyle.outline.opacity(
                     expanded ? 1 : microOutlineOpacity
                 ),
                 lineWidth: s(1)
@@ -1323,33 +1496,42 @@ private struct WhisperFlowIslandView: View {
         HStack(spacing: s(ambientControlSpacing)) {
             ambientStatusRegion
 
-            Button(action: onReadyAction) {
-                Image(systemName: "arrow.right")
-                    .font(.system(size: s(ambientArrowFontSize), weight: .semibold))
-                    .foregroundColor(.white)
+            if model.continueGenerating {
+                Color.clear
                     .frame(
                         width: s(ambientActionWidth),
                         height: s(ambientActionHeight)
                     )
-                    .background(
-                        Capsule()
-                            .fill(
-                                arrowHovered
-                                    ? Color(red: 58 / 255, green: 58 / 255, blue: 56 / 255)
-                                    : WhisperFlowPreview.outline
-                            )
-                    )
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
-            .accessibilityLabel("Show what I was doing")
-            .help("Show what I was doing")
-            .onHover { hovering in
-                arrowHovered = hovering
-                if hovering {
-                    NSCursor.pointingHand.set()
-                } else {
-                    NSCursor.arrow.set()
+                    .accessibilityHidden(true)
+            } else {
+                Button(action: onReadyAction) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: s(ambientArrowFontSize), weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(
+                            width: s(ambientActionWidth),
+                            height: s(ambientActionHeight)
+                        )
+                        .background(
+                            Capsule()
+                                .fill(
+                                    arrowHovered
+                                        ? Color(red: 58 / 255, green: 58 / 255, blue: 56 / 255)
+                                        : WhisperFlowStyle.outline
+                                )
+                        )
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+                .accessibilityLabel("Show what I was doing")
+                .help("Show what I was doing")
+                .onHover { hovering in
+                    arrowHovered = hovering
+                    if hovering {
+                        NSCursor.pointingHand.set()
+                    } else {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
         }
@@ -1370,7 +1552,7 @@ private struct WhisperFlowIslandView: View {
         }
         .animation(
             IslandMotion.memoryContinuityMorph(shouldReduceMotion),
-            value: model.memoryTransitionCountdownActive
+            value: model.memoryTransitionCountdownActive || model.continueGenerating
         )
         .accessibilityElement(children: .contain)
         .onChange(of: model.captureStatus) { status in
@@ -1508,89 +1690,89 @@ private struct WhisperFlowIslandView: View {
     }
 
     private var ambientCapsuleWidth: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationW
             : kWhisperFlowCaptureW
     }
 
     private var ambientCapsuleHeight: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationH
             : kWhisperFlowCaptureH
     }
 
     private var ambientPanelWidth: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationPanelW
             : kWhisperFlowCapturePanelW
     }
 
     private var ambientPanelHeight: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationPanelH
             : kWhisperFlowCapturePanelH
     }
 
     private var ambientContentWidth: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationContentW
             : kWhisperFlowCaptureContentW
     }
 
     private var ambientStatusLabelWidth: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationStatusLabelW
             : kWhisperFlowCaptureStatusLabelW
     }
 
     private var ambientActionWidth: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationActionW
             : kWhisperFlowCaptureActionW
     }
 
     private var ambientActionHeight: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationActionH
             : kWhisperFlowCaptureActionH
     }
 
     private var ambientDotMatrixSize: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationDotMatrixSize
             : kWhisperFlowDotMatrixSize
     }
 
     private var ambientFontSize: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationFontSize
             : 12
     }
 
     private var ambientCountdownLineHeight: CGFloat {
-        model.memoryTransitionCountdownActive
+        model.memoryTransitionCountdownActive || model.continueGenerating
             ? kWhisperFlowNotificationCountdownLineH
             : kWhisperFlowCountdownLineH
     }
 
     private var ambientControlSpacing: CGFloat {
-        model.memoryTransitionCountdownActive ? 7 : 5
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 7 : 5
     }
 
     private var ambientStatusSpacing: CGFloat {
-        model.memoryTransitionCountdownActive ? 5 : 4
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 5 : 4
     }
 
     private var ambientLeadingPadding: CGFloat {
-        model.memoryTransitionCountdownActive ? 10 : 8
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 10 : 8
     }
 
     private var ambientTrailingPadding: CGFloat {
-        model.memoryTransitionCountdownActive ? 6 : 4
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 6 : 4
     }
 
     private var ambientArrowFontSize: CGFloat {
-        model.memoryTransitionCountdownActive ? 13 : 11
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 13 : 11
     }
 
     private func refreshMemoryTransitionCountdown() {
@@ -1649,6 +1831,10 @@ private struct WhisperFlowIslandView: View {
         case .ambientMemory:
             microPulseExpanded = false
             prepareAmbientAppearance()
+        case .generating:
+            microPulseExpanded = false
+            arrowHovered = false
+            prepareAmbientAppearance()
         case .answerSummary, .answerExpanded:
             break
         }
@@ -1703,6 +1889,8 @@ private struct WhisperFlowIslandView: View {
             return "Starting memory…"
         case .processing:
             return "Pausing memory…"
+        case .generating:
+            return "Generating answer…"
         case .inactive:
             return model.memoryHasStarted ? "Memory paused" : "Start memory"
         case .suppressed:
@@ -1731,72 +1919,102 @@ private struct WhisperFlowIslandView: View {
     }
 
     private var answerSummaryView: some View {
-        HStack(spacing: s(2)) {
-            Text(WhisperFlowPreview.title)
+        let answer = model.answer ?? .unavailable
+
+        return HStack(spacing: s(2)) {
+            Text(answer.title)
                 .foregroundColor(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
 
             Button(action: onExpandAnswer) {
                 Text("See more")
-                    .foregroundColor(WhisperFlowPreview.accent)
+                    .foregroundColor(WhisperFlowStyle.accent)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("See more of the island answer")
         }
+        .padding(.horizontal, s(10))
         .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
-        .lineLimit(1)
-        .fixedSize()
-        .frame(width: s(kWhisperFlowAnswerSummaryW), height: s(kWhisperFlowAnswerSummaryH))
-        .background(WhisperFlowPreview.surface)
+        .frame(
+            width: s(model.answerLayout.summaryWidth),
+            height: s(kWhisperFlowAnswerSummaryH)
+        )
+        .background(WhisperFlowStyle.surface)
         .overlay(
             Capsule()
-                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
+                .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
         )
         .clipShape(Capsule())
         .frame(
-            width: s(kWhisperFlowAnswerSummaryPanelW),
+            width: s(model.answerLayout.summaryPanelWidth),
             height: s(kWhisperFlowAnswerSummaryPanelH),
             alignment: .top
         )
         .contentShape(Rectangle())
-        .onHover(perform: onAnswerSummaryHover)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Island ready. See more")
+        .accessibilityLabel("\(answer.title). See more")
     }
 
     private var answerExpandedView: some View {
-        VStack(alignment: .leading, spacing: s(18)) {
-            HStack(spacing: s(12)) {
-                Text(WhisperFlowPreview.title)
-                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
-                    .foregroundColor(.white)
+        let answer = model.answer ?? .unavailable
 
-                Spacer(minLength: s(12))
-
-                Button(action: onCollapseAnswer) {
-                    Text("See less")
+        return ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
+                HStack(spacing: s(12)) {
+                    Text(answer.title)
                         .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
-                        .foregroundColor(WhisperFlowPreview.accent)
+                        .foregroundColor(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
+
+                    Spacer(minLength: s(12))
+
+                    Button(action: onCollapseAnswer) {
+                        Text("See less")
+                            .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                            .foregroundColor(WhisperFlowStyle.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("See less of the island answer")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("See less of the island answer")
+
+                if !answer.rows.isEmpty {
+                    VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerRowSpacing)) {
+                        ForEach(Array(answer.rows.enumerated()), id: \.offset) { _, row in
+                            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerLabelValueSpacing)) {
+                                Text(row.label)
+                                    .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                    .foregroundColor(WhisperFlowStyle.accent)
+
+                                Text(row.value)
+                                    .font(Brand.swiftUIFont(size: s(14), weight: .regular))
+                                    .foregroundColor(.white)
+                                    .lineSpacing(s(3))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-
-            Text(WhisperFlowPreview.answer)
-                .font(Brand.swiftUIFont(size: s(14), weight: .regular))
-                .foregroundColor(.white)
-                .lineSpacing(s(3))
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, s(24))
-        .padding(.vertical, s(20))
-        .frame(width: s(kWhisperFlowAnswerExpandedW), height: s(kWhisperFlowAnswerExpandedH))
-        .background(WhisperFlowPreview.surface)
+        .frame(height: s(model.answerLayout.contentViewportHeight))
+        .padding(.horizontal, s(kWhisperFlowAnswerHorizontalPadding))
+        .padding(.vertical, s(kWhisperFlowAnswerVerticalPadding))
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.expandedHeight),
+            alignment: .top
+        )
+        .background(WhisperFlowStyle.surface)
         .overlay(
             RoundedRectangle(cornerRadius: s(24), style: .continuous)
-                .stroke(WhisperFlowPreview.outline, lineWidth: s(1))
+                .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
         )
         .clipShape(RoundedRectangle(cornerRadius: s(24), style: .continuous))
         .accessibilityElement(children: .contain)
@@ -1880,10 +2098,10 @@ private final class SessionIslandController: NSObject {
     private var blockedMicroHoverObserved = false
     private var outsideGlobalClickMonitor: Any?
     private var outsideLocalClickMonitor: Any?
-    private var answerRevealTimer: Timer?
-    private var answerReturnTimer: Timer?
-    private var answerReturnStartedAt: Date?
-    private var answerReturnRemaining = kWhisperFlowAnswerReturnDelay
+    private var continueRequestInFlight = false
+    private var latchedAnswer: WhisperFlowAnswerContent?
+    private var latchedDecisionId: String?
+    private var answerLayout = WhisperFlowAnswerLayout()
     private var memoryTransitionTimer: Timer?
     private var ambientHoverReturnTimer: Timer?
     private var memoryTransitionCountdownActive = false
@@ -1918,6 +2136,14 @@ private final class SessionIslandController: NSObject {
         if snapshot.state == "hidden" {
             hide()
             return
+        }
+
+        if snapshot.state == "trail_reconstructing" {
+            continueRequestInFlight = true
+            setPresentation(.generating)
+        } else if continueRequestInFlight,
+                  snapshot.state == "resume_ready" || snapshot.state == "error" {
+            finishContinueRequest(with: snapshot)
         }
 
         let captureControlActive = snapshot.memoryActive || snapshot.state == "starting"
@@ -1962,7 +2188,11 @@ private final class SessionIslandController: NSObject {
         ambientBodyHovered = false
         hoverRevealArmed = true
         blockedMicroHoverObserved = false
-        cancelPreviewTimers()
+        continueRequestInFlight = false
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        answerLayout = WhisperFlowAnswerLayout()
+        cancelPresentationTimers()
         updateOutsideClickMonitors()
         DispatchQueue.main.async { [self] in
             panel?.orderOut(nil)
@@ -1980,11 +2210,12 @@ private final class SessionIslandController: NSObject {
 
     func reposition() {
         initializeIfNeeded()
+        refreshAnswerLayout()
         positionPanel(preserveCurrentAnchor: false, animated: false)
     }
 
     func shutdown() {
-        cancelPreviewTimers()
+        cancelPresentationTimers()
         removeOutsideClickMonitors()
         islandModel.isPanelVisible = false
         panel?.orderOut(nil)
@@ -2000,6 +2231,10 @@ private final class SessionIslandController: NSObject {
         ambientBodyHovered = false
         hoverRevealArmed = true
         blockedMicroHoverObserved = false
+        continueRequestInFlight = false
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        answerLayout = WhisperFlowAnswerLayout()
     }
 
     private var memoryActive: Bool {
@@ -2011,6 +2246,9 @@ private final class SessionIslandController: NSObject {
     }
 
     private var captureStatus: WhisperFlowCaptureStatus {
+        if continueRequestInFlight {
+            return .generating
+        }
         if snapshot.state == "error" || snapshot.lastError != nil {
             return .error
         }
@@ -2066,6 +2304,10 @@ private final class SessionIslandController: NSObject {
     }
 
     private func revealAmbientMemory() {
+        guard !continueRequestInFlight else {
+            setPresentation(.generating)
+            return
+        }
         setPresentation(.ambientMemory)
     }
 
@@ -2085,47 +2327,171 @@ private final class SessionIslandController: NSObject {
         revealAmbientMemory()
     }
 
-    private func readyActionPreview() {
-        continuePreview()
+    private func requestContinue() {
+        guard !continueRequestInFlight else { return }
+        cancelPresentationTimers()
+        continueRequestInFlight = true
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        answerLayout = WhisperFlowAnswerLayout()
+        setPresentation(.generating)
+        updateContent()
+
+        guard sendAction("continue") else {
+            snapshot = IslandSnapshot.continueDecodeError()
+            finishContinueRequest(with: snapshot)
+            return
+        }
     }
 
-    private func continuePreview() {
-        cancelPreviewTimers()
-        setPresentation(.micro)
+    private func finishContinueRequest(with snapshot: IslandSnapshot) {
+        continueRequestInFlight = false
+        cancelMemoryTransitionCountdown()
+        let answer = WhisperFlowAnswerContent(snapshot: snapshot)
+        latchedAnswer = answer
+        latchedDecisionId = answer.decisionId
+        refreshAnswerLayout()
+        setPresentation(.answerSummary)
+        updateContent()
+    }
 
-        let timer = Timer(timeInterval: kWhisperFlowAnswerRevealDelay, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.answerRevealTimer = nil
-                self.showAnswerSummary()
-            }
+    private func refreshAnswerLayout() {
+        guard let answer = latchedAnswer else {
+            answerLayout = WhisperFlowAnswerLayout()
+            return
         }
-        RunLoop.main.add(timer, forMode: .common)
-        answerRevealTimer = timer
+
+        let screen = panel?.screen
+            ?? screenContaining(NSEvent.mouseLocation)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleSize = screen?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
+        let usableWidth = max(1, visibleSize.width / gOverlayScale)
+        let usableHeight = max(1, visibleSize.height / gOverlayScale)
+        let summaryFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let summaryActionFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let summaryMaximum = max(
+            kWhisperFlowAnswerSummaryMinW,
+            usableWidth - 32 - kWhisperFlowAnswerSummaryPanelMarginW
+        )
+        let summaryContentWidth = measuredTextWidth(answer.title, font: summaryFont)
+            + measuredTextWidth("See more", font: summaryActionFont)
+            + 2
+            + 20
+        let summaryWidth = min(
+            max(kWhisperFlowAnswerSummaryMinW, ceil(summaryContentWidth)),
+            summaryMaximum
+        )
+
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let valueFont = NSFont.systemFont(ofSize: 14, weight: .regular)
+        let collapseFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let longestTextWidth = ([measuredTextWidth(answer.title, font: titleFont)]
+            + answer.rows.flatMap { row in
+                [
+                    measuredTextWidth(row.label, font: labelFont),
+                    measuredTextWidth(row.value, font: valueFont),
+                ]
+            }).max() ?? 0
+        let expandedMaximum = max(
+            kWhisperFlowAnswerExpandedMinW,
+            min(kWhisperFlowAnswerExpandedMaxW, usableWidth - 32)
+        )
+        let expandedWidth = min(
+            max(
+                kWhisperFlowAnswerExpandedMinW,
+                ceil(longestTextWidth + kWhisperFlowAnswerHorizontalPadding * 2)
+            ),
+            expandedMaximum
+        )
+        let contentWidth = max(1, expandedWidth - kWhisperFlowAnswerHorizontalPadding * 2)
+        let collapseWidth = measuredTextWidth("See less", font: collapseFont)
+        let titleWidth = max(1, contentWidth - collapseWidth - 18)
+        let titleHeight = measuredTextHeight(answer.title, font: titleFont, width: titleWidth)
+        let headerHeight = max(20, titleHeight)
+
+        var bodyHeight: CGFloat = 0
+        for (index, row) in answer.rows.enumerated() {
+            if index > 0 {
+                bodyHeight += kWhisperFlowAnswerRowSpacing
+            }
+            bodyHeight += measuredTextHeight(row.label, font: labelFont, width: contentWidth)
+            bodyHeight += kWhisperFlowAnswerLabelValueSpacing
+            bodyHeight += measuredTextHeight(
+                row.value,
+                font: valueFont,
+                width: contentWidth,
+                lineSpacing: 3
+            )
+        }
+
+        let bodySpacing = answer.rows.isEmpty ? 0 : kWhisperFlowAnswerHeaderSpacing
+        let naturalHeight = max(
+            kWhisperFlowAnswerExpandedMinH,
+            ceil(
+                kWhisperFlowAnswerVerticalPadding * 2
+                    + headerHeight
+                    + bodySpacing
+                    + bodyHeight
+            )
+        )
+        let maximumHeight = max(
+            kWhisperFlowAnswerExpandedMinH,
+            usableHeight * kWhisperFlowAnswerExpandedMaxScreenFraction
+        )
+        let expandedHeight = min(naturalHeight, maximumHeight)
+        let contentViewportHeight = max(
+            0,
+            expandedHeight - kWhisperFlowAnswerVerticalPadding * 2
+        )
+
+        answerLayout = WhisperFlowAnswerLayout(
+            summaryWidth: summaryWidth,
+            summaryPanelWidth: summaryWidth + kWhisperFlowAnswerSummaryPanelMarginW,
+            expandedWidth: expandedWidth,
+            expandedHeight: expandedHeight,
+            contentViewportHeight: contentViewportHeight
+        )
+    }
+
+    private func measuredTextWidth(_ text: String, font: NSFont) -> CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    private func measuredTextHeight(
+        _ text: String,
+        font: NSFont,
+        width: CGFloat,
+        lineSpacing: CGFloat = 0
+    ) -> CGFloat {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = lineSpacing
+        let bounds = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font, .paragraphStyle: paragraph]
+        )
+        return max(ceil(font.ascender - font.descender), ceil(bounds.height))
     }
 
     private func showAnswerSummary() {
+        guard latchedAnswer != nil else {
+            returnToDefaultPresentation()
+            return
+        }
         setPresentation(.answerSummary)
-        startAnswerReturnTimer()
     }
 
     private func expandAnswer() {
-        cancelAnswerReturnTimer(resetRemaining: true)
+        guard latchedAnswer != nil else { return }
         setPresentation(.answerExpanded)
     }
 
     private func returnToDefaultPresentation() {
-        cancelAnswerReturnTimer(resetRemaining: true)
         cancelMemoryTransitionCountdown()
         setPresentation(.micro)
-    }
-
-    private func answerSummaryHoverChanged(_ hovering: Bool) {
-        if hovering {
-            pauseAnswerReturnTimer()
-        } else {
-            resumeAnswerReturnTimer()
-        }
     }
 
     private func ambientBodyHoverChanged(_ hovering: Bool) {
@@ -2177,7 +2543,8 @@ private final class SessionIslandController: NSObject {
         }
         previousMemoryLifecyclePhase = current
 
-        guard current != .unavailable,
+        guard !continueRequestInFlight,
+              current != .unavailable,
               captureStatus != .error,
               captureStatus != .suppressed else { return }
 
@@ -2242,58 +2609,9 @@ private final class SessionIslandController: NSObject {
         }
     }
 
-    private func markPanelDragBegan() {
-        answerRevealTimer?.invalidate()
-        answerRevealTimer = nil
-    }
+    private func markPanelDragBegan() {}
 
-    private func startAnswerReturnTimer() {
-        cancelAnswerReturnTimer(resetRemaining: true)
-        resumeAnswerReturnTimer()
-    }
-
-    private func pauseAnswerReturnTimer() {
-        guard presentation == .answerSummary else { return }
-        if let answerReturnStartedAt {
-            answerReturnRemaining = max(
-                0,
-                answerReturnRemaining - Date().timeIntervalSince(answerReturnStartedAt)
-            )
-        }
-        answerReturnTimer?.invalidate()
-        answerReturnTimer = nil
-        answerReturnStartedAt = nil
-    }
-
-    private func resumeAnswerReturnTimer() {
-        guard presentation == .answerSummary, answerReturnTimer == nil else { return }
-        let delay = max(0.05, answerReturnRemaining)
-        answerReturnStartedAt = Date()
-        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.presentation == .answerSummary else { return }
-                self.answerReturnTimer = nil
-                self.answerReturnStartedAt = nil
-                self.returnToDefaultPresentation()
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        answerReturnTimer = timer
-    }
-
-    private func cancelAnswerReturnTimer(resetRemaining: Bool) {
-        answerReturnTimer?.invalidate()
-        answerReturnTimer = nil
-        answerReturnStartedAt = nil
-        if resetRemaining {
-            answerReturnRemaining = kWhisperFlowAnswerReturnDelay
-        }
-    }
-
-    private func cancelPreviewTimers() {
-        answerRevealTimer?.invalidate()
-        answerRevealTimer = nil
-        cancelAnswerReturnTimer(resetRemaining: true)
+    private func cancelPresentationTimers() {
         cancelAmbientHoverReturn()
         cancelMemoryTransitionCountdown()
     }
@@ -2305,28 +2623,28 @@ private final class SessionIslandController: NSObject {
                 width: kWhisperFlowCapturePanelW * gOverlayScale,
                 height: kWhisperFlowCapturePanelH * gOverlayScale
             )
-        case .ambientMemory:
+        case .ambientMemory, .generating:
             return NSSize(
                 width: (
-                    memoryTransitionCountdownActive
+                    memoryTransitionCountdownActive || continueRequestInFlight
                         ? kWhisperFlowNotificationPanelW
                         : kWhisperFlowCapturePanelW
                 ) * gOverlayScale,
                 height: (
-                    memoryTransitionCountdownActive
+                    memoryTransitionCountdownActive || continueRequestInFlight
                         ? kWhisperFlowNotificationPanelH
                         : kWhisperFlowCapturePanelH
                 ) * gOverlayScale
             )
         case .answerSummary:
             return NSSize(
-                width: kWhisperFlowAnswerSummaryPanelW * gOverlayScale,
+                width: answerLayout.summaryPanelWidth * gOverlayScale,
                 height: kWhisperFlowAnswerSummaryPanelH * gOverlayScale
             )
         case .answerExpanded:
             return NSSize(
-                width: kWhisperFlowAnswerExpandedW * gOverlayScale,
-                height: kWhisperFlowAnswerExpandedH * gOverlayScale
+                width: answerLayout.expandedWidth * gOverlayScale,
+                height: answerLayout.expandedHeight * gOverlayScale
             )
         }
     }
@@ -2470,6 +2788,15 @@ private final class SessionIslandController: NSObject {
         if islandModel.memoryTransitionCountdownNonce != memoryTransitionCountdownNonce {
             islandModel.memoryTransitionCountdownNonce = memoryTransitionCountdownNonce
         }
+        if islandModel.continueGenerating != continueRequestInFlight {
+            islandModel.continueGenerating = continueRequestInFlight
+        }
+        if islandModel.answer != latchedAnswer {
+            islandModel.answer = latchedAnswer
+        }
+        if islandModel.answerLayout != answerLayout {
+            islandModel.answerLayout = answerLayout
+        }
 
         guard hostingView == nil else { return }
 
@@ -2483,7 +2810,7 @@ private final class SessionIslandController: NSObject {
                 self?.microHoverChanged(hovering)
             },
             onReadyAction: { [weak self] in
-                self?.readyActionPreview()
+                self?.requestContinue()
             },
             onStartMemory: { [weak self] in
                 self?.handle(action: "start_memory")
@@ -2493,9 +2820,6 @@ private final class SessionIslandController: NSObject {
             },
             onAmbientBodyHover: { [weak self] hovering in
                 self?.ambientBodyHoverChanged(hovering)
-            },
-            onAnswerSummaryHover: { [weak self] hovering in
-                self?.answerSummaryHoverChanged(hovering)
             },
             onExpandAnswer: { [weak self] in
                 self?.expandAnswer()
@@ -2525,8 +2849,7 @@ private final class SessionIslandController: NSObject {
         case "open_search":
             sendAction("open_main_window")
         case "continue":
-            setPresentation(.answerExpanded)
-            sendAction("continue")
+            requestContinue()
         case "start_memory":
             setPresentation(.ambientMemory)
             sendAction("start_capture")
@@ -2534,8 +2857,7 @@ private final class SessionIslandController: NSObject {
             setPresentation(.ambientMemory)
             sendAction("stop_capture")
         case "reconstruct_trail":
-            setPresentation(.answerExpanded)
-            sendAction("continue")
+            requestContinue()
         case "show_trail":
             sendAction("show_trail")
         case "open_resume_point":
@@ -2646,6 +2968,7 @@ private final class SessionIslandController: NSObject {
         }
     }
 
+    @discardableResult
     private func sendAction(
         _ action: String,
         decisionId: String? = nil,
@@ -2654,8 +2977,8 @@ private final class SessionIslandController: NSObject {
         taskSnapshotRevision: Int64? = nil,
         affectedTaskField: String? = nil,
         taskHypothesisId: String? = nil
-    ) {
-        guard let callback = gActionCallback else { return }
+    ) -> Bool {
+        guard let callback = gActionCallback else { return false }
         var fields = ["\"action\":\"\(jsonEscaped(action))\""]
         if let decisionId, !decisionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             fields.append("\"decision_id\":\"\(jsonEscaped(decisionId))\"")
@@ -2680,6 +3003,7 @@ private final class SessionIslandController: NSObject {
         json.withCString { pointer in
             callback(pointer)
         }
+        return true
     }
 
     private func jsonEscaped(_ value: String) -> String {

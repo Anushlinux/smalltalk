@@ -2222,12 +2222,13 @@ mod tests {
     }
 
     #[test]
-    fn swift_ambient_memory_is_micro_first_with_timed_memory_feedback() {
+    fn swift_ambient_memory_connects_real_continue_with_adaptive_answer() {
         let source = include_str!("../macos/SessionIslandPanel.swift");
 
         for state in [
             "case micro",
             "case ambientMemory",
+            "case generating",
             "case answerSummary",
             "case answerExpanded",
         ] {
@@ -2246,7 +2247,9 @@ mod tests {
             "Not saving this app",
             "Memory needs attention",
             "Show what I was doing",
-            "Island ready.",
+            "Generating answer…",
+            "Couldn’t recover the task",
+            "Continue unavailable",
             "See more",
             "See less",
         ] {
@@ -2278,12 +2281,13 @@ mod tests {
             "kWhisperFlowAmbientHoverReturnDelay: TimeInterval = 1.0",
             "kWhisperFlowCountdownLineH: CGFloat = 1",
             "kWhisperFlowAmbientBodyHoverArmDelay: TimeInterval = 0.20",
-            "kWhisperFlowAnswerSummaryW: CGFloat = 152",
+            "kWhisperFlowAnswerSummaryPanelH: CGFloat = 49",
+            "kWhisperFlowAnswerSummaryMinW: CGFloat = 152",
             "kWhisperFlowAnswerSummaryH: CGFloat = 30",
-            "kWhisperFlowAnswerExpandedW: CGFloat = 520",
-            "kWhisperFlowAnswerExpandedH: CGFloat = 152",
-            "kWhisperFlowAnswerRevealDelay: TimeInterval = 0.35",
-            "kWhisperFlowAnswerReturnDelay: TimeInterval = 8.0",
+            "kWhisperFlowAnswerExpandedMinW: CGFloat = 320",
+            "kWhisperFlowAnswerExpandedMaxW: CGFloat = 640",
+            "kWhisperFlowAnswerExpandedMinH: CGFloat = 104",
+            "kWhisperFlowAnswerExpandedMaxScreenFraction: CGFloat = 0.70",
             "kWhisperFlowMorphDuration: TimeInterval = 0.18",
             "kWhisperFlowMicroAmbientTransitionDuration: TimeInterval = 0.18",
             "kWhisperFlowReducedMotionFadeDuration: TimeInterval = 0.12",
@@ -2296,6 +2300,8 @@ mod tests {
             "pausedPattern = Set([6, 8, 11, 13, 16, 18])",
             "filteredPattern = Set([1, 3, 5, 9, 10, 14, 16, 18, 22])",
             "errorPattern = Set([2, 7, 12, 22])",
+            "generatingPattern = Set([2, 3, 4, 9, 14])",
+            "generatingDuration: TimeInterval = 0.82",
             "restartPattern = Set([1, 6, 7, 11, 12, 13, 16, 17, 21])",
         ] {
             assert!(
@@ -2326,6 +2332,9 @@ mod tests {
                     .next()
             })
             .expect("Swift must keep a bounded truthful capture-status resolver");
+        let generating = capture_status
+            .find("if continueRequestInFlight")
+            .expect("explicit Continue must own loading status");
         let error = capture_status
             .find("snapshot.state == \"error\" || snapshot.lastError != nil")
             .expect("error precedence");
@@ -2341,21 +2350,25 @@ mod tests {
         let active = capture_status
             .find("snapshot.memoryActive ? .active : .inactive")
             .expect("explicit memory-active fallback");
+        assert!(generating < error);
         assert!(
             error < privacy && privacy < starting && starting < processing && processing < active
         );
 
         let arrow_action = source
-            .split("private func readyActionPreview()")
+            .split("private func requestContinue()")
             .nth(1)
-            .and_then(|suffix| suffix.split("private func continuePreview()").next())
-            .expect("Swift must keep a bounded arrow preview action");
-        assert!(arrow_action.contains("continuePreview()"));
+            .and_then(|suffix| suffix.split("private func finishContinueRequest").next())
+            .expect("Swift must keep a bounded real Continue action");
+        assert!(arrow_action.contains("guard !continueRequestInFlight else { return }"));
+        assert!(arrow_action.contains("continueRequestInFlight = true"));
+        assert!(arrow_action.contains("latchedAnswer = nil"));
+        assert!(arrow_action.contains("setPresentation(.generating)"));
+        assert!(arrow_action.contains("guard sendAction(\"continue\") else"));
         assert!(!arrow_action.contains("start_capture"));
-        assert!(!arrow_action.contains("startMemoryPreview"));
+        assert!(!arrow_action.contains("Timer("));
         assert!(!source.contains("previewMemoryActiveOverride"));
         assert!(!source.contains("kWhisperFlowCapturePreviewEnabled"));
-        assert!(!source.contains("repeatCount = .infinity"));
         assert!(!source.contains("statusCarousel"));
         assert!(!source.contains("What was I doing?"));
 
@@ -2369,6 +2382,11 @@ mod tests {
         assert!(indicator.contains("requestCapturePulse"));
         assert!(indicator.contains("runCapturePulse"));
         assert!(indicator.contains("runStartingAnimation"));
+        assert!(indicator.contains("runGeneratingAnimation"));
+        assert!(indicator.contains("generatingPerimeter"));
+        assert!(indicator.contains("animation.repeatCount = .infinity"));
+        assert!(indicator.contains("guard !shouldReduceMotion else { return }"));
+        assert!(indicator.contains("dot.removeAllAnimations()"));
         assert!(indicator.contains("startingAnimationEndsAt"));
         assert!(indicator.contains("startingFeedbackNonce"));
         assert!(indicator.contains("latestStartingFeedbackNonce"));
@@ -2405,6 +2423,8 @@ mod tests {
             .and_then(|suffix| suffix.split("private var shouldReduceMotion").next())
             .expect("Swift must keep bounded ambient-memory content");
         assert!(ambient.contains("Button(action: onReadyAction)"));
+        assert!(ambient.contains("if model.continueGenerating"));
+        assert!(ambient.contains("Color.clear"));
         assert!(ambient.contains(".help(\"Show what I was doing\")"));
         assert!(ambient.contains("Button(action: onStartMemory)"));
         assert!(ambient.contains(".accessibilityLabel(\"Start memory\")"));
@@ -2459,7 +2479,7 @@ mod tests {
         assert!(!ambient.contains("sendAction("));
         assert!(!ambient.contains("stop_capture"));
         assert!(!ambient.contains("repeatForever"));
-        assert!(!ambient.contains(".background(WhisperFlowPreview.surface)"));
+        assert!(!ambient.contains(".background(WhisperFlowStyle.surface)"));
         assert!(!ambient.contains("Capsule()\n                .stroke"));
 
         let snapshot_update = source
@@ -2468,6 +2488,13 @@ mod tests {
             .and_then(|suffix| suffix.split("func show()").next())
             .expect("Swift must keep a bounded snapshot update implementation");
         assert!(snapshot_update.contains("observeMemoryLifecycleTransition()"));
+        assert!(snapshot_update.contains("snapshot.state == \"trail_reconstructing\""));
+        assert!(snapshot_update.contains("continueRequestInFlight = true"));
+        assert!(snapshot_update.contains("setPresentation(.generating)"));
+        assert!(snapshot_update.contains("else if continueRequestInFlight"));
+        assert!(snapshot_update
+            .contains("snapshot.state == \"resume_ready\" || snapshot.state == \"error\""));
+        assert!(snapshot_update.contains("finishContinueRequest(with: snapshot)"));
         assert!(!snapshot_update.contains("setPresentation(.ambientMemory)"));
 
         let lifecycle = source
@@ -2511,7 +2538,7 @@ mod tests {
         let micro_hover = source
             .split("private func microHoverChanged(_ hovering: Bool)")
             .nth(1)
-            .and_then(|suffix| suffix.split("private func readyActionPreview()").next())
+            .and_then(|suffix| suffix.split("private func requestContinue()").next())
             .expect("Swift must keep a bounded micro hover re-entry latch");
         assert!(micro_hover.contains("if !hoverRevealArmed"));
         assert!(micro_hover.contains("blockedMicroHoverObserved = true"));
@@ -2536,30 +2563,37 @@ mod tests {
         assert!(ambient_hover.contains("!self.ambientHovered"));
         assert!(ambient_hover.contains("setPresentation(.micro)"));
 
-        let continue_preview = source
-            .split("private func continuePreview()")
+        let finish_continue = source
+            .split("private func finishContinueRequest(with snapshot: IslandSnapshot)")
             .nth(1)
-            .and_then(|suffix| suffix.split("private func showAnswerSummary()").next())
-            .expect("Swift must preserve the local answer preview");
-        assert!(continue_preview.contains("setPresentation(.micro)"));
-        assert!(continue_preview.contains("showAnswerSummary()"));
-        assert!(!continue_preview.contains("sendAction("));
+            .and_then(|suffix| suffix.split("private func refreshAnswerLayout()").next())
+            .expect("Swift must latch the terminal Continue answer");
+        assert!(finish_continue.contains("continueRequestInFlight = false"));
+        assert!(
+            finish_continue.contains("let answer = WhisperFlowAnswerContent(snapshot: snapshot)")
+        );
+        assert!(finish_continue.contains("latchedAnswer = answer"));
+        assert!(finish_continue.contains("latchedDecisionId = answer.decisionId"));
+        assert!(finish_continue.contains("refreshAnswerLayout()"));
+        assert!(finish_continue.contains("setPresentation(.answerSummary)"));
         assert!(source.contains("@Published var presentation: WhisperFlowPresentation = .micro"));
+        assert!(source.contains("@Published var continueGenerating = false"));
+        assert!(source.contains("@Published var answer: WhisperFlowAnswerContent?"));
+        assert!(source.contains("private var continueRequestInFlight = false"));
+        assert!(source.contains("private var latchedAnswer: WhisperFlowAnswerContent?"));
+        assert!(source.contains("private var latchedDecisionId: String?"));
         assert!(source.contains("@Published var startingFeedbackNonce: UInt64?"));
         assert!(source.contains("private var startingFeedbackNonceCounter: UInt64 = 0"));
         assert!(source.contains("private var activeStartingFeedbackNonce: UInt64?"));
         assert!(source.contains("private var presentation: WhisperFlowPresentation = .micro"));
         assert!(source.contains("self?.handle(action: \"start_memory\")"));
-        let default_return = source
-            .split("private func returnToDefaultPresentation()")
-            .nth(1)
-            .and_then(|suffix| {
-                suffix
-                    .split("private func answerSummaryHoverChanged")
-                    .next()
-            })
-            .expect("Swift must return answers to micro");
-        assert!(default_return.contains("setPresentation(.micro)"));
+        assert!(!source.contains("answerRevealTimer"));
+        assert!(!source.contains("answerReturnTimer"));
+        assert!(!source.contains("kWhisperFlowAnswerRevealDelay"));
+        assert!(!source.contains("kWhisperFlowAnswerReturnDelay"));
+        assert!(!source.contains("readyActionPreview"));
+        assert!(!source.contains("continuePreview"));
+        assert!(!source.contains("Island ready."));
         assert!(
             source.contains("@Published var captureStatus: WhisperFlowCaptureStatus = .inactive")
         );
@@ -2576,7 +2610,7 @@ mod tests {
             .nth(1)
             .and_then(|suffix| suffix.split(".fixedSize()").next())
             .expect("Swift must keep bounded presentation transitions");
-        assert!(presentation_switch.contains("case .micro, .ambientMemory:"));
+        assert!(presentation_switch.contains("case .micro, .ambientMemory, .generating:"));
         assert!(presentation_switch.contains("memoryContinuityView"));
         assert!(presentation_switch.contains(".transition(stateTransition(scale: 0.97))"));
         assert!(!presentation_switch.contains(".transition(microTransition)"));
@@ -2615,12 +2649,13 @@ mod tests {
             .and_then(|suffix| suffix.split("private var microHitTarget: some View").next())
             .expect("Swift must keep one persistent micro-medium silhouette");
         assert!(continuity_view.contains("model.presentation == .ambientMemory"));
+        assert!(continuity_view.contains("model.presentation == .generating"));
         assert_eq!(
             continuity_view.matches("TopAnchoredCapsuleShape(").count(),
             2,
             "one synchronized fill and stroke must own the shared silhouette"
         );
-        assert!(continuity_view.contains(".fill(WhisperFlowPreview.surface)"));
+        assert!(continuity_view.contains(".fill(WhisperFlowStyle.surface)"));
         assert!(continuity_view.contains(".stroke("));
         assert!(continuity_view.contains("ambientMemoryContent"));
         assert!(continuity_view.contains("microHitTarget"));
@@ -2653,6 +2688,53 @@ mod tests {
         assert!(!source.contains("private var ambientMemoryTransition: AnyTransition"));
         assert!(!source.contains("kWhisperFlowMicroAmbientTransitionScale"));
 
+        let answer_content = source
+            .split("private struct WhisperFlowAnswerContent: Equatable")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("private struct WhisperFlowAnswerLayout")
+                    .next()
+            })
+            .expect("Swift must keep exact semantic answer presentation data");
+        assert!(
+            answer_content.contains("decisionId = state.decisionId ?? snapshot.continueDecisionId")
+        );
+        assert!(answer_content.contains("title = Self.verbatim(answer?.taskSummary)"));
+        let ordered_labels = [
+            "Task object",
+            "Current activity — observed surface",
+            "Current activity — immediate operation",
+            "Current activity — operation effect",
+            "Current activity — current subtask",
+            "Current activity — relationship to primary",
+            "Last meaningful progress",
+            "Unfinished state",
+            "Next action",
+            "Where summary",
+        ];
+        let mut previous = 0;
+        for label in ordered_labels {
+            let position = answer_content[previous..]
+                .find(label)
+                .map(|offset| previous + offset)
+                .unwrap_or_else(|| panic!("missing semantic field label {label:?}"));
+            previous = position + label.len();
+        }
+        for forbidden in [
+            "activityLabel",
+            "activitySummary",
+            "currentFocus",
+            "windowTitle",
+            "appName",
+        ] {
+            assert!(
+                !answer_content.contains(forbidden),
+                "answer content must not substitute local activity text via {forbidden}"
+            );
+        }
+        assert!(answer_content.contains("return value"));
+
         let answer_summary = source
             .split("private var answerSummaryView: some View")
             .nth(1)
@@ -2664,6 +2746,38 @@ mod tests {
             .expect("Swift must keep a bounded top-aligned answer summary");
         assert!(answer_summary
             .contains("height: s(kWhisperFlowAnswerSummaryPanelH),\n            alignment: .top"));
+        assert!(answer_summary.contains("Text(answer.title)"));
+        assert!(answer_summary.contains(".lineLimit(1)"));
+        assert!(answer_summary.contains("width: s(model.answerLayout.summaryWidth)"));
+        assert!(answer_summary.contains("height: s(kWhisperFlowAnswerSummaryH)"));
+        assert!(answer_summary.contains("width: s(model.answerLayout.summaryPanelWidth)"));
+        assert!(answer_summary.contains(".accessibilityLabel(\"\\(answer.title). See more\")"));
+
+        let answer_expanded = source
+            .split("private var answerExpandedView: some View")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private var morphAnimation").next())
+            .expect("Swift must keep the content-driven expanded answer");
+        assert!(answer_expanded.contains("Text(answer.title)"));
+        assert!(answer_expanded.contains("Text(row.value)"));
+        assert!(answer_expanded.contains("ScrollView(.vertical, showsIndicators: true)"));
+        assert!(answer_expanded.contains("width: s(model.answerLayout.expandedWidth)"));
+        assert!(answer_expanded.contains("height: s(model.answerLayout.expandedHeight)"));
+        assert!(answer_expanded.contains("height: s(model.answerLayout.contentViewportHeight)"));
+
+        let adaptive_layout = source
+            .split("private func refreshAnswerLayout()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func measuredTextWidth").next())
+            .expect("Swift must measure answer geometry from rendered content");
+        assert!(adaptive_layout.contains("measuredTextWidth(answer.title"));
+        assert!(adaptive_layout.contains("row.value,"));
+        assert!(adaptive_layout.contains("lineSpacing: 3"));
+        assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMinW"));
+        assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMaxW"));
+        assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMinH"));
+        assert!(adaptive_layout.contains("kWhisperFlowAnswerExpandedMaxScreenFraction"));
+        assert!(source.contains("options: [.usesLineFragmentOrigin, .usesFontLeading]"));
 
         let panel_frame = source
             .split("private func resolvedPanelFrame(preserveCurrentAnchor: Bool)")
@@ -2689,6 +2803,9 @@ mod tests {
         assert!(target_panel_size.contains(": kWhisperFlowCapturePanelW"));
         assert!(target_panel_size.contains("? kWhisperFlowNotificationPanelH"));
         assert!(target_panel_size.contains(": kWhisperFlowCapturePanelH"));
+        assert!(target_panel_size.contains("width: answerLayout.summaryPanelWidth * gOverlayScale"));
+        assert!(target_panel_size.contains("width: answerLayout.expandedWidth * gOverlayScale"));
+        assert!(target_panel_size.contains("height: answerLayout.expandedHeight * gOverlayScale"));
         assert!(!target_panel_size.contains("ambientBodyHovered"));
 
         let ambient_body_hover = source
@@ -2712,7 +2829,8 @@ mod tests {
         );
         assert!(content_animation.contains(".easeOut(duration: 0.12).delay(0.04)"));
         assert!(content_animation.contains(".easeOut(duration: 0.10)"));
-        assert!(ambient.contains("value: model.memoryTransitionCountdownActive"));
+        assert!(ambient
+            .contains("value: model.memoryTransitionCountdownActive || model.continueGenerating"));
         assert!(source.contains(".scaleEffect(scale, anchor: .top)"));
     }
     #[test]
