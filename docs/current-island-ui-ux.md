@@ -43,7 +43,7 @@ The first placement is near the top center of the screen containing the pointer.
 
 ## 3. Presentation states
 
-The native presentation enum has five states:
+The native presentation enum has eight states:
 
 ```swift
 private enum WhisperFlowPresentation: Equatable {
@@ -52,6 +52,9 @@ private enum WhisperFlowPresentation: Equatable {
     case generating
     case answerSummary
     case answerExpanded
+    case historyLoading
+    case historyList
+    case historyDetail
 }
 ```
 
@@ -64,6 +67,13 @@ stateDiagram-v2
     AnswerSummary --> AnswerExpanded: See more
     AnswerSummary --> Micro: Outside click
     AnswerExpanded --> AnswerSummary: See less or outside click
+    AmbientMemory --> HistoryLoading: History button
+    AnswerSummary --> HistoryLoading: History button
+    HistoryLoading --> HistoryList: Page response
+    HistoryList --> HistoryDetail: Select saved answer
+    HistoryDetail --> HistoryList: Back or outside click
+    HistoryList --> AnswerSummary: Outside click when opened from answer
+    HistoryList --> AmbientMemory: Outside click when opened from ambient
     AnswerSummary --> Generating: New explicit request after returning to the arrow
 ```
 
@@ -185,7 +195,40 @@ The optional card uses the same 320–640-point content-driven width as the answ
 
 The screenshot is read and decoded away from the main thread. A decoding failure silently omits both the button and cue without changing the answer. Clicking the button uses a short opacity entrance while the existing 180 ms top-anchored panel morph makes room. Reduce Motion keeps the state change but removes positional motion.
 
-## 8. Answer latching and snapshot rules
+## 8. Continue history
+
+The medium ambient island and compact current-answer capsule now expose a detached `clock.arrow.circlepath` control. The visible circle is 30 points, its hit target is 40 points, and its visible edge sits eight points from the capsule. It is hidden in micro, generating, expanded current-answer, and capture-transition presentations.
+
+The control normally sits to the left. It moves to the right only when its 40-point hit target would leave the usable screen frame. The control and history content remain inside the existing `NSPanel`; no second window is created. Panel growth preserves the live capsule's top-center anchor.
+
+Opening history shows a card eight points below the live capsule:
+
+- Preferred width: 360 points, clamped to 320–380 points.
+- Maximum height: 60% of the usable screen height.
+- First page: 25 entries, newest first.
+- Retention: the newest 100 unique decision IDs.
+- Loading: four restrained skeleton rows.
+- Empty: `No previous answers yet` and `Use Continue to create one`.
+- Failure: `History unavailable` with a Retry action.
+- Pagination: `Load older answers` appears only when the page returns another cursor.
+
+Each row shows the exact saved title, limited to two lines, and a locale-aware relative time. Its tooltip and VoiceOver label contain the full local date and time. The live decision receives a restrained pink `Current` indicator.
+
+Selecting a row opens a read-only detail. It uses the same title, field order, label typography, value typography, and spacing as the expanded current answer, with `Past answer · <date/time>` and Back. Historical detail does not expose a visual cue, target opening, regeneration, feedback, deletion, search, or export.
+
+The history controller keeps separate state for the live answer and saved detail. Page and detail requests run away from the main thread and carry monotonically increasing request IDs. Swift accepts a response only when its echoed ID matches the active request, so late or unrelated snapshots cannot replace or reopen the history surface.
+
+Dismissal is one level at a time: detail returns to list, list returns to the originating ambient or compact-answer state, and the normal island behavior can then return to micro. Pressing the history button while history is open closes the whole history surface directly. Escape follows the same one-level rule. VoiceOver focus moves to the History heading when opened and returns to the history button when closed.
+
+Dragging remains available from the preserved live capsule while history is open. The history control, card, rows, scrolling region, and scrollbars cannot begin a panel drag.
+
+### Persistence boundary
+
+`continue_answer_history` stores an immutable version-1 product output: decision ID, presentation timestamp, origin (`island` or `main_app`), exact title, and ordered visible answer rows. It stores only final, decision-backed, explicit manual Continue results. Startup and background refreshes are excluded. Duplicate decision IDs keep their first saved copy.
+
+History reads are bounded, read-only SQLite queries. They are internal to the native island bridge and do not add a Tauri command or React interface. Selecting saved history never updates the remembered live decision, current-answer latch, feedback state, strict-open ownership, or visual cue. Delete local memory replaces the local database, which also removes the history table contents.
+
+## 9. Answer latching and snapshot rules
 
 The controller maintains separate internal state for:
 
@@ -195,6 +238,7 @@ The controller maintains separate internal state for:
 - The latched visual-cue path and decoded image.
 - Whether the user has explicitly revealed the cue.
 - An asynchronous image-load nonce used to reject stale completions.
+- The history origin, page, cursor, selected saved output, errors, and independent page/detail request IDs.
 - The measured answer layout.
 
 The state flow is deliberately different from ordinary capture presentation:
@@ -208,7 +252,7 @@ The state flow is deliberately different from ordinary capture presentation:
 
 The decision ID is presentation state only. It does not change backend authority or strict target-opening policy.
 
-## 9. Error and unresolved behavior
+## 10. Error and unresolved behavior
 
 A backend failure displays `Continue unavailable`. An unresolved result without a semantic task summary displays an honest unresolved title such as `Couldn’t recover the task`.
 
@@ -223,15 +267,18 @@ The native layer does not fabricate a successful-looking answer from:
 
 Optional semantic fields that are empty are omitted from the expanded card. Existing non-empty values are preserved exactly.
 
-## 10. Motion and accessibility
+## 11. Motion and accessibility
 
 The normal panel morph remains 180 ms and top-anchored. The generating chase uses Core Animation and stops when status leaves `generating`.
+
+History list/detail changes use a 140 ms opacity and 0.97-scale transition without bounce or stagger.
 
 Reduce Motion behavior:
 
 - No rotating generating chase.
 - Static highlighted matrix while generation is active.
 - Immediate or opacity-only presentation changes where existing island behavior already requires it.
+- Opacity-only history transitions.
 - No change to the displayed text.
 
 VoiceOver behavior:
@@ -242,20 +289,26 @@ VoiceOver behavior:
 - The expanded answer exposes the title, each field label, each exact field value, and `See less`.
 - A decoded safe screenshot exposes a `Visual cue` button whose label announces whether it will show or hide the cue.
 - The cue card exposes `Visual cue`, and the image is described as `Full-screen evidence used for this answer`.
+- The history control is labeled and tooled as `Continue history`.
+- Each history row announces its exact title, full local timestamp, and current or past state.
+- Opening history focuses the History heading; closing it returns focus to the history control.
 
-## 11. Outside click, dismissal, and persistence
+## 12. Outside click, dismissal, and persistence
 
-Outside-click monitors exist only for the compact and expanded answer states.
+Outside-click monitors exist for compact answers, expanded answers, and open history.
 
 - Compact answer plus outside click: return to micro.
 - Expanded answer plus outside click: return to compact answer.
+- Historical detail plus outside click: return to history list.
+- History list/loading plus outside click: restore the exact originating ambient or compact-answer presentation.
+- History button while history is open: close the whole history surface directly.
 - `See less`: return to compact answer.
 - `Visual cue`: toggle the optional screenshot card without changing the answer.
 - Click inside the panel: do nothing in the outside-click handler.
 
 There is no answer reveal timer and no answer return timer. Dismissing the presentation does not mutate the backend answer. Starting another explicit Continue request is the only path that clears the old latch for replacement.
 
-## 12. Interfaces intentionally unchanged
+## 13. Interfaces intentionally unchanged
 
 This wiring does not change:
 
@@ -269,11 +322,11 @@ This wiring does not change:
 - Capture commands or capture privacy behavior.
 - The React surface.
 
-The only backend interface addition is the internal optional `SessionIslandSnapshot.visual_cue` presentation field. It contains a validated local image path and does not alter `IslandContinueState`, `TaskTruthPublicAnswerV1`, a Tauri command, or any generated output.
+The backend interface additions remain internal optional snapshot fields: `SessionIslandSnapshot.visual_cue`, `continue_history_page`, and `continue_history_output`. The cue contains a validated local image path. History responses contain only the saved product title and ordered answer rows plus pagination/request identity. None alters `IslandContinueState`, `TaskTruthPublicAnswerV1`, a Tauri command, or the React surface.
 
 The incomplete PFTU release verdict is also unchanged. Connecting the island to the backend output is not a release-readiness claim.
 
-## 13. Size reference
+## 14. Size reference
 
 | Element or behavior | Current value |
 | --- | ---: |
@@ -291,13 +344,20 @@ The incomplete PFTU release verdict is also unchanged. Connecting the island to 
 | Visual-cue card radius | 18 pt |
 | Visual-cue image maximum height | 220 pt |
 | Visual-cue image radius | 12 pt |
+| History control | 30 pt visual / 40 pt hit target |
+| History visual gap | 8 pt |
+| History card width | 320–380 pt; 360 pt preferred |
+| History card maximum height | 60% of usable screen |
+| History page size | 25 entries |
+| History retention | 100 unique decisions |
+| History list/detail transition | 0.14 s |
 | Generating chase | 0.82 s per loop |
 | Main morph/frame duration | 0.18 s |
 | Drag threshold | 4 pt |
 
 All dimensions are multiplied by `gOverlayScale`, currently `1.0`.
 
-## 14. Verification contract
+## 15. Verification contract
 
 The Rust source-contract test now checks the native file for:
 
@@ -318,5 +378,10 @@ The Rust source-contract test now checks the native file for:
 - The 70% combined-stack height cap, 220-point image cap, and 104-point answer minimum.
 - Persistent results without reveal or auto-return timers.
 - Top-center panel anchoring.
+- One-panel history rendering and detached-control visibility rules.
+- History action encoding, cursor pagination, request-ID response latching, and stale-response rejection.
+- Exact saved-title rows, empty/loading/error/retry/detail states, full timestamps, and current-decision indication.
+- Read-only history behavior with no target dispatch, feedback mutation, regeneration, or historical visual cue.
+- History drag exclusion, side flipping, one-level dismissal, VoiceOver focus restoration, and Reduce Motion.
 
 Runtime visual verification still needs both a short backend answer and a deliberately long backend answer because source tests and type-checking cannot prove final screen appearance.

@@ -15,6 +15,7 @@ pub(crate) mod activity_recap_validation;
 pub(crate) mod confidence;
 pub(crate) mod enrichment;
 pub(crate) mod feedback_policy;
+pub(crate) mod history;
 pub(crate) mod semantic_consistency;
 pub(crate) mod task_truth_v2;
 pub(crate) mod task_turn;
@@ -120,6 +121,7 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_activity_classifications",
     "continue_candidates",
     "continue_decisions",
+    "continue_answer_history",
     "continue_decision_open_events",
     "continue_feedback_events",
     "continue_feedback_policy_evaluations",
@@ -39709,10 +39711,11 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
         .optional()
         .map(|marker| marker.as_deref() == Some(expected_marker.as_str()))
         .unwrap_or(false);
-    if schema_is_current {
+    if schema_is_current && history::has_continue_history_schema(conn)? {
         return Ok(());
     }
 
+    history::ensure_continue_history_schema(conn)?;
     ensure_weak_surface_enrichment_schema(conn)?;
     conn.execute_batch(
         "
@@ -41253,6 +41256,7 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
 }
 
 pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
+    history::clear_continue_history(conn)?;
     if !table_exists(conn, "continue_artifacts")? {
         return Ok(());
     }
