@@ -39,6 +39,8 @@ private struct IslandSnapshot: Decodable {
     var resumeWarning: String?
     var islandContinueState: IslandContinueState?
     var visualCue: IslandVisualCue?
+    var continueHistoryPage: ContinueHistoryPageV1?
+    var continueHistoryOutput: ContinueHistoryOutputV1?
     var privacyLabel: String?
     var isSensitive: Bool = false
 
@@ -73,6 +75,8 @@ private struct IslandSnapshot: Decodable {
         case resumeWarning = "resume_warning"
         case islandContinueState = "island_continue_state"
         case visualCue = "visual_cue"
+        case continueHistoryPage = "continue_history_page"
+        case continueHistoryOutput = "continue_history_output"
         case privacyLabel = "privacy_label"
         case isSensitive = "is_sensitive"
     }
@@ -83,6 +87,98 @@ private struct IslandSnapshot: Decodable {
         snapshot.lastError = "Continue state could not be decoded."
         snapshot.islandContinueState = IslandContinueState.errorFallback()
         return snapshot
+    }
+}
+
+private struct ContinueHistoryCursorV1: Decodable, Equatable {
+    var createdAtMs: Int64
+    var decisionId: String
+
+    enum CodingKeys: String, CodingKey {
+        case createdAtMs = "created_at_ms"
+        case decisionId = "decision_id"
+    }
+}
+
+private struct ContinueHistorySummaryV1: Decodable, Equatable, Identifiable {
+    var decisionId: String
+    var createdAtMs: Int64
+    var origin: String
+    var title: String
+
+    var id: String { decisionId }
+
+    enum CodingKeys: String, CodingKey {
+        case decisionId = "decision_id"
+        case createdAtMs = "created_at_ms"
+        case origin
+        case title
+    }
+}
+
+private struct ContinueHistoryPageV1: Decodable, Equatable {
+    var schema: String?
+    var items: [ContinueHistorySummaryV1]
+    var nextCursor: ContinueHistoryCursorV1?
+    var requestId: UInt64
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case items
+        case nextCursor = "next_cursor"
+        case requestId = "request_id"
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        items = try container.decodeIfPresent([ContinueHistorySummaryV1].self, forKey: .items) ?? []
+        nextCursor = try container.decodeIfPresent(ContinueHistoryCursorV1.self, forKey: .nextCursor)
+        requestId = try container.decodeIfPresent(UInt64.self, forKey: .requestId) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+private struct ContinueHistoryAnswerRowV1: Decodable, Equatable, Identifiable {
+    var label: String
+    var value: String
+
+    var id: String { "\(label)\u{1f}\(value)" }
+}
+
+private struct ContinueHistoryOutputV1: Decodable, Equatable {
+    var schema: String?
+    var decisionId: String
+    var createdAtMs: Int64
+    var origin: String
+    var title: String
+    var rows: [ContinueHistoryAnswerRowV1]
+    var requestId: UInt64
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case decisionId = "decision_id"
+        case createdAtMs = "created_at_ms"
+        case origin
+        case title
+        case rows
+        case requestId = "request_id"
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId) ?? ""
+        createdAtMs = try container.decodeIfPresent(Int64.self, forKey: .createdAtMs) ?? 0
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? ""
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        rows = try container.decodeIfPresent([ContinueHistoryAnswerRowV1].self, forKey: .rows) ?? []
+        requestId = try container.decodeIfPresent(UInt64.self, forKey: .requestId) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
     }
 }
 
@@ -533,6 +629,25 @@ private extension String {
     }
 }
 
+private func historyDate(_ timestampMs: Int64) -> Date {
+    Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1_000)
+}
+
+private func historyRelativeTimestamp(_ timestampMs: Int64) -> String {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.locale = .current
+    formatter.unitsStyle = .full
+    return formatter.localizedString(for: historyDate(timestampMs), relativeTo: Date())
+}
+
+private func historyFullTimestamp(_ timestampMs: Int64) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = .current
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    return formatter.string(from: historyDate(timestampMs))
+}
+
 private struct OverlayMetrics {
     var screenActive = false
     var captureFps = 0.0
@@ -673,6 +788,20 @@ private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
 private let kWhisperFlowMorphDuration: TimeInterval = 0.18
 private let kWhisperFlowMicroAmbientTransitionDuration: TimeInterval = 0.18
 private let kWhisperFlowReducedMotionFadeDuration: TimeInterval = 0.12
+private let kWhisperFlowHistoryButtonVisualSize: CGFloat = 30
+private let kWhisperFlowHistoryButtonHitSize: CGFloat = 40
+private let kWhisperFlowHistoryButtonGap: CGFloat = 8
+private let kWhisperFlowHistoryAccessoryAllowance: CGFloat =
+    kWhisperFlowHistoryButtonHitSize + kWhisperFlowHistoryButtonGap
+private let kWhisperFlowHistoryCardPreferredW: CGFloat = 360
+private let kWhisperFlowHistoryCardMinW: CGFloat = 320
+private let kWhisperFlowHistoryCardMaxW: CGFloat = 380
+private let kWhisperFlowHistoryCardPreferredH: CGFloat = 420
+private let kWhisperFlowHistoryCardGap: CGFloat = 8
+private let kWhisperFlowHistoryCardRadius: CGFloat = 24
+private let kWhisperFlowHistoryHeaderH: CGFloat = 54
+private let kWhisperFlowHistoryRowMinH: CGFloat = 58
+private let kWhisperFlowHistoryTransitionDuration: TimeInterval = 0.14
 
 private enum WhisperFlowPresentation: Equatable {
     case micro
@@ -680,6 +809,18 @@ private enum WhisperFlowPresentation: Equatable {
     case generating
     case answerSummary
     case answerExpanded
+    case historyLoading
+    case historyList
+    case historyDetail
+
+    var isHistory: Bool {
+        switch self {
+        case .historyLoading, .historyList, .historyDetail:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 private enum WhisperFlowCaptureStatus: Equatable {
@@ -817,6 +958,15 @@ private struct WhisperFlowAnswerLayout: Equatable {
     var visualCueImageHeight: CGFloat = 0
 }
 
+private struct WhisperFlowHistoryLayout: Equatable {
+    var cardWidth: CGFloat = kWhisperFlowHistoryCardPreferredW
+    var cardHeight: CGFloat = kWhisperFlowHistoryCardPreferredH
+    var canvasWidth: CGFloat = kWhisperFlowHistoryCardPreferredW
+    var canvasHeight: CGFloat = kWhisperFlowHistoryCardPreferredH
+    var capsuleOffsetX: CGFloat = 0
+    var controlOnLeft = true
+}
+
 @available(macOS 13.0, *)
 private final class WhisperFlowIslandModel: ObservableObject {
     @Published var presentation: WhisperFlowPresentation = .micro
@@ -834,6 +984,18 @@ private final class WhisperFlowIslandModel: ObservableObject {
     @Published var answerLayout = WhisperFlowAnswerLayout()
     @Published var visualCueImage: NSImage? = nil
     @Published var visualCuePresented = false
+    @Published var historyOriginPresentation: WhisperFlowPresentation = .ambientMemory
+    @Published var historyButtonVisible = false
+    @Published var historyItems: [ContinueHistorySummaryV1] = []
+    @Published var historyNextCursor: ContinueHistoryCursorV1? = nil
+    @Published var historyError: String? = nil
+    @Published var historyLoadingOlder = false
+    @Published var historySelectedOutput: ContinueHistoryOutputV1? = nil
+    @Published var historySelectedDecisionId: String? = nil
+    @Published var historyDetailLoading = false
+    @Published var historyDetailError: String? = nil
+    @Published var currentDecisionId: String? = nil
+    @Published var historyLayout = WhisperFlowHistoryLayout()
 }
 
 @available(macOS 13.0, *)
@@ -1401,7 +1563,18 @@ private struct WhisperFlowIslandView: View {
     let onExpandAnswer: () -> Void
     let onCollapseAnswer: () -> Void
     let onToggleVisualCue: () -> Void
+    let onToggleHistory: () -> Void
+    let onHistoryButtonHover: (Bool) -> Void
+    let onLoadOlderHistory: () -> Void
+    let onRetryHistory: () -> Void
+    let onRetryHistoryDetail: () -> Void
+    let onSelectHistoryOutput: (String) -> Void
+    let onBackFromHistoryDetail: () -> Void
+    let onDismissOneLevel: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AccessibilityFocusState private var historyHeadingFocused: Bool
+    @AccessibilityFocusState private var historyDetailFocused: Bool
+    @AccessibilityFocusState private var historyButtonFocused: Bool
     @State private var microPulseExpanded = false
     @State private var ambientBodyHovered = false
     @State private var ambientBodyHoverArmed = false
@@ -1409,32 +1582,84 @@ private struct WhisperFlowIslandView: View {
     @State private var ambientCapsuleHovered = false
     @State private var pausedRestartHovered = false
     @State private var arrowHovered = false
+    @State private var historyButtonHovered = false
     @State private var memoryTransitionCountdownProgress: CGFloat = 0
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
     var body: some View {
         ZStack(alignment: .top) {
-            switch model.presentation {
-            case .micro, .ambientMemory, .generating:
-                memoryContinuityView
-            case .answerSummary:
-                answerSummaryView
-                    .transition(.opacity)
-            case .answerExpanded:
-                answerExpandedView
+            currentIslandContent(for: renderedIslandPresentation)
+                .offset(x: s(model.historyLayout.capsuleOffsetX))
+                .allowsHitTesting(!model.presentation.isHistory)
+
+            if model.historyButtonVisible || model.presentation.isHistory {
+                historyButton
+                    .offset(
+                        x: s(historyButtonOffsetX),
+                        y: s(historyButtonOffsetY)
+                    )
+            }
+
+            if model.presentation.isHistory {
+                historyCard
+                    .padding(.top, s(historyCardTop))
                     .transition(stateTransition(scale: 0.97))
             }
         }
-        .fixedSize()
+        .frame(
+            width: s(model.historyLayout.canvasWidth),
+            height: s(model.historyLayout.canvasHeight),
+            alignment: .top
+        )
         .background(Color.clear)
-        .animation(morphAnimation, value: model.presentation)
+        .animation(presentationAnimation, value: model.presentation)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onChange(of: model.presentation) { presentation in
+            if presentation == .historyLoading || presentation == .historyList {
+                DispatchQueue.main.async {
+                    historyHeadingFocused = true
+                }
+            } else if presentation == .historyDetail {
+                DispatchQueue.main.async {
+                    historyDetailFocused = true
+                }
+            } else if !presentation.isHistory {
+                DispatchQueue.main.async {
+                    historyButtonFocused = true
+                }
+            }
+        }
+        .onExitCommand(perform: onDismissOneLevel)
+    }
+
+    @ViewBuilder
+    private func currentIslandContent(
+        for presentation: WhisperFlowPresentation
+    ) -> some View {
+        switch presentation {
+        case .micro, .ambientMemory, .generating:
+            memoryContinuityView
+        case .answerSummary:
+            answerSummaryView
+                .transition(.opacity)
+        case .answerExpanded:
+            answerExpandedView
+                .transition(stateTransition(scale: 0.97))
+        case .historyLoading, .historyList, .historyDetail:
+            EmptyView()
+        }
+    }
+
+    private var renderedIslandPresentation: WhisperFlowPresentation {
+        model.presentation.isHistory
+            ? model.historyOriginPresentation
+            : model.presentation
     }
 
     private var memoryContinuityView: some View {
-        let expanded = model.presentation == .ambientMemory
-            || model.presentation == .generating
+        let expanded = renderedIslandPresentation == .ambientMemory
+            || renderedIslandPresentation == .generating
         let visualWidth = expanded
             ? ambientCapsuleWidth
             : kBaseMicroVisualW * microScale
@@ -1860,6 +2085,9 @@ private struct WhisperFlowIslandView: View {
             prepareAmbientAppearance()
         case .answerSummary, .answerExpanded:
             break
+        case .historyLoading, .historyList, .historyDetail:
+            microPulseExpanded = false
+            cleanUpAmbientInteractionState()
         }
     }
 
@@ -2140,6 +2368,454 @@ private struct WhisperFlowIslandView: View {
         .accessibilityElement(children: .contain)
     }
 
+    private var historyButton: some View {
+        Button(action: onToggleHistory) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: s(13), weight: .semibold))
+                .foregroundColor(
+                    model.presentation.isHistory || historyButtonHovered
+                        ? WhisperFlowStyle.accent
+                        : .white.opacity(0.86)
+                )
+                .frame(
+                    width: s(kWhisperFlowHistoryButtonVisualSize),
+                    height: s(kWhisperFlowHistoryButtonVisualSize)
+                )
+                .background(
+                    Circle()
+                        .fill(WhisperFlowStyle.surface)
+                )
+                .overlay(
+                    Circle()
+                        .stroke(
+                            model.presentation.isHistory
+                                ? WhisperFlowStyle.accent.opacity(0.58)
+                                : WhisperFlowStyle.outline,
+                            lineWidth: s(1)
+                        )
+                )
+                .offset(
+                    y: s((renderedCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2)
+                )
+                .frame(
+                    width: s(kWhisperFlowHistoryButtonHitSize),
+                    height: s(kWhisperFlowHistoryButtonHitSize)
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: shouldReduceMotion))
+        .accessibilityLabel("Continue history")
+        .accessibilityHint(
+            model.presentation.isHistory
+                ? "Closes Continue history"
+                : "Shows previous Continue answers"
+        )
+        .accessibilityFocused($historyButtonFocused)
+        .help("Continue history")
+        .onHover { hovering in
+            historyButtonHovered = hovering
+            onHistoryButtonHover(hovering)
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+
+    private var historyCard: some View {
+        Group {
+            switch model.presentation {
+            case .historyLoading:
+                historyLoadingCard
+            case .historyList:
+                historyListCard
+            case .historyDetail:
+                historyDetailCard
+            default:
+                EmptyView()
+            }
+        }
+        .id(model.presentation)
+        .transition(stateTransition(scale: 0.97))
+        .frame(
+            width: s(model.historyLayout.cardWidth),
+            height: s(model.historyLayout.cardHeight),
+            alignment: .top
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowHistoryCardRadius),
+                style: .continuous
+            )
+            .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowHistoryCardRadius),
+                style: .continuous
+            )
+        )
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historyLoadingCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            historyHeader(title: "History")
+
+            VStack(spacing: s(8)) {
+                ForEach(0..<4, id: \.self) { index in
+                    VStack(alignment: .leading, spacing: s(8)) {
+                        RoundedRectangle(cornerRadius: s(3), style: .continuous)
+                            .fill(Color.white.opacity(0.12))
+                            .frame(
+                                width: s(index == 3 ? 164 : 226),
+                                height: s(10)
+                            )
+                        RoundedRectangle(cornerRadius: s(3), style: .continuous)
+                            .fill(Color.white.opacity(0.07))
+                            .frame(width: s(78), height: s(8))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, s(18))
+                    .padding(.vertical, s(10))
+                    .accessibilityHidden(true)
+                }
+            }
+            .padding(.top, s(4))
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityLabel("Loading Continue history")
+    }
+
+    private var historyListCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            historyHeader(title: "History")
+
+            if let error = model.historyError?.nonEmpty {
+                historyErrorState(error)
+            } else if model.historyItems.isEmpty {
+                historyEmptyState
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.historyItems) { item in
+                            historyRow(item)
+                        }
+
+                        if model.historyNextCursor != nil {
+                            Button(action: onLoadOlderHistory) {
+                                HStack(spacing: s(7)) {
+                                    if model.historyLoadingOlder {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .tint(WhisperFlowStyle.accent)
+                                    }
+                                    Text(
+                                        model.historyLoadingOlder
+                                            ? "Loading older answers…"
+                                            : "Load older answers"
+                                    )
+                                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                                    .foregroundColor(WhisperFlowStyle.accent)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, s(15))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.historyLoadingOlder)
+                            .accessibilityLabel(
+                                model.historyLoadingOlder
+                                    ? "Loading older Continue answers"
+                                    : "Load older Continue answers"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func historyHeader(title: String) -> some View {
+        HStack(spacing: s(8)) {
+            Text(title)
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityFocused($historyHeadingFocused)
+
+            Spacer(minLength: 0)
+
+            Text("Latest 100")
+                .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                .foregroundColor(.white.opacity(0.58))
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, s(18))
+        .frame(height: s(kWhisperFlowHistoryHeaderH))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(WhisperFlowStyle.outline.opacity(0.74))
+                .frame(height: s(1))
+        }
+    }
+
+    private func historyRow(_ item: ContinueHistorySummaryV1) -> some View {
+        let fullTimestamp = historyFullTimestamp(item.createdAtMs)
+        let isCurrent = item.decisionId == model.currentDecisionId
+
+        return Button {
+            onSelectHistoryOutput(item.decisionId)
+        } label: {
+            HStack(alignment: .center, spacing: s(12)) {
+                VStack(alignment: .leading, spacing: s(6)) {
+                    Text(item.title)
+                        .font(Brand.swiftUIFont(size: s(13), weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Text(historyRelativeTimestamp(item.createdAtMs))
+                        .font(Brand.swiftUIFont(size: s(11), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+
+                if isCurrent {
+                    Text("Current")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .semibold))
+                        .foregroundColor(WhisperFlowStyle.accent)
+                        .padding(.horizontal, s(7))
+                        .padding(.vertical, s(4))
+                        .background(
+                            Capsule()
+                                .fill(WhisperFlowStyle.accent.opacity(0.10))
+                        )
+                        .overlay(
+                            Capsule()
+                                .stroke(WhisperFlowStyle.accent.opacity(0.34), lineWidth: s(1))
+                        )
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: s(9), weight: .semibold))
+                        .foregroundColor(.white.opacity(0.36))
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, s(18))
+            .padding(.vertical, s(11))
+            .frame(minHeight: s(kWhisperFlowHistoryRowMinH))
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(WhisperFlowStyle.outline.opacity(0.64))
+                    .frame(height: s(1))
+                    .padding(.leading, s(18))
+            }
+        }
+        .buttonStyle(.plain)
+        .help(fullTimestamp)
+        .accessibilityLabel(
+            "\(item.title). \(fullTimestamp). \(isCurrent ? "Current answer" : "Past answer")"
+        )
+        .accessibilityHint("Opens this saved Continue answer")
+    }
+
+    private var historyEmptyState: some View {
+        VStack(spacing: s(7)) {
+            Spacer(minLength: 0)
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: s(18), weight: .medium))
+                .foregroundColor(.white.opacity(0.46))
+                .accessibilityHidden(true)
+            Text("No previous answers yet")
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+            Text("Use Continue to create one")
+                .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                .foregroundColor(.white.opacity(0.62))
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func historyErrorState(_ error: String) -> some View {
+        VStack(spacing: s(8)) {
+            Spacer(minLength: 0)
+            Text("History unavailable")
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+            Text(error)
+                .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                .foregroundColor(.white.opacity(0.62))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+            Button("Retry", action: onRetryHistory)
+                .buttonStyle(.plain)
+                .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                .foregroundColor(WhisperFlowStyle.accent)
+                .padding(.top, s(3))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, s(28))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historyDetailCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: s(10)) {
+                Button(action: onBackFromHistoryDetail) {
+                    HStack(spacing: s(5)) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: s(9), weight: .bold))
+                        Text("Back")
+                    }
+                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                    .foregroundColor(WhisperFlowStyle.accent)
+                    .frame(minWidth: s(54), minHeight: s(30), alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Back to Continue history")
+                .accessibilityFocused($historyDetailFocused)
+
+                Spacer(minLength: 0)
+
+                if let output = model.historySelectedOutput {
+                    Text("Past answer · \(historyFullTimestamp(output.createdAtMs))")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .help(historyFullTimestamp(output.createdAtMs))
+                } else {
+                    Text("Past answer")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                }
+            }
+            .padding(.horizontal, s(18))
+            .frame(height: s(kWhisperFlowHistoryHeaderH))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(WhisperFlowStyle.outline.opacity(0.74))
+                    .frame(height: s(1))
+            }
+
+            if model.historyDetailLoading {
+                VStack(spacing: s(9)) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(WhisperFlowStyle.accent)
+                    Text("Loading saved answer…")
+                        .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement(children: .combine)
+            } else if let error = model.historyDetailError?.nonEmpty {
+                VStack(spacing: s(8)) {
+                    Spacer(minLength: 0)
+                    Text("Answer unavailable")
+                        .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                        .foregroundColor(.white)
+                    Text(error)
+                        .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                        .multilineTextAlignment(.center)
+                    Button("Retry", action: onRetryHistoryDetail)
+                        .buttonStyle(.plain)
+                        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                        .foregroundColor(WhisperFlowStyle.accent)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, s(28))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let output = model.historySelectedOutput {
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
+                        Text(output.title)
+                            .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                            .foregroundColor(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if !output.rows.isEmpty {
+                            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerRowSpacing)) {
+                                ForEach(output.rows) { row in
+                                    VStack(
+                                        alignment: .leading,
+                                        spacing: s(kWhisperFlowAnswerLabelValueSpacing)
+                                    ) {
+                                        Text(row.label)
+                                            .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                            .foregroundColor(WhisperFlowStyle.accent)
+                                        Text(row.value)
+                                            .font(Brand.swiftUIFont(size: s(14), weight: .regular))
+                                            .foregroundColor(.white)
+                                            .lineSpacing(s(3))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, s(18))
+                    .padding(.vertical, s(18))
+                }
+                .accessibilityLabel(
+                    "Past Continue answer from \(historyFullTimestamp(output.createdAtMs))"
+                )
+            }
+        }
+    }
+
+    private var historyButtonOffsetX: CGFloat {
+        let direction: CGFloat = model.historyLayout.controlOnLeft ? -1 : 1
+        return model.historyLayout.capsuleOffsetX
+            + direction * (
+                renderedCapsuleWidth / 2
+                    + kWhisperFlowHistoryButtonGap
+                    + kWhisperFlowHistoryButtonVisualSize / 2
+            )
+    }
+
+    private var historyButtonOffsetY: CGFloat {
+        max(0, (renderedCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2)
+    }
+
+    private var renderedCapsuleWidth: CGFloat {
+        switch renderedIslandPresentation {
+        case .answerSummary:
+            return model.answerLayout.summaryWidth
+        case .ambientMemory:
+            return ambientCapsuleWidth
+        default:
+            return 0
+        }
+    }
+
+    private var renderedCapsuleHeight: CGFloat {
+        switch renderedIslandPresentation {
+        case .answerSummary:
+            return kWhisperFlowAnswerSummaryH
+        case .ambientMemory:
+            return ambientCapsuleHeight
+        default:
+            return 0
+        }
+    }
+
+    private var historyCardTop: CGFloat {
+        renderedCapsuleHeight + kWhisperFlowHistoryCardGap
+    }
+
     private var morphAnimation: Animation {
         .timingCurve(
             0.23,
@@ -2149,6 +2825,19 @@ private struct WhisperFlowIslandView: View {
             duration: reduceMotion
                 ? kWhisperFlowReducedMotionFadeDuration
                 : kWhisperFlowMorphDuration
+        )
+    }
+
+    private var presentationAnimation: Animation {
+        guard model.presentation.isHistory else { return morphAnimation }
+        return .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: shouldReduceMotion
+                ? kWhisperFlowReducedMotionFadeDuration
+                : kWhisperFlowHistoryTransitionDuration
         )
     }
 
@@ -2232,6 +2921,20 @@ private final class SessionIslandController: NSObject {
     private var memoryTransitionCountdownNonce: UInt64 = 0
     private var startingFeedbackNonceCounter: UInt64 = 0
     private var activeStartingFeedbackNonce: UInt64?
+    private var historyOriginPresentation: WhisperFlowPresentation = .ambientMemory
+    private var historyItems: [ContinueHistorySummaryV1] = []
+    private var historyNextCursor: ContinueHistoryCursorV1?
+    private var historyError: String?
+    private var historyLoadingOlder = false
+    private var historySelectedOutput: ContinueHistoryOutputV1?
+    private var historySelectedDecisionId: String?
+    private var historyDetailLoading = false
+    private var historyDetailError: String?
+    private var historyRequestId: UInt64 = 0
+    private var activeHistoryPageRequestId: UInt64?
+    private var activeHistoryDetailRequestId: UInt64?
+    private var historyAnchor: NSPoint?
+    private var historyLayout = WhisperFlowHistoryLayout()
 
     func initializeIfNeeded() {
         if panel == nil {
@@ -2251,6 +2954,8 @@ private final class SessionIslandController: NSObject {
             }
         }
 
+        processHistoryResponses(from: snapshot)
+
         if snapshot.memoryActive ||
             snapshot.state == "starting" ||
             snapshot.state == "processing" {
@@ -2263,6 +2968,9 @@ private final class SessionIslandController: NSObject {
         }
 
         if snapshot.state == "trail_reconstructing" {
+            if presentation.isHistory {
+                closeHistory()
+            }
             continueRequestInFlight = true
             setPresentation(.generating)
         } else if continueRequestInFlight,
@@ -2316,6 +3024,7 @@ private final class SessionIslandController: NSObject {
         latchedAnswer = nil
         latchedDecisionId = nil
         clearVisualCue()
+        clearHistoryState()
         answerLayout = WhisperFlowAnswerLayout()
         cancelPresentationTimers()
         updateOutsideClickMonitors()
@@ -2360,6 +3069,7 @@ private final class SessionIslandController: NSObject {
         latchedAnswer = nil
         latchedDecisionId = nil
         clearVisualCue()
+        clearHistoryState()
         answerLayout = WhisperFlowAnswerLayout()
     }
 
@@ -2765,6 +3475,232 @@ private final class SessionIslandController: NSObject {
         )
     }
 
+    private func toggleHistory() {
+        if presentation.isHistory {
+            closeHistory()
+        } else {
+            openHistory()
+        }
+    }
+
+    private func openHistory() {
+        guard historyButtonShouldBeVisible,
+              presentation == .ambientMemory || presentation == .answerSummary else { return }
+        cancelPresentationTimers()
+        historyOriginPresentation = presentation
+        if let panel {
+            historyAnchor = NSPoint(x: panel.frame.midX, y: panel.frame.maxY)
+        }
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        setPresentation(.historyLoading)
+        if !sendAction(
+            "open_continue_history",
+            historyRequestId: requestId
+        ) {
+            activeHistoryPageRequestId = nil
+            historyError = "Smalltalk could not request saved answers."
+            setPresentation(.historyList)
+        }
+    }
+
+    private func closeHistory() {
+        guard presentation.isHistory else { return }
+        let origin = historyOriginPresentation
+        setPresentation(origin)
+        historyAnchor = nil
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryPageRequestId = nil
+        historyLoadingOlder = false
+        activeHistoryDetailRequestId = nil
+        refreshHistoryLayout()
+        updateContent()
+        if origin == .ambientMemory, !ambientHovered {
+            scheduleAmbientHoverReturn()
+        }
+    }
+
+    private func showHistoryList() {
+        guard presentation == .historyDetail else { return }
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryDetailRequestId = nil
+        setPresentation(.historyList)
+    }
+
+    private func loadOlderHistory() {
+        guard presentation == .historyList,
+              !historyLoadingOlder,
+              let cursor = historyNextCursor else { return }
+        historyLoadingOlder = true
+        historyError = nil
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        updateContent()
+        if !sendAction(
+            "load_older_continue_history",
+            historyRequestId: requestId,
+            historyCursor: cursor
+        ) {
+            activeHistoryPageRequestId = nil
+            historyLoadingOlder = false
+            historyError = "Smalltalk could not load older answers."
+            updateContent()
+        }
+    }
+
+    private func retryHistory() {
+        guard presentation == .historyList || presentation == .historyLoading else { return }
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        setPresentation(.historyLoading)
+        if !sendAction(
+            "retry_continue_history",
+            historyRequestId: requestId
+        ) {
+            activeHistoryPageRequestId = nil
+            historyError = "Smalltalk could not retry saved answers."
+            setPresentation(.historyList)
+        }
+    }
+
+    private func selectHistoryOutput(_ decisionId: String) {
+        let cleanDecisionId = decisionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard presentation == .historyList, !cleanDecisionId.isEmpty else { return }
+        historySelectedDecisionId = cleanDecisionId
+        historySelectedOutput = nil
+        historyDetailError = nil
+        historyDetailLoading = true
+        let requestId = nextHistoryRequestId()
+        activeHistoryDetailRequestId = requestId
+        setPresentation(.historyDetail)
+        if !sendAction(
+            "select_continue_history_output",
+            decisionId: cleanDecisionId,
+            historyRequestId: requestId
+        ) {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            historyDetailError = "Smalltalk could not load this saved answer."
+            updateContent()
+        }
+    }
+
+    private func retryHistoryDetail() {
+        guard presentation == .historyDetail,
+              let decisionId = historySelectedDecisionId else { return }
+        historySelectedOutput = nil
+        historyDetailError = nil
+        historyDetailLoading = true
+        let requestId = nextHistoryRequestId()
+        activeHistoryDetailRequestId = requestId
+        updateContent()
+        if !sendAction(
+            "select_continue_history_output",
+            decisionId: decisionId,
+            historyRequestId: requestId
+        ) {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            historyDetailError = "Smalltalk could not retry this saved answer."
+            updateContent()
+        }
+    }
+
+    private func nextHistoryRequestId() -> UInt64 {
+        historyRequestId &+= 1
+        return historyRequestId
+    }
+
+    private func processHistoryResponses(from snapshot: IslandSnapshot) {
+        if let page = snapshot.continueHistoryPage,
+           page.requestId == activeHistoryPageRequestId {
+            activeHistoryPageRequestId = nil
+            let wasLoadingOlder = historyLoadingOlder
+            historyLoadingOlder = false
+
+            if let error = page.error?.nonEmpty {
+                historyError = error
+            } else {
+                historyError = nil
+                if wasLoadingOlder {
+                    var knownDecisionIds = Set(historyItems.map(\.decisionId))
+                    for item in page.items where knownDecisionIds.insert(item.decisionId).inserted {
+                        historyItems.append(item)
+                    }
+                } else {
+                    historyItems = page.items
+                }
+                historyNextCursor = page.nextCursor
+            }
+
+            if presentation == .historyLoading {
+                setPresentation(.historyList)
+            } else {
+                updateContent()
+            }
+        }
+
+        if let output = snapshot.continueHistoryOutput,
+           output.requestId == activeHistoryDetailRequestId {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            if let error = output.error?.nonEmpty {
+                historySelectedOutput = nil
+                historyDetailError = error
+            } else if output.decisionId == historySelectedDecisionId {
+                historySelectedOutput = output
+                historyDetailError = nil
+            }
+            updateContent()
+        }
+    }
+
+    private func clearHistoryState() {
+        historyOriginPresentation = .ambientMemory
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryPageRequestId = nil
+        activeHistoryDetailRequestId = nil
+        historyAnchor = nil
+        historyLayout = WhisperFlowHistoryLayout()
+    }
+
+    private func dismissOnePresentationLevel() {
+        if presentation == .historyDetail {
+            showHistoryList()
+        } else if presentation == .historyList || presentation == .historyLoading {
+            closeHistory()
+        } else if presentation == .answerExpanded {
+            showAnswerSummary()
+        } else if presentation == .answerSummary {
+            returnToDefaultPresentation()
+        }
+    }
+
     private func returnToDefaultPresentation() {
         cancelMemoryTransitionCountdown()
         setPresentation(.micro)
@@ -2833,6 +3769,9 @@ private final class SessionIslandController: NSObject {
     }
 
     private func beginMemoryTransitionCountdown(forMemoryStart: Bool) {
+        if presentation.isHistory {
+            closeHistory()
+        }
         cancelAmbientHoverReturn()
         cancelMemoryTransitionCountdown()
         memoryTransitionCountdownActive = true
@@ -2887,13 +3826,104 @@ private final class SessionIslandController: NSObject {
 
     private func markPanelDragBegan() {}
 
+    private func markPanelDragEnded() {
+        if presentation.isHistory, let panel {
+            historyAnchor = NSPoint(
+                x: panel.frame.midX
+                    + historyLayout.capsuleOffsetX * gOverlayScale,
+                y: panel.frame.maxY
+            )
+        }
+        positionPanel(preserveCurrentAnchor: true, animated: false)
+    }
+
+    private func shouldBeginWindowDrag(at point: NSPoint) -> Bool {
+        if historyControlRect.contains(point) {
+            return false
+        }
+        if presentation.isHistory {
+            let capsuleCenterX = targetPanelSize.width / 2
+                + historyLayout.capsuleOffsetX * gOverlayScale
+            let capsuleWidth = historyCapsuleWidth * gOverlayScale
+            let capsuleHeight = historyCapsuleHeight * gOverlayScale
+            let capsuleRect = NSRect(
+                x: capsuleCenterX - capsuleWidth / 2,
+                y: targetPanelSize.height - capsuleHeight,
+                width: capsuleWidth,
+                height: capsuleHeight
+            )
+            return capsuleRect.contains(point)
+        }
+        return true
+    }
+
+    private var historyControlRect: NSRect {
+        guard historyButtonShouldBeVisible else { return .zero }
+        let direction: CGFloat = historyLayout.controlOnLeft ? -1 : 1
+        let controlCenterX = targetPanelSize.width / 2
+            + historyLayout.capsuleOffsetX * gOverlayScale
+            + direction * (
+                historyCapsuleWidth / 2
+                    + kWhisperFlowHistoryButtonGap
+                    + kWhisperFlowHistoryButtonVisualSize / 2
+            ) * gOverlayScale
+        let controlTop = max(
+            0,
+            (historyCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2
+        ) * gOverlayScale
+        let controlCenterY = targetPanelSize.height
+            - controlTop
+            - kWhisperFlowHistoryButtonHitSize * gOverlayScale / 2
+        let radius = kWhisperFlowHistoryButtonHitSize * gOverlayScale / 2
+        return NSRect(
+            x: controlCenterX - radius,
+            y: controlCenterY - radius,
+            width: radius * 2,
+            height: radius * 2
+        )
+    }
+
+    private var historyCapsuleHeight: CGFloat {
+        let target = presentation.isHistory ? historyOriginPresentation : presentation
+        switch target {
+        case .answerSummary:
+            return kWhisperFlowAnswerSummaryH
+        case .ambientMemory:
+            return memoryTransitionCountdownActive || continueRequestInFlight
+                ? kWhisperFlowNotificationH
+                : kWhisperFlowCaptureH
+        default:
+            return 0
+        }
+    }
+
     private func cancelPresentationTimers() {
         cancelAmbientHoverReturn()
         cancelMemoryTransitionCountdown()
     }
 
     private var targetPanelSize: NSSize {
-        switch presentation {
+        let base = basePanelSize(
+            for: presentation.isHistory ? historyOriginPresentation : presentation
+        )
+        if presentation.isHistory {
+            return NSSize(
+                width: historyLayout.canvasWidth * gOverlayScale,
+                height: historyLayout.canvasHeight * gOverlayScale
+            )
+        }
+        if historyButtonShouldBeVisible {
+            return NSSize(
+                width: base.width
+                    + kWhisperFlowHistoryAccessoryAllowance * 2 * gOverlayScale,
+                height: base.height
+            )
+        }
+        return base
+    }
+
+    private func basePanelSize(for targetPresentation: WhisperFlowPresentation) -> NSSize {
+        switch targetPresentation {
         case .micro:
             return NSSize(
                 width: kWhisperFlowCapturePanelW * gOverlayScale,
@@ -2922,6 +3952,116 @@ private final class SessionIslandController: NSObject {
                 width: answerLayout.expandedWidth * gOverlayScale,
                 height: answerLayout.expandedHeight * gOverlayScale
             )
+        case .historyLoading, .historyList, .historyDetail:
+            return basePanelSize(for: historyOriginPresentation)
+        }
+    }
+
+    private var historyButtonShouldBeVisible: Bool {
+        if presentation.isHistory || presentation == .answerSummary {
+            return true
+        }
+        return presentation == .ambientMemory
+            && !continueRequestInFlight
+            && !memoryTransitionCountdownActive
+            && snapshot.state != "starting"
+            && snapshot.state != "processing"
+    }
+
+    private func refreshHistoryLayout() {
+        let screen = historyAnchor.flatMap(screenContaining)
+            ?? panel?.screen
+            ?? screenContaining(NSEvent.mouseLocation)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleSize = screen?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
+        let usableWidth = max(1, visibleSize.width / gOverlayScale)
+        let usableHeight = max(1, visibleSize.height / gOverlayScale)
+        let availableHeightBelowAnchor = historyAnchor.map { anchor in
+            max(1, (anchor.y - (screen?.visibleFrame.minY ?? 0)) / gOverlayScale)
+        } ?? usableHeight
+        let basePresentation = presentation.isHistory
+            ? historyOriginPresentation
+            : presentation
+        let base = basePanelSize(for: basePresentation)
+        let baseWidth = base.width / gOverlayScale
+        let baseHeight = base.height / gOverlayScale
+
+        if presentation.isHistory {
+            let cardWidth = min(
+                kWhisperFlowHistoryCardMaxW,
+                max(
+                    kWhisperFlowHistoryCardMinW,
+                    min(kWhisperFlowHistoryCardPreferredW, usableWidth - 24)
+                )
+            )
+            let cardHeight = max(
+                1,
+                min(
+                    kWhisperFlowHistoryCardPreferredH,
+                    usableHeight * 0.60,
+                    availableHeightBelowAnchor
+                        - historyCapsuleHeight
+                        - kWhisperFlowHistoryCardGap
+                        - 12
+                )
+            )
+            historyLayout.cardWidth = cardWidth
+            historyLayout.cardHeight = cardHeight
+            historyLayout.canvasWidth = min(
+                usableWidth,
+                max(
+                    cardWidth,
+                    baseWidth + kWhisperFlowHistoryAccessoryAllowance * 2
+                )
+            )
+            historyLayout.canvasHeight = historyCapsuleHeight
+                + kWhisperFlowHistoryCardGap
+                + cardHeight
+        } else {
+            historyLayout.cardWidth = kWhisperFlowHistoryCardPreferredW
+            historyLayout.cardHeight = kWhisperFlowHistoryCardPreferredH
+            historyLayout.canvasWidth = baseWidth
+                + (historyButtonShouldBeVisible
+                    ? kWhisperFlowHistoryAccessoryAllowance * 2
+                    : 0)
+            historyLayout.canvasHeight = baseHeight
+            historyLayout.capsuleOffsetX = 0
+        }
+    }
+
+    private func updateHistoryPlacement(for frame: NSRect) {
+        let anchor = historyAnchor
+            ?? NSPoint(x: frame.midX, y: frame.maxY)
+        historyLayout.capsuleOffsetX = presentation.isHistory
+            ? (anchor.x - frame.midX) / gOverlayScale
+            : 0
+
+        let screen = screenContaining(anchor)
+            ?? panel?.screen
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleFrame = screen?.visibleFrame ?? frame
+        let capsuleWidth = historyCapsuleWidth
+        let leftEdge = anchor.x
+            - (capsuleWidth / 2
+                + kWhisperFlowHistoryButtonGap
+                + kWhisperFlowHistoryButtonVisualSize / 2
+                + kWhisperFlowHistoryButtonHitSize / 2) * gOverlayScale
+        historyLayout.controlOnLeft = leftEdge >= visibleFrame.minX + 4
+    }
+
+    private var historyCapsuleWidth: CGFloat {
+        let target = presentation.isHistory ? historyOriginPresentation : presentation
+        switch target {
+        case .answerSummary:
+            return answerLayout.summaryWidth
+        case .ambientMemory:
+            return memoryTransitionCountdownActive || continueRequestInFlight
+                ? kWhisperFlowNotificationW
+                : kWhisperFlowCaptureW
+        default:
+            return 0
         }
     }
 
@@ -2955,18 +4095,24 @@ private final class SessionIslandController: NSObject {
 
     private func positionPanel(preserveCurrentAnchor: Bool, animated: Bool) {
         guard panel != nil else { return }
-        setPanelFrame(
-            resolvedPanelFrame(preserveCurrentAnchor: preserveCurrentAnchor),
-            animated: animated
-        )
+        refreshHistoryLayout()
+        let frame = resolvedPanelFrame(preserveCurrentAnchor: preserveCurrentAnchor)
+        updateHistoryPlacement(for: frame)
+        setPanelFrame(frame, animated: animated)
+        updateContent()
     }
 
     private func resolvedPanelFrame(preserveCurrentAnchor: Bool) -> NSRect {
         let size = targetPanelSize
         let currentFrame = panel?.frame ?? .zero
-        let anchor = preserveCurrentAnchor && currentFrame.width > 0 && currentFrame.height > 0
-            ? NSPoint(x: currentFrame.midX, y: currentFrame.maxY)
-            : initialTopCenterAnchor(for: size)
+        let anchor: NSPoint
+        if let historyAnchor {
+            anchor = historyAnchor
+        } else if preserveCurrentAnchor && currentFrame.width > 0 && currentFrame.height > 0 {
+            anchor = NSPoint(x: currentFrame.midX, y: currentFrame.maxY)
+        } else {
+            anchor = initialTopCenterAnchor(for: size)
+        }
         let screen = screenContaining(anchor)
             ?? screenContaining(NSEvent.mouseLocation)
             ?? NSScreen.main
@@ -3033,6 +4179,7 @@ private final class SessionIslandController: NSObject {
 
     private func updateContent() {
         guard let panel, let contentView = panel.contentView else { return }
+        panel.isMovableByWindowBackground = !presentation.isHistory
         if islandModel.presentation != presentation {
             islandModel.presentation = presentation
         }
@@ -3079,6 +4226,45 @@ private final class SessionIslandController: NSObject {
         if islandModel.visualCuePresented != visualCuePresented {
             islandModel.visualCuePresented = visualCuePresented
         }
+        if islandModel.historyOriginPresentation != historyOriginPresentation {
+            islandModel.historyOriginPresentation = historyOriginPresentation
+        }
+        if islandModel.historyButtonVisible != historyButtonShouldBeVisible {
+            islandModel.historyButtonVisible = historyButtonShouldBeVisible
+        }
+        if islandModel.historyItems != historyItems {
+            islandModel.historyItems = historyItems
+        }
+        if islandModel.historyNextCursor != historyNextCursor {
+            islandModel.historyNextCursor = historyNextCursor
+        }
+        if islandModel.historyError != historyError {
+            islandModel.historyError = historyError
+        }
+        if islandModel.historyLoadingOlder != historyLoadingOlder {
+            islandModel.historyLoadingOlder = historyLoadingOlder
+        }
+        if islandModel.historySelectedOutput != historySelectedOutput {
+            islandModel.historySelectedOutput = historySelectedOutput
+        }
+        if islandModel.historySelectedDecisionId != historySelectedDecisionId {
+            islandModel.historySelectedDecisionId = historySelectedDecisionId
+        }
+        if islandModel.historyDetailLoading != historyDetailLoading {
+            islandModel.historyDetailLoading = historyDetailLoading
+        }
+        if islandModel.historyDetailError != historyDetailError {
+            islandModel.historyDetailError = historyDetailError
+        }
+        let currentDecisionId = latchedDecisionId
+            ?? snapshot.islandContinueState?.decisionId
+            ?? snapshot.continueDecisionId
+        if islandModel.currentDecisionId != currentDecisionId {
+            islandModel.currentDecisionId = currentDecisionId
+        }
+        if islandModel.historyLayout != historyLayout {
+            islandModel.historyLayout = historyLayout
+        }
 
         guard hostingView == nil else { return }
 
@@ -3111,12 +4297,42 @@ private final class SessionIslandController: NSObject {
             },
             onToggleVisualCue: { [weak self] in
                 self?.toggleVisualCue()
+            },
+            onToggleHistory: { [weak self] in
+                self?.toggleHistory()
+            },
+            onHistoryButtonHover: { [weak self] hovering in
+                self?.ambientHoverChanged(hovering)
+            },
+            onLoadOlderHistory: { [weak self] in
+                self?.loadOlderHistory()
+            },
+            onRetryHistory: { [weak self] in
+                self?.retryHistory()
+            },
+            onRetryHistoryDetail: { [weak self] in
+                self?.retryHistoryDetail()
+            },
+            onSelectHistoryOutput: { [weak self] decisionId in
+                self?.selectHistoryOutput(decisionId)
+            },
+            onBackFromHistoryDetail: { [weak self] in
+                self?.showHistoryList()
+            },
+            onDismissOneLevel: { [weak self] in
+                self?.dismissOnePresentationLevel()
             }
         )
 
         let hosting = DraggableHostingView(rootView: AnyView(view))
         hosting.onDragBegan = { [weak self] in
             self?.markPanelDragBegan()
+        }
+        hosting.onDragEnded = { [weak self] in
+            self?.markPanelDragEnded()
+        }
+        hosting.shouldBeginWindowDrag = { [weak self] point in
+            self?.shouldBeginWindowDrag(at: point) ?? false
         }
         hosting.configureTransparentLayer()
         hosting.frame = contentView.bounds
@@ -3199,7 +4415,11 @@ private final class SessionIslandController: NSObject {
     }
 
     private func updateOutsideClickMonitors() {
-        if visible && (presentation == .answerSummary || presentation == .answerExpanded) {
+        if visible && (
+            presentation == .answerSummary
+                || presentation == .answerExpanded
+                || presentation.isHistory
+        ) {
             installOutsideClickMonitors()
         } else {
             removeOutsideClickMonitors()
@@ -3235,7 +4455,10 @@ private final class SessionIslandController: NSObject {
     }
 
     private func collapseIfOutside(_ event: NSEvent) {
-        guard presentation == .answerSummary || presentation == .answerExpanded, let panel else { return }
+        guard presentation == .answerSummary
+                || presentation == .answerExpanded
+                || presentation.isHistory,
+              let panel else { return }
         if event.window === panel {
             return
         }
@@ -3244,12 +4467,7 @@ private final class SessionIslandController: NSObject {
         }
 
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.presentation == .answerExpanded {
-                self.showAnswerSummary()
-            } else if self.presentation == .answerSummary {
-                self.returnToDefaultPresentation()
-            }
+            self?.dismissOnePresentationLevel()
         }
     }
 
@@ -3261,7 +4479,9 @@ private final class SessionIslandController: NSObject {
         taskSnapshotId: String? = nil,
         taskSnapshotRevision: Int64? = nil,
         affectedTaskField: String? = nil,
-        taskHypothesisId: String? = nil
+        taskHypothesisId: String? = nil,
+        historyRequestId: UInt64? = nil,
+        historyCursor: ContinueHistoryCursorV1? = nil
     ) -> Bool {
         guard let callback = gActionCallback else { return false }
         var fields = ["\"action\":\"\(jsonEscaped(action))\""]
@@ -3282,6 +4502,15 @@ private final class SessionIslandController: NSObject {
         }
         if let taskHypothesisId, !taskHypothesisId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             fields.append("\"task_hypothesis_id\":\"\(jsonEscaped(taskHypothesisId))\"")
+        }
+        if let historyRequestId {
+            fields.append("\"history_request_id\":\(historyRequestId)")
+        }
+        if let historyCursor {
+            fields.append(
+                "\"history_cursor\":{\"created_at_ms\":\(historyCursor.createdAtMs),"
+                    + "\"decision_id\":\"\(jsonEscaped(historyCursor.decisionId))\"}"
+            )
         }
         fields.append("\"source\":\"native_island\"")
         let json = "{\(fields.joined(separator: ","))}"
@@ -3336,6 +4565,8 @@ private final class IslandTrackingView: NSView {
 @available(macOS 13.0, *)
 private final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     var onDragBegan: (() -> Void)?
+    var onDragEnded: (() -> Void)?
+    var shouldBeginWindowDrag: ((NSPoint) -> Bool)?
     private var dragMonitor: Any?
     private var dragStartLocation = NSPoint.zero
 
@@ -3361,6 +4592,7 @@ private final class DraggableHostingView<Content: View>: NSHostingView<Content> 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         guard let window else { return }
+        guard shouldBeginWindowDrag?(event.locationInWindow) ?? true else { return }
 
         if let dragMonitor {
             NSEvent.removeMonitor(dragMonitor)
@@ -3388,6 +4620,7 @@ private final class DraggableHostingView<Content: View>: NSHostingView<Content> 
                     }
                     self.onDragBegan?()
                     window.performDrag(with: event)
+                    self.onDragEnded?()
                     return nil
                 }
                 return event

@@ -4591,6 +4591,19 @@ pub fn get_continue_decision(
             eprintln!("[mfti_review] artifact write failed: {error}");
         }
     }
+    let history_created_at_ms = request
+        .manual_continue_started_at_ms
+        .unwrap_or_else(now_millis);
+    if let Err(error) = crate::continuation::history::record_explicit_continue_output(
+        &conn,
+        &request,
+        history_created_at_ms,
+        &result,
+    ) {
+        // History is an optional read-only surface. A storage failure must not
+        // turn an otherwise valid Continue answer into an application error.
+        eprintln!("[continue_history] final output persistence failed: {error}");
+    }
     Ok(result)
 }
 
@@ -4898,6 +4911,23 @@ pub fn get_continue_decision_trace(
 ) -> Result<crate::continuation::ContinueDecisionTrace, String> {
     let conn = open_db(&app)?;
     crate::continuation::get_continue_decision_trace(&conn, input)
+}
+
+pub(crate) fn list_continue_history_for_island(
+    app: &AppHandle,
+    cursor: Option<&crate::continuation::history::ContinueHistoryCursorV1>,
+    limit: Option<usize>,
+) -> Result<crate::continuation::history::ContinueHistoryPageV1, String> {
+    let conn = open_readonly_db(app)?;
+    crate::continuation::history::list_continue_history(&conn, cursor, limit)
+}
+
+pub(crate) fn get_continue_history_output_for_island(
+    app: &AppHandle,
+    decision_id: &str,
+) -> Result<Option<crate::continuation::history::ContinueHistoryOutputV1>, String> {
+    let conn = open_readonly_db(app)?;
+    crate::continuation::history::get_continue_history_output(&conn, decision_id)
 }
 
 #[derive(Debug, Clone, Serialize)]
