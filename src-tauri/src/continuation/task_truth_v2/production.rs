@@ -13,11 +13,19 @@ use super::selection::SNAPSHOT_SELECTION_POLICY_V1;
 use super::task_snapshot::{TaskSnapshotV2, TASK_SNAPSHOT_SCHEMA_V2};
 use super::verifier::TASK_TRUTH_VERIFIER_VERSION;
 
-pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v4";
+pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v5";
 pub(crate) const TASK_TRUTH_AUTHORITY_POLICY_V1: &str =
     "smalltalk.model_first_task_truth_authority_policy.v1";
 
 fn default_public_task_basis() -> String {
+    "unresolved".into()
+}
+
+fn default_public_task_state() -> String {
+    "unclear".into()
+}
+
+fn default_public_model_status() -> String {
     "unresolved".into()
 }
 
@@ -63,6 +71,10 @@ pub struct TaskTruthFieldSupportV1 {
     pub confidence: Option<f64>,
     pub support_status: String,
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub missing_evidence: Vec<String>,
+    #[serde(default)]
+    pub verifier_result: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -131,6 +143,26 @@ pub struct TaskTruthPublicAnswerV1 {
     #[serde(default = "default_public_task_basis")]
     pub task_basis: String,
     pub task_resolution_status: String,
+    /// Raw compact-provider status. Public compatibility status may be locally
+    /// downgraded after verification, but this value is never upgraded.
+    #[serde(default = "default_public_model_status")]
+    pub model_resolution_status: String,
+    /// LCA-02 authoritative meaning: the newest concrete unfinished objective.
+    #[serde(default)]
+    pub unfinished_task: Option<String>,
+    /// LCA-02 authoritative lifecycle state. Compatibility execution fields are
+    /// derived from this value for compact answers and never override it.
+    #[serde(default = "default_public_task_state")]
+    pub task_state: String,
+    /// LCA-02 authoritative meaning: the exact meaningful state left behind.
+    #[serde(default)]
+    pub resume_point: Option<String>,
+    /// LCA-02 authoritative meaning: one admitted, evidence-supported action.
+    #[serde(default)]
+    pub next_supported_action: Option<String>,
+    /// Immediately relevant work already complete, never a second headline.
+    #[serde(default)]
+    pub completed_context: Option<String>,
     pub observed_surface: Option<String>,
     pub immediate_user_operation: Option<String>,
     pub semantic_effect_of_operation: Option<String>,
@@ -172,6 +204,12 @@ impl Default for TaskTruthPublicAnswerV1 {
             schema: TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1.into(),
             task_basis: "unresolved".into(),
             task_resolution_status: "unresolved".into(),
+            model_resolution_status: "unresolved".into(),
+            unfinished_task: None,
+            task_state: "unclear".into(),
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
             observed_surface: None,
             immediate_user_operation: None,
             semantic_effect_of_operation: None,
@@ -750,6 +788,11 @@ pub(crate) fn authoritative_runtime_enabled() -> bool {
 
 fn clear_unsupported_semantics(answer: &mut TaskTruthPublicAnswerV1, reason: &str) {
     answer.task_resolution_status = "unresolved".into();
+    answer.unfinished_task = None;
+    answer.task_state = "unclear".into();
+    answer.resume_point = None;
+    answer.next_supported_action = None;
+    answer.completed_context = None;
     answer.observed_surface = None;
     answer.immediate_user_operation = None;
     answer.semantic_effect_of_operation = None;
@@ -852,6 +895,259 @@ struct PersistedCorrectionProjection {
 /// categorically ineligible even if a stale JSON value is present.
 fn probe_status_allows_admitted_output(status: &str) -> bool {
     matches!(status, "success" | "support_slot_validation_failure")
+}
+
+/// Identity and diagnostic envelope for projecting one admitted compact result.
+/// Keeping this separate from SQLite lets production and deterministic replay
+/// exercise the exact same mapper without creating a second answer engine.
+#[derive(Debug, Clone)]
+pub(crate) struct CompactProbePublicMappingContext {
+    pub(crate) decision_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) packet_id: String,
+    pub(crate) evidence_watermark: String,
+    pub(crate) configured_model: String,
+    pub(crate) response_model: Option<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) provider_request_id: Option<String>,
+    pub(crate) provider_response_id: Option<String>,
+    pub(crate) diagnostic_status: String,
+    pub(crate) validation_issues: Vec<String>,
+    pub(crate) recent_context: Vec<TaskTruthRecentContextV1>,
+}
+
+/// Atomically maps the locally admitted LCA-02 contract to the public answer.
+/// Every compatibility field is derived from the same compact object. Local
+/// recap, task-thread, and target wording are deliberately absent here.
+pub(crate) fn map_compact_probe_output_to_public_answer(
+    output: &super::semantic_probe::ProbeModelOutput,
+    slots: &BTreeMap<String, super::semantic_probe::SupportSlot>,
+    context: &CompactProbePublicMappingContext,
+) -> TaskTruthPublicAnswerV1 {
+    let support = |probe_field: &str, value_present: bool| {
+        let evidence_refs = output
+            .support_slots_by_field
+            .get(probe_field)
+            .into_iter()
+            .flatten()
+            .filter_map(|slot_id| slots.get(slot_id))
+            .map(|slot| format!("{}:{}", slot.source_kind, slot.record_id))
+            .collect::<Vec<_>>();
+        let verifier_result = output
+            .verifier_result_by_field
+            .get(probe_field)
+            .copied()
+            .unwrap_or_default();
+        let support_status = match verifier_result {
+            super::semantic_probe::ProbeFieldVerifierResult::Admitted
+                if evidence_refs.is_empty() =>
+            {
+                "partial"
+            }
+            super::semantic_probe::ProbeFieldVerifierResult::Admitted => "supported",
+            super::semantic_probe::ProbeFieldVerifierResult::Rejected => "rejected",
+            super::semantic_probe::ProbeFieldVerifierResult::NotProposed => "unsupported",
+            super::semantic_probe::ProbeFieldVerifierResult::Pending if value_present => "partial",
+            super::semantic_probe::ProbeFieldVerifierResult::Pending => "unsupported",
+        };
+        TaskTruthFieldSupportV1 {
+            confidence: output.confidence_by_field.get(probe_field).copied(),
+            support_status: support_status.into(),
+            evidence_refs,
+            missing_evidence: output
+                .missing_evidence_by_field
+                .get(probe_field)
+                .cloned()
+                .unwrap_or_default(),
+            verifier_result: Some(verifier_result.label().into()),
+        }
+    };
+
+    let semantic_support = BTreeMap::from([
+        (
+            "unfinished_task".to_string(),
+            support("unfinished_task", output.unfinished_task.is_some()),
+        ),
+        (
+            "task_state".to_string(),
+            support(
+                "task_state",
+                output.task_state != super::semantic_probe::ProbeTaskState::Unclear,
+            ),
+        ),
+        (
+            "resume_point".to_string(),
+            support("resume_point", output.resume_point.is_some()),
+        ),
+        (
+            "next_supported_action".to_string(),
+            support(
+                "next_supported_action",
+                output.next_supported_action.is_some(),
+            ),
+        ),
+        (
+            "completed_context".to_string(),
+            support("completed_context", output.completed_context.is_some()),
+        ),
+        (
+            "where_summary".to_string(),
+            support("where_summary", output.where_summary.is_some()),
+        ),
+    ]);
+    let mut field_support = semantic_support.clone();
+    // Compatibility fields remain for existing consumers, but their support
+    // and wording come only from the corresponding new semantic meaning.
+    for (compatibility_field, semantic_field) in [
+        ("task_summary", "unfinished_task"),
+        ("execution_state", "task_state"),
+        ("current_subtask", "resume_point"),
+        ("unfinished_state", "resume_point"),
+        ("last_meaningful_progress", "completed_context"),
+        ("next_action", "next_supported_action"),
+    ] {
+        if let Some(value) = semantic_support.get(semantic_field) {
+            field_support.insert(compatibility_field.into(), value.clone());
+        }
+    }
+
+    let has_visible_semantics = output.unfinished_task.is_some()
+        || output.task_state != super::semantic_probe::ProbeTaskState::Unclear
+        || output.resume_point.is_some()
+        || output.next_supported_action.is_some()
+        || output.completed_context.is_some()
+        || output.where_summary.is_some();
+    let identity_seed = serde_json::json!({
+        "decision_id": context.decision_id,
+        "packet_id": context.packet_id,
+        "request_id": context.provider_request_id.as_ref().or(context.request_id.as_ref()),
+        "provider_response_id": context.provider_response_id,
+        "verifier_version": TASK_TRUTH_VERIFIER_VERSION,
+        "admitted_output": output,
+    });
+    let identity_hash = stable_hash(identity_seed.to_string().as_bytes());
+    let response_identity = context
+        .provider_response_id
+        .clone()
+        .unwrap_or_else(|| format!("provider-response-envelope-{identity_hash}"));
+    let selected_hypothesis_id =
+        has_visible_semantics.then(|| format!("pftu-hypothesis-{identity_hash}"));
+    let snapshot_id = format!("pftu-snapshot-{identity_hash}");
+    let task_thread_id = has_visible_semantics.then(|| format!("pftu-task-thread-{identity_hash}"));
+    let preview_frame_id = output
+        .support_slots_by_field
+        .values()
+        .flatten()
+        .filter_map(|slot_id| slots.get(slot_id))
+        .find_map(|slot| slot.frame_id.clone());
+    let raw_model_status = match output.status {
+        super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
+        super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partly_resolved",
+        super::semantic_probe::ProbeResolutionStatus::Unresolved => "unresolved",
+        super::semantic_probe::ProbeResolutionStatus::Refused => "refused",
+    };
+    let task_resolution_status = match output.status {
+        super::semantic_probe::ProbeResolutionStatus::Resolved
+            if !context.validation_issues.is_empty() =>
+        {
+            if has_visible_semantics {
+                "partial"
+            } else {
+                "unresolved"
+            }
+        }
+        super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
+        super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partial",
+        super::semantic_probe::ProbeResolutionStatus::Unresolved
+        | super::semantic_probe::ProbeResolutionStatus::Refused => "unresolved",
+    };
+    let semantic_source = if has_visible_semantics {
+        "cloud_multimodal_model"
+    } else {
+        "unresolved"
+    };
+    let current_relationship = context
+        .recent_context
+        .iter()
+        .find(|visit| visit.is_current)
+        .and_then(|visit| visit.semantic_role.clone())
+        .unwrap_or_else(|| "unrelated_or_unknown".into());
+
+    TaskTruthPublicAnswerV1 {
+        task_basis: if has_visible_semantics {
+            "model_inferred"
+        } else {
+            "unresolved"
+        }
+        .into(),
+        task_resolution_status: task_resolution_status.into(),
+        model_resolution_status: raw_model_status.into(),
+        unfinished_task: output.unfinished_task.clone(),
+        task_state: output.task_state.label().into(),
+        resume_point: output.resume_point.clone(),
+        next_supported_action: output.next_supported_action.clone(),
+        completed_context: output.completed_context.clone(),
+        current_subtask: output.resume_point.clone(),
+        current_activity: TaskTruthCurrentActivityV1 {
+            current_subtask: output.resume_point.clone(),
+            relationship_to_primary: current_relationship,
+            ..Default::default()
+        },
+        task_summary: output.unfinished_task.clone(),
+        last_meaningful_progress: output.completed_context.clone(),
+        unfinished_state: output.resume_point.clone(),
+        execution_state: output.task_state.label().into(),
+        next_action: output.next_supported_action.clone(),
+        where_summary: output.where_summary.clone(),
+        recent_context: context.recent_context.clone(),
+        field_support,
+        direct_return_target: None,
+        evidence_preview: preview_frame_id.map(|frame_id| ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".into(),
+            preview_kind: "pftu_semantic_probe_evidence".into(),
+            frame_id,
+        }),
+        task_understanding_source: semantic_source.into(),
+        wording_source: "cloud_model".into(),
+        target_selection_source: "strict_local_policy".into(),
+        snapshot_id: snapshot_id.clone(),
+        snapshot_revision: 1,
+        evidence_watermark: context.evidence_watermark.clone(),
+        semantic_source: semantic_source.into(),
+        provider_name: Some("openai".into()),
+        provider_model: context
+            .response_model
+            .clone()
+            .or_else(|| Some(context.configured_model.clone())),
+        request_id: context
+            .provider_request_id
+            .clone()
+            .or_else(|| context.request_id.clone()),
+        response_id: context.provider_response_id.clone(),
+        selected_hypothesis_id: selected_hypothesis_id.clone(),
+        inference_status: if context.validation_issues.is_empty() {
+            context.diagnostic_status.clone()
+        } else {
+            "model_answer_visible_with_validation_limits".into()
+        },
+        atomic_identity: TaskTruthAtomicIdentityV1 {
+            session_id: context.session_id.clone(),
+            task_thread_id,
+            task_thread_revision: has_visible_semantics.then_some(1),
+            task_snapshot_id: snapshot_id,
+            snapshot_revision: 1,
+            selected_hypothesis_id,
+            model_request_id: context
+                .provider_request_id
+                .clone()
+                .or_else(|| context.request_id.clone()),
+            model_response_id: Some(response_identity),
+            observation_packet_id: context.packet_id.clone(),
+            evidence_watermark: context.evidence_watermark.clone(),
+            correction_fingerprint: String::new(),
+        },
+        ..Default::default()
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -990,159 +1286,60 @@ fn pftu_probe_public_result(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let has_visible_semantics = output.as_ref().is_some_and(|output| {
-        output.primary_task.is_some()
-            || output.current_step.is_some()
-            || output.last_progress.is_some()
-            || output.unfinished_state.is_some()
-            || output
-                .visit_roles
-                .values()
-                .any(|role| role.role != super::semantic_probe::ProbeSurfaceRole::Unclear)
-    });
-    let identity_seed = serde_json::json!({
+    let legacy_compact_row = output.is_none()
+        && admitted_output_json.as_deref().is_some_and(|raw| {
+            serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .is_some_and(|object| {
+                    [
+                        "primary_task",
+                        "current_step",
+                        "last_progress",
+                        "unfinished_state",
+                    ]
+                    .iter()
+                    .any(|field| object.contains_key(*field))
+                })
+        });
+    let mapping_context = CompactProbePublicMappingContext {
+        decision_id: decision_id.into(),
+        session_id: session_id.clone(),
+        packet_id: packet_id.clone(),
+        evidence_watermark: evidence_watermark.clone(),
+        configured_model: configured_model.clone(),
+        response_model: response_model.clone(),
+        request_id: request_id.clone(),
+        provider_request_id: provider_request_id.clone(),
+        provider_response_id: provider_response_id.clone(),
+        diagnostic_status: diagnostic_status.clone(),
+        validation_issues: validation_issues.clone(),
+        recent_context: recent_context.clone(),
+    };
+    let answer = output
+        .as_ref()
+        .map(|output| map_compact_probe_output_to_public_answer(output, &slots, &mapping_context));
+    let unresolved_identity_seed = serde_json::json!({
         "decision_id": decision_id,
         "packet_id": packet_id,
+        "request_id": provider_request_id.as_ref().or(request_id.as_ref()),
         "provider_response_id": provider_response_id,
-        "output": output,
+        "legacy_compact_row": legacy_compact_row,
     });
-    let identity_hash = stable_hash(identity_seed.to_string().as_bytes());
-    let response_identity = provider_response_id
+    let unresolved_identity_hash = stable_hash(unresolved_identity_seed.to_string().as_bytes());
+    let unresolved_snapshot_id = format!("pftu-snapshot-{unresolved_identity_hash}");
+    let unresolved_response_identity = provider_response_id
         .clone()
-        .unwrap_or_else(|| format!("provider-response-envelope-{identity_hash}"));
-    let selected_hypothesis_id =
-        has_visible_semantics.then(|| format!("pftu-hypothesis-{identity_hash}"));
-    let snapshot_id = format!("pftu-snapshot-{identity_hash}");
-    let task_thread_id = has_visible_semantics.then(|| format!("pftu-task-thread-{identity_hash}"));
-
-    let answer = output.map(|output| {
-        let support = |probe_field: &str, value_present: bool| {
-            let evidence_refs = output
-                .support_slots_by_field
-                .get(probe_field)
-                .into_iter()
-                .flatten()
-                .filter_map(|slot_id| slots.get(slot_id))
-                .map(|slot| format!("{}:{}", slot.source_kind, slot.record_id))
-                .collect::<Vec<_>>();
-            TaskTruthFieldSupportV1 {
-                confidence: output.confidence_by_field.get(probe_field).copied(),
-                support_status: if value_present {
-                    if evidence_refs.is_empty() {
-                        "partial"
-                    } else {
-                        "supported"
-                    }
-                } else {
-                    "unsupported"
-                }
-                .into(),
-                evidence_refs,
-            }
-        };
-        let mut field_support = BTreeMap::new();
-        field_support.insert(
-            "task_summary".into(),
-            support("primary_task", output.primary_task.is_some()),
-        );
-        field_support.insert(
-            "current_subtask".into(),
-            support("current_step", output.current_step.is_some()),
-        );
-        field_support.insert(
-            "last_meaningful_progress".into(),
-            support("last_progress", output.last_progress.is_some()),
-        );
-        field_support.insert(
-            "unfinished_state".into(),
-            support("unfinished_state", output.unfinished_state.is_some()),
-        );
-        let preview_frame_id = output
-            .support_slots_by_field
-            .values()
-            .flatten()
-            .filter_map(|slot_id| slots.get(slot_id))
-            .find_map(|slot| slot.frame_id.clone());
-        let task_resolution_status = match output.status {
-            super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
-            super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partial",
-            super::semantic_probe::ProbeResolutionStatus::Unresolved => "unresolved",
-        };
-        let semantic_source = if has_visible_semantics {
-            "cloud_multimodal_model"
-        } else {
-            "unresolved"
-        };
-        let current_relationship = recent_context
-            .iter()
-            .find(|visit| visit.is_current)
-            .and_then(|visit| visit.semantic_role.clone())
-            .unwrap_or_else(|| "unrelated_or_unknown".into());
-        TaskTruthPublicAnswerV1 {
-            task_basis: if output.primary_task.is_some() {
-                "explicit_goal"
-            } else {
-                "observed_activity_only"
-            }
-            .into(),
-            task_resolution_status: task_resolution_status.into(),
-            current_subtask: output.current_step.clone(),
-            current_activity: TaskTruthCurrentActivityV1 {
-                current_subtask: output.current_step.clone(),
-                relationship_to_primary: current_relationship,
-                ..Default::default()
-            },
-            task_summary: output.primary_task.clone(),
-            last_meaningful_progress: output.last_progress.clone(),
-            unfinished_state: output.unfinished_state.clone(),
-            recent_context: recent_context.clone(),
-            field_support,
-            evidence_preview: preview_frame_id.map(|frame_id| ContinueEvidencePreview {
-                schema: "smalltalk.continue_evidence_preview.v1".into(),
-                preview_kind: "pftu_semantic_probe_evidence".into(),
-                frame_id,
-            }),
-            task_understanding_source: semantic_source.into(),
-            wording_source: "cloud_model".into(),
-            target_selection_source: "strict_local_policy".into(),
-            snapshot_id: snapshot_id.clone(),
-            snapshot_revision: 1,
-            evidence_watermark: evidence_watermark.clone(),
-            semantic_source: semantic_source.into(),
-            provider_name: Some("openai".into()),
-            provider_model: response_model.clone().or(Some(configured_model.clone())),
-            request_id: provider_request_id.clone().or(request_id.clone()),
-            response_id: provider_response_id.clone(),
-            selected_hypothesis_id: selected_hypothesis_id.clone(),
-            inference_status: if validation_issues.is_empty() {
-                diagnostic_status.clone()
-            } else {
-                "model_answer_visible_with_validation_limits".into()
-            },
-            atomic_identity: TaskTruthAtomicIdentityV1 {
-                session_id: session_id.clone(),
-                task_thread_id,
-                task_thread_revision: has_visible_semantics.then_some(1),
-                task_snapshot_id: snapshot_id.clone(),
-                snapshot_revision: 1,
-                selected_hypothesis_id,
-                model_request_id: provider_request_id.clone().or(request_id.clone()),
-                model_response_id: Some(response_identity.clone()),
-                observation_packet_id: packet_id.clone(),
-                evidence_watermark: evidence_watermark.clone(),
-                correction_fingerprint: String::new(),
-            },
-            ..Default::default()
-        }
-    });
+        .unwrap_or_else(|| format!("provider-response-envelope-{unresolved_identity_hash}"));
     let answer = answer.or_else(|| {
-        (!recent_context.is_empty()).then(|| TaskTruthPublicAnswerV1 {
+        (!recent_context.is_empty() || legacy_compact_row).then(|| TaskTruthPublicAnswerV1 {
             task_resolution_status: "unresolved".into(),
+            model_resolution_status: "unresolved".into(),
             recent_context: recent_context.clone(),
             task_understanding_source: "unresolved".into(),
             wording_source: "deterministic".into(),
             target_selection_source: "strict_local_policy".into(),
-            snapshot_id: snapshot_id.clone(),
+            snapshot_id: unresolved_snapshot_id.clone(),
             snapshot_revision: 1,
             evidence_watermark: evidence_watermark.clone(),
             semantic_source: "unresolved".into(),
@@ -1150,16 +1347,20 @@ fn pftu_probe_public_result(
             provider_model: response_model.clone().or(Some(configured_model.clone())),
             request_id: provider_request_id.clone().or(request_id.clone()),
             response_id: provider_response_id.clone(),
-            inference_status: diagnostic_status.clone(),
+            inference_status: if legacy_compact_row {
+                "legacy_compact_contract_downgraded".into()
+            } else {
+                diagnostic_status.clone()
+            },
             atomic_identity: TaskTruthAtomicIdentityV1 {
                 session_id: session_id.clone(),
                 task_thread_id: None,
                 task_thread_revision: None,
-                task_snapshot_id: snapshot_id.clone(),
+                task_snapshot_id: unresolved_snapshot_id.clone(),
                 snapshot_revision: 1,
                 selected_hypothesis_id: None,
                 model_request_id: provider_request_id.clone().or(request_id.clone()),
-                model_response_id: Some(response_identity.clone()),
+                model_response_id: Some(unresolved_response_identity.clone()),
                 observation_packet_id: packet_id.clone(),
                 evidence_watermark: evidence_watermark.clone(),
                 correction_fingerprint: String::new(),
@@ -1167,10 +1368,20 @@ fn pftu_probe_public_result(
             ..Default::default()
         })
     });
+    let has_visible_semantics = answer.as_ref().is_some_and(|answer| {
+        answer.unfinished_task.is_some()
+            || answer.task_state != "unclear"
+            || answer.resume_point.is_some()
+            || answer.next_supported_action.is_some()
+            || answer.completed_context.is_some()
+            || answer.where_summary.is_some()
+    });
 
     let diagnostic = TaskTruthInferenceDiagnosticV1 {
         schema: "smalltalk.task_truth_inference_diagnostic.v1".into(),
-        status: if has_visible_semantics {
+        status: if legacy_compact_row {
+            "legacy_compact_contract_downgraded".into()
+        } else if has_visible_semantics {
             "success".into()
         } else {
             diagnostic_status.clone()
@@ -1330,6 +1541,8 @@ fn visible_legacy_model_answer(
                 .flat_map(|claim| claim.evidence_refs.iter())
                 .map(|evidence| format!("{}:{}", evidence.source_kind, evidence.record_id))
                 .collect(),
+            missing_evidence: Vec::new(),
+            verifier_result: None,
         }
     };
     let mut support = BTreeMap::new();
@@ -1534,6 +1747,8 @@ fn field_support(snapshot: &TaskSnapshotV2, field: &str) -> TaskTruthFieldSuppor
             "unsupported".into()
         },
         evidence_refs,
+        missing_evidence: Vec::new(),
+        verifier_result: None,
     }
 }
 
@@ -1616,6 +1831,12 @@ fn public_answer(snapshot: &TaskSnapshotV2) -> TaskTruthPublicAnswerV1 {
         schema: TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1.into(),
         task_basis: snapshot.task_basis.clone(),
         task_resolution_status: task_resolution_status.into(),
+        model_resolution_status: "unresolved".into(),
+        unfinished_task: None,
+        task_state: "unclear".into(),
+        resume_point: None,
+        next_supported_action: None,
+        completed_context: None,
         observed_surface: snapshot.observed_surface.clone(),
         immediate_user_operation: snapshot.immediate_user_operation.clone(),
         semantic_effect_of_operation: snapshot.semantic_effect_of_operation.clone(),
@@ -1788,6 +2009,8 @@ fn apply_scoped_feedback(
                             confidence: Some(1.0),
                             support_status: "human_corrected".into(),
                             evidence_refs: selected.evidence_refs,
+                            missing_evidence: Vec::new(),
+                            verifier_result: Some("human_corrected".into()),
                         },
                     );
                     answer
@@ -1823,6 +2046,7 @@ fn apply_scoped_feedback(
                 } else {
                     value
                 };
+                answer.task_state = answer.execution_state.clone();
                 answer.task_understanding_source = "human_correction".into();
                 answer.semantic_source = "human_correction".into();
             }
@@ -1844,10 +2068,17 @@ fn apply_scoped_feedback(
                 confidence: None,
                 support_status: "rejected_by_user".into(),
                 evidence_refs: Vec::new(),
+                missing_evidence: Vec::new(),
+                verifier_result: Some("rejected_by_user".into()),
             });
         match field.as_str() {
             "task_summary" => {
                 answer.task_resolution_status = "unresolved".into();
+                answer.unfinished_task = None;
+                answer.task_state = "unclear".into();
+                answer.resume_point = None;
+                answer.next_supported_action = None;
+                answer.completed_context = None;
                 answer.task_summary = None;
                 answer.task_object = None;
                 answer.last_meaningful_progress = None;
@@ -1858,10 +2089,16 @@ fn apply_scoped_feedback(
             }
             "task_object" => answer.task_object = None,
             "state" => {
+                answer.task_state = "unclear".into();
+                answer.resume_point = None;
+                answer.completed_context = None;
                 answer.last_meaningful_progress = None;
                 answer.unfinished_state = None;
             }
-            "next_action" => answer.next_action = None,
+            "next_action" => {
+                answer.next_supported_action = None;
+                answer.next_action = None;
+            }
             "where" => {
                 answer.where_summary = None;
                 answer.direct_return_target = None;
@@ -2352,6 +2589,29 @@ mod tests {
         unresolved_snapshot, SnapshotSelectionStatusV2,
     };
 
+    fn arm_probe_case_for_run_fk(conn: &Connection, case_id: &str) {
+        super::super::semantic_probe::arm_case(
+            conn,
+            &super::super::semantic_probe::ArmedProbeCase {
+                case_id: case_id.into(),
+                case_kind: "production_mapping_fixture".into(),
+                held_back: false,
+                expected_recorded_at_ms: 1,
+                expected_primary_task: None,
+                expected_current_step: None,
+                expected_last_progress: None,
+                expected_unfinished_state: None,
+                recoverable_by_field: BTreeMap::from([
+                    ("primary_task".into(), false),
+                    ("current_step".into(), false),
+                    ("last_progress".into(), false),
+                    ("unfinished_state".into(), false),
+                ]),
+            },
+        )
+        .unwrap();
+    }
+
     fn feedback_packet() -> ObservationPacketV2 {
         let observed_at_ms = 1_000;
         let current_frame = KeyframeReferenceV2 {
@@ -2378,6 +2638,11 @@ mod tests {
             local_image_handle_hash: None,
             ephemeral_local_image_path: None,
             selection_reasons: vec!["current_frame".into()],
+            task_evidence_role: None,
+            task_turn_id: None,
+            same_task_relation: "unknown".into(),
+            cross_pane_ambiguity: false,
+            near_duplicate_group: None,
         };
         ObservationPacketV2 {
             schema: "smalltalk.observation_packet.v2".into(),
@@ -2389,6 +2654,8 @@ mod tests {
             current_frame: current_frame.clone(),
             semantic_keyframes: vec![current_frame],
             surface_timeline: Vec::new(),
+            task_relevance: Default::default(),
+            image_candidates: Vec::new(),
             canonical_elements: Vec::new(),
             focused_element_ids: Vec::new(),
             editable_element_ids: Vec::new(),
@@ -3403,30 +3670,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         checkpoint::ensure_schema(&conn).unwrap();
         super::super::semantic_probe::ensure_schema(&conn).unwrap();
-        let armed_case = super::super::semantic_probe::ArmedProbeCase {
-            case_id: "case-visible".into(),
-            case_kind: "model_answer_visibility".into(),
-            held_back: false,
-            expected_recorded_at_ms: 1,
-            expected_primary_task: Some("Fix Continue so GPT answers stay visible".into()),
-            expected_current_step: Some("Routing the PFTU response into the public answer".into()),
-            expected_last_progress: Some("The paid provider response was parsed".into()),
-            expected_unfinished_state: Some(
-                "React and the island still need the same answer".into(),
-            ),
-            recoverable_by_field: BTreeMap::from([
-                ("primary_task".into(), true),
-                ("current_step".into(), true),
-                ("last_progress".into(), true),
-                ("unfinished_state".into(), true),
-            ]),
-        };
-        super::super::semantic_probe::arm_case(&conn, &armed_case).unwrap();
+        arm_probe_case_for_run_fk(&conn, "case-visible");
         let output = super::super::semantic_probe::ProbeModelOutput {
-            primary_task: Some("Fix Continue so GPT answers stay visible".into()),
-            current_step: Some("Routing the PFTU response into the public answer".into()),
-            last_progress: Some("The paid provider response was parsed".into()),
-            unfinished_state: Some("React and the island still need the same answer".into()),
+            unfinished_task: Some("Fix Continue so GPT answers stay visible".into()),
+            task_state: super::super::semantic_probe::ProbeTaskState::Active,
+            resume_point: Some("Routing the PFTU response into the public answer".into()),
+            next_supported_action: Some("Inspect the routed answer in the main app".into()),
+            completed_context: Some("The paid provider response was parsed".into()),
+            where_summary: Some("The Codex implementation result".into()),
             visit_roles: BTreeMap::from([
                 (
                     "T1_VISIT".into(),
@@ -3450,18 +3701,42 @@ mod tests {
                 ),
             ]),
             support_slots_by_field: BTreeMap::from([
-                ("primary_task".into(), Vec::new()),
-                ("current_step".into(), Vec::new()),
-                ("last_progress".into(), Vec::new()),
-                ("unfinished_state".into(), Vec::new()),
+                ("unfinished_task".into(), Vec::new()),
+                ("task_state".into(), Vec::new()),
+                ("resume_point".into(), Vec::new()),
+                ("next_supported_action".into(), Vec::new()),
+                ("completed_context".into(), Vec::new()),
+                ("where_summary".into(), Vec::new()),
             ]),
             missing_evidence: vec!["no_direct_return_locator".into()],
+            missing_evidence_by_field: BTreeMap::from([(
+                "where_summary".into(),
+                vec!["exact locator not established".into()],
+            )]),
             confidence_by_field: BTreeMap::from([
-                ("primary_task".into(), 0.91),
-                ("current_step".into(), 0.88),
-                ("last_progress".into(), 0.86),
-                ("unfinished_state".into(), 0.84),
+                ("unfinished_task".into(), 0.91),
+                ("task_state".into(), 0.90),
+                ("resume_point".into(), 0.88),
+                ("next_supported_action".into(), 0.87),
+                ("completed_context".into(), 0.86),
+                ("where_summary".into(), 0.84),
             ]),
+            verifier_result_by_field: [
+                "unfinished_task",
+                "task_state",
+                "resume_point",
+                "next_supported_action",
+                "completed_context",
+                "where_summary",
+            ]
+            .into_iter()
+            .map(|field| {
+                (
+                    field.into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::Admitted,
+                )
+            })
+            .collect(),
             status: super::super::semantic_probe::ProbeResolutionStatus::Resolved,
         };
         let request_audit = serde_json::json!({
@@ -3546,6 +3821,8 @@ mod tests {
             .expect("the exact decision-bound probe result should be found");
         let mut answer = result.answer.expect("parsed model text must become public");
         assert_eq!(answer.task_resolution_status, "resolved");
+        assert_eq!(answer.model_resolution_status, "resolved");
+        assert_eq!(answer.task_state, "active");
         assert_eq!(
             answer.task_summary.as_deref(),
             Some("Fix Continue so GPT answers stay visible")
@@ -3554,10 +3831,15 @@ mod tests {
             answer.current_subtask.as_deref(),
             Some("Routing the PFTU response into the public answer")
         );
+        assert_eq!(answer.unfinished_task, answer.task_summary);
+        assert_eq!(answer.resume_point, answer.current_subtask);
+        assert_eq!(answer.next_supported_action, answer.next_action);
+        assert_eq!(answer.completed_context, answer.last_meaningful_progress);
+        assert_eq!(answer.task_basis, "model_inferred");
         assert!(answer.direct_return_target.is_none());
         assert_eq!(answer.response_id.as_deref(), Some("response-provider"));
         assert_eq!(answer.recent_context.len(), 3);
-        assert_eq!(answer.schema, "smalltalk.task_truth_public_answer.v4");
+        assert_eq!(answer.schema, "smalltalk.task_truth_public_answer.v5");
         assert_eq!(answer.recent_context[0].app_label, "ChatGPT");
         assert_eq!(
             answer.recent_context[0].semantic_role.as_deref(),
@@ -3607,14 +3889,18 @@ mod tests {
         // A non-primary unsupported field remains field-local. Keep the task
         // and the other admitted fields visible.
         let mut field_limited_output = output.clone();
-        field_limited_output.current_step = None;
+        field_limited_output.resume_point = None;
+        field_limited_output.verifier_result_by_field.insert(
+            "resume_point".into(),
+            super::super::semantic_probe::ProbeFieldVerifierResult::Rejected,
+        );
         field_limited_output.status =
             super::super::semantic_probe::ProbeResolutionStatus::PartlyResolved;
         conn.execute(
             "UPDATE task_truth_v2_semantic_probe_runs
              SET diagnostic_status='support_slot_validation_failure',
                  admitted_output_json=?2,
-                 validation_issues_json='[\"current_step:unsupported\"]'
+                 validation_issues_json='[\"resume_point:unsupported\"]'
              WHERE decision_id=?1",
             params![
                 "decision-visible",
@@ -3637,9 +3923,10 @@ mod tests {
             field_limited.last_meaningful_progress.as_deref(),
             Some("The paid provider response was parsed")
         );
+        assert!(field_limited.unfinished_state.is_none());
         assert_eq!(
-            field_limited.unfinished_state.as_deref(),
-            Some("React and the island still need the same answer")
+            field_limited.next_action.as_deref(),
+            Some("Inspect the routed answer in the main app")
         );
         assert_eq!(
             field_limited.inference_status,
@@ -3665,17 +3952,19 @@ mod tests {
             field_limited_public.last_meaningful_progress.as_deref(),
             Some("The paid provider response was parsed")
         );
-        assert_eq!(
-            field_limited_public.unfinished_state.as_deref(),
-            Some("React and the island still need the same answer")
-        );
+        assert!(field_limited_public.unfinished_state.is_none());
+        assert_eq!(field_limited_public.task_state, "active");
 
         // A rejected primary-task claim must stay rejected, but it must not
         // erase other fields that independently passed local admission. The
         // product can show those fields as a limited, inspect-only answer while
         // still refusing to claim a broad task or open an exact target.
         let mut primary_rejected_output = output.clone();
-        primary_rejected_output.primary_task = None;
+        primary_rejected_output.unfinished_task = None;
+        primary_rejected_output.verifier_result_by_field.insert(
+            "unfinished_task".into(),
+            super::super::semantic_probe::ProbeFieldVerifierResult::Rejected,
+        );
         primary_rejected_output.visit_roles.clear();
         primary_rejected_output.status =
             super::super::semantic_probe::ProbeResolutionStatus::Unresolved;
@@ -3683,7 +3972,7 @@ mod tests {
             "UPDATE task_truth_v2_semantic_probe_runs
              SET diagnostic_status='support_slot_validation_failure',
                  admitted_output_json=?2,
-                 validation_issues_json='[\"primary_task:passive_evidence_cannot_establish_primary_task\"]'
+                 validation_issues_json='[\"unfinished_task:passive_evidence_cannot_establish_primary_task\"]'
              WHERE decision_id=?1",
             params![
                 "decision-visible",
@@ -3708,7 +3997,7 @@ mod tests {
         );
         assert_eq!(
             primary_rejected.unfinished_state.as_deref(),
-            Some("React and the island still need the same answer")
+            Some("Routing the PFTU response into the public answer")
         );
         assert!(primary_rejected
             .recent_context
@@ -3739,6 +4028,99 @@ mod tests {
         assert!(invalidated_answer.current_subtask.is_none());
         assert!(invalidated_answer.last_meaningful_progress.is_none());
         assert!(invalidated_answer.unfinished_state.is_none());
+    }
+
+    #[test]
+    fn factual_where_summary_alone_never_creates_openability_or_legacy_task_fill() {
+        let output = super::super::semantic_probe::ProbeModelOutput {
+            unfinished_task: None,
+            task_state: super::super::semantic_probe::ProbeTaskState::Unclear,
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
+            where_summary: Some("The visible answer section in Codex".into()),
+            visit_roles: BTreeMap::new(),
+            support_slots_by_field: [
+                "unfinished_task",
+                "task_state",
+                "resume_point",
+                "next_supported_action",
+                "completed_context",
+                "where_summary",
+            ]
+            .into_iter()
+            .map(|field| (field.into(), Vec::new()))
+            .collect(),
+            missing_evidence: vec!["exact return locator unavailable".into()],
+            missing_evidence_by_field: BTreeMap::from([(
+                "where_summary".into(),
+                vec!["location is descriptive only".into()],
+            )]),
+            confidence_by_field: BTreeMap::from([
+                ("unfinished_task".into(), 0.0),
+                ("task_state".into(), 0.0),
+                ("resume_point".into(), 0.0),
+                ("next_supported_action".into(), 0.0),
+                ("completed_context".into(), 0.0),
+                ("where_summary".into(), 0.72),
+            ]),
+            verifier_result_by_field: BTreeMap::from([
+                (
+                    "unfinished_task".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::NotProposed,
+                ),
+                (
+                    "task_state".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::NotProposed,
+                ),
+                (
+                    "resume_point".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::NotProposed,
+                ),
+                (
+                    "next_supported_action".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::NotProposed,
+                ),
+                (
+                    "completed_context".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::NotProposed,
+                ),
+                (
+                    "where_summary".into(),
+                    super::super::semantic_probe::ProbeFieldVerifierResult::Admitted,
+                ),
+            ]),
+            status: super::super::semantic_probe::ProbeResolutionStatus::PartlyResolved,
+        };
+        let answer = map_compact_probe_output_to_public_answer(
+            &output,
+            &BTreeMap::new(),
+            &CompactProbePublicMappingContext {
+                decision_id: "decision-where-only".into(),
+                session_id: Some("session-where-only".into()),
+                packet_id: "packet-where-only".into(),
+                evidence_watermark: "watermark-where-only".into(),
+                configured_model: "gpt-test".into(),
+                response_model: None,
+                request_id: Some("request-where-only".into()),
+                provider_request_id: None,
+                provider_response_id: Some("response-where-only".into()),
+                diagnostic_status: "support_slot_validation_failure".into(),
+                validation_issues: Vec::new(),
+                recent_context: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            answer.where_summary.as_deref(),
+            Some("The visible answer section in Codex")
+        );
+        assert!(answer.direct_return_target.is_none());
+        assert!(answer.unfinished_task.is_none());
+        assert!(answer.task_summary.is_none());
+        assert!(answer.current_subtask.is_none());
+        assert!(answer.unfinished_state.is_none());
+        assert!(answer.next_action.is_none());
     }
 
     #[test]
@@ -3773,14 +4155,28 @@ mod tests {
     fn old_public_answer_rows_deserialize_without_recent_context() {
         let mut legacy = serde_json::to_value(TaskTruthPublicAnswerV1::default()).unwrap();
         legacy["schema"] = serde_json::json!("smalltalk.task_truth_public_answer.v2");
-        legacy
-            .as_object_mut()
-            .expect("public answer object")
-            .remove("recent_context");
+        let legacy_object = legacy.as_object_mut().expect("public answer object");
+        for field in [
+            "recent_context",
+            "model_resolution_status",
+            "unfinished_task",
+            "task_state",
+            "resume_point",
+            "next_supported_action",
+            "completed_context",
+        ] {
+            legacy_object.remove(field);
+        }
 
         let restored: TaskTruthPublicAnswerV1 = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.schema, "smalltalk.task_truth_public_answer.v2");
         assert!(restored.recent_context.is_empty());
+        assert_eq!(restored.model_resolution_status, "unresolved");
+        assert!(restored.unfinished_task.is_none());
+        assert_eq!(restored.task_state, "unclear");
+        assert!(restored.resume_point.is_none());
+        assert!(restored.next_supported_action.is_none());
+        assert!(restored.completed_context.is_none());
 
         let mut v3 = serde_json::to_value(TaskTruthPublicAnswerV1::default()).unwrap();
         v3["schema"] = serde_json::json!("smalltalk.task_truth_public_answer.v3");
@@ -3801,29 +4197,78 @@ mod tests {
     }
 
     #[test]
+    fn stored_pre_lca_compact_row_is_explicitly_downgraded_without_semantic_fill() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::semantic_probe::ensure_schema(&conn).unwrap();
+        arm_probe_case_for_run_fk(&conn, "case-legacy");
+        let old_compact_output = serde_json::json!({
+            "primary_task": "Old broad project wording",
+            "current_step": "Reviewing",
+            "last_progress": "Implementation was completed",
+            "unfinished_state": "Testing remains",
+            "visit_roles": {},
+            "support_slots_by_field": {
+                "primary_task": [],
+                "current_step": [],
+                "last_progress": [],
+                "unfinished_state": []
+            },
+            "missing_evidence": [],
+            "confidence_by_field": {
+                "primary_task": 0.9,
+                "current_step": 0.8,
+                "last_progress": 0.8,
+                "unfinished_state": 0.8
+            },
+            "status": "resolved"
+        });
+        conn.execute(
+            "INSERT INTO task_truth_v2_semantic_probe_runs (
+               run_id, case_id, decision_id, session_id, packet_id,
+               evidence_watermark, model, diagnostic_status, request_id,
+               response_id, admitted_output_json, validation_issues_json,
+               latency_ms, parsed_response, provider_post_count, created_at_ms
+             ) VALUES (
+               'run-legacy','case-legacy','decision-legacy','session-legacy',
+               'packet-legacy','watermark-legacy','gpt-test','success','request-legacy',
+               'response-legacy',?1,'[]',10,1,1,1000
+             )",
+            [serde_json::to_string(&old_compact_output).unwrap()],
+        )
+        .unwrap();
+
+        let result = pftu_probe_public_result(&conn, "decision-legacy")
+            .unwrap()
+            .expect("legacy diagnostic row remains inspectable");
+        let answer = result.answer.expect("typed unresolved downgrade");
+        assert_eq!(
+            result.diagnostic.status,
+            "legacy_compact_contract_downgraded"
+        );
+        assert_eq!(answer.task_resolution_status, "unresolved");
+        assert_eq!(
+            answer.inference_status,
+            "legacy_compact_contract_downgraded"
+        );
+        assert!(answer.unfinished_task.is_none());
+        assert_eq!(answer.task_state, "unclear");
+        assert!(answer.resume_point.is_none());
+        assert!(answer.next_supported_action.is_none());
+        assert!(answer.completed_context.is_none());
+        assert!(answer.task_summary.is_none());
+        assert!(answer.current_subtask.is_none());
+        assert!(answer.last_meaningful_progress.is_none());
+        assert!(answer.unfinished_state.is_none());
+        assert!(answer.next_action.is_none());
+        assert!(answer.where_summary.is_none());
+        assert!(answer.direct_return_target.is_none());
+    }
+
+    #[test]
     fn unresolved_probe_still_projects_factual_recent_context() {
         let conn = Connection::open_in_memory().unwrap();
         super::super::semantic_probe::ensure_schema(&conn).unwrap();
-        super::super::semantic_probe::arm_case(
-            &conn,
-            &super::super::semantic_probe::ArmedProbeCase {
-                case_id: "case-unresolved".into(),
-                case_kind: "recent_context_without_semantics".into(),
-                held_back: false,
-                expected_recorded_at_ms: 1,
-                expected_primary_task: None,
-                expected_current_step: None,
-                expected_last_progress: None,
-                expected_unfinished_state: None,
-                recoverable_by_field: BTreeMap::from([
-                    ("primary_task".into(), false),
-                    ("current_step".into(), false),
-                    ("last_progress".into(), false),
-                    ("unfinished_state".into(), false),
-                ]),
-            },
-        )
-        .unwrap();
+        arm_probe_case_for_run_fk(&conn, "case-unresolved");
         let request_audit = serde_json::json!({
             "request_schema": "smalltalk.pftu_01.semantic_probe_request.v2",
             "request_id": "request-unresolved",

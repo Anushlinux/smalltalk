@@ -2,15 +2,18 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::process::Command;
 use std::time::Instant;
 
 use super::model::{self, ProviderUsageV1};
 use super::observation_packet::{
     is_private_status, AuthorshipStatusV2, EvidencePartitionV2, ObservationPacketV2, RegionRoleV2,
+    TaskEvidenceRoleV1,
 };
 
-pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v5";
+pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v3";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v7";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
@@ -18,22 +21,41 @@ const MAX_IMAGES: usize = 4;
 const MAX_TEXT_BYTES: usize = 24 * 1024;
 const MAX_ESTIMATED_TEXT_TOKENS: usize = 6_144;
 // The Responses API counts model reasoning and the final structured JSON
-// against the same output budget. The response contract can contain four
+// against the same output budget. The response contract can contain six
 // semantic fields plus one role object for each of the four supplied images.
 // The former 1,200-token limit was exhausted before that JSON was complete.
 const MAX_OUTPUT_TOKENS: usize = 6_000;
 const MAX_OBSERVATIONS_PER_BOUNDARY: usize = 6;
 const MAX_ACTIONS_PER_BOUNDARY: usize = 4;
 const MAX_DELTAS_PER_BOUNDARY: usize = 3;
-const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
+const MAX_UNFINISHED_TASK_CHARS: usize = 220;
+const MAX_RESUME_POINT_CHARS: usize = 260;
+const MAX_NEXT_SUPPORTED_ACTION_CHARS: usize = 180;
+const MAX_COMPLETED_CONTEXT_CHARS: usize = 180;
+const MAX_WHERE_SUMMARY_CHARS: usize = 220;
 const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
+const MAX_TASK_RELEVANT_SPANS: usize = 12;
+const MAX_IMAGE_LONG_EDGE: i64 = 1_600;
+const MIN_RELIABLE_CROP_OWNERSHIP: f64 = 0.75;
+const AMBIGUOUS_PANE_CONFIDENCE_CAP_MILLIS: i64 = 550;
 const MAX_ARMED_CASE_AGE_MS: i64 = 15 * 60 * 1_000;
 // An app switch immediately before the manual cutoff is evidence that the
 // foreground changed. It is not evidence that the new foreground became the
 // user's task. A confirming action on the new surface removes this safeguard.
 const MOMENTARY_APP_SWITCH_MAX_AGE_MS: i64 = 3_000;
 const MANUAL_PROVIDER_RETRIES: u32 = 0;
-const SEMANTIC_FIELDS: [&str; 4] = [
+const SEMANTIC_FIELDS: [&str; 6] = [
+    "unfinished_task",
+    "task_state",
+    "resume_point",
+    "next_supported_action",
+    "completed_context",
+    "where_summary",
+];
+// Private PFTU-01 proof-corpus rows are an older diagnostic artifact. Keep
+// their four-field vocabulary isolated so stored rows do not masquerade as
+// LCA-02 provider output.
+const LEGACY_PROOF_FIELDS: [&str; 4] = [
     "primary_task",
     "current_step",
     "last_progress",
@@ -46,6 +68,55 @@ pub(crate) enum ProbeResolutionStatus {
     Resolved,
     PartlyResolved,
     Unresolved,
+    Refused,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeTaskState {
+    Active,
+    WaitingForResult,
+    NeedsUserVerification,
+    Blocked,
+    Superseded,
+    Completed,
+    #[default]
+    Unclear,
+}
+
+impl ProbeTaskState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::WaitingForResult => "waiting_for_result",
+            Self::NeedsUserVerification => "needs_user_verification",
+            Self::Blocked => "blocked",
+            Self::Superseded => "superseded",
+            Self::Completed => "completed",
+            Self::Unclear => "unclear",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeFieldVerifierResult {
+    #[default]
+    Pending,
+    Admitted,
+    Rejected,
+    NotProposed,
+}
+
+impl ProbeFieldVerifierResult {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Admitted => "admitted",
+            Self::Rejected => "rejected",
+            Self::NotProposed => "not_proposed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,15 +178,21 @@ pub(crate) enum SupportCategory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProbeModelOutput {
-    pub(crate) primary_task: Option<String>,
-    pub(crate) current_step: Option<String>,
-    pub(crate) last_progress: Option<String>,
-    pub(crate) unfinished_state: Option<String>,
+    pub(crate) unfinished_task: Option<String>,
+    pub(crate) task_state: ProbeTaskState,
+    pub(crate) resume_point: Option<String>,
+    pub(crate) next_supported_action: Option<String>,
+    pub(crate) completed_context: Option<String>,
+    pub(crate) where_summary: Option<String>,
     #[serde(default)]
     pub(crate) visit_roles: BTreeMap<String, ProbeVisitRole>,
     pub(crate) support_slots_by_field: BTreeMap<String, Vec<String>>,
     pub(crate) missing_evidence: Vec<String>,
+    pub(crate) missing_evidence_by_field: BTreeMap<String, Vec<String>>,
     pub(crate) confidence_by_field: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub(crate) verifier_result_by_field: BTreeMap<String, ProbeFieldVerifierResult>,
+    /// Raw model status. Local admission never rewrites it.
     pub(crate) status: ProbeResolutionStatus,
 }
 
@@ -178,6 +255,35 @@ pub(crate) struct ProbeRequestAudit {
     pub(crate) omitted_surface_visit_count: usize,
     #[serde(default)]
     pub(crate) image_exclusions_by_reason: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) task_relevance_source: String,
+    #[serde(default)]
+    pub(crate) current_task_turn_id: Option<String>,
+    #[serde(default = "default_confidence_cap_millis")]
+    pub(crate) task_confidence_cap_millis: i64,
+    #[serde(default)]
+    pub(crate) image_candidates: Vec<Value>,
+    #[serde(default)]
+    pub(crate) image_preparations: Vec<ProbeImagePreparationAudit>,
+}
+
+fn default_confidence_cap_millis() -> i64 {
+    1_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProbeImagePreparationAudit {
+    pub(crate) slot: String,
+    pub(crate) frame_id: String,
+    pub(crate) original_width: Option<i64>,
+    pub(crate) original_height: Option<i64>,
+    pub(crate) sent_width: Option<i64>,
+    pub(crate) sent_height: Option<i64>,
+    pub(crate) image_scope: String,
+    pub(crate) crop_ownership: String,
+    pub(crate) redaction_status: String,
+    pub(crate) near_duplicate_group: Option<String>,
+    pub(crate) preparation_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +310,8 @@ pub(crate) struct ProbeSurfaceVisitAudit {
     pub(crate) committed_input: bool,
     #[serde(default)]
     pub(crate) carried_into_current_surface: bool,
+    #[serde(default)]
+    pub(crate) hostname_mentioned_in_current_surface: bool,
     pub(crate) image_slot: Option<String>,
     #[serde(default)]
     pub(crate) image_omission_reason: Option<String>,
@@ -255,11 +363,16 @@ pub(crate) struct ArmedProbeCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RequestSlot<'a> {
-    slot: &'a str,
+struct RequestSlot {
+    slot: String,
     category: SupportCategory,
     observed_at_ms: i64,
-    summary: &'a str,
+    summary: String,
+    evidence_roles: Vec<String>,
+    pane_ids: Vec<String>,
+    region_roles: Vec<String>,
+    conversational_roles: Vec<String>,
+    task_authority: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,7 +383,7 @@ struct RequestBoundary<'a> {
     surface_relation: &'a str,
     observed_transition: String,
     prior_image_slot: Option<&'a str>,
-    slots: Vec<RequestSlot<'a>>,
+    slots: Vec<RequestSlot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,12 +396,13 @@ struct RequestSurfaceVisit<'a> {
     last_observed_at_ms: i64,
     is_current: bool,
     revisited: bool,
-    interaction_count: usize,
-    frame_count: usize,
-    engagement_score: i64,
-    observed_duration_ms: i64,
     committed_input: bool,
-    carried_into_current_surface: bool,
+    hostname_mentioned_in_current_surface: bool,
+    task_evidence_role: &'static str,
+    task_relevance_score: i64,
+    same_task_relation: &'a str,
+    cross_pane_ambiguity: bool,
+    engagement_used_as_same_task_tiebreaker: bool,
     image_slot: Option<&'a str>,
 }
 
@@ -308,6 +422,13 @@ struct SlotBuildAudit {
     excluded_nonsemantic_records_by_kind: BTreeMap<String, usize>,
 }
 
+#[derive(Debug)]
+struct PreparedProbeImage {
+    bytes: Vec<u8>,
+    mime: String,
+    audit: ProbeImagePreparationAudit,
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= max_chars {
@@ -319,6 +440,251 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
 fn fingerprint<T: Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     super::super::stable_hash(&bytes)
+}
+
+fn task_evidence_role_label(role: TaskEvidenceRoleV1) -> &'static str {
+    match role {
+        TaskEvidenceRoleV1::LatestUserGoal => "latest_user_goal",
+        TaskEvidenceRoleV1::CurrentUnsentDraft => "current_unsent_draft",
+        TaskEvidenceRoleV1::CurrentAgentState => "current_agent_state",
+        TaskEvidenceRoleV1::PriorTaskBoundary => "prior_task_boundary",
+        TaskEvidenceRoleV1::CurrentTaskContext => "current_task_context",
+        TaskEvidenceRoleV1::SupportingContext => "supporting_context",
+        TaskEvidenceRoleV1::FlattenedFallback => "flattened_fallback",
+        TaskEvidenceRoleV1::Unknown => "unknown",
+    }
+}
+
+fn frame_candidate<'a>(
+    packet: &'a ObservationPacketV2,
+    frame_id: &str,
+) -> Option<&'a super::observation_packet::ImageCandidateAuditV1> {
+    packet
+        .image_candidates
+        .iter()
+        .find(|candidate| candidate.frame_id == frame_id)
+}
+
+fn frame_task_fact_signature(
+    packet: &ObservationPacketV2,
+    frame: &super::observation_packet::KeyframeReferenceV2,
+) -> String {
+    if let Some(candidate) = frame_candidate(packet, &frame.frame_id) {
+        return fingerprint(&json!({
+            "task_turn_id": candidate.task_turn_id,
+            "evidence_role": candidate.evidence_role,
+            "latest_user": candidate.supports_latest_user_goal,
+            "current_agent": candidate.supports_current_agent_state,
+            "prior_boundary": candidate.supports_prior_task_boundary,
+            "same_task_relation": candidate.same_task_relation,
+        }));
+    }
+    fingerprint(&json!({
+        "task_turn_id": frame.task_turn_id,
+        "evidence_role": frame.task_evidence_role,
+        "same_task_relation": frame.same_task_relation,
+    }))
+}
+
+fn frame_semantic_content_set(packet: &ObservationPacketV2, frame_id: &str) -> BTreeSet<String> {
+    packet
+        .canonical_elements
+        .iter()
+        .filter(|element| element.frame_id == frame_id && element_is_probe_eligible(element))
+        .map(|element| {
+            fingerprint(&json!({
+                "text_reference": element.text_reference,
+                "visual_description": element.visual_description,
+                "region_role": element.region_role,
+                "authorship": element.authorship_status,
+                "window_id": element.window_id,
+                "bounds": element.bounds,
+            }))
+        })
+        .collect()
+}
+
+fn frames_are_semantically_redundant(
+    packet: &ObservationPacketV2,
+    older: &super::observation_packet::KeyframeReferenceV2,
+    newer: &super::observation_packet::KeyframeReferenceV2,
+) -> bool {
+    if frame_task_fact_signature(packet, older) != frame_task_fact_signature(packet, newer) {
+        return false;
+    }
+    if older.local_image_handle_hash.is_some()
+        && older.local_image_handle_hash == newer.local_image_handle_hash
+    {
+        return true;
+    }
+    if older.near_duplicate_group.is_some()
+        && older.near_duplicate_group == newer.near_duplicate_group
+    {
+        return true;
+    }
+    if !same_surface(older, newer) {
+        return false;
+    }
+    let older_content = frame_semantic_content_set(packet, &older.frame_id);
+    let newer_content = frame_semantic_content_set(packet, &newer.frame_id);
+    if older_content.is_empty() || newer_content.is_empty() {
+        return false;
+    }
+    let intersection = older_content.intersection(&newer_content).count();
+    let union = older_content.union(&newer_content).count();
+    intersection * 100 >= union * 85
+}
+
+fn reliable_crop(frame: &super::observation_packet::KeyframeReferenceV2) -> bool {
+    let Some(crop) = frame.crop_pixels.as_ref() else {
+        return false;
+    };
+    let geometry_is_valid = crop.x.is_finite()
+        && crop.y.is_finite()
+        && crop.width.is_finite()
+        && crop.height.is_finite()
+        && crop.x >= 0.0
+        && crop.y >= 0.0
+        && crop.width >= 64.0
+        && crop.height >= 64.0
+        && frame
+            .image_width
+            .is_none_or(|width| crop.x + crop.width <= width as f64 + 1.0)
+        && frame
+            .image_height
+            .is_none_or(|height| crop.y + crop.height <= height as f64 + 1.0);
+    let scope_is_owned = frame.image_scope.contains("active_window")
+        || frame.image_scope.contains("owned")
+        || frame.image_scope.contains("task_region");
+    geometry_is_valid
+        && scope_is_owned
+        && frame.surface_ownership_confidence >= MIN_RELIABLE_CROP_OWNERSHIP
+        && !frame.cross_pane_ambiguity
+}
+
+fn scaled_dimensions(width: Option<i64>, height: Option<i64>) -> (Option<i64>, Option<i64>, bool) {
+    let (Some(width), Some(height)) = (width, height) else {
+        return (width, height, false);
+    };
+    let long_edge = width.max(height);
+    if long_edge <= MAX_IMAGE_LONG_EDGE {
+        return (Some(width), Some(height), false);
+    }
+    let scale = MAX_IMAGE_LONG_EDGE as f64 / long_edge as f64;
+    (
+        Some((width as f64 * scale).round().max(1.0) as i64),
+        Some((height as f64 * scale).round().max(1.0) as i64),
+        true,
+    )
+}
+
+fn resize_image_bytes(
+    bytes: &[u8],
+    mime: &str,
+    frame_id: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let input_extension = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => return Err("unsupported_image_type_for_resize".into()),
+    };
+    let token = super::super::stable_hash(format!("{frame_id}:{}", bytes.len()).as_bytes());
+    let input = std::env::temp_dir().join(format!(
+        "smalltalk-lca-image-{}-{token}.{input_extension}",
+        std::process::id()
+    ));
+    let output = std::env::temp_dir().join(format!(
+        "smalltalk-lca-image-{}-{token}-prepared.jpg",
+        std::process::id()
+    ));
+    fs::write(&input, bytes).map_err(|_| "image_resize_input_unwritable".to_string())?;
+    let result = Command::new("/usr/bin/sips")
+        .args(["-Z", &MAX_IMAGE_LONG_EDGE.to_string()])
+        .arg(&input)
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .map_err(|_| "image_resize_tool_unavailable".to_string());
+    let prepared = match result {
+        Ok(result) if result.status.success() && output.is_file() => {
+            fs::read(&output).map_err(|_| "prepared_image_unreadable".to_string())
+        }
+        Ok(_) => Err("image_resize_failed".into()),
+        Err(error) => Err(error),
+    };
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&output);
+    prepared.map(|bytes| (bytes, "image/jpeg".into()))
+}
+
+fn prepare_probe_image(
+    packet: &ObservationPacketV2,
+    slot: &SupportSlot,
+    frame: &super::observation_packet::KeyframeReferenceV2,
+) -> Result<PreparedProbeImage, String> {
+    if !frame.model_eligible || is_private_status(Some(&frame.privacy_status)) {
+        return Err("privacy_or_model_ineligible_image".into());
+    }
+    let mut prepared_frame = frame.clone();
+    let crop_requested = prepared_frame.crop_pixels.is_some();
+    let crop_is_reliable = reliable_crop(&prepared_frame);
+    if crop_requested && !crop_is_reliable {
+        prepared_frame.crop_pixels = None;
+    }
+    let (effective_width, effective_height) = if crop_is_reliable {
+        let crop = frame.crop_pixels.as_ref().expect("reliable crop exists");
+        (
+            Some(crop.width.round() as i64),
+            Some(crop.height.round() as i64),
+        )
+    } else {
+        (frame.image_width, frame.image_height)
+    };
+    let (sent_width, sent_height, needs_resize) =
+        scaled_dimensions(effective_width, effective_height);
+    let (mut bytes, mut mime) = model::read_model_image(&prepared_frame)?;
+    if needs_resize {
+        (bytes, mime) = resize_image_bytes(&bytes, &mime, &frame.frame_id)?;
+    }
+    let preparation_reason = match (crop_requested, crop_is_reliable, needs_resize) {
+        (true, true, true) => "reliable_owned_crop_then_long_edge_cap",
+        (true, true, false) => "reliable_owned_crop_preserved",
+        (true, false, true) => "unreliable_crop_rejected_full_window_long_edge_cap",
+        (true, false, false) => "unreliable_crop_rejected_no_guessed_crop",
+        (false, _, true) => "bounded_full_window_long_edge_cap",
+        (false, _, false) => "existing_bounded_image_preserved",
+    };
+    let candidate = frame_candidate(packet, &frame.frame_id);
+    Ok(PreparedProbeImage {
+        bytes,
+        mime,
+        audit: ProbeImagePreparationAudit {
+            slot: slot.slot.clone(),
+            frame_id: frame.frame_id.clone(),
+            original_width: frame.image_width,
+            original_height: frame.image_height,
+            sent_width,
+            sent_height,
+            image_scope: frame.image_scope.clone(),
+            crop_ownership: if crop_is_reliable {
+                "reliable_owned_region"
+            } else if crop_requested {
+                "unreliable_geometry_crop_rejected"
+            } else {
+                "no_crop_available"
+            }
+            .into(),
+            redaction_status: candidate
+                .map(|candidate| candidate.redaction_status.clone())
+                .unwrap_or_else(|| frame.privacy_status.clone()),
+            near_duplicate_group: frame
+                .near_duplicate_group
+                .clone()
+                .or_else(|| candidate.and_then(|candidate| candidate.near_duplicate_group.clone())),
+            preparation_reason: preparation_reason.into(),
+        },
+    })
 }
 
 fn physical_frame_fingerprint(frame: &super::observation_packet::KeyframeReferenceV2) -> String {
@@ -930,53 +1296,121 @@ fn surface_visit_identity(visit: &super::observation_packet::SurfaceVisitV2) -> 
     )
 }
 
+fn visit_role_rank(visit: &super::observation_packet::SurfaceVisitV2) -> i64 {
+    visit
+        .task_evidence_role
+        .unwrap_or(TaskEvidenceRoleV1::Unknown)
+        .authority_rank()
+}
+
+fn visit_task_fact_key(visit: &super::observation_packet::SurfaceVisitV2) -> String {
+    let frame = visit.representative_frame.as_ref();
+    fingerprint(&json!({
+        "task_turn_id": frame.and_then(|frame| frame.task_turn_id.as_deref()),
+        "evidence_role": visit.task_evidence_role,
+        "same_task_relation": visit.same_task_relation,
+        "cross_pane_ambiguity": visit.cross_pane_ambiguity,
+    }))
+}
+
+fn visit_is_better_same_fact(
+    candidate: &super::observation_packet::SurfaceVisitV2,
+    existing: &super::observation_packet::SurfaceVisitV2,
+) -> bool {
+    let candidate_task_rank = (visit_role_rank(candidate), candidate.task_relevance_score);
+    let existing_task_rank = (visit_role_rank(existing), existing.task_relevance_score);
+    if candidate_task_rank != existing_task_rank {
+        return candidate_task_rank > existing_task_rank;
+    }
+    let can_use_engagement = candidate.engagement_used_as_same_task_tiebreaker
+        && existing.engagement_used_as_same_task_tiebreaker
+        && !candidate.same_task_relation.is_empty()
+        && candidate.same_task_relation == existing.same_task_relation
+        && !matches!(
+            candidate.same_task_relation.as_str(),
+            "unrelated" | "unknown"
+        );
+    if can_use_engagement && candidate.engagement_score != existing.engagement_score {
+        return candidate.engagement_score > existing.engagement_score;
+    }
+    (candidate.last_observed_at_ms, candidate.sequence_index)
+        > (existing.last_observed_at_ms, existing.sequence_index)
+}
+
 fn selected_context_image_visits(
     packet: &ObservationPacketV2,
     cutoff: i64,
 ) -> Vec<&super::observation_packet::SurfaceVisitV2> {
-    let current_identity = packet
-        .surface_timeline
-        .iter()
-        .find(|visit| visit.is_current)
-        .map(surface_visit_identity);
-    let mut best_by_surface = BTreeMap::<String, &super::observation_packet::SurfaceVisitV2>::new();
+    let mut best_by_surface_fact =
+        BTreeMap::<String, &super::observation_packet::SurfaceVisitV2>::new();
     for visit in &packet.surface_timeline {
-        let identity = surface_visit_identity(visit);
         let Some(frame) = visit.representative_frame.as_ref() else {
             continue;
         };
         if visit.is_current
             || visit.private
-            || current_identity.as_deref() == Some(identity.as_str())
             || frame.observed_at_ms > cutoff
             || !frame.model_eligible
             || is_private_status(Some(&frame.privacy_status))
         {
             continue;
         }
-        let replace = best_by_surface.get(&identity).is_none_or(|existing| {
-            (
-                visit.engagement_score,
-                visit.last_observed_at_ms,
-                visit.sequence_index,
-            ) > (
-                existing.engagement_score,
-                existing.last_observed_at_ms,
-                existing.sequence_index,
-            )
-        });
+        let role = visit
+            .task_evidence_role
+            .unwrap_or(TaskEvidenceRoleV1::Unknown);
+        if packet.task_relevance.source == "p6_role_region_task_turn"
+            && (role == TaskEvidenceRoleV1::Unknown
+                || visit.same_task_relation.contains("unrelated"))
+        {
+            continue;
+        }
+        let identity = format!(
+            "{}|{}",
+            surface_visit_identity(visit),
+            visit_task_fact_key(visit)
+        );
+        let replace = best_by_surface_fact
+            .get(&identity)
+            .is_none_or(|existing| visit_is_better_same_fact(visit, existing));
         if replace {
-            best_by_surface.insert(identity, visit);
+            best_by_surface_fact.insert(identity, visit);
         }
     }
-    let mut selected = best_by_surface.into_values().collect::<Vec<_>>();
+    let mut selected = best_by_surface_fact.into_values().collect::<Vec<_>>();
     selected.sort_by_key(|visit| {
         (
-            std::cmp::Reverse(visit.engagement_score),
+            std::cmp::Reverse(visit_role_rank(visit)),
+            std::cmp::Reverse(visit.task_relevance_score),
             std::cmp::Reverse(visit.last_observed_at_ms),
             visit.sequence_index,
         )
     });
+    let mut deduplicated = Vec::new();
+    for visit in selected {
+        let Some(frame) = visit.representative_frame.as_ref() else {
+            continue;
+        };
+        if let Some(existing_index) =
+            deduplicated
+                .iter()
+                .position(|existing: &&super::observation_packet::SurfaceVisitV2| {
+                    existing
+                        .representative_frame
+                        .as_ref()
+                        .is_some_and(|existing_frame| {
+                            frames_are_semantically_redundant(packet, frame, existing_frame)
+                        })
+                })
+        {
+            let existing = deduplicated[existing_index];
+            if visit_is_better_same_fact(visit, existing) {
+                deduplicated[existing_index] = visit;
+            }
+        } else {
+            deduplicated.push(visit);
+        }
+    }
+    let mut selected = deduplicated;
     selected.truncate(MAX_IMAGES.saturating_sub(1));
     selected.sort_by_key(|visit| visit.sequence_index);
     selected
@@ -994,6 +1428,9 @@ fn surface_image_omission_reason(
     };
     if selected_image_frame_ids.contains(frame.frame_id.as_str()) {
         return None;
+    }
+    if frame.near_duplicate_group.is_some() {
+        return Some("near_duplicate_or_budget_omitted");
     }
     if frame.model_eligible {
         return Some("budget_omitted");
@@ -1108,16 +1545,95 @@ fn build_slots(
         raw_reason_count.saturating_sub(reason_strings.len()),
     );
 
-    let context_image_visits = selected_context_image_visits(packet, cutoff);
-    let mut emitted_image_frame_ids = BTreeSet::new();
+    let mut emitted_image_frame_ids = BTreeSet::<String>::new();
     let mut emitted_observation_ids = BTreeSet::new();
     let mut emitted_event_ids = BTreeSet::new();
     let mut emitted_delta_ids = BTreeSet::new();
+    // A surface visit has only one representative frame. When a completed task and
+    // a newer request share that surface, visit-level grouping can therefore hide
+    // the exact frame that proves the completion boundary. Reserve the image budget
+    // for attributed P6 task-state transitions before adding general context visits.
+    let mut task_state_frames = packet
+        .semantic_keyframes
+        .iter()
+        .filter(|frame| {
+            frame.frame_id != packet.current_frame.frame_id
+                && frame.observed_at_ms <= cutoff
+                && frame.model_eligible
+                && !is_private_status(Some(&frame.privacy_status))
+                && matches!(
+                    frame.task_evidence_role,
+                    Some(
+                        TaskEvidenceRoleV1::LatestUserGoal
+                            | TaskEvidenceRoleV1::CurrentUnsentDraft
+                            | TaskEvidenceRoleV1::CurrentAgentState
+                            | TaskEvidenceRoleV1::PriorTaskBoundary
+                    )
+                )
+        })
+        .collect::<Vec<_>>();
+    task_state_frames.sort_by_key(|frame| {
+        (
+            std::cmp::Reverse(
+                frame
+                    .task_evidence_role
+                    .unwrap_or(TaskEvidenceRoleV1::Unknown)
+                    .authority_rank(),
+            ),
+            std::cmp::Reverse(frame.observed_at_ms),
+            frame.frame_id.clone(),
+        )
+    });
+    for (index, frame) in task_state_frames.into_iter().enumerate() {
+        if emitted_image_frame_ids.len() >= MAX_IMAGES.saturating_sub(1) {
+            break;
+        }
+        if emitted_image_frame_ids
+            .iter()
+            .filter_map(|frame_id| find_packet_frame(packet, frame_id))
+            .any(|existing| frames_are_semantically_redundant(packet, frame, existing))
+            || !emitted_image_frame_ids.insert(frame.frame_id.clone())
+        {
+            continue;
+        }
+        let role = frame
+            .task_evidence_role
+            .unwrap_or(TaskEvidenceRoleV1::Unknown);
+        insert_slot(
+            &mut slots,
+            SupportSlot {
+                slot: format!("P{}_TASK_CONTEXT_IMAGE", index + 1),
+                boundary_index: 0,
+                category: SupportCategory::ContextImage,
+                source_kind: "keyframe".into(),
+                record_id: frame.frame_id.clone(),
+                frame_id: Some(frame.frame_id.clone()),
+                content_hash: frame.local_image_handle_hash.clone(),
+                source_fingerprint: physical_frame_fingerprint(frame),
+                observed_at_ms: frame.observed_at_ms,
+                privacy_eligible: true,
+                ownership_eligible: frame.surface_ownership_confidence >= 0.5,
+                summary: format!(
+                    "Earlier attributed screen selected as {} task-state transition evidence.",
+                    task_evidence_role_label(role)
+                ),
+            },
+        );
+    }
+    let context_image_visits = selected_context_image_visits(packet, cutoff);
     for visit in &context_image_visits {
+        if emitted_image_frame_ids.len() >= MAX_IMAGES.saturating_sub(1) {
+            break;
+        }
         let Some(frame) = visit.representative_frame.as_ref() else {
             continue;
         };
-        if !emitted_image_frame_ids.insert(frame.frame_id.clone()) {
+        if emitted_image_frame_ids
+            .iter()
+            .filter_map(|frame_id| find_packet_frame(packet, frame_id))
+            .any(|existing| frames_are_semantically_redundant(packet, frame, existing))
+            || !emitted_image_frame_ids.insert(frame.frame_id.clone())
+        {
             continue;
         }
         insert_slot(
@@ -1134,13 +1650,20 @@ fn build_slots(
                 observed_at_ms: frame.observed_at_ms,
                 privacy_eligible: frame.model_eligible
                     && !is_private_status(Some(&frame.privacy_status)),
-                ownership_eligible: true,
-                summary: "Representative screen from an earlier observed session surface.".into(),
+                ownership_eligible: frame.surface_ownership_confidence >= 0.5,
+                summary: format!(
+                    "Earlier screen selected as {} evidence; its pane and speaker roles remain separate in task_relevance.",
+                    task_evidence_role_label(
+                        visit
+                            .task_evidence_role
+                            .unwrap_or(TaskEvidenceRoleV1::Unknown)
+                    )
+                ),
             },
         );
     }
-    let allow_current_before = context_image_visits.len() + 2 <= MAX_IMAGES;
-    let use_boundary_image_fallback = context_image_visits.is_empty();
+    let allow_current_before = emitted_image_frame_ids.len() + 2 <= MAX_IMAGES;
+    let use_boundary_image_fallback = emitted_image_frame_ids.is_empty();
     for (assignment_index, boundary) in boundaries.iter().enumerate() {
         let boundary_index = assignment_index + 1;
         let boundary_frames = &boundary.frames;
@@ -1163,12 +1686,22 @@ fn build_slots(
                 continue;
             }
             let is_current_frame = frame.frame_id == packet.current_frame.frame_id;
+            if !is_current_frame
+                && packet.task_relevance.source == "p6_role_region_task_turn"
+                && (frame.task_evidence_role.is_none_or(|role| {
+                    matches!(
+                        role,
+                        TaskEvidenceRoleV1::Unknown | TaskEvidenceRoleV1::FlattenedFallback
+                    )
+                }) || frame.same_task_relation.contains("unrelated"))
+            {
+                continue;
+            }
             if !is_current_frame && !allow_current_before {
                 continue;
             }
             if !is_current_frame
-                && frame.local_image_handle_hash.is_some()
-                && frame.local_image_handle_hash == packet.current_frame.local_image_handle_hash
+                && frames_are_semantically_redundant(packet, frame, &packet.current_frame)
             {
                 continue;
             }
@@ -1202,7 +1735,7 @@ fn build_slots(
                     observed_at_ms: frame.observed_at_ms,
                     privacy_eligible: frame.model_eligible
                         && !is_private_status(Some(&frame.privacy_status)),
-                    ownership_eligible: true,
+                    ownership_eligible: frame.surface_ownership_confidence >= 0.5,
                     summary: if category == SupportCategory::ImageBefore {
                         "Screen captured before this boundary's observed actions and visible change."
                             .into()
@@ -1436,7 +1969,7 @@ fn response_schema(
     slots: &BTreeMap<String, SupportSlot>,
     visits: &[RequestSurfaceVisit<'_>],
 ) -> Value {
-    let nullable_string = || json!({"anyOf":[{"type":"null"},{"type":"string","maxLength":320}]});
+    let nullable_string = |max_length: usize| json!({"anyOf":[{"type":"null"},{"type":"string","maxLength":max_length}]});
     let support_properties = SEMANTIC_FIELDS
         .iter()
         .map(|field| {
@@ -1457,6 +1990,26 @@ fn response_schema(
             (
                 (*field).to_string(),
                 json!({"type":"number","minimum":0,"maximum":1}),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    let missing_evidence_properties = SEMANTIC_FIELDS
+        .iter()
+        .map(|field| {
+            (
+                (*field).to_string(),
+                json!({"type":"array","maxItems":4,"items":{"type":"string","maxLength":MAX_MISSING_EVIDENCE_CHARS}}),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    let verifier_result_properties = SEMANTIC_FIELDS
+        .iter()
+        .map(|field| {
+            (
+                (*field).to_string(),
+                // The provider can only mark a field pending. Local admission
+                // replaces this with admitted, rejected, or not_proposed.
+                json!({"type":"string","enum":["pending"]}),
             )
         })
         .collect::<serde_json::Map<String, Value>>();
@@ -1496,14 +2049,21 @@ fn response_schema(
         "type":"object",
         "additionalProperties":false,
         "required":[
-            "primary_task","current_step","last_progress","unfinished_state","visit_roles",
-            "support_slots_by_field","missing_evidence","confidence_by_field","status"
+            "unfinished_task","task_state","resume_point","next_supported_action",
+            "completed_context","where_summary","visit_roles","support_slots_by_field",
+            "missing_evidence","missing_evidence_by_field","confidence_by_field",
+            "verifier_result_by_field","status"
         ],
         "properties":{
-            "primary_task":nullable_string(),
-            "current_step":nullable_string(),
-            "last_progress":nullable_string(),
-            "unfinished_state":nullable_string(),
+            "unfinished_task":nullable_string(MAX_UNFINISHED_TASK_CHARS),
+            "task_state":{"type":"string","enum":[
+                "active","waiting_for_result","needs_user_verification","blocked",
+                "superseded","completed","unclear"
+            ]},
+            "resume_point":nullable_string(MAX_RESUME_POINT_CHARS),
+            "next_supported_action":nullable_string(MAX_NEXT_SUPPORTED_ACTION_CHARS),
+            "completed_context":nullable_string(MAX_COMPLETED_CONTEXT_CHARS),
+            "where_summary":nullable_string(MAX_WHERE_SUMMARY_CHARS),
             "visit_roles":{
                 "type":"object","additionalProperties":false,
                 "required":role_required,"properties":role_properties
@@ -1513,11 +2073,19 @@ fn response_schema(
                 "required":SEMANTIC_FIELDS,"properties":support_properties
             },
             "missing_evidence":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":240}},
+            "missing_evidence_by_field":{
+                "type":"object","additionalProperties":false,
+                "required":SEMANTIC_FIELDS,"properties":missing_evidence_properties
+            },
             "confidence_by_field":{
                 "type":"object","additionalProperties":false,
                 "required":SEMANTIC_FIELDS,"properties":confidence_properties
             },
-            "status":{"type":"string","enum":["resolved","partly_resolved","unresolved"]}
+            "verifier_result_by_field":{
+                "type":"object","additionalProperties":false,
+                "required":SEMANTIC_FIELDS,"properties":verifier_result_properties
+            },
+            "status":{"type":"string","enum":["resolved","partly_resolved","unresolved","refused"]}
         }
     })
 }
@@ -1542,7 +2110,7 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
 }
 
 fn system_instruction() -> &'static str {
-    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, a qualified primary task using words such as likely or appears to be is allowed if it cites the relevant source and current images; do not invent a narrower purpose than those images support. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
+    "Resolve one atomic continuation from the compact chronological packet. Answer these questions: What is the newest unfinished task? What relevant work is already complete? What exact state was left behind? What one next action is directly supported by the supplied evidence? Where was that state observed, without inventing a locator? Read boundaries and panes chronologically. Prefer attributed user and agent task evidence over visually prominent prose. Distinguish a broad workstream from the newest concrete task, implementation from verification, and a draft from a submitted request. A completed task followed by a new request means the new request is unfinished and the old task is completed_context only when needed. Completed implementation with checks passed and user testing remaining means unfinished_task is verification, task_state is needs_user_verification, and next_supported_action is the concrete supported test. When an agent is still working, use the user objective as unfinished_task, waiting_for_result as task_state, the latest agent state as resume_point, and only an evidenced wait or inspect action. An unsent draft may establish its purpose and editing state, but never claim submission. Preserve causal wording in a draft as a complaint or hypothesis, not as proof that the named change caused the result. Truly completed work uses completed and has no invented next action. Supporting research or an adjacent chat cannot replace the primary task without explicit same-task evidence. Thin evidence requires null semantic fields, task_state unclear, and status unresolved. Do not turn a causal complaint or hypothesis into fact. Classify every requested visit as primary_work, supporting_work, detour_or_unrelated, or unclear. Use the attributed P6 task_relevance evidence in this order: newest high-confidence user goal or unsent draft; the agent, tool, editor, terminal, or result directly serving that goal; the immediately prior completion boundary; then bounded supporting or current-state evidence. Keep pane_id regions separate and use reading_order only within a pane. Flattened-window fallback has low task authority. The final screen is factual current state, not automatic task authority. App names, titles, hostnames, duration, recency, interaction volume, dwell, frame count, text length, workstream labels, and local activity classes cannot establish task relevance or a next action. Engagement may only break a tie among evidence already proven to belong to the same task. hostname_mentioned_in_current_surface cannot establish continuity by itself. committed_input proves an input commit but contains no characters. Each visit role must cite its own image slot and explain its evidence-grounded relationship. Cite request-local support for every non-null semantic field and for any task_state other than unclear. Set every verifier_result_by_field value to pending; local code owns admission. Record field-local missing evidence. Return null instead of generic wording such as Continue working, Keep browsing, or Review it. Never invent targets, paths, URLs, commands, identifiers, intentions, causality, progress, or unsupported actions. Never recommend sending or submitting an unsent draft. Never recommend a destructive operation. Respect task_relevance.confidence_cap for every field and visit confidence. Return strict JSON matching the supplied schema."
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -1584,6 +2152,198 @@ fn support_category_order(category: SupportCategory) -> u8 {
     }
 }
 
+fn compact_task_relevance_value(
+    packet: &ObservationPacketV2,
+    selected_frame_ids: &BTreeSet<&str>,
+    confidence_cap_millis: i64,
+) -> Value {
+    let mut spans = packet
+        .task_relevance
+        .spans
+        .iter()
+        .filter(|span| {
+            selected_frame_ids.contains(span.frame_id.as_str())
+                && !is_private_status(Some(&span.privacy_status))
+        })
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| {
+        (
+            frame_time(packet, &span.frame_id).unwrap_or_default(),
+            span.pane_id.clone(),
+            span.reading_order,
+            std::cmp::Reverse(span.evidence_role.authority_rank()),
+            span.span_id.clone(),
+        )
+    });
+    spans.dedup_by(|left, right| left.span_id == right.span_id);
+    spans.truncate(MAX_TASK_RELEVANT_SPANS);
+    json!({
+        "schema": packet.task_relevance.schema,
+        "source": packet.task_relevance.source,
+        "task_authority": if packet.task_relevance.source == "p6_role_region_task_turn" {
+            "attributed_role_region_task_turn"
+        } else {
+            "flattened_window_fallback_low_authority"
+        },
+        "current_task_turn": packet.task_relevance.current_task_turn,
+        "latest_user_goal_sample": packet.task_relevance.latest_user_goal_sample.as_deref().map(|value| bounded_text(value, 320)),
+        "latest_user_input_submission_state": if packet.task_relevance.current_unsent_draft_present {
+            "unsent_draft"
+        } else if packet.task_relevance.latest_user_goal_sample.is_some() {
+            "submitted_or_committed"
+        } else {
+            "unknown"
+        },
+        "current_agent_state_sample": packet.task_relevance.current_agent_state_sample.as_deref().map(|value| bounded_text(value, 320)),
+        "prior_task_boundary_sample": packet.task_relevance.prior_task_boundary_sample.as_deref().map(|value| bounded_text(value, 320)),
+        "ordered_spans": spans,
+        "missing_evidence": packet.task_relevance.missing_evidence.iter().take(8).map(|value| bounded_text(value, MAX_MISSING_EVIDENCE_CHARS)).collect::<Vec<_>>(),
+        "fallback_flags": packet.task_relevance.fallback_flags,
+        "confidence_cap": confidence_cap_millis as f64 / 1_000.0,
+        "pane_policy": "Reading order is local to pane_id. Never merge text across panes or use vertical position as cross-pane chronology.",
+    })
+}
+
+fn request_slot(packet: &ObservationPacketV2, slot: &SupportSlot) -> RequestSlot {
+    let mut matching_spans = packet
+        .task_relevance
+        .spans
+        .iter()
+        .filter(|span| slot.frame_id.as_deref() == Some(span.frame_id.as_str()))
+        .collect::<Vec<_>>();
+    matching_spans.sort_by_key(|span| {
+        (
+            span.pane_id.clone(),
+            span.reading_order,
+            std::cmp::Reverse(span.evidence_role.authority_rank()),
+        )
+    });
+    let unique = |values: Vec<String>| {
+        let mut values = values;
+        values.sort();
+        values.dedup();
+        values
+    };
+    RequestSlot {
+        slot: slot.slot.clone(),
+        category: slot.category,
+        observed_at_ms: slot.observed_at_ms,
+        summary: slot.summary.clone(),
+        evidence_roles: unique(
+            matching_spans
+                .iter()
+                .map(|span| task_evidence_role_label(span.evidence_role).to_string())
+                .collect(),
+        ),
+        pane_ids: unique(
+            matching_spans
+                .iter()
+                .map(|span| span.pane_id.clone())
+                .collect(),
+        ),
+        region_roles: unique(
+            matching_spans
+                .iter()
+                .map(|span| span.region_role.clone())
+                .collect(),
+        ),
+        conversational_roles: unique(
+            matching_spans
+                .iter()
+                .map(|span| span.conversational_role.clone())
+                .collect(),
+        ),
+        task_authority: if packet.task_relevance.source == "p6_role_region_task_turn" {
+            "attributed_structured_spans"
+        } else {
+            "flattened_fallback_not_task_authority"
+        }
+        .into(),
+    }
+}
+
+fn image_candidate_audit_values(
+    packet: &ObservationPacketV2,
+    selected_frame_ids: &BTreeSet<&str>,
+) -> Vec<Value> {
+    let mut values = packet
+        .image_candidates
+        .iter()
+        .filter_map(|candidate| serde_json::to_value(candidate).ok())
+        .collect::<Vec<_>>();
+    let known = packet
+        .image_candidates
+        .iter()
+        .map(|candidate| candidate.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for (candidate, value) in packet.image_candidates.iter().zip(values.iter_mut()) {
+        let selected = selected_frame_ids.contains(candidate.frame_id.as_str());
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        object.insert("selected".into(), json!(selected));
+        let mut selection_reasons = candidate.selection_reasons.clone();
+        let mut rejection_reasons = candidate.rejection_reasons.clone();
+        if selected {
+            selection_reasons.push(format!(
+                "semantic_probe_task_role:{}",
+                task_evidence_role_label(candidate.evidence_role)
+            ));
+        } else if rejection_reasons.is_empty() {
+            rejection_reasons.push(
+                if candidate.near_duplicate_group.is_some() {
+                    "near_duplicate_without_task_state_change"
+                } else {
+                    "not_selected_by_task_relevance_policy"
+                }
+                .into(),
+            );
+        }
+        selection_reasons.sort();
+        selection_reasons.dedup();
+        rejection_reasons.sort();
+        rejection_reasons.dedup();
+        object.insert("selection_reasons".into(), json!(selection_reasons));
+        object.insert("rejection_reasons".into(), json!(rejection_reasons));
+    }
+    for frame_id in selected_frame_ids
+        .iter()
+        .filter(|frame_id| !known.contains(**frame_id))
+    {
+        if let Some(frame) = find_packet_frame(packet, frame_id) {
+            values.push(json!({
+                "frame_id": frame.frame_id,
+                "task_turn_id": frame.task_turn_id,
+                "evidence_role": frame.task_evidence_role.unwrap_or(TaskEvidenceRoleV1::Unknown),
+                "selected": true,
+                "selection_reasons": ["semantic_probe_selected_packet_frame"],
+                "rejection_reasons": [],
+                "supports_latest_user_goal": frame.task_evidence_role == Some(TaskEvidenceRoleV1::LatestUserGoal),
+                "supports_current_agent_state": frame.task_evidence_role == Some(TaskEvidenceRoleV1::CurrentAgentState),
+                "supports_prior_task_boundary": frame.task_evidence_role == Some(TaskEvidenceRoleV1::PriorTaskBoundary),
+                "same_task_relation": frame.same_task_relation,
+                "cross_pane_ambiguity": frame.cross_pane_ambiguity,
+                "near_duplicate_group": frame.near_duplicate_group,
+                "engagement_used_as_same_task_tiebreaker": false,
+                "original_width": frame.image_width,
+                "original_height": frame.image_height,
+                "image_scope": frame.image_scope,
+                "crop_policy": if frame.crop_pixels.is_some() { "packet_crop" } else { "no_crop" },
+                "redaction_status": frame.privacy_status,
+                "preparation_reason": "semantic_probe_preparation_audit_has_sent_dimensions",
+            }));
+        }
+    }
+    values.sort_by_key(|value| {
+        value
+            .get("frame_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    values
+}
+
 pub(crate) fn build_probe_request(
     packet: &ObservationPacketV2,
     model_name: &str,
@@ -1615,18 +2375,13 @@ pub(crate) fn build_probe_request(
             let mut boundary_slots = slots
                 .values()
                 .filter(|slot| slot.boundary_index == index + 1)
-                .map(|slot| RequestSlot {
-                    slot: &slot.slot,
-                    category: slot.category,
-                    observed_at_ms: slot.observed_at_ms,
-                    summary: &slot.summary,
-                })
+                .map(|slot| request_slot(packet, slot))
                 .collect::<Vec<_>>();
             boundary_slots.sort_by_key(|slot| {
                 (
                     slot.observed_at_ms,
                     support_category_order(slot.category),
-                    slot.slot,
+                    slot.slot.clone(),
                 )
             });
             let prior_image_slot = boundary
@@ -1669,6 +2424,31 @@ pub(crate) fn build_probe_request(
             }
         })
         .collect::<Vec<_>>();
+    let selected_image_frame_ids = slots
+        .values()
+        .filter(|slot| {
+            matches!(
+                slot.category,
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
+            )
+        })
+        .map(|slot| slot.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let packet_cap_millis =
+        (packet.task_relevance.confidence_cap.clamp(0.0, 1.0) * 1_000.0).round() as i64;
+    let task_confidence_cap_millis = selected_image_frame_ids
+        .iter()
+        .filter_map(|frame_id| find_packet_frame(packet, frame_id))
+        .fold(packet_cap_millis, |cap, frame| {
+            if frame.cross_pane_ambiguity || (frame.crop_pixels.is_some() && !reliable_crop(frame))
+            {
+                cap.min(AMBIGUOUS_PANE_CONFIDENCE_CAP_MILLIS)
+            } else {
+                cap
+            }
+        });
     let image_slot_by_frame = slots
         .values()
         .filter(|slot| {
@@ -1694,14 +2474,17 @@ pub(crate) fn build_probe_request(
             last_observed_at_ms: visit.last_observed_at_ms,
             is_current: visit.is_current,
             revisited: visit.revisited,
-            interaction_count: visit.interaction_count,
-            frame_count: visit.frame_count,
-            engagement_score: visit.engagement_score,
-            observed_duration_ms: visit
-                .last_observed_at_ms
-                .saturating_sub(visit.first_observed_at_ms),
             committed_input: visit.committed_input,
-            carried_into_current_surface: visit.carried_into_current_surface,
+            hostname_mentioned_in_current_surface: visit.hostname_mentioned_in_current_surface,
+            task_evidence_role: task_evidence_role_label(
+                visit
+                    .task_evidence_role
+                    .unwrap_or(TaskEvidenceRoleV1::Unknown),
+            ),
+            task_relevance_score: visit.task_relevance_score,
+            same_task_relation: &visit.same_task_relation,
+            cross_pane_ambiguity: visit.cross_pane_ambiguity,
+            engagement_used_as_same_task_tiebreaker: visit.engagement_used_as_same_task_tiebreaker,
             image_slot: visit
                 .representative_frame
                 .as_ref()
@@ -1740,9 +2523,12 @@ pub(crate) fn build_probe_request(
         "reading_guide":{
             "ordering":"Boundaries and slots are chronological. The final boundary is what was visible when Continue was invoked.",
             "images":"context_image slots are representative earlier screens. image_before and image_after belong to the final causal boundary. Images are globally capped at four.",
-            "meaning":"The surface timeline is factual chronology only. App names and hostnames cannot establish the primary task or a visit role without cited visual or action evidence. carried_into_current_surface is a locally verified visible source carry, and committed_input contains no typed characters. Interaction and duration values are bounded factual signals, not task labels.",
+            "meaning":"The P6 task_relevance block owns task ordering when attributed spans are available. Latest user goal outranks older completed work; its directly related agent/result state follows it. App names, hostnames, text length, interaction volume, dwell, and recency cannot establish cross-surface task relevance. Engagement may only break a tie already proven to belong to the same task. hostname_mentioned_in_current_surface is a neutral visible-text observation and cannot establish continuity by itself. committed_input contains no typed characters.",
+            "panes":"Each ordered span retains pane_id, region role, conversational role, and pane-local reading order. Never merge adjacent panes into one conversation. A long assistant or side-pane response cannot outrank a shorter attributed user goal.",
+            "fallback":"flattened_window_fallback has low authority and the stated confidence cap. It cannot support confident speaker, pane, or task-turn claims.",
             "momentary_switch":"A boundary marked momentary_app_switch_at_continue means the foreground changed immediately before Continue without a confirming action on the new surface. The new surface must not replace stronger earlier task evidence merely because it is final."
         },
+        "task_relevance": compact_task_relevance_value(packet, &selected_image_frame_ids, task_confidence_cap_millis),
         "recent_surface_timeline":&request_surface_timeline,
         "boundaries":request_boundaries,
         "missing_evidence":missing_evidence,
@@ -1773,6 +2559,7 @@ pub(crate) fn build_probe_request(
     let mut content = vec![json!({"type":"input_text","text":structured_text})];
     let mut image_bytes = 0usize;
     let mut supplied_image_slots = Vec::new();
+    let mut image_preparations = Vec::new();
     let mut image_slots = slots
         .values()
         .filter(|slot| {
@@ -1789,23 +2576,24 @@ pub(crate) fn build_probe_request(
         let Some(frame) = find_packet_frame(packet, &slot.record_id) else {
             continue;
         };
-        let (bytes, mime) = model::read_model_image(frame).map_err(|reason| {
+        let prepared = prepare_probe_image(packet, slot, frame).map_err(|reason| {
             (
                 ProbeDiagnosticStatus::RequestNotBuilt,
                 format!("probe_image_unavailable:{}:{reason}", slot.slot),
             )
         })?;
-        image_bytes += bytes.len();
+        image_bytes += prepared.bytes.len();
         content.push(json!({
             "type":"input_text",
             "text":format!("support_slot={} observed_at_ms={}", slot.slot, slot.observed_at_ms)
         }));
         content.push(json!({
             "type":"input_image",
-            "image_url":format!("data:{mime};base64,{}", model::base64_encode(&bytes)),
+            "image_url":format!("data:{};base64,{}", prepared.mime, model::base64_encode(&prepared.bytes)),
             "detail":"high"
         }));
         supplied_image_slots.push(slot.slot.clone());
+        image_preparations.push(prepared.audit);
     }
     if supplied_image_slots.is_empty() {
         return Err((
@@ -1823,18 +2611,6 @@ pub(crate) fn build_probe_request(
             .as_bytes()
         )
     );
-    let selected_image_frame_ids = slots
-        .values()
-        .filter(|slot| {
-            matches!(
-                slot.category,
-                SupportCategory::ContextImage
-                    | SupportCategory::ImageBefore
-                    | SupportCategory::ImageAfter
-            )
-        })
-        .map(|slot| slot.record_id.as_str())
-        .collect::<BTreeSet<_>>();
     let surface_timeline = packet
         .surface_timeline
         .iter()
@@ -1861,7 +2637,8 @@ pub(crate) fn build_probe_request(
                 .last_observed_at_ms
                 .saturating_sub(visit.first_observed_at_ms),
             committed_input: visit.committed_input,
-            carried_into_current_surface: visit.carried_into_current_surface,
+            carried_into_current_surface: false,
+            hostname_mentioned_in_current_surface: visit.hostname_mentioned_in_current_surface,
             image_slot: visit
                 .representative_frame
                 .as_ref()
@@ -1891,14 +2668,16 @@ pub(crate) fn build_probe_request(
         .values()
         .filter_map(|slot| {
             let reason = match slot.category {
-                SupportCategory::ContextImage => "engagement_ranked_distinct_surface",
-                SupportCategory::ImageBefore => {
-                    "current_boundary_before_when_visually_distinct_and_budget_available"
-                }
-                SupportCategory::ImageAfter => "reserved_current_frame",
+                SupportCategory::ContextImage => find_packet_frame(packet, &slot.record_id)
+                    .and_then(|frame| frame.task_evidence_role)
+                    .map(task_evidence_role_label)
+                    .map(|role| format!("task_relevance_ranked:{role}"))
+                    .unwrap_or_else(|| "flattened_fallback_ambiguity_context".into()),
+                SupportCategory::ImageBefore => "task_state_transition_before_image".into(),
+                SupportCategory::ImageAfter => "reserved_factual_current_state".into(),
                 _ => return None,
             };
-            Some((slot.slot.clone(), reason.to_string()))
+            Some((slot.slot.clone(), reason))
         })
         .collect::<BTreeMap<_, _>>();
     let mut image_exclusions_by_reason = BTreeMap::<String, usize>::new();
@@ -1914,13 +2693,23 @@ pub(crate) fn build_probe_request(
         .get("budget_omitted")
         .copied()
         .unwrap_or(0);
+    let image_candidates = image_candidate_audit_values(packet, &selected_image_frame_ids);
+    for candidate in &image_candidates {
+        if let Some(reasons) = candidate.get("rejection_reasons").and_then(Value::as_array) {
+            for reason in reasons.iter().filter_map(Value::as_str) {
+                *image_exclusions_by_reason
+                    .entry(reason.to_string())
+                    .or_default() += 1;
+            }
+        }
+    }
     let body = json!({
         "model":model_name,
         "store":crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens":MAX_OUTPUT_TOKENS,
         "text":{"format":{
             "type":"json_schema",
-            "name":"smalltalk_pftu_01_semantic_probe",
+            "name":"smalltalk_pftu_01_semantic_probe_v3",
             "strict":true,
             "schema":response_schema(&slots, &request_surface_timeline)
         }},
@@ -1970,6 +2759,15 @@ pub(crate) fn build_probe_request(
             image_selection_reasons,
             omitted_surface_visit_count,
             image_exclusions_by_reason,
+            task_relevance_source: packet.task_relevance.source.clone(),
+            current_task_turn_id: packet
+                .task_relevance
+                .current_task_turn
+                .as_ref()
+                .map(|task_turn| task_turn.task_turn_id.clone()),
+            task_confidence_cap_millis,
+            image_candidates,
+            image_preparations,
         },
         slots,
     })
@@ -2020,27 +2818,36 @@ fn output_text(response: &Value) -> Result<String, (ProbeDiagnosticStatus, Strin
     }
 }
 
-fn field_value<'a>(output: &'a ProbeModelOutput, field: &str) -> Option<&'a String> {
+fn field_value(output: &ProbeModelOutput, field: &str) -> Option<String> {
     match field {
-        "primary_task" => output.primary_task.as_ref(),
-        "current_step" => output.current_step.as_ref(),
-        "last_progress" => output.last_progress.as_ref(),
-        "unfinished_state" => output.unfinished_state.as_ref(),
+        "unfinished_task" => output.unfinished_task.clone(),
+        "task_state" => (output.task_state != ProbeTaskState::Unclear)
+            .then(|| output.task_state.label().to_string()),
+        "resume_point" => output.resume_point.clone(),
+        "next_supported_action" => output.next_supported_action.clone(),
+        "completed_context" => output.completed_context.clone(),
+        "where_summary" => output.where_summary.clone(),
         _ => None,
     }
 }
 
 fn set_field_value(output: &mut ProbeModelOutput, field: &str, value: Option<String>) {
     match field {
-        "primary_task" => output.primary_task = value,
-        "current_step" => output.current_step = value,
-        "last_progress" => output.last_progress = value,
-        "unfinished_state" => output.unfinished_state = value,
+        "unfinished_task" => output.unfinished_task = value,
+        "task_state" => {
+            if value.is_none() {
+                output.task_state = ProbeTaskState::Unclear;
+            }
+        }
+        "resume_point" => output.resume_point = value,
+        "next_supported_action" => output.next_supported_action = value,
+        "completed_context" => output.completed_context = value,
+        "where_summary" => output.where_summary = value,
         _ => {}
     }
 }
 
-fn primary_task_is_generic(value: &str) -> bool {
+fn unfinished_task_is_generic(value: &str) -> bool {
     let normalized = value
         .trim()
         .trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
@@ -2070,6 +2877,97 @@ fn primary_task_is_generic(value: &str) -> bool {
                 || normalized == format!("{generic} the {object}")
         })
     })
+}
+
+fn field_length_limit(field: &str) -> Option<usize> {
+    match field {
+        "unfinished_task" => Some(MAX_UNFINISHED_TASK_CHARS),
+        "resume_point" => Some(MAX_RESUME_POINT_CHARS),
+        "next_supported_action" => Some(MAX_NEXT_SUPPORTED_ACTION_CHARS),
+        "completed_context" => Some(MAX_COMPLETED_CONTEXT_CHARS),
+        "where_summary" => Some(MAX_WHERE_SUMMARY_CHARS),
+        "task_state" => None,
+        _ => None,
+    }
+}
+
+fn next_action_is_generic(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "continue"
+            | "continue working"
+            | "keep working"
+            | "keep browsing"
+            | "keep going"
+            | "review"
+            | "review it"
+            | "inspect"
+            | "inspect it"
+            | "resume"
+            | "resume work"
+    )
+}
+
+fn next_action_is_unsafe_or_locator_like(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    let unsafe_prefixes = [
+        "delete ",
+        "erase ",
+        "drop ",
+        "overwrite ",
+        "reset ",
+        "remove ",
+        "send ",
+        "submit ",
+        "post ",
+        "publish ",
+        "force push ",
+        "git reset ",
+        "rm ",
+        "sudo ",
+    ];
+    unsafe_prefixes
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        || normalized.contains("http://")
+        || normalized.contains("https://")
+        || normalized.contains("file://")
+        || normalized.contains("../")
+        || normalized.contains("~/")
+        || normalized.starts_with('/')
+        || normalized.contains(" /users/")
+}
+
+fn next_action_contradicts_state(value: &str, state: ProbeTaskState) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    match state {
+        ProbeTaskState::Completed | ProbeTaskState::Superseded | ProbeTaskState::Unclear => true,
+        ProbeTaskState::WaitingForResult => ["implement ", "build ", "edit ", "fix ", "change "]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix)),
+        ProbeTaskState::NeedsUserVerification => {
+            ["implement ", "build ", "write ", "add ", "change ", "fix "]
+                .iter()
+                .any(|prefix| normalized.starts_with(prefix))
+        }
+        ProbeTaskState::Active | ProbeTaskState::Blocked => false,
+    }
+}
+
+fn where_summary_has_raw_locator(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("http://")
+        || normalized.contains("https://")
+        || normalized.contains("file://")
+        || normalized.contains("?token=")
+        || normalized.contains("?key=")
+        || normalized.contains("/users/")
+        || normalized.starts_with('/')
+        || normalized.starts_with("~/")
 }
 
 fn source_fingerprint_matches(packet: &ObservationPacketV2, slot: &SupportSlot) -> bool {
@@ -2167,6 +3065,14 @@ fn request_has_primary_task_basis(
     let direct_basis = cited_slots
         .iter()
         .any(|slot| match slot.source_kind.as_str() {
+            "keyframe" => packet_frame_variants(packet, &slot.record_id).any(|frame| {
+                matches!(
+                    frame.task_evidence_role,
+                    Some(
+                        TaskEvidenceRoleV1::LatestUserGoal | TaskEvidenceRoleV1::CurrentUnsentDraft
+                    )
+                )
+            }),
             "causal_event" => packet
                 .causal_events
                 .iter()
@@ -2339,7 +3245,7 @@ pub(crate) fn admit_output(
     mut output: ProbeModelOutput,
 ) -> (ProbeModelOutput, Vec<String>) {
     let mut issues = Vec::new();
-    let mut primary_task_rejected_as_passive = false;
+    let mut unfinished_task_rejected_as_passive = false;
     let expected_fields = SEMANTIC_FIELDS.into_iter().collect::<BTreeSet<_>>();
     let actual_support_fields = output
         .support_slots_by_field
@@ -2351,15 +3257,32 @@ pub(crate) fn admit_output(
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    let actual_missing_evidence_fields = output
+        .missing_evidence_by_field
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let actual_verifier_fields = output
+        .verifier_result_by_field
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     if actual_support_fields != expected_fields {
         issues.push("support_field_set_mismatch".into());
     }
     if actual_confidence_fields != expected_fields {
         issues.push("confidence_field_set_mismatch".into());
     }
+    if actual_missing_evidence_fields != expected_fields {
+        issues.push("missing_evidence_field_set_mismatch".into());
+    }
+    if actual_verifier_fields != expected_fields {
+        issues.push("verifier_result_field_set_mismatch".into());
+    }
 
     for field in SEMANTIC_FIELDS {
-        let value = field_value(&output, field).cloned();
+        let value = field_value(&output, field);
+        let proposed = value.is_some();
         let mut supports = output
             .support_slots_by_field
             .get(field)
@@ -2372,10 +3295,33 @@ pub(crate) fn admit_output(
             .get(field)
             .copied()
             .unwrap_or_default();
+        let mut field_missing_evidence = output
+            .missing_evidence_by_field
+            .get(field)
+            .cloned()
+            .unwrap_or_default();
         let mut field_issues = Vec::new();
+        if output.verifier_result_by_field.get(field) != Some(&ProbeFieldVerifierResult::Pending) {
+            field_issues.push("provider_verifier_result_not_pending");
+        }
         if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
             field_issues.push("invalid_confidence");
         }
+        let raw_missing_evidence_count = field_missing_evidence.len();
+        field_missing_evidence.retain(|note| {
+            !note.trim().is_empty() && note.chars().count() <= MAX_MISSING_EVIDENCE_CHARS
+        });
+        field_missing_evidence.sort();
+        field_missing_evidence.dedup();
+        if raw_missing_evidence_count != field_missing_evidence.len()
+            || field_missing_evidence.len() > 4
+        {
+            field_issues.push("field_missing_evidence_invalid");
+            field_missing_evidence.truncate(4);
+        }
+        output
+            .missing_evidence_by_field
+            .insert(field.into(), field_missing_evidence.clone());
         if value.is_none() {
             if !supports.is_empty() {
                 field_issues.push("null_field_has_support_slots");
@@ -2387,22 +3333,40 @@ pub(crate) fn admit_output(
             {
                 field_issues.push("empty_field_value");
             }
-            if value
-                .as_deref()
-                .is_some_and(|value| value.chars().count() > MAX_SEMANTIC_FIELD_CHARS)
-            {
+            if value.as_deref().is_some_and(|value| {
+                field_length_limit(field).is_some_and(|limit| value.chars().count() > limit)
+            }) {
                 field_issues.push("field_value_too_long");
             }
             if supports.is_empty() {
                 field_issues.push("non_null_field_has_no_support");
             }
-            if field == "primary_task" && value.as_deref().is_some_and(primary_task_is_generic) {
-                field_issues.push("forbidden_generic_primary_task");
+            if field == "unfinished_task"
+                && value.as_deref().is_some_and(unfinished_task_is_generic)
+            {
+                field_issues.push("forbidden_generic_unfinished_task");
             }
-            if field == "primary_task"
+            if field == "unfinished_task"
                 && !request_has_primary_task_basis(packet, request, &supports)
             {
-                field_issues.push("passive_evidence_cannot_establish_primary_task");
+                field_issues.push("passive_evidence_cannot_establish_unfinished_task");
+            }
+            if field == "next_supported_action"
+                && value.as_deref().is_some_and(next_action_is_generic)
+            {
+                field_issues.push("forbidden_generic_next_action");
+            }
+            if field == "next_supported_action"
+                && value
+                    .as_deref()
+                    .is_some_and(next_action_is_unsafe_or_locator_like)
+            {
+                field_issues.push("unsafe_or_locator_like_next_action");
+            }
+            if field == "where_summary"
+                && value.as_deref().is_some_and(where_summary_has_raw_locator)
+            {
+                field_issues.push("raw_locator_not_allowed");
             }
             for support in &supports {
                 match request.slots.get(support) {
@@ -2425,10 +3389,10 @@ pub(crate) fn admit_output(
             }
         }
         if !field_issues.is_empty() {
-            if field == "primary_task"
-                && field_issues.contains(&"passive_evidence_cannot_establish_primary_task")
+            if field == "unfinished_task"
+                && field_issues.contains(&"passive_evidence_cannot_establish_unfinished_task")
             {
-                primary_task_rejected_as_passive = true;
+                unfinished_task_rejected_as_passive = true;
             }
             field_issues.sort_unstable();
             field_issues.dedup();
@@ -2442,17 +3406,27 @@ pub(crate) fn admit_output(
                 .support_slots_by_field
                 .insert(field.into(), Vec::new());
             output.confidence_by_field.insert(field.into(), 0.0);
+            output
+                .verifier_result_by_field
+                .insert(field.into(), ProbeFieldVerifierResult::Rejected);
         } else {
             output.support_slots_by_field.insert(field.into(), supports);
+            output.verifier_result_by_field.insert(
+                field.into(),
+                if proposed {
+                    ProbeFieldVerifierResult::Admitted
+                } else {
+                    ProbeFieldVerifierResult::NotProposed
+                },
+            );
         }
     }
 
-    // The four semantic fields describe one task state. If the proposed task
-    // was rejected because it came only from a momentary final screen, do not
-    // keep progress and unfinished-state claims derived from that same screen.
-    // Those claims would merely restate visible agent output as user work.
-    if primary_task_rejected_as_passive {
-        for field in ["current_step", "last_progress", "unfinished_state"] {
+    // The semantic fields describe one atomic task state. If the proposed task
+    // was rejected because it came only from a momentary final screen, reject
+    // task-state, resume, and action claims derived only from that screen too.
+    if unfinished_task_rejected_as_passive {
+        for field in ["task_state", "resume_point", "next_supported_action"] {
             let supports = output
                 .support_slots_by_field
                 .get(field)
@@ -2466,9 +3440,45 @@ pub(crate) fn admit_output(
                     .support_slots_by_field
                     .insert(field.into(), Vec::new());
                 output.confidence_by_field.insert(field.into(), 0.0);
+                output
+                    .verifier_result_by_field
+                    .insert(field.into(), ProbeFieldVerifierResult::Rejected);
                 issues.push(format!(
-                    "{field}:depends_on_rejected_momentary_primary_task"
+                    "{field}:depends_on_rejected_momentary_unfinished_task"
                 ));
+            }
+        }
+    }
+
+    if let Some(action) = output.next_supported_action.as_deref() {
+        if next_action_contradicts_state(action, output.task_state) {
+            output.next_supported_action = None;
+            output
+                .support_slots_by_field
+                .insert("next_supported_action".into(), Vec::new());
+            output
+                .confidence_by_field
+                .insert("next_supported_action".into(), 0.0);
+            output.verifier_result_by_field.insert(
+                "next_supported_action".into(),
+                ProbeFieldVerifierResult::Rejected,
+            );
+            issues.push("next_supported_action:contradicts_task_state".into());
+        }
+    }
+
+    if output.status == ProbeResolutionStatus::Refused {
+        for field in SEMANTIC_FIELDS {
+            if field_value(&output, field).is_some() {
+                set_field_value(&mut output, field, None);
+                output
+                    .support_slots_by_field
+                    .insert(field.into(), Vec::new());
+                output.confidence_by_field.insert(field.into(), 0.0);
+                output
+                    .verifier_result_by_field
+                    .insert(field.into(), ProbeFieldVerifierResult::Rejected);
+                issues.push(format!("{field}:refused_status_has_semantics"));
             }
         }
     }
@@ -2478,11 +3488,22 @@ pub(crate) fn admit_output(
     output.visit_roles = visit_roles;
     issues.extend(visit_role_issues);
 
-    if output.primary_task.is_none() {
+    let confidence_cap =
+        (request.audit.task_confidence_cap_millis.clamp(0, 1_000) as f64) / 1_000.0;
+    for confidence in output.confidence_by_field.values_mut() {
+        *confidence = confidence.min(confidence_cap);
+    }
+    for role in output.visit_roles.values_mut() {
+        role.confidence = role.confidence.min(confidence_cap);
+    }
+
+    if output.unfinished_task.is_none() {
         for (visit_id, role) in &mut output.visit_roles {
             if role.role != ProbeSurfaceRole::Unclear {
                 *role = unclear_visit_role();
-                issues.push(format!("visit_role:{visit_id}:primary_task_not_admitted"));
+                issues.push(format!(
+                    "visit_role:{visit_id}:unfinished_task_not_admitted"
+                ));
             }
         }
     } else if request_has_momentary_app_switch(request) {
@@ -2513,20 +3534,8 @@ pub(crate) fn admit_output(
         }
     }
 
-    let admitted_count = SEMANTIC_FIELDS
-        .iter()
-        .filter(|field| field_value(&output, field).is_some())
-        .count();
-    output.status = if output.primary_task.is_none() || admitted_count == 0 {
-        ProbeResolutionStatus::Unresolved
-    } else if admitted_count == SEMANTIC_FIELDS.len()
-        && output.primary_task.is_some()
-        && issues.is_empty()
-    {
-        ProbeResolutionStatus::Resolved
-    } else {
-        ProbeResolutionStatus::PartlyResolved
-    };
+    // `status` is the raw model status. Do not replace it with a locally
+    // inferred status; field_verifier_results records the admission outcome.
     let mut missing_evidence = output
         .missing_evidence
         .into_iter()
@@ -2988,10 +3997,10 @@ fn validate_armed_case(case: &ArmedProbeCase) -> Result<(), String> {
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if fields != SEMANTIC_FIELDS.into_iter().collect::<BTreeSet<_>>() {
+    if fields != LEGACY_PROOF_FIELDS.into_iter().collect::<BTreeSet<_>>() {
         return Err("probe_case_recoverable_field_set_mismatch".into());
     }
-    for field in SEMANTIC_FIELDS {
+    for field in LEGACY_PROOF_FIELDS {
         let expected = match field {
             "primary_task" => case.expected_primary_task.as_ref(),
             "current_step" => case.expected_current_step.as_ref(),
@@ -3210,7 +4219,7 @@ fn ensure_production_runtime_case(
         expected_current_step: None,
         expected_last_progress: None,
         expected_unfinished_state: None,
-        recoverable_by_field: SEMANTIC_FIELDS
+        recoverable_by_field: LEGACY_PROOF_FIELDS
             .iter()
             .map(|field| ((*field).to_string(), false))
             .collect(),
@@ -3441,7 +4450,7 @@ const REQUIRED_CASE_KINDS: [&str; 12] = [
 
 fn exact_semantic_field_set<T>(map: &BTreeMap<String, T>) -> bool {
     map.keys().map(String::as_str).collect::<BTreeSet<_>>()
-        == SEMANTIC_FIELDS.into_iter().collect::<BTreeSet<_>>()
+        == LEGACY_PROOF_FIELDS.into_iter().collect::<BTreeSet<_>>()
 }
 
 fn chosen_attempt<'a>(case: &'a ProofCase, model_name: &str) -> Result<&'a ProofAttempt, String> {
@@ -3613,7 +4622,7 @@ pub(crate) fn evaluate_proof_corpus(corpus: &ProofCorpus) -> ProofGateReport {
                 case.case_id
             ));
         }
-        for field in SEMANTIC_FIELDS {
+        for field in LEGACY_PROOF_FIELDS {
             let recoverable = case.recoverable_by_field.get(field) == Some(&true);
             let judgment = attempt.judgments_by_field.get(field);
             let output_value = attempt
@@ -3864,7 +4873,8 @@ mod tests {
     use super::*;
     use crate::continuation::task_truth_v2::observation_packet::{
         ActiveSurfaceIdentityV2, CanonicalElementV2, CausalEventV2, FrameCapacityAccountingV2,
-        FrameChangeV2, KeyframeReferenceV2, PacketSizeAccountingV2, SurfaceVisitV2,
+        FrameChangeV2, KeyframeReferenceV2, PacketSizeAccountingV2, PacketTaskTurnV1,
+        SurfaceVisitV2, TaskRelevantSpanV1,
     };
 
     fn image_file(id: usize) -> String {
@@ -3913,6 +4923,11 @@ mod tests {
             } else {
                 "material_change_boundary".into()
             }],
+            task_evidence_role: None,
+            task_turn_id: None,
+            same_task_relation: String::new(),
+            cross_pane_ambiguity: false,
+            near_duplicate_group: None,
         }
     }
 
@@ -4024,6 +5039,8 @@ mod tests {
             current_frame: current,
             semantic_keyframes: frames,
             surface_timeline: Vec::new(),
+            task_relevance: Default::default(),
+            image_candidates: Vec::new(),
             canonical_elements: (1..=4).map(element).collect(),
             focused_element_ids: vec!["element-4".into()],
             editable_element_ids: vec!["element-4".into()],
@@ -4085,6 +5102,12 @@ mod tests {
             engagement_score,
             committed_input: false,
             carried_into_current_surface: false,
+            hostname_mentioned_in_current_surface: false,
+            task_evidence_role: None,
+            task_relevance_score: 0,
+            same_task_relation: String::new(),
+            cross_pane_ambiguity: false,
+            engagement_used_as_same_task_tiebreaker: false,
             evidence_refs: vec![frame.frame_id.clone()],
             representative_frame: Some(frame),
         }
@@ -4120,6 +5143,118 @@ mod tests {
             ),
         ];
         packet
+    }
+
+    fn mark_p6_visit(
+        packet: &mut ObservationPacketV2,
+        visit_index: usize,
+        role: TaskEvidenceRoleV1,
+        relevance_score: i64,
+        relation: &str,
+        pane_id: &str,
+        submitted: Option<bool>,
+    ) {
+        packet.task_relevance.source = "p6_role_region_task_turn".into();
+        packet.task_relevance.confidence_cap = 0.92;
+        packet.task_relevance.missing_evidence.clear();
+        packet.task_relevance.fallback_flags.clear();
+        packet.task_relevance.current_task_turn = Some(PacketTaskTurnV1 {
+            task_turn_id: "task-turn-current".into(),
+            revision: 2,
+            execution_state: "active".into(),
+            current_actor: "assistant_or_agent".into(),
+            waiting_on: "agent".into(),
+            relation_to_prior: "new_task".into(),
+            goal_confidence: 0.94,
+            actor_state_confidence: 0.9,
+            relation_confidence: 0.88,
+            attribution_confidence: 0.93,
+            missing_evidence: Vec::new(),
+            quality_flags: Vec::new(),
+        });
+        let visit = &mut packet.surface_timeline[visit_index];
+        visit.task_evidence_role = Some(role);
+        visit.task_relevance_score = relevance_score;
+        visit.same_task_relation = relation.into();
+        visit.engagement_used_as_same_task_tiebreaker = relation == "current_task_turn";
+        let frame_id = visit
+            .representative_frame
+            .as_ref()
+            .expect("visit frame")
+            .frame_id
+            .clone();
+        if let Some(frame) = visit.representative_frame.as_mut() {
+            frame.task_evidence_role = Some(role);
+            frame.task_turn_id = Some("task-turn-current".into());
+            frame.same_task_relation = relation.into();
+        }
+        for frame in &mut packet.semantic_keyframes {
+            if frame.frame_id == frame_id {
+                frame.task_evidence_role = Some(role);
+                frame.task_turn_id = Some("task-turn-current".into());
+                frame.same_task_relation = relation.into();
+            }
+        }
+        if packet.current_frame.frame_id == frame_id {
+            packet.current_frame.task_evidence_role = Some(role);
+            packet.current_frame.task_turn_id = Some("task-turn-current".into());
+            packet.current_frame.same_task_relation = relation.into();
+        }
+        packet.task_relevance.spans.push(TaskRelevantSpanV1 {
+            span_id: format!("span-{visit_index}-{}", task_evidence_role_label(role)),
+            frame_id,
+            surface_key_hash: Some(format!("surface-{visit_index}")),
+            pane_id: pane_id.into(),
+            region_role: match role {
+                TaskEvidenceRoleV1::LatestUserGoal | TaskEvidenceRoleV1::CurrentUnsentDraft => {
+                    "user_message"
+                }
+                TaskEvidenceRoleV1::CurrentAgentState => "agent_status",
+                TaskEvidenceRoleV1::PriorTaskBoundary => "conversation_history",
+                _ => "editor_content",
+            }
+            .into(),
+            conversational_role: match role {
+                TaskEvidenceRoleV1::LatestUserGoal | TaskEvidenceRoleV1::CurrentUnsentDraft => {
+                    "user"
+                }
+                TaskEvidenceRoleV1::CurrentAgentState | TaskEvidenceRoleV1::PriorTaskBoundary => {
+                    "assistant_or_agent"
+                }
+                _ => "unknown",
+            }
+            .into(),
+            evidence_role: role,
+            reading_order: visit_index as i64,
+            source_scope: "active_window".into(),
+            ownership_kind: "active_window".into(),
+            owner_window_id: Some(44),
+            owner_app_id: Some("com.example.editor".into()),
+            ownership_confidence: 0.95,
+            region_confidence: 0.92,
+            speaker_confidence: 0.91,
+            order_confidence: 0.9,
+            privacy_status: "allowed".into(),
+            text_hash: format!("task-span-hash-{visit_index}"),
+            focused: role == TaskEvidenceRoleV1::CurrentUnsentDraft,
+            selected: true,
+            submitted,
+            geometry: None,
+            quality_flags: Vec::new(),
+            reason_codes: vec!["test_p6_attribution".into()],
+            missing_evidence: Vec::new(),
+        });
+    }
+
+    fn structured_request(request: &ProbeRequest) -> Value {
+        serde_json::from_str(
+            request
+                .body
+                .pointer("/input/1/content/0/text")
+                .and_then(Value::as_str)
+                .expect("structured request text"),
+        )
+        .expect("structured request json")
     }
 
     fn named_frame(
@@ -4243,6 +5378,12 @@ mod tests {
                 engagement_score: 65_560,
                 committed_input: false,
                 carried_into_current_surface: false,
+                hostname_mentioned_in_current_surface: false,
+                task_evidence_role: None,
+                task_relevance_score: 0,
+                same_task_relation: String::new(),
+                cross_pane_ambiguity: false,
+                engagement_used_as_same_task_tiebreaker: false,
                 evidence_refs: vec!["53".into(), "54".into()],
                 representative_frame: Some(inkling_end),
             },
@@ -4260,6 +5401,12 @@ mod tests {
                 engagement_score: 18_050,
                 committed_input: false,
                 carried_into_current_surface: false,
+                hostname_mentioned_in_current_surface: false,
+                task_evidence_role: None,
+                task_relevance_score: 0,
+                same_task_relation: String::new(),
+                cross_pane_ambiguity: false,
+                engagement_used_as_same_task_tiebreaker: false,
                 evidence_refs: vec!["55".into()],
                 representative_frame: Some(chat_support),
             },
@@ -4277,6 +5424,12 @@ mod tests {
                 engagement_score: 1_050,
                 committed_input: false,
                 carried_into_current_surface: false,
+                hostname_mentioned_in_current_surface: false,
+                task_evidence_role: None,
+                task_relevance_score: 0,
+                same_task_relation: String::new(),
+                cross_pane_ambiguity: false,
+                engagement_used_as_same_task_tiebreaker: false,
                 evidence_refs: vec!["56".into()],
                 representative_frame: Some(current),
             },
@@ -4332,33 +5485,52 @@ mod tests {
     fn output(primary: Option<&str>, request: &ProbeRequest) -> ProbeModelOutput {
         let values = BTreeMap::from([
             (
-                "primary_task".into(),
+                "unfinished_task".into(),
                 vec![latest_slot(request, SupportCategory::UserAction)],
             ),
             (
-                "current_step".into(),
+                "task_state".into(),
                 vec![latest_slot(request, SupportCategory::UserAction)],
             ),
             (
-                "last_progress".into(),
+                "resume_point".into(),
                 vec![latest_slot(request, SupportCategory::Delta)],
             ),
             (
-                "unfinished_state".into(),
+                "next_supported_action".into(),
+                vec![latest_slot(request, SupportCategory::OwnedObservation)],
+            ),
+            ("completed_context".into(), Vec::new()),
+            (
+                "where_summary".into(),
                 vec![latest_slot(request, SupportCategory::OwnedObservation)],
             ),
         ]);
         ProbeModelOutput {
-            primary_task: primary.map(str::to_string),
-            current_step: Some("Add support-slot validation".into()),
-            last_progress: Some("The probe request was compiled".into()),
-            unfinished_state: Some("The real proof corpus remains to be run".into()),
+            unfinished_task: primary.map(str::to_string),
+            task_state: if primary.is_some() {
+                ProbeTaskState::Active
+            } else {
+                ProbeTaskState::Unclear
+            },
+            resume_point: Some("The probe request was compiled".into()),
+            next_supported_action: Some("Run the real proof corpus".into()),
+            completed_context: None,
+            where_summary: Some("The compact semantic probe task".into()),
             visit_roles: visit_roles(request),
             support_slots_by_field: values,
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).to_string(), Vec::new()))
+                .collect(),
             confidence_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).to_string(), 0.9))
+                .collect(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).to_string(), ProbeFieldVerifierResult::Pending))
                 .collect(),
             status: ProbeResolutionStatus::Resolved,
         }
@@ -4376,6 +5548,23 @@ mod tests {
         assert_eq!(
             request.audit.supplied_image_slots,
             vec!["B1_IMAGE_BEFORE", "B1_IMAGE_AFTER"]
+        );
+        assert_eq!(request.audit.image_preparations.len(), 2);
+        assert!(request.audit.image_preparations.iter().all(|image| {
+            image.original_width == Some(100)
+                && image.original_height == Some(100)
+                && image.sent_width == Some(100)
+                && image.sent_height == Some(100)
+                && image.preparation_reason == "existing_bounded_image_preserved"
+        }));
+        assert_eq!(
+            request
+                .audit
+                .image_candidates
+                .iter()
+                .filter(|candidate| candidate["selected"] == true)
+                .count(),
+            2
         );
         let transported_labels = request
             .body
@@ -4419,7 +5608,7 @@ mod tests {
 
         assert_eq!(request.audit.request_schema, PROBE_REQUEST_SCHEMA);
         assert_eq!(request.audit.image_count, MAX_IMAGES);
-        assert_eq!(request.audit.output_contract_field_count, 8);
+        assert_eq!(request.audit.output_contract_field_count, 10);
         assert_eq!(request.audit.max_output_tokens, MAX_OUTPUT_TOKENS);
         assert_eq!(
             request
@@ -4487,15 +5676,338 @@ mod tests {
 
         let primary_slots = request
             .body
-            .pointer("/text/format/schema/properties/support_slots_by_field/properties/primary_task/items/enum")
+            .pointer("/text/format/schema/properties/support_slots_by_field/properties/unfinished_task/items/enum")
             .and_then(Value::as_array)
-            .expect("primary task support slots");
+            .expect("unfinished task support slots");
         assert!(primary_slots.iter().filter_map(Value::as_str).any(|slot| {
             request
                 .slots
                 .get(slot)
                 .is_some_and(|support| support.category == SupportCategory::ContextImage)
         }));
+    }
+
+    #[test]
+    fn lca_0d1c_new_visual_cue_request_outranks_completed_backend_and_launch_detour() {
+        let mut packet = live_shaped_session_packet();
+        packet.surface_timeline[0].engagement_score = 90_000;
+        packet.surface_timeline[1].engagement_score = 10;
+        packet.surface_timeline[2].engagement_score = 900_000;
+        mark_p6_visit(
+            &mut packet,
+            0,
+            TaskEvidenceRoleV1::PriorTaskBoundary,
+            500,
+            "immediately_prior_task_boundary",
+            "pane-main",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            1,
+            TaskEvidenceRoleV1::LatestUserGoal,
+            700,
+            "current_task_turn",
+            "pane-main",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            2,
+            TaskEvidenceRoleV1::SupportingContext,
+            200,
+            "unrelated_launch_checklist",
+            "pane-side",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::CurrentAgentState,
+            600,
+            "current_task_turn",
+            "pane-main",
+            Some(true),
+        );
+        packet.task_relevance.latest_user_goal_sample =
+            Some("Add an answer-linked visual cue under Show more".into());
+        packet.task_relevance.current_agent_state_sample =
+            Some("Implementing the visual cue in the real island output".into());
+        packet.task_relevance.prior_task_boundary_sample =
+            Some("Backend connection and arrow output were already verified".into());
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let selected = request
+            .slots
+            .values()
+            .filter(|slot| {
+                matches!(
+                    slot.category,
+                    SupportCategory::ContextImage
+                        | SupportCategory::ImageBefore
+                        | SupportCategory::ImageAfter
+                )
+            })
+            .map(|slot| slot.record_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            selected.contains("frame-2"),
+            "latest user request must be selected"
+        );
+        assert!(
+            selected.contains("frame-1"),
+            "prior completion boundary must remain explicit"
+        );
+        assert!(
+            !selected.contains("frame-3"),
+            "launch checklist detour must not consume image budget"
+        );
+        assert!(request
+            .audit
+            .image_selection_reasons
+            .values()
+            .all(|reason| !reason.contains("engagement")));
+    }
+
+    #[test]
+    fn lca_0056_verification_state_is_primary_and_pftu_side_pane_is_excluded() {
+        let mut packet = live_shaped_session_packet();
+        mark_p6_visit(
+            &mut packet,
+            0,
+            TaskEvidenceRoleV1::PriorTaskBoundary,
+            500,
+            "immediately_prior_task_boundary",
+            "pane-main",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            1,
+            TaskEvidenceRoleV1::LatestUserGoal,
+            700,
+            "current_task_turn",
+            "pane-main",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            2,
+            TaskEvidenceRoleV1::SupportingContext,
+            200,
+            "unrelated_pftu_release_gate",
+            "pane-side-pftu",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::CurrentTaskContext,
+            400,
+            "current_task_turn",
+            "pane-main",
+            Some(true),
+        );
+        packet.task_relevance.latest_user_goal_sample =
+            Some("Verify the completed answer-linked visual cue in the island".into());
+        packet.task_relevance.prior_task_boundary_sample =
+            Some("Visual-cue implementation is complete and focused checks passed".into());
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let selected = request
+            .slots
+            .values()
+            .filter(|slot| {
+                matches!(
+                    slot.category,
+                    SupportCategory::ContextImage
+                        | SupportCategory::ImageBefore
+                        | SupportCategory::ImageAfter
+                )
+            })
+            .map(|slot| slot.record_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(selected.contains("frame-2"));
+        assert!(!selected.contains("frame-3"));
+        let structured = structured_request(&request);
+        assert_eq!(
+            structured.pointer("/task_relevance/latest_user_goal_sample"),
+            Some(&json!(
+                "Verify the completed answer-linked visual cue in the island"
+            ))
+        );
+        assert!(!structured
+            .pointer("/task_relevance/ordered_spans")
+            .and_then(Value::as_array)
+            .is_some_and(|spans| spans.iter().any(|span| span["pane_id"] == "pane-side-pftu")));
+    }
+
+    #[test]
+    fn lca_0e34_unsent_regression_draft_is_current_but_not_submitted_or_causal_proof() {
+        let mut packet = live_shaped_session_packet();
+        mark_p6_visit(
+            &mut packet,
+            0,
+            TaskEvidenceRoleV1::PriorTaskBoundary,
+            500,
+            "immediately_prior_task_boundary",
+            "pane-main",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::CurrentUnsentDraft,
+            710,
+            "current_task_turn",
+            "pane-composer",
+            Some(false),
+        );
+        packet.task_relevance.current_unsent_draft_present = true;
+        packet.task_relevance.latest_user_goal_sample = Some(
+            "Draft complaint: investigate why Continue became insufficient after visual-cue work"
+                .into(),
+        );
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let structured = structured_request(&request);
+        assert_eq!(
+            structured.pointer("/task_relevance/latest_user_input_submission_state"),
+            Some(&json!("unsent_draft"))
+        );
+        let draft = structured
+            .pointer("/task_relevance/ordered_spans")
+            .and_then(Value::as_array)
+            .and_then(|spans| {
+                spans
+                    .iter()
+                    .find(|span| span["evidence_role"] == "current_unsent_draft")
+            })
+            .expect("draft span");
+        assert_eq!(draft.get("submitted"), Some(&json!(false)));
+        assert!(system_instruction().contains("not as proof that the named change caused"));
+    }
+
+    #[test]
+    fn lca_05cd_answer_review_keeps_user_goal_and_related_agent_state_together() {
+        let mut packet = live_shaped_session_packet();
+        mark_p6_visit(
+            &mut packet,
+            0,
+            TaskEvidenceRoleV1::LatestUserGoal,
+            700,
+            "current_task_turn",
+            "pane-conversation",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            1,
+            TaskEvidenceRoleV1::CurrentAgentState,
+            600,
+            "current_task_turn",
+            "pane-conversation",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            2,
+            TaskEvidenceRoleV1::SupportingContext,
+            200,
+            "supporting_product_context",
+            "pane-support",
+            Some(true),
+        );
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::CurrentTaskContext,
+            400,
+            "current_task_turn",
+            "pane-conversation",
+            Some(true),
+        );
+        packet.task_relevance.latest_user_goal_sample =
+            Some("Review whether the context-reconstruction product solves a real need".into());
+        packet.task_relevance.current_agent_state_sample =
+            Some("The answer has begun and affirms the attention-residue need".into());
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let selected = request
+            .slots
+            .values()
+            .filter(|slot| slot.category == SupportCategory::ContextImage)
+            .map(|slot| slot.record_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(selected.contains("frame-1"));
+        assert!(selected.contains("frame-2"));
+        let structured = structured_request(&request);
+        assert_eq!(
+            structured.pointer("/task_relevance/current_agent_state_sample"),
+            Some(&json!(
+                "The answer has begun and affirms the attention-residue need"
+            ))
+        );
+    }
+
+    #[test]
+    fn near_duplicate_images_collapse_unless_the_task_fact_changes() {
+        let mut packet = live_shaped_session_packet();
+        for index in 0..=1 {
+            mark_p6_visit(
+                &mut packet,
+                index,
+                TaskEvidenceRoleV1::CurrentTaskContext,
+                400,
+                "current_task_turn",
+                "pane-main",
+                Some(true),
+            );
+            packet.surface_timeline[index]
+                .representative_frame
+                .as_mut()
+                .unwrap()
+                .near_duplicate_group = Some("near-group-a".into());
+        }
+        let selected = selected_context_image_visits(&packet, packet.observed_at_ms);
+        assert_eq!(selected.len(), 1);
+
+        packet.surface_timeline[0].task_evidence_role = Some(TaskEvidenceRoleV1::LatestUserGoal);
+        packet.surface_timeline[0]
+            .representative_frame
+            .as_mut()
+            .unwrap()
+            .task_evidence_role = Some(TaskEvidenceRoleV1::LatestUserGoal);
+        let selected = selected_context_image_visits(&packet, packet.observed_at_ms);
+        assert_eq!(
+            selected.len(),
+            2,
+            "a changed task fact preserves before and after"
+        );
+    }
+
+    #[test]
+    fn image_dimension_cap_and_crop_ownership_are_deterministic() {
+        assert_eq!(
+            scaled_dimensions(Some(3_104), Some(1_962)),
+            (Some(1_600), Some(1_011), true)
+        );
+        let mut frame = keyframe(9, false);
+        frame.image_width = Some(3_104);
+        frame.image_height = Some(1_962);
+        frame.crop_pixels = Some(super::super::observation_packet::PacketBoundsV2 {
+            x: 100.0,
+            y: 100.0,
+            width: 1_400.0,
+            height: 1_000.0,
+        });
+        frame.image_scope = "owned_task_region".into();
+        assert!(reliable_crop(&frame));
+        frame.surface_ownership_confidence = 0.4;
+        assert!(!reliable_crop(&frame));
+        frame.surface_ownership_confidence = 0.95;
+        frame.cross_pane_ambiguity = true;
+        assert!(!reliable_crop(&frame));
     }
 
     #[test]
@@ -4536,12 +6048,13 @@ mod tests {
             .get("recent_surface_timeline")
             .and_then(Value::as_array)
             .expect("surface timeline");
-        assert_eq!(timeline[0]["interaction_count"], json!(65));
-        assert_eq!(timeline[0]["engagement_score"], json!(65_560));
-        assert_eq!(timeline[0]["observed_duration_ms"], json!(46_397));
-        assert_eq!(timeline[1]["interaction_count"], json!(18));
-        assert_eq!(timeline[2]["interaction_count"], json!(1));
-        assert_eq!(timeline[2]["engagement_score"], json!(1_050));
+        assert!(timeline
+            .iter()
+            .all(|visit| visit.get("interaction_count").is_none()
+                && visit.get("engagement_score").is_none()
+                && visit.get("observed_duration_ms").is_none()));
+        assert_eq!(request.audit.surface_timeline[0].interaction_count, 65);
+        assert_eq!(request.audit.surface_timeline[0].engagement_score, 65_560);
         assert!(structured_text.contains("must not replace stronger earlier task evidence"));
     }
 
@@ -4583,45 +6096,55 @@ mod tests {
         roles.get_mut("T2_VISIT").unwrap().role = ProbeSurfaceRole::DetourOrUnrelated;
         roles.get_mut("T3_VISIT").unwrap().role = ProbeSurfaceRole::PrimaryWork;
         let proposed = ProbeModelOutput {
-            primary_task: Some(
+            unfinished_task: Some(
                 "Fix Continue so a stalled capture process does not spin indefinitely".into(),
             ),
-            current_step: Some("Reviewing the completed capture-stall fix in Codex".into()),
-            last_progress: Some("The capture-stall fix passed its checks".into()),
-            unfinished_state: Some("The Codex response continues below the viewport".into()),
+            task_state: ProbeTaskState::NeedsUserVerification,
+            resume_point: Some("The capture-stall fix passed its checks".into()),
+            next_supported_action: Some("Inspect the completed capture-stall fix".into()),
+            completed_context: Some("The capture-stall implementation completed".into()),
+            where_summary: Some("The current Codex response".into()),
             visit_roles: roles,
             support_slots_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), vec![current_slot.clone()]))
                 .collect(),
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             confidence_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), 0.99))
+                .collect(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), ProbeFieldVerifierResult::Pending))
                 .collect(),
             status: ProbeResolutionStatus::Resolved,
         };
 
         let (admitted, issues) = admit_output(&packet, &request, proposed);
 
-        assert!(admitted.primary_task.is_none());
-        assert!(admitted.current_step.is_none());
-        assert!(admitted.last_progress.is_none());
-        assert!(admitted.unfinished_state.is_none());
-        assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert!(admitted.unfinished_task.is_none());
+        assert_eq!(admitted.task_state, ProbeTaskState::Unclear);
+        assert!(admitted.resume_point.is_none());
+        assert!(admitted.next_supported_action.is_none());
+        assert_eq!(admitted.status, ProbeResolutionStatus::Resolved);
         assert!(admitted
             .visit_roles
             .values()
             .all(|role| role.role == ProbeSurfaceRole::Unclear));
         assert!(issues.iter().any(|issue| {
-            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue == "resume_point:depends_on_rejected_momentary_unfinished_task"
         }));
         assert!(issues
             .iter()
-            .any(|issue| { issue == "current_step:depends_on_rejected_momentary_primary_task" }));
-        assert!(issues
-            .iter()
-            .any(|issue| issue == "visit_role:T3_VISIT:primary_task_not_admitted"));
+            .any(|issue| issue == "visit_role:T3_VISIT:unfinished_task_not_admitted"));
     }
 
     #[test]
@@ -4641,35 +6164,42 @@ mod tests {
         roles.get_mut("T2_VISIT").unwrap().role = ProbeSurfaceRole::PrimaryWork;
         roles.get_mut("T3_VISIT").unwrap().role = ProbeSurfaceRole::DetourOrUnrelated;
         let proposed = ProbeModelOutput {
-            primary_task: Some(
+            unfinished_task: Some(
                 "Assess whether Thinking Machines' Inkling model could improve Smalltalk task recovery"
                     .into(),
             ),
-            current_step: Some(
+            task_state: ProbeTaskState::Active,
+            resume_point: Some(
                 "Comparing Inkling's capabilities with Smalltalk's task-recovery requirements"
                     .into(),
             ),
-            last_progress: Some(
-                "The Smalltalk chat identified a task-recovery model as the strongest use"
-                    .into(),
-            ),
-            unfinished_state: Some(
-                "The model choice and integration approach are still being evaluated".into(),
-            ),
+            next_supported_action: Some("Continue comparing the model with the task-recovery requirements".into()),
+            completed_context: Some("The Smalltalk chat identified task recovery as the strongest use".into()),
+            where_summary: Some("The Inkling model page and related Smalltalk chat".into()),
             visit_roles: roles,
             support_slots_by_field: BTreeMap::from([
                 (
-                    "primary_task".into(),
+                    "unfinished_task".into(),
                     vec![source_slot.clone(), chat_slot.clone()],
                 ),
-                ("current_step".into(), vec![chat_slot.clone()]),
-                ("last_progress".into(), vec![chat_slot.clone()]),
-                ("unfinished_state".into(), vec![chat_slot]),
+                ("task_state".into(), vec![chat_slot.clone()]),
+                ("resume_point".into(), vec![chat_slot.clone()]),
+                ("next_supported_action".into(), vec![chat_slot.clone()]),
+                ("completed_context".into(), vec![chat_slot.clone()]),
+                ("where_summary".into(), vec![source_slot, chat_slot]),
             ]),
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             confidence_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), 0.9))
+                .collect(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), ProbeFieldVerifierResult::Pending))
                 .collect(),
             status: ProbeResolutionStatus::Resolved,
         };
@@ -4677,7 +6207,7 @@ mod tests {
         let (admitted, issues) = admit_output(&packet, &request, proposed);
 
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some(
                 "Assess whether Thinking Machines' Inkling model could improve Smalltalk task recovery"
             )
@@ -4695,9 +6225,9 @@ mod tests {
     }
 
     #[test]
-    fn request_transports_verified_source_carry_and_committed_input_without_text() {
+    fn request_transports_neutral_hostname_mention_and_committed_input_without_text() {
         let mut packet = live_shaped_session_packet();
-        packet.surface_timeline[1].carried_into_current_surface = true;
+        packet.surface_timeline[1].hostname_mentioned_in_current_surface = true;
         packet.surface_timeline[3].committed_input = true;
 
         let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
@@ -4714,10 +6244,11 @@ mod tests {
 
         assert_eq!(
             timeline[1]
-                .get("carried_into_current_surface")
+                .get("hostname_mentioned_in_current_surface")
                 .and_then(Value::as_bool),
             Some(true)
         );
+        assert!(timeline[1].get("carried_into_current_surface").is_none());
         assert_eq!(
             timeline[3].get("committed_input").and_then(Value::as_bool),
             Some(true)
@@ -4725,7 +6256,8 @@ mod tests {
         assert!(structured_text.contains("devfolio.co"));
         assert!(!structured_text.contains("typed_characters"));
         assert!(!structured_text.contains("raw_text"));
-        assert!(request.audit.surface_timeline[1].carried_into_current_surface);
+        assert!(!request.audit.surface_timeline[1].carried_into_current_surface);
+        assert!(request.audit.surface_timeline[1].hostname_mentioned_in_current_surface);
         assert!(request.audit.surface_timeline[3].committed_input);
     }
 
@@ -4733,7 +6265,7 @@ mod tests {
     fn thinking_machines_to_smalltalk_chat_task_survives_local_admission() {
         let mut packet = live_shaped_session_packet();
         packet.surface_timeline[1].site_hostname = Some("thinkingmachines.ai".into());
-        packet.surface_timeline[1].carried_into_current_surface = true;
+        packet.surface_timeline[1].hostname_mentioned_in_current_surface = true;
         packet.surface_timeline[3].site_hostname = Some("chatgpt.com".into());
         packet.surface_timeline[3].committed_input = true;
 
@@ -4760,21 +6292,21 @@ mod tests {
             &request,
         );
         generated.support_slots_by_field.insert(
-            "primary_task".into(),
+            "unfinished_task".into(),
             vec![source_slot, current_slot, action_slot],
         );
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
 
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some(
                 "Likely assessing whether Thinking Machines' Inkling model could be useful for Smalltalk"
             )
         );
         assert!(!issues
             .iter()
-            .any(|issue| issue.starts_with("primary_task:")));
+            .any(|issue| issue.starts_with("unfinished_task:")));
     }
 
     #[test]
@@ -4782,7 +6314,7 @@ mod tests {
         let error = output_text(&json!({
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
-            "output_text": "{\"primary_task\":\"cut off"
+            "output_text": "{\"unfinished_task\":\"cut off"
         }))
         .expect_err("an incomplete envelope must never be parsed as task truth");
 
@@ -4823,26 +6355,34 @@ mod tests {
         );
 
         let proposed = ProbeModelOutput {
-            primary_task: Some("A task guessed only from the app timeline".into()),
-            current_step: None,
-            last_progress: None,
-            unfinished_state: None,
+            unfinished_task: Some("A task guessed only from the app timeline".into()),
+            task_state: ProbeTaskState::Unclear,
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
+            where_summary: None,
             visit_roles: BTreeMap::new(),
-            support_slots_by_field: BTreeMap::from([
-                ("primary_task".into(), Vec::new()),
-                ("current_step".into(), Vec::new()),
-                ("last_progress".into(), Vec::new()),
-                ("unfinished_state".into(), Vec::new()),
-            ]),
+            support_slots_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             confidence_by_field: BTreeMap::new(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), ProbeFieldVerifierResult::Pending))
+                .collect(),
             status: ProbeResolutionStatus::PartlyResolved,
         };
         let (admitted, issues) = admit_output(&packet, &request, proposed);
-        assert!(admitted.primary_task.is_none());
+        assert!(admitted.unfinished_task.is_none());
         assert!(issues
             .iter()
-            .any(|issue| { issue.contains("primary_task") && issue.contains("support") }));
+            .any(|issue| { issue.contains("unfinished_task") && issue.contains("support") }));
     }
 
     #[test]
@@ -4864,8 +6404,8 @@ mod tests {
             .audit
             .surface_timeline
             .iter()
-            .find(|visit| visit.site_hostname.as_deref() == Some("github.com"))
-            .expect("omitted surface audit");
+            .find(|visit| visit.image_omission_reason.as_deref() == Some("budget_omitted"))
+            .expect("one surface should carry the typed budget omission");
         assert!(omitted.image_slot.is_none());
         assert_eq!(
             omitted.image_omission_reason.as_deref(),
@@ -5195,32 +6735,49 @@ mod tests {
             .slot
             .clone();
         let proposed = ProbeModelOutput {
-            primary_task: Some("Complete the visible hackathon application".into()),
-            current_step: None,
-            last_progress: None,
-            unfinished_state: None,
+            unfinished_task: Some("Complete the visible hackathon application".into()),
+            task_state: ProbeTaskState::Unclear,
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
+            where_summary: None,
             visit_roles: visit_roles(&request),
-            support_slots_by_field: BTreeMap::from([
-                ("primary_task".into(), vec![earlier_image]),
-                ("current_step".into(), Vec::new()),
-                ("last_progress".into(), Vec::new()),
-                ("unfinished_state".into(), Vec::new()),
-            ]),
+            support_slots_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| {
+                    (
+                        (*field).into(),
+                        if *field == "unfinished_task" {
+                            vec![earlier_image.clone()]
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                })
+                .collect(),
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             confidence_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), 0.8))
+                .collect(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), ProbeFieldVerifierResult::Pending))
                 .collect(),
             status: ProbeResolutionStatus::PartlyResolved,
         };
         let (admitted, issues) = admit_output(&packet, &request, proposed);
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some("Complete the visible hackathon application")
         );
         assert!(!issues
             .iter()
-            .any(|issue| issue.contains("passive_evidence_cannot_establish_primary_task")));
+            .any(|issue| issue.contains("passive_evidence_cannot_establish_unfinished_task")));
     }
 
     #[test]
@@ -5483,16 +7040,16 @@ mod tests {
         let mut output = output(Some("Implement the PFTU semantic probe"), &request);
         output
             .support_slots_by_field
-            .insert("current_step".into(), vec!["FOREIGN_SLOT".into()]);
+            .insert("resume_point".into(), vec!["FOREIGN_SLOT".into()]);
         let (admitted, issues) = admit_output(&packet, &request, output);
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some("Implement the PFTU semantic probe")
         );
-        assert_eq!(admitted.current_step, None);
+        assert_eq!(admitted.resume_point, None);
         assert!(issues
             .iter()
-            .any(|issue| issue == "current_step:foreign_or_missing_slot"));
+            .any(|issue| issue == "resume_point:foreign_or_missing_slot"));
     }
 
     #[test]
@@ -5502,12 +7059,241 @@ mod tests {
         let generated = output(Some("Implement the PFTU semantic probe"), &request);
         let (admitted, issues) = admit_output(&packet, &request, generated.clone());
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(admitted, generated);
+        let mut expected = generated;
+        let confidence_cap =
+            request.audit.task_confidence_cap_millis.clamp(0, 1_000) as f64 / 1_000.0;
+        for confidence in expected.confidence_by_field.values_mut() {
+            *confidence = confidence.min(confidence_cap);
+        }
+        expected.verifier_result_by_field = SEMANTIC_FIELDS
+            .iter()
+            .map(|field| {
+                (
+                    (*field).into(),
+                    if field_value(&expected, field).is_some() {
+                        ProbeFieldVerifierResult::Admitted
+                    } else {
+                        ProbeFieldVerifierResult::NotProposed
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(admitted, expected);
+    }
+
+    #[test]
+    fn lca_02_atomic_schema_is_strict_and_all_enums_round_trip() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        let generated = output(
+            Some("Implement the actionable continuation contract"),
+            &request,
+        );
+        let encoded = serde_json::to_value(&generated).expect("serialize provider output");
+        let restored: ProbeModelOutput =
+            serde_json::from_value(encoded.clone()).expect("strict round trip");
+        assert_eq!(restored, generated);
+
+        let properties = request
+            .body
+            .pointer("/text/format/schema/properties")
+            .and_then(Value::as_object)
+            .expect("response properties");
         for field in SEMANTIC_FIELDS {
-            assert!(admitted
-                .support_slots_by_field
-                .get(field)
-                .is_some_and(|slots| !slots.is_empty()));
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+        assert_eq!(
+            request
+                .body
+                .pointer("/text/format/schema/additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let mut unknown = encoded;
+        unknown
+            .as_object_mut()
+            .expect("output object")
+            .insert("legacy_recap".into(), json!("must fail"));
+        assert!(serde_json::from_value::<ProbeModelOutput>(unknown).is_err());
+
+        for state in [
+            ProbeTaskState::Active,
+            ProbeTaskState::WaitingForResult,
+            ProbeTaskState::NeedsUserVerification,
+            ProbeTaskState::Blocked,
+            ProbeTaskState::Superseded,
+            ProbeTaskState::Completed,
+            ProbeTaskState::Unclear,
+        ] {
+            let encoded = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ProbeTaskState>(&encoded).unwrap(),
+                state
+            );
+        }
+        for status in [
+            ProbeResolutionStatus::Resolved,
+            ProbeResolutionStatus::PartlyResolved,
+            ProbeResolutionStatus::Unresolved,
+            ProbeResolutionStatus::Refused,
+        ] {
+            let encoded = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ProbeResolutionStatus>(&encoded).unwrap(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn lca_02_each_public_text_cap_rejects_without_truncation_or_rewrite() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        for (field, limit) in [
+            ("unfinished_task", MAX_UNFINISHED_TASK_CHARS),
+            ("resume_point", MAX_RESUME_POINT_CHARS),
+            ("next_supported_action", MAX_NEXT_SUPPORTED_ACTION_CHARS),
+            ("completed_context", MAX_COMPLETED_CONTEXT_CHARS),
+            ("where_summary", MAX_WHERE_SUMMARY_CHARS),
+        ] {
+            let overlong = "x".repeat(limit + 1);
+            let mut generated = output(
+                Some("Implement the actionable continuation contract"),
+                &request,
+            );
+            match field {
+                "unfinished_task" => generated.unfinished_task = Some(overlong),
+                "resume_point" => generated.resume_point = Some(overlong),
+                "next_supported_action" => generated.next_supported_action = Some(overlong),
+                "completed_context" => {
+                    generated.completed_context = Some(overlong);
+                    generated.support_slots_by_field.insert(
+                        field.into(),
+                        vec![latest_slot(&request, SupportCategory::UserAction)],
+                    );
+                }
+                "where_summary" => generated.where_summary = Some(overlong),
+                _ => unreachable!(),
+            }
+            let (admitted, issues) = admit_output(&packet, &request, generated);
+            assert!(field_value(&admitted, field).is_none(), "{field} survived");
+            assert_eq!(
+                admitted.verifier_result_by_field.get(field),
+                Some(&ProbeFieldVerifierResult::Rejected)
+            );
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue == &format!("{field}:field_value_too_long")),
+                "missing length issue for {field}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lca_02_temporal_states_preserve_new_task_verification_and_waiting_meanings() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let support = latest_slot(&request, SupportCategory::UserAction);
+
+        let mut new_task = output(Some("Review the new continuation answer"), &request);
+        new_task.completed_context = Some("The implementation completed and checks passed".into());
+        new_task
+            .support_slots_by_field
+            .insert("completed_context".into(), vec![support.clone()]);
+        let (new_task, issues) = admit_output(&packet, &request, new_task);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(new_task.task_state, ProbeTaskState::Active);
+        assert_eq!(
+            new_task.completed_context.as_deref(),
+            Some("The implementation completed and checks passed")
+        );
+
+        let mut verification = output(Some("Verify the completed visual cue"), &request);
+        verification.task_state = ProbeTaskState::NeedsUserVerification;
+        verification.next_supported_action =
+            Some("Open the latest Continue answer and verify the visual cue".into());
+        let (verification, issues) = admit_output(&packet, &request, verification);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(
+            verification.task_state,
+            ProbeTaskState::NeedsUserVerification
+        );
+        assert!(verification
+            .next_supported_action
+            .as_deref()
+            .is_some_and(|action| action.contains("verify")));
+
+        let mut waiting = output(Some("Receive the agent's implementation result"), &request);
+        waiting.task_state = ProbeTaskState::WaitingForResult;
+        waiting.resume_point = Some("The agent is still implementing the requested change".into());
+        waiting.next_supported_action = Some("Inspect the agent's result when it arrives".into());
+        let (waiting, issues) = admit_output(&packet, &request, waiting);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(waiting.task_state, ProbeTaskState::WaitingForResult);
+        assert!(waiting.next_supported_action.is_some());
+
+        let instruction = system_instruction();
+        assert!(instruction.contains("completed task followed by a new request"));
+        assert!(instruction.contains("Completed implementation with checks passed"));
+        assert!(instruction.contains("When an agent is still working"));
+        assert!(instruction.contains("An unsent draft"));
+        assert!(instruction.contains("Supporting research or an adjacent chat"));
+    }
+
+    #[test]
+    fn lca_02_thin_evidence_is_unresolved_with_field_local_abstention() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let mut thin = output(None, &request);
+        thin.task_state = ProbeTaskState::Unclear;
+        thin.resume_point = None;
+        thin.next_supported_action = None;
+        thin.completed_context = None;
+        thin.where_summary = None;
+        thin.status = ProbeResolutionStatus::Unresolved;
+        for field in SEMANTIC_FIELDS {
+            thin.support_slots_by_field.insert(field.into(), Vec::new());
+            thin.confidence_by_field.insert(field.into(), 0.0);
+            thin.missing_evidence_by_field.insert(
+                field.into(),
+                vec!["The concrete task is not recoverable from supplied evidence".into()],
+            );
+        }
+        let (admitted, issues) = admit_output(&packet, &request, thin);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert_eq!(admitted.task_state, ProbeTaskState::Unclear);
+        assert!(SEMANTIC_FIELDS.iter().all(|field| {
+            admitted.verifier_result_by_field.get(*field)
+                == Some(&ProbeFieldVerifierResult::NotProposed)
+        }));
+    }
+
+    #[test]
+    fn lca_02_generic_destructive_and_locator_actions_are_field_local_rejections() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        for action in [
+            "Continue working",
+            "Delete the current database",
+            "Open https://example.test/private?token=secret",
+            "Send the unsent draft",
+        ] {
+            let mut generated = output(Some("Finish the supported task"), &request);
+            generated.next_supported_action = Some(action.into());
+            let (admitted, issues) = admit_output(&packet, &request, generated);
+            assert!(admitted.next_supported_action.is_none(), "{action}");
+            assert_eq!(
+                admitted.unfinished_task.as_deref(),
+                Some("Finish the supported task")
+            );
+            assert!(issues
+                .iter()
+                .any(|issue| issue.starts_with("next_supported_action:")));
         }
     }
 
@@ -5517,7 +7303,7 @@ mod tests {
         let request = build_probe_request(&packet, "model-a").expect("build request");
         let schema_slots = request
             .body
-            .pointer("/text/format/schema/properties/support_slots_by_field/properties/primary_task/items/enum")
+            .pointer("/text/format/schema/properties/support_slots_by_field/properties/unfinished_task/items/enum")
             .and_then(Value::as_array)
             .expect("support slot enum")
             .iter()
@@ -5526,7 +7312,7 @@ mod tests {
         let policy_slots = request
             .slots
             .values()
-            .filter(|slot| semantic_support_allowed("primary_task", slot.category))
+            .filter(|slot| semantic_support_allowed("unfinished_task", slot.category))
             .map(|slot| slot.slot.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(schema_slots, policy_slots);
@@ -5536,11 +7322,11 @@ mod tests {
         let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
         generated
             .support_slots_by_field
-            .insert("primary_task".into(), vec!["B1_IMAGE_BEFORE".into()]);
+            .insert("unfinished_task".into(), vec!["B1_IMAGE_BEFORE".into()]);
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert!(admitted.primary_task.is_none());
+        assert!(admitted.unfinished_task.is_none());
         assert!(issues.iter().any(|issue| {
-            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
         }));
     }
 
@@ -5556,18 +7342,18 @@ mod tests {
         let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
         generated
             .support_slots_by_field
-            .insert("current_step".into(), vec!["B1_IMAGE_BEFORE".into()]);
+            .insert("resume_point".into(), vec!["B1_IMAGE_BEFORE".into()]);
         let response = json!({"output_text": serde_json::to_string(&generated).unwrap()});
         let (admitted, _, issues, cited_before_admission) =
             parse_probe_response(&packet, &request, &response).expect("parse response");
-        assert_eq!(admitted.current_step, None);
+        assert_eq!(admitted.resume_point, None);
         assert_eq!(
-            cited_before_admission.get("current_step"),
+            cited_before_admission.get("resume_point"),
             Some(&vec!["B1_IMAGE_BEFORE".into()])
         );
         assert!(issues
             .iter()
-            .any(|issue| issue == "current_step:slot_category_not_allowed_for_field"));
+            .any(|issue| issue == "resume_point:slot_category_not_allowed_for_field"));
     }
 
     #[test]
@@ -5580,10 +7366,10 @@ mod tests {
             &request,
             output(Some("Implement the PFTU semantic probe"), &request),
         );
-        assert_eq!(admitted.unfinished_state, None);
+        assert_eq!(admitted.next_supported_action, None);
         assert!(issues
             .iter()
-            .any(|issue| issue == "unfinished_state:stale_or_ineligible_slot"));
+            .any(|issue| issue == "next_supported_action:stale_or_ineligible_slot"));
     }
 
     #[test]
@@ -5607,16 +7393,16 @@ mod tests {
         let mut generated = output(Some("Audit the visible continuation contract"), &request);
         generated
             .support_slots_by_field
-            .insert("primary_task".into(), vec![context_slot]);
+            .insert("unfinished_task".into(), vec![context_slot]);
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some("Audit the visible continuation contract")
         );
         assert!(!issues
             .iter()
-            .any(|issue| issue == "primary_task:stale_or_ineligible_slot"));
+            .any(|issue| issue == "unfinished_task:stale_or_ineligible_slot"));
     }
 
     #[test]
@@ -5634,13 +7420,13 @@ mod tests {
         let mut generated = output(Some("Audit the visible continuation contract"), &request);
         generated
             .support_slots_by_field
-            .insert("primary_task".into(), vec![context_slot]);
+            .insert("unfinished_task".into(), vec![context_slot]);
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert!(admitted.primary_task.is_none());
+        assert!(admitted.unfinished_task.is_none());
         assert!(issues
             .iter()
-            .any(|issue| issue == "primary_task:stale_or_ineligible_slot"));
+            .any(|issue| issue == "unfinished_task:stale_or_ineligible_slot"));
     }
 
     #[test]
@@ -5692,7 +7478,7 @@ mod tests {
             ProbeSurfaceRole::SupportingWork
         );
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some("Audit the visible continuation contract")
         );
         assert!(issues
@@ -5780,7 +7566,7 @@ mod tests {
     fn slot_round_trip_rejects_chronology_drift_even_when_source_hash_matches() {
         let packet = packet(false);
         let mut request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
-        let action_slot = latest_slot(&request, SupportCategory::UserAction);
+        let action_slot = latest_slot(&request, SupportCategory::Delta);
         request
             .slots
             .get_mut(&action_slot)
@@ -5791,10 +7577,10 @@ mod tests {
             &request,
             output(Some("Implement the PFTU semantic probe"), &request),
         );
-        assert_eq!(admitted.current_step, None);
+        assert_eq!(admitted.resume_point, None);
         assert!(issues
             .iter()
-            .any(|issue| issue == "current_step:slot_chronology_invalid"));
+            .any(|issue| issue == "resume_point:slot_chronology_invalid"));
     }
 
     #[test]
@@ -5812,26 +7598,26 @@ mod tests {
             &request,
             output(Some("Implement the PFTU semantic probe"), &request),
         );
-        assert_eq!(admitted.unfinished_state, None);
+        assert_eq!(admitted.next_supported_action, None);
         assert_eq!(
-            admitted.primary_task.as_deref(),
+            admitted.unfinished_task.as_deref(),
             Some("Implement the PFTU semantic probe")
         );
         assert!(issues
             .iter()
-            .any(|issue| issue == "unfinished_state:stale_or_ineligible_slot"));
+            .any(|issue| issue == "next_supported_action:stale_or_ineligible_slot"));
     }
 
     #[test]
-    fn generic_primary_task_is_rejected_without_local_repair() {
+    fn generic_unfinished_task_is_rejected_without_local_repair() {
         let packet = packet(false);
         let request = build_probe_request(&packet, "model-a").expect("build request");
         let (admitted, issues) =
             admit_output(&packet, &request, output(Some("Editing code"), &request));
-        assert_eq!(admitted.primary_task, None);
+        assert_eq!(admitted.unfinished_task, None);
         assert!(issues
             .iter()
-            .any(|issue| issue == "primary_task:forbidden_generic_primary_task"));
+            .any(|issue| issue == "unfinished_task:forbidden_generic_unfinished_task"));
     }
 
     #[test]
@@ -5841,21 +7627,21 @@ mod tests {
         let purpose = "Reviewing the agent output for future-event leakage";
         let (admitted, issues) = admit_output(&packet, &request, output(Some(purpose), &request));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(admitted.primary_task.as_deref(), Some(purpose));
+        assert_eq!(admitted.unfinished_task.as_deref(), Some(purpose));
     }
 
     #[test]
     fn overlong_semantic_field_is_nulled_instead_of_truncated_or_rewritten() {
         let packet = packet(false);
         let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
-        let overlong = "x".repeat(MAX_SEMANTIC_FIELD_CHARS + 1);
+        let overlong = "x".repeat(MAX_RESUME_POINT_CHARS + 1);
         let mut generated = output(Some("Implement the PFTU semantic probe"), &request);
-        generated.current_step = Some(overlong);
+        generated.resume_point = Some(overlong);
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert_eq!(admitted.current_step, None);
+        assert_eq!(admitted.resume_point, None);
         assert!(issues
             .iter()
-            .any(|issue| issue == "current_step:field_value_too_long"));
+            .any(|issue| issue == "resume_point:field_value_too_long"));
     }
 
     #[test]
@@ -5886,38 +7672,48 @@ mod tests {
             .slot
             .clone();
         let mut generated = ProbeModelOutput {
-            primary_task: Some("Research the product described on the page".into()),
-            current_step: None,
-            last_progress: None,
-            unfinished_state: None,
+            unfinished_task: Some("Research the product described on the page".into()),
+            task_state: ProbeTaskState::Unclear,
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
+            where_summary: None,
             visit_roles: BTreeMap::new(),
             support_slots_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), Vec::new()))
                 .collect(),
             missing_evidence: Vec::new(),
+            missing_evidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), Vec::new()))
+                .collect(),
             confidence_by_field: SEMANTIC_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), 0.0))
+                .collect(),
+            verifier_result_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), ProbeFieldVerifierResult::Pending))
                 .collect(),
             status: ProbeResolutionStatus::PartlyResolved,
         };
         generated
             .support_slots_by_field
-            .insert("primary_task".into(), vec![primary_slot]);
+            .insert("unfinished_task".into(), vec![primary_slot]);
         generated
             .confidence_by_field
-            .insert("primary_task".into(), 0.9);
+            .insert("unfinished_task".into(), 0.9);
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert_eq!(admitted.primary_task, None);
-        assert_eq!(admitted.status, ProbeResolutionStatus::Unresolved);
+        assert_eq!(admitted.unfinished_task, None);
+        assert_eq!(admitted.status, ProbeResolutionStatus::PartlyResolved);
         assert!(issues.iter().any(|issue| {
-            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
         }));
     }
 
     #[test]
-    fn unrelated_action_cannot_justify_a_primary_task_cited_only_to_a_passive_image() {
+    fn unrelated_action_cannot_justify_an_unfinished_task_cited_only_to_a_passive_image() {
         let packet = packet(false);
         let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
         assert!(request
@@ -5928,12 +7724,12 @@ mod tests {
         let mut generated = output(Some("Infer a purpose from the final screen"), &request);
         generated
             .support_slots_by_field
-            .insert("primary_task".into(), vec![passive_image]);
+            .insert("unfinished_task".into(), vec![passive_image]);
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert!(admitted.primary_task.is_none());
+        assert!(admitted.unfinished_task.is_none());
         assert!(issues.iter().any(|issue| {
-            issue == "primary_task:passive_evidence_cannot_establish_primary_task"
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
         }));
     }
 
@@ -5967,13 +7763,13 @@ mod tests {
         );
 
         let mut partial_output = output(Some("Implement the PFTU semantic probe"), &request);
-        partial_output.current_step = None;
+        partial_output.resume_point = None;
         partial_output
             .support_slots_by_field
-            .insert("current_step".into(), Vec::new());
+            .insert("resume_point".into(), Vec::new());
         partial_output
             .confidence_by_field
-            .insert("current_step".into(), 0.0);
+            .insert("resume_point".into(), 0.0);
         partial_output.status = ProbeResolutionStatus::PartlyResolved;
         let partial = json!({"output_text":serde_json::to_string(&partial_output).unwrap()});
         assert_eq!(
@@ -5985,9 +7781,11 @@ mod tests {
         );
 
         let mut unresolved_output = output(None, &request);
-        unresolved_output.current_step = None;
-        unresolved_output.last_progress = None;
-        unresolved_output.unfinished_state = None;
+        unresolved_output.task_state = ProbeTaskState::Unclear;
+        unresolved_output.resume_point = None;
+        unresolved_output.next_supported_action = None;
+        unresolved_output.completed_context = None;
+        unresolved_output.where_summary = None;
         for field in SEMANTIC_FIELDS {
             unresolved_output
                 .support_slots_by_field
@@ -6076,12 +7874,13 @@ mod tests {
     #[test]
     fn passive_page_prompt_does_not_turn_visible_content_into_user_intent() {
         let instruction = system_instruction();
-        assert!(instruction.contains("Never rewrite the purpose of visible page content"));
-        assert!(instruction.contains("primary_task must be null"));
-        assert!(instruction.contains("carried_into_current_surface"));
+        assert!(instruction.contains("What is the newest unfinished task?"));
+        assert!(instruction.contains("Thin evidence requires null semantic fields"));
+        assert!(instruction.contains("hostname_mentioned_in_current_surface"));
+        assert!(instruction.contains("cannot establish continuity by itself"));
         assert!(instruction.contains("committed_input"));
-        assert!(instruction.contains("a qualified primary task"));
-        assert!(instruction.contains("do not invent a narrower purpose"));
+        assert!(instruction.contains("unsent draft"));
+        assert!(instruction.contains("hypothesis"));
     }
 
     #[test]
@@ -6146,29 +7945,29 @@ mod tests {
             estimated_cost_usd: Some(0.01),
             latency_ms: 1_000,
             output_status: ProbeResolutionStatus::Resolved,
-            output_by_field: SEMANTIC_FIELDS
+            output_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), Some(format!("value for {field}"))))
                 .collect(),
-            confidence_by_field: SEMANTIC_FIELDS
+            confidence_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), 0.9))
                 .collect(),
-            cited_support_slots_by_field: SEMANTIC_FIELDS
+            cited_support_slots_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), vec!["B1_IMAGE_AFTER".into()]))
                 .collect(),
-            support_admitted_by_field: SEMANTIC_FIELDS
+            support_admitted_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), true))
                 .collect(),
             unsupported_fields_null_or_rejected: true,
             local_semantic_fallback_used: false,
-            judgments_by_field: SEMANTIC_FIELDS
+            judgments_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), FieldJudgment::Correct))
                 .collect(),
-            corrections_by_field: SEMANTIC_FIELDS
+            corrections_by_field: LEGACY_PROOF_FIELDS
                 .iter()
                 .map(|field| ((*field).into(), "none".into()))
                 .collect(),
@@ -6200,11 +7999,11 @@ mod tests {
                     session_id: format!("session-{index}"),
                     decision_id: format!("decision-{index}"),
                     expected_recorded_at_ms: 1_000,
-                    expected_by_field: SEMANTIC_FIELDS
+                    expected_by_field: LEGACY_PROOF_FIELDS
                         .iter()
                         .map(|field| ((*field).into(), Some(format!("expected {field}"))))
                         .collect(),
-                    recoverable_by_field: SEMANTIC_FIELDS
+                    recoverable_by_field: LEGACY_PROOF_FIELDS
                         .iter()
                         .map(|field| ((*field).into(), true))
                         .collect(),

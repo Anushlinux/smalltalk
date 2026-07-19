@@ -1,0 +1,77 @@
+{
+  "schema": "smalltalk.continue_accuracy_fixture.v1",
+  "case_id": "lca_0d1c_visual_cue_request",
+  "scenario": "lca_0d1c_visual_cue_request",
+  "description": "Privacy-safe causal shape for a newer visual-cue request after completed backend work, with an adjacent launch-checklist pane.",
+  "privacy_review": { "status": "approved", "reviewed_at_ms": 1784414000000, "reviewer_role": "fixture_owner" },
+  "fixture_partition": "development", "injection_boundary": "capture_records",
+  "redacted_source_records": {
+    "frames": [
+      { "record_id": "frame-completed", "frame_id": "frame-completed", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": { "x": 0.0, "y": 0.0, "width": 1440.0, "height": 900.0 }, "owner_id_hash": null, "confidence": 1.0, "text": { "text": "The backend connection and arrow-output flow are implemented and verified.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic visual cue task" }, "capture_trigger": { "kind": "label", "value": "surface_change" } } },
+      { "record_id": "frame-current", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": "frame-completed", "source_role": "active_window", "source_order": 1, "bounds": { "x": 0.0, "y": 0.0, "width": 1440.0, "height": 900.0 }, "owner_id_hash": null, "confidence": 1.0, "text": { "text": "Add an answer-linked visual cue to the real island output and show it as a separate block. An adjacent launch checklist is supporting material only.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic visual cue task" }, "capture_trigger": { "kind": "label", "value": "manual" } } }
+    ],
+    "ax_nodes": [
+      { "record_id": "ax-completed", "frame_id": "frame-completed", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 1, "bounds": { "x": 80.0, "y": 220.0, "width": 760.0, "height": 90.0 }, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "The backend connection and arrow-output flow are implemented and verified.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-history-assistant-message" } } },
+      { "record_id": "ax-user-cue", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 1, "bounds": { "x": 500.0, "y": 350.0, "width": 520.0, "height": 100.0 }, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "Add an answer-linked visual cue to the real island output and show it as a separate block.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-user-message" } } },
+      { "record_id": "ax-agent-cue", "frame_id": "frame-current", "observed_at_ms": 2010, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 2, "bounds": { "x": 80.0, "y": 480.0, "width": 760.0, "height": 80.0 }, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "I will add the answer-linked visual cue while preserving the existing island output contract.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-assistant-message" } } },
+      { "record_id": "ax-launch-side-pane", "frame_id": "frame-current", "observed_at_ms": 2010, "parent_record_id": null, "source_role": "AXGroup", "source_order": 3, "bounds": { "x": 1080.0, "y": 80.0, "width": 330.0, "height": 700.0 }, "owner_id_hash": null, "confidence": 0.95, "text": { "text": "Launch checklist: packaging, updates, analytics, and website.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "sidebar-navigation" } } }
+    ],
+    "ocr_spans": [], "content_units": [], "frame_text_resolution": [],
+    "app_window_context": [
+      { "record_id": "context-1", "frame_id": "frame-completed", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.95, "text": null, "metadata": { "adapter_id": { "kind": "label", "value": "fixture_agent_chat" }, "object_type": { "kind": "label", "value": "chat_conversation" } } },
+      { "record_id": "context-2", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.95, "text": null, "metadata": { "adapter_id": { "kind": "label", "value": "fixture_agent_chat" }, "object_type": { "kind": "label", "value": "chat_conversation" } } }
+    ],
+    "ui_events": [
+      { "record_id": "event-agent-cue", "frame_id": "frame-current", "observed_at_ms": 2010, "parent_record_id": null, "source_role": "agent_status", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.9, "text": null, "metadata": { "event_type": { "kind": "label", "value": "agent_status" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "app_name": { "kind": "label", "value": "AgentChat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic visual cue task" } } }
+    ],
+    "transitions": [],
+    "typing_metadata": [
+      { "record_id": "typing-cue", "frame_id": "frame-current", "observed_at_ms": 1990, "parent_record_id": null, "source_role": "typing_burst", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.95, "text": null, "metadata": { "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "app_name": { "kind": "label", "value": "AgentChat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic visual cue task" }, "char_count": { "kind": "integer", "value": 91 }, "enter_count": { "kind": "integer", "value": 1 }, "committed": { "kind": "boolean", "value": true }, "commit_signal": { "kind": "label", "value": "enter" }, "raw_text_captured": { "kind": "boolean", "value": false }, "pre_frame_id": { "kind": "label", "value": "frame-completed" }, "post_frame_id": { "kind": "label", "value": "frame-current" }, "association_source": { "kind": "label", "value": "explicit_post_frame" }, "association_confidence": { "kind": "number", "value": 0.95 } } }
+    ]
+  },
+  "injected_historical_state": { "feedback_events": [], "branch_contexts": [], "workstreams": [], "open_loops": [], "memory_cells": [] },
+  "expected_checkpoints": [
+    { "checkpoint": "task_relevant_evidence_packet", "status": "expected", "slots": { "task_relevance_source": { "kind": "label", "value": "p6_role_region_task_turn" }, "latest_user_goal_present": { "kind": "boolean", "value": true }, "current_agent_state_present": { "kind": "boolean", "value": true }, "prior_task_boundary_present": { "kind": "boolean", "value": true }, "current_draft_present": { "kind": "boolean", "value": false }, "current_draft_submitted": { "kind": "boolean", "value": false }, "adjacent_pane_has_task_authority": { "kind": "boolean", "value": false }, "hostname_mention_has_task_authority": { "kind": "boolean", "value": false } } },
+    { "checkpoint": "compact_semantic_request", "status": "expected", "slots": { "primary_evidence_role": { "kind": "label", "value": "latest_user_goal" }, "boundary_count_within_limit": { "kind": "boolean", "value": true }, "image_count_within_limit": { "kind": "boolean", "value": true }, "structured_text_within_limit": { "kind": "boolean", "value": true }, "selected_latest_user_goal": { "kind": "boolean", "value": true }, "selected_current_agent_state": { "kind": "boolean", "value": true }, "selected_prior_task_boundary": { "kind": "boolean", "value": true }, "selected_current_draft": { "kind": "boolean", "value": false }, "near_duplicates_collapsed": { "kind": "boolean", "value": true }, "sent_dimensions_bounded": { "kind": "boolean", "value": true }, "provider_post_ceiling": { "kind": "integer", "value": 1 }, "reconciliation_post_count": { "kind": "integer", "value": 0 }, "http_retry_count": { "kind": "integer", "value": 0 }, "transport_executed": { "kind": "boolean", "value": false } } },
+    { "checkpoint": "compact_semantic_output", "status": "expected", "slots": {
+      "unfinished_task": { "kind": "text", "value": { "text": "Add and inspect the answer-linked visual cue in the real island output.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "task_state": { "kind": "label", "value": "waiting_for_result" },
+      "resume_point": { "kind": "text", "value": { "text": "The agent is implementing the answer-linked visual cue while preserving the island output contract.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "next_supported_action": { "kind": "text", "value": { "text": "Return to the Codex visual-cue task and inspect its implementation result.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "completed_context": { "kind": "text", "value": { "text": "The backend connection and output flow were already implemented and verified.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "where_summary": { "kind": "text", "value": { "text": "the Codex visual-cue task", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "status": { "kind": "label", "value": "resolved" },
+      "all_non_null_fields_admitted": { "kind": "boolean", "value": true }
+    } },
+    { "checkpoint": "product_answer", "status": "expected", "slots": {
+      "unfinished_task": { "kind": "text", "value": { "text": "Add and inspect the answer-linked visual cue in the real island output.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "task_state": { "kind": "label", "value": "waiting_for_result" },
+      "resume_point": { "kind": "text", "value": { "text": "The agent is implementing the answer-linked visual cue while preserving the island output contract.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "next_supported_action": { "kind": "text", "value": { "text": "Return to the Codex visual-cue task and inspect its implementation result.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "completed_context": { "kind": "text", "value": { "text": "The backend connection and output flow were already implemented and verified.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "where_summary": { "kind": "text", "value": { "text": "the Codex visual-cue task", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "model_resolution_status": { "kind": "label", "value": "resolved" },
+      "compatibility_fields_match": { "kind": "boolean", "value": true },
+      "direct_return_target": { "kind": "null" },
+      "public_target_honest": { "kind": "boolean", "value": true }
+    } }
+  ],
+  "forbidden_claims": [], "allowed_uncertainty": [],
+  "deterministic_model_output": {
+    "schema": "smalltalk.lca_02.semantic_probe_response.v3",
+    "unfinished_task": "Add and inspect the answer-linked visual cue in the real island output.",
+    "task_state": "waiting_for_result",
+    "resume_point": "The agent is implementing the answer-linked visual cue while preserving the island output contract.",
+    "next_supported_action": "Return to the Codex visual-cue task and inspect its implementation result.",
+    "completed_context": "The backend connection and output flow were already implemented and verified.",
+    "where_summary": "the Codex visual-cue task",
+    "visit_roles": {},
+    "support_slots_by_field": { "unfinished_task": ["$user_action"], "task_state": ["$current_image"], "resume_point": ["$current_image"], "next_supported_action": ["$current_image"], "completed_context": ["$current_image"], "where_summary": ["$current_image"] },
+    "missing_evidence": [],
+    "missing_evidence_by_field": { "unfinished_task": [], "task_state": [], "resume_point": [], "next_supported_action": [], "completed_context": [], "where_summary": [] },
+    "confidence_by_field": { "unfinished_task": 0.94, "task_state": 0.87, "resume_point": 0.88, "next_supported_action": 0.84, "completed_context": 0.9, "where_summary": 0.8 },
+    "verifier_result_by_field": { "unfinished_task": "pending", "task_state": "pending", "resume_point": "pending", "next_supported_action": "pending", "completed_context": "pending", "where_summary": "pending" },
+    "status": "resolved"
+  },
+  "expected_model_parity": { "required": false, "identity_slots": [] }
+}

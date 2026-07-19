@@ -554,6 +554,7 @@ pub(crate) fn run_fixture_once(
     crate::capture::init_db(&conn)?;
     let anchor = super::current_time_millis() - 60_000;
     let frame_map = insert_source_records(&conn, fixture, anchor)?;
+    let _synthetic_image_assets = attach_lca_synthetic_images(&conn, fixture, &frame_map)?;
     for frame_id in frame_map.values() {
         let _private_redacted_resolution =
             crate::capture::resolve_accuracy_frame_text(&conn, *frame_id)?;
@@ -603,6 +604,112 @@ pub(crate) fn run_fixture_once(
         },
     )?;
     let mut actual = collect_checkpoints(&conn, &decision)?;
+    if is_lca_scenario(&fixture.scenario) {
+        let frames = super::load_evidence_frames(
+            &conn,
+            &ContinueSecondLayerRebuildRequest {
+                session_id: Some(fixture_session_id(fixture)),
+                lookback_ms: None,
+                start_frame_id: None,
+                end_frame_id: None,
+                limit: Some(100),
+            },
+        )?;
+        let watermark = super::stable_hash(format!("accuracy-lca:{}", fixture.case_id).as_bytes());
+        let (packet, probe_request) =
+            super::task_truth_v2::deterministic_lca_probe_input(&conn, &frames, &watermark)?;
+        let (packet_checkpoint, request_checkpoint) =
+            super::task_truth_v2::deterministic_lca_request_checkpoints(
+                &conn, &frames, &watermark,
+            )?;
+        actual.insert(
+            AccuracyCheckpointV1::TaskRelevantEvidencePacket,
+            packet_checkpoint,
+        );
+        actual.insert(
+            AccuracyCheckpointV1::CompactSemanticRequest,
+            request_checkpoint,
+        );
+        let proposed = fixture_probe_output(fixture, &probe_request)?;
+        let (admitted, field_local_issues) =
+            super::task_truth_v2::semantic_probe::admit_output(&packet, &probe_request, proposed);
+        actual.insert(
+            AccuracyCheckpointV1::CompactSemanticOutput,
+            compact_semantic_output_slots(&admitted),
+        );
+        let public_answer =
+            super::task_truth_v2::production::map_compact_probe_output_to_public_answer(
+                &admitted,
+                &probe_request.slots,
+                &super::task_truth_v2::production::CompactProbePublicMappingContext {
+                    decision_id: format!("accuracy-lca-decision:{}", fixture.case_id),
+                    session_id: Some(fixture_session_id(fixture)),
+                    packet_id: packet.packet_id.clone(),
+                    evidence_watermark: watermark.clone(),
+                    configured_model: "deterministic-fixture-model".into(),
+                    response_model: Some("deterministic-fixture-model".into()),
+                    request_id: Some(probe_request.audit.request_id.clone()),
+                    provider_request_id: Some(format!(
+                        "accuracy-lca-provider-request:{}",
+                        fixture.case_id
+                    )),
+                    provider_response_id: Some(format!(
+                        "accuracy-lca-provider-response:{}",
+                        fixture.case_id
+                    )),
+                    diagnostic_status: if field_local_issues.is_empty() {
+                        "success".into()
+                    } else {
+                        "support_slot_validation_failure".into()
+                    },
+                    validation_issues: field_local_issues,
+                    recent_context: Vec::new(),
+                },
+            );
+        let compatibility_fields_match = public_answer.task_summary
+            == public_answer.unfinished_task
+            && public_answer.execution_state == public_answer.task_state
+            && public_answer.current_subtask == public_answer.resume_point
+            && public_answer.unfinished_state == public_answer.resume_point
+            && public_answer.last_meaningful_progress == public_answer.completed_context
+            && public_answer.next_action == public_answer.next_supported_action;
+        actual.insert(
+            AccuracyCheckpointV1::ProductAnswer,
+            BTreeMap::from([
+                (
+                    "unfinished_task".into(),
+                    json!(public_answer.unfinished_task),
+                ),
+                ("task_state".into(), json!(public_answer.task_state)),
+                ("resume_point".into(), json!(public_answer.resume_point)),
+                (
+                    "next_supported_action".into(),
+                    json!(public_answer.next_supported_action),
+                ),
+                (
+                    "completed_context".into(),
+                    json!(public_answer.completed_context),
+                ),
+                ("where_summary".into(), json!(public_answer.where_summary)),
+                (
+                    "model_resolution_status".into(),
+                    json!(public_answer.model_resolution_status),
+                ),
+                (
+                    "compatibility_fields_match".into(),
+                    json!(compatibility_fields_match),
+                ),
+                (
+                    "direct_return_target".into(),
+                    json!(public_answer.direct_return_target),
+                ),
+                (
+                    "public_target_honest".into(),
+                    json!(public_answer.direct_return_target.is_none()),
+                ),
+            ]),
+        );
+    }
     let (model_parity, validated_recap) = if fixture.expected_model_parity.required {
         deterministic_model_parity(&decision, &fixture.expected_model_parity.identity_slots)
     } else {
@@ -617,6 +724,290 @@ pub(crate) fn run_fixture_once(
         model_parity,
         duration_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+fn is_lca_scenario(scenario: &CaptureAccuracyScenarioV1) -> bool {
+    matches!(
+        scenario,
+        CaptureAccuracyScenarioV1::Lca05cdProductNeedReview
+            | CaptureAccuracyScenarioV1::Lca0d1cVisualCueRequest
+            | CaptureAccuracyScenarioV1::Lca0056VisualCueVerification
+            | CaptureAccuracyScenarioV1::Lca0e34UnsentRegressionDraft
+    )
+}
+
+fn fixture_probe_task_state(
+    state: FixtureProbeTaskStateV1,
+) -> super::task_truth_v2::semantic_probe::ProbeTaskState {
+    use super::task_truth_v2::semantic_probe::ProbeTaskState;
+    match state {
+        FixtureProbeTaskStateV1::Active => ProbeTaskState::Active,
+        FixtureProbeTaskStateV1::WaitingForResult => ProbeTaskState::WaitingForResult,
+        FixtureProbeTaskStateV1::NeedsUserVerification => ProbeTaskState::NeedsUserVerification,
+        FixtureProbeTaskStateV1::Blocked => ProbeTaskState::Blocked,
+        FixtureProbeTaskStateV1::Superseded => ProbeTaskState::Superseded,
+        FixtureProbeTaskStateV1::Completed => ProbeTaskState::Completed,
+        FixtureProbeTaskStateV1::Unclear => ProbeTaskState::Unclear,
+    }
+}
+
+fn fixture_probe_resolution_status(
+    status: FixtureProbeResolutionStatusV1,
+) -> super::task_truth_v2::semantic_probe::ProbeResolutionStatus {
+    use super::task_truth_v2::semantic_probe::ProbeResolutionStatus;
+    match status {
+        FixtureProbeResolutionStatusV1::Resolved => ProbeResolutionStatus::Resolved,
+        FixtureProbeResolutionStatusV1::PartlyResolved => ProbeResolutionStatus::PartlyResolved,
+        FixtureProbeResolutionStatusV1::Unresolved => ProbeResolutionStatus::Unresolved,
+        FixtureProbeResolutionStatusV1::Refused => ProbeResolutionStatus::Refused,
+    }
+}
+
+fn fixture_probe_verifier_result(
+    result: FixtureProbeFieldVerifierResultV1,
+) -> super::task_truth_v2::semantic_probe::ProbeFieldVerifierResult {
+    use super::task_truth_v2::semantic_probe::ProbeFieldVerifierResult;
+    match result {
+        FixtureProbeFieldVerifierResultV1::Pending => ProbeFieldVerifierResult::Pending,
+        FixtureProbeFieldVerifierResultV1::Admitted => ProbeFieldVerifierResult::Admitted,
+        FixtureProbeFieldVerifierResultV1::Rejected => ProbeFieldVerifierResult::Rejected,
+        FixtureProbeFieldVerifierResultV1::NotProposed => ProbeFieldVerifierResult::NotProposed,
+    }
+}
+
+fn fixture_probe_surface_role(
+    role: FixtureProbeSurfaceRoleV1,
+) -> super::task_truth_v2::semantic_probe::ProbeSurfaceRole {
+    use super::task_truth_v2::semantic_probe::ProbeSurfaceRole;
+    match role {
+        FixtureProbeSurfaceRoleV1::PrimaryWork => ProbeSurfaceRole::PrimaryWork,
+        FixtureProbeSurfaceRoleV1::SupportingWork => ProbeSurfaceRole::SupportingWork,
+        FixtureProbeSurfaceRoleV1::DetourOrUnrelated => ProbeSurfaceRole::DetourOrUnrelated,
+        FixtureProbeSurfaceRoleV1::Unclear => ProbeSurfaceRole::Unclear,
+    }
+}
+
+fn resolve_fixture_support_slot(
+    request: &super::task_truth_v2::semantic_probe::ProbeRequest,
+    value: &str,
+) -> Result<String, String> {
+    use super::task_truth_v2::semantic_probe::SupportCategory;
+    if !value.starts_with('$') {
+        return request
+            .slots
+            .contains_key(value)
+            .then(|| value.to_string())
+            .ok_or_else(|| format!("fixture cites unavailable request slot {value:?}"));
+    }
+    let (categories, prefer_earliest): (&[SupportCategory], bool) = match value {
+        "$user_action" => (&[SupportCategory::UserAction], false),
+        "$owned_observation" => (&[SupportCategory::OwnedObservation], false),
+        "$prior_context_image" => (
+            &[
+                SupportCategory::ContextImage,
+                SupportCategory::ImageBefore,
+                SupportCategory::OwnedObservation,
+            ],
+            true,
+        ),
+        "$current_image" => (
+            &[
+                SupportCategory::ImageAfter,
+                SupportCategory::OwnedObservation,
+            ],
+            false,
+        ),
+        _ => return Err(format!("unknown fixture support selector {value:?}")),
+    };
+    let mut candidates = request
+        .slots
+        .values()
+        .filter(|slot| {
+            slot.privacy_eligible && slot.ownership_eligible && categories.contains(&slot.category)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|slot| (slot.observed_at_ms, slot.slot.as_str()));
+    let selected = if prefer_earliest {
+        candidates.first()
+    } else {
+        candidates.last()
+    };
+    selected
+        .map(|slot| slot.slot.clone())
+        .ok_or_else(|| format!("fixture support selector {value:?} matched no request slot"))
+}
+
+fn fixture_probe_output(
+    fixture: &ContinueAccuracyFixtureV1,
+    request: &super::task_truth_v2::semantic_probe::ProbeRequest,
+) -> Result<super::task_truth_v2::semantic_probe::ProbeModelOutput, String> {
+    use super::task_truth_v2::semantic_probe::{ProbeModelOutput, ProbeVisitRole};
+    let output = fixture.deterministic_model_output.as_ref().ok_or_else(|| {
+        format!(
+            "LCA fixture {} has no deterministic model output",
+            fixture.case_id
+        )
+    })?;
+    let resolve_map = |values: &BTreeMap<String, Vec<String>>| {
+        values
+            .iter()
+            .map(|(field, supports)| {
+                supports
+                    .iter()
+                    .map(|support| resolve_fixture_support_slot(request, support))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|supports| (field.clone(), supports))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+    };
+    let visit_roles = output
+        .visit_roles
+        .iter()
+        .map(|(visit_id, role)| {
+            role.support_slots
+                .iter()
+                .map(|support| resolve_fixture_support_slot(request, support))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|support_slots| {
+                    (
+                        visit_id.clone(),
+                        ProbeVisitRole {
+                            role: fixture_probe_surface_role(role.role),
+                            confidence: role.confidence,
+                            support_slots,
+                            relationship_to_primary_task: role.relationship_to_primary_task.clone(),
+                        },
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(ProbeModelOutput {
+        unfinished_task: output.unfinished_task.clone(),
+        task_state: fixture_probe_task_state(output.task_state),
+        resume_point: output.resume_point.clone(),
+        next_supported_action: output.next_supported_action.clone(),
+        completed_context: output.completed_context.clone(),
+        where_summary: output.where_summary.clone(),
+        visit_roles,
+        support_slots_by_field: resolve_map(&output.support_slots_by_field)?,
+        missing_evidence: output.missing_evidence.clone(),
+        missing_evidence_by_field: output.missing_evidence_by_field.clone(),
+        confidence_by_field: output.confidence_by_field.clone(),
+        verifier_result_by_field: output
+            .verifier_result_by_field
+            .iter()
+            .map(|(field, result)| (field.clone(), fixture_probe_verifier_result(*result)))
+            .collect(),
+        status: fixture_probe_resolution_status(output.status),
+    })
+}
+
+fn compact_semantic_output_slots(
+    output: &super::task_truth_v2::semantic_probe::ProbeModelOutput,
+) -> BTreeMap<String, Value> {
+    use super::task_truth_v2::semantic_probe::ProbeFieldVerifierResult;
+    let field_values = BTreeMap::from([
+        ("unfinished_task", output.unfinished_task.as_ref()),
+        ("resume_point", output.resume_point.as_ref()),
+        (
+            "next_supported_action",
+            output.next_supported_action.as_ref(),
+        ),
+        ("completed_context", output.completed_context.as_ref()),
+        ("where_summary", output.where_summary.as_ref()),
+    ]);
+    let all_non_null_fields_admitted = field_values.iter().all(|(field, value)| {
+        value.is_none()
+            || output.verifier_result_by_field.get(*field)
+                == Some(&ProbeFieldVerifierResult::Admitted)
+    }) && output.verifier_result_by_field.get("task_state")
+        == Some(&ProbeFieldVerifierResult::Admitted);
+    BTreeMap::from([
+        ("unfinished_task".into(), json!(output.unfinished_task)),
+        ("task_state".into(), json!(output.task_state.label())),
+        ("resume_point".into(), json!(output.resume_point)),
+        (
+            "next_supported_action".into(),
+            json!(output.next_supported_action),
+        ),
+        ("completed_context".into(), json!(output.completed_context)),
+        ("where_summary".into(), json!(output.where_summary)),
+        ("status".into(), json!(output.status)),
+        (
+            "all_non_null_fields_admitted".into(),
+            json!(all_non_null_fields_admitted),
+        ),
+    ])
+}
+
+struct SyntheticImageAssets {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for SyntheticImageAssets {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+const SYNTHETIC_ONE_PIXEL_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 240, 31, 0, 5,
+    0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+fn attach_lca_synthetic_images(
+    conn: &Connection,
+    fixture: &ContinueAccuracyFixtureV1,
+    frame_map: &HashMap<String, i64>,
+) -> Result<Option<SyntheticImageAssets>, String> {
+    if !is_lca_scenario(&fixture.scenario) {
+        return Ok(None);
+    }
+    let mut paths = Vec::new();
+    for record in &fixture.redacted_source_records.frames {
+        let frame_id = frame_map
+            .get(&record.record_id)
+            .copied()
+            .ok_or_else(|| format!("fixture frame mapping missing: {}", record.record_id))?;
+        let path = std::env::temp_dir().join(format!(
+            "smalltalk-accuracy-lca-{}-{}-{}.png",
+            std::process::id(),
+            fixture.case_id,
+            frame_id
+        ));
+        fs::write(&path, SYNTHETIC_ONE_PIXEL_PNG).map_err(to_string)?;
+        let bounds = record.bounds.unwrap_or(FixtureBoundsV1 {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
+        conn.execute(
+            "UPDATE frames
+             SET full_screenshot_path = ?2,
+                 active_window_crop_path = ?2,
+                 scope = 'active_window',
+                 screen_scale = 1.0,
+                 pixel_width = ?3,
+                 pixel_height = ?4,
+                 image_hash = ?5,
+                 phash = ?5
+             WHERE id = ?1",
+            params![
+                frame_id,
+                path.to_string_lossy(),
+                bounds.width.round().max(1.0) as i64,
+                bounds.height.round().max(1.0) as i64,
+                "synthetic-near-duplicate-group",
+            ],
+        )
+        .map_err(to_string)?;
+        paths.push(path);
+    }
+    Ok(Some(SyntheticImageAssets { paths }))
 }
 
 fn insert_source_records(
@@ -1639,6 +2030,11 @@ fn compare_checkpoint(
     actual: Option<&BTreeMap<String, Value>>,
 ) -> AccuracyCheckpointResult {
     let coverage = match checkpoint {
+        AccuracyCheckpointV1::TaskRelevantEvidencePacket
+        | AccuracyCheckpointV1::CompactSemanticRequest => AccuracyProductionCoverage::Production,
+        AccuracyCheckpointV1::CompactSemanticOutput => {
+            AccuracyProductionCoverage::ProductionValidatorWithDeterministicTransport
+        }
         AccuracyCheckpointV1::RegionRoles
         | AccuracyCheckpointV1::ConversationalRoles
         | AccuracyCheckpointV1::OrderedTurnSpans
@@ -2445,13 +2841,16 @@ fn count_forbidden(cases: &[ContinueAccuracyCaseResult], term: &str) -> i64 {
         .count() as i64
 }
 
-fn checkpoint_order() -> [AccuracyCheckpointV1; 17] {
+fn checkpoint_order() -> [AccuracyCheckpointV1; 20] {
     [
         AccuracyCheckpointV1::ResolvedText,
         AccuracyCheckpointV1::RegionRoles,
         AccuracyCheckpointV1::ConversationalRoles,
         AccuracyCheckpointV1::OrderedTurnSpans,
         AccuracyCheckpointV1::LatestTaskTurn,
+        AccuracyCheckpointV1::TaskRelevantEvidencePacket,
+        AccuracyCheckpointV1::CompactSemanticRequest,
+        AccuracyCheckpointV1::CompactSemanticOutput,
         AccuracyCheckpointV1::TaskAction,
         AccuracyCheckpointV1::SemanticDelta,
         AccuracyCheckpointV1::EligibleFeedback,
@@ -2818,6 +3217,9 @@ fn checkpoint_label(checkpoint: AccuracyCheckpointV1) -> &'static str {
         AccuracyCheckpointV1::ProductAnswer => "product_answer",
         AccuracyCheckpointV1::CurrentSurface => "current_surface",
         AccuracyCheckpointV1::SelectedCandidate => "selected_candidate",
+        AccuracyCheckpointV1::TaskRelevantEvidencePacket => "task_relevant_evidence_packet",
+        AccuracyCheckpointV1::CompactSemanticRequest => "compact_semantic_request",
+        AccuracyCheckpointV1::CompactSemanticOutput => "compact_semantic_output",
     }
 }
 fn to_string(error: impl std::fmt::Display) -> String {
@@ -2832,7 +3234,7 @@ mod tests {
     fn committed_accuracy_replay_reports_expected_first_divergence_and_determinism() {
         let report =
             run_committed_continue_accuracy_eval(ContinueAccuracyEvalOptions::default()).unwrap();
-        assert_eq!(report.case_count, 8);
+        assert_eq!(report.case_count, 12);
         assert!(
             report.milestone_contract_passed,
             "{:?}; cases={:?}",
@@ -2915,7 +3317,7 @@ mod tests {
             Some(0.0)
         );
         assert!(!report.release_gate.passed);
-        assert_eq!(report.release_gate.corpus.case_count, 8);
+        assert_eq!(report.release_gate.corpus.case_count, 12);
         assert_eq!(
             report
                 .release_gate
@@ -2938,6 +3340,52 @@ mod tests {
     fn first_divergence_and_forbidden_matching_ignore_metadata() {
         assert!(normalized_contains("Stremio is primary", "stremio"));
         assert!(!normalized_contains("audit handle stale-media", "stremio"));
+    }
+
+    #[test]
+    fn lca_cases_exercise_real_packet_and_request_without_transport() {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continue_accuracy/cases");
+        let mut fixture_paths = fs::read_dir(fixture_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("lca_") && name.ends_with(".json"))
+            })
+            .collect::<Vec<_>>();
+        fixture_paths.sort();
+        assert_eq!(fixture_paths.len(), 4);
+        for path in fixture_paths {
+            let fixture = parse_accuracy_fixture_json_for_access(
+                &fs::read(path).unwrap(),
+                HoldoutAccessModeV1::Development,
+            )
+            .unwrap();
+            let snapshot = run_fixture_once(&fixture).unwrap();
+            for checkpoint in [
+                AccuracyCheckpointV1::TaskRelevantEvidencePacket,
+                AccuracyCheckpointV1::CompactSemanticRequest,
+                AccuracyCheckpointV1::CompactSemanticOutput,
+                AccuracyCheckpointV1::ProductAnswer,
+            ] {
+                let expected = fixture
+                    .expected_checkpoints
+                    .iter()
+                    .find(|expected| expected.checkpoint == checkpoint);
+                let result =
+                    compare_checkpoint(checkpoint, expected, snapshot.actual.get(&checkpoint));
+                assert_eq!(
+                    result.status,
+                    AccuracyCheckpointStatus::Match,
+                    "case={} checkpoint={checkpoint:?} mismatches={:?}",
+                    fixture.case_id,
+                    result.mismatched_slots
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,77 @@
+{
+  "schema": "smalltalk.continue_accuracy_fixture.v1",
+  "case_id": "lca_05cd_product_need_review",
+  "scenario": "lca_05cd_product_need_review",
+  "description": "Privacy-safe causal shape for reviewing a partly completed product-need answer after supporting discussion.",
+  "privacy_review": { "status": "approved", "reviewed_at_ms": 1784414000000, "reviewer_role": "fixture_owner" },
+  "fixture_partition": "development",
+  "injection_boundary": "capture_records",
+  "redacted_source_records": {
+    "frames": [
+      { "record_id": "frame-context", "frame_id": "frame-context", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": { "x": 0.0, "y": 0.0, "width": 1440.0, "height": 900.0 }, "owner_id_hash": null, "confidence": 1.0, "text": { "text": "Supporting discussion about attention residue and reconstructing work context.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "session_id": { "kind": "label", "value": "fixture-session" }, "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic product review" }, "capture_trigger": { "kind": "label", "value": "surface_change" } } },
+      { "record_id": "frame-current", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": "frame-context", "source_role": "active_window", "source_order": 1, "bounds": { "x": 0.0, "y": 0.0, "width": 1440.0, "height": 900.0 }, "owner_id_hash": null, "confidence": 1.0, "text": { "text": "Review whether the screen-aware context-reconstruction product solves a real need. The answer has begun and affirms the need; more remains to review.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "session_id": { "kind": "label", "value": "fixture-session" }, "app_name": { "kind": "label", "value": "AgentChat" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic product review" }, "capture_trigger": { "kind": "label", "value": "manual" } } }
+    ],
+    "ax_nodes": [
+      { "record_id": "ax-context", "frame_id": "frame-context", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 1, "bounds": { "x": 120.0, "y": 120.0, "width": 900.0, "height": 90.0 }, "owner_id_hash": null, "confidence": 0.95, "text": { "text": "Supporting discussion about attention residue and reconstructing work context.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-assistant-message" } } },
+      { "record_id": "ax-user-goal", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 1, "bounds": { "x": 720.0, "y": 360.0, "width": 600.0, "height": 80.0 }, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "Review whether the screen-aware context-reconstruction product solves a real need.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-user-message" } } },
+      { "record_id": "ax-agent-state", "frame_id": "frame-current", "observed_at_ms": 2010, "parent_record_id": null, "source_role": "AXStaticText", "source_order": 2, "bounds": { "x": 720.0, "y": 470.0, "width": 600.0, "height": 110.0 }, "owner_id_hash": null, "confidence": 0.99, "text": { "text": "The product addresses attention residue and context reconstruction; the answer continues below.", "storage_class": "synthetic", "purpose": "source_semantic_text", "human_privacy_approved": false, "source_hash": null }, "metadata": { "identifier": { "kind": "label", "value": "conversation-assistant-message" } } }
+    ],
+    "ocr_spans": [], "content_units": [], "frame_text_resolution": [],
+    "app_window_context": [
+      { "record_id": "context-1", "frame_id": "frame-context", "observed_at_ms": 1000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.95, "text": null, "metadata": { "adapter_id": { "kind": "label", "value": "fixture_agent_chat" }, "object_type": { "kind": "label", "value": "chat_conversation" } } },
+      { "record_id": "context-2", "frame_id": "frame-current", "observed_at_ms": 2000, "parent_record_id": null, "source_role": "active_window", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.95, "text": null, "metadata": { "adapter_id": { "kind": "label", "value": "fixture_agent_chat" }, "object_type": { "kind": "label", "value": "chat_conversation" } } }
+    ],
+    "ui_events": [
+      { "record_id": "event-agent-stream", "frame_id": "frame-current", "observed_at_ms": 2010, "parent_record_id": null, "source_role": "agent_status", "source_order": 1, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.9, "text": null, "metadata": { "event_type": { "kind": "label", "value": "agent_status" }, "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "app_name": { "kind": "label", "value": "AgentChat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic product review" } } }
+    ],
+    "transitions": [],
+    "typing_metadata": [
+      { "record_id": "typing-user-goal", "frame_id": "frame-current", "observed_at_ms": 1990, "parent_record_id": null, "source_role": "typing_burst", "source_order": 0, "bounds": null, "owner_id_hash": "fixture-owner", "confidence": 0.9, "text": null, "metadata": { "app_bundle_id": { "kind": "label", "value": "com.fixture.agentchat" }, "app_name": { "kind": "label", "value": "AgentChat" }, "window_id": { "kind": "integer", "value": 42 }, "window_title": { "kind": "label", "value": "Synthetic product review" }, "char_count": { "kind": "integer", "value": 84 }, "enter_count": { "kind": "integer", "value": 1 }, "committed": { "kind": "boolean", "value": true }, "commit_signal": { "kind": "label", "value": "enter" }, "raw_text_captured": { "kind": "boolean", "value": false }, "pre_frame_id": { "kind": "label", "value": "frame-context" }, "post_frame_id": { "kind": "label", "value": "frame-current" }, "association_source": { "kind": "label", "value": "explicit_post_frame" }, "association_confidence": { "kind": "number", "value": 0.95 } } }
+    ]
+  },
+  "injected_historical_state": { "feedback_events": [], "branch_contexts": [], "workstreams": [], "open_loops": [], "memory_cells": [] },
+  "expected_checkpoints": [
+    { "checkpoint": "task_relevant_evidence_packet", "status": "expected", "slots": { "task_relevance_source": { "kind": "label", "value": "p6_role_region_task_turn" }, "latest_user_goal_present": { "kind": "boolean", "value": true }, "current_agent_state_present": { "kind": "boolean", "value": true }, "current_draft_present": { "kind": "boolean", "value": false }, "current_draft_submitted": { "kind": "boolean", "value": false }, "adjacent_pane_has_task_authority": { "kind": "boolean", "value": false }, "hostname_mention_has_task_authority": { "kind": "boolean", "value": false } } },
+    { "checkpoint": "compact_semantic_request", "status": "expected", "slots": { "primary_evidence_role": { "kind": "label", "value": "latest_user_goal" }, "boundary_count_within_limit": { "kind": "boolean", "value": true }, "image_count_within_limit": { "kind": "boolean", "value": true }, "structured_text_within_limit": { "kind": "boolean", "value": true }, "selected_latest_user_goal": { "kind": "boolean", "value": true }, "selected_current_agent_state": { "kind": "boolean", "value": true }, "selected_current_draft": { "kind": "boolean", "value": false }, "near_duplicates_collapsed": { "kind": "boolean", "value": true }, "sent_dimensions_bounded": { "kind": "boolean", "value": true }, "provider_post_ceiling": { "kind": "integer", "value": 1 }, "reconciliation_post_count": { "kind": "integer", "value": 0 }, "http_retry_count": { "kind": "integer", "value": 0 }, "transport_executed": { "kind": "boolean", "value": false } } },
+    { "checkpoint": "compact_semantic_output", "status": "expected", "slots": {
+      "unfinished_task": { "kind": "text", "value": { "text": "Assess whether the proposed screen-aware context-reconstruction product solves a real need by reviewing the conversational answer.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "task_state": { "kind": "label", "value": "active" },
+      "resume_point": { "kind": "text", "value": { "text": "The answer has begun, affirms the need, and continues beyond the visible section.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "next_supported_action": { "kind": "text", "value": { "text": "Continue reviewing the answer from the Does your product solve a real need section.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "completed_context": { "kind": "null" },
+      "where_summary": { "kind": "text", "value": { "text": "the conversational answer", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "status": { "kind": "label", "value": "resolved" },
+      "all_non_null_fields_admitted": { "kind": "boolean", "value": true }
+    } },
+    { "checkpoint": "product_answer", "status": "expected", "slots": {
+      "unfinished_task": { "kind": "text", "value": { "text": "Assess whether the proposed screen-aware context-reconstruction product solves a real need by reviewing the conversational answer.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "task_state": { "kind": "label", "value": "active" },
+      "resume_point": { "kind": "text", "value": { "text": "The answer has begun, affirms the need, and continues beyond the visible section.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "next_supported_action": { "kind": "text", "value": { "text": "Continue reviewing the answer from the Does your product solve a real need section.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "completed_context": { "kind": "null" },
+      "where_summary": { "kind": "text", "value": { "text": "the conversational answer", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
+      "model_resolution_status": { "kind": "label", "value": "resolved" },
+      "compatibility_fields_match": { "kind": "boolean", "value": true },
+      "direct_return_target": { "kind": "null" },
+      "public_target_honest": { "kind": "boolean", "value": true }
+    } }
+  ],
+  "forbidden_claims": [], "allowed_uncertainty": [],
+  "deterministic_model_output": {
+    "schema": "smalltalk.lca_02.semantic_probe_response.v3",
+    "unfinished_task": "Assess whether the proposed screen-aware context-reconstruction product solves a real need by reviewing the conversational answer.",
+    "task_state": "active",
+    "resume_point": "The answer has begun, affirms the need, and continues beyond the visible section.",
+    "next_supported_action": "Continue reviewing the answer from the Does your product solve a real need section.",
+    "completed_context": null,
+    "where_summary": "the conversational answer",
+    "visit_roles": {},
+    "support_slots_by_field": { "unfinished_task": ["$user_action"], "task_state": ["$user_action"], "resume_point": ["$current_image"], "next_supported_action": ["$user_action"], "completed_context": [], "where_summary": ["$current_image"] },
+    "missing_evidence": [],
+    "missing_evidence_by_field": { "unfinished_task": [], "task_state": [], "resume_point": [], "next_supported_action": [], "completed_context": [], "where_summary": [] },
+    "confidence_by_field": { "unfinished_task": 0.92, "task_state": 0.88, "resume_point": 0.86, "next_supported_action": 0.86, "completed_context": 0.0, "where_summary": 0.8 },
+    "verifier_result_by_field": { "unfinished_task": "pending", "task_state": "pending", "resume_point": "pending", "next_supported_action": "pending", "completed_context": "pending", "where_summary": "pending" },
+    "status": "resolved"
+  },
+  "expected_model_parity": { "required": false, "identity_slots": [] }
+}

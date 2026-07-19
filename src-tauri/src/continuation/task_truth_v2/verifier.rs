@@ -276,6 +276,9 @@ impl TaskTruthVerifier for LocalEvidenceVerifier {
                 if value.is_some_and(generic_next_action) {
                     reasons.push("generic_invented_next_action".into());
                 }
+                if value.is_some_and(unsafe_or_invented_next_action) {
+                    reasons.push("unsafe_or_invented_next_action".into());
+                }
                 if !refs.iter().any(|reference| {
                     reference.source_kind == "canonical_element"
                         && reference.content_hash.is_some()
@@ -318,6 +321,7 @@ impl TaskTruthVerifier for LocalEvidenceVerifier {
                         | "invented_document_or_thread_identity"
                         | "invented_surface_identity"
                         | "generic_invented_next_action"
+                        | "unsafe_or_invented_next_action"
                         | "next_action_without_unfinished_state"
                         | "lifecycle_value_not_supported_by_schema"
                         | "unfinished_step_conflicts_with_completed_state"
@@ -882,6 +886,33 @@ fn generic_next_action(value: &str) -> bool {
         )
 }
 
+fn unsafe_or_invented_next_action(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    [
+        "delete ",
+        "erase ",
+        "drop ",
+        "overwrite ",
+        "reset ",
+        "remove ",
+        "send ",
+        "submit ",
+        "post ",
+        "publish ",
+        "force push ",
+        "git reset ",
+        "rm ",
+        "sudo ",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+        || normalized.contains("http://")
+        || normalized.contains("https://")
+        || normalized.contains("file://")
+        || normalized.contains("../")
+        || normalized.contains("~/")
+}
+
 pub(crate) fn deterministic_first_screen_wording(snapshot: &TaskSnapshotV2) -> String {
     let task = snapshot
         .task_summary
@@ -1012,6 +1043,11 @@ mod tests {
             local_image_handle_hash: Some("image-hash".into()),
             ephemeral_local_image_path: None,
             selection_reasons: vec!["manual_continue_boundary".into()],
+            task_evidence_role: None,
+            task_turn_id: None,
+            same_task_relation: "unknown".into(),
+            cross_pane_ambiguity: false,
+            near_duplicate_group: None,
         };
         let old = KeyframeReferenceV2 {
             frame_id: "frame-old".into(),
@@ -1037,6 +1073,11 @@ mod tests {
             local_image_handle_hash: Some("old-image-hash".into()),
             ephemeral_local_image_path: None,
             selection_reasons: vec!["causal_baseline".into()],
+            task_evidence_role: None,
+            task_turn_id: None,
+            same_task_relation: "unknown".into(),
+            cross_pane_ambiguity: false,
+            near_duplicate_group: None,
         };
         ObservationPacketV2 {
             schema: "smalltalk.observation_packet.v2".into(),
@@ -1055,6 +1096,8 @@ mod tests {
             current_frame: current.clone(),
             semantic_keyframes: vec![old, current],
             surface_timeline: Vec::new(),
+            task_relevance: Default::default(),
+            image_candidates: Vec::new(),
             canonical_elements: vec![
                 element(
                     "element-user",
@@ -1267,6 +1310,30 @@ mod tests {
             FieldVerdictV1::Removed
         );
         assert!(result.snapshot.unwrap().next_action.is_none());
+    }
+
+    #[test]
+    fn destructive_or_locator_like_next_action_is_removed_field_locally() {
+        for proposed in [
+            "Delete the repository and start again",
+            "Open https://invented.invalid/task/123",
+        ] {
+            let mut hypothesis = hypothesis("element-user");
+            hypothesis.possible_next_action = Some(proposed.into());
+            let result = LocalEvidenceVerifier.verify(
+                &packet(),
+                None,
+                &[hypothesis],
+                ResolutionStatusV1::Resolved,
+            );
+            assert_eq!(
+                verdict(&result, "possible_next_action"),
+                FieldVerdictV1::Removed
+            );
+            let snapshot = result.snapshot.expect("other admitted fields survive");
+            assert!(snapshot.next_action.is_none());
+            assert!(snapshot.task_summary.is_some());
+        }
     }
 
     #[test]
