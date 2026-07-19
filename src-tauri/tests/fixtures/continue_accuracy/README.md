@@ -1,8 +1,8 @@
 # Continue accuracy corpus v1
 
-This directory is the committed, privacy-safe Continue accuracy corpus. It contains the seven mandatory P6.01 Capture-button cases, one TT2 causal-containment case, and four launch-accuracy packet/request cases under `cases/`. The frozen evaluation policy lives in `eval-policy.v1.json`, and the milestone contract lives in `known-failures.v1.json`. The validator requires the original seven cases as a stable subset and permits reviewed cases to be added; it no longer caps the corpus at seven.
+This directory is the committed, privacy-safe Continue accuracy corpus. It contains the seven mandatory P6.01 Capture-button cases under `cases/`, the frozen evaluation policy in `eval-policy.v1.json`, and the milestone contract in `known-failures.v1.json`. The validator requires those seven cases as a stable subset and permits reviewed P6.09 cases to be added; it no longer caps the corpus at seven.
 
-All retained language is synthetic. The fixtures preserve only the phase-reviewed semantic facts needed to test the Capture-button and launch-accuracy causal shapes. They contain no screenshots, databases, local paths, URLs, source conversation identifiers, raw typed sequences, or verbatim private capture text. Relative timestamps and fixture-local identifiers replace source timestamps and stable identifiers.
+All retained language is synthetic. The fixtures preserve only the phase-reviewed semantic facts needed to test the Capture-button failure. They contain no screenshots, databases, local paths, URLs, source conversation identifiers, raw typed sequences, or verbatim private capture text. Relative timestamps and fixture-local identifiers replace source timestamps and stable identifiers.
 
 `fixture-owner` is a reserved synthetic ownership marker used only in source-record provenance; the privacy linter permits this non-personal sentinel and rejects every other unhashed owner identifier.
 
@@ -14,19 +14,7 @@ Historical feedback, branch, workstream, open-loop, and memory rows are inserted
 
 The local-only importer in `accuracy_fixture.rs` reads an allowlisted set of files from a private audit and emits only structural shapes, text hashes, and character counts. Its output is a review candidate, not a committed fixture. A human-authored synthetic or explicitly approved derived-redacted fixture must be created from that candidate. The importer never copies screenshots or databases.
 
-These fixtures are synthetic-only development/validation artifacts. Their `privacy_review` metadata records repository ownership of the synthetic review, not a claim of independent human adjudication; P6.09 must add that sign-off before release.
-
-## LCA-02 deterministic provider seam
-
-The four `lca_*` cases include a strict, privacy-linted `deterministic_model_output`. Replay first builds the real task-relevant packet and compact request. It then resolves the fixture's `$user_action`, `$owned_observation`, `$prior_context_image`, and `$current_image` selectors to request-local support-slot identifiers. The resulting typed response passes through the production field-level admission function and the same compact-to-public mapper used for persisted provider rows. No network transport runs.
-
-Each LCA case checks three distinct boundaries:
-
-- `compact_semantic_request` proves bounded input, role selection, one-post ceiling, zero reconciliation, zero retry, and no transport.
-- `compact_semantic_output` proves the six LCA-02 semantic meanings survive field-local admission with their raw model status unchanged.
-- `product_answer` proves canonical public fields and compatibility fields come from the same admitted compact object, while `direct_return_target` remains null and target honesty remains true.
-
-The response strings and selectors are synthetic. They contain no raw provider log text, private capture material, paths, URLs, provider identifiers, or typed-character payloads.
+These seven fixtures are synthetic-only development/validation artifacts. Their `privacy_review` metadata records repository ownership of the synthetic review, not a claim of independent human adjudication; P6.09 must add that sign-off before release.
 
 ## Initial cases
 
@@ -40,14 +28,10 @@ The response strings and selectors are synthetic. They contain no raw provider l
 | `capture_button_adjacent_before_new_task` | Only the earlier completed Continue-card task is visible. | Completed prior task; no newer active task. |
 | `capture_button_adjacent_after_support_detour` | Adds a later app-switch/search support surface. | Capture-button investigation remains active. |
 | `tt2_session_013_control` | Legacy null post-frame Enter, matching later chat frame, prior completion, and actionable approval control. | The new right-aligned request is current; the control is ineligible and public target remains null. |
-| `lca_05cd_product_need_review` | Current product-need request, answer under review, and surrounding discussion. | The current user goal and continuing answer outrank surrounding discussion. |
-| `lca_0d1c_visual_cue_request` | New visual-cue request after completed backend work, with an adjacent checklist pane. | The visual-cue request supersedes the completed work; the checklist has no task authority. |
-| `lca_0056_visual_cue_verification` | Verification request after visual-cue implementation, with an unrelated PFTU pane. | The verification request is current and the completed implementation is its prior boundary. |
-| `lca_0e34_unsent_regression_draft` | Focused, unsubmitted regression-investigation draft after completed visual-cue work. | The draft is current but unsubmitted; its causal claim remains unproven. |
 
 The before-to-canonical change is a legitimate task-identity change because a newer user goal and agent status appear. The canonical-to-after change is a legitimate current-surface/support delta, but not a task supersession: the later surface is a non-promotable search/support branch without a newer user goal.
 
-Repeatability reuses `capture_button_all_contaminants` with `repeat_count` greater than one. Repetition does not add another corpus case.
+Repeatability reuses `capture_button_all_contaminants` with `repeat_count` greater than one. It is not an eighth case.
 
 ## Current milestone
 

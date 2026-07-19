@@ -27,9 +27,7 @@ pub(crate) mod task_snapshot;
 pub(crate) mod task_thread;
 pub(crate) mod verifier;
 
-use self::observation_packet::{
-    build_observation_packet_with_task_relevance, load_task_relevance_evidence,
-};
+use self::observation_packet::build_observation_packet;
 use self::task_snapshot::{project_current_task_turn, unresolved_snapshot};
 use self::verifier::TaskTruthVerifier;
 
@@ -37,229 +35,6 @@ pub(crate) const TASK_TRUTH_FIXTURE_SCHEMA_V2: &str = "smalltalk.task_truth_fixt
 pub(crate) const TASK_TRUTH_POLICY_SCHEMA_V1: &str = "smalltalk.task_truth_v2.eval_policy.v1";
 pub(crate) const TASK_TRUTH_REPORT_SCHEMA_V1: &str = "smalltalk.task_truth_v2.report.v1";
 pub(crate) const TASK_TRUTH_BUILDER_SCHEMA_V1: &str = "smalltalk.task_truth_v2.builder_input.v1";
-
-/// Build the same bounded packet and compact semantic request used by manual
-/// Continue, but stop before transport. Accuracy fixtures use the returned
-/// facts to prove the production selection and size contracts without reading
-/// credentials or issuing a provider request.
-pub(super) fn deterministic_lca_probe_input(
-    conn: &Connection,
-    frames: &[super::EvidenceFrame],
-    evidence_watermark: &str,
-) -> Result<
-    (
-        observation_packet::ObservationPacketV2,
-        semantic_probe::ProbeRequest,
-    ),
-    String,
-> {
-    let task_relevance = load_task_relevance_evidence(conn, frames)?;
-    let packet = build_observation_packet_with_task_relevance(
-        frames,
-        evidence_watermark,
-        None,
-        task_relevance,
-    )?;
-    let request =
-        semantic_probe::build_probe_request(&packet, &semantic_probe::configured_model_name())
-            .map_err(|(status, reason)| {
-                format!("compact request checkpoint failed: {status:?}:{reason}")
-            })?;
-    Ok((packet, request))
-}
-
-pub(super) fn deterministic_lca_request_checkpoints(
-    conn: &Connection,
-    frames: &[super::EvidenceFrame],
-    evidence_watermark: &str,
-) -> Result<
-    (
-        BTreeMap<String, serde_json::Value>,
-        BTreeMap<String, serde_json::Value>,
-    ),
-    String,
-> {
-    use self::observation_packet::TaskEvidenceRoleV1;
-
-    let (packet, request) = deterministic_lca_probe_input(conn, frames, evidence_watermark)?;
-
-    let authoritative_role = |role: TaskEvidenceRoleV1| {
-        matches!(
-            role,
-            TaskEvidenceRoleV1::LatestUserGoal
-                | TaskEvidenceRoleV1::CurrentUnsentDraft
-                | TaskEvidenceRoleV1::CurrentAgentState
-                | TaskEvidenceRoleV1::PriorTaskBoundary
-        )
-    };
-    let has_role = |role: TaskEvidenceRoleV1| {
-        packet
-            .task_relevance
-            .spans
-            .iter()
-            .any(|span| span.evidence_role == role)
-    };
-    let current_draft_submitted = packet
-        .task_relevance
-        .spans
-        .iter()
-        .filter(|span| span.evidence_role == TaskEvidenceRoleV1::CurrentUnsentDraft)
-        .any(|span| span.submitted == Some(true));
-    let adjacent_pane_has_task_authority = packet.task_relevance.spans.iter().any(|span| {
-        authoritative_role(span.evidence_role)
-            && matches!(
-                span.region_role.trim().to_ascii_lowercase().as_str(),
-                "navigation" | "sidebar" | "toolbar" | "control" | "browser_chrome"
-            )
-    });
-    let hostname_mention_has_task_authority = packet.task_relevance.spans.iter().any(|span| {
-        authoritative_role(span.evidence_role)
-            && span.reason_codes.iter().any(|reason| {
-                let reason = reason.to_ascii_lowercase();
-                reason.contains("hostname") || reason.contains("url_mention")
-            })
-    });
-    let causal_claim_proven = packet.task_relevance.spans.iter().any(|span| {
-        authoritative_role(span.evidence_role)
-            && span
-                .reason_codes
-                .iter()
-                .any(|reason| reason.to_ascii_lowercase().contains("causal_typing"))
-    });
-    let packet_checkpoint = BTreeMap::from([
-        (
-            "task_relevance_source".into(),
-            json!(packet.task_relevance.source),
-        ),
-        (
-            "latest_user_goal_present".into(),
-            json!(has_role(TaskEvidenceRoleV1::LatestUserGoal)),
-        ),
-        (
-            "current_agent_state_present".into(),
-            json!(has_role(TaskEvidenceRoleV1::CurrentAgentState)),
-        ),
-        (
-            "prior_task_boundary_present".into(),
-            json!(has_role(TaskEvidenceRoleV1::PriorTaskBoundary)),
-        ),
-        (
-            "current_draft_present".into(),
-            json!(has_role(TaskEvidenceRoleV1::CurrentUnsentDraft)),
-        ),
-        (
-            "current_draft_submitted".into(),
-            json!(current_draft_submitted),
-        ),
-        (
-            "adjacent_pane_has_task_authority".into(),
-            json!(adjacent_pane_has_task_authority),
-        ),
-        (
-            "hostname_mention_has_task_authority".into(),
-            json!(hostname_mention_has_task_authority),
-        ),
-        ("causal_claim_proven".into(), json!(causal_claim_proven)),
-    ]);
-
-    let structured_text = request
-        .body
-        .pointer("/input/1/content/0/text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "compact request checkpoint missing structured input".to_string())?;
-    let structured: Value = serde_json::from_str(structured_text)
-        .map_err(|error| format!("compact request checkpoint JSON invalid: {error}"))?;
-    let selected_roles = structured
-        .pointer("/task_relevance/ordered_spans")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|span| span.get("evidence_role").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
-    let primary_evidence_role = [
-        "current_unsent_draft",
-        "latest_user_goal",
-        "current_agent_state",
-        "prior_task_boundary",
-        "current_task_context",
-        "supporting_context",
-        "flattened_fallback",
-        "unknown",
-    ]
-    .into_iter()
-    .find(|role| selected_roles.contains(role))
-    .unwrap_or("unknown");
-    let mut selected_duplicate_keys = BTreeSet::new();
-    let near_duplicates_collapsed = request.audit.image_candidates.iter().all(|candidate| {
-        if candidate.get("selected").and_then(Value::as_bool) != Some(true) {
-            return true;
-        }
-        let Some(group) = candidate
-            .get("near_duplicate_group")
-            .and_then(Value::as_str)
-        else {
-            return true;
-        };
-        let role = candidate
-            .get("evidence_role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        selected_duplicate_keys.insert((group.to_string(), role.to_string()))
-    });
-    let sent_dimensions_bounded = !request.audit.image_preparations.is_empty()
-        && request.audit.image_preparations.iter().all(|image| {
-            image.sent_width.is_some_and(|width| width <= 1_600)
-                && image.sent_height.is_some_and(|height| height <= 1_600)
-        });
-    let request_checkpoint = BTreeMap::from([
-        ("primary_evidence_role".into(), json!(primary_evidence_role)),
-        (
-            "boundary_count_within_limit".into(),
-            json!((1..=2).contains(&request.audit.boundary_count)),
-        ),
-        (
-            "image_count_within_limit".into(),
-            json!((1..=4).contains(&request.audit.image_count)),
-        ),
-        (
-            "structured_text_within_limit".into(),
-            json!(
-                request.audit.structured_bytes <= request.audit.max_text_bytes
-                    && request.audit.estimated_text_tokens
-                        <= request.audit.max_estimated_text_tokens
-            ),
-        ),
-        (
-            "selected_latest_user_goal".into(),
-            json!(selected_roles.contains("latest_user_goal")),
-        ),
-        (
-            "selected_current_agent_state".into(),
-            json!(selected_roles.contains("current_agent_state")),
-        ),
-        (
-            "selected_prior_task_boundary".into(),
-            json!(selected_roles.contains("prior_task_boundary")),
-        ),
-        (
-            "selected_current_draft".into(),
-            json!(selected_roles.contains("current_unsent_draft")),
-        ),
-        (
-            "near_duplicates_collapsed".into(),
-            json!(near_duplicates_collapsed),
-        ),
-        (
-            "sent_dimensions_bounded".into(),
-            json!(sent_dimensions_bounded),
-        ),
-        ("provider_post_ceiling".into(), json!(1)),
-        ("reconciliation_post_count".into(), json!(0)),
-        ("http_retry_count".into(), json!(0)),
-        ("transport_executed".into(), json!(false)),
-    ]);
-    Ok((packet_checkpoint, request_checkpoint))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct MultimodalShadowAuditV1 {
@@ -528,12 +303,10 @@ pub(super) fn checkpoint_observation_frames(
         .and_then(|frame| frame.session_id.as_deref())
         .filter(|value| !value.trim().is_empty());
     let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id)?;
-    let task_relevance = load_task_relevance_evidence(conn, frames)?;
-    let packet = build_observation_packet_with_task_relevance(
+    let packet = build_observation_packet(
         frames,
         evidence_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
-        task_relevance,
     )?;
     let snapshot = match super::task_turn::selected_current_task_turn(conn)? {
         Some(turn)
@@ -667,12 +440,10 @@ fn record_manual_continue_shadow_with_lookback(
         .to_string()
         .as_bytes(),
     );
-    let task_relevance = load_task_relevance_evidence(conn, &frames)?;
-    let packet = build_observation_packet_with_task_relevance(
+    let packet = build_observation_packet(
         &frames,
         &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
-        task_relevance,
     )?;
     let semantic_probe_error = if let Err(error) = semantic_probe::run_manual_probe(
         conn,
@@ -2071,7 +1842,6 @@ fn to_replay_fixture(case: &TaskTruthCaseV2) -> Result<ContinueAccuracyFixtureV1
         expected_checkpoints: vec![],
         forbidden_claims: vec![],
         allowed_uncertainty: vec![],
-        deterministic_model_output: None,
         expected_model_parity: ExpectedModelParityV1 {
             required: false,
             identity_slots: vec![],

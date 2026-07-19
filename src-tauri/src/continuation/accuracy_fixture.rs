@@ -10,16 +10,6 @@ pub(crate) const ACCURACY_EVAL_POLICY_SCHEMA_V1: &str =
 pub(crate) const ACCURACY_MILESTONE_SCHEMA_V1: &str = "smalltalk.continue_accuracy_milestones.v1";
 pub(crate) const AUDIT_IMPORT_CANDIDATE_SCHEMA_V1: &str =
     "smalltalk.continue_accuracy_import_candidate.v1";
-pub(crate) const LCA_COMPACT_MODEL_OUTPUT_SCHEMA_V1: &str =
-    "smalltalk.lca_02.semantic_probe_response.v3";
-pub(crate) const LCA_SEMANTIC_FIELDS_V1: [&str; 6] = [
-    "unfinished_task",
-    "task_state",
-    "resume_point",
-    "next_supported_action",
-    "completed_context",
-    "where_summary",
-];
 
 /// Text limits are intentionally small. Fixtures are semantic probes, not capture archives.
 pub(crate) const MAX_CASE_ID_CHARS: usize = 96;
@@ -91,14 +81,6 @@ pub(crate) enum CaptureAccuracyScenarioV1 {
     Adjacent5318852,
     #[serde(rename = "adjacent_5478796")]
     Adjacent5478796,
-    #[serde(rename = "lca_05cd_product_need_review")]
-    Lca05cdProductNeedReview,
-    #[serde(rename = "lca_0d1c_visual_cue_request")]
-    Lca0d1cVisualCueRequest,
-    #[serde(rename = "lca_0056_visual_cue_verification")]
-    Lca0056VisualCueVerification,
-    #[serde(rename = "lca_0e34_unsent_regression_draft")]
-    Lca0e34UnsentRegressionDraft,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -266,9 +248,6 @@ pub(crate) enum AccuracyCheckpointV1 {
     ProductAnswer,
     CurrentSurface,
     SelectedCandidate,
-    TaskRelevantEvidencePacket,
-    CompactSemanticRequest,
-    CompactSemanticOutput,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,79 +257,6 @@ pub(crate) enum ExpectedCheckpointStatusV1 {
     ExpectedAbstention,
     NotImplemented,
     Missing,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FixtureProbeTaskStateV1 {
-    Active,
-    WaitingForResult,
-    NeedsUserVerification,
-    Blocked,
-    Superseded,
-    Completed,
-    Unclear,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FixtureProbeResolutionStatusV1 {
-    Resolved,
-    PartlyResolved,
-    Unresolved,
-    Refused,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FixtureProbeFieldVerifierResultV1 {
-    Pending,
-    Admitted,
-    Rejected,
-    NotProposed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FixtureProbeSurfaceRoleV1 {
-    PrimaryWork,
-    SupportingWork,
-    DetourOrUnrelated,
-    Unclear,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FixtureProbeVisitRoleV1 {
-    pub(crate) role: FixtureProbeSurfaceRoleV1,
-    pub(crate) confidence: f64,
-    #[serde(default)]
-    pub(crate) support_slots: Vec<String>,
-    pub(crate) relationship_to_primary_task: String,
-}
-
-/// A synthetic provider response used only at the deterministic transport seam.
-/// It mirrors the LCA-02 response contract, but carries no provider identifiers,
-/// raw captures, paths, or URLs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FixtureCompactModelOutputV1 {
-    pub(crate) schema: String,
-    pub(crate) unfinished_task: Option<String>,
-    pub(crate) task_state: FixtureProbeTaskStateV1,
-    pub(crate) resume_point: Option<String>,
-    pub(crate) next_supported_action: Option<String>,
-    pub(crate) completed_context: Option<String>,
-    pub(crate) where_summary: Option<String>,
-    #[serde(default)]
-    pub(crate) visit_roles: BTreeMap<String, FixtureProbeVisitRoleV1>,
-    pub(crate) support_slots_by_field: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub(crate) missing_evidence: Vec<String>,
-    pub(crate) missing_evidence_by_field: BTreeMap<String, Vec<String>>,
-    pub(crate) confidence_by_field: BTreeMap<String, f64>,
-    pub(crate) verifier_result_by_field: BTreeMap<String, FixtureProbeFieldVerifierResultV1>,
-    pub(crate) status: FixtureProbeResolutionStatusV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -407,8 +313,6 @@ pub(crate) struct ContinueAccuracyFixtureV1 {
     pub(crate) forbidden_claims: Vec<ForbiddenClaimV1>,
     #[serde(default)]
     pub(crate) allowed_uncertainty: Vec<AllowedUncertaintyV1>,
-    #[serde(default)]
-    pub(crate) deterministic_model_output: Option<FixtureCompactModelOutputV1>,
     pub(crate) expected_model_parity: ExpectedModelParityV1,
 }
 
@@ -751,130 +655,9 @@ fn validate_fixture_contract(
             )));
         }
     }
-    let is_lca = matches!(
-        fixture.scenario,
-        CaptureAccuracyScenarioV1::Lca05cdProductNeedReview
-            | CaptureAccuracyScenarioV1::Lca0d1cVisualCueRequest
-            | CaptureAccuracyScenarioV1::Lca0056VisualCueVerification
-            | CaptureAccuracyScenarioV1::Lca0e34UnsentRegressionDraft
-    );
-    if is_lca != fixture.deterministic_model_output.is_some() {
-        return Err(AccuracyFixtureError::InvalidContract(
-            "exactly the four LCA fixtures must provide deterministic_model_output".to_string(),
-        ));
-    }
-    if let Some(output) = &fixture.deterministic_model_output {
-        validate_compact_model_output(output)?;
-    }
     let privacy = lint_accuracy_fixture(fixture);
     if !privacy.passed {
         return Err(AccuracyFixtureError::Privacy(privacy.violations));
-    }
-    Ok(())
-}
-
-fn validate_compact_model_output(
-    output: &FixtureCompactModelOutputV1,
-) -> Result<(), AccuracyFixtureError> {
-    if output.schema != LCA_COMPACT_MODEL_OUTPUT_SCHEMA_V1 {
-        return Err(AccuracyFixtureError::InvalidContract(format!(
-            "deterministic_model_output uses unsupported schema {:?}",
-            output.schema
-        )));
-    }
-    let expected_fields = LCA_SEMANTIC_FIELDS_V1.into_iter().collect::<BTreeSet<_>>();
-    for (name, actual) in [
-        (
-            "support_slots_by_field",
-            output
-                .support_slots_by_field
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-        ),
-        (
-            "missing_evidence_by_field",
-            output
-                .missing_evidence_by_field
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-        ),
-        (
-            "confidence_by_field",
-            output
-                .confidence_by_field
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-        ),
-        (
-            "verifier_result_by_field",
-            output
-                .verifier_result_by_field
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-        ),
-    ] {
-        if actual != expected_fields {
-            return Err(AccuracyFixtureError::InvalidContract(format!(
-                "deterministic_model_output.{name} must contain the exact LCA semantic field set"
-            )));
-        }
-    }
-    for (field, value, cap) in [
-        ("unfinished_task", output.unfinished_task.as_deref(), 220),
-        ("resume_point", output.resume_point.as_deref(), 260),
-        (
-            "next_supported_action",
-            output.next_supported_action.as_deref(),
-            180,
-        ),
-        (
-            "completed_context",
-            output.completed_context.as_deref(),
-            180,
-        ),
-        ("where_summary", output.where_summary.as_deref(), 220),
-    ] {
-        if value.is_some_and(|value| value.trim().is_empty() || value.chars().count() > cap) {
-            return Err(AccuracyFixtureError::InvalidContract(format!(
-                "deterministic_model_output.{field} is empty or exceeds its public cap"
-            )));
-        }
-        let supports = &output.support_slots_by_field[field];
-        if value.is_some() == supports.is_empty() {
-            return Err(AccuracyFixtureError::InvalidContract(format!(
-                "deterministic_model_output.{field} must cite support exactly when non-null"
-            )));
-        }
-    }
-    if (output.task_state != FixtureProbeTaskStateV1::Unclear)
-        == output.support_slots_by_field["task_state"].is_empty()
-    {
-        return Err(AccuracyFixtureError::InvalidContract(
-            "deterministic_model_output.task_state must cite support unless it is unclear"
-                .to_string(),
-        ));
-    }
-    if output
-        .confidence_by_field
-        .values()
-        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
-    {
-        return Err(AccuracyFixtureError::InvalidContract(
-            "deterministic_model_output confidences must be finite values in [0, 1]".to_string(),
-        ));
-    }
-    if output
-        .verifier_result_by_field
-        .values()
-        .any(|result| *result != FixtureProbeFieldVerifierResultV1::Pending)
-    {
-        return Err(AccuracyFixtureError::InvalidContract(
-            "fixture provider responses must leave every verifier result pending".to_string(),
-        ));
     }
     Ok(())
 }
@@ -1117,106 +900,6 @@ pub(crate) fn lint_accuracy_fixture(fixture: &ContinueAccuracyFixtureV1) -> Priv
                 MAX_LABEL_CHARS,
                 &mut violations,
             );
-        }
-    }
-    if let Some(output) = &fixture.deterministic_model_output {
-        lint_metadata_string(
-            "deterministic_model_output.schema",
-            &output.schema,
-            MAX_LABEL_CHARS,
-            &mut violations,
-        );
-        for (field, value, cap) in [
-            ("unfinished_task", output.unfinished_task.as_deref(), 220),
-            ("resume_point", output.resume_point.as_deref(), 260),
-            (
-                "next_supported_action",
-                output.next_supported_action.as_deref(),
-                180,
-            ),
-            (
-                "completed_context",
-                output.completed_context.as_deref(),
-                180,
-            ),
-            ("where_summary", output.where_summary.as_deref(), 220),
-        ] {
-            if let Some(value) = value {
-                lint_sensitive_string(
-                    &format!("deterministic_model_output.{field}"),
-                    value,
-                    cap,
-                    &mut violations,
-                );
-            }
-        }
-        for (field, supports) in &output.support_slots_by_field {
-            lint_metadata_string(
-                "deterministic_model_output.support_slots_by_field.key",
-                field,
-                MAX_LABEL_CHARS,
-                &mut violations,
-            );
-            for (index, support) in supports.iter().enumerate() {
-                lint_metadata_string(
-                    &format!("deterministic_model_output.support_slots_by_field.{field}[{index}]"),
-                    support,
-                    MAX_LABEL_CHARS,
-                    &mut violations,
-                );
-            }
-        }
-        for (field, notes) in &output.missing_evidence_by_field {
-            lint_metadata_string(
-                "deterministic_model_output.missing_evidence_by_field.key",
-                field,
-                MAX_LABEL_CHARS,
-                &mut violations,
-            );
-            for (index, note) in notes.iter().enumerate() {
-                lint_sensitive_string(
-                    &format!(
-                        "deterministic_model_output.missing_evidence_by_field.{field}[{index}]"
-                    ),
-                    note,
-                    MAX_NOTE_TEXT_CHARS,
-                    &mut violations,
-                );
-            }
-        }
-        for (index, note) in output.missing_evidence.iter().enumerate() {
-            lint_sensitive_string(
-                &format!("deterministic_model_output.missing_evidence[{index}]"),
-                note,
-                MAX_NOTE_TEXT_CHARS,
-                &mut violations,
-            );
-        }
-        for (visit_id, visit) in &output.visit_roles {
-            lint_metadata_string(
-                "deterministic_model_output.visit_roles.key",
-                visit_id,
-                MAX_LABEL_CHARS,
-                &mut violations,
-            );
-            lint_sensitive_string(
-                &format!(
-                    "deterministic_model_output.visit_roles.{visit_id}.relationship_to_primary_task"
-                ),
-                &visit.relationship_to_primary_task,
-                MAX_NOTE_TEXT_CHARS,
-                &mut violations,
-            );
-            for (index, support) in visit.support_slots.iter().enumerate() {
-                lint_metadata_string(
-                    &format!(
-                        "deterministic_model_output.visit_roles.{visit_id}.support_slots[{index}]"
-                    ),
-                    support,
-                    MAX_LABEL_CHARS,
-                    &mut violations,
-                );
-            }
         }
     }
     for (index, slot) in fixture
@@ -1760,7 +1443,6 @@ mod tests {
             }],
             forbidden_claims: vec![],
             allowed_uncertainty: vec![],
-            deterministic_model_output: None,
             expected_model_parity: ExpectedModelParityV1 {
                 required: true,
                 identity_slots: vec!["task_object".to_string()],

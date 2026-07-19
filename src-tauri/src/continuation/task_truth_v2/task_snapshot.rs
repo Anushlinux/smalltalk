@@ -413,11 +413,6 @@ mod tests {
             local_image_handle_hash: None,
             ephemeral_local_image_path: None,
             selection_reasons: vec!["current_frame".into()],
-            task_evidence_role: None,
-            task_turn_id: None,
-            same_task_relation: "unknown".into(),
-            cross_pane_ambiguity: false,
-            near_duplicate_group: None,
         };
         ObservationPacketV2 {
             schema: "smalltalk.observation_packet.v2".into(),
@@ -436,8 +431,6 @@ mod tests {
             current_frame: current_frame.clone(),
             semantic_keyframes: vec![current_frame],
             surface_timeline: Vec::new(),
-            task_relevance: Default::default(),
-            image_candidates: Vec::new(),
             canonical_elements: Vec::new(),
             focused_element_ids: Vec::new(),
             editable_element_ids: Vec::new(),

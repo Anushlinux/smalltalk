@@ -1,6 +1,4 @@
-use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -10,7 +8,6 @@ use super::super::{
 };
 
 pub(crate) const OBSERVATION_PACKET_SCHEMA_V2: &str = "smalltalk.observation_packet.v2";
-pub(crate) const TASK_RELEVANCE_EVIDENCE_SCHEMA_V1: &str = "smalltalk.task_relevance_evidence.v1";
 const MAX_KEYFRAMES: usize = 4;
 const MAX_SURFACE_VISITS: usize = 8;
 const MAX_ELEMENTS: usize = 160;
@@ -56,542 +53,6 @@ pub(crate) enum AuthorshipStatusV2 {
     ApplicationOrAgent,
     Mixed,
     Unknown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TaskEvidenceRoleV1 {
-    LatestUserGoal,
-    CurrentUnsentDraft,
-    CurrentAgentState,
-    PriorTaskBoundary,
-    CurrentTaskContext,
-    SupportingContext,
-    FlattenedFallback,
-    Unknown,
-}
-
-impl TaskEvidenceRoleV1 {
-    pub(crate) fn authority_rank(self) -> i64 {
-        match self {
-            Self::LatestUserGoal => 700,
-            Self::CurrentUnsentDraft => 710,
-            Self::CurrentAgentState => 600,
-            Self::PriorTaskBoundary => 500,
-            Self::CurrentTaskContext => 400,
-            Self::SupportingContext => 200,
-            Self::FlattenedFallback => 50,
-            Self::Unknown => 0,
-        }
-    }
-
-    fn selection_reason(self) -> &'static str {
-        match self {
-            Self::LatestUserGoal => "p6_latest_user_goal",
-            Self::CurrentUnsentDraft => "p6_current_unsent_draft",
-            Self::CurrentAgentState => "p6_current_agent_state",
-            Self::PriorTaskBoundary => "p6_prior_task_boundary",
-            Self::CurrentTaskContext => "p6_current_task_context",
-            Self::SupportingContext => "p6_supporting_context",
-            Self::FlattenedFallback => "flattened_window_fallback",
-            Self::Unknown => "task_relation_unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct PacketTaskTurnV1 {
-    pub(crate) task_turn_id: String,
-    pub(crate) revision: i64,
-    pub(crate) execution_state: String,
-    pub(crate) current_actor: String,
-    pub(crate) waiting_on: String,
-    pub(crate) relation_to_prior: String,
-    pub(crate) goal_confidence: f64,
-    pub(crate) actor_state_confidence: f64,
-    pub(crate) relation_confidence: f64,
-    pub(crate) attribution_confidence: f64,
-    pub(crate) missing_evidence: Vec<String>,
-    pub(crate) quality_flags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct TaskRelevantSpanV1 {
-    pub(crate) span_id: String,
-    pub(crate) frame_id: String,
-    pub(crate) surface_key_hash: Option<String>,
-    pub(crate) pane_id: String,
-    pub(crate) region_role: String,
-    pub(crate) conversational_role: String,
-    pub(crate) evidence_role: TaskEvidenceRoleV1,
-    pub(crate) reading_order: i64,
-    pub(crate) source_scope: String,
-    pub(crate) ownership_kind: String,
-    pub(crate) owner_window_id: Option<i64>,
-    pub(crate) owner_app_id: Option<String>,
-    pub(crate) ownership_confidence: f64,
-    pub(crate) region_confidence: f64,
-    pub(crate) speaker_confidence: f64,
-    pub(crate) order_confidence: f64,
-    pub(crate) privacy_status: String,
-    pub(crate) text_hash: String,
-    pub(crate) focused: bool,
-    pub(crate) selected: bool,
-    pub(crate) submitted: Option<bool>,
-    pub(crate) geometry: Option<PacketBoundsV2>,
-    pub(crate) quality_flags: Vec<String>,
-    pub(crate) reason_codes: Vec<String>,
-    pub(crate) missing_evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct TaskRelevanceEvidenceV1 {
-    pub(crate) schema: String,
-    pub(crate) source: String,
-    pub(crate) current_task_turn: Option<PacketTaskTurnV1>,
-    pub(crate) latest_user_goal_sample: Option<String>,
-    pub(crate) current_agent_state_sample: Option<String>,
-    pub(crate) prior_task_boundary_sample: Option<String>,
-    pub(crate) current_unsent_draft_present: bool,
-    pub(crate) spans: Vec<TaskRelevantSpanV1>,
-    pub(crate) missing_evidence: Vec<String>,
-    pub(crate) fallback_flags: Vec<String>,
-    pub(crate) confidence_cap: f64,
-}
-
-impl Default for TaskRelevanceEvidenceV1 {
-    fn default() -> Self {
-        Self {
-            schema: TASK_RELEVANCE_EVIDENCE_SCHEMA_V1.into(),
-            source: "flattened_window_fallback".into(),
-            current_task_turn: None,
-            latest_user_goal_sample: None,
-            current_agent_state_sample: None,
-            prior_task_boundary_sample: None,
-            current_unsent_draft_present: false,
-            spans: Vec::new(),
-            missing_evidence: vec!["p6_role_region_task_turn_evidence_unavailable".into()],
-            fallback_flags: vec!["flattened_text_fallback_low_authority".into()],
-            confidence_cap: 0.35,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct P6SelectionRow {
-    frame_id: String,
-    observed_at_ms: i64,
-    salient_span_ids: Vec<String>,
-    user_span_ids: Vec<String>,
-    agent_span_ids: Vec<String>,
-    prior_span_ids: Vec<String>,
-    user_sample: Option<String>,
-    agent_sample: Option<String>,
-    prior_sample: Option<String>,
-    sampling_confidence: f64,
-    missing_roles: Vec<String>,
-    rejected_span_ids: Vec<String>,
-    fallback_flags: Vec<String>,
-    committed_input_attribution: bool,
-}
-
-fn parse_string_array(value: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
-}
-
-fn parse_rejected_span_ids(value: &str) -> Vec<String> {
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| {
-            entry
-                .get("span_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-fn bounded_safe_sample(value: Option<String>, max_chars: usize) -> Option<String> {
-    value.and_then(|value| {
-        let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!normalized.is_empty()).then(|| normalized.chars().take(max_chars).collect())
-    })
-}
-
-fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
-        [table],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|row| row.is_some())
-    .map_err(|error| error.to_string())
-}
-
-fn load_p6_selection_row(
-    conn: &Connection,
-    frame_id: &str,
-) -> Result<Option<P6SelectionRow>, String> {
-    conn.query_row(
-        "SELECT frame_id, observed_at_ms, salient_span_ids_json, latest_user_span_ids_json,
-                current_agent_span_ids_json, prior_boundary_span_ids_json,
-                salient_user_goal_sample, salient_agent_state_sample,
-                prior_boundary_sample, sampling_confidence, missing_roles_json,
-                rejected_spans_json, fallback_flags_json, causal_typing_attribution_json
-         FROM continue_salient_turn_evidence WHERE frame_id=?1",
-        [frame_id],
-        |row| {
-            let salient_json = row.get::<_, String>(2)?;
-            let user_json = row.get::<_, String>(3)?;
-            let agent_json = row.get::<_, String>(4)?;
-            let prior_json = row.get::<_, String>(5)?;
-            let missing_json = row.get::<_, String>(10)?;
-            let rejected_json = row.get::<_, String>(11)?;
-            let fallback_json = row.get::<_, String>(12)?;
-            Ok(P6SelectionRow {
-                frame_id: row.get(0)?,
-                observed_at_ms: row.get(1)?,
-                salient_span_ids: parse_string_array(&salient_json),
-                user_span_ids: parse_string_array(&user_json),
-                agent_span_ids: parse_string_array(&agent_json),
-                prior_span_ids: parse_string_array(&prior_json),
-                user_sample: row.get(6)?,
-                agent_sample: row.get(7)?,
-                prior_sample: row.get(8)?,
-                sampling_confidence: row.get(9)?,
-                missing_roles: parse_string_array(&missing_json),
-                rejected_span_ids: parse_rejected_span_ids(&rejected_json),
-                fallback_flags: parse_string_array(&fallback_json),
-                committed_input_attribution: row.get::<_, Option<String>>(13)?.is_some(),
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| error.to_string())
-}
-
-fn load_task_relevant_span(
-    conn: &Connection,
-    span_id: &str,
-    evidence_role: TaskEvidenceRoleV1,
-) -> Result<Option<TaskRelevantSpanV1>, String> {
-    conn.query_row(
-        "SELECT span_id, frame_id, surface_key, pane_id, region_role,
-                conversational_role, reading_order, source_scope, ownership_kind,
-                owner_window_id, owner_app_id, ownership_confidence, region_confidence,
-                speaker_confidence, order_confidence, privacy_status, text_hash, focused,
-                selected, geometry_json, quality_flags_json, reason_codes_json
-         FROM continue_ordered_evidence_spans WHERE span_id=?1",
-        [span_id],
-        |row| {
-            let geometry_json = row.get::<_, Option<String>>(19)?;
-            let geometry = geometry_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<PacketBoundsV2>(value).ok());
-            let mut missing_evidence = Vec::new();
-            if geometry.is_none() {
-                missing_evidence.push("geometry_unavailable_or_unreliable".into());
-            }
-            let owner_window_id = row.get::<_, Option<i64>>(9)?;
-            let owner_app_id = row.get::<_, Option<String>>(10)?;
-            if owner_window_id.is_none() && owner_app_id.is_none() {
-                missing_evidence.push("surface_owner_identifier_missing".into());
-            }
-            Ok(TaskRelevantSpanV1 {
-                span_id: row.get(0)?,
-                frame_id: row.get(1)?,
-                surface_key_hash: row
-                    .get::<_, Option<String>>(2)?
-                    .map(|value| stable_hash(format!("task_surface|{value}").as_bytes())),
-                pane_id: row.get(3)?,
-                region_role: row.get(4)?,
-                conversational_role: row.get(5)?,
-                evidence_role,
-                reading_order: row.get(6)?,
-                source_scope: row.get(7)?,
-                ownership_kind: row.get(8)?,
-                owner_window_id,
-                owner_app_id,
-                ownership_confidence: row.get(11)?,
-                region_confidence: row.get(12)?,
-                speaker_confidence: row.get(13)?,
-                order_confidence: row.get(14)?,
-                privacy_status: row.get(15)?,
-                text_hash: row.get(16)?,
-                focused: row.get::<_, i64>(17)? != 0,
-                selected: row.get::<_, i64>(18)? != 0,
-                submitted: (evidence_role == TaskEvidenceRoleV1::CurrentUnsentDraft)
-                    .then_some(false),
-                geometry,
-                quality_flags: parse_string_array(&row.get::<_, String>(20)?),
-                reason_codes: parse_string_array(&row.get::<_, String>(21)?),
-                missing_evidence,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| error.to_string())
-}
-
-fn span_is_focused_composer(conn: &Connection, span_id: &str) -> Result<bool, String> {
-    conn.query_row(
-        "SELECT region_role, focused FROM continue_ordered_evidence_spans WHERE span_id=?1",
-        [span_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-    )
-    .optional()
-    .map(|row| {
-        row.is_some_and(|(role, focused)| {
-            focused != 0 && matches!(role.as_str(), "composer" | "terminal_input")
-        })
-    })
-    .map_err(|error| error.to_string())
-}
-
-pub(super) fn load_task_relevance_evidence(
-    conn: &Connection,
-    frames: &[EvidenceFrame],
-) -> Result<TaskRelevanceEvidenceV1, String> {
-    let Some(current) = frames.last() else {
-        return Ok(TaskRelevanceEvidenceV1::default());
-    };
-    if !sqlite_table_exists(conn, "continue_salient_turn_evidence")?
-        || !sqlite_table_exists(conn, "continue_ordered_evidence_spans")?
-    {
-        return Ok(TaskRelevanceEvidenceV1::default());
-    }
-
-    let frame_ids = frames
-        .iter()
-        .map(|frame| frame.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut selections = frames
-        .iter()
-        .filter_map(|frame| load_p6_selection_row(conn, &frame.id).transpose())
-        .collect::<Result<Vec<_>, _>>()?;
-    selections.sort_by_key(|row| (row.observed_at_ms, row.frame_id.clone()));
-    let latest_selection = selections.last().cloned();
-
-    let current_turn = if sqlite_table_exists(conn, "continue_task_turns")? {
-        super::super::task_turn::selected_current_task_turn(conn)?
-            .filter(|turn| turn.session_id == current.session_id)
-            .filter(|turn| turn.last_observed_at_ms <= current.captured_at)
-            .filter(|turn| {
-                turn.latest_user_span_ids
-                    .iter()
-                    .chain(turn.current_state_span_ids.iter())
-                    .chain(turn.prior_boundary_span_ids.iter())
-                    .any(|span_id| {
-                        selections.iter().any(|selection| {
-                            selection.user_span_ids.contains(span_id)
-                                || selection.agent_span_ids.contains(span_id)
-                                || selection.prior_span_ids.contains(span_id)
-                        })
-                    })
-            })
-    } else {
-        None
-    };
-
-    let mut user_ids = current_turn
-        .as_ref()
-        .map(|turn| turn.latest_user_span_ids.clone())
-        .unwrap_or_default();
-    let mut agent_ids = current_turn
-        .as_ref()
-        .map(|turn| turn.current_state_span_ids.clone())
-        .unwrap_or_default();
-    let mut prior_ids = current_turn
-        .as_ref()
-        .map(|turn| turn.prior_boundary_span_ids.clone())
-        .unwrap_or_default();
-    if let Some(selection) = latest_selection.as_ref() {
-        if user_ids.is_empty() {
-            user_ids = selection.user_span_ids.clone();
-        }
-        if agent_ids.is_empty() {
-            agent_ids = selection.agent_span_ids.clone();
-        }
-        if prior_ids.is_empty() {
-            prior_ids = selection.prior_span_ids.clone();
-        }
-    }
-    user_ids.retain(|id| {
-        selections
-            .iter()
-            .any(|selection| selection.user_span_ids.contains(id))
-    });
-    agent_ids.retain(|id| {
-        selections
-            .iter()
-            .any(|selection| selection.agent_span_ids.contains(id))
-    });
-    prior_ids.retain(|id| {
-        selections
-            .iter()
-            .any(|selection| selection.prior_span_ids.contains(id))
-    });
-
-    let role_by_span = user_ids
-        .iter()
-        .map(|id| (id.clone(), TaskEvidenceRoleV1::LatestUserGoal))
-        .chain(
-            agent_ids
-                .iter()
-                .map(|id| (id.clone(), TaskEvidenceRoleV1::CurrentAgentState)),
-        )
-        .chain(
-            prior_ids
-                .iter()
-                .map(|id| (id.clone(), TaskEvidenceRoleV1::PriorTaskBoundary)),
-        )
-        .collect::<BTreeMap<_, _>>();
-    let mut span_roles = role_by_span;
-    for selection in &selections {
-        if selection.committed_input_attribution {
-            continue;
-        }
-        for span_id in &selection.salient_span_ids {
-            if !span_roles.contains_key(span_id) && span_is_focused_composer(conn, span_id)? {
-                span_roles.insert(span_id.clone(), TaskEvidenceRoleV1::CurrentUnsentDraft);
-            }
-        }
-    }
-    for selection in &selections {
-        for span_id in selection.rejected_span_ids.iter().take(24) {
-            span_roles
-                .entry(span_id.clone())
-                .or_insert(TaskEvidenceRoleV1::SupportingContext);
-        }
-    }
-    let mut spans = span_roles
-        .into_iter()
-        .filter_map(|(span_id, role)| load_task_relevant_span(conn, &span_id, role).transpose())
-        .collect::<Result<Vec<_>, _>>()?;
-    spans.retain(|span| frame_ids.contains(span.frame_id.as_str()));
-    spans.sort_by_key(|span| {
-        (
-            span.frame_id.clone(),
-            span.reading_order,
-            span.span_id.clone(),
-        )
-    });
-    spans.truncate(64);
-
-    if spans.is_empty() {
-        return Ok(TaskRelevanceEvidenceV1::default());
-    }
-
-    let mut missing_evidence = latest_selection
-        .as_ref()
-        .map(|row| row.missing_roles.clone())
-        .unwrap_or_default();
-    if user_ids.is_empty() {
-        missing_evidence.push("latest_user_goal_span_missing".into());
-    }
-    if agent_ids.is_empty() {
-        missing_evidence.push("current_agent_state_span_missing".into());
-    }
-    missing_evidence.sort();
-    missing_evidence.dedup();
-
-    let mut fallback_flags = latest_selection
-        .as_ref()
-        .map(|row| row.fallback_flags.clone())
-        .unwrap_or_default();
-    fallback_flags.sort();
-    fallback_flags.dedup();
-    let sampling_confidence = latest_selection
-        .as_ref()
-        .map(|row| row.sampling_confidence)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let packet_turn = current_turn.as_ref().map(|turn| PacketTaskTurnV1 {
-        task_turn_id: turn.task_turn_id.clone(),
-        revision: turn.revision,
-        execution_state: turn.execution_state.label().into(),
-        current_actor: turn.current_actor.label().into(),
-        waiting_on: turn.waiting_on.label().into(),
-        relation_to_prior: turn.relation_to_prior.label().into(),
-        goal_confidence: turn.goal_confidence,
-        actor_state_confidence: turn.actor_state_confidence,
-        relation_confidence: turn.relation_confidence,
-        attribution_confidence: turn.attribution_confidence,
-        missing_evidence: turn.missing_evidence.clone(),
-        quality_flags: turn.quality_flags.clone(),
-    });
-    let confidence_cap = packet_turn
-        .as_ref()
-        .map(|turn| {
-            sampling_confidence
-                .min(turn.attribution_confidence)
-                .min(turn.goal_confidence.max(turn.actor_state_confidence))
-        })
-        .unwrap_or(sampling_confidence.min(0.7));
-    let latest_user_goal_sample = current_turn
-        .as_ref()
-        .and_then(|turn| turn.latest_user_goal_summary.clone())
-        .or_else(|| {
-            latest_selection
-                .as_ref()
-                .and_then(|row| row.user_sample.clone())
-        });
-    let current_agent_state_sample = current_turn
-        .as_ref()
-        .and_then(|turn| turn.actor_activity_state.clone())
-        .or_else(|| {
-            latest_selection
-                .as_ref()
-                .and_then(|row| row.agent_sample.clone())
-        });
-
-    Ok(TaskRelevanceEvidenceV1 {
-        schema: TASK_RELEVANCE_EVIDENCE_SCHEMA_V1.into(),
-        source: "p6_role_region_task_turn".into(),
-        current_task_turn: packet_turn,
-        latest_user_goal_sample: bounded_safe_sample(latest_user_goal_sample, 280),
-        current_agent_state_sample: bounded_safe_sample(current_agent_state_sample, 220),
-        prior_task_boundary_sample: bounded_safe_sample(
-            latest_selection.and_then(|row| row.prior_sample),
-            220,
-        ),
-        current_unsent_draft_present: spans
-            .iter()
-            .any(|span| span.evidence_role == TaskEvidenceRoleV1::CurrentUnsentDraft),
-        spans,
-        missing_evidence,
-        fallback_flags,
-        confidence_cap,
-    })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct ImageCandidateAuditV1 {
-    pub(crate) frame_id: String,
-    pub(crate) task_turn_id: Option<String>,
-    pub(crate) evidence_role: TaskEvidenceRoleV1,
-    pub(crate) selected: bool,
-    pub(crate) selection_reasons: Vec<String>,
-    pub(crate) rejection_reasons: Vec<String>,
-    pub(crate) supports_latest_user_goal: bool,
-    pub(crate) supports_current_agent_state: bool,
-    pub(crate) supports_prior_task_boundary: bool,
-    pub(crate) same_task_relation: String,
-    pub(crate) cross_pane_ambiguity: bool,
-    pub(crate) near_duplicate_group: Option<String>,
-    pub(crate) engagement_used_as_same_task_tiebreaker: bool,
-    pub(crate) original_width: Option<i64>,
-    pub(crate) original_height: Option<i64>,
-    pub(crate) prepared_width: Option<i64>,
-    pub(crate) prepared_height: Option<i64>,
-    pub(crate) image_scope: String,
-    pub(crate) crop_policy: String,
-    pub(crate) redaction_status: String,
-    pub(crate) preparation_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -678,16 +139,6 @@ pub(crate) struct KeyframeReferenceV2 {
     #[serde(skip)]
     pub(crate) ephemeral_local_image_path: Option<String>,
     pub(crate) selection_reasons: Vec<String>,
-    #[serde(default)]
-    pub(crate) task_evidence_role: Option<TaskEvidenceRoleV1>,
-    #[serde(default)]
-    pub(crate) task_turn_id: Option<String>,
-    #[serde(default)]
-    pub(crate) same_task_relation: String,
-    #[serde(default)]
-    pub(crate) cross_pane_ambiguity: bool,
-    #[serde(default)]
-    pub(crate) near_duplicate_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -707,18 +158,6 @@ pub(crate) struct SurfaceVisitV2 {
     pub(crate) committed_input: bool,
     #[serde(default)]
     pub(crate) carried_into_current_surface: bool,
-    #[serde(default)]
-    pub(crate) hostname_mentioned_in_current_surface: bool,
-    #[serde(default)]
-    pub(crate) task_evidence_role: Option<TaskEvidenceRoleV1>,
-    #[serde(default)]
-    pub(crate) task_relevance_score: i64,
-    #[serde(default)]
-    pub(crate) same_task_relation: String,
-    #[serde(default)]
-    pub(crate) cross_pane_ambiguity: bool,
-    #[serde(default)]
-    pub(crate) engagement_used_as_same_task_tiebreaker: bool,
     pub(crate) evidence_refs: Vec<String>,
     pub(crate) representative_frame: Option<KeyframeReferenceV2>,
 }
@@ -820,10 +259,6 @@ pub(crate) struct ObservationPacketV2 {
     pub(crate) semantic_keyframes: Vec<KeyframeReferenceV2>,
     #[serde(default)]
     pub(crate) surface_timeline: Vec<SurfaceVisitV2>,
-    #[serde(default)]
-    pub(crate) task_relevance: TaskRelevanceEvidenceV1,
-    #[serde(default)]
-    pub(crate) image_candidates: Vec<ImageCandidateAuditV1>,
     pub(crate) canonical_elements: Vec<CanonicalElementV2>,
     pub(crate) focused_element_ids: Vec<String>,
     pub(crate) editable_element_ids: Vec<String>,
@@ -1251,144 +686,12 @@ fn keyframe_reference(
             .and_then(|path| hash_optional(Some(path))),
         ephemeral_local_image_path: image_path,
         selection_reasons: reasons,
-        task_evidence_role: None,
-        task_turn_id: None,
-        same_task_relation: "unknown".into(),
-        cross_pane_ambiguity: false,
-        near_duplicate_group: near_duplicate_group(frame),
     }
-}
-
-fn near_duplicate_group(frame: &EvidenceFrame) -> Option<String> {
-    if let Some(content_hash) = frame
-        .content_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(format!(
-            "stable_content:{}",
-            stable_hash(format!("{}|{content_hash}", surface_visit_key(frame)).as_bytes())
-        ));
-    }
-    let image_hash = frame
-        .image_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(format!("image:{}", stable_hash(image_hash.as_bytes())))
-}
-
-fn task_role_for_frame(
-    task_relevance: &TaskRelevanceEvidenceV1,
-    frame_id: &str,
-) -> Option<TaskEvidenceRoleV1> {
-    task_relevance
-        .spans
-        .iter()
-        .filter(|span| span.frame_id == frame_id)
-        .map(|span| span.evidence_role)
-        .max_by_key(|role| role.authority_rank())
-}
-
-fn task_pane_ambiguity(task_relevance: &TaskRelevanceEvidenceV1, frame_id: &str) -> bool {
-    let task_panes = task_relevance
-        .spans
-        .iter()
-        .filter(|span| span.frame_id == frame_id)
-        .filter(|span| {
-            matches!(
-                span.evidence_role,
-                TaskEvidenceRoleV1::LatestUserGoal
-                    | TaskEvidenceRoleV1::CurrentUnsentDraft
-                    | TaskEvidenceRoleV1::CurrentAgentState
-                    | TaskEvidenceRoleV1::PriorTaskBoundary
-            )
-        })
-        .map(|span| span.pane_id.as_str())
-        .collect::<BTreeSet<_>>();
-    task_panes.contains("pane-unknown") || task_panes.len() > 1
-}
-
-fn same_task_relation(
-    task_relevance: &TaskRelevanceEvidenceV1,
-    role: Option<TaskEvidenceRoleV1>,
-) -> String {
-    if task_relevance.current_task_turn.is_none() {
-        return if role == Some(TaskEvidenceRoleV1::FlattenedFallback) {
-            "flattened_fallback_unverified".into()
-        } else {
-            "unknown".into()
-        };
-    }
-    match role.unwrap_or(TaskEvidenceRoleV1::Unknown) {
-        TaskEvidenceRoleV1::LatestUserGoal
-        | TaskEvidenceRoleV1::CurrentUnsentDraft
-        | TaskEvidenceRoleV1::CurrentAgentState
-        | TaskEvidenceRoleV1::CurrentTaskContext => "current_task_turn".into(),
-        TaskEvidenceRoleV1::PriorTaskBoundary => "immediately_prior_task_boundary".into(),
-        TaskEvidenceRoleV1::SupportingContext => "supporting_or_adjacent".into(),
-        TaskEvidenceRoleV1::FlattenedFallback => "flattened_fallback_unverified".into(),
-        TaskEvidenceRoleV1::Unknown => "unknown".into(),
-    }
-}
-
-fn annotate_keyframe(
-    frame: &EvidenceFrame,
-    mut reference: KeyframeReferenceV2,
-    task_relevance: &TaskRelevanceEvidenceV1,
-) -> KeyframeReferenceV2 {
-    let role = task_role_for_frame(task_relevance, &frame.id).or_else(|| {
-        (task_relevance.source == "flattened_window_fallback")
-            .then_some(TaskEvidenceRoleV1::FlattenedFallback)
-    });
-    if let Some(role) = role {
-        reference
-            .selection_reasons
-            .push(role.selection_reason().into());
-        reference.selection_reasons.sort();
-        reference.selection_reasons.dedup();
-    }
-    reference.task_evidence_role = role;
-    reference.task_turn_id = task_relevance
-        .current_task_turn
-        .as_ref()
-        .map(|turn| turn.task_turn_id.clone());
-    reference.same_task_relation = same_task_relation(task_relevance, role);
-    reference.cross_pane_ambiguity = task_pane_ambiguity(task_relevance, &frame.id);
-    reference
-}
-
-fn downgrade_fallback_keyframe(mut reference: KeyframeReferenceV2) -> KeyframeReferenceV2 {
-    reference.task_evidence_role = Some(TaskEvidenceRoleV1::FlattenedFallback);
-    reference.same_task_relation = "flattened_fallback_unverified".into();
-    reference
-        .selection_reasons
-        .push("flattened_window_fallback_non_authoritative".into());
-    reference.selection_reasons.sort();
-    reference.selection_reasons.dedup();
-    reference
-}
-
-fn selected_has_semantic_duplicate(
-    selected: &[KeyframeReferenceV2],
-    candidate: &KeyframeReferenceV2,
-) -> bool {
-    candidate
-        .near_duplicate_group
-        .as_ref()
-        .is_some_and(|group| {
-            selected.iter().any(|existing| {
-                existing.near_duplicate_group.as_ref() == Some(group)
-                    && existing.task_evidence_role == candidate.task_evidence_role
-            })
-        })
 }
 
 fn select_keyframes(
     frames: &[EvidenceFrame],
     partitions: &BTreeMap<String, EvidencePartitionV2>,
-    task_relevance: &TaskRelevanceEvidenceV1,
 ) -> Vec<KeyframeReferenceV2> {
     let mut scored = frames
         .iter()
@@ -1411,72 +714,21 @@ fn select_keyframes(
     let current_id = frames.last().map(|frame| frame.id.as_str());
     let mut selected = Vec::new();
     if let Some(current) = frames.last() {
-        selected.push(annotate_keyframe(
+        selected.push(keyframe_reference(
             current,
-            keyframe_reference(
-                current,
-                EvidencePartitionV2::Current,
-                vec!["current_frame_factual_state".into()],
-            ),
-            task_relevance,
+            EvidencePartitionV2::Current,
+            vec!["current_frame".into()],
         ));
     }
-    for role in [
-        TaskEvidenceRoleV1::LatestUserGoal,
-        TaskEvidenceRoleV1::CurrentUnsentDraft,
-        TaskEvidenceRoleV1::CurrentAgentState,
-        TaskEvidenceRoleV1::PriorTaskBoundary,
-        TaskEvidenceRoleV1::CurrentTaskContext,
-    ] {
-        if selected.len() >= MAX_KEYFRAMES {
-            break;
-        }
-        let Some(frame) = frames.iter().rev().find(|frame| {
-            task_role_for_frame(task_relevance, &frame.id) == Some(role)
-                && !selected.iter().any(|item| item.frame_id == frame.id)
-        }) else {
-            continue;
-        };
-        let reference = annotate_keyframe(
-            frame,
-            keyframe_reference(
-                frame,
-                partitions
-                    .get(&frame.id)
-                    .copied()
-                    .unwrap_or(EvidencePartitionV2::Prior),
-                vec![role.selection_reason().into()],
-            ),
-            task_relevance,
-        );
-        if !selected_has_semantic_duplicate(&selected, &reference) {
-            selected.push(reference);
-        }
-    }
-    let structured_task_evidence = task_relevance.source == "p6_role_region_task_turn";
-    if selected.len() < MAX_KEYFRAMES {
-        if let Some(support) = frames.iter().rev().find(|frame| {
-            partitions.get(&frame.id) == Some(&EvidencePartitionV2::Support)
-                && !selected.iter().any(|item| item.frame_id == frame.id)
-                && (!structured_task_evidence
-                    || task_role_for_frame(task_relevance, &frame.id).is_some())
-        }) {
-            let mut reference = annotate_keyframe(
-                support,
-                keyframe_reference(
-                    support,
-                    EvidencePartitionV2::Support,
-                    vec!["reserved_recent_structured_support_surface".into()],
-                ),
-                task_relevance,
-            );
-            if !structured_task_evidence && reference.task_evidence_role.is_none() {
-                reference = downgrade_fallback_keyframe(reference);
-            }
-            if !selected_has_semantic_duplicate(&selected, &reference) {
-                selected.push(reference);
-            }
-        }
+    if let Some(support) = frames.iter().rev().find(|frame| {
+        partitions.get(&frame.id) == Some(&EvidencePartitionV2::Support)
+            && !selected.iter().any(|item| item.frame_id == frame.id)
+    }) {
+        selected.push(keyframe_reference(
+            support,
+            EvidencePartitionV2::Support,
+            vec!["reserved_recent_structured_support_surface".into()],
+        ));
     }
     // Browser activity often contains a short detour with several pages on
     // the same app/window. Reserve the most recent different origin and the
@@ -1488,53 +740,18 @@ fn select_keyframes(
             (frames.last(), frames.last().and_then(browser_origin_key))
         {
             if let Some(context) = frames.iter().rev().find(|frame| {
-                let explicit_detour_return = frames.iter().any(|earlier| {
-                    earlier.captured_at < frame.captured_at
-                        && browser_origin_key(earlier).as_deref() == Some(current_origin.as_str())
-                }) && frames.iter().any(|later| {
-                    later.captured_at > frame.captured_at
-                        && browser_origin_key(later).as_deref() == Some(current_origin.as_str())
-                });
                 frame.id != current.id
                     && !is_private_status(frame.privacy_status.as_deref())
                     && !is_diagnostic_surface(frame)
                     && frame_has_visual(frame)
                     && browser_origin_key(frame).is_some_and(|origin| origin != current_origin)
-                    && (task_role_for_frame(task_relevance, &frame.id).is_some()
-                        || explicit_detour_return
-                        || !structured_task_evidence)
             }) {
                 if !selected.iter().any(|item| item.frame_id == context.id) {
-                    let explicit_detour_return = frames.iter().any(|earlier| {
-                        earlier.captured_at < context.captured_at
-                            && browser_origin_key(earlier).as_deref()
-                                == Some(current_origin.as_str())
-                    }) && frames.iter().any(|later| {
-                        later.captured_at > context.captured_at
-                            && browser_origin_key(later).as_deref() == Some(current_origin.as_str())
-                    });
-                    let mut reference = annotate_keyframe(
+                    selected.push(keyframe_reference(
                         context,
-                        keyframe_reference(
-                            context,
-                            EvidencePartitionV2::Support,
-                            vec![if explicit_detour_return {
-                                "explicit_browser_detour_return_context".into()
-                            } else {
-                                "reserved_recent_distinct_browser_origin".into()
-                            }],
-                        ),
-                        task_relevance,
-                    );
-                    if explicit_detour_return && reference.task_evidence_role.is_none() {
-                        reference.task_evidence_role = Some(TaskEvidenceRoleV1::SupportingContext);
-                        reference.same_task_relation = "explicit_detour_return_context".into();
-                    } else if !structured_task_evidence && reference.task_evidence_role.is_none() {
-                        reference = downgrade_fallback_keyframe(reference);
-                    }
-                    if !selected_has_semantic_duplicate(&selected, &reference) {
-                        selected.push(reference);
-                    }
+                        EvidencePartitionV2::Support,
+                        vec!["reserved_recent_distinct_browser_origin".into()],
+                    ));
                 }
                 if selected.len() < MAX_KEYFRAMES {
                     if let Some(entry) = frames.iter().find(|frame| {
@@ -1543,24 +760,14 @@ fn select_keyframes(
                             && browser_origin_key(frame).as_deref() == Some(current_origin.as_str())
                     }) {
                         if !selected.iter().any(|item| item.frame_id == entry.id) {
-                            let mut reference = annotate_keyframe(
+                            selected.push(keyframe_reference(
                                 entry,
-                                keyframe_reference(
-                                    entry,
-                                    partitions
-                                        .get(&entry.id)
-                                        .copied()
-                                        .unwrap_or(EvidencePartitionV2::Prior),
-                                    vec!["entry_to_current_browser_origin".into()],
-                                ),
-                                task_relevance,
-                            );
-                            if !structured_task_evidence && reference.task_evidence_role.is_none() {
-                                reference = downgrade_fallback_keyframe(reference);
-                            }
-                            if !selected_has_semantic_duplicate(&selected, &reference) {
-                                selected.push(reference);
-                            }
+                                partitions
+                                    .get(&entry.id)
+                                    .copied()
+                                    .unwrap_or(EvidencePartitionV2::Prior),
+                                vec!["entry_to_current_browser_origin".into()],
+                            ));
                         }
                     }
                 }
@@ -1574,48 +781,34 @@ fn select_keyframes(
         if selected.iter().any(|item| item.frame_id == frame.id) {
             continue;
         }
-        if structured_task_evidence && task_role_for_frame(task_relevance, &frame.id).is_none() {
-            continue;
-        }
         if reasons.is_empty() && Some(frame.id.as_str()) != current_id {
             continue;
         }
         if Some(frame.id.as_str()) == current_id {
             reasons.push("current_frame".into());
         }
-        let reference = annotate_keyframe(
+        selected.push(keyframe_reference(
             frame,
-            keyframe_reference(
-                frame,
-                partitions
-                    .get(&frame.id)
-                    .copied()
-                    .unwrap_or(EvidencePartitionV2::Background),
-                reasons,
-            ),
-            task_relevance,
-        );
-        if !selected_has_semantic_duplicate(&selected, &reference) {
-            selected.push(reference);
-        }
+            partitions
+                .get(&frame.id)
+                .copied()
+                .unwrap_or(EvidencePartitionV2::Background),
+            reasons,
+        ));
     }
     if selected.len() < 2 && frames.len() > 1 {
-        if let Some(baseline) = frames.iter().rev().find(|frame| {
-            !selected.iter().any(|item| item.frame_id == frame.id)
-                && (!structured_task_evidence
-                    || task_role_for_frame(task_relevance, &frame.id).is_some())
-        }) {
-            selected.push(annotate_keyframe(
+        if let Some(baseline) = frames
+            .iter()
+            .rev()
+            .find(|frame| !selected.iter().any(|item| item.frame_id == frame.id))
+        {
+            selected.push(keyframe_reference(
                 baseline,
-                keyframe_reference(
-                    baseline,
-                    partitions
-                        .get(&baseline.id)
-                        .copied()
-                        .unwrap_or(EvidencePartitionV2::Prior),
-                    vec!["causal_baseline_for_current_observation".into()],
-                ),
-                task_relevance,
+                partitions
+                    .get(&baseline.id)
+                    .copied()
+                    .unwrap_or(EvidencePartitionV2::Prior),
+                vec!["causal_baseline_for_current_observation".into()],
             ));
         }
     }
@@ -1685,7 +878,6 @@ fn build_surface_timeline(
     frames: &[EvidenceFrame],
     current_frame_id: &str,
     cutoff_ms: i64,
-    task_relevance: &TaskRelevanceEvidenceV1,
 ) -> Vec<SurfaceVisitV2> {
     let current_frame = frames.iter().find(|frame| frame.id == current_frame_id);
     let current_is_chat = current_frame.is_some_and(|frame| {
@@ -1795,12 +987,13 @@ fn build_surface_timeline(
             let engagement_score = (interaction_count as i64 * 1_000)
                 + (dwell_ms.clamp(0, 30 * 60 * 1_000) / 1_000 * 10)
                 + (frames.len() as i64 * 50);
-            let representative_candidates = frames
-                .iter()
-                .map(|frame| {
-                    let reference = annotate_keyframe(
-                        frame,
-                        keyframe_reference(
+            let representative_frame = if private {
+                None
+            } else {
+                frames
+                    .iter()
+                    .map(|frame| {
+                        let reference = keyframe_reference(
                             frame,
                             if frame.id == current_frame_id {
                                 EvidencePartitionV2::Current
@@ -1808,57 +1001,32 @@ fn build_surface_timeline(
                                 EvidencePartitionV2::Support
                             },
                             vec!["session_surface_representative".into()],
-                        ),
-                        task_relevance,
-                    );
-                    let activity = frame
-                        .ui_events
-                        .iter()
-                        .filter(|event| event_matches_frame_surface(frame, event))
-                        .count()
-                        + frame
-                            .typing_bursts
+                        );
+                        let activity = frame
+                            .ui_events
                             .iter()
-                            .filter(|burst| {
-                                burst.committed && typing_burst_matches_frame_surface(frame, burst)
-                            })
-                            .count();
-                    let task_rank = reference
-                        .task_evidence_role
-                        .map(TaskEvidenceRoleV1::authority_rank)
-                        .unwrap_or(0);
-                    (reference, task_rank, activity)
-                })
-                .collect::<Vec<_>>();
-            let highest_task_rank = representative_candidates
-                .iter()
-                .filter(|(reference, _, _)| reference.model_eligible)
-                .map(|(_, rank, _)| *rank)
-                .max()
-                .unwrap_or(0);
-            let engagement_used_as_same_task_tiebreaker = representative_candidates
-                .iter()
-                .filter(|(reference, rank, _)| {
-                    reference.model_eligible && *rank == highest_task_rank
-                })
-                .count()
-                > 1;
-            let representative_frame = (!private)
-                .then(|| {
-                    representative_candidates
-                        .into_iter()
-                        .max_by_key(|(reference, task_rank, activity)| {
-                            (
-                                reference.model_eligible,
-                                *task_rank,
-                                *activity,
-                                reference.observed_at_ms,
-                                reference.frame_id.clone(),
-                            )
-                        })
-                        .map(|(reference, _, _)| reference)
-                })
-                .flatten();
+                            .filter(|event| event_matches_frame_surface(frame, event))
+                            .count()
+                            + frame
+                                .typing_bursts
+                                .iter()
+                                .filter(|burst| {
+                                    burst.committed
+                                        && typing_burst_matches_frame_surface(frame, burst)
+                                })
+                                .count();
+                        (reference, activity)
+                    })
+                    .max_by_key(|(reference, activity)| {
+                        (
+                            reference.model_eligible,
+                            *activity,
+                            reference.observed_at_ms,
+                            reference.frame_id.clone(),
+                        )
+                    })
+                    .map(|(reference, _)| reference)
+            };
             let app_label = if private {
                 "Private activity".into()
             } else {
@@ -1872,22 +1040,12 @@ fn build_surface_timeline(
                         .find_map(|frame| browser_origin_key(frame))
                 })
                 .flatten();
-            let hostname_mentioned_in_current_surface = !private
+            let carried_into_current_surface = !private
                 && current_is_chat
                 && !frames.iter().any(|frame| frame.id == current_frame_id)
                 && site_hostname.as_deref().is_some_and(|hostname| {
                     current_visible_content.contains(&hostname.to_ascii_lowercase())
                 });
-            let task_evidence_role = frames
-                .iter()
-                .filter_map(|frame| task_role_for_frame(task_relevance, &frame.id))
-                .max_by_key(|role| role.authority_rank());
-            let task_relevance_score = task_evidence_role
-                .map(TaskEvidenceRoleV1::authority_rank)
-                .unwrap_or(0);
-            let cross_pane_ambiguity = frames
-                .iter()
-                .any(|frame| task_pane_ambiguity(task_relevance, &frame.id));
             let mut evidence_refs = BTreeSet::new();
             evidence_refs.insert(first.id.clone());
             evidence_refs.insert(last.id.clone());
@@ -1907,15 +1065,7 @@ fn build_surface_timeline(
                 frame_count: frames.len(),
                 engagement_score,
                 committed_input,
-                // Retained for old-row compatibility only. A hostname mention is
-                // not proof that two surfaces belong to the same task turn.
-                carried_into_current_surface: false,
-                hostname_mentioned_in_current_surface,
-                task_evidence_role,
-                task_relevance_score,
-                same_task_relation: same_task_relation(task_relevance, task_evidence_role),
-                cross_pane_ambiguity,
-                engagement_used_as_same_task_tiebreaker,
+                carried_into_current_surface,
                 evidence_refs: evidence_refs.into_iter().collect(),
                 representative_frame,
             })
@@ -2815,164 +1965,10 @@ fn semantic_deltas(frames: &[EvidenceFrame], events: &[CausalEventV2]) -> Vec<Fr
     deltas
 }
 
-fn image_candidate_audits(
-    frames: &[EvidenceFrame],
-    semantic_keyframes: &[KeyframeReferenceV2],
-    surface_timeline: &[SurfaceVisitV2],
-    task_relevance: &TaskRelevanceEvidenceV1,
-) -> Vec<ImageCandidateAuditV1> {
-    let representatives = surface_timeline
-        .iter()
-        .filter_map(|visit| {
-            visit
-                .representative_frame
-                .as_ref()
-                .map(|frame| (frame.frame_id.as_str(), visit))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let selected_by_id = semantic_keyframes
-        .iter()
-        .map(|frame| (frame.frame_id.as_str(), frame))
-        .chain(surface_timeline.iter().filter_map(|visit| {
-            visit
-                .representative_frame
-                .as_ref()
-                .map(|frame| (frame.frame_id.as_str(), frame))
-        }))
-        .collect::<BTreeMap<_, _>>();
-    let selected_duplicate_facts = selected_by_id
-        .values()
-        .filter_map(|frame| {
-            frame.near_duplicate_group.as_ref().map(|group| {
-                (
-                    group.clone(),
-                    frame
-                        .task_evidence_role
-                        .unwrap_or(TaskEvidenceRoleV1::Unknown),
-                )
-            })
-        })
-        .collect::<BTreeSet<_>>();
-    let task_turn_id = task_relevance
-        .current_task_turn
-        .as_ref()
-        .map(|turn| turn.task_turn_id.clone());
-    let mut audits = frames
-        .iter()
-        .map(|frame| {
-            let reference = selected_by_id
-                .get(frame.id.as_str())
-                .copied()
-                .cloned()
-                .unwrap_or_else(|| {
-                    annotate_keyframe(
-                        frame,
-                        keyframe_reference(frame, EvidencePartitionV2::Background, Vec::new()),
-                        task_relevance,
-                    )
-                });
-            let role = reference
-                .task_evidence_role
-                .unwrap_or(TaskEvidenceRoleV1::Unknown);
-            let selected = selected_by_id.contains_key(frame.id.as_str());
-            let mut rejection_reasons = Vec::new();
-            if !selected {
-                if is_private_status(frame.privacy_status.as_deref()) {
-                    rejection_reasons.push("privacy_blocked_before_transport".into());
-                } else if let Some(reason) = reference.image_rejection_reason.clone() {
-                    rejection_reasons.push(reason);
-                }
-                if reference
-                    .near_duplicate_group
-                    .as_ref()
-                    .is_some_and(|group| selected_duplicate_facts.contains(&(group.clone(), role)))
-                {
-                    rejection_reasons.push("near_duplicate_same_task_fact".into());
-                }
-                if rejection_reasons.is_empty() && role == TaskEvidenceRoleV1::Unknown {
-                    rejection_reasons.push("not_proven_task_relevant".into());
-                } else if rejection_reasons.is_empty() {
-                    rejection_reasons.push("bounded_image_budget_omitted".into());
-                }
-            }
-            let (prepared_width, prepared_height) = reference
-                .crop_pixels
-                .as_ref()
-                .map(|crop| {
-                    (
-                        Some(crop.width.round() as i64),
-                        Some(crop.height.round() as i64),
-                    )
-                })
-                .unwrap_or((reference.image_width, reference.image_height));
-            let crop_policy = match reference.image_source_kind.as_str() {
-                "native_active_window" => "privacy_safe_native_active_window",
-                "derived_active_window_crop" => "verified_owned_window_crop",
-                "full_display" => "bounded_full_window_equivalent",
-                _ => "no_prepared_image",
-            }
-            .to_string();
-            let preparation_reason = if selected {
-                if role.authority_rank() >= TaskEvidenceRoleV1::PriorTaskBoundary.authority_rank() {
-                    "task_state_transition_evidence"
-                } else if reference.partition == EvidencePartitionV2::Current {
-                    "factual_current_state"
-                } else {
-                    "bounded_supporting_context"
-                }
-            } else {
-                "not_prepared"
-            }
-            .to_string();
-            ImageCandidateAuditV1 {
-                frame_id: frame.id.clone(),
-                task_turn_id: task_turn_id.clone(),
-                evidence_role: role,
-                selected,
-                selection_reasons: reference.selection_reasons.clone(),
-                rejection_reasons,
-                supports_latest_user_goal: role == TaskEvidenceRoleV1::LatestUserGoal,
-                supports_current_agent_state: role == TaskEvidenceRoleV1::CurrentAgentState,
-                supports_prior_task_boundary: role == TaskEvidenceRoleV1::PriorTaskBoundary,
-                same_task_relation: reference.same_task_relation.clone(),
-                cross_pane_ambiguity: reference.cross_pane_ambiguity,
-                near_duplicate_group: reference.near_duplicate_group.clone(),
-                engagement_used_as_same_task_tiebreaker: representatives
-                    .get(frame.id.as_str())
-                    .is_some_and(|visit| visit.engagement_used_as_same_task_tiebreaker),
-                original_width: frame.pixel_width,
-                original_height: frame.pixel_height,
-                prepared_width,
-                prepared_height,
-                image_scope: reference.image_scope.clone(),
-                crop_policy,
-                redaction_status: reference.privacy_status.clone(),
-                preparation_reason,
-            }
-        })
-        .collect::<Vec<_>>();
-    audits.sort_by_key(|audit| audit.frame_id.clone());
-    audits
-}
-
 pub(super) fn build_observation_packet(
     input_frames: &[EvidenceFrame],
     evidence_watermark: &str,
     previous_valid_snapshot_id: Option<String>,
-) -> Result<ObservationPacketV2, String> {
-    build_observation_packet_with_task_relevance(
-        input_frames,
-        evidence_watermark,
-        previous_valid_snapshot_id,
-        TaskRelevanceEvidenceV1::default(),
-    )
-}
-
-pub(super) fn build_observation_packet_with_task_relevance(
-    input_frames: &[EvidenceFrame],
-    evidence_watermark: &str,
-    previous_valid_snapshot_id: Option<String>,
-    task_relevance: TaskRelevanceEvidenceV1,
 ) -> Result<ObservationPacketV2, String> {
     let Some(input_current) = input_frames.last() else {
         return Err("observation packet requires at least one evidence frame".into());
@@ -3003,34 +1999,23 @@ pub(super) fn build_observation_packet_with_task_relevance(
         input_frames,
         &timeline_current.id,
         timeline_current.captured_at,
-        &task_relevance,
     );
     let dropped_frame_count = packet_frames.len().saturating_sub(24);
     let frames = &packet_frames[dropped_frame_count..];
     let current = frames.last().expect("bounded frame window is non-empty");
     let partitions_by_frame = partition_frames(frames);
-    let semantic_keyframes = select_keyframes(frames, &partitions_by_frame, &task_relevance);
+    let semantic_keyframes = select_keyframes(frames, &partitions_by_frame);
     let current_frame = semantic_keyframes
         .iter()
         .find(|keyframe| keyframe.frame_id == current.id)
         .cloned()
         .unwrap_or_else(|| {
-            annotate_keyframe(
+            keyframe_reference(
                 current,
-                keyframe_reference(
-                    current,
-                    EvidencePartitionV2::Current,
-                    vec!["current_frame_factual_state".into()],
-                ),
-                &task_relevance,
+                EvidencePartitionV2::Current,
+                vec!["current_frame".into()],
             )
         });
-    let image_candidates = image_candidate_audits(
-        &packet_frames,
-        &semantic_keyframes,
-        &surface_timeline,
-        &task_relevance,
-    );
     let (canonical_elements, mut frame_accounting) =
         canonical_elements(frames, &partitions_by_frame);
     let causal_events = causal_events(
@@ -3191,8 +2176,6 @@ pub(super) fn build_observation_packet_with_task_relevance(
         current_frame,
         semantic_keyframes,
         surface_timeline,
-        task_relevance,
-        image_candidates,
         canonical_elements,
         focused_element_ids,
         editable_element_ids,
@@ -3331,91 +2314,6 @@ mod tests {
             owner_window_id: Some(1),
             owner_bundle_id: Some("com.example.test".into()),
             quality_flags: Vec::new(),
-        }
-    }
-
-    fn task_span(
-        id: &str,
-        frame_id: &str,
-        role: TaskEvidenceRoleV1,
-        pane_id: &str,
-    ) -> TaskRelevantSpanV1 {
-        TaskRelevantSpanV1 {
-            span_id: id.into(),
-            frame_id: frame_id.into(),
-            surface_key_hash: Some("surface-hash".into()),
-            pane_id: pane_id.into(),
-            region_role: match role {
-                TaskEvidenceRoleV1::LatestUserGoal => "user_message",
-                TaskEvidenceRoleV1::CurrentUnsentDraft => "composer",
-                TaskEvidenceRoleV1::CurrentAgentState => "agent_status",
-                TaskEvidenceRoleV1::PriorTaskBoundary => "conversation_history",
-                _ => "unknown",
-            }
-            .into(),
-            conversational_role: match role {
-                TaskEvidenceRoleV1::LatestUserGoal => "user",
-                TaskEvidenceRoleV1::CurrentAgentState | TaskEvidenceRoleV1::PriorTaskBoundary => {
-                    "assistant_or_agent"
-                }
-                _ => "unknown",
-            }
-            .into(),
-            evidence_role: role,
-            reading_order: 1,
-            source_scope: "active_window".into(),
-            ownership_kind: "active_window_owned".into(),
-            owner_window_id: Some(1),
-            owner_app_id: Some("com.example.test".into()),
-            ownership_confidence: 0.95,
-            region_confidence: 0.95,
-            speaker_confidence: 0.95,
-            order_confidence: 0.95,
-            privacy_status: "allowed".into(),
-            text_hash: format!("hash-{id}"),
-            focused: role == TaskEvidenceRoleV1::CurrentUnsentDraft,
-            selected: true,
-            submitted: (role == TaskEvidenceRoleV1::CurrentUnsentDraft).then_some(false),
-            geometry: Some(PacketBoundsV2 {
-                x: 10.0,
-                y: 10.0,
-                width: 600.0,
-                height: 80.0,
-            }),
-            quality_flags: Vec::new(),
-            reason_codes: Vec::new(),
-            missing_evidence: Vec::new(),
-        }
-    }
-
-    fn structured_task_relevance(spans: Vec<TaskRelevantSpanV1>) -> TaskRelevanceEvidenceV1 {
-        TaskRelevanceEvidenceV1 {
-            schema: TASK_RELEVANCE_EVIDENCE_SCHEMA_V1.into(),
-            source: "p6_role_region_task_turn".into(),
-            current_task_turn: Some(PacketTaskTurnV1 {
-                task_turn_id: "turn-current".into(),
-                revision: 2,
-                execution_state: "active".into(),
-                current_actor: "assistant_or_agent".into(),
-                waiting_on: "agent".into(),
-                relation_to_prior: "new_task".into(),
-                goal_confidence: 0.94,
-                actor_state_confidence: 0.9,
-                relation_confidence: 0.88,
-                attribution_confidence: 0.93,
-                missing_evidence: Vec::new(),
-                quality_flags: Vec::new(),
-            }),
-            latest_user_goal_sample: Some("Verify the completed visual cue".into()),
-            current_agent_state_sample: Some("Implementation is complete".into()),
-            prior_task_boundary_sample: Some("Earlier backend work completed".into()),
-            current_unsent_draft_present: spans
-                .iter()
-                .any(|span| span.evidence_role == TaskEvidenceRoleV1::CurrentUnsentDraft),
-            spans,
-            missing_evidence: Vec::new(),
-            fallback_flags: Vec::new(),
-            confidence_cap: 0.9,
         }
     }
 
@@ -3637,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_timeline_records_neutral_hostname_mention_without_claiming_continuity() {
+    fn surface_timeline_records_source_carried_into_chat_without_typed_characters() {
         let mut source = frame("source", 1_000, "app_switch");
         source.app_name = Some("Helium".into());
         source.window_name = Some("Inkling - Helium".into());
@@ -3698,8 +2596,7 @@ mod tests {
 
         let packet = build_observation_packet(&[source, chat], "watermark", None).unwrap();
         assert_eq!(packet.surface_timeline.len(), 2);
-        assert!(!packet.surface_timeline[0].carried_into_current_surface);
-        assert!(packet.surface_timeline[0].hostname_mentioned_in_current_surface);
+        assert!(packet.surface_timeline[0].carried_into_current_surface);
         assert!(packet.surface_timeline[1].committed_input);
         let serialized = serde_json::to_string(&packet).unwrap();
         assert!(serialized.contains("thinkingmachines.ai"));
@@ -4668,265 +3565,5 @@ mod tests {
                 .map(|entry| entry.retained_events)
                 .sum::<usize>()
         );
-    }
-
-    #[test]
-    fn p6_task_roles_outrank_busy_unrelated_surface_and_old_completion() {
-        let old_completion = frame("old-completion", 1_000, "manual");
-        let latest_goal = frame("latest-goal", 2_000, "submit");
-        let mut busy_unrelated = frame("busy-unrelated", 3_000, "manual");
-        busy_unrelated.app_name = Some("Adjacent Chat".into());
-        busy_unrelated.app_bundle_id = Some("com.example.adjacent".into());
-        busy_unrelated.window_id = Some(8);
-        for index in 0..40 {
-            let mut event = ui_event(
-                &format!("busy-{index}"),
-                "scroll",
-                3_000 + index,
-                None,
-                None,
-            );
-            event.app_bundle_id = Some("com.example.adjacent".into());
-            event.window_id = Some(8);
-            busy_unrelated.ui_events.push(event);
-        }
-        let current = frame("current", 4_000, "manual");
-        let task_relevance = structured_task_relevance(vec![
-            task_span(
-                "prior-span",
-                "old-completion",
-                TaskEvidenceRoleV1::PriorTaskBoundary,
-                "pane-00",
-            ),
-            task_span(
-                "goal-span",
-                "latest-goal",
-                TaskEvidenceRoleV1::LatestUserGoal,
-                "pane-00",
-            ),
-        ]);
-
-        let packet = build_observation_packet_with_task_relevance(
-            &[old_completion, latest_goal, busy_unrelated, current],
-            "task-ranked",
-            None,
-            task_relevance,
-        )
-        .unwrap();
-
-        let goal = packet
-            .semantic_keyframes
-            .iter()
-            .find(|frame| frame.frame_id == "latest-goal")
-            .expect("latest attributed goal must survive image pressure");
-        assert_eq!(
-            goal.task_evidence_role,
-            Some(TaskEvidenceRoleV1::LatestUserGoal)
-        );
-        assert!(packet.image_candidates.iter().any(|candidate| {
-            candidate.frame_id == "latest-goal"
-                && candidate.selected
-                && candidate.supports_latest_user_goal
-        }));
-        let busy = packet
-            .image_candidates
-            .iter()
-            .find(|candidate| candidate.frame_id == "busy-unrelated")
-            .unwrap();
-        assert_eq!(busy.evidence_role, TaskEvidenceRoleV1::Unknown);
-        assert_ne!(busy.same_task_relation, "current_task_turn");
-    }
-
-    #[test]
-    fn near_duplicate_same_task_fact_keeps_newer_image_only() {
-        let mut older = frame("goal-older", 1_000, "submit");
-        let mut newer = frame("goal-newer", 2_000, "submit");
-        older.content_hash = Some("same-stable-content".into());
-        newer.content_hash = Some("same-stable-content".into());
-        let current = frame("current", 3_000, "manual");
-        let task_relevance = structured_task_relevance(vec![
-            task_span(
-                "goal-old-span",
-                "goal-older",
-                TaskEvidenceRoleV1::LatestUserGoal,
-                "pane-00",
-            ),
-            task_span(
-                "goal-new-span",
-                "goal-newer",
-                TaskEvidenceRoleV1::LatestUserGoal,
-                "pane-00",
-            ),
-        ]);
-
-        let packet = build_observation_packet_with_task_relevance(
-            &[older, newer, current],
-            "near-duplicate",
-            None,
-            task_relevance,
-        )
-        .unwrap();
-
-        assert!(packet
-            .semantic_keyframes
-            .iter()
-            .any(|frame| frame.frame_id == "goal-newer"));
-        assert!(!packet
-            .semantic_keyframes
-            .iter()
-            .any(|frame| frame.frame_id == "goal-older"));
-        let older_audit = packet
-            .image_candidates
-            .iter()
-            .find(|candidate| candidate.frame_id == "goal-older")
-            .unwrap();
-        assert!(older_audit
-            .rejection_reasons
-            .contains(&"near_duplicate_same_task_fact".into()));
-    }
-
-    #[test]
-    fn same_visual_content_is_preserved_when_task_state_changes() {
-        let mut user = frame("user", 1_000, "submit");
-        let mut agent = frame("agent", 2_000, "surface_change");
-        user.content_hash = Some("same-stable-content".into());
-        agent.content_hash = Some("same-stable-content".into());
-        let current = frame("current", 3_000, "manual");
-        let task_relevance = structured_task_relevance(vec![
-            task_span(
-                "user-span",
-                "user",
-                TaskEvidenceRoleV1::LatestUserGoal,
-                "pane-00",
-            ),
-            task_span(
-                "agent-span",
-                "agent",
-                TaskEvidenceRoleV1::CurrentAgentState,
-                "pane-00",
-            ),
-        ]);
-
-        let packet = build_observation_packet_with_task_relevance(
-            &[user, agent, current],
-            "state-change",
-            None,
-            task_relevance,
-        )
-        .unwrap();
-        let ids = packet
-            .semantic_keyframes
-            .iter()
-            .map(|frame| frame.frame_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(ids.contains("user"));
-        assert!(ids.contains("agent"));
-    }
-
-    #[test]
-    fn focused_uncommitted_composer_becomes_current_unsent_draft() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE continue_salient_turn_evidence (
-               frame_id TEXT PRIMARY KEY, observed_at_ms INTEGER NOT NULL,
-               salient_span_ids_json TEXT NOT NULL, latest_user_span_ids_json TEXT NOT NULL,
-               current_agent_span_ids_json TEXT NOT NULL,
-               prior_boundary_span_ids_json TEXT NOT NULL,
-               salient_user_goal_sample TEXT, salient_agent_state_sample TEXT,
-               prior_boundary_sample TEXT, sampling_confidence REAL NOT NULL,
-               missing_roles_json TEXT NOT NULL, rejected_spans_json TEXT NOT NULL,
-               fallback_flags_json TEXT NOT NULL, causal_typing_attribution_json TEXT
-             );
-             CREATE TABLE continue_ordered_evidence_spans (
-               span_id TEXT PRIMARY KEY, frame_id TEXT NOT NULL, surface_key TEXT,
-               pane_id TEXT NOT NULL, region_role TEXT NOT NULL,
-               conversational_role TEXT NOT NULL, reading_order INTEGER NOT NULL,
-               source_scope TEXT NOT NULL, ownership_kind TEXT NOT NULL,
-               owner_window_id INTEGER, owner_app_id TEXT,
-               ownership_confidence REAL NOT NULL, region_confidence REAL NOT NULL,
-               speaker_confidence REAL NOT NULL, order_confidence REAL NOT NULL,
-               privacy_status TEXT NOT NULL, text_hash TEXT NOT NULL,
-               focused INTEGER NOT NULL, selected INTEGER NOT NULL,
-               geometry_json TEXT, quality_flags_json TEXT NOT NULL,
-               reason_codes_json TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO continue_salient_turn_evidence VALUES
-             (?1,?2,?3,'[]','[]',?4,NULL,NULL,?5,0.88,'[]','[]','[]',NULL)",
-            rusqlite::params![
-                "draft-frame",
-                2_000_i64,
-                "[\"draft-span\",\"prior-span\"]",
-                "[\"prior-span\"]",
-                "Earlier implementation completed"
-            ],
-        )
-        .unwrap();
-        for (span_id, frame_id, region, role, focused, order) in [
-            (
-                "prior-span",
-                "prior-frame",
-                "conversation_history",
-                "assistant_or_agent",
-                0_i64,
-                1_i64,
-            ),
-            (
-                "draft-span",
-                "draft-frame",
-                "composer",
-                "unknown",
-                1_i64,
-                2_i64,
-            ),
-        ] {
-            conn.execute(
-                "INSERT INTO continue_ordered_evidence_spans VALUES
-                 (?1,?2,'surface', 'pane-00',?3,?4,?5,'active_window',
-                  'active_window_owned',1,'com.example.test',0.95,0.95,0.8,0.95,
-                  'allowed',?6,?7,1,'{\"x\":10.0,\"y\":10.0,\"width\":500.0,\"height\":80.0}',
-                  '[]','[]')",
-                rusqlite::params![
-                    span_id,
-                    frame_id,
-                    region,
-                    role,
-                    order,
-                    format!("hash-{span_id}"),
-                    focused
-                ],
-            )
-            .unwrap();
-        }
-        let frames = vec![
-            frame("prior-frame", 1_000, "surface_change"),
-            frame("draft-frame", 2_000, "manual"),
-        ];
-
-        let relevance = load_task_relevance_evidence(&conn, &frames).unwrap();
-
-        assert_eq!(relevance.source, "p6_role_region_task_turn");
-        assert!(relevance.current_unsent_draft_present);
-        let draft = relevance
-            .spans
-            .iter()
-            .find(|span| span.span_id == "draft-span")
-            .unwrap();
-        assert_eq!(draft.evidence_role, TaskEvidenceRoleV1::CurrentUnsentDraft);
-        assert_eq!(draft.submitted, Some(false));
-        assert!(draft.focused);
-        assert_eq!(draft.owner_window_id, Some(1));
-        assert!(draft.geometry.is_some());
-
-        let packet =
-            build_observation_packet_with_task_relevance(&frames, "unsent-draft", None, relevance)
-                .unwrap();
-        assert_eq!(
-            packet.current_frame.task_evidence_role,
-            Some(TaskEvidenceRoleV1::CurrentUnsentDraft)
-        );
-        assert!(!packet.surface_timeline[0].carried_into_current_surface);
     }
 }
