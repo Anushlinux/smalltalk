@@ -20,10 +20,6 @@ pub use contract::{
 #[allow(unused_imports)]
 pub use gateway::{IslandContinueReason, IslandContinueStateInput};
 
-use crate::continuation::history::{
-    ContinueHistoryCursorV1, ContinueHistoryOutputV1, ContinueHistorySummaryV1,
-};
-
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static EXPANDED: AtomicBool = AtomicBool::new(false);
 #[allow(dead_code)]
@@ -89,8 +85,6 @@ pub struct SessionIslandSnapshot {
     pub resume_warning: Option<String>,
     pub island_continue_state: Option<IslandContinueState>,
     pub visual_cue: Option<IslandVisualCue>,
-    pub continue_history_page: Option<IslandContinueHistoryPage>,
-    pub continue_history_output: Option<IslandContinueHistoryOutput>,
     pub privacy_label: Option<String>,
     pub is_sensitive: bool,
 }
@@ -98,81 +92,6 @@ pub struct SessionIslandSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct IslandVisualCue {
     pub image_path: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IslandContinueHistoryPage {
-    pub schema: String,
-    pub items: Vec<ContinueHistorySummaryV1>,
-    pub next_cursor: Option<ContinueHistoryCursorV1>,
-    pub request_id: u64,
-    pub error: Option<String>,
-}
-
-impl IslandContinueHistoryPage {
-    fn ready(
-        items: Vec<ContinueHistorySummaryV1>,
-        next_cursor: Option<ContinueHistoryCursorV1>,
-        request_id: u64,
-    ) -> Self {
-        Self {
-            schema: "smalltalk.island_continue_history_page.v1".to_string(),
-            items,
-            next_cursor,
-            request_id,
-            error: None,
-        }
-    }
-
-    fn error(request_id: u64, error: String) -> Self {
-        Self {
-            schema: "smalltalk.island_continue_history_page.v1".to_string(),
-            items: Vec::new(),
-            next_cursor: None,
-            request_id,
-            error: Some(error),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IslandContinueHistoryOutput {
-    pub schema: String,
-    pub decision_id: String,
-    pub created_at_ms: i64,
-    pub origin: String,
-    pub title: String,
-    pub rows: Vec<crate::continuation::history::ContinueHistoryAnswerRowV1>,
-    pub request_id: u64,
-    pub error: Option<String>,
-}
-
-impl IslandContinueHistoryOutput {
-    fn ready(output: ContinueHistoryOutputV1, request_id: u64) -> Self {
-        Self {
-            schema: "smalltalk.island_continue_history_output.v1".to_string(),
-            decision_id: output.decision_id,
-            created_at_ms: output.created_at_ms,
-            origin: output.origin,
-            title: output.title,
-            rows: output.rows,
-            request_id,
-            error: None,
-        }
-    }
-
-    fn error(decision_id: Option<String>, request_id: u64, error: String) -> Self {
-        Self {
-            schema: "smalltalk.island_continue_history_output.v1".to_string(),
-            decision_id: decision_id.unwrap_or_default(),
-            created_at_ms: 0,
-            origin: String::new(),
-            title: String::new(),
-            rows: Vec::new(),
-            request_id,
-            error: Some(error),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -348,16 +267,6 @@ pub static ISLAND_ROUTE_INVENTORY: &[IslandRouteInventoryItem] = &[
         requires_continue_decision_id: true,
         replacement: "native_action_open_resume_point",
         notes: "Legacy action alias; the Continue-first primary action is open_resume_point with a decision id.",
-    },
-    IslandRouteInventoryItem {
-        route_name: "native_action_continue_history",
-        current_handler: "load_continue_history_from_island / select_continue_history_output_from_island",
-        kind: IslandRouteKind::PresentationOnly,
-        disposition: IslandActionDisposition::AllowedPrimary,
-        allowed_in_primary_ui: true,
-        requires_continue_decision_id: false,
-        replacement: "read-only persisted Continue output history",
-        notes: "Presentation-only history; it cannot regenerate, adopt, provide feedback for, or open an older decision.",
     },
     IslandRouteInventoryItem {
         route_name: "native_action_toggle_expanded",
@@ -546,8 +455,6 @@ struct SessionIslandAction {
     task_snapshot_revision: Option<i64>,
     affected_task_field: Option<String>,
     task_hypothesis_id: Option<String>,
-    history_cursor: Option<ContinueHistoryCursorV1>,
-    history_request_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -565,10 +472,6 @@ enum SessionIslandActionKind {
     ResumeMe,
     ToggleExpanded,
     Collapse,
-    OpenContinueHistory,
-    LoadOlderContinueHistory,
-    RetryContinueHistory,
-    SelectContinueHistoryOutput,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -627,8 +530,6 @@ impl SessionIslandSnapshot {
             resume_warning: None,
             island_continue_state: None,
             visual_cue: None,
-            continue_history_page: None,
-            continue_history_output: None,
             privacy_label: None,
             is_sensitive: false,
         }
@@ -937,8 +838,6 @@ fn snapshot_from_status(
         resume_warning: None,
         island_continue_state: None,
         visual_cue: None,
-        continue_history_page: None,
-        continue_history_output: None,
         privacy_label,
         is_sensitive,
     };
@@ -1093,102 +992,6 @@ extern "C" fn handle_native_action(action_json: *const c_char) {
         }
         SessionIslandActionKind::ToggleExpanded => toggle_expanded_from_native(),
         SessionIslandActionKind::Collapse => set_session_island_expanded(false),
-        SessionIslandActionKind::OpenContinueHistory
-        | SessionIslandActionKind::RetryContinueHistory => {
-            load_continue_history_from_island(None, action.history_request_id.unwrap_or_default())
-        }
-        SessionIslandActionKind::LoadOlderContinueHistory => load_continue_history_from_island(
-            action.history_cursor,
-            action.history_request_id.unwrap_or_default(),
-        ),
-        SessionIslandActionKind::SelectContinueHistoryOutput => {
-            select_continue_history_output_from_island(
-                action.decision_id,
-                action.history_request_id.unwrap_or_default(),
-            )
-        }
-    }
-}
-
-fn load_continue_history_from_island(cursor: Option<ContinueHistoryCursorV1>, request_id: u64) {
-    let Some(app) = APP_HANDLE.get().cloned() else {
-        eprintln!("[session_island] Continue history requested before AppHandle was ready");
-        return;
-    };
-
-    thread::spawn(move || {
-        let result =
-            crate::capture::list_continue_history_for_island(&app, cursor.as_ref(), Some(25));
-        let mut snapshot = current_status_snapshot(&app);
-        snapshot.continue_history_page = Some(match result {
-            Ok(page) => IslandContinueHistoryPage::ready(page.items, page.next_cursor, request_id),
-            Err(error) => {
-                eprintln!("[session_island] Continue history list failed: {error}");
-                IslandContinueHistoryPage::error(request_id, "History unavailable".to_string())
-            }
-        });
-        update_session_island(snapshot);
-        show_session_island();
-    });
-}
-
-fn select_continue_history_output_from_island(decision_id: Option<String>, request_id: u64) {
-    let Some(app) = APP_HANDLE.get().cloned() else {
-        eprintln!(
-            "[session_island] Continue history selection requested before AppHandle was ready"
-        );
-        return;
-    };
-    let decision_id = decision_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    thread::spawn(move || {
-        let result = decision_id
-            .as_deref()
-            .ok_or_else(|| "history_decision_id_missing".to_string())
-            .and_then(|decision_id| {
-                crate::capture::get_continue_history_output_for_island(&app, decision_id)
-            });
-        let mut snapshot = current_status_snapshot(&app);
-        snapshot.continue_history_output = Some(match result {
-            Ok(Some(output)) => IslandContinueHistoryOutput::ready(output, request_id),
-            Ok(None) => IslandContinueHistoryOutput::error(
-                decision_id,
-                request_id,
-                "Saved answer unavailable".to_string(),
-            ),
-            Err(error) => {
-                eprintln!("[session_island] Continue history detail failed: {error}");
-                IslandContinueHistoryOutput::error(
-                    decision_id,
-                    request_id,
-                    "Saved answer unavailable".to_string(),
-                )
-            }
-        });
-        update_session_island(snapshot);
-        show_session_island();
-    });
-}
-
-fn current_status_snapshot(app: &AppHandle) -> SessionIslandSnapshot {
-    let state = app.state::<crate::capture::CaptureState>();
-    match crate::capture::capture_status(app.clone(), state) {
-        Ok(status) => snapshot_from_status(
-            &status,
-            if status.running {
-                SessionIslandState::RecordingCompact
-            } else {
-                SessionIslandState::Ready
-            },
-        ),
-        Err(error) => {
-            eprintln!(
-                "[session_island] status unavailable while loading Continue history: {error}"
-            );
-            SessionIslandSnapshot::ready()
-        }
     }
 }
 
@@ -2440,70 +2243,6 @@ mod tests {
     }
 
     #[test]
-    fn native_continue_history_envelope_preserves_cursor_and_request_identity() {
-        let action: SessionIslandAction = serde_json::from_value(serde_json::json!({
-            "action": "load_older_continue_history",
-            "history_cursor": {
-                "created_at_ms": 1_234,
-                "decision_id": "decision-history"
-            },
-            "history_request_id": 7
-        }))
-        .unwrap();
-        assert_eq!(
-            action.action,
-            SessionIslandActionKind::LoadOlderContinueHistory
-        );
-        let cursor = action.history_cursor.expect("history cursor");
-        assert_eq!(cursor.created_at_ms, 1_234);
-        assert_eq!(cursor.decision_id, "decision-history");
-        assert_eq!(action.history_request_id, Some(7));
-    }
-
-    #[test]
-    fn native_continue_history_responses_preserve_saved_copy_and_request_identity() {
-        let page = IslandContinueHistoryPage::ready(
-            vec![ContinueHistorySummaryV1 {
-                decision_id: "decision-history".to_string(),
-                created_at_ms: 1_234,
-                origin: "island".to_string(),
-                title: "Exact saved title".to_string(),
-            }],
-            Some(ContinueHistoryCursorV1 {
-                created_at_ms: 1_234,
-                decision_id: "decision-history".to_string(),
-            }),
-            7,
-        );
-        assert_eq!(page.request_id, 7);
-        assert_eq!(page.items[0].title, "Exact saved title");
-        assert_eq!(
-            page.next_cursor
-                .as_ref()
-                .map(|cursor| cursor.decision_id.as_str()),
-            Some("decision-history")
-        );
-
-        let output = IslandContinueHistoryOutput::ready(
-            ContinueHistoryOutputV1 {
-                schema: "smalltalk.continue_history_output.v1".to_string(),
-                decision_id: "decision-history".to_string(),
-                created_at_ms: 1_234,
-                origin: "island".to_string(),
-                title: "Exact saved title".to_string(),
-                rows: vec![crate::continuation::history::ContinueHistoryAnswerRowV1 {
-                    label: "Next action".to_string(),
-                    value: "Use the saved wording exactly.".to_string(),
-                }],
-            },
-            8,
-        );
-        assert_eq!(output.request_id, 8);
-        assert_eq!(output.title, "Exact saved title");
-        assert_eq!(output.rows[0].value, "Use the saved wording exactly.");
-    }
-
-    #[test]
     fn snapshot_from_status_uses_event_backed_signal_count_for_trail_moments() {
         let _guard = TEST_LOCK.lock().unwrap();
         clear_remembered_continue_for_test();
@@ -3066,13 +2805,9 @@ mod tests {
         assert!(!source.contains("hostingView.rootView = AnyView(view)"));
 
         let presentation_switch = source
-            .split("private func currentIslandContent(")
+            .split("switch model.presentation")
             .nth(1)
-            .and_then(|suffix| {
-                suffix
-                    .split("private var renderedIslandPresentation")
-                    .next()
-            })
+            .and_then(|suffix| suffix.split(".fixedSize()").next())
             .expect("Swift must keep bounded presentation transitions");
         assert!(presentation_switch.contains("case .micro, .ambientMemory, .generating:"));
         assert!(presentation_switch.contains("memoryContinuityView"));
@@ -3112,8 +2847,8 @@ mod tests {
             .nth(1)
             .and_then(|suffix| suffix.split("private var microHitTarget: some View").next())
             .expect("Swift must keep one persistent micro-medium silhouette");
-        assert!(continuity_view.contains("renderedIslandPresentation == .ambientMemory"));
-        assert!(continuity_view.contains("renderedIslandPresentation == .generating"));
+        assert!(continuity_view.contains("model.presentation == .ambientMemory"));
+        assert!(continuity_view.contains("model.presentation == .generating"));
         assert_eq!(
             continuity_view.matches("TopAnchoredCapsuleShape(").count(),
             2,
@@ -3341,105 +3076,6 @@ mod tests {
             .contains("value: model.memoryTransitionCountdownActive || model.continueGenerating"));
         assert!(source.contains(".scaleEffect(scale, anchor: .top)"));
     }
-
-    #[test]
-    fn swift_continue_history_is_one_panel_read_only_and_latched() {
-        let source = include_str!("../macos/SessionIslandPanel.swift");
-
-        for state in [
-            "case historyLoading",
-            "case historyList",
-            "case historyDetail",
-        ] {
-            assert!(source.contains(state), "missing history state {state:?}");
-        }
-        for copy in [
-            "Continue history",
-            "No previous answers yet",
-            "Use Continue to create one",
-            "History unavailable",
-            "Load older answers",
-            "Past answer ·",
-        ] {
-            assert!(source.contains(copy), "missing history copy {copy:?}");
-        }
-        for action in [
-            "open_continue_history",
-            "load_older_continue_history",
-            "retry_continue_history",
-            "select_continue_history_output",
-        ] {
-            assert!(source.contains(action), "missing history action {action:?}");
-        }
-
-        assert_eq!(
-            source.matches("NSPanel(").count(),
-            1,
-            "history must remain inside the existing native panel"
-        );
-        assert!(source.contains("kWhisperFlowHistoryButtonVisualSize: CGFloat = 30"));
-        assert!(source.contains("kWhisperFlowHistoryButtonHitSize: CGFloat = 40"));
-        assert!(source.contains("kWhisperFlowHistoryButtonGap: CGFloat = 8"));
-        assert!(source.contains("kWhisperFlowHistoryCardPreferredW: CGFloat = 360"));
-        assert!(source.contains("usableHeight * 0.60"));
-        assert!(source.contains("historyLayout.controlOnLeft"));
-        assert!(
-            source.contains("historyAnchor = NSPoint(x: panel.frame.midX, y: panel.frame.maxY)")
-        );
-        assert!(source.contains("page.requestId == activeHistoryPageRequestId"));
-        assert!(source.contains("output.requestId == activeHistoryDetailRequestId"));
-        assert!(source.contains("historyRelativeTimestamp(item.createdAtMs)"));
-        assert!(source.contains("historyFullTimestamp(item.createdAtMs)"));
-        assert!(source.contains(".lineLimit(2)"));
-        assert!(source.contains("@AccessibilityFocusState private var historyHeadingFocused"));
-        assert!(source.contains("@AccessibilityFocusState private var historyDetailFocused"));
-        assert!(source.contains("@AccessibilityFocusState private var historyButtonFocused"));
-        assert!(source.contains("guard !reduceMotion else { return .opacity }"));
-
-        let history_visibility = source
-            .split("private var historyButtonShouldBeVisible: Bool")
-            .nth(1)
-            .and_then(|suffix| suffix.split("private func refreshHistoryLayout()").next())
-            .expect("Swift must keep bounded history-control visibility rules");
-        assert!(history_visibility.contains("presentation.isHistory"));
-        assert!(history_visibility.contains("presentation == .answerSummary"));
-        assert!(history_visibility.contains("presentation == .ambientMemory"));
-        assert!(history_visibility.contains("!continueRequestInFlight"));
-        assert!(history_visibility.contains("!memoryTransitionCountdownActive"));
-        assert!(history_visibility.contains("snapshot.state != \"starting\""));
-        assert!(history_visibility.contains("snapshot.state != \"processing\""));
-
-        let history_drag = source
-            .split("private func shouldBeginWindowDrag(at point: NSPoint)")
-            .nth(1)
-            .and_then(|suffix| suffix.split("private var historyCapsuleHeight").next())
-            .expect("Swift must bound panel dragging away from history interactions");
-        assert!(history_drag.contains("historyControlRect.contains(point)"));
-        assert!(history_drag.contains("if presentation.isHistory"));
-        assert!(history_drag.contains("return capsuleRect.contains(point)"));
-
-        let history_controls = source
-            .split("private func toggleHistory()")
-            .nth(1)
-            .and_then(|suffix| suffix.split("private func clearHistoryState()").next())
-            .expect("Swift must keep bounded history-only controller actions");
-        for forbidden in [
-            "open_resume_point",
-            "openContinueTarget",
-            "perform_continue_action",
-            "latchedAnswer =",
-            "latchedDecisionId =",
-            "visualCuePresented = true",
-        ] {
-            assert!(
-                !history_controls.contains(forbidden),
-                "history controller must not mutate or open live Continue state via {forbidden:?}"
-            );
-        }
-        assert!(history_controls.contains("activeHistoryPageRequestId = nil"));
-        assert!(history_controls.contains("activeHistoryDetailRequestId = nil"));
-    }
-
     #[test]
     fn island_base_request_does_not_write_full_audit_output() {
         let request = island_continue_decision_request();
@@ -3505,16 +3141,6 @@ mod tests {
             ("resume_me", "native_action_resume_me"),
             ("toggle_expanded", "native_action_toggle_expanded"),
             ("collapse", "native_action_collapse"),
-            ("open_continue_history", "native_action_continue_history"),
-            (
-                "load_older_continue_history",
-                "native_action_continue_history",
-            ),
-            ("retry_continue_history", "native_action_continue_history"),
-            (
-                "select_continue_history_output",
-                "native_action_continue_history",
-            ),
         ];
 
         for (wire_action, route_name) in actions {
