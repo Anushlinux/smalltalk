@@ -50,7 +50,12 @@ mod runtime_stability;
 mod swift_helpers;
 
 const MAX_RESUME_QUERY_INPUT_FRAMES: usize = 96;
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
+const SQLITE_READ_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
+// Normal writable commands may briefly contend with the bounded event-ingest
+// transaction. Give that writer time to finish instead of turning a transient
+// WAL hand-off into a product-visible `database is locked` failure. Capture
+// frame persistence keeps its separate 500 ms cancellation bound.
+const SQLITE_WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCK_DISPLAY_DEADLINE: Duration = Duration::from_secs(6);
 const SCK_ACTIVE_WINDOW_DEADLINE: Duration = Duration::from_secs(6);
 const ACCESSIBILITY_DEADLINE: Duration = Duration::from_secs(4);
@@ -463,6 +468,9 @@ pub struct CaptureStatus {
     pub started_at: Option<i64>,
     pub last_error: Option<String>,
     pub latest_frame: Option<CaptureFrame>,
+    /// Hash of material Continue evidence only. Raw low-value event/count
+    /// growth is intentionally excluded by the Continue watermark policy.
+    pub continue_evidence_watermark_hash: Option<String>,
     pub skipped_samples: i64,
     pub last_skipped_at: Option<i64>,
     pub data_dir: String,
@@ -3920,6 +3928,7 @@ pub fn get_continue_workstream_detail(
 }
 
 const MANUAL_CONTINUE_EVENT_RECENCY_MS: i64 = 60_000;
+const MANUAL_CONTINUE_FRAME_REUSE_RECENCY_MS: i64 = 5_000;
 
 #[derive(Debug, Clone)]
 struct ManualContinueExternalEvent {
@@ -3936,6 +3945,23 @@ struct ManualContinueCaptureExpectation {
     app_bundle_id: Option<String>,
     app_name: Option<String>,
     window_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ManualContinueCaptureFailure {
+    trigger_id: Option<String>,
+    public_reason: String,
+    trigger_reason: String,
+}
+
+impl From<String> for ManualContinueCaptureFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            trigger_id: None,
+            public_reason: reason.clone(),
+            trigger_reason: reason,
+        }
+    }
 }
 
 fn latest_manual_continue_external_event(
@@ -4034,7 +4060,7 @@ fn manual_continue_window_titles_match(
 fn manual_continue_anchor_since(
     conn: &Connection,
     session_id: &str,
-    event: Option<&ManualContinueExternalEvent>,
+    event: &ManualContinueExternalEvent,
     minimum_captured_at: i64,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
@@ -4072,29 +4098,22 @@ fn manual_continue_anchor_since(
                     .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"));
             let has_readable_asset = crop
                 .as_deref()
-                .is_some_and(|value| Path::new(value).is_file())
+                .is_some_and(|value| manual_continue_asset_is_decodable(Path::new(value)))
                 || full
                     .as_deref()
-                    .is_some_and(|value| Path::new(value).is_file());
+                    .is_some_and(|value| manual_continue_asset_is_decodable(Path::new(value)));
             if is_smalltalk
                 || !has_readable_asset
                 || !privacy_status_allows_manual_continue_frame(privacy.as_deref())
             {
                 return None;
             }
-            let Some(event) = event else {
-                return Some(frame_id);
-            };
             let app_matches = match (event.app_bundle_id.as_deref(), bundle_id.as_deref()) {
                 (Some(expected), Some(actual)) if !expected.trim().is_empty() => expected == actual,
                 _ => match (event.app_name.as_deref(), app_name.as_deref()) {
                     (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
                     _ => false,
                 },
-            };
-            let window_matches = match (event.window_id, window_id) {
-                (Some(expected), Some(actual)) if expected > 0 && actual > 0 => expected == actual,
-                _ => true,
             };
             let title_matches = match (
                 event
@@ -4110,9 +4129,13 @@ fn manual_continue_anchor_since(
                 (Some(expected), Some(actual)) => {
                     manual_continue_window_titles_match(expected, actual, event.app_name.as_deref())
                 }
-                _ => true,
+                _ => false,
             };
-            (app_matches && window_matches && title_matches).then_some(frame_id)
+            let exact_window_matches = match (event.window_id, window_id) {
+                (Some(expected), Some(actual)) if expected > 0 && actual > 0 => expected == actual,
+                _ => title_matches,
+            };
+            (app_matches && exact_window_matches).then_some(frame_id)
         },
     ))
 }
@@ -4123,9 +4146,12 @@ fn manual_continue_anchor_once(
     event: Option<&ManualContinueExternalEvent>,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
+    let Some(event) = event else {
+        return Ok(None);
+    };
     let minimum_captured_at = event
-        .map(|event| event.ts_ms)
-        .unwrap_or_else(|| now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS));
+        .ts_ms
+        .max(now_ms.saturating_sub(MANUAL_CONTINUE_FRAME_REUSE_RECENCY_MS));
     manual_continue_anchor_since(conn, session_id, event, minimum_captured_at, now_ms)
 }
 
@@ -4133,15 +4159,95 @@ fn recent_manual_continue_fallback_anchor(
     conn: &Connection,
     session_id: &str,
     event: &ManualContinueExternalEvent,
+    boundary_started_at_ms: i64,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
-    manual_continue_anchor_since(
-        conn,
-        session_id,
-        Some(event),
-        now_ms.saturating_sub(MANUAL_CONTINUE_EVENT_RECENCY_MS),
-        now_ms,
-    )
+    let minimum_captured_at = event
+        .ts_ms
+        .max(boundary_started_at_ms.saturating_sub(MANUAL_CONTINUE_FRAME_REUSE_RECENCY_MS));
+    manual_continue_anchor_since(conn, session_id, event, minimum_captured_at, now_ms)
+}
+
+fn manual_continue_asset_is_decodable(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if jpeg_dimensions(&bytes).is_some() {
+        return true;
+    }
+    const PNG_END: &[u8] = b"\0\0\0\0IEND\xaeB`\x82";
+    if bytes.len() < 45
+        || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+        || &bytes[12..16] != b"IHDR"
+        || !bytes.ends_with(PNG_END)
+    {
+        return false;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap_or([0; 4]));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap_or([0; 4]));
+    width > 0 && height > 0
+}
+
+fn record_manual_continue_frame_reuse(
+    conn: &Connection,
+    session_id: &str,
+    frame_id: &str,
+    reuse_source: &str,
+    existing_trigger_id: Option<&str>,
+    pre_frame_id: Option<&str>,
+    capture_failure_reason: Option<&str>,
+) -> Result<String, String> {
+    let trigger_id = if let Some(trigger_id) = existing_trigger_id {
+        trigger_id.to_string()
+    } else {
+        let trigger = PendingTrigger {
+            id: next_id("trg"),
+            capture_trigger: "manual_continue_boundary".to_string(),
+            caused_by_event_ids: Vec::new(),
+            caused_event_count: 0,
+            omitted_event_count: 0,
+            pre_frame_id: pre_frame_id.map(str::to_string),
+            settle_delay_ms: 0,
+            ready_at: Instant::now(),
+        };
+        insert_capture_trigger(
+            conn,
+            session_id,
+            &trigger,
+            now_millis(),
+            false,
+            "exact_frame_reuse",
+        )?;
+        trigger.id
+    };
+    let reuse_audit = serde_json::json!({
+        "schema": "smalltalk.manual_continue_frame_reuse.v1",
+        "reuse_source": reuse_source,
+        "reused_frame_id": frame_id,
+        "capture_failure_reason": capture_failure_reason,
+        "requirements": [
+            "same_session",
+            "exact_app_and_window",
+            "post_event",
+            "privacy_eligible",
+            "readable_asset"
+        ]
+    });
+    let changed = conn
+        .execute(
+            "UPDATE capture_triggers
+         SET status='captured', post_frame_id=?2, aggregation_json=?3,
+             dedupe_policy='exact_frame_reuse', error=NULL
+         WHERE id=?1",
+            params![trigger_id, frame_id, reuse_audit.to_string()],
+        )
+        .map_err(to_string)?;
+    if changed != 1 {
+        return Err(format!(
+            "manual_continue_frame_reuse_trigger_missing:{trigger_id}"
+        ));
+    }
+    Ok(trigger_id)
 }
 
 fn manual_continue_capture_identity_matches(
@@ -4286,7 +4392,7 @@ fn capture_manual_continue_external_frame(
     app: &AppHandle,
     session_id: &str,
     event: &ManualContinueExternalEvent,
-) -> Result<String, String> {
+) -> Result<String, ManualContinueCaptureFailure> {
     let expected_bundle = event
         .app_bundle_id
         .as_deref()
@@ -4297,13 +4403,17 @@ fn capture_manual_continue_external_frame(
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case("smalltalk"))
     {
-        return Err("manual_continue_external_surface_is_smalltalk".to_string());
+        return Err("manual_continue_external_surface_is_smalltalk"
+            .to_string()
+            .into());
     }
     let paths = capture_paths(app)?;
     let window_snapshot = collect_window_snapshot(&paths, WINDOW_SNAPSHOT_DEADLINE, None).ok();
     let target_window_id = resolve_manual_continue_window_id(event, window_snapshot.as_ref());
     if target_window_id.is_none() && expected_bundle.is_none() {
-        return Err("manual_continue_external_surface_identity_missing".to_string());
+        return Err("manual_continue_external_surface_identity_missing"
+            .to_string()
+            .into());
     }
 
     let pre_frame_id = latest_frame_id_for_session(app, session_id).ok().flatten();
@@ -4345,7 +4455,11 @@ fn capture_manual_continue_external_frame(
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = mark_capture_trigger_failed(app, &trigger_id, &error);
-            return Err("manual_continue_external_window_capture_failed".to_string());
+            return Err(ManualContinueCaptureFailure {
+                trigger_id: Some(trigger_id),
+                public_reason: "manual_continue_external_window_capture_failed".to_string(),
+                trigger_reason: error,
+            });
         }
     };
     let Some(frame) = outcome.frame else {
@@ -4353,38 +4467,76 @@ fn capture_manual_continue_external_frame(
             .skip_reason
             .unwrap_or_else(|| "capture_not_stored".to_string());
         let _ = mark_capture_trigger_failed(app, &trigger_id, &reason);
-        return Err(format!("manual_continue_external_window_{reason}"));
+        return Err(ManualContinueCaptureFailure {
+            trigger_id: Some(trigger_id),
+            public_reason: format!("manual_continue_external_window_{reason}"),
+            trigger_reason: reason,
+        });
     };
     if frame.captured_at < event.ts_ms {
         let _ = mark_capture_trigger_failed(app, &trigger_id, "captured_before_external_event");
-        return Err("manual_continue_external_window_not_post_event".to_string());
+        return Err(ManualContinueCaptureFailure {
+            trigger_id: Some(trigger_id),
+            public_reason: "manual_continue_external_window_not_post_event".to_string(),
+            trigger_reason: "captured_before_external_event".to_string(),
+        });
     }
     let _ = finalize_capture_trigger_by_id(app, &trigger_id, true);
     Ok(frame.id.to_string())
 }
 
-fn resolve_manual_continue_frame(
+fn resolve_manual_continue_frame_without_held_connection(
     app: &AppHandle,
-    conn: &Connection,
     session_id: &str,
 ) -> Result<String, String> {
     let pressed_at_ms = now_millis();
-    let event = latest_manual_continue_external_event(conn, session_id, pressed_at_ms)?;
-    if let Some(frame_id) =
-        manual_continue_anchor_once(conn, session_id, event.as_ref(), pressed_at_ms)?
-    {
+    let (event, existing_anchor, pre_frame_id) = {
+        let conn = open_db(app)?;
+        let event = latest_manual_continue_external_event(&conn, session_id, pressed_at_ms)?;
+        let pre_frame_id = latest_frame_id_for_session_from_conn(&conn, session_id)?;
+        let anchor = manual_continue_anchor_once(&conn, session_id, event.as_ref(), pressed_at_ms)?;
+        if let Some(frame_id) = anchor.as_deref() {
+            record_manual_continue_frame_reuse(
+                &conn,
+                session_id,
+                frame_id,
+                "pre_capture_exact_anchor",
+                None,
+                pre_frame_id.as_deref(),
+                None,
+            )?;
+        }
+        (event, anchor, pre_frame_id)
+    };
+    if let Some(frame_id) = existing_anchor {
         return Ok(frame_id);
     }
     let event = event.ok_or_else(|| "manual_continue_recent_external_event_missing".to_string())?;
     match capture_manual_continue_external_frame(app, session_id, &event) {
         Ok(frame_id) => Ok(frame_id),
-        Err(capture_error) => {
-            if let Some(frame_id) =
-                recent_manual_continue_fallback_anchor(conn, session_id, &event, pressed_at_ms)?
-            {
+        Err(capture_failure) => {
+            // Reopen only after the capture wait. Another exact post-event
+            // frame may have completed while the manual request was queued.
+            let conn = open_db(app)?;
+            if let Some(frame_id) = recent_manual_continue_fallback_anchor(
+                &conn,
+                session_id,
+                &event,
+                pressed_at_ms,
+                now_millis(),
+            )? {
+                record_manual_continue_frame_reuse(
+                    &conn,
+                    session_id,
+                    &frame_id,
+                    "post_capture_failure_exact_anchor",
+                    capture_failure.trigger_id.as_deref(),
+                    pre_frame_id.as_deref(),
+                    Some(&capture_failure.trigger_reason),
+                )?;
                 return Ok(frame_id);
             }
-            Err(capture_error)
+            Err(capture_failure.public_reason)
         }
     }
 }
@@ -4411,29 +4563,30 @@ pub fn get_continue_decision(
     request.manual_continue_started_at_ms = (trigger == "manual").then_some(now_millis());
     request.manual_continue_frame_id = None;
     request.manual_continue_preflight_failure = None;
-    let material_watermark = {
+    {
         let preflight_conn = open_db(&app)?;
-        // Resolve scope and manual capture before admission. The connection is
-        // dropped before this request can wait in the workload queue.
         if request.session_id.is_none() {
             request.session_id = latest_session_id(&preflight_conn)?;
         }
-        if trigger == "manual" {
-            match request.session_id.as_deref() {
-                Some(session_id) => {
-                    match resolve_manual_continue_frame(&app, &preflight_conn, session_id) {
-                        Ok(frame_id) => request.manual_continue_frame_id = Some(frame_id),
-                        Err(reason) => request.manual_continue_preflight_failure = Some(reason),
-                    }
-                }
-                None => {
-                    request.manual_continue_preflight_failure =
-                        Some("manual_continue_session_scope_missing".to_string())
+    }
+    if trigger == "manual" {
+        match request.session_id.as_deref() {
+            Some(session_id) => {
+                match resolve_manual_continue_frame_without_held_connection(&app, session_id) {
+                    Ok(frame_id) => request.manual_continue_frame_id = Some(frame_id),
+                    Err(reason) => request.manual_continue_preflight_failure = Some(reason),
                 }
             }
+            None => {
+                request.manual_continue_preflight_failure =
+                    Some("manual_continue_session_scope_missing".to_string())
+            }
         }
+    }
+    let material_watermark = {
+        let conn = open_db(&app)?;
         crate::continuation::current_continue_evidence_watermark_hash(
-            &preflight_conn,
+            &conn,
             request.session_id.as_deref(),
         )?
     };
@@ -5038,14 +5191,12 @@ pub fn record_continue_feedback(
     crate::continuation::record_continue_feedback(&conn, input)
 }
 
-pub fn latest_continue_feedback_or_open_watermark_ms(
-    app: &AppHandle,
-) -> Result<Option<i64>, String> {
+pub fn latest_continue_feedback_watermark_ms(app: &AppHandle) -> Result<Option<i64>, String> {
     let conn = match open_readonly_db(app) {
         Ok(conn) => conn,
         Err(_) => return Ok(None),
     };
-    crate::continuation::latest_feedback_or_open_watermark_ms(&conn)
+    crate::continuation::latest_continue_feedback_watermark_ms(&conn)
 }
 
 #[tauri::command]
@@ -16452,6 +16603,7 @@ fn capture_loop(
             });
             match result {
                 Ok(()) => {
+                    clear_transient_database_error(&state);
                     refresh_island_after_event(&app, &state, &mut last_island_event_status_at);
                 }
                 Err(error) => update_error_and_island(&app, &state, error),
@@ -16501,10 +16653,8 @@ fn capture_loop(
                         }
                         last_capture_at = Instant::now();
                     }
-                    Err(error) => {
-                        let _ = mark_capture_trigger_failed(&app, &trigger.id, &error);
-                        update_error_and_island(&app, &state, error)
-                    }
+                    Err(error) if automatic_capture_was_superseded(&error) => {}
+                    Err(error) => update_error_and_island(&app, &state, error),
                 }
             }
         }
@@ -16533,6 +16683,7 @@ fn capture_loop(
                         last_capture_at = Instant::now();
                     }
                 }
+                Err(error) if automatic_capture_was_superseded(&error) => {}
                 Err(error) => update_error_and_island(&app, &state, error),
             }
         }
@@ -16566,7 +16717,7 @@ fn capture_and_emit(
             dedupe,
         )?),
     };
-    let outcome = capture_frame(
+    let outcome = match capture_frame(
         app,
         session_id,
         capture_trigger,
@@ -16579,7 +16730,19 @@ fn capture_and_emit(
         trigger_id.as_deref(),
         pre_frame_id.as_deref(),
         None,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(id) = trigger_id.as_deref() {
+                if automatic_capture_was_superseded(&error) {
+                    let _ = mark_capture_trigger_superseded(app, id, &error);
+                } else {
+                    let _ = mark_capture_trigger_failed(app, id, &error);
+                }
+            }
+            return Err(error);
+        }
+    };
 
     *previous_image_hash = Some(outcome.image_hash.clone());
     *previous_content_hash = outcome
@@ -17811,6 +17974,28 @@ fn mark_capture_trigger_failed(
     Ok(())
 }
 
+fn automatic_capture_was_superseded(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("automatic_capture_superseded_by_manual_boundary")
+        || normalized.contains("screenshotcapture deferred behind manual boundary capture")
+        || (normalized.contains("screenshotcapture request")
+            && (normalized.contains("superseded") || normalized.contains("cancelled")))
+}
+
+fn mark_capture_trigger_superseded(
+    app: &AppHandle,
+    trigger_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let conn = open_db(app)?;
+    conn.execute(
+        "UPDATE capture_triggers SET status = 'superseded', error = ?2 WHERE id = ?1",
+        params![trigger_id, reason],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
 fn classify_transition_type(
     conn: &Connection,
     trigger_type: &str,
@@ -17959,574 +18144,632 @@ fn capture_frame(
     previous_frame_id: Option<&str>,
     manual_continue_expectation: Option<&ManualContinueCaptureExpectation>,
 ) -> Result<CaptureOutcome, String> {
-    let _capture_permit = if capture_trigger == "manual_continue_boundary" {
+    let capture_is_manual_boundary = capture_trigger == "manual_continue_boundary";
+    let mut capture_permit = if capture_is_manual_boundary {
         crate::workload::governor().acquire_with_timeout(
-            crate::workload::WorkClass::ScreenshotCapture,
+            crate::workload::WorkClass::ManualBoundaryCapture,
             MANUAL_CAPTURE_PERMIT_TIMEOUT,
         )?
     } else {
         crate::workload::governor().acquire(crate::workload::WorkClass::ScreenshotCapture)?
     };
-    let paths = capture_paths(app)?;
-    fs::create_dir_all(&paths.snapshot_dir).map_err(to_string)?;
-    ensure_db(app)?;
+    let workload_cancellation_flag = capture_permit.cancellation_flag();
+    let linked_cancellation = (!capture_is_manual_boundary).then(|| {
+        cancellation
+            .cloned()
+            .unwrap_or_default()
+            .linked_to(Arc::clone(&workload_cancellation_flag))
+    });
+    let cancellation = linked_cancellation.as_ref().or(cancellation);
+    let automatic_capture_cancelled =
+        || !capture_is_manual_boundary && workload_cancellation_flag.load(Ordering::Acquire);
+    let result = (|| -> Result<CaptureOutcome, String> {
+        let paths = capture_paths(app)?;
+        fs::create_dir_all(&paths.snapshot_dir).map_err(to_string)?;
+        ensure_db(app)?;
 
-    let captured_at = now_millis();
-    let day = day_bucket(captured_at);
-    let day_dir = paths.snapshot_dir.join(day);
-    fs::create_dir_all(&day_dir).map_err(to_string)?;
+        let captured_at = now_millis();
+        let day = day_bucket(captured_at);
+        let day_dir = paths.snapshot_dir.join(day);
+        fs::create_dir_all(&day_dir).map_err(to_string)?;
 
-    fault_injection::cancellation_checkpoint("before_accessibility", cancellation)?;
-    let context =
-        precollected_context.unwrap_or_else(|| collect_accessibility_context(&paths, cancellation));
-    let semantic_fingerprint = SemanticFingerprint::from_context(&context);
-    let privacy = privacy_decision(app, &context)?;
-    if privacy.skip_capture {
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash: stable_hash_bytes(
-                format!("skipped:{}:{}", capture_trigger, captured_at).as_bytes(),
-            ),
-            content_hash: None,
-            semantic_fingerprint,
-            skip_reason: Some("privacy".to_string()),
-        });
-    }
+        fault_injection::cancellation_checkpoint("before_accessibility", cancellation)?;
+        let context = precollected_context
+            .unwrap_or_else(|| collect_accessibility_context(&paths, cancellation));
+        if automatic_capture_cancelled() {
+            return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+        }
+        let semantic_fingerprint = SemanticFingerprint::from_context(&context);
+        let privacy = privacy_decision(app, &context)?;
+        if privacy.skip_capture {
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash: stable_hash_bytes(
+                    format!("skipped:{}:{}", capture_trigger, captured_at).as_bytes(),
+                ),
+                content_hash: None,
+                semantic_fingerprint,
+                skip_reason: Some("privacy".to_string()),
+            });
+        }
 
-    let conn = open_db(app)?;
-    increment_maintenance_counter(&conn, "ax_snapshots", 1)?;
-    if let Some(skip_reason) = should_skip_heavy_capture_for_budget(
-        &conn,
-        &paths,
-        session_id,
-        capture_trigger,
-        captured_at,
-        &context,
-        &semantic_fingerprint,
-        previous_semantic_fingerprint,
-    )? {
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash: stable_hash_bytes(
-                format!(
-                    "budget-skip:{}:{}:{}",
-                    capture_trigger, skip_reason, captured_at
-                )
-                .as_bytes(),
-            ),
-            content_hash: semantic_fingerprint.text_hash.clone(),
-            semantic_fingerprint,
-            skip_reason: Some(skip_reason),
-        });
-    }
-
-    fault_injection::cancellation_checkpoint("before_window_snapshot", cancellation)?;
-    let window_snapshot =
-        collect_window_snapshot(&paths, WINDOW_SNAPSHOT_DEADLINE, cancellation).ok();
-    // A manual Continue request targets the last verified external surface.
-    // Once Smalltalk is frontmost, the current active window is Smalltalk and
-    // must never be substituted for a missing external target.
-    let mut active_window_id = resolve_capture_window_id(
-        context.window_id,
-        window_snapshot.as_ref(),
-        manual_continue_expectation.is_some(),
-    );
-
-    fault_injection::cancellation_checkpoint("before_screenshot", cancellation)?;
-    let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
-    let full_capture = capture_screenshot(&paths, &conn, &snapshot_path, cancellation)?;
-    let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
-    let image_hash = stable_hash_bytes(&image_bytes);
-    let image_dimensions = jpeg_dimensions(&image_bytes);
-    let mut active_window_capture_error = None;
-    let mut active_window_capture = if let Some(window_id) = active_window_id {
-        let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
-        match capture_window_screenshot(
-            &paths,
+        let conn = open_db(app)?;
+        increment_maintenance_counter(&conn, "ax_snapshots", 1)?;
+        if let Some(skip_reason) = should_skip_heavy_capture_for_budget(
             &conn,
-            window_id,
-            &crop_path,
-            context.app_bundle_id.as_deref(),
-            cancellation,
-        ) {
-            Ok(capture) => Some((crop_path, capture)),
-            Err(error) => {
-                active_window_capture_error = Some(error);
-                None
-            }
-        }
-    } else if let Some(expected_bundle) = manual_continue_expectation
-        .and_then(|expected| expected.app_bundle_id.as_deref())
-        .filter(|bundle_id| !bundle_id.trim().is_empty())
-    {
-        let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
-        match capture_sck_screenshot(
             &paths,
-            "active_window",
-            &crop_path,
-            None,
-            Some(expected_bundle),
-            false,
-            cancellation,
-        ) {
-            Ok(capture) => {
-                active_window_id = capture.window_id;
-                Some((crop_path, capture))
-            }
-            Err(failure) => {
-                active_window_capture_error = Some(failure.message);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    if let Some((_, capture)) = active_window_capture.as_mut() {
-        annotate_capture_with_window_owner(capture, window_snapshot.as_ref());
-    }
-    if let Some(expectation) = manual_continue_expectation {
-        let Some((crop_path, capture)) = active_window_capture.as_ref() else {
-            let _ = fs::remove_file(&snapshot_path);
-            return Err(active_window_capture_error
-                .map(|error| {
-                    format!("manual Continue external window capture unavailable: {error}")
-                })
-                .unwrap_or_else(|| {
-                    "manual Continue external window capture unavailable".to_string()
-                }));
-        };
-        if !manual_continue_capture_identity_matches(expectation, capture) {
-            let _ = fs::remove_file(&snapshot_path);
-            let _ = fs::remove_file(crop_path);
-            return Err("manual Continue external window identity mismatch".to_string());
-        }
-    }
-    let active_window_crop_path = active_window_capture
-        .as_ref()
-        .map(|(path, _)| path.to_path_buf());
-
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash: None,
-            semantic_fingerprint: SemanticFingerprint::default(),
-            skip_reason: Some("cancellation".to_string()),
-        });
-    }
-
-    let accessibility_text = non_empty(context.text.clone());
-    let accessibility_tree_json = if context.nodes.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&context.nodes).map_err(to_string)?)
-    };
-    let a11y_is_thin = accessibility_text
-        .as_deref()
-        .map(|_| accessibility_is_thin(&context))
-        .unwrap_or(true);
-
-    let active_sck_capture = active_window_capture
-        .as_ref()
-        .and_then(|(_, capture)| (capture.provider == "screen_capture_kit").then_some(capture));
-    let full_sck_capture = (full_capture.provider == "screen_capture_kit").then_some(&full_capture);
-    let sck_capture = active_sck_capture.or(full_sck_capture);
-    let sck_filter_summary_json =
-        sck_capture.and_then(|capture| capture.filter_summary_json.clone());
-    let sck_configuration_summary_json =
-        sck_capture.and_then(|capture| capture.configuration_summary_json.clone());
-    let sck_frame_metadata_json =
-        sck_capture.and_then(|capture| capture.frame_metadata_json.clone());
-    let sck_capture_mode = sck_capture
-        .and_then(|capture| capture.capture_mode.clone())
-        .or_else(|| full_sck_capture.map(|_| "screenshot".to_string()));
-    let sck_audio_policy = sck_capture
-        .and_then(|capture| capture.audio_policy.clone())
-        .or_else(|| full_sck_capture.map(|_| "disabled".to_string()));
-    let metadata = FrameMetadata {
-        capture_provider: full_capture.provider.clone(),
-        active_window_capture_provider: active_window_capture
-            .as_ref()
-            .map(|(_, capture)| capture.provider.clone()),
-        scope: if active_window_capture.is_some() {
-            "active_window".to_string()
-        } else {
-            "active_display".to_string()
-        },
-        display_id: full_capture.display_id.clone().or_else(|| {
-            window_snapshot
-                .as_ref()
-                .and_then(|_| Some("main".to_string()))
-        }),
-        window_id: active_window_id,
-        app_pid: context.app_pid.or_else(|| {
-            if manual_continue_expectation.is_none() {
-                window_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.active_app_pid)
-            } else {
-                None
-            }
-        }),
-        app_bundle_id: context.app_bundle_id.clone().or_else(|| {
-            window_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.active_app_bundle_id.clone())
-        }),
-        screen_scale: sck_capture
-            .and_then(|capture| capture.frame_metadata_json.as_deref())
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| value.get("scale_factor").and_then(Value::as_f64))
-            .filter(|scale| *scale > 0.0)
-            .unwrap_or(1.0),
-        pixel_width: full_capture
-            .width
-            .or_else(|| image_dimensions.map(|(width, _)| width)),
-        pixel_height: full_capture
-            .height
-            .or_else(|| image_dimensions.map(|(_, height)| height)),
-        full_screenshot_path: snapshot_path.to_string_lossy().to_string(),
-        active_window_crop_path: active_window_crop_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string()),
-        active_element_crop_path: None,
-        phash: Some(image_hash.clone()),
-        privacy_status: privacy.status.clone(),
-        sck_display_id: full_sck_capture.and_then(|capture| capture.display_id.clone()),
-        sck_window_id: active_sck_capture.and_then(|capture| capture.window_id),
-        sck_owning_bundle_id: active_sck_capture
-            .and_then(|capture| capture.bundle_id.clone())
-            .or_else(|| full_sck_capture.and_then(|capture| capture.bundle_id.clone())),
-        sck_filter_summary_json,
-        sck_configuration_summary_json,
-        sck_frame_metadata_json,
-        sck_capture_mode,
-        sck_audio_policy,
-    };
-
-    let ocr_source_path = active_window_crop_path.as_deref().unwrap_or(&snapshot_path);
-    let ocr_source_scope = if active_window_crop_path.is_some() {
-        "active_window"
-    } else {
-        "active_display"
-    };
-    fault_injection::cancellation_checkpoint("before_ocr", cancellation)?;
-    let ocr = if accessibility_text.is_none() || a11y_is_thin {
-        increment_maintenance_counter(&conn, "ocr_runs", 1)?;
-        run_ocr(&paths, ocr_source_path, cancellation).unwrap_or_else(|error| OcrOutput {
-            error: Some(error),
-            ..OcrOutput::default()
-        })
-    } else {
-        OcrOutput::default()
-    };
-
-    let ocr_text = non_empty(ocr.text.clone());
-    let ocr_span_drafts = build_ocr_span_drafts(
-        &ocr,
-        &metadata,
-        &context,
-        window_snapshot.as_ref(),
-        ocr_source_scope,
-    )?;
-    let (legacy_text_source, legacy_full_text) = resolve_text(
-        accessibility_text.as_deref(),
-        ocr_text.as_deref(),
-        a11y_is_thin,
-    );
-    let (resolved_text_source, full_text, text_resolution) = resolve_frame_text(
-        accessibility_text.as_deref(),
-        &ocr_span_drafts,
-        a11y_is_thin,
-    );
-    let text_source = resolved_text_source.or(legacy_text_source);
-    let full_text = full_text.or(legacy_full_text);
-    let content_hash = text_resolution.active_content_hash.clone();
-
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("cancellation".to_string()),
-        });
-    }
-
-    if should_skip_dedup(
-        dedupe,
-        previous_image_hash,
-        &image_hash,
-        previous_content_hash,
-        content_hash.as_deref(),
-    ) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("dedupe".to_string()),
-        });
-    }
-
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        let _ = fs::remove_file(&snapshot_path);
-        if let Some(path) = active_window_crop_path.as_ref() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(CaptureOutcome {
-            frame: None,
-            image_hash,
-            content_hash,
-            semantic_fingerprint,
-            skip_reason: Some("cancellation".to_string()),
-        });
-    }
-
-    fault_injection::cancellation_checkpoint("before_persistence", cancellation)?;
-    conn.busy_timeout(Duration::from_millis(500))
-        .map_err(to_string)?;
-    let persistence_result = (|| -> Result<i64, String> {
-        // One short write transaction means Stop can wait on at most one
-        // 500 ms SQLite busy boundary. Cancellation checks between evidence
-        // groups then roll the transaction back instead of leaving a partial
-        // frame or waiting through a series of independent busy timeouts.
-        let tx = conn.unchecked_transaction().map_err(to_string)?;
-        tx.execute(
-            INSERT_FRAME_SQL,
-            params![
-                captured_at,
-                snapshot_path.to_string_lossy().to_string(),
-                context.app_name.clone(),
-                context.window_name.clone(),
-                context.browser_url.clone(),
-                context.document_path.clone(),
-                true,
-                capture_trigger,
-                text_source,
-                accessibility_text.clone(),
-                accessibility_tree_json,
-                full_text.clone(),
-                content_hash.clone(),
-                image_hash,
-                captured_at,
-                metadata.capture_provider,
-                metadata.scope,
-                metadata.display_id,
-                metadata.window_id,
-                metadata.app_pid,
-                metadata.app_bundle_id,
-                metadata.screen_scale,
-                metadata.pixel_width,
-                metadata.pixel_height,
-                metadata.full_screenshot_path,
-                metadata.active_window_crop_path,
-                metadata.active_element_crop_path,
-                metadata.phash,
-                metadata.privacy_status,
-                capture_trigger_id,
-                previous_frame_id,
-                session_id,
-                metadata.sck_display_id,
-                metadata.sck_window_id,
-                metadata.sck_owning_bundle_id,
-                metadata.sck_filter_summary_json,
-                metadata.sck_configuration_summary_json,
-                metadata.sck_frame_metadata_json,
-                metadata.sck_capture_mode,
-                metadata.sck_audio_policy,
-            ],
-        )
-        .map_err(to_string)?;
-
-        let frame_id = tx.last_insert_rowid();
-        tx.execute(
-            "UPDATE capture_sessions
-             SET frame_count = frame_count + 1
-             WHERE id = ?1",
-            params![session_id],
-        )
-        .map_err(to_string)?;
-        capture_persistence_checkpoint(cancellation)?;
-        if let Some(provider) = metadata.active_window_capture_provider.as_deref() {
-            tx.execute(
-                "UPDATE frames SET active_window_capture_provider = ?2 WHERE id = ?1",
-                params![frame_id, provider],
-            )
-            .map_err(to_string)?;
-        }
-        persist_frame_text_resolution(&tx, frame_id, &text_resolution)?;
-        capture_persistence_checkpoint(cancellation)?;
-
-        let mut ocr_text_for_fts = None;
-        if let Some(text) = ocr_text.as_ref() {
-            ocr_text_for_fts = Some(text.clone());
-            tx.execute(
-                "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![frame_id, text, ocr.text_json, ocr.engine],
-            )
-            .map_err(to_string)?;
-        }
-        if let Some(snapshot) = window_snapshot.as_ref() {
-            persist_window_snapshot(&tx, frame_id, snapshot)?;
-        }
-        capture_persistence_checkpoint(cancellation)?;
-
-        let ax_node_ids = persist_ax_nodes(&tx, frame_id, &context)?;
-        capture_persistence_checkpoint(cancellation)?;
-        let ocr_span_ids = persist_ocr_spans(&tx, frame_id, &ocr, &ocr_span_drafts)?;
-        persist_app_contexts(&tx, frame_id, &context)?;
-        capture_persistence_checkpoint(cancellation)?;
-        persist_content_units(
-            &tx,
-            frame_id,
+            session_id,
+            capture_trigger,
+            captured_at,
             &context,
-            &ax_node_ids,
-            &ocr_span_ids,
-            metadata.pixel_width,
-            metadata.pixel_height,
-        )?;
-        let content_unit_count = tx
-            .query_row(
-                "SELECT COUNT(*) FROM content_units WHERE frame_id = ?1",
-                params![frame_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(to_string)?;
-        tx.execute(
-            "UPDATE capture_sessions
-             SET content_unit_count = content_unit_count + ?2
-             WHERE id = ?1",
-            params![session_id, content_unit_count],
-        )
-        .map_err(to_string)?;
-        persist_sensitive_regions(&tx, frame_id, &context, &privacy)?;
-        persist_presence_sample(&tx, session_id, &context)?;
-        capture_persistence_checkpoint(cancellation)?;
-        if let Some(previous) = previous_frame_id {
-            persist_frame_diff(
-                &tx,
-                session_id,
-                previous,
-                &frame_id.to_string(),
-                capture_trigger,
-                full_text.as_deref(),
-                ocr_text_for_fts.as_deref(),
-            )?;
+            &semantic_fingerprint,
+            previous_semantic_fingerprint,
+        )? {
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash: stable_hash_bytes(
+                    format!(
+                        "budget-skip:{}:{}:{}",
+                        capture_trigger, skip_reason, captured_at
+                    )
+                    .as_bytes(),
+                ),
+                content_hash: semantic_fingerprint.text_hash.clone(),
+                semantic_fingerprint,
+                skip_reason: Some(skip_reason),
+            });
         }
-        capture_persistence_checkpoint(cancellation)?;
-        tx.commit().map_err(to_string)?;
-        Ok(frame_id)
-    })();
-    let frame_id = match persistence_result {
-        Ok(frame_id) => frame_id,
-        Err(error) => {
+
+        fault_injection::cancellation_checkpoint("before_window_snapshot", cancellation)?;
+        let window_snapshot =
+            collect_window_snapshot(&paths, WINDOW_SNAPSHOT_DEADLINE, cancellation).ok();
+        // A manual Continue request targets the last verified external surface.
+        // Once Smalltalk is frontmost, the current active window is Smalltalk and
+        // must never be substituted for a missing external target.
+        let mut active_window_id = resolve_capture_window_id(
+            context.window_id,
+            window_snapshot.as_ref(),
+            manual_continue_expectation.is_some(),
+        );
+
+        fault_injection::cancellation_checkpoint("before_screenshot", cancellation)?;
+        if automatic_capture_cancelled() {
+            return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+        }
+        let snapshot_path = day_dir.join(format!("{}_full.jpg", captured_at));
+        let full_capture = capture_screenshot(&paths, &conn, &snapshot_path, cancellation)?;
+        if automatic_capture_cancelled() {
+            let _ = fs::remove_file(&snapshot_path);
+            return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+        }
+        let image_bytes = fs::read(&snapshot_path).map_err(to_string)?;
+        let image_hash = stable_hash_bytes(&image_bytes);
+        let image_dimensions = jpeg_dimensions(&image_bytes);
+        let mut active_window_capture_error = None;
+        let mut active_window_capture = if let Some(window_id) = active_window_id {
+            let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
+            match capture_window_screenshot(
+                &paths,
+                &conn,
+                window_id,
+                &crop_path,
+                context.app_bundle_id.as_deref(),
+                cancellation,
+            ) {
+                Ok(capture) => Some((crop_path, capture)),
+                Err(error) => {
+                    active_window_capture_error = Some(error);
+                    None
+                }
+            }
+        } else if let Some(expected_bundle) = manual_continue_expectation
+            .and_then(|expected| expected.app_bundle_id.as_deref())
+            .filter(|bundle_id| !bundle_id.trim().is_empty())
+        {
+            let crop_path = day_dir.join(format!("{}_window.jpg", captured_at));
+            match capture_sck_screenshot(
+                &paths,
+                "active_window",
+                &crop_path,
+                None,
+                Some(expected_bundle),
+                false,
+                cancellation,
+            ) {
+                Ok(capture) => {
+                    active_window_id = capture.window_id;
+                    Some((crop_path, capture))
+                }
+                Err(failure) => {
+                    active_window_capture_error = Some(failure.message);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((_, capture)) = active_window_capture.as_mut() {
+            annotate_capture_with_window_owner(capture, window_snapshot.as_ref());
+        }
+        if let Some(expectation) = manual_continue_expectation {
+            let Some((crop_path, capture)) = active_window_capture.as_ref() else {
+                let _ = fs::remove_file(&snapshot_path);
+                return Err(active_window_capture_error
+                    .map(|error| {
+                        format!("manual Continue external window capture unavailable: {error}")
+                    })
+                    .unwrap_or_else(|| {
+                        "manual Continue external window capture unavailable".to_string()
+                    }));
+            };
+            if !manual_continue_capture_identity_matches(expectation, capture) {
+                let _ = fs::remove_file(&snapshot_path);
+                let _ = fs::remove_file(crop_path);
+                return Err("manual Continue external window identity mismatch".to_string());
+            }
+        }
+        let active_window_crop_path = active_window_capture
+            .as_ref()
+            .map(|(path, _)| path.to_path_buf());
+
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
             let _ = fs::remove_file(&snapshot_path);
             if let Some(path) = active_window_crop_path.as_ref() {
                 let _ = fs::remove_file(path);
             }
-            return Err(error);
+            if automatic_capture_cancelled() {
+                return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+            }
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash,
+                content_hash: None,
+                semantic_fingerprint: SemanticFingerprint::default(),
+                skip_reason: Some("cancellation".to_string()),
+            });
         }
-    };
-    let stored_frame = CaptureFrame {
-        id: frame_id,
-        captured_at,
-        snapshot_path: snapshot_path.to_string_lossy().to_string(),
-        app_name: context.app_name.clone(),
-        window_name: context.window_name.clone(),
-        browser_url: context.browser_url.clone(),
-        document_path: context.document_path.clone(),
-        focused: true,
-        capture_trigger: capture_trigger.to_string(),
-        text_source: text_source.map(str::to_string),
-        accessibility_text: accessibility_text.clone(),
-        accessibility_tree_json: None,
-        full_text: full_text.clone(),
-        content_hash: content_hash.clone(),
-        image_hash: None,
-        capture_provider: Some(metadata.capture_provider.clone()),
-        active_window_capture_provider: metadata.active_window_capture_provider.clone(),
-        scope: Some(metadata.scope.clone()),
-        display_id: metadata.display_id.clone(),
-        window_id: metadata.window_id,
-        app_pid: metadata.app_pid,
-        app_bundle_id: metadata.app_bundle_id.clone(),
-        screen_scale: Some(metadata.screen_scale),
-        pixel_width: metadata.pixel_width,
-        pixel_height: metadata.pixel_height,
-        full_screenshot_path: Some(metadata.full_screenshot_path.clone()),
-        active_window_crop_path: metadata.active_window_crop_path.clone(),
-        active_element_crop_path: metadata.active_element_crop_path.clone(),
-        phash: metadata.phash.clone(),
-        privacy_status: Some(metadata.privacy_status.clone()),
-        capture_trigger_id: capture_trigger_id.map(str::to_string),
-        previous_frame_id: previous_frame_id.map(str::to_string),
-        session_id: Some(session_id.to_string()),
-        sck_display_id: metadata.sck_display_id.clone(),
-        sck_window_id: metadata.sck_window_id,
-        sck_owning_bundle_id: metadata.sck_owning_bundle_id.clone(),
-        sck_filter_summary_json: metadata.sck_filter_summary_json.clone(),
-        sck_configuration_summary_json: metadata.sck_configuration_summary_json.clone(),
-        sck_frame_metadata_json: metadata.sck_frame_metadata_json.clone(),
-        sck_capture_mode: metadata.sck_capture_mode.clone(),
-        sck_audio_policy: metadata.sck_audio_policy.clone(),
-    };
-    let _ = validate_frame_consistency_inner(&conn, &stored_frame);
-    if !cancellation.is_some_and(CancellationToken::is_cancelled) {
-        let frame_key = frame_id.to_string();
-        let enrichment_ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap_or_default();
-        let enrichment_ocr_spans = query_ocr_spans(&conn, &frame_key).unwrap_or_default();
-        let enrichment_content_units =
-            query_content_units_for_frame(&conn, &frame_key).unwrap_or_default();
-        let enrichment_app_contexts = query_app_contexts(&conn, &frame_key).unwrap_or_default();
-        let enrichment_events = query_events_for_frame(&conn, &stored_frame).unwrap_or_default();
-        let _ = persist_frame_surface_enrichment(
-            &conn,
-            &stored_frame,
-            &enrichment_content_units,
-            &enrichment_app_contexts,
-            &enrichment_ax_nodes,
-            &enrichment_ocr_spans,
-            &enrichment_events,
+
+        let accessibility_text = non_empty(context.text.clone());
+        let accessibility_tree_json = if context.nodes.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&context.nodes).map_err(to_string)?)
+        };
+        let a11y_is_thin = accessibility_text
+            .as_deref()
+            .map(|_| accessibility_is_thin(&context))
+            .unwrap_or(true);
+
+        let active_sck_capture = active_window_capture
+            .as_ref()
+            .and_then(|(_, capture)| (capture.provider == "screen_capture_kit").then_some(capture));
+        let full_sck_capture =
+            (full_capture.provider == "screen_capture_kit").then_some(&full_capture);
+        let sck_capture = active_sck_capture.or(full_sck_capture);
+        let sck_filter_summary_json =
+            sck_capture.and_then(|capture| capture.filter_summary_json.clone());
+        let sck_configuration_summary_json =
+            sck_capture.and_then(|capture| capture.configuration_summary_json.clone());
+        let sck_frame_metadata_json =
+            sck_capture.and_then(|capture| capture.frame_metadata_json.clone());
+        let sck_capture_mode = sck_capture
+            .and_then(|capture| capture.capture_mode.clone())
+            .or_else(|| full_sck_capture.map(|_| "screenshot".to_string()));
+        let sck_audio_policy = sck_capture
+            .and_then(|capture| capture.audio_policy.clone())
+            .or_else(|| full_sck_capture.map(|_| "disabled".to_string()));
+        let metadata = FrameMetadata {
+            capture_provider: full_capture.provider.clone(),
+            active_window_capture_provider: active_window_capture
+                .as_ref()
+                .map(|(_, capture)| capture.provider.clone()),
+            scope: if active_window_capture.is_some() {
+                "active_window".to_string()
+            } else {
+                "active_display".to_string()
+            },
+            display_id: full_capture.display_id.clone().or_else(|| {
+                window_snapshot
+                    .as_ref()
+                    .and_then(|_| Some("main".to_string()))
+            }),
+            window_id: active_window_id,
+            app_pid: context.app_pid.or_else(|| {
+                if manual_continue_expectation.is_none() {
+                    window_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.active_app_pid)
+                } else {
+                    None
+                }
+            }),
+            app_bundle_id: context.app_bundle_id.clone().or_else(|| {
+                window_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.active_app_bundle_id.clone())
+            }),
+            screen_scale: sck_capture
+                .and_then(|capture| capture.frame_metadata_json.as_deref())
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|value| value.get("scale_factor").and_then(Value::as_f64))
+                .filter(|scale| *scale > 0.0)
+                .unwrap_or(1.0),
+            pixel_width: full_capture
+                .width
+                .or_else(|| image_dimensions.map(|(width, _)| width)),
+            pixel_height: full_capture
+                .height
+                .or_else(|| image_dimensions.map(|(_, height)| height)),
+            full_screenshot_path: snapshot_path.to_string_lossy().to_string(),
+            active_window_crop_path: active_window_crop_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            active_element_crop_path: None,
+            phash: Some(image_hash.clone()),
+            privacy_status: privacy.status.clone(),
+            sck_display_id: full_sck_capture.and_then(|capture| capture.display_id.clone()),
+            sck_window_id: active_sck_capture.and_then(|capture| capture.window_id),
+            sck_owning_bundle_id: active_sck_capture
+                .and_then(|capture| capture.bundle_id.clone())
+                .or_else(|| full_sck_capture.and_then(|capture| capture.bundle_id.clone())),
+            sck_filter_summary_json,
+            sck_configuration_summary_json,
+            sck_frame_metadata_json,
+            sck_capture_mode,
+            sck_audio_policy,
+        };
+
+        let ocr_source_path = active_window_crop_path.as_deref().unwrap_or(&snapshot_path);
+        if automatic_capture_cancelled() {
+            let _ = fs::remove_file(&snapshot_path);
+            if let Some(path) = active_window_crop_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+        }
+        let ocr_source_scope = if active_window_crop_path.is_some() {
+            "active_window"
+        } else {
+            "active_display"
+        };
+        fault_injection::cancellation_checkpoint("before_ocr", cancellation)?;
+        let ocr = if accessibility_text.is_none() || a11y_is_thin {
+            increment_maintenance_counter(&conn, "ocr_runs", 1)?;
+            run_ocr(&paths, ocr_source_path, cancellation).unwrap_or_else(|error| OcrOutput {
+                error: Some(error),
+                ..OcrOutput::default()
+            })
+        } else {
+            OcrOutput::default()
+        };
+
+        let ocr_text = non_empty(ocr.text.clone());
+        let ocr_span_drafts = build_ocr_span_drafts(
+            &ocr,
+            &metadata,
+            &context,
             window_snapshot.as_ref(),
+            ocr_source_scope,
+        )?;
+        let (legacy_text_source, legacy_full_text) = resolve_text(
+            accessibility_text.as_deref(),
+            ocr_text.as_deref(),
+            a11y_is_thin,
         );
-    }
+        let (resolved_text_source, full_text, text_resolution) = resolve_frame_text(
+            accessibility_text.as_deref(),
+            &ocr_span_drafts,
+            a11y_is_thin,
+        );
+        let text_source = resolved_text_source.or(legacy_text_source);
+        let full_text = full_text.or(legacy_full_text);
+        let content_hash = text_resolution.active_content_hash.clone();
 
-    let mut frame =
-        get_frame(app.clone(), frame_id)?.ok_or_else(|| "stored frame missing".to_string())?;
-    if frame.full_text.is_none() {
-        let mut notes = Vec::new();
-        if let Some(error) = context.error {
-            notes.push(format!("accessibility: {}", error));
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let _ = fs::remove_file(&snapshot_path);
+            if let Some(path) = active_window_crop_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            if automatic_capture_cancelled() {
+                return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+            }
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash,
+                content_hash,
+                semantic_fingerprint,
+                skip_reason: Some("cancellation".to_string()),
+            });
         }
-        if let Some(error) = ocr.error {
-            notes.push(format!("ocr: {}", error));
-        }
-        if !notes.is_empty() {
-            frame.full_text = Some(notes.join("\n"));
-        }
-    }
 
-    Ok(CaptureOutcome {
-        frame: Some(frame),
-        image_hash,
-        content_hash,
-        semantic_fingerprint,
-        skip_reason: None,
-    })
+        if should_skip_dedup(
+            dedupe,
+            previous_image_hash,
+            &image_hash,
+            previous_content_hash,
+            content_hash.as_deref(),
+        ) {
+            let _ = fs::remove_file(&snapshot_path);
+            if let Some(path) = active_window_crop_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash,
+                content_hash,
+                semantic_fingerprint,
+                skip_reason: Some("dedupe".to_string()),
+            });
+        }
+
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let _ = fs::remove_file(&snapshot_path);
+            if let Some(path) = active_window_crop_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            if automatic_capture_cancelled() {
+                return Err("automatic_capture_superseded_by_manual_boundary".to_string());
+            }
+            return Ok(CaptureOutcome {
+                frame: None,
+                image_hash,
+                content_hash,
+                semantic_fingerprint,
+                skip_reason: Some("cancellation".to_string()),
+            });
+        }
+
+        fault_injection::cancellation_checkpoint("before_persistence", cancellation)?;
+        conn.busy_timeout(Duration::from_millis(500))
+            .map_err(to_string)?;
+        let persistence_result = (|| -> Result<i64, String> {
+            // One short write transaction means Stop can wait on at most one
+            // 500 ms SQLite busy boundary. Cancellation checks between evidence
+            // groups then roll the transaction back instead of leaving a partial
+            // frame or waiting through a series of independent busy timeouts.
+            let tx = conn.unchecked_transaction().map_err(to_string)?;
+            tx.execute(
+                INSERT_FRAME_SQL,
+                params![
+                    captured_at,
+                    snapshot_path.to_string_lossy().to_string(),
+                    context.app_name.clone(),
+                    context.window_name.clone(),
+                    context.browser_url.clone(),
+                    context.document_path.clone(),
+                    true,
+                    capture_trigger,
+                    text_source,
+                    accessibility_text.clone(),
+                    accessibility_tree_json,
+                    full_text.clone(),
+                    content_hash.clone(),
+                    image_hash,
+                    captured_at,
+                    metadata.capture_provider,
+                    metadata.scope,
+                    metadata.display_id,
+                    metadata.window_id,
+                    metadata.app_pid,
+                    metadata.app_bundle_id,
+                    metadata.screen_scale,
+                    metadata.pixel_width,
+                    metadata.pixel_height,
+                    metadata.full_screenshot_path,
+                    metadata.active_window_crop_path,
+                    metadata.active_element_crop_path,
+                    metadata.phash,
+                    metadata.privacy_status,
+                    capture_trigger_id,
+                    previous_frame_id,
+                    session_id,
+                    metadata.sck_display_id,
+                    metadata.sck_window_id,
+                    metadata.sck_owning_bundle_id,
+                    metadata.sck_filter_summary_json,
+                    metadata.sck_configuration_summary_json,
+                    metadata.sck_frame_metadata_json,
+                    metadata.sck_capture_mode,
+                    metadata.sck_audio_policy,
+                ],
+            )
+            .map_err(to_string)?;
+
+            let frame_id = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE capture_sessions
+             SET frame_count = frame_count + 1
+             WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(to_string)?;
+            capture_persistence_checkpoint(cancellation)?;
+            if let Some(provider) = metadata.active_window_capture_provider.as_deref() {
+                tx.execute(
+                    "UPDATE frames SET active_window_capture_provider = ?2 WHERE id = ?1",
+                    params![frame_id, provider],
+                )
+                .map_err(to_string)?;
+            }
+            persist_frame_text_resolution(&tx, frame_id, &text_resolution)?;
+            capture_persistence_checkpoint(cancellation)?;
+
+            let mut ocr_text_for_fts = None;
+            if let Some(text) = ocr_text.as_ref() {
+                ocr_text_for_fts = Some(text.clone());
+                tx.execute(
+                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine)
+                 VALUES (?1, ?2, ?3, ?4)",
+                    params![frame_id, text, ocr.text_json, ocr.engine],
+                )
+                .map_err(to_string)?;
+            }
+            if let Some(snapshot) = window_snapshot.as_ref() {
+                persist_window_snapshot(&tx, frame_id, snapshot)?;
+            }
+            capture_persistence_checkpoint(cancellation)?;
+
+            let ax_node_ids = persist_ax_nodes(&tx, frame_id, &context)?;
+            capture_persistence_checkpoint(cancellation)?;
+            let ocr_span_ids = persist_ocr_spans(&tx, frame_id, &ocr, &ocr_span_drafts)?;
+            persist_app_contexts(&tx, frame_id, &context)?;
+            capture_persistence_checkpoint(cancellation)?;
+            persist_content_units(
+                &tx,
+                frame_id,
+                &context,
+                &ax_node_ids,
+                &ocr_span_ids,
+                metadata.pixel_width,
+                metadata.pixel_height,
+            )?;
+            let content_unit_count = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM content_units WHERE frame_id = ?1",
+                    params![frame_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(to_string)?;
+            tx.execute(
+                "UPDATE capture_sessions
+             SET content_unit_count = content_unit_count + ?2
+             WHERE id = ?1",
+                params![session_id, content_unit_count],
+            )
+            .map_err(to_string)?;
+            persist_sensitive_regions(&tx, frame_id, &context, &privacy)?;
+            persist_presence_sample(&tx, session_id, &context)?;
+            capture_persistence_checkpoint(cancellation)?;
+            if let Some(previous) = previous_frame_id {
+                persist_frame_diff(
+                    &tx,
+                    session_id,
+                    previous,
+                    &frame_id.to_string(),
+                    capture_trigger,
+                    full_text.as_deref(),
+                    ocr_text_for_fts.as_deref(),
+                )?;
+            }
+            capture_persistence_checkpoint(cancellation)?;
+            tx.commit().map_err(to_string)?;
+            Ok(frame_id)
+        })();
+        let frame_id = match persistence_result {
+            Ok(frame_id) => frame_id,
+            Err(error) => {
+                let _ = fs::remove_file(&snapshot_path);
+                if let Some(path) = active_window_crop_path.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
+        let stored_frame = CaptureFrame {
+            id: frame_id,
+            captured_at,
+            snapshot_path: snapshot_path.to_string_lossy().to_string(),
+            app_name: context.app_name.clone(),
+            window_name: context.window_name.clone(),
+            browser_url: context.browser_url.clone(),
+            document_path: context.document_path.clone(),
+            focused: true,
+            capture_trigger: capture_trigger.to_string(),
+            text_source: text_source.map(str::to_string),
+            accessibility_text: accessibility_text.clone(),
+            accessibility_tree_json: None,
+            full_text: full_text.clone(),
+            content_hash: content_hash.clone(),
+            image_hash: None,
+            capture_provider: Some(metadata.capture_provider.clone()),
+            active_window_capture_provider: metadata.active_window_capture_provider.clone(),
+            scope: Some(metadata.scope.clone()),
+            display_id: metadata.display_id.clone(),
+            window_id: metadata.window_id,
+            app_pid: metadata.app_pid,
+            app_bundle_id: metadata.app_bundle_id.clone(),
+            screen_scale: Some(metadata.screen_scale),
+            pixel_width: metadata.pixel_width,
+            pixel_height: metadata.pixel_height,
+            full_screenshot_path: Some(metadata.full_screenshot_path.clone()),
+            active_window_crop_path: metadata.active_window_crop_path.clone(),
+            active_element_crop_path: metadata.active_element_crop_path.clone(),
+            phash: metadata.phash.clone(),
+            privacy_status: Some(metadata.privacy_status.clone()),
+            capture_trigger_id: capture_trigger_id.map(str::to_string),
+            previous_frame_id: previous_frame_id.map(str::to_string),
+            session_id: Some(session_id.to_string()),
+            sck_display_id: metadata.sck_display_id.clone(),
+            sck_window_id: metadata.sck_window_id,
+            sck_owning_bundle_id: metadata.sck_owning_bundle_id.clone(),
+            sck_filter_summary_json: metadata.sck_filter_summary_json.clone(),
+            sck_configuration_summary_json: metadata.sck_configuration_summary_json.clone(),
+            sck_frame_metadata_json: metadata.sck_frame_metadata_json.clone(),
+            sck_capture_mode: metadata.sck_capture_mode.clone(),
+            sck_audio_policy: metadata.sck_audio_policy.clone(),
+        };
+        let _ = validate_frame_consistency_inner(&conn, &stored_frame);
+        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let frame_key = frame_id.to_string();
+            let enrichment_ax_nodes = query_ax_nodes(&conn, &frame_key).unwrap_or_default();
+            let enrichment_ocr_spans = query_ocr_spans(&conn, &frame_key).unwrap_or_default();
+            let enrichment_content_units =
+                query_content_units_for_frame(&conn, &frame_key).unwrap_or_default();
+            let enrichment_app_contexts = query_app_contexts(&conn, &frame_key).unwrap_or_default();
+            let enrichment_events =
+                query_events_for_frame(&conn, &stored_frame).unwrap_or_default();
+            let _ = persist_frame_surface_enrichment(
+                &conn,
+                &stored_frame,
+                &enrichment_content_units,
+                &enrichment_app_contexts,
+                &enrichment_ax_nodes,
+                &enrichment_ocr_spans,
+                &enrichment_events,
+                window_snapshot.as_ref(),
+            );
+        }
+
+        let mut frame =
+            get_frame(app.clone(), frame_id)?.ok_or_else(|| "stored frame missing".to_string())?;
+        if frame.full_text.is_none() {
+            let mut notes = Vec::new();
+            if let Some(error) = context.error {
+                notes.push(format!("accessibility: {}", error));
+            }
+            if let Some(error) = ocr.error {
+                notes.push(format!("ocr: {}", error));
+            }
+            if !notes.is_empty() {
+                frame.full_text = Some(notes.join("\n"));
+            }
+        }
+
+        Ok(CaptureOutcome {
+            frame: Some(frame),
+            image_hash,
+            content_hash,
+            semantic_fingerprint,
+            skip_reason: None,
+        })
+    })();
+    match &result {
+        Err(_) if automatic_capture_cancelled() => capture_permit.mark_superseded(),
+        Err(_) => capture_permit.mark_failed(),
+        Ok(outcome) if outcome.skip_reason.as_deref() == Some("cancellation") => {
+            if automatic_capture_cancelled() {
+                capture_permit.mark_superseded();
+            } else {
+                capture_permit.mark_cancelled();
+            }
+        }
+        Ok(_) => {}
+    }
+    if result.is_err() && automatic_capture_cancelled() {
+        Err("automatic_capture_superseded_by_manual_boundary".to_string())
+    } else {
+        result
+    }
 }
 
 fn capture_persistence_checkpoint(cancellation: Option<&CancellationToken>) -> Result<(), String> {
@@ -20043,7 +20286,10 @@ fn should_skip_heavy_capture_for_budget(
 }
 
 fn is_manual_or_start_capture(capture_trigger: &str) -> bool {
-    matches!(capture_trigger, "manual" | "session_start")
+    matches!(
+        capture_trigger,
+        "manual" | "manual_continue_boundary" | "session_start"
+    )
 }
 
 fn is_important_capture_trigger(capture_trigger: &str) -> bool {
@@ -20197,6 +20443,9 @@ fn capture_status_snapshot_inner(
         .as_ref()
         .and_then(|conn| local_signal_count(conn, scoped_session_id).ok())
         .unwrap_or(counts.frames);
+    let continue_evidence_watermark_hash = conn.as_ref().and_then(|conn| {
+        crate::continuation::current_continue_evidence_watermark_hash(conn, scoped_session_id).ok()
+    });
 
     let mut status = CaptureStatus {
         running,
@@ -20213,6 +20462,7 @@ fn capture_status_snapshot_inner(
         started_at,
         last_error,
         latest_frame: latest_frame.or(runtime_latest_frame),
+        continue_evidence_watermark_hash,
         skipped_samples,
         last_skipped_at,
         data_dir: paths.root_dir.to_string_lossy().to_string(),
@@ -28101,8 +28351,13 @@ fn open_readonly_db(app: &AppHandle) -> Result<Connection, String> {
 }
 
 fn configure_db_connection(conn: &Connection, writable: bool) -> Result<(), String> {
-    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(to_string)?;
-    let _ = conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    let busy_timeout = if writable {
+        SQLITE_WRITE_BUSY_TIMEOUT
+    } else {
+        SQLITE_READ_BUSY_TIMEOUT
+    };
+    conn.busy_timeout(busy_timeout).map_err(to_string)?;
+    let _ = conn.pragma_update(None, "busy_timeout", busy_timeout.as_millis() as i64);
     if writable {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
@@ -30792,6 +31047,19 @@ fn update_error(state: &Arc<Mutex<CaptureRuntime>>, error: String) {
     runtime.last_error = Some(error);
 }
 
+fn clear_transient_database_error(state: &Arc<Mutex<CaptureRuntime>>) {
+    let mut runtime = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if runtime
+        .last_error
+        .as_deref()
+        .is_some_and(sqlite_error_is_busy)
+    {
+        runtime.last_error = None;
+    }
+}
+
 fn update_error_and_island(app: &AppHandle, state: &Arc<Mutex<CaptureRuntime>>, error: String) {
     update_error(state, error);
     if let Ok(status) = capture_status_snapshot_inner(app, state) {
@@ -31101,6 +31369,43 @@ mod tests {
         drop(locking);
         invalidate_database_generation(&paths.db_path);
         let _ = fs::remove_dir_all(&paths.root_dir);
+    }
+
+    #[test]
+    fn configured_writes_wait_longer_than_status_reads() {
+        let paths = temporary_capture_paths("busy-timeouts");
+        ensure_database_initialized(&paths).unwrap();
+        let writer = open_db_at_path(&paths.db_path, true).unwrap();
+        let reader = open_db_at_path(&paths.db_path, false).unwrap();
+        let writer_timeout: i64 = writer
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let reader_timeout: i64 = reader
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(writer_timeout, SQLITE_WRITE_BUSY_TIMEOUT.as_millis() as i64);
+        assert_eq!(reader_timeout, SQLITE_READ_BUSY_TIMEOUT.as_millis() as i64);
+        drop(reader);
+        drop(writer);
+        invalidate_database_generation(&paths.db_path);
+        let _ = fs::remove_dir_all(&paths.root_dir);
+    }
+
+    #[test]
+    fn successful_event_ingest_clears_only_transient_database_errors() {
+        let state = Arc::new(Mutex::new(CaptureRuntime {
+            last_error: Some("database is locked".into()),
+            ..Default::default()
+        }));
+        clear_transient_database_error(&state);
+        assert!(state.lock().unwrap().last_error.is_none());
+
+        state.lock().unwrap().last_error = Some("screen permission denied".into());
+        clear_transient_database_error(&state);
+        assert_eq!(
+            state.lock().unwrap().last_error.as_deref(),
+            Some("screen permission denied")
+        );
     }
 
     #[test]
@@ -31541,6 +31846,70 @@ mod tests {
     }
 
     #[test]
+    fn manual_continue_boundary_bypasses_rolling_budget_but_background_capture_does_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let now = now_millis();
+        for index in 0..MAX_SCREENSHOT_FRAMES_PER_10_MINUTES {
+            conn.execute(
+                "INSERT INTO frames (
+                    session_id, captured_at, snapshot_path, focused,
+                    capture_trigger, created_at
+                 ) VALUES ('session-a', ?1, ?2, 1, 'click', ?1)",
+                params![now - index, format!("/tmp/budget-frame-{index}.jpg")],
+            )
+            .unwrap();
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("smalltalk-manual-boundary-budget-test-{}", now));
+        let paths = CapturePaths {
+            root_dir: root.clone(),
+            snapshot_dir: root.join("snapshots"),
+            db_path: root.join("smalltalk-capture.sqlite"),
+        };
+        fs::create_dir_all(&paths.snapshot_dir).unwrap();
+        let context = AccessibilityContext {
+            app_bundle_id: Some("com.example.browser".to_string()),
+            app_name: Some("Browser".to_string()),
+            window_name: Some("Chat".to_string()),
+            text: "unfinished task".to_string(),
+            ..Default::default()
+        };
+        let fingerprint = SemanticFingerprint::from_context(&context);
+
+        let background = should_skip_heavy_capture_for_budget(
+            &conn,
+            &paths,
+            "session-a",
+            "click",
+            now,
+            &context,
+            &fingerprint,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            background.as_deref(),
+            Some("rolling_screenshot_budget_exhausted")
+        );
+
+        let manual_boundary = should_skip_heavy_capture_for_budget(
+            &conn,
+            &paths,
+            "session-a",
+            "manual_continue_boundary",
+            now,
+            &context,
+            &fingerprint,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manual_boundary, None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn low_value_event_bursts_use_long_heavy_capture_interval() {
         let (_, scroll_settle) = normalize_event_trigger("scroll").unwrap();
         let (_, key_settle) = normalize_event_trigger("key_down").unwrap();
@@ -31741,7 +32110,7 @@ mod tests {
             "smalltalk-manual-anchor-{}-code.png",
             std::process::id()
         ));
-        fs::write(&readable_image, b"test-image").unwrap();
+        fs::write(&readable_image, b"not-an-image").unwrap();
         conn.execute(
             "INSERT INTO frames (
                session_id, captured_at, snapshot_path, app_name, focused,
@@ -31752,22 +32121,36 @@ mod tests {
             params![readable_image.to_string_lossy().as_ref()],
         )
         .unwrap();
+        assert!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_200)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(&readable_image, tiny_png()).unwrap();
         assert_eq!(
             manual_continue_anchor_once(&conn, "session-a", Some(&event), 1_200).unwrap(),
             Some("2".to_string())
         );
+        assert!(
+            manual_continue_anchor_once(&conn, "session-a", Some(&event), 7_000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(manual_continue_anchor_once(&conn, "session-a", None, 1_200)
+            .unwrap()
+            .is_none());
         let _ = fs::remove_file(readable_image);
     }
 
     #[test]
-    fn manual_continue_can_fall_back_to_a_recent_matching_external_frame() {
+    fn manual_continue_fallback_rejects_pre_event_and_accepts_exact_post_event_frame() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let readable_image = std::env::temp_dir().join(format!(
             "smalltalk-manual-fallback-anchor-{}-helium.png",
             std::process::id()
         ));
-        fs::write(&readable_image, b"test-image").unwrap();
+        fs::write(&readable_image, tiny_png()).unwrap();
         conn.execute(
             "INSERT INTO frames (
                session_id, captured_at, snapshot_path, app_name, window_name, focused,
@@ -31792,20 +32175,129 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            recent_manual_continue_fallback_anchor(&conn, "session-a", &event, 1_100).unwrap(),
-            Some("1".to_string())
+        assert!(
+            recent_manual_continue_fallback_anchor(&conn, "session-a", &event, 1_100, 1_100)
+                .unwrap()
+                .is_none()
         );
+
+        conn.execute(
+            "INSERT INTO frames (
+               session_id, captured_at, snapshot_path, app_name, window_name, focused,
+               capture_trigger, created_at, app_bundle_id, privacy_status,
+               full_screenshot_path
+             ) VALUES ('session-a',1050,?1,'Helium','Usage - OpenAI API',1,
+                       'surface_change',1050,'net.imput.helium','normal',?1)",
+            params![readable_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        assert_eq!(
+            recent_manual_continue_fallback_anchor(&conn, "session-a", &event, 1_100, 1_100,)
+                .unwrap(),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            recent_manual_continue_fallback_anchor(&conn, "session-a", &event, 1_100, 9_000,)
+                .unwrap(),
+            Some("2".to_string()),
+            "capture wait duration must not age out a frame that was immediate at the button press"
+        );
+        let failed_trigger = PendingTrigger {
+            id: "manual-trigger-1".to_string(),
+            capture_trigger: "manual_continue_boundary".to_string(),
+            caused_by_event_ids: Vec::new(),
+            caused_event_count: 0,
+            omitted_event_count: 0,
+            pre_frame_id: Some("1".to_string()),
+            settle_delay_ms: 0,
+            ready_at: Instant::now(),
+        };
+        insert_capture_trigger(
+            &conn,
+            "session-a",
+            &failed_trigger,
+            1_075,
+            false,
+            "manual_bypass",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE capture_triggers SET status='failed', error='capture_helper_timeout' WHERE id=?1",
+            params![failed_trigger.id],
+        )
+        .unwrap();
+        let reuse_trigger = record_manual_continue_frame_reuse(
+            &conn,
+            "session-a",
+            "2",
+            "post_capture_failure_exact_anchor",
+            Some(&failed_trigger.id),
+            Some("1"),
+            Some("capture_helper_timeout"),
+        )
+        .unwrap();
+        let (trigger_type, status, policy, post_frame_id, audit): (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT trigger_type, status, dedupe_policy, post_frame_id, aggregation_json
+                 FROM capture_triggers WHERE id=?1",
+                params![reuse_trigger],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(trigger_type, "manual_continue_boundary");
+        assert_eq!(status, "captured");
+        assert_eq!(policy, "exact_frame_reuse");
+        assert_eq!(post_frame_id.as_deref(), Some("2"));
+        assert!(audit.contains("post_capture_failure_exact_anchor"));
+        assert!(audit.contains("capture_helper_timeout"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM capture_triggers WHERE trigger_type='manual_continue_boundary'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(record_manual_continue_frame_reuse(
+            &conn,
+            "session-a",
+            "2",
+            "post_capture_failure_exact_anchor",
+            Some("missing-trigger"),
+            Some("1"),
+            Some("capture_helper_timeout"),
+        )
+        .unwrap_err()
+        .contains("manual_continue_frame_reuse_trigger_missing"));
 
         let different_page = ManualContinueExternalEvent {
             window_title: Some("Logs - OpenAI API - Helium".to_string()),
             ..event
         };
-        assert!(
-            recent_manual_continue_fallback_anchor(&conn, "session-a", &different_page, 1_100)
-                .unwrap()
-                .is_none()
-        );
+        assert!(recent_manual_continue_fallback_anchor(
+            &conn,
+            "session-a",
+            &different_page,
+            1_100,
+            1_100,
+        )
+        .unwrap()
+        .is_none());
         let _ = fs::remove_file(readable_image);
     }
 
@@ -31826,7 +32318,7 @@ mod tests {
             "smalltalk-manual-anchor-{}-browser.png",
             std::process::id()
         ));
-        fs::write(&readable_browser_image, b"test-image").unwrap();
+        fs::write(&readable_browser_image, tiny_png()).unwrap();
         conn.execute(
             "INSERT INTO frames (
                session_id, captured_at, snapshot_path, app_name, focused,
@@ -31849,6 +32341,22 @@ mod tests {
                 .is_none()
         );
         let _ = fs::remove_file(readable_browser_image);
+    }
+
+    #[test]
+    fn automatic_manual_priority_outcomes_are_not_runtime_failures() {
+        assert!(automatic_capture_was_superseded(
+            "automatic_capture_superseded_by_manual_boundary"
+        ));
+        assert!(automatic_capture_was_superseded(
+            "screenshotcapture deferred behind manual boundary capture"
+        ));
+        assert!(automatic_capture_was_superseded(
+            "screenshotcapture request cancelled"
+        ));
+        assert!(!automatic_capture_was_superseded(
+            "screen capture helper timed out"
+        ));
     }
 
     #[test]

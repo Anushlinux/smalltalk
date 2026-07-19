@@ -20,7 +20,7 @@ Pressing the right arrow:
 4. Dispatches the existing native `continue` action to Rust.
 5. Keeps generating through the backend's `trail_reconstructing` snapshot and unrelated capture/status snapshots.
 6. Latches the terminal `island_continue_state` and its decision ID when Rust returns `resume_ready` or `error`.
-7. Shows the exact non-empty `semantic_answer.task_summary` as the compact title.
+7. Shows the exact non-empty `semantic_answer.product_projection.primary_instruction` as the compact title.
 
 There is no separate preview answer, summarizer, model prompt, response schema, or presentation-specific fallback based on the current application or window. The React interface is not involved.
 
@@ -108,14 +108,16 @@ Capture lifecycle transitions cannot replace the generating presentation while t
 
 ## 6. Compact answer
 
-The compact answer displays the returned `semantic_answer.task_summary` verbatim. Swift checks whether the field is empty, but it does not trim, normalize, punctuate, summarize, or reconstruct the displayed value.
+The compact answer displays the returned `semantic_answer.product_projection.primary_instruction` verbatim. Swift checks whether the field is empty, but it does not trim, normalize, punctuate, summarize, or reconstruct the displayed value. The backend creates this instruction only from the admitted `next_supported_action`; legacy `task_summary`, `next_action`, and `unfinished_state` fields cannot replace it.
 
-If the backend does not provide a usable task summary, the compact title is an honest typed state. Examples include:
+If the backend does not provide a usable instruction, the compact title is an honest typed state. Examples include:
 
-- `Couldn’t recover the task`
-- `Continue unavailable`
-- `Not enough local memory`
-- `Continue needs refreshing`
+- `I found the task, but not a safe next step.`
+- `I couldn’t identify the unfinished task.`
+- `The provider couldn’t produce a usable Continue answer.`
+- `I couldn’t read the Continue answer.`
+- `The Continue answer did not pass validation.`
+- `The saved answer is older than the latest work.`
 
 Application names, window titles, current-focus labels, activity summaries, and remembered local UI copy are not used as answer substitutes.
 
@@ -133,24 +135,17 @@ The summary has no eight-second timer and does not change on hover. `See more` o
 
 ## 7. Expanded answer
 
-The expanded answer renders only non-empty semantic values. UI labels organize the fields, but values are passed directly to `Text` without rephrasing or joining.
+The expanded answer renders only the canonical product projection. Values are passed directly to `Text` without rephrasing or joining.
 
 The order is:
 
-1. Task summary.
-2. Task object.
-3. Current activity fields:
-   - Observed surface.
-   - Immediate operation.
-   - Operation effect.
-   - Current subtask.
-   - Relationship to the primary task.
-4. Last meaningful progress.
-5. Unfinished state.
-6. Next action.
-7. Where summary.
+1. Primary instruction.
+2. `Where you stopped`, when `resume_context` is present.
+3. `Location`, when `location_context` is present.
+4. The typed primary action, when the matching island action is enabled.
+5. `Inspect`, when aligned evidence or diagnostics are available.
 
-The semantic answer's `next_action` is used when present. The typed state's existing `next_action` is used only when that semantic field is absent. No new next action is invented by Swift.
+The typed action is `open_direct_target`, `inspect_evidence`, `refresh_continue`, or `none`. Swift routes it through the existing enabled island action. It cannot manufacture an open action from a frame preview or legacy target field. Confidence, evidence identifiers, support slots, admission diagnostics, recent context, and compatibility fields stay outside this canonical first-screen branch.
 
 ### Content-driven geometry
 
@@ -224,7 +219,7 @@ Dragging remains available from the preserved live capsule while history is open
 
 ### Persistence boundary
 
-`continue_answer_history` stores an immutable version-1 product output: decision ID, presentation timestamp, origin (`island` or `main_app`), exact title, and ordered visible answer rows. It stores only final, decision-backed, explicit manual Continue results. Startup and background refreshes are excluded. Duplicate decision IDs keep their first saved copy.
+`continue_answer_history` stores an immutable version-1 product output: decision ID, presentation timestamp, origin (`island` or `main_app`), exact canonical instruction, resume context, optional location, action label, answer identity, and ordered visible rows. It stores only final, decision-backed, explicit manual Continue results. Startup and background refreshes are excluded. Duplicate decision IDs keep their first saved copy.
 
 History reads are bounded, read-only SQLite queries. They are internal to the native island bridge and do not add a Tauri command or React interface. Selecting saved history never updates the remembered live decision, current-answer latch, feedback state, strict-open ownership, or visual cue. Delete local memory replaces the local database, which also removes the history table contents.
 
@@ -254,7 +249,7 @@ The decision ID is presentation state only. It does not change backend authority
 
 ## 10. Error and unresolved behavior
 
-A backend failure displays `Continue unavailable`. An unresolved result without a semantic task summary displays an honest unresolved title such as `Couldn’t recover the task`.
+A backend provider, parser, or validation failure displays its matching canonical failure instruction. An unresolved result without an admitted unfinished task displays `I couldn’t identify the unfinished task.` A known task without an admitted next action displays `I found the task, but not a safe next step.`
 
 The native layer does not fabricate a successful-looking answer from:
 
@@ -265,7 +260,7 @@ The native layer does not fabricate a successful-looking answer from:
 - window title
 - recent context labels
 
-Optional semantic fields that are empty are omitted from the expanded card. Existing non-empty values are preserved exactly.
+Optional projection fields that are empty are omitted from the expanded card. Existing non-empty values are preserved exactly.
 
 ## 11. Motion and accessibility
 
@@ -308,21 +303,21 @@ Outside-click monitors exist for compact answers, expanded answers, and open his
 
 There is no answer reveal timer and no answer return timer. Dismissing the presentation does not mutate the backend answer. Starting another explicit Continue request is the only path that clears the old latch for replacement.
 
-## 13. Interfaces intentionally unchanged
+## 13. Shared interface and intentionally unchanged behavior
 
-This wiring does not change:
+`TaskTruthPublicAnswerV1` now includes the versioned `smalltalk.continue_product_projection.v1` object. `IslandContinueState` carries that answer unchanged. React and Swift both consume the same instruction, context, semantic/task/target states, action kind, action label, and answer identity. The projection is recomputed after admission, correction, forced unresolved sanitization, target attachment, and stale-decision transitions.
 
-- `IslandContinueState`.
-- `TaskTruthPublicAnswerV1`.
+This presentation contract does not change:
+
 - Tauri command names.
-- Rust gateway behavior.
-- Model prompts or model configuration.
-- Strict target opening.
+- Rust gateway dispatch.
+- Strict decision-ID target opening.
 - Feedback buttons or correction behavior.
 - Capture commands or capture privacy behavior.
-- The React surface.
+- Visual-cue ownership and privacy validation.
+- Read-only history selection.
 
-The backend interface additions remain internal optional snapshot fields: `SessionIslandSnapshot.visual_cue`, `continue_history_page`, and `continue_history_output`. The cue contains a validated local image path. History responses contain only the saved product title and ordered answer rows plus pagination/request identity. None alters `IslandContinueState`, `TaskTruthPublicAnswerV1`, a Tauri command, or the React surface.
+The optional snapshot fields `SessionIslandSnapshot.visual_cue`, `continue_history_page`, and `continue_history_output` remain internal to the native bridge. The cue contains a validated local image path. History responses contain only saved canonical product copy plus pagination and request identity.
 
 The incomplete PFTU release verdict is also unchanged. Connecting the island to the backend output is not a release-readiness claim.
 
@@ -385,3 +380,9 @@ The Rust source-contract test now checks the native file for:
 - History drag exclusion, side flipping, one-level dismissal, VoiceOver focus restoration, and Reduce Motion.
 
 Runtime visual verification still needs both a short backend answer and a deliberately long backend answer because source tests and type-checking cannot prove final screen appearance.
+
+## 2026-07-19 LCA-06 freshness correction
+
+The island no longer infers a stale answer from newer frame, event, signal, or capture timestamps. It consumes the backend-owned `decision_stale` state, whose identity is based on material Continue evidence. The same decision may update from current to stale when that material watermark advances, but a weaker background answer still cannot replace the latched manual answer.
+
+Target availability remains separate from the instruction. A preview-only or suppressed target changes the action to View or Inspect and preserves useful semantic copy. Only a genuinely stale decision shows Refresh Continue and disables direct open. Capture-specific manual-boundary failure has retryable copy. Geometry, motion, capture controls, visual-cue behavior, and read-only history layout are unchanged by LCA-06.

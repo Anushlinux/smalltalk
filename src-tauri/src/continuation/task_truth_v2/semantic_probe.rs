@@ -1,9 +1,11 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::Command;
+use std::rc::Rc;
 use std::time::Instant;
 
 use super::model::{self, ProviderUsageV1};
@@ -259,16 +261,34 @@ pub(crate) struct ProbeRequestAudit {
     pub(crate) task_relevance_source: String,
     #[serde(default)]
     pub(crate) current_task_turn_id: Option<String>,
+    /// Request-local slots that contain an attributed, submitted user goal.
+    /// This is identity/provenance metadata only; local code never derives
+    /// replacement task wording from it.
+    #[serde(default)]
+    pub(crate) explicit_goal_support_slots: Vec<String>,
     #[serde(default = "default_confidence_cap_millis")]
     pub(crate) task_confidence_cap_millis: i64,
     #[serde(default)]
     pub(crate) image_candidates: Vec<Value>,
     #[serde(default)]
     pub(crate) image_preparations: Vec<ProbeImagePreparationAudit>,
+    #[serde(default)]
+    pub(crate) admission_feasibility: AdmissionFeasibilityV1,
 }
 
 fn default_confidence_cap_millis() -> i64 {
     1_000
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AdmissionFeasibilityV1 {
+    pub(crate) eligible_fields: Vec<String>,
+    pub(crate) ineligible_fields: BTreeMap<String, Vec<String>>,
+    pub(crate) eligible_support_categories: BTreeMap<String, Vec<String>>,
+    pub(crate) unfinished_task_admissible: bool,
+    pub(crate) resume_point_admissible: bool,
+    pub(crate) next_supported_action_admissible: bool,
+    pub(crate) useful_partly_resolved_possible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,6 +345,42 @@ pub(crate) struct ProbeRequest {
     pub(crate) body: Value,
     pub(crate) audit: ProbeRequestAudit,
     pub(crate) slots: BTreeMap<String, SupportSlot>,
+}
+
+type RequestScopedProviderTransport = Rc<dyn Fn(&ProbeRequest) -> Result<Value, String>>;
+
+thread_local! {
+    static REQUEST_SCOPED_PROVIDER_TRANSPORTS: RefCell<Vec<RequestScopedProviderTransport>> =
+        RefCell::new(Vec::new());
+}
+
+struct RequestScopedProviderTransportGuard;
+
+impl Drop for RequestScopedProviderTransportGuard {
+    fn drop(&mut self) {
+        REQUEST_SCOPED_PROVIDER_TRANSPORTS.with(|transports| {
+            transports.borrow_mut().pop();
+        });
+    }
+}
+
+/// Execute one synchronous Continue request with an injected provider
+/// transport. The override is local to the current thread and is removed even
+/// if the request unwinds. Production callers that do not enter this scope use
+/// the real Responses API transport exactly as before.
+pub(crate) fn with_request_scoped_provider_transport<T>(
+    transport: impl Fn(&ProbeRequest) -> Result<Value, String> + 'static,
+    request: impl FnOnce() -> T,
+) -> T {
+    REQUEST_SCOPED_PROVIDER_TRANSPORTS.with(|transports| {
+        transports.borrow_mut().push(Rc::new(transport));
+    });
+    let _guard = RequestScopedProviderTransportGuard;
+    request()
+}
+
+fn request_scoped_provider_transport() -> Option<RequestScopedProviderTransport> {
+    REQUEST_SCOPED_PROVIDER_TRANSPORTS.with(|transports| transports.borrow().last().cloned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2109,6 +2165,101 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
     }
 }
 
+fn slot_has_task_evidence_role(
+    packet: &ObservationPacketV2,
+    slot: &SupportSlot,
+    roles: &[TaskEvidenceRoleV1],
+) -> bool {
+    let frame_id = slot
+        .frame_id
+        .as_deref()
+        .or_else(|| (slot.source_kind == "keyframe").then_some(slot.record_id.as_str()));
+    frame_id.is_some_and(|frame_id| {
+        packet.task_relevance.spans.iter().any(|span| {
+            span.frame_id == frame_id
+                && roles.contains(&span.evidence_role)
+                && !is_private_status(Some(&span.privacy_status))
+        })
+    })
+}
+
+fn field_specific_support_allowed(
+    packet: &ObservationPacketV2,
+    field: &str,
+    slot: &SupportSlot,
+) -> bool {
+    use TaskEvidenceRoleV1 as Role;
+    let attributed_task_object = slot.source_kind == "canonical_element"
+        && packet
+            .canonical_elements
+            .iter()
+            .find(|element| element.element_id == slot.record_id)
+            .is_some_and(|element| {
+                element.authorship_status == AuthorshipStatusV2::User
+                    || !element.causal_evidence_refs.is_empty()
+            });
+    match field {
+        "unfinished_task" => {
+            slot_has_task_evidence_role(
+                packet,
+                slot,
+                &[
+                    Role::LatestUserGoal,
+                    Role::CurrentUnsentDraft,
+                    Role::CurrentAgentState,
+                    Role::CurrentTaskContext,
+                ],
+            ) || slot.category == SupportCategory::UserAction
+                || attributed_task_object
+        }
+        "task_state" | "resume_point" => {
+            slot_has_task_evidence_role(
+                packet,
+                slot,
+                &[
+                    Role::LatestUserGoal,
+                    Role::CurrentUnsentDraft,
+                    Role::CurrentAgentState,
+                    Role::PriorTaskBoundary,
+                    Role::CurrentTaskContext,
+                ],
+            ) || matches!(
+                slot.category,
+                SupportCategory::UserAction | SupportCategory::Delta
+            )
+        }
+        "next_supported_action" => {
+            slot_has_task_evidence_role(
+                packet,
+                slot,
+                &[
+                    Role::LatestUserGoal,
+                    Role::CurrentUnsentDraft,
+                    Role::CurrentAgentState,
+                    Role::CurrentTaskContext,
+                ],
+            ) || slot.category == SupportCategory::UserAction
+                || attributed_task_object
+        }
+        "completed_context" => {
+            slot_has_task_evidence_role(
+                packet,
+                slot,
+                &[
+                    Role::CurrentAgentState,
+                    Role::PriorTaskBoundary,
+                    Role::CurrentTaskContext,
+                ],
+            ) || matches!(
+                slot.category,
+                SupportCategory::UserAction | SupportCategory::Delta
+            )
+        }
+        "where_summary" => true,
+        _ => false,
+    }
+}
+
 fn system_instruction() -> &'static str {
     "Resolve one atomic continuation from the compact chronological packet. Answer these questions: What is the newest unfinished task? What relevant work is already complete? What exact state was left behind? What one next action is directly supported by the supplied evidence? Where was that state observed, without inventing a locator? Read boundaries and panes chronologically. Prefer attributed user and agent task evidence over visually prominent prose. Distinguish a broad workstream from the newest concrete task, implementation from verification, and a draft from a submitted request. A completed task followed by a new request means the new request is unfinished and the old task is completed_context only when needed. Completed implementation with checks passed and user testing remaining means unfinished_task is verification, task_state is needs_user_verification, and next_supported_action is the concrete supported test. When an agent is still working, use the user objective as unfinished_task, waiting_for_result as task_state, the latest agent state as resume_point, and only an evidenced wait or inspect action. An unsent draft may establish its purpose and editing state, but never claim submission. Preserve causal wording in a draft as a complaint or hypothesis, not as proof that the named change caused the result. Truly completed work uses completed and has no invented next action. Supporting research or an adjacent chat cannot replace the primary task without explicit same-task evidence. Thin evidence requires null semantic fields, task_state unclear, and status unresolved. Do not turn a causal complaint or hypothesis into fact. Classify every requested visit as primary_work, supporting_work, detour_or_unrelated, or unclear. Use the attributed P6 task_relevance evidence in this order: newest high-confidence user goal or unsent draft; the agent, tool, editor, terminal, or result directly serving that goal; the immediately prior completion boundary; then bounded supporting or current-state evidence. Keep pane_id regions separate and use reading_order only within a pane. Flattened-window fallback has low task authority. The final screen is factual current state, not automatic task authority. App names, titles, hostnames, duration, recency, interaction volume, dwell, frame count, text length, workstream labels, and local activity classes cannot establish task relevance or a next action. Engagement may only break a tie among evidence already proven to belong to the same task. hostname_mentioned_in_current_surface cannot establish continuity by itself. committed_input proves an input commit but contains no characters. Each visit role must cite its own image slot and explain its evidence-grounded relationship. Cite request-local support for every non-null semantic field and for any task_state other than unclear. Set every verifier_result_by_field value to pending; local code owns admission. Record field-local missing evidence. Return null instead of generic wording such as Continue working, Keep browsing, or Review it. Never invent targets, paths, URLs, commands, identifiers, intentions, causality, progress, or unsupported actions. Never recommend sending or submitting an unsent draft. Never recommend a destructive operation. Respect task_relevance.confidence_cap for every field and visit confidence. Return strict JSON matching the supplied schema."
 }
@@ -2260,6 +2411,38 @@ fn request_slot(packet: &ObservationPacketV2, slot: &SupportSlot) -> RequestSlot
         }
         .into(),
     }
+}
+
+fn explicit_goal_support_slots(
+    packet: &ObservationPacketV2,
+    slots: &BTreeMap<String, SupportSlot>,
+) -> Vec<String> {
+    if packet.task_relevance.source != "p6_role_region_task_turn" {
+        return Vec::new();
+    }
+    let explicit_frame_ids = packet
+        .task_relevance
+        .spans
+        .iter()
+        .filter(|span| {
+            span.evidence_role == TaskEvidenceRoleV1::LatestUserGoal
+                && span.submitted != Some(false)
+                && !is_private_status(Some(&span.privacy_status))
+        })
+        .map(|span| span.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut result = slots
+        .values()
+        .filter(|slot| {
+            slot.frame_id
+                .as_deref()
+                .is_some_and(|frame_id| explicit_frame_ids.contains(frame_id))
+        })
+        .map(|slot| slot.slot.clone())
+        .collect::<Vec<_>>();
+    result.sort();
+    result.dedup();
+    result
 }
 
 fn image_candidate_audit_values(
@@ -2718,7 +2901,8 @@ pub(crate) fn build_probe_request(
             {"role":"user","content":content}
         ]
     });
-    Ok(ProbeRequest {
+    let explicit_goal_support_slots = explicit_goal_support_slots(packet, &slots);
+    let mut request = ProbeRequest {
         body,
         audit: ProbeRequestAudit {
             request_schema: PROBE_REQUEST_SCHEMA.into(),
@@ -2765,12 +2949,89 @@ pub(crate) fn build_probe_request(
                 .current_task_turn
                 .as_ref()
                 .map(|task_turn| task_turn.task_turn_id.clone()),
+            explicit_goal_support_slots,
             task_confidence_cap_millis,
             image_candidates,
             image_preparations,
+            admission_feasibility: AdmissionFeasibilityV1::default(),
         },
         slots,
-    })
+    };
+    request.audit.admission_feasibility = admission_feasibility(packet, &request);
+    Ok(request)
+}
+
+fn support_category_label(category: SupportCategory) -> String {
+    format!("{category:?}").to_ascii_lowercase()
+}
+
+fn admission_feasibility(
+    packet: &ObservationPacketV2,
+    request: &ProbeRequest,
+) -> AdmissionFeasibilityV1 {
+    let attributed_task_basis = packet.task_relevance.spans.iter().any(|span| {
+        matches!(
+            span.evidence_role,
+            TaskEvidenceRoleV1::LatestUserGoal | TaskEvidenceRoleV1::CurrentUnsentDraft
+        ) && !is_private_status(Some(&span.privacy_status))
+            && span.region_confidence >= 0.64
+            && span.speaker_confidence >= 0.64
+    });
+    let proven_existing_task = packet.task_relevance.current_task_turn.is_some()
+        && packet.task_relevance.latest_user_goal_sample.is_some();
+    let mut result = AdmissionFeasibilityV1::default();
+    for field in SEMANTIC_FIELDS {
+        let mut categories = BTreeSet::new();
+        for slot in request.slots.values() {
+            let eligible = slot.privacy_eligible
+                && slot.ownership_eligible
+                && source_fingerprint_matches(packet, slot)
+                && slot_chronology_valid(packet, request, slot)
+                && semantic_support_allowed(field, slot.category)
+                && field_specific_support_allowed(packet, field, slot)
+                && (field != "unfinished_task"
+                    || (attributed_task_basis
+                        && request_has_primary_task_basis(
+                            packet,
+                            request,
+                            std::slice::from_ref(&slot.slot),
+                        )));
+            if eligible {
+                categories.insert(support_category_label(slot.category));
+            }
+        }
+        if categories.is_empty() {
+            result.ineligible_fields.insert(
+                field.to_string(),
+                vec![if field == "unfinished_task" && !attributed_task_basis {
+                    "attributed_task_authority_missing".to_string()
+                } else {
+                    "no_validator_eligible_support_slot".to_string()
+                }],
+            );
+        } else {
+            result.eligible_fields.push(field.to_string());
+            result
+                .eligible_support_categories
+                .insert(field.to_string(), categories.into_iter().collect());
+        }
+    }
+    result.unfinished_task_admissible = result
+        .eligible_fields
+        .iter()
+        .any(|field| field == "unfinished_task");
+    result.resume_point_admissible = result
+        .eligible_fields
+        .iter()
+        .any(|field| field == "resume_point");
+    result.next_supported_action_admissible = result
+        .eligible_fields
+        .iter()
+        .any(|field| field == "next_supported_action");
+    result.useful_partly_resolved_possible = result.unfinished_task_admissible
+        || (proven_existing_task
+            && (result.resume_point_admissible || result.next_supported_action_admissible));
+    result
 }
 
 fn output_text(response: &Value) -> Result<String, (ProbeDiagnosticStatus, String)> {
@@ -2877,6 +3138,95 @@ fn unfinished_task_is_generic(value: &str) -> bool {
                 || normalized == format!("{generic} the {object}")
         })
     })
+}
+
+fn task_meaning_tokens(value: &str) -> BTreeSet<String> {
+    const GENERIC: [&str; 30] = [
+        "about",
+        "after",
+        "answer",
+        "before",
+        "continue",
+        "current",
+        "from",
+        "have",
+        "inspect",
+        "into",
+        "latest",
+        "more",
+        "open",
+        "output",
+        "real",
+        "result",
+        "return",
+        "review",
+        "reviewing",
+        "smalltalk",
+        "task",
+        "that",
+        "their",
+        "this",
+        "through",
+        "user",
+        "verify",
+        "what",
+        "where",
+        "with",
+    ];
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter_map(|token| {
+            let mut token = token.to_ascii_lowercase();
+            if token.len() > 5 && token.ends_with("ing") {
+                token.truncate(token.len() - 3);
+            } else if token.len() > 4 && token.ends_with("ed") {
+                token.truncate(token.len() - 2);
+            } else if token.len() > 4 && token.ends_with('s') {
+                token.pop();
+            }
+            (token.len() >= 4 && !GENERIC.contains(&token.as_str())).then_some(token)
+        })
+        .collect()
+}
+
+fn unfinished_task_matches_primary_evidence(
+    packet: &ObservationPacketV2,
+    _request: &ProbeRequest,
+    _cited_supports: &[String],
+    claim: &str,
+) -> bool {
+    let evidence_samples = packet
+        .task_relevance
+        .latest_user_goal_sample
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if evidence_samples.is_empty() {
+        // Flattened packets and private unsent drafts intentionally expose no
+        // plaintext task sample. Their role-specific support and primary-basis
+        // gates remain authoritative; do not reconstruct draft text here.
+        return true;
+    }
+    let claim_tokens = task_meaning_tokens(claim);
+    if claim_tokens.is_empty() {
+        return true;
+    }
+    let evidence_tokens = evidence_samples
+        .iter()
+        .flat_map(|sample| task_meaning_tokens(sample))
+        .collect::<BTreeSet<_>>();
+    claim_tokens
+        .iter()
+        .any(|token| evidence_tokens.contains(token))
+}
+
+fn unfinished_task_duplicates_completed_context(task: &str, completed: Option<&str>) -> bool {
+    let Some(completed) = completed.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let task = task_meaning_tokens(task);
+    let completed = task_meaning_tokens(completed);
+    !task.is_empty() && task == completed
 }
 
 fn field_length_limit(field: &str) -> Option<usize> {
@@ -3095,45 +3445,63 @@ fn request_has_primary_task_basis(
         return true;
     }
 
-    // A context image is selected from a distinct, engaged session surface.
-    // Local code does not assign task meaning to it, but Luna may cite the
-    // actual pixels when they visibly establish a concrete objective. The
-    // factual app/hostname timeline has no slot and therefore cannot satisfy
-    // this rule by itself.
-    if cited_slots
-        .iter()
-        .any(|slot| slot.category == SupportCategory::ContextImage)
-    {
-        return true;
-    }
-
-    // Local code cannot read an image semantically, but it can prove that an
-    // earlier image was selected through a grounded transition rather than
-    // mere recency. Permit Luna to use that image as primary-task evidence;
-    // the prompt still requires a concrete visible objective and citations.
-    let has_grounded_context_boundary =
-        request
-            .audit
-            .boundary_selection_reasons
-            .iter()
-            .any(|reason| {
-                matches!(
-                    reason.as_str(),
-                    "recent_surface_transition_with_activity"
-                        | "return_to_prior_surface"
-                        | "committed_action_with_result"
-                )
-            });
-    has_grounded_context_boundary
+    // A selected image is not semantic authority by itself. An earlier or
+    // current image can support the task only when P6 attribution ties it to
+    // the current task turn or to an explicit detour/return boundary.
+    let p6_attributed = packet.task_relevance.current_task_turn.is_some()
         && cited_slots.iter().any(|slot| {
-            slot.boundary_index < request.audit.boundary_count
-                && matches!(
-                    slot.category,
-                    SupportCategory::ImageBefore
-                        | SupportCategory::ImageAfter
-                        | SupportCategory::OwnedObservation
-                )
+            slot_has_task_evidence_role(
+                packet,
+                slot,
+                &[
+                    TaskEvidenceRoleV1::LatestUserGoal,
+                    TaskEvidenceRoleV1::CurrentUnsentDraft,
+                    TaskEvidenceRoleV1::CurrentAgentState,
+                    TaskEvidenceRoleV1::CurrentTaskContext,
+                ],
+            )
+        });
+    let proven_detour_or_return = request
+        .audit
+        .boundary_selection_reasons
+        .iter()
+        .any(|reason| {
+            matches!(
+                reason.as_str(),
+                "recent_surface_transition_with_activity"
+                    | "return_to_prior_surface"
+                    | "committed_action_with_result"
+            )
         })
+        && cited_slots.iter().any(|slot| {
+            slot.category == SupportCategory::ContextImage
+                || (slot.boundary_index < request.audit.boundary_count
+                    && matches!(
+                        slot.category,
+                        SupportCategory::ImageBefore
+                            | SupportCategory::ImageAfter
+                            | SupportCategory::OwnedObservation
+                    ))
+        });
+    let timeline_attributed = cited_slots.iter().any(|slot| {
+        slot.category == SupportCategory::ContextImage
+            && packet.surface_timeline.iter().any(|visit| {
+                visit
+                    .representative_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.frame_id == slot.record_id)
+                    && (visit.task_evidence_role.is_some()
+                        || matches!(
+                            visit.same_task_relation.as_str(),
+                            "same_task"
+                                | "current_task_turn"
+                                | "child_support"
+                                | "detour"
+                                | "returned_support"
+                        ))
+            })
+    });
+    p6_attributed || proven_detour_or_return || timeline_attributed
 }
 
 fn unclear_visit_role() -> ProbeVisitRole {
@@ -3245,7 +3613,6 @@ pub(crate) fn admit_output(
     mut output: ProbeModelOutput,
 ) -> (ProbeModelOutput, Vec<String>) {
     let mut issues = Vec::new();
-    let mut unfinished_task_rejected_as_passive = false;
     let expected_fields = SEMANTIC_FIELDS.into_iter().collect::<BTreeSet<_>>();
     let actual_support_fields = output
         .support_slots_by_field
@@ -3338,6 +3705,12 @@ pub(crate) fn admit_output(
             }) {
                 field_issues.push("field_value_too_long");
             }
+            if value
+                .as_deref()
+                .is_some_and(|value| request.slots.keys().any(|slot_id| value.contains(slot_id)))
+            {
+                field_issues.push("inline_support_token_not_allowed");
+            }
             if supports.is_empty() {
                 field_issues.push("non_null_field_has_no_support");
             }
@@ -3350,6 +3723,23 @@ pub(crate) fn admit_output(
                 && !request_has_primary_task_basis(packet, request, &supports)
             {
                 field_issues.push("passive_evidence_cannot_establish_unfinished_task");
+            }
+            if field == "unfinished_task"
+                && value.as_deref().is_some_and(|claim| {
+                    !unfinished_task_matches_primary_evidence(packet, request, &supports, claim)
+                })
+            {
+                field_issues.push("unfinished_task_meaning_mismatches_primary_evidence");
+            }
+            if field == "unfinished_task"
+                && value.as_deref().is_some_and(|task| {
+                    unfinished_task_duplicates_completed_context(
+                        task,
+                        output.completed_context.as_deref(),
+                    )
+                })
+            {
+                field_issues.push("unfinished_task_duplicates_completed_context");
             }
             if field == "next_supported_action"
                 && value.as_deref().is_some_and(next_action_is_generic)
@@ -3371,15 +3761,23 @@ pub(crate) fn admit_output(
             for support in &supports {
                 match request.slots.get(support) {
                     None => field_issues.push("foreign_or_missing_slot"),
-                    Some(slot)
-                        if !slot.privacy_eligible
-                            || !slot.ownership_eligible
-                            || !source_fingerprint_matches(packet, slot) =>
-                    {
-                        field_issues.push("stale_or_ineligible_slot")
+                    Some(slot) if !slot.privacy_eligible => {
+                        field_issues.push("private_slot");
+                        field_issues.push("stale_or_ineligible_slot");
+                    }
+                    Some(slot) if !slot.ownership_eligible => {
+                        field_issues.push("wrong_surface_slot");
+                        field_issues.push("stale_or_ineligible_slot");
+                    }
+                    Some(slot) if !source_fingerprint_matches(packet, slot) => {
+                        field_issues.push("stale_slot");
+                        field_issues.push("stale_or_ineligible_slot");
                     }
                     Some(slot) if !semantic_support_allowed(field, slot.category) => {
                         field_issues.push("slot_category_not_allowed_for_field")
+                    }
+                    Some(slot) if !field_specific_support_allowed(packet, field, slot) => {
+                        field_issues.push("slot_not_attributed_to_field")
                     }
                     Some(slot) if !slot_chronology_valid(packet, request, slot) => {
                         field_issues.push("slot_chronology_invalid")
@@ -3389,11 +3787,6 @@ pub(crate) fn admit_output(
             }
         }
         if !field_issues.is_empty() {
-            if field == "unfinished_task"
-                && field_issues.contains(&"passive_evidence_cannot_establish_unfinished_task")
-            {
-                unfinished_task_rejected_as_passive = true;
-            }
             field_issues.sort_unstable();
             field_issues.dedup();
             issues.extend(
@@ -3419,34 +3812,6 @@ pub(crate) fn admit_output(
                     ProbeFieldVerifierResult::NotProposed
                 },
             );
-        }
-    }
-
-    // The semantic fields describe one atomic task state. If the proposed task
-    // was rejected because it came only from a momentary final screen, reject
-    // task-state, resume, and action claims derived only from that screen too.
-    if unfinished_task_rejected_as_passive {
-        for field in ["task_state", "resume_point", "next_supported_action"] {
-            let supports = output
-                .support_slots_by_field
-                .get(field)
-                .cloned()
-                .unwrap_or_default();
-            if field_value(&output, field).is_some()
-                && supports_only_momentary_current_boundary(request, &supports)
-            {
-                set_field_value(&mut output, field, None);
-                output
-                    .support_slots_by_field
-                    .insert(field.into(), Vec::new());
-                output.confidence_by_field.insert(field.into(), 0.0);
-                output
-                    .verifier_result_by_field
-                    .insert(field.into(), ProbeFieldVerifierResult::Rejected);
-                issues.push(format!(
-                    "{field}:depends_on_rejected_momentary_unfinished_task"
-                ));
-            }
         }
     }
 
@@ -3560,7 +3925,7 @@ pub(crate) fn admit_output(
     (output, issues)
 }
 
-fn parse_probe_response(
+pub(crate) fn parse_probe_response(
     packet: &ObservationPacketV2,
     request: &ProbeRequest,
     response: &Value,
@@ -3711,7 +4076,47 @@ pub(crate) fn run_probe(
         }
     };
     let slots = request.slots.clone();
-    let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+    if !request
+        .audit
+        .admission_feasibility
+        .useful_partly_resolved_possible
+    {
+        return (
+            ProbeAttempt {
+                diagnostic_status: ProbeDiagnosticStatus::RequestNotBuilt,
+                model: model_name.into(),
+                request_id: Some(request.audit.request_id.clone()),
+                provider_request_id: None,
+                response_id: None,
+                response_model: None,
+                request_audit: Some(request.audit),
+                usage: ProviderUsageV1::default(),
+                estimated_cost_usd: None,
+                latency_ms: started.elapsed().as_millis() as i64,
+                output_bytes: None,
+                parsed_response: false,
+                provider_post_count: 0,
+                cited_support_slots_before_admission: BTreeMap::new(),
+                admitted_output: None,
+                validation_issues: Vec::new(),
+                failure_reason: Some(
+                    "task_evidence_acquisition_failure:no_admissible_semantic_fields".into(),
+                ),
+            },
+            Some(slots),
+        );
+    }
+    let scoped_transport = request_scoped_provider_transport();
+    let response_result = if let Some(transport) = scoped_transport {
+        transport(&request)
+    } else if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        super::super::call_openai_responses_with_timeout(
+            api_key,
+            &request.body,
+            90,
+            MANUAL_PROVIDER_RETRIES,
+        )
+    } else {
         return (
             ProbeAttempt {
                 diagnostic_status: ProbeDiagnosticStatus::ProviderUnavailable,
@@ -3735,12 +4140,7 @@ pub(crate) fn run_probe(
             Some(slots),
         );
     };
-    let response = match super::super::call_openai_responses_with_timeout(
-        api_key,
-        &request.body,
-        90,
-        MANUAL_PROVIDER_RETRIES,
-    ) {
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
             let (diagnostic_status, failure_reason) = classify_transport_failure(&error);
@@ -3921,6 +4321,8 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
            output_bytes INTEGER,
            parsed_response INTEGER NOT NULL,
            provider_post_count INTEGER NOT NULL DEFAULT 0,
+           cache_policy_identity TEXT NOT NULL DEFAULT '',
+           reused_from_decision_id TEXT,
            created_at_ms INTEGER NOT NULL,
            FOREIGN KEY(case_id) REFERENCES task_truth_v2_semantic_probe_cases(case_id)
          );
@@ -3981,6 +4383,30 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| error.to_string())?;
+    }
+    for (column, definition) in [
+        ("cache_policy_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("reused_from_decision_id", "TEXT"),
+    ] {
+        let exists = conn
+            .prepare("PRAGMA table_info(task_truth_v2_semantic_probe_runs)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|existing| existing == column);
+        if !exists {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE task_truth_v2_semantic_probe_runs ADD COLUMN {column} {definition}"
+                ),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -4103,6 +4529,211 @@ fn diagnostic_label(status: ProbeDiagnosticStatus) -> &'static str {
     }
 }
 
+fn cache_policy_identity(
+    session_id: Option<&str>,
+    packet: &ObservationPacketV2,
+    model: &str,
+    request_audit: Option<&ProbeRequestAudit>,
+) -> Option<String> {
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let packet_session_id = packet
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let request_audit = request_audit?;
+    if session_id != packet_session_id
+        || request_audit.request_schema != PROBE_REQUEST_SCHEMA
+        || request_audit.model != model
+        || request_audit.request_id.trim().is_empty()
+    {
+        return None;
+    }
+    serde_json::to_vec(&json!({
+        "session_id": session_id,
+        "packet_id": packet.packet_id,
+        "evidence_watermark": packet.evidence_watermark,
+        "current_frame_id": packet.current_frame.frame_id,
+        "model": model,
+        "request_id": request_audit.request_id,
+        "request_schema": PROBE_REQUEST_SCHEMA,
+        "response_schema": PROBE_RESPONSE_SCHEMA,
+        "verifier_version": super::verifier::TASK_TRUTH_VERIFIER_VERSION,
+        "admission_version": super::production::COMPACT_ADMISSION_VERSION,
+    }))
+    .ok()
+    .map(|bytes| super::super::stable_hash(&bytes))
+}
+
+fn current_correction_watermark(
+    conn: &Connection,
+    snapshot_id: &str,
+    snapshot_revision: i64,
+) -> Result<String, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT feedback_id, affected_field, hypothesis_id, feedback_kind, correction_value
+             FROM task_truth_v2_feedback_events
+             WHERE task_snapshot_id=?1 AND task_snapshot_revision=?2
+             ORDER BY observed_at_ms ASC, feedback_id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let feedback = statement
+        .query_map(params![snapshot_id, snapshot_revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if feedback.is_empty() {
+        return Ok(String::new());
+    }
+    serde_json::to_vec(&feedback)
+        .map_err(|error| error.to_string())
+        .map(|bytes| super::super::stable_hash(&bytes))
+}
+
+#[derive(Debug)]
+struct ReusedProbeAttempt {
+    source_decision_id: String,
+    attempt: ProbeAttempt,
+}
+
+fn reusable_admitted_attempt(
+    conn: &Connection,
+    session_id: Option<&str>,
+    packet: &ObservationPacketV2,
+    model: &str,
+    request: &ProbeRequest,
+) -> Result<Option<ReusedProbeAttempt>, String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(policy_identity) =
+        cache_policy_identity(Some(session_id), packet, model, Some(&request.audit))
+    else {
+        return Ok(None);
+    };
+    super::checkpoint::ensure_schema(conn)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT r.decision_id, r.provider_request_id, r.response_id, r.response_model,
+                    r.cited_support_slots_json, r.admitted_output_json,
+                    r.validation_issues_json, r.output_bytes, r.diagnostic_status,
+                    d.snapshot_id, d.snapshot_revision, d.correction_watermark
+             FROM task_truth_v2_semantic_probe_runs r
+             INNER JOIN task_truth_v2_decision_contracts d ON d.decision_id=r.decision_id
+             WHERE r.session_id=?1 AND r.packet_id=?2 AND r.evidence_watermark=?3
+               AND r.model=?4 AND r.request_id=?5 AND r.cache_policy_identity=?6
+               AND r.parsed_response=1 AND r.admitted_output_json IS NOT NULL
+               AND r.diagnostic_status IN ('success','support_slot_validation_failure')
+               AND d.observation_packet_id=?2 AND d.evidence_watermark=?3
+               AND d.packet_policy_version=?7 AND d.response_schema_version=?8
+               AND d.admission_version=?9 AND d.answer_contract_json IS NOT NULL
+               AND COALESCE(d.correction_fingerprint,'')=COALESCE(d.correction_watermark,'')
+             ORDER BY r.created_at_ms DESC, r.run_id DESC
+             LIMIT 20",
+        )
+        .map_err(|error| error.to_string())?;
+    let candidates = statement
+        .query_map(
+            params![
+                session_id,
+                packet.packet_id,
+                packet.evidence_watermark,
+                model,
+                request.audit.request_id,
+                policy_identity,
+                PROBE_REQUEST_SCHEMA,
+                PROBE_RESPONSE_SCHEMA,
+                super::production::COMPACT_ADMISSION_VERSION,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (
+        source_decision_id,
+        provider_request_id,
+        response_id,
+        response_model,
+        cited_support_slots_json,
+        admitted_output_json,
+        validation_issues_json,
+        output_bytes,
+        diagnostic_status,
+        snapshot_id,
+        snapshot_revision,
+        stored_correction_watermark,
+    ) in candidates
+    {
+        if current_correction_watermark(conn, &snapshot_id, snapshot_revision)?
+            != stored_correction_watermark.unwrap_or_default()
+        {
+            continue;
+        }
+        let diagnostic_status = if diagnostic_status == "success" {
+            ProbeDiagnosticStatus::Success
+        } else {
+            ProbeDiagnosticStatus::SupportSlotValidationFailure
+        };
+        return Ok(Some(ReusedProbeAttempt {
+            source_decision_id,
+            attempt: ProbeAttempt {
+                diagnostic_status,
+                model: model.to_string(),
+                request_id: Some(request.audit.request_id.clone()),
+                provider_request_id,
+                response_id,
+                response_model,
+                request_audit: Some(request.audit.clone()),
+                usage: ProviderUsageV1::default(),
+                estimated_cost_usd: None,
+                latency_ms: 0,
+                output_bytes: output_bytes.and_then(|value| usize::try_from(value).ok()),
+                parsed_response: true,
+                provider_post_count: 0,
+                cited_support_slots_before_admission: serde_json::from_str(
+                    &cited_support_slots_json,
+                )
+                .map_err(|error| error.to_string())?,
+                admitted_output: Some(
+                    serde_json::from_str(&admitted_output_json)
+                        .map_err(|error| error.to_string())?,
+                ),
+                validation_issues: serde_json::from_str(&validation_issues_json)
+                    .map_err(|error| error.to_string())?,
+                failure_reason: None,
+            },
+        }));
+    }
+    Ok(None)
+}
+
 fn persist_attempt(
     conn: &Connection,
     case_id: &str,
@@ -4111,6 +4742,7 @@ fn persist_attempt(
     packet: &ObservationPacketV2,
     attempt: &ProbeAttempt,
     slots: Option<&BTreeMap<String, SupportSlot>>,
+    reused_from_decision_id: Option<&str>,
 ) -> Result<(), String> {
     let created_at_ms = super::super::current_time_millis();
     let run_id = format!(
@@ -4130,10 +4762,11 @@ fn persist_attempt(
            response_model, request_audit_json, support_slot_map_json,
            cited_support_slots_json, admitted_output_json, validation_issues_json, failure_reason,
            input_tokens, output_tokens, total_tokens, estimated_cost_usd,
-           latency_ms, output_bytes, parsed_response, provider_post_count, created_at_ms
+           latency_ms, output_bytes, parsed_response, provider_post_count,
+           cache_policy_identity, reused_from_decision_id, created_at_ms
          ) VALUES (
            ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-           ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27
+           ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29
          )",
         params![
             run_id,
@@ -4176,6 +4809,14 @@ fn persist_attempt(
             attempt.output_bytes.map(|value| value as i64),
             i64::from(attempt.parsed_response),
             attempt.provider_post_count as i64,
+            cache_policy_identity(
+                session_id,
+                packet,
+                &attempt.model,
+                attempt.request_audit.as_ref()
+            )
+            .unwrap_or_default(),
+            reused_from_decision_id,
             created_at_ms,
         ],
     )
@@ -4266,7 +4907,7 @@ pub(crate) fn run_manual_probe(
         ensure_production_runtime_case(conn, decision_id, now_ms)?
     };
     let (api_key, model_name) = configured_model()?;
-    let (attempt, slots) = if let Some(reason) = preflight_failure {
+    let (attempt, slots, reused_from_decision_id) = if let Some(reason) = preflight_failure {
         let normalized = reason.to_ascii_lowercase();
         let diagnostic_status = if normalized.contains("private")
             || normalized.contains("secure")
@@ -4300,9 +4941,32 @@ pub(crate) fn run_manual_probe(
                 )),
             },
             None,
+            None,
         )
+    } else if evaluation_case_id.is_none() {
+        match build_probe_request(packet, &model_name) {
+            Ok(request) => {
+                if let Some(reused) =
+                    reusable_admitted_attempt(conn, session_id, packet, &model_name, &request)?
+                {
+                    (
+                        reused.attempt,
+                        Some(request.slots),
+                        Some(reused.source_decision_id),
+                    )
+                } else {
+                    let (attempt, slots) = run_probe(packet, &model_name, api_key.as_deref());
+                    (attempt, slots, None)
+                }
+            }
+            Err(_) => {
+                let (attempt, slots) = run_probe(packet, &model_name, api_key.as_deref());
+                (attempt, slots, None)
+            }
+        }
     } else {
-        run_probe(packet, &model_name, api_key.as_deref())
+        let (attempt, slots) = run_probe(packet, &model_name, api_key.as_deref());
+        (attempt, slots, None)
     };
     persist_attempt(
         conn,
@@ -4312,6 +4976,7 @@ pub(crate) fn run_manual_probe(
         packet,
         &attempt,
         slots.as_ref(),
+        reused_from_decision_id.as_deref(),
     )?;
     if evaluation_case_id.is_some() {
         conn.execute(
@@ -4876,6 +5541,7 @@ mod tests {
         FrameChangeV2, KeyframeReferenceV2, PacketSizeAccountingV2, PacketTaskTurnV1,
         SurfaceVisitV2, TaskRelevantSpanV1,
     };
+    use std::cell::Cell;
 
     fn image_file(id: usize) -> String {
         let path = std::env::temp_dir().join(format!(
@@ -6136,19 +6802,22 @@ mod tests {
             .visit_roles
             .values()
             .all(|role| role.role == ProbeSurfaceRole::Unclear));
-        assert!(issues.iter().any(|issue| {
-            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
-        }));
-        assert!(issues.iter().any(|issue| {
+        assert!(issues
+            .iter()
+            .any(|issue| issue.starts_with("unfinished_task:")));
+        assert!(!issues.iter().any(|issue| {
             issue == "resume_point:depends_on_rejected_momentary_unfinished_task"
         }));
+        assert!(issues
+            .iter()
+            .any(|issue| issue == "resume_point:slot_not_attributed_to_field"));
         assert!(issues
             .iter()
             .any(|issue| issue == "visit_role:T3_VISIT:unfinished_task_not_admitted"));
     }
 
     #[test]
-    fn inkling_fixture_admits_browser_task_and_keeps_codex_as_detour() {
+    fn inkling_fixture_without_task_turn_cannot_promote_engagement_to_a_browser_task() {
         let packet = inkling_brief_codex_switch_packet();
         let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
         let source_slot = request.audit.surface_timeline[0]
@@ -6206,22 +6875,15 @@ mod tests {
 
         let (admitted, issues) = admit_output(&packet, &request, proposed);
 
-        assert_eq!(
-            admitted.unfinished_task.as_deref(),
-            Some(
-                "Assess whether Thinking Machines' Inkling model could improve Smalltalk task recovery"
-            )
-        );
+        assert!(admitted.unfinished_task.is_none());
         assert_eq!(admitted.status, ProbeResolutionStatus::Resolved);
-        assert_eq!(
-            admitted.visit_roles["T2_VISIT"].role,
-            ProbeSurfaceRole::PrimaryWork
-        );
-        assert_eq!(
-            admitted.visit_roles["T3_VISIT"].role,
-            ProbeSurfaceRole::DetourOrUnrelated
-        );
-        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+        assert!(admitted
+            .visit_roles
+            .values()
+            .all(|role| role.role == ProbeSurfaceRole::Unclear));
+        assert!(issues.iter().any(|issue| {
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
+        }));
     }
 
     #[test]
@@ -6262,7 +6924,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_machines_to_smalltalk_chat_task_survives_local_admission() {
+    fn hostname_and_committed_input_without_attributed_text_cannot_claim_a_task() {
         let mut packet = live_shaped_session_packet();
         packet.surface_timeline[1].site_hostname = Some("thinkingmachines.ai".into());
         packet.surface_timeline[1].hostname_mentioned_in_current_surface = true;
@@ -6298,13 +6960,8 @@ mod tests {
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
 
-        assert_eq!(
-            admitted.unfinished_task.as_deref(),
-            Some(
-                "Likely assessing whether Thinking Machines' Inkling model could be useful for Smalltalk"
-            )
-        );
-        assert!(!issues
+        assert!(admitted.unfinished_task.is_none());
+        assert!(issues
             .iter()
             .any(|issue| issue.starts_with("unfinished_task:")));
     }
@@ -6771,13 +7428,10 @@ mod tests {
             status: ProbeResolutionStatus::PartlyResolved,
         };
         let (admitted, issues) = admit_output(&packet, &request, proposed);
-        assert_eq!(
-            admitted.unfinished_task.as_deref(),
-            Some("Complete the visible hackathon application")
-        );
-        assert!(!issues
+        assert!(admitted.unfinished_task.is_none());
+        assert!(issues
             .iter()
-            .any(|issue| issue.contains("passive_evidence_cannot_establish_unfinished_task")));
+            .any(|issue| issue.starts_with("unfinished_task:")));
     }
 
     #[test]
@@ -7003,6 +7657,7 @@ mod tests {
             &packet,
             &attempt,
             None,
+            None,
         )
         .expect("persist compact run");
 
@@ -7024,6 +7679,135 @@ mod tests {
             )
             .expect("count compact runs");
         assert_eq!(run_count, 1);
+    }
+
+    fn seed_reusable_admitted_run(
+        conn: &Connection,
+        packet: &ObservationPacketV2,
+        decision_id: &str,
+    ) -> ProbeRequest {
+        ensure_schema(conn).expect("semantic probe schema");
+        super::super::checkpoint::ensure_schema(conn).expect("decision contract schema");
+        let case_id = ensure_production_runtime_case(
+            conn,
+            decision_id,
+            super::super::super::current_time_millis(),
+        )
+        .expect("production case");
+        let request =
+            build_probe_request(packet, DEFAULT_LUNA_MODEL).expect("build reusable request");
+        let admitted_output = output(Some("Implement the compact Continue cache"), &request);
+        let attempt = ProbeAttempt {
+            diagnostic_status: ProbeDiagnosticStatus::Success,
+            model: DEFAULT_LUNA_MODEL.into(),
+            request_id: Some(request.audit.request_id.clone()),
+            provider_request_id: Some("provider-request-cached".into()),
+            response_id: Some("provider-response-cached".into()),
+            response_model: Some(DEFAULT_LUNA_MODEL.into()),
+            request_audit: Some(request.audit.clone()),
+            usage: ProviderUsageV1 {
+                input_tokens: Some(120),
+                output_tokens: Some(40),
+                total_tokens: Some(160),
+            },
+            estimated_cost_usd: Some(0.01),
+            latency_ms: 50,
+            output_bytes: Some(500),
+            parsed_response: true,
+            provider_post_count: 1,
+            cited_support_slots_before_admission: admitted_output.support_slots_by_field.clone(),
+            admitted_output: Some(admitted_output),
+            validation_issues: Vec::new(),
+            failure_reason: None,
+        };
+        persist_attempt(
+            conn,
+            &case_id,
+            decision_id,
+            packet.session_id.as_deref(),
+            packet,
+            &attempt,
+            Some(&request.slots),
+            None,
+        )
+        .expect("persist admitted probe");
+        conn.execute(
+            "INSERT INTO task_truth_v2_decision_contracts (
+               decision_id, effective_state, release_gate_passed, snapshot_id,
+               snapshot_revision, provider_attempt_count, observation_packet_id,
+               evidence_watermark, packet_policy_version, response_schema_version,
+               admission_version, admitted_result_id, answer_contract_json, created_at_ms
+             ) VALUES (?1,'resolved',1,?2,1,1,?3,?4,?5,?6,?7,?8,'{}',?9)",
+            params![
+                decision_id,
+                format!("snapshot-{decision_id}"),
+                packet.packet_id,
+                packet.evidence_watermark,
+                PROBE_REQUEST_SCHEMA,
+                PROBE_RESPONSE_SCHEMA,
+                super::super::production::COMPACT_ADMISSION_VERSION,
+                format!("admitted-{decision_id}"),
+                super::super::super::current_time_millis(),
+            ],
+        )
+        .expect("persist decision contract");
+        request
+    }
+
+    #[test]
+    fn repeated_manual_decision_reuses_unchanged_admitted_result_without_provider_post() {
+        let conn = Connection::open_in_memory().expect("open database");
+        let packet = packet(false);
+        let source_decision_id = "decision-cache-source";
+        seed_reusable_admitted_run(&conn, &packet, source_decision_id);
+
+        let repeated_decision_id = "decision-cache-repeat";
+        run_manual_probe(
+            &conn,
+            repeated_decision_id,
+            packet.session_id.as_deref(),
+            &packet,
+            None,
+        )
+        .expect("reuse unchanged admitted result");
+
+        let (post_count, reused_from, response_id): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provider_post_count, reused_from_decision_id, response_id
+                 FROM task_truth_v2_semantic_probe_runs WHERE decision_id=?1",
+                [repeated_decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read repeated decision run");
+        assert_eq!(post_count, 0);
+        assert_eq!(reused_from.as_deref(), Some(source_decision_id));
+        assert_eq!(response_id.as_deref(), Some("provider-response-cached"));
+    }
+
+    #[test]
+    fn correction_change_invalidates_admitted_result_reuse() {
+        let conn = Connection::open_in_memory().expect("open database");
+        let packet = packet(false);
+        let source_decision_id = "decision-correction-source";
+        let request = seed_reusable_admitted_run(&conn, &packet, source_decision_id);
+        conn.execute(
+            "INSERT INTO task_truth_v2_feedback_events (
+               feedback_id, task_snapshot_id, task_snapshot_revision,
+               affected_field, feedback_kind, observed_at_ms
+             ) VALUES ('feedback-new',?1,1,'unfinished_task','should_be_unresolved',5000)",
+            [format!("snapshot-{source_decision_id}")],
+        )
+        .expect("persist later correction");
+
+        let reused = reusable_admitted_attempt(
+            &conn,
+            packet.session_id.as_deref(),
+            &packet,
+            DEFAULT_LUNA_MODEL,
+            &request,
+        )
+        .expect("evaluate cache identity");
+        assert!(reused.is_none());
     }
 
     #[test]
@@ -7373,7 +8157,7 @@ mod tests {
     }
 
     #[test]
-    fn context_image_uses_physical_identity_not_selection_metadata() {
+    fn physical_context_image_identity_does_not_create_semantic_authority() {
         let mut packet = live_shaped_session_packet();
         packet.semantic_keyframes[0].partition = EvidencePartitionV2::Background;
         packet.semantic_keyframes[0].selection_reasons = vec!["semantic_keyframe_reason".into()];
@@ -7396,13 +8180,13 @@ mod tests {
             .insert("unfinished_task".into(), vec![context_slot]);
 
         let (admitted, issues) = admit_output(&packet, &request, generated);
-        assert_eq!(
-            admitted.unfinished_task.as_deref(),
-            Some("Audit the visible continuation contract")
-        );
+        assert!(admitted.unfinished_task.is_none());
         assert!(!issues
             .iter()
             .any(|issue| issue == "unfinished_task:stale_or_ineligible_slot"));
+        assert!(issues.iter().any(|issue| {
+            issue == "unfinished_task:passive_evidence_cannot_establish_unfinished_task"
+        }));
     }
 
     #[test]
@@ -7734,6 +8518,168 @@ mod tests {
     }
 
     #[test]
+    fn lca_06_preflight_avoids_provider_without_admissible_semantics() {
+        let packet = packet(false);
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request audit");
+        assert!(
+            !request
+                .audit
+                .admission_feasibility
+                .useful_partly_resolved_possible
+        );
+        assert_eq!(
+            request
+                .audit
+                .admission_feasibility
+                .ineligible_fields
+                .get("unfinished_task")
+                .cloned(),
+            Some(vec!["attributed_task_authority_missing".to_string()])
+        );
+
+        let transport_invocations = Rc::new(Cell::new(0usize));
+        let transport_counter = Rc::clone(&transport_invocations);
+        let (attempt, _) = with_request_scoped_provider_transport(
+            move |_| {
+                transport_counter.set(transport_counter.get().saturating_add(1));
+                Err("zero-admissible transport must not execute".into())
+            },
+            || run_probe(&packet, DEFAULT_LUNA_MODEL, None),
+        );
+        assert_eq!(transport_invocations.get(), 0);
+        assert_eq!(attempt.provider_post_count, 0);
+        assert_eq!(
+            attempt.diagnostic_status,
+            ProbeDiagnosticStatus::RequestNotBuilt
+        );
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some("task_evidence_acquisition_failure:no_admissible_semantic_fields")
+        );
+    }
+
+    #[test]
+    fn lca_06_structurally_attributed_task_allows_exactly_one_provider_post() {
+        let mut packet = live_shaped_session_packet();
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::LatestUserGoal,
+            900,
+            "current_task_turn",
+            "chat-message-group",
+            Some(true),
+        );
+        packet.task_relevance.latest_user_goal_sample =
+            Some("Repair the two real continuation bugs".into());
+
+        let transport_invocations = Rc::new(Cell::new(0usize));
+        let transport_counter = Rc::clone(&transport_invocations);
+        let (attempt, _) = with_request_scoped_provider_transport(
+            move |request| {
+                transport_counter.set(transport_counter.get().saturating_add(1));
+                let generated = output(Some("Repair the two real continuation bugs"), request);
+                Ok(json!({
+                    "id": "response-lca-06-structured-task",
+                    "model": DEFAULT_LUNA_MODEL,
+                    "output_text": serde_json::to_string(&generated).unwrap()
+                }))
+            },
+            || run_probe(&packet, DEFAULT_LUNA_MODEL, None),
+        );
+
+        assert_eq!(transport_invocations.get(), 1);
+        assert_eq!(attempt.provider_post_count, 1);
+        assert!(attempt.parsed_response);
+        assert!(attempt.request_audit.is_some_and(|audit| {
+            audit.admission_feasibility.useful_partly_resolved_possible
+                && audit.current_task_turn_id.as_deref() == Some("task-turn-current")
+        }));
+    }
+
+    #[test]
+    fn lca_06_zero_admissible_manual_attempt_persists_zero_posts_and_typed_projection() {
+        let conn = Connection::open_in_memory().expect("open replay database");
+        crate::capture::init_db(&conn).expect("initialize production schemas");
+        let packet = packet(false);
+        let decision_id = "lca-06-zero-admissible-production-attempt";
+        let transport_invocations = Rc::new(Cell::new(0usize));
+        let transport_counter = Rc::clone(&transport_invocations);
+        with_request_scoped_provider_transport(
+            move |_| {
+                transport_counter.set(transport_counter.get().saturating_add(1));
+                Err("zero-admissible transport must not execute".into())
+            },
+            || {
+                run_manual_probe(
+                    &conn,
+                    decision_id,
+                    packet.session_id.as_deref(),
+                    &packet,
+                    None,
+                )
+            },
+        )
+        .expect("persist zero-admissible manual attempt");
+
+        assert_eq!(transport_invocations.get(), 0);
+        let (status, provider_post_count, parsed_response, failure_reason): (
+            String,
+            i64,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT diagnostic_status, provider_post_count, parsed_response, failure_reason
+                 FROM task_truth_v2_semantic_probe_runs WHERE decision_id=?1",
+                [decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("load persisted zero-post ProbeAttempt");
+        assert_eq!(status, "request_not_built");
+        assert_eq!(provider_post_count, 0);
+        assert_eq!(parsed_response, 0);
+        assert_eq!(
+            failure_reason.as_deref(),
+            Some("task_evidence_acquisition_failure:no_admissible_semantic_fields")
+        );
+
+        let production = super::super::production::production_decision_for_attempt(
+            &conn,
+            packet.session_id.as_deref(),
+            true,
+            Some(decision_id),
+        )
+        .expect("project persisted zero-post attempt");
+        let answer = production.answer.expect("typed unresolved public answer");
+        assert!(answer.unfinished_task.is_none());
+        assert!(answer.next_supported_action.is_none());
+        assert_eq!(
+            production
+                .inference_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.provider_attempt_count),
+            Some(0)
+        );
+        assert_eq!(answer.product_projection.semantic_status, "unresolved");
+        assert_eq!(
+            answer.product_projection.unresolved_reason.as_deref(),
+            Some("task_evidence_acquisition_failure:no_admissible_semantic_fields")
+        );
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            super::super::production::ContinuePresentationStateV1::TaskUnknown
+        );
+        assert_eq!(
+            production
+                .inference_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.status.as_str()),
+            Some("request_not_built")
+        );
+    }
+
+    #[test]
     fn provider_payload_contains_only_short_slots_and_neutral_boundary_metadata() {
         let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
         let structured_text = request
@@ -7842,15 +8788,41 @@ mod tests {
     }
 
     #[test]
-    fn missing_credentials_is_a_typed_provider_failure_with_no_output() {
+    fn no_admissible_semantics_preempts_missing_credentials_without_a_post() {
         let (attempt, _) = run_probe(&packet(false), DEFAULT_LUNA_MODEL, None);
         assert_eq!(
             attempt.diagnostic_status,
-            ProbeDiagnosticStatus::ProviderUnavailable
+            ProbeDiagnosticStatus::RequestNotBuilt
         );
         assert!(!attempt.parsed_response);
         assert_eq!(attempt.provider_post_count, 0);
         assert_eq!(attempt.admitted_output, None);
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some("task_evidence_acquisition_failure:no_admissible_semantic_fields")
+        );
+    }
+
+    #[test]
+    fn admissible_semantics_without_credentials_remains_a_typed_provider_failure() {
+        let mut packet = live_shaped_session_packet();
+        mark_p6_visit(
+            &mut packet,
+            3,
+            TaskEvidenceRoleV1::LatestUserGoal,
+            100,
+            "current_task_turn",
+            "main",
+            Some(true),
+        );
+        packet.task_relevance.latest_user_goal_sample =
+            Some("Verify the current task state".into());
+        let (attempt, _) = run_probe(&packet, DEFAULT_LUNA_MODEL, None);
+        assert_eq!(
+            attempt.diagnostic_status,
+            ProbeDiagnosticStatus::ProviderUnavailable
+        );
+        assert_eq!(attempt.provider_post_count, 0);
         assert_eq!(
             attempt.failure_reason.as_deref(),
             Some("credentials_missing")

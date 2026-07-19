@@ -40,7 +40,7 @@
       "next_supported_action": { "kind": "text", "value": { "text": "Return to the Codex visual-cue task and inspect its implementation result.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
       "completed_context": { "kind": "text", "value": { "text": "The backend connection and output flow were already implemented and verified.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
       "where_summary": { "kind": "text", "value": { "text": "the Codex visual-cue task", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
-      "status": { "kind": "label", "value": "resolved" },
+      "status": { "kind": "label", "value": "partly_resolved" },
       "all_non_null_fields_admitted": { "kind": "boolean", "value": true }
     } },
     { "checkpoint": "product_answer", "status": "expected", "slots": {
@@ -50,7 +50,12 @@
       "next_supported_action": { "kind": "text", "value": { "text": "Return to the Codex visual-cue task and inspect its implementation result.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
       "completed_context": { "kind": "text", "value": { "text": "The backend connection and output flow were already implemented and verified.", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
       "where_summary": { "kind": "text", "value": { "text": "the Codex visual-cue task", "storage_class": "synthetic", "purpose": "expected_semantic_text", "human_privacy_approved": false, "source_hash": null } },
-      "model_resolution_status": { "kind": "label", "value": "resolved" },
+      "model_resolution_status": { "kind": "label", "value": "partly_resolved" },
+      "admitted_semantic_status": { "kind": "label", "value": "partly_resolved" },
+      "semantic_source_kind": { "kind": "label", "value": "verified_cloud_explicit_goal" },
+      "target_status": { "kind": "label", "value": "frame_preview_only" },
+      "unresolved_or_failure_reason": { "kind": "label", "value": "raw_model_partly_resolved" },
+      "atomic_answer_identity_present": { "kind": "boolean", "value": true },
       "compatibility_fields_match": { "kind": "boolean", "value": true },
       "direct_return_target": { "kind": "null" },
       "public_target_honest": { "kind": "boolean", "value": true }
@@ -71,7 +76,7 @@
     "missing_evidence_by_field": { "unfinished_task": [], "task_state": [], "resume_point": [], "next_supported_action": [], "completed_context": [], "where_summary": [] },
     "confidence_by_field": { "unfinished_task": 0.94, "task_state": 0.87, "resume_point": 0.88, "next_supported_action": 0.84, "completed_context": 0.9, "where_summary": 0.8 },
     "verifier_result_by_field": { "unfinished_task": "pending", "task_state": "pending", "resume_point": "pending", "next_supported_action": "pending", "completed_context": "pending", "where_summary": "pending" },
-    "status": "resolved"
+    "status": "partly_resolved"
   },
   "expected_model_parity": { "required": false, "identity_slots": [] }
 }

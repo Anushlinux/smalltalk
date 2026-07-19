@@ -349,13 +349,38 @@ pub(crate) fn resolve_provisional_task_turns(
             && row.agent_span_ids.is_empty()
             && !row.prior_span_ids.is_empty()
     });
+    let latest_sample_row = rows
+        .iter()
+        .max_by_key(|row| (row.observed_at_ms, numeric_id(&row.frame_id)))
+        .cloned();
     rows.retain(|row| !row.user_span_ids.is_empty());
     rows.sort_by_key(|row| (row.observed_at_ms, numeric_id(&row.frame_id)));
     if rows.is_empty() {
-        if prior_only_evidence_observed {
+        let preserved = if prior_only_evidence_observed {
+            None
+        } else {
+            latest_sample_row
+                .as_ref()
+                .map(|row| preserve_selected_turn_across_empty_sample(conn, row))
+                .transpose()?
+                .flatten()
+        };
+        let manual_boundary_without_lineage = latest_sample_row
+            .as_ref()
+            .map(|row| frame_is_manual_continue_boundary(conn, &row.frame_id))
+            .transpose()?
+            .unwrap_or(false)
+            && preserved.is_none();
+        if (prior_only_evidence_observed || manual_boundary_without_lineage) && preserved.is_none()
+        {
             clear_selected_task_turn(conn)?;
         }
         return Ok(TaskTurnResolution {
+            selected_task_turn_id: preserved.as_ref().map(|turn| turn.task_turn_id.clone()),
+            selection_reason_codes: preserved
+                .as_ref()
+                .map(|_| vec!["same_surface_empty_sample_preserved".to_string()])
+                .unwrap_or_default(),
             missing_evidence: vec!["current_user_goal_evidence".to_string()],
             ..TaskTurnResolution::default()
         });
@@ -470,6 +495,59 @@ pub(crate) fn resolve_provisional_task_turns(
         .into_iter()
         .collect();
     Ok(result)
+}
+
+fn frame_is_manual_continue_boundary(conn: &Connection, frame_id: &str) -> Result<bool, String> {
+    if !table_exists(conn, "frames")? || !column_exists(conn, "frames", "capture_trigger")? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT capture_trigger='manual_continue_boundary' FROM frames WHERE CAST(id AS TEXT)=?1",
+        params![frame_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(to_string)
+}
+
+fn preserve_selected_turn_across_empty_sample(
+    conn: &Connection,
+    row: &SalientRow,
+) -> Result<Option<CurrentTaskTurn>, String> {
+    let selected_id = conn
+        .query_row(
+            "SELECT task_turn_id FROM continue_task_turns
+             WHERE selected=1 ORDER BY updated_at_ms DESC, task_turn_id DESC LIMIT 1",
+            [],
+            |result| result.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some(selected) = selected_id
+        .map(|id| load_task_turn(conn, &id))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let row_surface_key_hash = row
+        .surface_key
+        .as_deref()
+        .map(|value| stable_hash(format!("task-turn-surface|{value}").as_bytes()));
+    let exact_lineage = row.session_id == selected.session_id
+        && row_surface_key_hash.is_some()
+        && row_surface_key_hash == selected.surface_key_hash;
+    let bounded = row.observed_at_ms >= selected.last_observed_at_ms
+        && row
+            .observed_at_ms
+            .saturating_sub(selected.last_observed_at_ms)
+            <= 15_000;
+    Ok((exact_lineage
+        && bounded
+        && selected.attribution_confidence >= 0.64
+        && !selected.latest_user_span_ids.is_empty())
+    .then_some(selected))
 }
 
 pub(crate) fn finalize_task_turns(
@@ -2300,6 +2378,10 @@ mod tests {
               evidence_event_ids_json TEXT,
               created_at_ms INTEGER
             );
+            CREATE TABLE frames (
+              id INTEGER PRIMARY KEY,
+              capture_trigger TEXT
+            );
             ",
         )
         .unwrap();
@@ -2563,6 +2645,68 @@ mod tests {
 
         assert!(resolution.selected_task_turn_id.is_none());
         assert!(resolution.frame_scopes.is_empty());
+        assert!(selected_current_task_turn(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn lca_06_same_surface_manual_sample_preserves_only_the_prior_causal_turn() {
+        let conn = fixture();
+        insert_evidence(
+            &conn,
+            "1",
+            100,
+            Some("Repair the live Continue runtime"),
+            Some("I am working on the repair"),
+            None,
+            "normal",
+        );
+        let first = resolve_provisional_task_turns(&conn, &["1".into()]).unwrap();
+        let original = first.selected_task_turn_id.unwrap();
+
+        insert_evidence(&conn, "2", 200, None, None, None, "normal");
+        conn.execute(
+            "INSERT INTO frames (id, capture_trigger) VALUES (2, 'manual_continue_boundary')",
+            [],
+        )
+        .unwrap();
+        let second = resolve_provisional_task_turns(&conn, &["2".into()]).unwrap();
+        assert_eq!(
+            second.selected_task_turn_id.as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(
+            second.selection_reason_codes,
+            vec!["same_surface_empty_sample_preserved".to_string()]
+        );
+    }
+
+    #[test]
+    fn lca_06_wrong_surface_manual_sample_does_not_reuse_the_selected_turn() {
+        let conn = fixture();
+        insert_evidence(
+            &conn,
+            "1",
+            100,
+            Some("Repair the live Continue runtime"),
+            Some("I am working on the repair"),
+            None,
+            "normal",
+        );
+        resolve_provisional_task_turns(&conn, &["1".into()]).unwrap();
+
+        insert_evidence(&conn, "2", 200, None, None, None, "normal");
+        conn.execute(
+            "UPDATE continue_salient_turn_evidence SET surface_key='other-surface' WHERE frame_id='2'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, capture_trigger) VALUES (2, 'manual_continue_boundary')",
+            [],
+        )
+        .unwrap();
+        let resolution = resolve_provisional_task_turns(&conn, &["2".into()]).unwrap();
+        assert!(resolution.selected_task_turn_id.is_none());
         assert!(selected_current_task_turn(&conn).unwrap().is_none());
     }
 

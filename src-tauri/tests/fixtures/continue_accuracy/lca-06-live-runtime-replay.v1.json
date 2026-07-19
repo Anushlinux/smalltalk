@@ -1,0 +1,83 @@
+{
+  "schema": "smalltalk.lca_06.live_runtime_replay.v1",
+  "privacy_class": "synthetic_causal_shape_only",
+  "cases": [
+    {
+      "case_id": "LCA-06-01",
+      "failure_class": "fresh_unresolved_without_target",
+      "initial_divergence": "strict_target_attachment",
+      "expected": ["fresh_semantic_unresolved", "target_status_no_task"],
+      "forbidden": ["stale_decision"]
+    },
+    {
+      "case_id": "LCA-06-02",
+      "failure_class": "fresh_useful_preview_only",
+      "initial_divergence": "strict_target_attachment",
+      "expected": ["supported_instruction_preserved", "frame_preview_only"],
+      "forbidden": ["stale_decision", "direct_open"]
+    },
+    {
+      "case_id": "LCA-06-03",
+      "failure_class": "fresh_useful_mismatched_target",
+      "initial_divergence": "strict_target_attachment",
+      "expected": ["supported_instruction_preserved", "target_suppressed"],
+      "forbidden": ["stale_decision", "direct_open"]
+    },
+    {
+      "case_id": "LCA-06-04",
+      "failure_class": "genuine_material_watermark_advance",
+      "initial_divergence": "none_baseline_expected_behavior",
+      "expected": ["stale_decision", "refresh_continue"],
+      "forbidden": ["direct_open"]
+    },
+    {
+      "case_id": "LCA-06-05",
+      "failure_class": "committed_goal_lost_at_manual_boundary",
+      "initial_divergence": "causal_typing_attribution",
+      "expected": ["latest_user_goal_attributed", "current_task_turn_selected"],
+      "forbidden": ["agent_text_as_user_goal", "control_text_as_user_goal"]
+    },
+    {
+      "case_id": "LCA-06-06",
+      "failure_class": "unconfirmed_geometric_user_like_text",
+      "initial_divergence": "none_baseline_safety_control",
+      "expected": ["explicit_user_claim_absent", "typed_threshold_unchanged"],
+      "forbidden": ["unsafe_user_promotion"]
+    },
+    {
+      "case_id": "LCA-06-07",
+      "failure_class": "provider_request_without_admissible_semantics",
+      "initial_divergence": "provider_admission_preflight",
+      "expected": ["provider_post_count_zero", "typed_task_evidence_acquisition_failure"],
+      "forbidden": ["provider_post", "invented_task", "stale_decision"]
+    },
+    {
+      "case_id": "LCA-06-08",
+      "failure_class": "automatic_capture_contends_with_manual_boundary",
+      "initial_divergence": "capture_workload_admission",
+      "expected": ["manual_boundary_user_priority", "automatic_requeue_blocked"],
+      "forbidden": ["automatic_capture_ahead_of_waiting_manual", "unbounded_queue"]
+    },
+    {
+      "case_id": "LCA-06-09",
+      "failure_class": "helium_chat_user_turn_structurally_proven",
+      "initial_divergence": "browser_chat_role_attribution",
+      "expected": ["ax_web_area_content_boundary", "current_task_turn_selected", "provider_post_count_one"],
+      "forbidden": ["browser_chrome_as_user_goal", "unrelated_search_typing_as_current_task", "second_provider_post"]
+    },
+    {
+      "case_id": "LCA-06-10",
+      "failure_class": "helium_chat_user_turn_geometry_only",
+      "initial_divergence": "browser_chat_role_attribution",
+      "expected": ["geometry_confidence_0_58", "task_evidence_acquisition_failure", "provider_post_count_zero"],
+      "forbidden": ["unsafe_user_promotion", "provider_post"]
+    },
+    {
+      "case_id": "LCA-06-11",
+      "failure_class": "typed_failure_followed_by_material_watermark_advance",
+      "initial_divergence": "stale_projection_selection",
+      "expected": ["cache_reuse_blocked", "direct_open_blocked", "typed_failure_projection_preserved"],
+      "forbidden": ["stale_decision", "saved_answer_older_copy"]
+    }
+  ]
+}

@@ -6433,28 +6433,24 @@ pub fn get_continue_decision(
             artifact.and_then(|artifact| artifact.last_seen_frame_id.clone()),
         )
     });
-    let target_owner = task_truth_target
-        .as_ref()
-        .map(|target| {
-            task_truth_v2::production::strict_target_owner(
-                conn,
-                task_truth_v2.answer.as_ref(),
-                target,
-            )
-        })
-        .transpose()?
-        .flatten();
-    task_truth_v2::production::attach_strict_target(
-        &mut task_truth_v2,
-        task_truth_thread_id.as_deref(),
-        task_truth_thread_revision,
-        target_owner
-            .as_ref()
-            .map(|(thread_id, _)| thread_id.as_str()),
-        target_owner.as_ref().map(|(_, revision)| *revision),
-        direct_target_policy.direct_target_allowed,
-        task_truth_target,
-    );
+    if let Some(task_truth_target) = task_truth_target {
+        let target_owner = task_truth_v2::production::strict_target_owner(
+            conn,
+            task_truth_v2.answer.as_ref(),
+            &task_truth_target,
+        )?;
+        task_truth_v2::production::attach_strict_target(
+            &mut task_truth_v2,
+            task_truth_thread_id.as_deref(),
+            task_truth_thread_revision,
+            target_owner
+                .as_ref()
+                .map(|(thread_id, _)| thread_id.as_str()),
+            target_owner.as_ref().map(|(_, revision)| *revision),
+            direct_target_policy.direct_target_allowed,
+            Some(task_truth_target),
+        );
+    }
     task_truth_v2::production::persist_decision_contract(conn, &decision_id, &task_truth_v2)?;
 
     let result = ContinueDecisionResult {
@@ -9224,7 +9220,9 @@ fn target_truth_for_decision(
     {
         "support_only"
     } else if reason_codes.iter().any(|reason| reason == "target_stale") {
-        "stale_decision"
+        // This proves only that the candidate target is no longer safe. The
+        // semantic answer has its own material-evidence freshness identity.
+        "target_suppressed"
     } else if task_known {
         "task_known_target_unknown"
     } else if evidence_preview.is_some() {
@@ -9871,20 +9869,6 @@ pub fn latest_continue_open_watermark_ms(conn: &Connection) -> Result<Option<i64
     max_i64_if_present(conn, "continue_decision_open_events", "opened_at_ms")
 }
 
-pub fn latest_feedback_or_open_watermark_ms(conn: &Connection) -> Result<Option<i64>, String> {
-    Ok(
-        match (
-            latest_continue_feedback_watermark_ms(conn)?,
-            latest_continue_open_watermark_ms(conn)?,
-        ) {
-            (Some(feedback), Some(open)) => Some(feedback.max(open)),
-            (Some(feedback), None) => Some(feedback),
-            (None, Some(open)) => Some(open),
-            (None, None) => None,
-        },
-    )
-}
-
 fn pending_open_feedback_exists_for_decision(
     conn: &Connection,
     decision_id: &str,
@@ -10221,6 +10205,7 @@ fn build_continue_evidence_watermark(
         "observed_at_ms",
     )?;
     let task_truth_feedback_count = count_if_present(conn, "task_truth_v2_feedback_events")?;
+    let privacy_policy_fingerprint = continue_privacy_policy_fingerprint(conn)?;
     let (latest_open_event_id, latest_open_event_at_ms) =
         latest_string_marker(conn, "continue_decision_open_events", "id", "opened_at_ms")?;
     let hash_seed = serde_json::json!({
@@ -10280,8 +10265,10 @@ fn build_continue_evidence_watermark(
         "latest_task_truth_feedback_id": latest_task_truth_feedback_id,
         "latest_task_truth_feedback_at_ms": latest_task_truth_feedback_at_ms,
         "task_truth_feedback_count": task_truth_feedback_count,
-        "latest_open_event_id": latest_open_event_id,
-        "latest_open_event_at_ms": latest_open_event_at_ms,
+        "privacy_policy_fingerprint": privacy_policy_fingerprint,
+        // Open lifecycle is not semantic evidence. It remains available on
+        // the watermark for diagnostics and delayed feedback inference, but
+        // opening a target must not make the saved answer stale by itself.
     });
     let hash = stable_hash(hash_seed.to_string().as_bytes());
     Ok(ContinueEvidenceWatermark {
@@ -10329,6 +10316,44 @@ fn build_continue_evidence_watermark(
         latest_open_event_at_ms,
         hash,
     })
+}
+
+fn continue_privacy_policy_fingerprint(conn: &Connection) -> Result<String, String> {
+    if !table_exists(conn, "exclusion_rules")? {
+        return Ok(stable_hash(
+            b"smalltalk.continue_privacy_material.v1:no_rules_table",
+        ));
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT id, rule_type, pattern, action, enabled, origin
+             FROM exclusion_rules
+             WHERE enabled = 1
+             ORDER BY id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "rule_type": row.get::<_, String>(1)?,
+                "pattern": row.get::<_, String>(2)?,
+                "action": row.get::<_, String>(3)?,
+                "enabled": row.get::<_, i64>(4)?,
+                "origin": row.get::<_, String>(5)?,
+            }))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    Ok(stable_hash(
+        serde_json::json!({
+            "schema": "smalltalk.continue_privacy_material.v1",
+            "enabled_rules": rows,
+        })
+        .to_string()
+        .as_bytes(),
+    ))
 }
 
 pub fn current_continue_evidence_watermark_hash(
@@ -47245,6 +47270,74 @@ mod tests {
             after.latest_ui_event_id.as_deref(),
             Some("event-high-value")
         );
+    }
+
+    #[test]
+    fn continue_open_lifecycle_does_not_change_material_evidence_watermark() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        init_evidence_schema(&conn);
+        conn.execute(
+            "INSERT INTO continue_decisions (
+               id, requested_at_ms, source, confidence, validation_status
+             ) VALUES ('decision-existing', 1000, 'test', 0.5, 'valid')",
+            [],
+        )
+        .unwrap();
+        let before = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+
+        conn.execute(
+            "INSERT INTO continue_decision_open_events (
+               id, decision_id, source, opened_at_ms, strategy,
+               opened_url, opened_path, opened_frame_fallback, warnings_json
+             ) VALUES (
+               'open-lifecycle-only', 'decision-existing', 'react', 2000,
+               'browser_url', 1, 0, 0, '[]'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let after = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+        assert_eq!(before.hash, after.hash);
+        assert_eq!(
+            after.latest_open_event_id.as_deref(),
+            Some("open-lifecycle-only")
+        );
+    }
+
+    #[test]
+    fn enabled_privacy_rule_change_invalidates_material_evidence_watermark() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        init_evidence_schema(&conn);
+        conn.execute_batch(
+            "CREATE TABLE exclusion_rules (
+               id TEXT PRIMARY KEY,
+               rule_type TEXT NOT NULL,
+               pattern TEXT NOT NULL,
+               action TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               origin TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        let before = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+
+        conn.execute(
+            "INSERT INTO exclusion_rules (
+               id, rule_type, pattern, action, enabled, origin, created_at_ms
+             ) VALUES (
+               'rule-private', 'window_title_regex', 'Private project',
+               'never_send_to_ai', 1, 'user', 2000
+             )",
+            [],
+        )
+        .unwrap();
+
+        let after = build_continue_evidence_watermark(&conn, Some("session-a")).unwrap();
+        assert_ne!(before.hash, after.hash);
     }
 
     #[test]

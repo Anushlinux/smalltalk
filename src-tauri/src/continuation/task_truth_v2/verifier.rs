@@ -407,10 +407,19 @@ impl TaskTruthVerifier for LocalEvidenceVerifier {
             .is_none()
         {
             ResolutionStatusV1::VerificationRejected
-        } else if model_status == ResolutionStatusV1::Ambiguous || hypotheses.len() > 1 {
-            ResolutionStatusV1::Ambiguous
         } else {
-            ResolutionStatusV1::Resolved
+            match model_status {
+                ResolutionStatusV1::Resolved if hypotheses.len() == 1 => {
+                    ResolutionStatusV1::Resolved
+                }
+                ResolutionStatusV1::Resolved | ResolutionStatusV1::Ambiguous => {
+                    ResolutionStatusV1::Ambiguous
+                }
+                ResolutionStatusV1::InsufficientEvidence => {
+                    ResolutionStatusV1::InsufficientEvidence
+                }
+                other => other,
+            }
         };
         VerificationResultV1 {
             status,
@@ -559,6 +568,20 @@ fn build_verified_snapshot(
                 .iter()
                 .any(|item| &item.record_id == anchor)
         });
+    let has_explicit_goal_evidence = selected
+        .claim_evidence
+        .get("likely_primary_task")
+        .and_then(Option::as_ref)
+        .is_some_and(|claim| {
+            claim.evidence_refs.iter().any(|evidence| {
+                packet.task_relevance.spans.iter().any(|span| {
+                    span.span_id == evidence.record_id
+                        && span.evidence_role
+                            == super::observation_packet::TaskEvidenceRoleV1::LatestUserGoal
+                        && span.submitted != Some(false)
+                })
+            })
+        });
     Some(TaskSnapshotV2 {
         schema: TASK_SNAPSHOT_SCHEMA_V2.into(),
         snapshot_id: format!("snapshot-{}", super::super::stable_hash(seed.as_bytes())),
@@ -577,7 +600,12 @@ fn build_verified_snapshot(
         continuity_identity_token: selected.continuity_identity_token.clone(),
         supersedes_thread_id: selected.supersedes_thread_id.clone(),
         legacy_task_turn_id: None,
-        task_basis: "explicit_goal".into(),
+        task_basis: if has_explicit_goal_evidence {
+            "verified_cloud_explicit_goal"
+        } else {
+            "verified_cloud_inferred_goal"
+        }
+        .into(),
         observed_surface: accepted(fields, "observed_surface")
             .then(|| selected.observed_surface.clone())
             .flatten(),
@@ -1465,6 +1493,18 @@ mod tests {
             snapshot.return_anchor_status,
             ReturnAnchorStatusV2::Unresolved
         );
+    }
+
+    #[test]
+    fn insufficient_model_status_can_never_be_locally_upgraded_to_resolved() {
+        let result = LocalEvidenceVerifier.verify(
+            &packet(),
+            None,
+            &[hypothesis("element-user")],
+            ResolutionStatusV1::InsufficientEvidence,
+        );
+        assert_eq!(result.status, ResolutionStatusV1::InsufficientEvidence);
+        assert!(result.snapshot.is_some());
     }
 
     #[test]

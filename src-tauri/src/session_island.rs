@@ -47,12 +47,10 @@ struct RememberedContinueIslandState {
     resume_warning: Option<String>,
     continue_freshness: String,
     evidence_updated_at_ms: Option<i64>,
+    evidence_watermark_hash: String,
     decision_updated_at_ms: Option<i64>,
     continue_openable: bool,
-    feedback_or_open_watermark_ms: Option<i64>,
-    frame_count: u64,
-    signal_count: u64,
-    event_count: u64,
+    feedback_watermark_ms: Option<i64>,
     island_continue_state: IslandContinueState,
 }
 
@@ -994,10 +992,10 @@ fn apply_remembered_continue_to_status_snapshot(
     let latest_capture_at = snapshot.last_capture_at_ms.unwrap_or_default();
     let remembered_evidence_at = remembered.evidence_updated_at_ms.unwrap_or_default();
     let has_new_evidence = session_changed
-        || snapshot.frame_count > remembered.frame_count
-        || snapshot.trail_moment_count > remembered.signal_count
-        || snapshot.event_count > remembered.event_count
-        || latest_capture_at > remembered_evidence_at;
+        || status
+            .continue_evidence_watermark_hash
+            .as_deref()
+            .is_some_and(|current| current != remembered.evidence_watermark_hash);
 
     snapshot.continue_decision_id = Some(remembered.decision_id);
     snapshot.continue_openable = Some(remembered.continue_openable);
@@ -1008,9 +1006,20 @@ fn apply_remembered_continue_to_status_snapshot(
 
     if has_new_evidence {
         if let Some(state) = snapshot.island_continue_state.as_mut() {
-            state.display_state = IslandDisplayState::NeedsRefresh;
             state.decision_stale = true;
             state.evidence_watermark_ms = Some(latest_capture_at.max(remembered_evidence_at));
+            let semantic_stale = state.semantic_answer.as_ref().map_or(true, |answer| {
+                answer.stale_product_projection.presentation_state
+                    == crate::continuation::task_truth_v2::production::ContinuePresentationStateV1::StaleDecision
+            });
+            if let Some(answer) = state.semantic_answer.as_mut() {
+                answer.product_projection = answer.stale_product_projection.clone();
+            }
+            if semantic_stale {
+                state.display_state = IslandDisplayState::NeedsRefresh;
+                state.target_state = "stale_decision".to_string();
+                state.target_reason_codes = vec!["target_stale".to_string()];
+            }
             state.available_actions = vec![
                 IslandAvailableAction::enabled(
                     IslandActionKind::RefreshContinue,
@@ -1225,6 +1234,7 @@ fn continue_from_island() {
                 started_at: None,
                 last_error: None,
                 latest_frame: None,
+                continue_evidence_watermark_hash: None,
                 skipped_samples: 0,
                 last_skipped_at: None,
                 data_dir: String::new(),
@@ -2122,12 +2132,10 @@ fn remember_continue_decision_from_snapshot(
             resume_warning: snapshot.resume_warning.clone(),
             continue_freshness,
             evidence_updated_at_ms: snapshot.evidence_updated_at_ms,
+            evidence_watermark_hash: decision.evidence_watermark_hash.clone(),
             decision_updated_at_ms: snapshot.decision_updated_at_ms,
             continue_openable,
-            feedback_or_open_watermark_ms: None,
-            frame_count: snapshot.frame_count,
-            signal_count: snapshot.trail_moment_count,
-            event_count: snapshot.event_count,
+            feedback_watermark_ms: None,
             island_continue_state,
         });
     }
@@ -2495,6 +2503,12 @@ mod tests {
                     label: "Next action".to_string(),
                     value: "Use the saved wording exactly.".to_string(),
                 }],
+                product_projection:
+                    crate::continuation::task_truth_v2::production::ContinueProductProjectionV1 {
+                        answer_identity: "answer-history".to_string(),
+                        primary_instruction: "Exact saved title".to_string(),
+                        ..Default::default()
+                    },
             },
             8,
         );
@@ -2526,6 +2540,7 @@ mod tests {
             started_at: Some(now_millis()),
             last_error: None,
             latest_frame: None,
+            continue_evidence_watermark_hash: None,
             skipped_samples: 0,
             last_skipped_at: None,
             data_dir: String::new(),
@@ -2566,10 +2581,25 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_from_status_marks_remembered_continue_stale_on_event_only_evidence() {
+    fn snapshot_from_status_marks_remembered_continue_stale_on_material_watermark_advance() {
         let _guard = TEST_LOCK.lock().unwrap();
         remember_continue_for_test(1, 7, 12, "current");
-        let status = status_for_island_freshness(1, 7, 13, 10_000);
+        if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+            let remembered = slot.as_mut().unwrap();
+            let mut answer =
+                crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+                    atomic_answer_identity: "answer-test".into(),
+                    unfinished_task: Some("Verify the current answer".into()),
+                    task_state: "active".into(),
+                    next_supported_action: Some("Open the verified target".into()),
+                    target_status: "direct_target_ready".into(),
+                    ..Default::default()
+                };
+            answer.recompute_product_projection();
+            remembered.island_continue_state.semantic_answer = Some(answer);
+        }
+        let mut status = status_for_island_freshness(1, 7, 13, 10_000);
+        status.continue_evidence_watermark_hash = Some("material-advanced".to_string());
 
         let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
 
@@ -2581,6 +2611,75 @@ mod tests {
         assert_eq!(snapshot.resume_headline.as_deref(), Some("New evidence"));
         assert_eq!(snapshot.resume_detail.as_deref(), Some("Refresh Continue"));
         assert_eq!(snapshot.resume_point.as_deref(), Some("PRODUCT.md"));
+        let state = snapshot.island_continue_state.as_ref().unwrap();
+        let projection = &state.semantic_answer.as_ref().unwrap().product_projection;
+        assert_eq!(state.target_state, "stale_decision");
+        assert!(!state.allows_open_continue_target());
+        assert_eq!(projection.answer_identity, "answer-test");
+        assert_eq!(projection.target_status, "stale_decision");
+        assert_eq!(
+            projection.presentation_state,
+            crate::continuation::task_truth_v2::production::ContinuePresentationStateV1::StaleDecision
+        );
+        assert_eq!(
+            projection.primary_instruction,
+            "The saved answer is older than the latest work."
+        );
+        assert_eq!(projection.primary_action.label, "Refresh Continue");
+        assert_eq!(
+            projection.primary_action.kind,
+            crate::continuation::task_truth_v2::production::ContinueProductActionKindV1::RefreshContinue
+        );
+    }
+
+    #[test]
+    fn snapshot_from_status_preserves_typed_acquisition_failure_on_watermark_advance() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        remember_continue_for_test(1, 7, 12, "current");
+        if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
+            let remembered = slot.as_mut().unwrap();
+            let mut answer =
+                crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+                    task_resolution_status: "unresolved".into(),
+                    admitted_semantic_status: "unresolved".into(),
+                    target_status: "no_task".into(),
+                    unresolved_or_failure_reason: Some(
+                        "task_evidence_acquisition_failure:no_admissible_semantic_fields".into(),
+                    ),
+                    ..Default::default()
+                };
+            answer.recompute_product_projection();
+            remembered.island_continue_state.display_state =
+                IslandDisplayState::NoClearContinuation;
+            remembered.island_continue_state.target_state = "no_task".into();
+            remembered.island_continue_state.semantic_answer = Some(answer);
+        }
+        let mut status = status_for_island_freshness(1, 7, 13, 10_000);
+        status.continue_evidence_watermark_hash = Some("material-advanced".to_string());
+
+        let snapshot = snapshot_from_status(&status, SessionIslandState::RecordingCompact);
+        let state = snapshot.island_continue_state.as_ref().unwrap();
+        let answer = state.semantic_answer.as_ref().unwrap();
+
+        assert!(
+            state.decision_stale,
+            "cache/open identity must still be invalidated"
+        );
+        assert_eq!(state.display_state, IslandDisplayState::NoClearContinuation);
+        assert_eq!(state.target_state, "no_task");
+        assert_eq!(
+            answer.unresolved_or_failure_reason.as_deref(),
+            Some("task_evidence_acquisition_failure:no_admissible_semantic_fields")
+        );
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            crate::continuation::task_truth_v2::production::ContinuePresentationStateV1::TaskUnknown
+        );
+        assert_ne!(
+            answer.product_projection.primary_instruction,
+            "The saved answer is older than the latest work."
+        );
+        assert!(!state.allows_open_continue_target());
     }
 
     #[test]
@@ -3164,8 +3263,20 @@ mod tests {
         assert!(
             answer_content.contains("decisionId = state.decisionId ?? snapshot.continueDecisionId")
         );
-        assert!(answer_content.contains("title = Self.verbatim(answer?.taskSummary)"));
-        let ordered_labels = [
+        assert!(answer_content.contains("let projection = answer?.productProjection"));
+        assert!(answer_content.contains("projection?.primaryInstruction"));
+        assert!(answer_content.contains("projection?.primaryAction"));
+        assert!(answer_content.contains("projection?.answerIdentity"));
+        let ordered_labels = ["Where you stopped", "Location"];
+        let mut previous = 0;
+        for label in ordered_labels {
+            let position = answer_content[previous..]
+                .find(label)
+                .map(|offset| previous + offset)
+                .unwrap_or_else(|| panic!("missing semantic field label {label:?}"));
+            previous = position + label.len();
+        }
+        for forbidden in [
             "Task object",
             "Current activity — observed surface",
             "Current activity — immediate operation",
@@ -3176,16 +3287,6 @@ mod tests {
             "Unfinished state",
             "Next action",
             "Where summary",
-        ];
-        let mut previous = 0;
-        for label in ordered_labels {
-            let position = answer_content[previous..]
-                .find(label)
-                .map(|offset| previous + offset)
-                .unwrap_or_else(|| panic!("missing semantic field label {label:?}"));
-            previous = position + label.len();
-        }
-        for forbidden in [
             "activityLabel",
             "activitySummary",
             "currentFocus",
@@ -3215,6 +3316,8 @@ mod tests {
         assert!(answer_summary.contains("width: s(model.answerLayout.summaryWidth)"));
         assert!(answer_summary.contains("height: s(kWhisperFlowAnswerSummaryH)"));
         assert!(answer_summary.contains("width: s(model.answerLayout.summaryPanelWidth)"));
+        assert!(answer_summary.contains("Button(action: onPrimaryAnswerAction)"));
+        assert!(answer_summary.contains(".accessibilityLabel(label)"));
         assert!(answer_summary.contains(".accessibilityLabel(\"\\(answer.title). See more\")"));
 
         let answer_expanded = source
@@ -3224,6 +3327,7 @@ mod tests {
             .expect("Swift must keep the content-driven expanded answer");
         assert!(answer_expanded.contains("Text(answer.title)"));
         assert!(answer_expanded.contains("Text(row.value)"));
+        assert!(answer_expanded.contains("Button(action: onPrimaryAnswerAction)"));
         assert!(answer_expanded.contains("ScrollView(.vertical, showsIndicators: true)"));
         assert!(answer_expanded.contains("width: s(model.answerLayout.expandedWidth)"));
         assert!(answer_expanded.contains("height: s(model.answerLayout.expandedHeight)"));
@@ -3287,6 +3391,21 @@ mod tests {
         assert!(cue_toggle.contains("preserveCurrentAnchor: true"));
         assert!(source.contains("@Published var visualCuePresented = false"));
 
+        let product_action = source
+            .split("private func performPrimaryAnswerAction()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func handle(continueAction").next())
+            .expect("Swift must route canonical product actions through typed island actions");
+        assert!(product_action.contains("case .openDirectTarget:"));
+        assert!(product_action.contains("actionKind = .openContinueTarget"));
+        assert!(product_action.contains("case .inspectEvidence:"));
+        assert!(product_action.contains("actionKind = .inspectEvidence"));
+        assert!(product_action.contains("case .refreshContinue:"));
+        assert!(product_action.contains("actionKind = .refreshContinue"));
+        assert!(product_action.contains("$0.enabled && $0.kind == actionKind"));
+        assert!(product_action.contains("actionKind == .openContinueTarget"));
+        assert!(product_action.contains("handle(continueAction: action)"));
+
         let panel_frame = source
             .split("private func resolvedPanelFrame(preserveCurrentAnchor: Bool)")
             .nth(1)
@@ -3340,6 +3459,98 @@ mod tests {
         assert!(ambient
             .contains("value: model.memoryTransitionCountdownActive || model.continueGenerating"));
         assert!(source.contains(".scaleEffect(scale, anchor: .top)"));
+    }
+
+    #[test]
+    fn native_product_projection_wire_shape_matches_the_backend_contract() {
+        use crate::continuation::task_truth_v2::production::{
+            ContinuePresentationStateV1, ContinueProductActionKindV1, TaskTruthPublicAnswerV1,
+        };
+
+        let mut answer = TaskTruthPublicAnswerV1 {
+            atomic_answer_identity: "answer-wire-1".into(),
+            admitted_semantic_status: "resolved".into(),
+            unfinished_task: Some("Verify native parity".into()),
+            task_state: "needs_user_verification".into(),
+            resume_point: Some("The canonical result is ready".into()),
+            next_supported_action: Some("Inspect the native result".into()),
+            where_summary: Some("Smalltalk island".into()),
+            target_status: "frame_preview_only".into(),
+            evidence_preview: Some(crate::continuation::ContinueEvidencePreview {
+                schema: "smalltalk.continue_evidence_preview.v1".into(),
+                preview_kind: "answer_evidence".into(),
+                frame_id: "42".into(),
+            }),
+            ..Default::default()
+        };
+        answer.recompute_product_projection();
+        let projection = answer.product_projection.clone();
+
+        let mut state = IslandContinueState::no_evidence(
+            IslandFreshness::default(),
+            IslandStateContext::default(),
+        );
+        state.semantic_answer = Some(answer);
+        state.decision_id = Some("decision-wire-1".into());
+        state.available_actions = vec![IslandAvailableAction::enabled(
+            IslandActionKind::InspectEvidence,
+            "View last screen",
+            None,
+        )];
+
+        let wire = serde_json::to_value(&state).unwrap();
+        let wire_projection = &wire["semantic_answer"]["product_projection"];
+        assert_eq!(wire_projection, &serde_json::to_value(&projection).unwrap());
+        assert_eq!(wire_projection["answer_identity"], "answer-wire-1");
+        assert_eq!(
+            wire_projection["primary_instruction"],
+            "Inspect the native result"
+        );
+        assert_eq!(
+            wire_projection["resume_context"],
+            "The canonical result is ready"
+        );
+        assert_eq!(wire_projection["location_context"], "Smalltalk island");
+        assert_eq!(wire_projection["presentation_state"], "action_known");
+        assert_eq!(
+            wire_projection["primary_action"]["kind"],
+            "inspect_evidence"
+        );
+        assert_eq!(
+            wire_projection["primary_action"]["label"],
+            "View last screen"
+        );
+        assert_eq!(
+            projection.presentation_state,
+            ContinuePresentationStateV1::ActionKnown
+        );
+        assert_eq!(
+            projection.primary_action.kind,
+            ContinueProductActionKindV1::InspectEvidence
+        );
+
+        let swift = include_str!("../macos/SessionIslandPanel.swift");
+        for coding_key in [
+            "answer_identity",
+            "presentation_state",
+            "primary_instruction",
+            "resume_context",
+            "location_context",
+            "semantic_status",
+            "task_state",
+            "target_status",
+            "primary_action",
+            "inspect_available",
+            "unresolved_reason",
+            "open_direct_target",
+            "inspect_evidence",
+            "refresh_continue",
+        ] {
+            assert!(
+                swift.contains(coding_key),
+                "Swift decoder/action mapping is missing {coding_key}"
+            );
+        }
     }
 
     #[test]
@@ -3727,9 +3938,9 @@ mod tests {
     }
 
     fn remember_continue_for_test(
-        frame_count: u64,
-        signal_count: u64,
-        event_count: u64,
+        _frame_count: u64,
+        _signal_count: u64,
+        _event_count: u64,
         freshness: &str,
     ) {
         if let Ok(mut slot) = LAST_CONTINUE_ISLAND_STATE.lock() {
@@ -3767,12 +3978,10 @@ mod tests {
                 resume_warning: None,
                 continue_freshness: freshness.to_string(),
                 evidence_updated_at_ms: Some(10_000),
+                evidence_watermark_hash: "material-current".to_string(),
                 decision_updated_at_ms: Some(11_000),
                 continue_openable: true,
-                feedback_or_open_watermark_ms: None,
-                frame_count,
-                signal_count,
-                event_count,
+                feedback_watermark_ms: None,
                 island_continue_state,
             });
         }
@@ -3841,6 +4050,10 @@ mod tests {
                 sck_capture_mode: None,
                 sck_audio_policy: None,
             }),
+            // Raw frame, signal, and event counters are deliberately not the
+            // freshness identity. Tests change this value explicitly only
+            // when material Continue evidence changes.
+            continue_evidence_watermark_hash: Some("material-current".to_string()),
             skipped_samples: 0,
             last_skipped_at: None,
             data_dir: String::new(),

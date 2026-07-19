@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,20 @@ const MAX_IDENTIFIER_CHARS: usize = 192;
 #[derive(Debug, Clone, Serialize)]
 struct ReviewSemanticAnswer {
     resolution_status: String,
+    raw_model_status: String,
+    admitted_semantic_status: String,
+    semantic_source_kind: String,
+    target_status: String,
+    unresolved_or_failure_reason: Option<String>,
+    atomic_answer_identity: String,
+    unfinished_task: Option<String>,
+    task_state: String,
+    resume_point: Option<String>,
+    next_supported_action: Option<String>,
+    completed_context: Option<String>,
+    field_admission: BTreeMap<String, String>,
+    claim_confidence: BTreeMap<String, f64>,
+    semantic_conflicts: Vec<String>,
     task_summary: Option<String>,
     current_subtask: Option<String>,
     task_object: Option<String>,
@@ -39,6 +54,14 @@ struct ReviewInference {
 
 #[derive(Debug, Clone, Serialize)]
 struct ReviewAtomicIdentity {
+    decision_id: String,
+    current_frame_id: String,
+    packet_policy_version: String,
+    response_schema_version: String,
+    admission_version: String,
+    admitted_result_id: String,
+    correction_watermark: String,
+    target_identity: Option<String>,
     session_id: Option<String>,
     task_thread_id: Option<String>,
     task_thread_revision: Option<i64>,
@@ -139,6 +162,38 @@ fn nonempty_identity(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn canonical_diagnostic_request_id(
+    diagnostic: Option<&super::production::TaskTruthInferenceDiagnosticV1>,
+) -> Option<&str> {
+    diagnostic.and_then(|diagnostic| {
+        nonempty_identity(diagnostic.provider_request_id.as_deref())
+            .or_else(|| nonempty_identity(diagnostic.request_id.as_deref()))
+    })
+}
+
+fn inference_identity_matches(
+    contract_request_id: Option<&str>,
+    answer_request_id: Option<&str>,
+    contract_response_id: Option<&str>,
+    answer_response_id: Option<&str>,
+    diagnostic: Option<&super::production::TaskTruthInferenceDiagnosticV1>,
+) -> bool {
+    let diagnostic_request_id = canonical_diagnostic_request_id(diagnostic);
+    let diagnostic_response_id =
+        diagnostic.and_then(|diagnostic| nonempty_identity(diagnostic.response_id.as_deref()));
+
+    contract_request_id == answer_request_id
+        && contract_request_id == diagnostic_request_id
+        && contract_response_id == answer_response_id
+        // Some providers and typed no-response failures do not supply a native
+        // response id. The production answer then uses its deterministic
+        // envelope identity. The persisted contract and answer must still
+        // agree; a native diagnostic id, when present, must also agree.
+        && diagnostic_response_id
+            .map(|response_id| contract_response_id == Some(response_id))
+            .unwrap_or(true)
+}
+
 fn safe_label(value: &str, fallback: &str) -> String {
     identifier(Some(value)).unwrap_or_else(|| fallback.to_string())
 }
@@ -147,6 +202,20 @@ fn semantic_answer(answer: Option<&TaskTruthPublicAnswerV1>) -> ReviewSemanticAn
     let Some(answer) = answer else {
         return ReviewSemanticAnswer {
             resolution_status: "unresolved".to_string(),
+            raw_model_status: "unresolved".to_string(),
+            admitted_semantic_status: "unresolved".to_string(),
+            semantic_source_kind: "unresolved".to_string(),
+            target_status: "no_task".to_string(),
+            unresolved_or_failure_reason: None,
+            atomic_answer_identity: String::new(),
+            unfinished_task: None,
+            task_state: "unclear".to_string(),
+            resume_point: None,
+            next_supported_action: None,
+            completed_context: None,
+            field_admission: BTreeMap::new(),
+            claim_confidence: BTreeMap::new(),
+            semantic_conflicts: Vec::new(),
             task_summary: None,
             current_subtask: None,
             task_object: None,
@@ -159,6 +228,34 @@ fn semantic_answer(answer: Option<&TaskTruthPublicAnswerV1>) -> ReviewSemanticAn
     };
     ReviewSemanticAnswer {
         resolution_status: safe_label(&answer.task_resolution_status, "unresolved"),
+        raw_model_status: safe_label(&answer.raw_model_status, "unresolved"),
+        admitted_semantic_status: safe_label(&answer.admitted_semantic_status, "unresolved"),
+        semantic_source_kind: safe_label(&answer.semantic_source_kind, "unresolved"),
+        target_status: safe_label(&answer.target_status, "no_task"),
+        unresolved_or_failure_reason: identifier(answer.unresolved_or_failure_reason.as_deref()),
+        atomic_answer_identity: identifier(Some(&answer.atomic_answer_identity))
+            .unwrap_or_default(),
+        unfinished_task: semantic(answer.unfinished_task.as_deref()),
+        task_state: safe_label(&answer.task_state, "unclear"),
+        resume_point: semantic(answer.resume_point.as_deref()),
+        next_supported_action: semantic(answer.next_supported_action.as_deref()),
+        completed_context: semantic(answer.completed_context.as_deref()),
+        field_admission: answer
+            .field_admission
+            .iter()
+            .map(|(field, admission)| {
+                (
+                    safe_label(field, "unknown_field"),
+                    safe_label(&admission.verdict, "rejected_invalid_state"),
+                )
+            })
+            .collect(),
+        claim_confidence: answer.claim_confidence.clone(),
+        semantic_conflicts: answer
+            .semantic_conflicts
+            .iter()
+            .filter_map(|conflict| identifier(Some(conflict)))
+            .collect(),
         task_summary: semantic(answer.task_summary.as_deref()),
         current_subtask: semantic(answer.current_subtask.as_deref()),
         task_object: semantic(answer.task_object.as_deref()),
@@ -174,6 +271,16 @@ fn atomic_identity(identity: Option<&TaskTruthAtomicIdentityV1>) -> ReviewAtomic
     let empty = TaskTruthAtomicIdentityV1::default();
     let identity = identity.unwrap_or(&empty);
     ReviewAtomicIdentity {
+        decision_id: identifier(Some(&identity.decision_id)).unwrap_or_default(),
+        current_frame_id: identifier(Some(&identity.current_frame_id)).unwrap_or_default(),
+        packet_policy_version: identifier(Some(&identity.packet_policy_version))
+            .unwrap_or_default(),
+        response_schema_version: identifier(Some(&identity.response_schema_version))
+            .unwrap_or_default(),
+        admission_version: identifier(Some(&identity.admission_version)).unwrap_or_default(),
+        admitted_result_id: identifier(Some(&identity.admitted_result_id)).unwrap_or_default(),
+        correction_watermark: identifier(Some(&identity.correction_watermark)).unwrap_or_default(),
+        target_identity: identifier(identity.target_identity.as_deref()),
         session_id: identifier(identity.session_id.as_deref()),
         task_thread_id: identifier(identity.task_thread_id.as_deref()),
         task_thread_revision: identity.task_thread_revision.filter(|value| *value >= 0),
@@ -312,20 +419,18 @@ fn review_artifact(
         .and_then(|identity| nonempty_identity(identity.model_request_id.as_deref()));
     let answer_request_id = answer
         .and_then(|answer| nonempty_identity(answer.atomic_identity.model_request_id.as_deref()));
-    let diagnostic_request_id =
-        diagnostic.and_then(|diagnostic| nonempty_identity(diagnostic.request_id.as_deref()));
     let contract_response_id = contract_identity
         .as_ref()
         .and_then(|identity| nonempty_identity(identity.model_response_id.as_deref()));
     let answer_response_id = answer
         .and_then(|answer| nonempty_identity(answer.atomic_identity.model_response_id.as_deref()));
-    let diagnostic_response_id =
-        diagnostic.and_then(|diagnostic| nonempty_identity(diagnostic.response_id.as_deref()));
-    if contract_request_id != answer_request_id
-        || contract_request_id != diagnostic_request_id
-        || contract_response_id != answer_response_id
-        || contract_response_id != diagnostic_response_id
-    {
+    if !inference_identity_matches(
+        contract_request_id,
+        answer_request_id,
+        contract_response_id,
+        answer_response_id,
+        diagnostic,
+    ) {
         return Err("mfti_review_inference_identity_mismatch".to_string());
     }
     if let (Some(contract), Some(answer)) = (contract_identity.as_ref(), answer) {
@@ -453,6 +558,82 @@ pub(crate) fn write_mfti_review_artifact(
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    fn diagnostic(
+        request_id: Option<&str>,
+        provider_request_id: Option<&str>,
+        response_id: Option<&str>,
+    ) -> super::super::production::TaskTruthInferenceDiagnosticV1 {
+        super::super::production::TaskTruthInferenceDiagnosticV1 {
+            schema: "smalltalk.task_truth_inference_diagnostic.v1".into(),
+            status: "success".into(),
+            origin: "live_cloud".into(),
+            provider: "openai".into(),
+            model: "test-model".into(),
+            request_id: request_id.map(str::to_string),
+            provider_request_id: provider_request_id.map(str::to_string),
+            response_id: response_id.map(str::to_string),
+            provider_attempt_count: 1,
+            latency_ms: 1,
+            image_count: 1,
+            image_bytes: 1,
+            estimated_tokens: 1,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            total_tokens: Some(2),
+            estimated_cost_usd: Some(0.0),
+            verification_status: "verified".into(),
+            selected_hypothesis_id: None,
+        }
+    }
+
+    #[test]
+    fn provider_request_identity_is_canonical_for_review_matching() {
+        let diagnostic = diagnostic(
+            Some("local-request"),
+            Some("provider-request"),
+            Some("provider-response"),
+        );
+
+        assert_eq!(
+            canonical_diagnostic_request_id(Some(&diagnostic)),
+            Some("provider-request")
+        );
+        assert!(inference_identity_matches(
+            Some("provider-request"),
+            Some("provider-request"),
+            Some("provider-response"),
+            Some("provider-response"),
+            Some(&diagnostic),
+        ));
+        assert!(!inference_identity_matches(
+            Some("local-request"),
+            Some("local-request"),
+            Some("provider-response"),
+            Some("provider-response"),
+            Some(&diagnostic),
+        ));
+    }
+
+    #[test]
+    fn deterministic_response_envelope_is_valid_when_provider_has_no_native_id() {
+        let diagnostic = diagnostic(Some("local-request"), None, None);
+
+        assert!(inference_identity_matches(
+            Some("local-request"),
+            Some("local-request"),
+            Some("provider-response-envelope-hash"),
+            Some("provider-response-envelope-hash"),
+            Some(&diagnostic),
+        ));
+        assert!(!inference_identity_matches(
+            Some("local-request"),
+            Some("local-request"),
+            Some("provider-response-envelope-a"),
+            Some("provider-response-envelope-b"),
+            Some(&diagnostic),
+        ));
+    }
 
     #[test]
     fn bounded_text_rejects_paths_urls_and_secrets() {

@@ -19,6 +19,7 @@ const MAX_ARGUMENT_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Default)]
 pub(super) struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    externally_cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl CancellationToken {
@@ -28,6 +29,15 @@ impl CancellationToken {
 
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .externally_cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+
+    pub(super) fn linked_to(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.externally_cancelled = Some(cancelled);
+        self
     }
 }
 
@@ -661,6 +671,19 @@ mod tests {
         rx.recv().unwrap();
         thread::sleep(Duration::from_millis(20));
         token.cancel();
+        let result = worker.join().unwrap();
+        assert_eq!(result.category, ProcessExitCategory::Cancelled);
+        assert_process_reaped(result.pid);
+    }
+
+    #[test]
+    fn linked_workload_cancellation_kills_and_reaps_child() {
+        let workload_cancelled = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::default().linked_to(Arc::clone(&workload_cancelled));
+        let worker =
+            thread::spawn(move || run_process(shell("sleep 10", Duration::from_secs(5)), &token));
+        thread::sleep(Duration::from_millis(20));
+        workload_cancelled.store(true, Ordering::Release);
         let result = worker.join().unwrap();
         assert_eq!(result.category, ProcessExitCategory::Cancelled);
         assert_process_reaped(result.pid);

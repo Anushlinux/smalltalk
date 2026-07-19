@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -6,6 +7,7 @@ import {
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
   buildContinuePublicProjection,
+  canExecuteContinueProductAction,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
   hasVisibleTaskTruthSemantics,
@@ -19,6 +21,23 @@ import {
   selectPrimaryTaskHeadline,
   splitConfidenceLabels,
 } from "../src/continuePresentation.ts";
+
+function productProjection(overrides = {}) {
+  return {
+    answer_identity: "answer-one",
+    presentation_state: "action_known_target_unavailable",
+    primary_instruction: "Run the receiving-path tests.",
+    resume_context: "The authoritative snapshot was selected; receiving-path verification remains.",
+    location_context: "Smalltalk",
+    semantic_status: "resolved",
+    task_state: "in_progress",
+    target_status: "task_known_target_unknown",
+    primary_action: { kind: "inspect_evidence", label: "View last screen" },
+    inspect_available: true,
+    unresolved_reason: null,
+    ...overrides,
+  };
+}
 
 function adoptionDecision(overrides = {}) {
   return {
@@ -84,6 +103,12 @@ function authoritativeDecision({
       release_gate_passed: true,
       answer: {
         task_resolution_status: status,
+        target_status: target ? "direct_target_ready" : "task_known_target_unknown",
+        product_projection: productProjection(target ? {
+          presentation_state: "actionable_direct_target",
+          target_status: "direct_target_ready",
+          primary_action: { kind: "open_direct_target", label: "Continue here" },
+        } : {}),
         task_summary: "Repair Task Truth adoption",
         task_object: "Continue card",
         last_meaningful_progress: "The authoritative snapshot was selected",
@@ -195,10 +220,35 @@ test("atomic identity validation failures have a retryable validation state", ()
 
 test("resolved Task Truth without complete atomic identity becomes honest unresolved", () => {
   const decision = authoritativeDecision();
+  Object.assign(decision.task_truth_v2.answer, {
+    admitted_semantic_status: "resolved",
+    semantic_source_kind: "verified_cloud_explicit_goal",
+    unfinished_task: "Verify the visual cue",
+    task_state: "needs_user_verification",
+    resume_point: "Implementation complete; verification remains",
+    next_supported_action: "Test the cue",
+    completed_context: "Checks passed",
+    target_status: "direct_target_ready",
+    atomic_answer_identity: "admitted-result",
+    field_admission: { unfinished_task: { verdict: "accepted", reasons: [] } },
+    claim_confidence: { unfinished_task: 0.9 },
+  });
   decision.task_truth_v2.answer.atomic_identity.model_response_id = null;
 
   const answer = authoritativeTaskTruthAnswer(decision);
   assert.equal(answer?.task_resolution_status, "unresolved");
+  assert.equal(answer?.admitted_semantic_status, "unresolved");
+  assert.equal(answer?.semantic_source_kind, "unresolved");
+  assert.equal(answer?.unfinished_task, null);
+  assert.equal(answer?.task_state, "unclear");
+  assert.equal(answer?.resume_point, null);
+  assert.equal(answer?.next_supported_action, null);
+  assert.equal(answer?.completed_context, null);
+  assert.equal(answer?.target_status, "no_task");
+  assert.equal(answer?.atomic_answer_identity, "");
+  assert.equal(answer?.product_projection, null);
+  assert.deepEqual(answer?.field_admission, {});
+  assert.deepEqual(answer?.claim_confidence, {});
   assert.equal(answer?.task_summary, null);
   assert.equal(answer?.inference_status, "invalid_atomic_identity");
   assert.deepEqual(authoritativeTaskTruthActionState(decision), {
@@ -253,6 +303,105 @@ test("provider-failure unresolved answer remains usable without task identity", 
     kind: "no_clear_continuation",
     label: "Inspect evidence",
   });
+});
+
+test("startup preserves the backend projection for a typed unresolved failure", () => {
+  const decision = authoritativeDecision({
+    status: "unresolved",
+    overrides: { request_trigger: "startup" },
+  });
+  decision.task_truth_v2.effective_state = "eligible";
+  decision.task_truth_v2.release_gate_passed = false;
+  const failure = productProjection({
+    presentation_state: "task_unknown",
+    primary_instruction: "I couldn’t identify the unfinished task.",
+    semantic_status: "unresolved",
+    task_state: "unclear",
+    target_status: "no_task",
+    primary_action: { kind: "refresh_continue", label: "Try Continue again" },
+    unresolved_reason: "task_evidence_acquisition_failure:no_admissible_semantic_fields",
+  });
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: null,
+    unfinished_task: null,
+    target_status: "no_task",
+    inference_status: "request_not_built",
+    unresolved_or_failure_reason:
+      "task_evidence_acquisition_failure:no_admissible_semantic_fields",
+    product_projection: failure,
+    stale_product_projection: { ...failure },
+  });
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.product_projection, failure);
+  assert.equal(answer?.stale_product_projection?.presentation_state, "task_unknown");
+  assert.equal(
+    buildContinuePublicProjection(answer)?.primary_instruction,
+    "I couldn’t identify the unfinished task.",
+  );
+  assert.notEqual(answer?.inference_status, "authority_not_released");
+});
+
+test("a presentable backend failure replaces a stuck incumbent with no projection", () => {
+  const incumbent = authoritativeDecision({ status: "unresolved" });
+  incumbent.decision_id = "decision-missing-projection";
+  incumbent.task_truth_v2.answer.product_projection = null;
+  incumbent.task_truth_v2.answer.stale_product_projection = null;
+
+  const challenger = authoritativeDecision({
+    status: "unresolved",
+    overrides: {
+      decision_id: "decision-presentable-failure",
+      request_trigger: "background",
+      current_task_turn: null,
+      evidence_freshness_ledger: {
+        latest_any_evidence_ms: 100,
+        latest_non_self_evidence_ms: 100,
+      },
+    },
+  });
+  challenger.task_truth_v2.answer.task_summary = null;
+  challenger.task_truth_v2.answer.product_projection = productProjection({
+    presentation_state: "task_unknown",
+    primary_instruction: "I couldn’t identify the unfinished task.",
+    semantic_status: "unresolved",
+    task_state: "unclear",
+    target_status: "no_task",
+    primary_action: { kind: "refresh_continue", label: "Try Continue again" },
+  });
+
+  assert.deepEqual(
+    compareContinueDecisionAdoption({
+      incumbent,
+      challenger,
+      incumbentTrigger: "manual",
+      challengerTrigger: "background",
+    }),
+    {
+      adopt: true,
+      reasonCodes: ["adopted:repaired_product_projection"],
+    },
+  );
+});
+
+test("a malformed refresh cannot replace a presentable backend answer", () => {
+  const incumbent = authoritativeDecision({ status: "unresolved" });
+  const challenger = authoritativeDecision({ status: "unresolved" });
+  challenger.task_truth_v2.answer.product_projection = null;
+  challenger.task_truth_v2.answer.stale_product_projection = null;
+
+  assert.deepEqual(
+    compareContinueDecisionAdoption({
+      incumbent,
+      challenger,
+      incumbentTrigger: "background",
+      challengerTrigger: "manual",
+    }),
+    {
+      adopt: false,
+      reasonCodes: ["rejected:missing_product_projection"],
+    },
+  );
 });
 
 test("recent context keeps the latest six meaningful visits for every answer state", () => {
@@ -315,33 +464,224 @@ test("recent context compresses repeated shell visits without losing the latest 
   assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
 });
 
-test("public projection gives one continuation instruction and one memory line", () => {
+test("React consumes the backend product projection without recomposing its meaning", () => {
   const decision = authoritativeDecision();
+  const projection = productProjection({
+    answer_identity: "answer-public",
+    primary_instruction: "Finish the two manual checks.",
+    resume_context: "The build and automated tests had already passed.",
+    location_context: "Codex",
+  });
   Object.assign(decision.task_truth_v2.answer, {
-    task_summary: "Smalltalk's always-on repair",
-    where_summary: "Codex",
-    next_action: "Finish the two manual checks",
-    last_meaningful_progress: "The build and automated tests had already passed",
-    evidence_preview: { frame_id: "frame-1" },
+    product_projection: projection,
+    unfinished_state: "This must never be promoted into an action.",
+    next_action: "A legacy action that must not replace the canonical instruction.",
   });
 
-  assert.deepEqual(
-    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false),
-    {
-      headline: "Continue in Codex to finish the two manual checks for Smalltalk's always-on repair.",
-      memoryLine: "You were working on Smalltalk's always-on repair; the build and automated tests had already passed.",
-      resumeSurface: "Codex",
-      openActionLabel: "View Codex screen",
-      exactTargetNote: "Exact task link not captured",
-    },
+  assert.strictEqual(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision)),
+    projection,
   );
 });
 
+test("the four critical cases preserve their canonical visible meaning", () => {
+  const cases = [
+    {
+      id: "05cd",
+      instruction: "Continue reviewing the answer about whether the product solves a real need.",
+      context: "The answer has begun and continues beyond the visible section.",
+    },
+    {
+      id: "0d1c",
+      instruction: "Return to the Codex visual-cue task and inspect its implementation result.",
+      context: "The backend connection was already complete; the newer visual-cue request was still active.",
+    },
+    {
+      id: "0056",
+      instruction: "Test the new answer-linked visual cue in Smalltalk.",
+      context: "Implementation passed its checks; user verification remains.",
+    },
+    {
+      id: "0e34",
+      instruction: "Return to the drafted regression report and continue the investigation.",
+      context: "The latest Continue result was rejected as insufficient evidence; the cause is not yet proven.",
+    },
+  ];
+
+  for (const criticalCase of cases) {
+    const decision = authoritativeDecision();
+    decision.task_truth_v2.answer.product_projection = productProjection({
+      answer_identity: `answer-${criticalCase.id}`,
+      primary_instruction: criticalCase.instruction,
+      resume_context: criticalCase.context,
+    });
+    const projection = buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision));
+    assert.equal(projection.primary_instruction, criticalCase.instruction, criticalCase.id);
+    assert.equal(projection.resume_context, criticalCase.context, criticalCase.id);
+    assert.deepEqual(
+      projection.primary_action,
+      { kind: "inspect_evidence", label: "View last screen" },
+      criticalCase.id,
+    );
+    assert.equal(projection.inspect_available, true, criticalCase.id);
+  }
+});
+
+test("canonical action execution keeps direct open, preview, refresh, and none distinct", () => {
+  assert.equal(
+    canExecuteContinueProductAction(
+      { kind: "open_direct_target", label: "Continue here" },
+      false,
+    ),
+    false,
+  );
+  assert.equal(
+    canExecuteContinueProductAction(
+      { kind: "open_direct_target", label: "Continue here" },
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    canExecuteContinueProductAction(
+      { kind: "inspect_evidence", label: "View last screen" },
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    canExecuteContinueProductAction(
+      { kind: "refresh_continue", label: "Refresh Continue" },
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    canExecuteContinueProductAction({ kind: "none", label: "" }, true),
+    false,
+  );
+});
+
+test("canonical stale presentation blocks open and offers refresh", () => {
+  const decision = authoritativeDecision();
+  decision.task_truth_v2.answer.product_projection = productProjection({
+    presentation_state: "stale_decision",
+    primary_instruction: "The saved answer is older than the latest work.",
+    resume_context: null,
+    target_status: "stale_decision",
+    primary_action: { kind: "refresh_continue", label: "Refresh Continue" },
+    unresolved_reason: "newer_evidence_available",
+  });
+  const projection = buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision));
+  assert.equal(projection.primary_instruction, "The saved answer is older than the latest work.");
+  assert.deepEqual(projection.primary_action, {
+    kind: "refresh_continue",
+    label: "Refresh Continue",
+  });
+  assert.notEqual(projection.primary_action.kind, "open_direct_target");
+});
+
+test("typed acquisition failure remains the canonical projection after evidence changes", () => {
+  const failure = productProjection({
+    presentation_state: "task_unknown",
+    primary_instruction: "I couldn't identify a current task from the available evidence.",
+    resume_context: "Try Continue again while the task conversation is visible.",
+    location_context: null,
+    semantic_status: "unresolved",
+    task_state: "unknown",
+    target_status: "no_task",
+    primary_action: { kind: "refresh_continue", label: "Try Continue again" },
+    inspect_available: true,
+    unresolved_reason: "task_evidence_acquisition_failure:no_admissible_semantic_fields",
+  });
+  const decision = authoritativeDecision();
+  decision.task_truth_v2.answer.product_projection = failure;
+  decision.task_truth_v2.answer.stale_product_projection = { ...failure };
+
+  const projection = buildContinuePublicProjection({
+    ...authoritativeTaskTruthAnswer(decision),
+    product_projection: decision.task_truth_v2.answer.stale_product_projection,
+  });
+  assert.equal(projection.presentation_state, "task_unknown");
+  assert.equal(
+    projection.unresolved_reason,
+    "task_evidence_acquisition_failure:no_admissible_semantic_fields",
+  );
+  assert.notEqual(projection.primary_instruction, "The saved answer is older than the latest work.");
+  assert.notEqual(projection.primary_action.kind, "open_direct_target");
+});
+
+test("canonical projection and first-screen source exclude semantic recomposition and diagnostics", () => {
+  const presentationSource = readFileSync(
+    new URL("../src/continuePresentation.ts", import.meta.url),
+    "utf8",
+  );
+  const projectionHelper = presentationSource.slice(
+    presentationSource.indexOf("export function buildContinuePublicProjection"),
+    presentationSource.indexOf("export function canExecuteContinueProductAction"),
+  );
+  assert.match(projectionHelper, /answer\.product_projection/);
+  assert.doesNotMatch(
+    projectionHelper,
+    /unfinished_state|next_action|last_meaningful_progress|task_summary|where_summary/,
+  );
+
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(appSource, /cardTaskTruthAnswer\?\.stale_product_projection/);
+  assert.doesNotMatch(
+    appSource,
+    /primary_instruction:\s*"The saved answer is older than the latest work\."/,
+  );
+  const freshnessComparison = appSource.slice(
+    appSource.indexOf("function continueEvidenceChanged"),
+    appSource.indexOf("function continueEvidenceSignature"),
+  );
+  assert.match(freshnessComparison, /return false/);
+  assert.doesNotMatch(
+    freshnessComparison,
+    /frameCount\s*>|artifactCount\s*>|workstreamCount\s*>|latestTimestamp\(/,
+  );
+  const canonicalHero = appSource.slice(
+    appSource.lastIndexOf('<div className="answer-hero answer-hero-public">'),
+    appSource.indexOf("{!displayProjection && recentContext.length"),
+  );
+  assert.match(canonicalHero, /primary_instruction|resume_context|location_context/);
+  assert.doesNotMatch(
+    canonicalHero,
+    /support slots|confidence|snapshot|frame_ids|recent trail|unfinished_state|next_action/i,
+  );
+  assert.match(canonicalHero, /aria-label="Inspect this Continue answer"/);
+  assert.doesNotMatch(appSource, /answer_identity:\s*decision\?\.decision_id\s*\|\|\s*"projection-unavailable"/);
+});
+
+test("local memory failure copy is contextualized once instead of repeating the error label", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const cueSource = appSource.slice(
+    appSource.indexOf("const memoryCueLabel"),
+    appSource.indexOf("const continuePrimaryMessage"),
+  );
+  const companionSource = appSource.slice(
+    appSource.indexOf("function ContinueCompanionPanel"),
+    appSource.indexOf("function PrivacyPanel"),
+  );
+  assert.match(cueSource, /: "Local memory"/);
+  assert.match(companionSource, /<span>Local memory<\/span>/);
+  assert.doesNotMatch(companionSource, /<span>\{statusLabel\}<\/span>/);
+});
+
 test("recent context roles use concise user-facing labels", () => {
-  assert.equal(recentContextRoleLabel("primary_work"), "Primary work");
-  assert.equal(recentContextRoleLabel("supporting_work"), "Supporting work");
-  assert.equal(recentContextRoleLabel("detour_or_unrelated"), "Detour or unrelated");
-  assert.equal(recentContextRoleLabel("unclear"), "Relationship unclear");
+  for (const role of ["primary_work", "continuation", "return_to_prior_task"]) {
+    assert.equal(recentContextRoleLabel(role), "Primary work", role);
+  }
+  for (const role of ["supporting_work", "supporting_research", "verification"]) {
+    assert.equal(recentContextRoleLabel(role), "Supporting work", role);
+  }
+  for (const role of ["detour_or_unrelated", "temporary_detour", "interruption", "new_task"]) {
+    assert.equal(recentContextRoleLabel(role), "Detour or unrelated", role);
+  }
+  for (const role of ["unclear", "unrelated_or_unknown"]) {
+    assert.equal(recentContextRoleLabel(role), "Relationship unclear", role);
+  }
   assert.equal(recentContextRoleLabel(null), null);
 });
 
@@ -357,6 +697,17 @@ test("field-limited model output remains visible instead of becoming the default
     direct_return_target: null,
     evidence_preview: null,
     inference_status: "model_answer_visible_with_validation_limits",
+    product_projection: productProjection({
+      presentation_state: "task_known_action_unknown",
+      primary_instruction: "I found the task, but not a safe next step.",
+      resume_context: "The model response was parsed and locally admitted.",
+      location_context: null,
+      semantic_status: "partial",
+      task_state: "in_progress",
+      target_status: "task_known_target_unknown",
+      primary_action: { kind: "inspect_evidence", label: "Inspect" },
+      unresolved_reason: "next_supported_action_not_admitted",
+    }),
   });
   decision.task_truth_v2.answer.field_support.task_summary = {
     confidence: 0,
@@ -382,14 +733,12 @@ test("field-limited model output remains visible instead of becoming the default
   });
   assert.equal(hasVisibleTaskTruthSemantics(answer), true);
   assert.deepEqual(
-    buildContinuePublicProjection(answer, false),
-    {
-      headline: "Continue to the visible Continue card still needs confirmation.",
-      memoryLine: "Verify the repaired Continue output; the model response was parsed and locally admitted.",
-      resumeSurface: null,
-      openActionLabel: "Try Continue again",
-      exactTargetNote: null,
-    },
+    buildContinuePublicProjection(answer),
+    decision.task_truth_v2.answer.product_projection,
+  );
+  assert.doesNotMatch(
+    buildContinuePublicProjection(answer).primary_instruction,
+    /visible Continue card still needs confirmation/i,
   );
 });
 

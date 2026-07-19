@@ -69,6 +69,14 @@ type ContinueTaskTruthFieldSupport = {
 };
 
 export type ContinueTaskTruthAtomicIdentity = {
+  decision_id?: string | null;
+  current_frame_id?: string | null;
+  packet_policy_version?: string | null;
+  response_schema_version?: string | null;
+  admission_version?: string | null;
+  admitted_result_id?: string | null;
+  correction_watermark?: string | null;
+  target_identity?: string | null;
   session_id?: string | null;
   task_thread_id: string | null;
   task_thread_revision: number | null;
@@ -106,24 +114,65 @@ export type ContinueTaskTruthRecentContext = {
   is_current: boolean;
   revisited: boolean;
   evidence_refs?: string[];
-  semantic_role?: "primary_work" | "supporting_work" | "detour_or_unrelated" | "unclear" | null;
+  semantic_role?:
+    | "primary_work"
+    | "supporting_work"
+    | "detour_or_unrelated"
+    | "unclear"
+    | "continuation"
+    | "return_to_prior_task"
+    | "supporting_research"
+    | "verification"
+    | "temporary_detour"
+    | "interruption"
+    | "new_task"
+    | "unrelated_or_unknown"
+    | null;
   role_confidence?: number | null;
   relationship_to_primary_task?: string | null;
   role_evidence_refs?: string[];
 };
 
+export type ContinueProductPrimaryAction = {
+  kind: "open_direct_target" | "inspect_evidence" | "refresh_continue" | "none";
+  label: string;
+};
+
 export type ContinuePublicProjection = {
-  headline: string;
-  memoryLine: string | null;
-  resumeSurface: string | null;
-  openActionLabel: string;
-  exactTargetNote: string | null;
+  answer_identity: string;
+  presentation_state: string;
+  primary_instruction: string;
+  resume_context: string | null;
+  location_context: string | null;
+  semantic_status: string;
+  task_state: string;
+  target_status: string;
+  primary_action: ContinueProductPrimaryAction;
+  inspect_available: boolean;
+  unresolved_reason: string | null;
 };
 
 export type ContinueTaskTruthAnswer = {
   schema: string;
   task_basis?: string | null;
   task_resolution_status?: string | null;
+  model_resolution_status?: string | null;
+  raw_model_status?: string | null;
+  admitted_semantic_status?: string | null;
+  semantic_source_kind?: string | null;
+  field_admission?: Record<string, { verdict?: string | null; reasons?: string[] }> | null;
+  claim_confidence?: Record<string, number> | null;
+  target_status?: string | null;
+  unresolved_or_failure_reason?: string | null;
+  semantic_conflicts?: string[];
+  atomic_answer_identity?: string | null;
+  product_projection?: ContinuePublicProjection | null;
+  stale_product_projection?: ContinuePublicProjection | null;
+  unfinished_task?: string | null;
+  task_state?: string | null;
+  resume_point?: string | null;
+  next_supported_action?: string | null;
+  completed_context?: string | null;
   observed_surface?: string | null;
   immediate_user_operation?: string | null;
   semantic_effect_of_operation?: string | null;
@@ -447,13 +496,19 @@ export function authoritativeTaskTruthAnswer(
     Boolean(decision?.task_truth_v2?.inference_diagnostic);
   const answer = decision?.task_truth_v2?.answer || null;
   if (!answer) return null;
+  // Typed unresolved/refused answers already carry the backend's canonical
+  // failure projection. They contain no admitted semantic instruction or
+  // openable target, so authority gating must not replace them with a frontend
+  // object whose projection is null.
+  if (["unresolved", "refused"].includes(normalizeToken(answer.task_resolution_status))) {
+    return answer;
+  }
   if (!releaseAuthoritative && !currentManualInference) {
     // Once model-first evidence exists, a startup/cache/background path must
     // not fall through to legacy semantic copy. Until the release gate opens,
     // present the boundary honestly as unresolved.
     return unresolvedTaskTruthAnswer(answer, "authority_not_released");
   }
-  if (normalizeToken(answer.task_resolution_status) === "unresolved") return answer;
   if (hasCompleteTaskTruthAtomicIdentity(answer.atomic_identity)) return answer;
 
   // A Task Truth decision with incomplete provenance must not fall through to
@@ -469,6 +524,13 @@ function unresolvedTaskTruthAnswer(
   return {
     ...answer,
     task_resolution_status: "unresolved",
+    admitted_semantic_status: "unresolved",
+    semantic_source_kind: "unresolved",
+    unfinished_task: null,
+    task_state: "unclear",
+    resume_point: null,
+    next_supported_action: null,
+    completed_context: null,
     observed_surface: null,
     immediate_user_operation: null,
     semantic_effect_of_operation: null,
@@ -490,6 +552,14 @@ function unresolvedTaskTruthAnswer(
     relationship_to_prior: "unrelated_or_unknown",
     alternative_hypotheses: [],
     direct_return_target: null,
+    target_status: "no_task",
+    unresolved_or_failure_reason: inferenceStatus,
+    semantic_conflicts: [],
+    atomic_answer_identity: "",
+    product_projection: null,
+    stale_product_projection: null,
+    field_admission: {},
+    claim_confidence: {},
     field_support: {},
     task_understanding_source: "unresolved",
     semantic_source: "unresolved",
@@ -578,46 +648,17 @@ export function recentContextSurfaceLabel(
 
 export function buildContinuePublicProjection(
   answer: ContinueTaskTruthAnswer,
-  targetOpenable: boolean,
-): ContinuePublicProjection {
-  const task = publicClause(answer.task_summary);
-  const currentStep = publicClause(answer.current_subtask);
-  const action = publicClause(answer.next_action || answer.unfinished_state);
-  const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
-  const surface = publicClause(answer.where_summary) || null;
+): ContinuePublicProjection | null {
+  return answer.product_projection || null;
+}
 
-  const destination = surface ? ` in ${surface}` : "";
-  const actionClause = action
-    ? ` to ${lowerFirst(stripLeadingTo(action))}`
-    : task
-      ? ` with ${task}`
-      : "";
-  const taskClause = action && task ? ` for ${task}` : "";
-  const headline = task || action
-    ? sentence(`Continue${destination}${actionClause}${taskClause}`)
-    : sentence(currentStep || progress || "Continue");
-
-  const memoryParts = [
-    task ? `You were working on ${task}` : null,
-    !task && currentStep ? currentStep : null,
-    progress ? lowerFirst(progress) : null,
-  ].filter((part): part is string => Boolean(part));
-
-  const openActionLabel = targetOpenable
-    ? surface ? `Open ${surface}` : "Open continuation"
-    : answer.evidence_preview
-      ? surface ? `View ${surface} screen` : "View last screen"
-      : "Try Continue again";
-
-  return {
-    headline,
-    memoryLine: memoryParts.length ? sentence(memoryParts.join("; ")) : null,
-    resumeSurface: surface,
-    openActionLabel,
-    exactTargetNote: targetOpenable || !surface
-      ? null
-      : "Exact task link not captured",
-  };
+export function canExecuteContinueProductAction(
+  action: ContinueProductPrimaryAction,
+  directTargetEligible: boolean,
+) {
+  if (action.kind === "none") return false;
+  if (action.kind === "open_direct_target") return directTargetEligible;
+  return true;
 }
 
 export function hasVisibleTaskTruthSemantics(
@@ -637,37 +678,25 @@ export function hasVisibleTaskTruthSemantics(
   ].some((value) => Boolean(value?.trim()));
 }
 
-function publicClause(value?: string | null) {
-  return (value || "")
-    .trim()
-    .replace(/[\s.!?;:]+$/, "")
-    .replace(/\s+/g, " ");
-}
-
-function stripLeadingTo(value: string) {
-  return value.replace(/^to\s+/i, "");
-}
-
-function lowerFirst(value: string) {
-  return value ? `${value.charAt(0).toLowerCase()}${value.slice(1)}` : value;
-}
-
-function sentence(value: string) {
-  const trimmed = value.trim();
-  return trimmed ? `${trimmed}${/[.!?]$/.test(trimmed) ? "" : "."}` : "Continue.";
-}
-
 export function recentContextRoleLabel(
   role?: ContinueTaskTruthRecentContext["semantic_role"],
 ) {
   switch (role) {
     case "primary_work":
+    case "continuation":
+    case "return_to_prior_task":
       return "Primary work";
     case "supporting_work":
+    case "supporting_research":
+    case "verification":
       return "Supporting work";
     case "detour_or_unrelated":
+    case "temporary_detour":
+    case "interruption":
+    case "new_task":
       return "Detour or unrelated";
     case "unclear":
+    case "unrelated_or_unknown":
       return "Relationship unclear";
     default:
       return null;
@@ -679,16 +708,19 @@ export function authoritativeTaskTruthActionState(
 ): ContinuePresentationActionState | null {
   const answer = authoritativeTaskTruthAnswer(decision);
   if (!decision || !answer) return null;
-  const target = answer.direct_return_target || null;
+  const projectionAction = answer.product_projection?.primary_action.kind || "none";
+  const directTargetReady = answer.target_status === "direct_target_ready"
+    && projectionAction === "open_direct_target";
+  const target = directTargetReady ? answer.direct_return_target || null : null;
   const unresolved = normalizeToken(answer.task_resolution_status) === "unresolved";
   return getContinuePresentationActionState({
     decisionId: decision.decision_id,
     outputMode: unresolved ? "no_clear_continuation" : "strong_continue",
     taskResolutionStatus: unresolved ? "no_clear_current_task" : "resolved_current_task",
     target,
-    targetTruthState: target ? "direct_continue_ready" : "task_known_target_unknown",
-    directTargetAllowed: Boolean(target),
-    answerAction: target ? "continue_here" : "inspect_evidence",
+    targetTruthState: directTargetReady ? "direct_continue_ready" : "task_known_target_unknown",
+    directTargetAllowed: directTargetReady,
+    answerAction: directTargetReady ? "continue_here" : "inspect_evidence",
     supportEvidenceOnly: false,
     thinCurrentWork: !unresolved && !target,
   });
@@ -811,6 +843,30 @@ export function compareContinueDecisionAdoption({
 }): ContinueAdoptionComparison {
   if (!incumbent) {
     return { adopt: true, reasonCodes: ["adopted:no_incumbent"] };
+  }
+
+  const incumbentHasProjection = Boolean(
+    authoritativeTaskTruthAnswer(incumbent)?.product_projection,
+  );
+  const challengerHasProjection = Boolean(
+    authoritativeTaskTruthAnswer(challenger)?.product_projection,
+  );
+
+  // Presentation validity is a prerequisite for comparing semantic quality.
+  // An older decision without the backend projection cannot remain visible just
+  // because it once had stronger task evidence. Likewise, a malformed refresh
+  // must not displace an answer that the product can still present safely.
+  if (!incumbentHasProjection && challengerHasProjection) {
+    return {
+      adopt: true,
+      reasonCodes: ["adopted:repaired_product_projection"],
+    };
+  }
+  if (incumbentHasProjection && !challengerHasProjection) {
+    return {
+      adopt: false,
+      reasonCodes: ["rejected:missing_product_projection"],
+    };
   }
 
   const incumbentTask = adoptionTaskIdentity(incumbent);

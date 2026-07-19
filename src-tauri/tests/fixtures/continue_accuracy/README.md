@@ -28,6 +28,14 @@ Each LCA case checks three distinct boundaries:
 
 The response strings and selectors are synthetic. They contain no raw provider log text, private capture material, paths, URLs, provider identifiers, or typed-character payloads.
 
+## LCA-05 replay gate
+
+`lca-replay-manifest.v1.json` is the versioned LCA-05 inventory. It assigns stable `LCA-CRIT-01` through `LCA-CRIT-04` identifiers to the four launch fixtures and maps `LCA-ADV-01` through `LCA-ADV-04` to existing privacy-safe P6 fixtures instead of duplicating their source shapes. Critical entries record only a short source label and SHA-256 digest; they do not contain raw log content or local paths.
+
+The same evaluator now reports `smalltalk.lca_05.replay_gate.v1` separately from the unchanged P6 release gate. Boundary A replays the critical evidence packet/request checkpoints and the mapped adversarial production checkpoints. Boundary B sends ten deterministic response variants per critical case through the production response parser, field admission, compact public mapper, and product projection. The forty variants cover resolved, partly resolved, one unsupported field, wrong task with a real but ineligible slot, prior completion, generic action, confidence inflation, inline citation, invalid structured output, and incomplete provider output.
+
+Every LCA metric includes numerator, denominator, excluded count, and rate. A passing LCA replay does not change `release_gate.passed`, prove live provider interpretation, or approve the React/native visuals. Those remain separate P6 and user-owned manual gates.
+
 ## Initial cases
 
 | Case | Source delta | Expected task identity |
@@ -70,7 +78,7 @@ Run the explicit capture-to-answer evaluator and refresh its privacy-safe baseli
 
 ```bash
 cd src-tauri
-cargo run --bin continue_accuracy_eval -- \
+cargo run --features eval-binaries --bin continue_accuracy_eval -- \
   --output tests/fixtures/continue_accuracy/baseline-report.v1.json \
   --repeat 3
 ```

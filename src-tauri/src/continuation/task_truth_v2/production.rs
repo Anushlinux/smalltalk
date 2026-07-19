@@ -13,9 +13,10 @@ use super::selection::SNAPSHOT_SELECTION_POLICY_V1;
 use super::task_snapshot::{TaskSnapshotV2, TASK_SNAPSHOT_SCHEMA_V2};
 use super::verifier::TASK_TRUTH_VERIFIER_VERSION;
 
-pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v5";
+pub(crate) const TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1: &str = "smalltalk.task_truth_public_answer.v6";
 pub(crate) const TASK_TRUTH_AUTHORITY_POLICY_V1: &str =
     "smalltalk.model_first_task_truth_authority_policy.v1";
+pub(crate) const COMPACT_ADMISSION_VERSION: &str = "smalltalk.compact_semantic_admission.v1";
 
 fn default_public_task_basis() -> String {
     "unresolved".into()
@@ -27,6 +28,10 @@ fn default_public_task_state() -> String {
 
 fn default_public_model_status() -> String {
     "unresolved".into()
+}
+
+fn default_target_status() -> String {
+    "no_task".into()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +82,13 @@ pub struct TaskTruthFieldSupportV1 {
     pub verifier_result: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskTruthFieldAdmissionV1 {
+    pub verdict: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TaskTruthAlternativeV1 {
     pub hypothesis_id: String,
@@ -104,6 +116,22 @@ pub struct TaskTruthCurrentActivityV1 {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskTruthAtomicIdentityV1 {
+    #[serde(default)]
+    pub decision_id: String,
+    #[serde(default)]
+    pub current_frame_id: String,
+    #[serde(default)]
+    pub packet_policy_version: String,
+    #[serde(default)]
+    pub response_schema_version: String,
+    #[serde(default)]
+    pub admission_version: String,
+    #[serde(default)]
+    pub admitted_result_id: String,
+    #[serde(default)]
+    pub correction_watermark: String,
+    #[serde(default)]
+    pub target_identity: Option<String>,
     pub session_id: Option<String>,
     pub task_thread_id: Option<String>,
     pub task_thread_revision: Option<i64>,
@@ -115,6 +143,90 @@ pub struct TaskTruthAtomicIdentityV1 {
     pub observation_packet_id: String,
     pub evidence_watermark: String,
     pub correction_fingerprint: String,
+}
+
+pub(crate) const CONTINUE_PRODUCT_PROJECTION_SCHEMA_V1: &str =
+    "smalltalk.continue_product_projection.v1";
+const PRODUCT_INSTRUCTION_MAX_CHARS: usize = 160;
+const PRODUCT_RESUME_CONTEXT_MAX_CHARS: usize = 180;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuePresentationStateV1 {
+    ActionKnown,
+    TaskKnownActionUnknown,
+    TaskUnknown,
+    ProviderFailure,
+    ParserFailure,
+    ValidationFailure,
+    CaptureFailure,
+    StaleDecision,
+}
+
+impl Default for ContinuePresentationStateV1 {
+    fn default() -> Self {
+        Self::TaskUnknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueProductActionKindV1 {
+    OpenDirectTarget,
+    InspectEvidence,
+    RefreshContinue,
+    None,
+}
+
+impl Default for ContinueProductActionKindV1 {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContinueProductActionV1 {
+    pub kind: ContinueProductActionKindV1,
+    pub label: String,
+}
+
+/// The one backend-owned meaning rendered by both React and the native island.
+/// Old stored answers deserialize safely through this type's defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContinueProductProjectionV1 {
+    pub schema: String,
+    pub answer_identity: String,
+    pub presentation_state: ContinuePresentationStateV1,
+    pub primary_instruction: String,
+    pub resume_context: Option<String>,
+    pub location_context: Option<String>,
+    pub semantic_status: String,
+    pub task_state: String,
+    pub target_status: String,
+    pub primary_action: ContinueProductActionV1,
+    pub inspect_available: bool,
+    pub unresolved_reason: Option<String>,
+}
+
+impl Default for ContinueProductProjectionV1 {
+    fn default() -> Self {
+        Self {
+            schema: CONTINUE_PRODUCT_PROJECTION_SCHEMA_V1.into(),
+            answer_identity: String::new(),
+            presentation_state: ContinuePresentationStateV1::TaskUnknown,
+            primary_instruction: "I couldn’t identify the unfinished task.".into(),
+            resume_context: None,
+            location_context: None,
+            semantic_status: "unresolved".into(),
+            task_state: "unclear".into(),
+            target_status: "no_task".into(),
+            primary_action: ContinueProductActionV1::default(),
+            inspect_available: false,
+            unresolved_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -147,6 +259,31 @@ pub struct TaskTruthPublicAnswerV1 {
     /// downgraded after verification, but this value is never upgraded.
     #[serde(default = "default_public_model_status")]
     pub model_resolution_status: String,
+    /// Exact provider semantic status. This is never locally rewritten.
+    #[serde(default = "default_public_model_status")]
+    pub raw_model_status: String,
+    /// Field-admitted status. Admission may preserve or downgrade raw status,
+    /// but can never increase certainty.
+    #[serde(default = "default_public_model_status")]
+    pub admitted_semantic_status: String,
+    #[serde(default = "default_public_task_basis")]
+    pub semantic_source_kind: String,
+    #[serde(default)]
+    pub field_admission: BTreeMap<String, TaskTruthFieldAdmissionV1>,
+    #[serde(default)]
+    pub claim_confidence: BTreeMap<String, f64>,
+    #[serde(default = "default_target_status")]
+    pub target_status: String,
+    #[serde(default)]
+    pub unresolved_or_failure_reason: Option<String>,
+    #[serde(default)]
+    pub semantic_conflicts: Vec<String>,
+    #[serde(default)]
+    pub atomic_answer_identity: String,
+    #[serde(default)]
+    pub product_projection: ContinueProductProjectionV1,
+    #[serde(default = "default_stale_product_projection")]
+    pub stale_product_projection: ContinueProductProjectionV1,
     /// LCA-02 authoritative meaning: the newest concrete unfinished objective.
     #[serde(default)]
     pub unfinished_task: Option<String>,
@@ -205,6 +342,17 @@ impl Default for TaskTruthPublicAnswerV1 {
             task_basis: "unresolved".into(),
             task_resolution_status: "unresolved".into(),
             model_resolution_status: "unresolved".into(),
+            raw_model_status: "unresolved".into(),
+            admitted_semantic_status: "unresolved".into(),
+            semantic_source_kind: "unresolved".into(),
+            field_admission: BTreeMap::new(),
+            claim_confidence: BTreeMap::new(),
+            target_status: "no_task".into(),
+            unresolved_or_failure_reason: None,
+            semantic_conflicts: Vec::new(),
+            atomic_answer_identity: String::new(),
+            product_projection: ContinueProductProjectionV1::default(),
+            stale_product_projection: default_stale_product_projection(),
             unfinished_task: None,
             task_state: "unclear".into(),
             resume_point: None,
@@ -246,6 +394,269 @@ impl Default for TaskTruthPublicAnswerV1 {
             inference_status: "no_inference".into(),
             atomic_identity: TaskTruthAtomicIdentityV1::default(),
         }
+    }
+}
+
+fn bounded_product_text(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    // Character counts, rather than bytes, keep this deterministic for Unicode.
+    // The ellipsis is included inside the documented limit.
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+fn nonempty_product_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn product_failure_state(answer: &TaskTruthPublicAnswerV1) -> Option<ContinuePresentationStateV1> {
+    let reason = format!(
+        "{} {}",
+        answer
+            .unresolved_or_failure_reason
+            .as_deref()
+            .unwrap_or_default(),
+        answer.inference_status
+    )
+    .to_ascii_lowercase();
+    if ["capture", "screenshot", "manual_continue_boundary"]
+        .iter()
+        .any(|marker| reason.contains(marker))
+    {
+        Some(ContinuePresentationStateV1::CaptureFailure)
+    } else if [
+        "parser",
+        "parse",
+        "invalid_json",
+        "invalid_response",
+        "schema",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+    {
+        Some(ContinuePresentationStateV1::ParserFailure)
+    } else if [
+        "provider",
+        "transport",
+        "timeout",
+        "http_",
+        "request_failed",
+        "refused",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+    {
+        Some(ContinuePresentationStateV1::ProviderFailure)
+    } else if [
+        "validation",
+        "verification",
+        "verifier",
+        "support_",
+        "invalid_atomic_identity",
+        "rejected",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+    {
+        Some(ContinuePresentationStateV1::ValidationFailure)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn continue_product_projection(
+    answer: &TaskTruthPublicAnswerV1,
+) -> ContinueProductProjectionV1 {
+    let action = nonempty_product_text(answer.next_supported_action.as_deref());
+    let task = nonempty_product_text(answer.unfinished_task.as_deref());
+    let answer_identity = nonempty_product_text(Some(&answer.atomic_answer_identity))
+        .or_else(|| nonempty_product_text(Some(&answer.atomic_identity.admitted_result_id)))
+        .unwrap_or_default()
+        .to_string();
+    let inspect_available = answer.evidence_preview.is_some()
+        || !answer_identity.is_empty()
+        || !answer.field_admission.is_empty()
+        || !answer.field_support.is_empty()
+        || !answer.recent_context.is_empty();
+
+    let presentation_state = if answer.target_status == "stale_decision" {
+        ContinuePresentationStateV1::StaleDecision
+    } else if let Some(failure_state) = product_failure_state(answer) {
+        failure_state
+    } else if action.is_some() {
+        ContinuePresentationStateV1::ActionKnown
+    } else if task.is_some() {
+        ContinuePresentationStateV1::TaskKnownActionUnknown
+    } else {
+        ContinuePresentationStateV1::TaskUnknown
+    };
+
+    let primary_instruction = match presentation_state {
+        ContinuePresentationStateV1::ActionKnown => {
+            // This is intentionally the only semantic source for an actionable
+            // headline. `unfinished_state` and all compatibility fields are ignored.
+            bounded_product_text(action.unwrap_or_default(), PRODUCT_INSTRUCTION_MAX_CHARS)
+        }
+        ContinuePresentationStateV1::TaskKnownActionUnknown => {
+            "I found the task, but not a safe next step.".into()
+        }
+        ContinuePresentationStateV1::TaskUnknown => {
+            "I couldn’t identify the unfinished task.".into()
+        }
+        ContinuePresentationStateV1::ProviderFailure => {
+            "The provider couldn’t produce a usable Continue answer.".into()
+        }
+        ContinuePresentationStateV1::ParserFailure => "I couldn’t read the Continue answer.".into(),
+        ContinuePresentationStateV1::ValidationFailure => {
+            "The Continue answer did not pass validation.".into()
+        }
+        ContinuePresentationStateV1::CaptureFailure => {
+            "I couldn’t capture the current task boundary.".into()
+        }
+        ContinuePresentationStateV1::StaleDecision => {
+            "The saved answer is older than the latest work.".into()
+        }
+    };
+
+    let resume_point = nonempty_product_text(answer.resume_point.as_deref());
+    let completed_context = nonempty_product_text(answer.completed_context.as_deref());
+    let resume_context = match (resume_point, completed_context) {
+        (Some(resume), Some(completed))
+            if answer.task_state == "needs_user_verification"
+                && !resume
+                    .to_ascii_lowercase()
+                    .contains(&completed.to_ascii_lowercase()) =>
+        {
+            Some(bounded_product_text(
+                &format!("{}; {}", completed.trim_end_matches('.'), resume),
+                PRODUCT_RESUME_CONTEXT_MAX_CHARS,
+            ))
+        }
+        (Some(resume), _) => Some(bounded_product_text(
+            resume,
+            PRODUCT_RESUME_CONTEXT_MAX_CHARS,
+        )),
+        (None, Some(completed)) => Some(bounded_product_text(
+            completed,
+            PRODUCT_RESUME_CONTEXT_MAX_CHARS,
+        )),
+        (None, None) => {
+            task.map(|task| bounded_product_text(task, PRODUCT_RESUME_CONTEXT_MAX_CHARS))
+        }
+    };
+
+    let primary_action = match presentation_state {
+        ContinuePresentationStateV1::StaleDecision => ContinueProductActionV1 {
+            kind: ContinueProductActionKindV1::RefreshContinue,
+            label: "Refresh Continue".into(),
+        },
+        ContinuePresentationStateV1::ActionKnown
+            if answer.target_status == "direct_target_ready"
+                && answer.direct_return_target.is_some() =>
+        {
+            ContinueProductActionV1 {
+                kind: ContinueProductActionKindV1::OpenDirectTarget,
+                label: "Continue here".into(),
+            }
+        }
+        ContinuePresentationStateV1::ActionKnown if answer.evidence_preview.is_some() => {
+            ContinueProductActionV1 {
+                kind: ContinueProductActionKindV1::InspectEvidence,
+                label: "View last screen".into(),
+            }
+        }
+        ContinuePresentationStateV1::ProviderFailure
+        | ContinuePresentationStateV1::ParserFailure
+        | ContinuePresentationStateV1::CaptureFailure
+        | ContinuePresentationStateV1::TaskUnknown => ContinueProductActionV1 {
+            kind: ContinueProductActionKindV1::RefreshContinue,
+            label: "Try Continue again".into(),
+        },
+        ContinuePresentationStateV1::ValidationFailure if inspect_available => {
+            ContinueProductActionV1 {
+                kind: ContinueProductActionKindV1::InspectEvidence,
+                label: "Inspect".into(),
+            }
+        }
+        _ if inspect_available => ContinueProductActionV1 {
+            kind: ContinueProductActionKindV1::InspectEvidence,
+            label: "Inspect".into(),
+        },
+        _ => ContinueProductActionV1::default(),
+    };
+
+    ContinueProductProjectionV1 {
+        schema: CONTINUE_PRODUCT_PROJECTION_SCHEMA_V1.into(),
+        answer_identity,
+        presentation_state,
+        primary_instruction,
+        resume_context,
+        location_context: nonempty_product_text(answer.where_summary.as_deref())
+            .map(|value| bounded_product_text(value, PRODUCT_RESUME_CONTEXT_MAX_CHARS)),
+        semantic_status: answer.admitted_semantic_status.clone(),
+        task_state: answer.task_state.clone(),
+        target_status: answer.target_status.clone(),
+        primary_action,
+        inspect_available,
+        unresolved_reason: answer.unresolved_or_failure_reason.clone(),
+    }
+}
+
+fn default_stale_product_projection() -> ContinueProductProjectionV1 {
+    stale_continue_product_projection(&ContinueProductProjectionV1::default())
+}
+
+fn stale_product_projection_for_current(
+    current: &ContinueProductProjectionV1,
+) -> ContinueProductProjectionV1 {
+    if matches!(
+        current.presentation_state,
+        ContinuePresentationStateV1::ActionKnown
+            | ContinuePresentationStateV1::TaskKnownActionUnknown
+            | ContinuePresentationStateV1::StaleDecision
+    ) {
+        stale_continue_product_projection(current)
+    } else {
+        // A changed evidence watermark invalidates reuse and direct opening,
+        // but it does not turn a typed acquisition/provider/parser/validation/
+        // capture failure into an older semantic answer.
+        current.clone()
+    }
+}
+
+pub(crate) fn stale_continue_product_projection(
+    current: &ContinueProductProjectionV1,
+) -> ContinueProductProjectionV1 {
+    ContinueProductProjectionV1 {
+        schema: CONTINUE_PRODUCT_PROJECTION_SCHEMA_V1.into(),
+        answer_identity: current.answer_identity.clone(),
+        presentation_state: ContinuePresentationStateV1::StaleDecision,
+        primary_instruction: "The saved answer is older than the latest work.".into(),
+        resume_context: current.resume_context.clone(),
+        location_context: None,
+        semantic_status: current.semantic_status.clone(),
+        task_state: current.task_state.clone(),
+        target_status: "stale_decision".into(),
+        primary_action: ContinueProductActionV1 {
+            kind: ContinueProductActionKindV1::RefreshContinue,
+            label: "Refresh Continue".into(),
+        },
+        inspect_available: true,
+        unresolved_reason: Some("material_evidence_watermark_advanced".into()),
+    }
+}
+
+impl TaskTruthPublicAnswerV1 {
+    pub(crate) fn recompute_product_projection(&mut self) {
+        let product_projection = continue_product_projection(self);
+        self.stale_product_projection = stale_product_projection_for_current(&product_projection);
+        self.product_projection = product_projection;
     }
 }
 
@@ -788,6 +1199,7 @@ pub(crate) fn authoritative_runtime_enabled() -> bool {
 
 fn clear_unsupported_semantics(answer: &mut TaskTruthPublicAnswerV1, reason: &str) {
     answer.task_resolution_status = "unresolved".into();
+    answer.admitted_semantic_status = "unresolved".into();
     answer.unfinished_task = None;
     answer.task_state = "unclear".into();
     answer.resume_point = None;
@@ -811,12 +1223,15 @@ fn clear_unsupported_semantics(answer: &mut TaskTruthPublicAnswerV1, reason: &st
     answer.relationship_to_prior = "unrelated_or_unknown".into();
     answer.alternative_hypotheses.clear();
     answer.direct_return_target = None;
+    answer.target_status = "no_task".into();
+    answer.unresolved_or_failure_reason = Some(reason.into());
     answer.field_support.clear();
     answer.task_understanding_source = "unresolved".into();
     answer.semantic_source = "unresolved".into();
     answer.selected_hypothesis_id = None;
     answer.inference_status = reason.into();
     answer.atomic_identity.selected_hypothesis_id = None;
+    answer.recompute_product_projection();
 }
 
 fn enforce_model_first_semantic_authority(answer: &mut TaskTruthPublicAnswerV1) -> Option<String> {
@@ -914,6 +1329,168 @@ pub(crate) struct CompactProbePublicMappingContext {
     pub(crate) diagnostic_status: String,
     pub(crate) validation_issues: Vec<String>,
     pub(crate) recent_context: Vec<TaskTruthRecentContextV1>,
+    pub(crate) current_frame_id: String,
+    pub(crate) packet_policy_version: String,
+    pub(crate) response_schema_version: String,
+    pub(crate) explicit_goal_support_slots: Vec<String>,
+    pub(crate) correction_watermark: String,
+    pub(crate) semantic_conflicts: Vec<String>,
+}
+
+fn probe_status_label(status: super::semantic_probe::ProbeResolutionStatus) -> &'static str {
+    match status {
+        super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
+        super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partly_resolved",
+        super::semantic_probe::ProbeResolutionStatus::Unresolved => "unresolved",
+        super::semantic_probe::ProbeResolutionStatus::Refused => "refused",
+    }
+}
+
+fn has_qualified_semantic_wording(output: &super::semantic_probe::ProbeModelOutput) -> bool {
+    output
+        .unfinished_task
+        .iter()
+        .chain(output.resume_point.iter())
+        .chain(output.next_supported_action.iter())
+        .any(|value| {
+            let normalized = format!(" {} ", value.to_ascii_lowercase());
+            [
+                " likely ",
+                " appears ",
+                " appears to ",
+                " may ",
+                " might ",
+                " seems ",
+                " suspected ",
+                " hypothesis ",
+                " possibly ",
+                " probably ",
+            ]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        })
+}
+
+fn compact_admitted_status(
+    output: &super::semantic_probe::ProbeModelOutput,
+    semantic_conflicts: &[String],
+) -> &'static str {
+    use super::semantic_probe::ProbeResolutionStatus as Raw;
+    match output.status {
+        Raw::Refused => return "refused",
+        Raw::Unresolved => return "unresolved",
+        _ => {}
+    }
+    if output.unfinished_task.is_none() || !semantic_conflicts.is_empty() {
+        return "unresolved";
+    }
+    if output.status == Raw::PartlyResolved {
+        return "partly_resolved";
+    }
+    let required_fields_present = output.task_state
+        != super::semantic_probe::ProbeTaskState::Unclear
+        && output.resume_point.is_some()
+        && output.next_supported_action.is_some();
+    let high_confidence = [
+        "unfinished_task",
+        "task_state",
+        "resume_point",
+        "next_supported_action",
+    ]
+    .into_iter()
+    .all(|field| {
+        output
+            .confidence_by_field
+            .get(field)
+            .copied()
+            .is_some_and(|score| {
+                super::super::confidence::ConfidenceLabel::from_score(score)
+                    == super::super::confidence::ConfidenceLabel::High
+            })
+    });
+    if required_fields_present && high_confidence && !has_qualified_semantic_wording(output) {
+        "resolved"
+    } else {
+        "partly_resolved"
+    }
+}
+
+fn field_admission_verdict(reasons: &[String]) -> &'static str {
+    if reasons.iter().any(|reason| reason.contains("private")) {
+        "rejected_private"
+    } else if reasons.iter().any(|reason| reason.contains("stale")) {
+        "rejected_stale"
+    } else if reasons.iter().any(|reason| {
+        reason.contains("wrong_surface") || reason.contains("slot_category_not_allowed")
+    }) {
+        "rejected_wrong_surface"
+    } else if reasons.iter().any(|reason| reason.contains("chronology")) {
+        "rejected_chronology"
+    } else if reasons.iter().any(|reason| reason.contains("contradict")) {
+        "rejected_contradiction"
+    } else if reasons.iter().any(|reason| reason.contains("generic")) {
+        "rejected_generic"
+    } else if reasons.iter().any(|reason| reason.contains("too_long")) {
+        "rejected_overlong"
+    } else if reasons.iter().any(|reason| {
+        reason.contains("invalid")
+            || reason.contains("inline_support_token")
+            || reason.contains("refused_status")
+    }) {
+        "rejected_invalid_state"
+    } else {
+        "rejected_unsupported"
+    }
+}
+
+fn compact_field_admission(
+    output: &super::semantic_probe::ProbeModelOutput,
+    validation_issues: &[String],
+) -> BTreeMap<String, TaskTruthFieldAdmissionV1> {
+    [
+        "unfinished_task",
+        "task_state",
+        "resume_point",
+        "next_supported_action",
+        "completed_context",
+        "where_summary",
+    ]
+    .into_iter()
+    .map(|field| {
+        let mut reasons = validation_issues
+            .iter()
+            .filter_map(|issue| issue.strip_prefix(&format!("{field}:")).map(str::to_string))
+            .collect::<Vec<_>>();
+        reasons.sort();
+        reasons.dedup();
+        let result = output
+            .verifier_result_by_field
+            .get(field)
+            .copied()
+            .unwrap_or_default();
+        let verdict = match result {
+            super::semantic_probe::ProbeFieldVerifierResult::Admitted => "accepted",
+            super::semantic_probe::ProbeFieldVerifierResult::NotProposed => {
+                reasons.push("not_proposed".into());
+                "rejected_unsupported"
+            }
+            super::semantic_probe::ProbeFieldVerifierResult::Rejected => {
+                field_admission_verdict(&reasons)
+            }
+            super::semantic_probe::ProbeFieldVerifierResult::Pending => {
+                reasons.push("admission_not_completed".into());
+                "rejected_invalid_state"
+            }
+        };
+        (
+            field.into(),
+            TaskTruthFieldAdmissionV1 {
+                verdict: verdict.into(),
+                reasons,
+            },
+        )
+    })
+    .collect()
 }
 
 /// Atomically maps the locally admitted LCA-02 contract to the public answer.
@@ -1017,13 +1594,45 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
         || output.next_supported_action.is_some()
         || output.completed_context.is_some()
         || output.where_summary.is_some();
+    let field_admission = compact_field_admission(output, &context.validation_issues);
+    let admitted_semantic_status =
+        compact_admitted_status(output, &context.semantic_conflicts).to_string();
+    let public_next_supported_action =
+        (!matches!(admitted_semantic_status.as_str(), "unresolved" | "refused"))
+            .then(|| output.next_supported_action.clone())
+            .flatten();
+    let raw_model_status = probe_status_label(output.status).to_string();
+    let task_supports = output
+        .support_slots_by_field
+        .get("unfinished_task")
+        .cloned()
+        .unwrap_or_default();
+    let task_is_qualified = has_qualified_semantic_wording(output);
+    let semantic_source_kind = if output.unfinished_task.is_none() {
+        "unresolved"
+    } else if !task_is_qualified
+        && task_supports.iter().any(|slot| {
+            context
+                .explicit_goal_support_slots
+                .iter()
+                .any(|explicit| explicit == slot)
+        })
+    {
+        "verified_cloud_explicit_goal"
+    } else {
+        "verified_cloud_inferred_goal"
+    };
     let identity_seed = serde_json::json!({
-        "decision_id": context.decision_id,
         "packet_id": context.packet_id,
-        "request_id": context.provider_request_id.as_ref().or(context.request_id.as_ref()),
+        "evidence_watermark": context.evidence_watermark,
         "provider_response_id": context.provider_response_id,
         "verifier_version": TASK_TRUTH_VERIFIER_VERSION,
+        "admission_version": COMPACT_ADMISSION_VERSION,
+        "response_schema_version": context.response_schema_version,
         "admitted_output": output,
+        "admitted_semantic_status": admitted_semantic_status,
+        "field_admission": field_admission,
+        "semantic_conflicts": context.semantic_conflicts,
     });
     let identity_hash = stable_hash(identity_seed.to_string().as_bytes());
     let response_identity = context
@@ -1040,26 +1649,33 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
         .flatten()
         .filter_map(|slot_id| slots.get(slot_id))
         .find_map(|slot| slot.frame_id.clone());
-    let raw_model_status = match output.status {
-        super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
-        super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partly_resolved",
-        super::semantic_probe::ProbeResolutionStatus::Unresolved => "unresolved",
-        super::semantic_probe::ProbeResolutionStatus::Refused => "refused",
+    let target_status = if output.unfinished_task.is_none() {
+        "no_task"
+    } else if preview_frame_id.is_some() {
+        "frame_preview_only"
+    } else {
+        "task_known_target_unknown"
     };
-    let task_resolution_status = match output.status {
-        super::semantic_probe::ProbeResolutionStatus::Resolved
-            if !context.validation_issues.is_empty() =>
-        {
-            if has_visible_semantics {
-                "partial"
-            } else {
-                "unresolved"
-            }
-        }
-        super::semantic_probe::ProbeResolutionStatus::Resolved => "resolved",
-        super::semantic_probe::ProbeResolutionStatus::PartlyResolved => "partial",
-        super::semantic_probe::ProbeResolutionStatus::Unresolved
-        | super::semantic_probe::ProbeResolutionStatus::Refused => "unresolved",
+    let unresolved_or_failure_reason = if admitted_semantic_status == "resolved" {
+        None
+    } else if admitted_semantic_status == "refused" {
+        Some("semantic_refused".to_string())
+    } else if !context.semantic_conflicts.is_empty() {
+        Some("p6_compact_semantic_conflict".to_string())
+    } else if admitted_semantic_status == "unresolved" && !context.validation_issues.is_empty() {
+        Some("support_validation_failure".to_string())
+    } else if admitted_semantic_status == "unresolved" {
+        Some("semantic_unresolved".to_string())
+    } else if output.next_supported_action.is_none() {
+        Some("missing_admitted_next_supported_action".to_string())
+    } else if output.resume_point.is_none() {
+        Some("missing_admitted_resume_point".to_string())
+    } else if task_is_qualified {
+        Some("qualified_semantic_claim".to_string())
+    } else if raw_model_status == "partly_resolved" {
+        Some("raw_model_partly_resolved".to_string())
+    } else {
+        Some("semantic_fields_incomplete".to_string())
     };
     let semantic_source = if has_visible_semantics {
         "cloud_multimodal_model"
@@ -1073,19 +1689,23 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
         .and_then(|visit| visit.semantic_role.clone())
         .unwrap_or_else(|| "unrelated_or_unknown".into());
 
-    TaskTruthPublicAnswerV1 {
-        task_basis: if has_visible_semantics {
-            "model_inferred"
-        } else {
-            "unresolved"
-        }
-        .into(),
-        task_resolution_status: task_resolution_status.into(),
-        model_resolution_status: raw_model_status.into(),
+    let mut answer = TaskTruthPublicAnswerV1 {
+        task_basis: semantic_source_kind.into(),
+        task_resolution_status: admitted_semantic_status.clone(),
+        model_resolution_status: raw_model_status.clone(),
+        raw_model_status,
+        admitted_semantic_status,
+        semantic_source_kind: semantic_source_kind.into(),
+        field_admission,
+        claim_confidence: output.confidence_by_field.clone(),
+        target_status: target_status.into(),
+        unresolved_or_failure_reason,
+        semantic_conflicts: context.semantic_conflicts.clone(),
+        atomic_answer_identity: identity_hash.clone(),
         unfinished_task: output.unfinished_task.clone(),
         task_state: output.task_state.label().into(),
         resume_point: output.resume_point.clone(),
-        next_supported_action: output.next_supported_action.clone(),
+        next_supported_action: public_next_supported_action.clone(),
         completed_context: output.completed_context.clone(),
         current_subtask: output.resume_point.clone(),
         current_activity: TaskTruthCurrentActivityV1 {
@@ -1097,7 +1717,7 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
         last_meaningful_progress: output.completed_context.clone(),
         unfinished_state: output.resume_point.clone(),
         execution_state: output.task_state.label().into(),
-        next_action: output.next_supported_action.clone(),
+        next_action: public_next_supported_action,
         where_summary: output.where_summary.clone(),
         recent_context: context.recent_context.clone(),
         field_support,
@@ -1131,6 +1751,14 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
             "model_answer_visible_with_validation_limits".into()
         },
         atomic_identity: TaskTruthAtomicIdentityV1 {
+            decision_id: context.decision_id.clone(),
+            current_frame_id: context.current_frame_id.clone(),
+            packet_policy_version: context.packet_policy_version.clone(),
+            response_schema_version: context.response_schema_version.clone(),
+            admission_version: COMPACT_ADMISSION_VERSION.into(),
+            admitted_result_id: identity_hash,
+            correction_watermark: context.correction_watermark.clone(),
+            target_identity: None,
             session_id: context.session_id.clone(),
             task_thread_id,
             task_thread_revision: has_visible_semantics.then_some(1),
@@ -1147,7 +1775,9 @@ pub(crate) fn map_compact_probe_output_to_public_answer(
             correction_fingerprint: String::new(),
         },
         ..Default::default()
-    }
+    };
+    answer.recompute_product_projection();
+    answer
 }
 
 #[allow(clippy::type_complexity)]
@@ -1164,7 +1794,7 @@ fn pftu_probe_public_result(
                     support_slot_map_json, admitted_output_json,
                     validation_issues_json, input_tokens, output_tokens,
                     total_tokens, estimated_cost_usd, latency_ms,
-                    parsed_response, provider_post_count
+                    parsed_response, provider_post_count, failure_reason
              FROM task_truth_v2_semantic_probe_runs
              WHERE decision_id=?1
              ORDER BY created_at_ms DESC LIMIT 1",
@@ -1191,6 +1821,7 @@ fn pftu_probe_public_result(
                     row.get::<_, i64>(17)?,
                     row.get::<_, i64>(18)? != 0,
                     row.get::<_, i64>(19)?.max(0) as usize,
+                    row.get::<_, Option<String>>(20)?,
                 ))
             },
         )
@@ -1217,6 +1848,7 @@ fn pftu_probe_public_result(
         latency_ms,
         parsed_response,
         provider_post_count,
+        failure_reason,
     )) = row
     else {
         return Ok(None);
@@ -1315,6 +1947,25 @@ fn pftu_probe_public_result(
         diagnostic_status: diagnostic_status.clone(),
         validation_issues: validation_issues.clone(),
         recent_context: recent_context.clone(),
+        current_frame_id: request_audit
+            .as_ref()
+            .map(|audit| audit.final_frame_id.clone())
+            .unwrap_or_default(),
+        packet_policy_version: request_audit
+            .as_ref()
+            .map(|audit| audit.request_schema.clone())
+            .unwrap_or_default(),
+        response_schema_version: super::semantic_probe::PROBE_RESPONSE_SCHEMA.into(),
+        explicit_goal_support_slots: request_audit
+            .as_ref()
+            .map(|audit| audit.explicit_goal_support_slots.clone())
+            .unwrap_or_default(),
+        correction_watermark: String::new(),
+        semantic_conflicts: validation_issues
+            .iter()
+            .filter(|issue| issue.starts_with("p6_compact_"))
+            .cloned()
+            .collect(),
     };
     let answer = output
         .as_ref()
@@ -1332,40 +1983,46 @@ fn pftu_probe_public_result(
         .clone()
         .unwrap_or_else(|| format!("provider-response-envelope-{unresolved_identity_hash}"));
     let answer = answer.or_else(|| {
-        (!recent_context.is_empty() || legacy_compact_row).then(|| TaskTruthPublicAnswerV1 {
-            task_resolution_status: "unresolved".into(),
-            model_resolution_status: "unresolved".into(),
-            recent_context: recent_context.clone(),
-            task_understanding_source: "unresolved".into(),
-            wording_source: "deterministic".into(),
-            target_selection_source: "strict_local_policy".into(),
-            snapshot_id: unresolved_snapshot_id.clone(),
-            snapshot_revision: 1,
-            evidence_watermark: evidence_watermark.clone(),
-            semantic_source: "unresolved".into(),
-            provider_name: Some("openai".into()),
-            provider_model: response_model.clone().or(Some(configured_model.clone())),
-            request_id: provider_request_id.clone().or(request_id.clone()),
-            response_id: provider_response_id.clone(),
-            inference_status: if legacy_compact_row {
-                "legacy_compact_contract_downgraded".into()
-            } else {
-                diagnostic_status.clone()
-            },
-            atomic_identity: TaskTruthAtomicIdentityV1 {
-                session_id: session_id.clone(),
-                task_thread_id: None,
-                task_thread_revision: None,
-                task_snapshot_id: unresolved_snapshot_id.clone(),
+        (!recent_context.is_empty() || legacy_compact_row || failure_reason.is_some()).then(|| {
+            TaskTruthPublicAnswerV1 {
+                task_resolution_status: "unresolved".into(),
+                model_resolution_status: "unresolved".into(),
+                unresolved_or_failure_reason: failure_reason
+                    .clone()
+                    .or_else(|| Some(diagnostic_status.clone())),
+                recent_context: recent_context.clone(),
+                task_understanding_source: "unresolved".into(),
+                wording_source: "deterministic".into(),
+                target_selection_source: "strict_local_policy".into(),
+                snapshot_id: unresolved_snapshot_id.clone(),
                 snapshot_revision: 1,
-                selected_hypothesis_id: None,
-                model_request_id: provider_request_id.clone().or(request_id.clone()),
-                model_response_id: Some(unresolved_response_identity.clone()),
-                observation_packet_id: packet_id.clone(),
                 evidence_watermark: evidence_watermark.clone(),
-                correction_fingerprint: String::new(),
-            },
-            ..Default::default()
+                semantic_source: "unresolved".into(),
+                provider_name: Some("openai".into()),
+                provider_model: response_model.clone().or(Some(configured_model.clone())),
+                request_id: provider_request_id.clone().or(request_id.clone()),
+                response_id: provider_response_id.clone(),
+                inference_status: if legacy_compact_row {
+                    "legacy_compact_contract_downgraded".into()
+                } else {
+                    diagnostic_status.clone()
+                },
+                atomic_identity: TaskTruthAtomicIdentityV1 {
+                    session_id: session_id.clone(),
+                    task_thread_id: None,
+                    task_thread_revision: None,
+                    task_snapshot_id: unresolved_snapshot_id.clone(),
+                    snapshot_revision: 1,
+                    selected_hypothesis_id: None,
+                    model_request_id: provider_request_id.clone().or(request_id.clone()),
+                    model_response_id: Some(unresolved_response_identity.clone()),
+                    observation_packet_id: packet_id.clone(),
+                    evidence_watermark: evidence_watermark.clone(),
+                    correction_fingerprint: String::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
         })
     });
     let has_visible_semantics = answer.as_ref().is_some_and(|answer| {
@@ -1608,15 +2265,27 @@ fn visible_legacy_model_answer(
 
     Ok(Some(TaskTruthPublicAnswerV1 {
         task_basis: if selected.likely_primary_task.is_some() {
-            "explicit_goal"
+            "verified_cloud_inferred_goal"
         } else {
-            "observed_activity_only"
+            "unresolved"
         }
         .into(),
         task_resolution_status: if selected.likely_primary_task.is_some() {
-            "resolved"
+            "partly_resolved"
         } else {
-            "partial"
+            "unresolved"
+        }
+        .into(),
+        admitted_semantic_status: if selected.likely_primary_task.is_some() {
+            "partly_resolved"
+        } else {
+            "unresolved"
+        }
+        .into(),
+        semantic_source_kind: if selected.likely_primary_task.is_some() {
+            "verified_cloud_inferred_goal"
+        } else {
+            "unresolved"
         }
         .into(),
         observed_surface: selected.observed_surface.clone(),
@@ -1676,6 +2345,7 @@ fn visible_legacy_model_answer(
             observation_packet_id: packet_id,
             evidence_watermark,
             correction_fingerprint: String::new(),
+            ..Default::default()
         },
         ..Default::default()
     }))
@@ -1703,7 +2373,8 @@ fn typed_unresolved_answer(
     let evidence_watermark = boundary_snapshot
         .map(|snapshot| snapshot.evidence_watermark.clone())
         .unwrap_or_default();
-    TaskTruthPublicAnswerV1 {
+    let mut answer = TaskTruthPublicAnswerV1 {
+        unresolved_or_failure_reason: Some(inference_status.clone()),
         inference_status,
         provider_name: diagnostic.map(|diagnostic| diagnostic.provider.clone()),
         provider_model: diagnostic.map(|diagnostic| diagnostic.model.clone()),
@@ -1725,7 +2396,9 @@ fn typed_unresolved_answer(
             ..Default::default()
         },
         ..Default::default()
-    }
+    };
+    answer.recompute_product_projection();
+    answer
 }
 
 fn field_support(snapshot: &TaskSnapshotV2, field: &str) -> TaskTruthFieldSupportV1 {
@@ -1827,11 +2500,32 @@ fn public_answer(snapshot: &TaskSnapshotV2) -> TaskTruthPublicAnswerV1 {
         .iter()
         .flat_map(|claim| claim.evidence_refs.iter())
         .find_map(|evidence| evidence.frame_id.clone());
-    TaskTruthPublicAnswerV1 {
+    let mut answer = TaskTruthPublicAnswerV1 {
         schema: TASK_TRUTH_PUBLIC_ANSWER_SCHEMA_V1.into(),
         task_basis: snapshot.task_basis.clone(),
         task_resolution_status: task_resolution_status.into(),
         model_resolution_status: "unresolved".into(),
+        raw_model_status: "unresolved".into(),
+        admitted_semantic_status: task_resolution_status.into(),
+        semantic_source_kind: snapshot.task_basis.clone(),
+        field_admission: BTreeMap::new(),
+        claim_confidence: snapshot.confidence_by_field.clone(),
+        target_status: if preview_ref.is_some() {
+            "frame_preview_only"
+        } else if snapshot.task_summary.is_some() {
+            "task_known_target_unknown"
+        } else {
+            "no_task"
+        }
+        .into(),
+        unresolved_or_failure_reason: (task_resolution_status == "unresolved")
+            .then(|| "semantic_unresolved".into()),
+        semantic_conflicts: snapshot.contradictions.clone(),
+        atomic_answer_identity: stable_hash(
+            format!("{}:{}", snapshot.snapshot_id, snapshot.revision).as_bytes(),
+        ),
+        product_projection: ContinueProductProjectionV1::default(),
+        stale_product_projection: default_stale_product_projection(),
         unfinished_task: None,
         task_state: "unclear".into(),
         resume_point: None,
@@ -1890,8 +2584,11 @@ fn public_answer(snapshot: &TaskSnapshotV2) -> TaskTruthPublicAnswerV1 {
             observation_packet_id: snapshot.packet_id.clone(),
             evidence_watermark: snapshot.evidence_watermark.clone(),
             correction_fingerprint: String::new(),
+            ..Default::default()
         },
-    }
+    };
+    answer.recompute_product_projection();
+    answer
 }
 
 fn apply_scoped_feedback(
@@ -1929,7 +2626,8 @@ fn apply_scoped_feedback(
             .as_bytes(),
     );
     if !feedback.is_empty() {
-        answer.atomic_identity.correction_fingerprint = correction_fingerprint;
+        answer.atomic_identity.correction_fingerprint = correction_fingerprint.clone();
+        answer.atomic_identity.correction_watermark = correction_fingerprint;
     }
     for (_feedback_id, field, hypothesis_id, kind, correction_value) in feedback {
         if field == "hypothesis" {
@@ -2001,6 +2699,7 @@ fn apply_scoped_feedback(
                     answer.task_resolution_status = "resolved".into();
                     answer.task_understanding_source = "human_correction".into();
                     answer.semantic_source = "human_correction".into();
+                    answer.semantic_source_kind = "human_correction".into();
                     answer.selected_hypothesis_id = Some(hypothesis_id.clone());
                     answer.atomic_identity.selected_hypothesis_id = Some(hypothesis_id.clone());
                     answer.field_support.insert(
@@ -2036,6 +2735,7 @@ fn apply_scoped_feedback(
                 answer.current_activity.relationship_to_primary = value;
                 answer.task_understanding_source = "human_correction".into();
                 answer.semantic_source = "human_correction".into();
+                answer.semantic_source_kind = "human_correction".into();
             }
             continue;
         }
@@ -2049,6 +2749,7 @@ fn apply_scoped_feedback(
                 answer.task_state = answer.execution_state.clone();
                 answer.task_understanding_source = "human_correction".into();
                 answer.semantic_source = "human_correction".into();
+                answer.semantic_source_kind = "human_correction".into();
             }
             continue;
         }
@@ -2071,20 +2772,23 @@ fn apply_scoped_feedback(
                 missing_evidence: Vec::new(),
                 verifier_result: Some("rejected_by_user".into()),
             });
+        answer.field_admission.insert(
+            support_key.into(),
+            TaskTruthFieldAdmissionV1 {
+                verdict: "rejected_unsupported".into(),
+                reasons: vec!["human_rejected_exact_field".into()],
+            },
+        );
         match field.as_str() {
             "task_summary" => {
                 answer.task_resolution_status = "unresolved".into();
+                answer.admitted_semantic_status = "unresolved".into();
                 answer.unfinished_task = None;
-                answer.task_state = "unclear".into();
-                answer.resume_point = None;
-                answer.next_supported_action = None;
-                answer.completed_context = None;
                 answer.task_summary = None;
                 answer.task_object = None;
-                answer.last_meaningful_progress = None;
-                answer.unfinished_state = None;
-                answer.next_action = None;
                 answer.direct_return_target = None;
+                answer.target_status = "no_task".into();
+                answer.unresolved_or_failure_reason = Some("human_rejected_unfinished_task".into());
                 answer.task_understanding_source = "unresolved".into();
             }
             "task_object" => answer.task_object = None,
@@ -2098,14 +2802,29 @@ fn apply_scoped_feedback(
             "next_action" => {
                 answer.next_supported_action = None;
                 answer.next_action = None;
+                if answer.unfinished_task.is_some() {
+                    answer.task_resolution_status = "partly_resolved".into();
+                    answer.admitted_semantic_status = "partly_resolved".into();
+                    answer.unresolved_or_failure_reason =
+                        Some("human_rejected_next_supported_action".into());
+                }
             }
             "where" => {
                 answer.where_summary = None;
                 answer.direct_return_target = None;
+                answer.target_status = if answer.evidence_preview.is_some() {
+                    "frame_preview_only"
+                } else if answer.unfinished_task.is_some() || answer.task_summary.is_some() {
+                    "task_known_target_unknown"
+                } else {
+                    "no_task"
+                }
+                .into();
             }
             _ => {}
         }
     }
+    answer.recompute_product_projection();
     Ok(())
 }
 
@@ -2310,6 +3029,7 @@ pub(crate) fn production_decision_for_attempt(
         if let Some(reason) = enforce_model_first_semantic_authority(answer) {
             reason_codes.push(reason);
         }
+        answer.recompute_product_projection();
     }
     let diagnostic_packet_id = attempt_packet_id.or_else(|| {
         answer_snapshot
@@ -2398,6 +3118,14 @@ pub(crate) fn attach_strict_target(
     direct_target_allowed: bool,
     target: Option<ContinueReturnTarget>,
 ) {
+    // Target attachment is deliberately narrower than freshness. Callers only
+    // enter this function for a real candidate target. Failing to prove that
+    // candidate belongs to this semantic answer suppresses the target; it does
+    // not make the freshly produced semantic answer old.
+    debug_assert!(
+        target.is_some(),
+        "strict target attachment requires a candidate"
+    );
     let identity_matches = snapshot_task_thread_id.is_some()
         && snapshot_task_thread_revision.is_some()
         && snapshot_task_thread_id == target_task_thread_id
@@ -2408,20 +3136,32 @@ pub(crate) fn attach_strict_target(
                 .field_support
                 .get("where_summary")
                 .is_none_or(|support| support.support_status != "rejected_by_user");
-        if identity_matches && direct_target_allowed && feedback_allows_target {
+        let target_identity = target
+            .as_ref()
+            .and_then(|target| serde_json::to_vec(target).ok())
+            .map(|bytes| stable_hash(&bytes));
+        if identity_matches && direct_target_allowed && feedback_allows_target && target.is_some() {
             answer.direct_return_target = target;
+            answer.target_status = "direct_target_ready".into();
+            answer.atomic_identity.target_identity = target_identity;
         } else {
             answer.direct_return_target = None;
+            answer.atomic_identity.target_identity = None;
             if !identity_matches {
+                answer.target_status = "target_suppressed".into();
                 decision
                     .reason_codes
                     .push("target_task_identity_mismatch".into());
             } else if !feedback_allows_target {
+                answer.target_status = "target_suppressed".into();
                 decision
                     .reason_codes
                     .push("target_blocked_by_scoped_task_feedback".into());
+            } else if target_identity.is_some() && !direct_target_allowed {
+                answer.target_status = "target_suppressed".into();
             }
         }
+        answer.recompute_product_projection();
     }
 }
 
@@ -2520,14 +3260,22 @@ pub(crate) fn persist_decision_contract(
 ) -> Result<(), String> {
     checkpoint::ensure_schema(conn)?;
     let answer = decision.answer.as_ref();
+    let answer_contract_json = answer
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     conn.execute(
         "INSERT OR REPLACE INTO task_truth_v2_decision_contracts (
            decision_id, effective_state, release_gate_passed, snapshot_id,
            snapshot_revision, task_thread_id, task_thread_revision,
            selected_hypothesis_id, model_request_id, model_response_id,
            provider_attempt_count, observation_packet_id, evidence_watermark,
-           correction_fingerprint, return_target_artifact_id, created_at_ms
+           correction_fingerprint, current_frame_id, packet_policy_version,
+           response_schema_version, admission_version, admitted_result_id,
+           correction_watermark, target_status, target_identity,
+           answer_contract_json, return_target_artifact_id, created_at_ms
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                   ?16,?17,?18,?19,?20,?21,?22,?23,?24,
                    CAST(strftime('%s','now') AS INTEGER) * 1000)",
         params![
             decision_id,
@@ -2565,6 +3313,29 @@ pub(crate) fn persist_decision_contract(
             nonempty_identity(
                 answer.map(|answer| answer.atomic_identity.correction_fingerprint.as_str())
             ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.current_frame_id.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.packet_policy_version.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.response_schema_version.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.admission_version.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.admitted_result_id.as_str())
+            ),
+            nonempty_identity(
+                answer.map(|answer| answer.atomic_identity.correction_watermark.as_str())
+            ),
+            nonempty_identity(answer.map(|answer| answer.target_status.as_str())),
+            nonempty_identity(
+                answer.and_then(|answer| answer.atomic_identity.target_identity.as_deref())
+            ),
+            answer_contract_json,
             answer
                 .and_then(|answer| answer.direct_return_target.as_ref())
                 .and_then(|target| target.artifact_id.as_deref()),
@@ -2588,6 +3359,261 @@ mod tests {
     use crate::continuation::task_truth_v2::task_snapshot::{
         unresolved_snapshot, SnapshotSelectionStatusV2,
     };
+
+    fn product_projection_answer() -> TaskTruthPublicAnswerV1 {
+        TaskTruthPublicAnswerV1 {
+            atomic_answer_identity: "answer-identity".into(),
+            admitted_semantic_status: "resolved".into(),
+            task_resolution_status: "resolved".into(),
+            unfinished_task: Some("Verify the Continue presentation".into()),
+            task_state: "active".into(),
+            resume_point: Some("The canonical backend answer is ready".into()),
+            next_supported_action: Some("Inspect the shared Continue answer".into()),
+            completed_context: Some("The backend mapping passed".into()),
+            target_status: "task_known_target_unknown".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn product_projection_uses_only_supported_action_and_bounds_copy() {
+        let mut answer = product_projection_answer();
+        answer.next_supported_action = Some("a".repeat(200));
+        answer.unfinished_state = Some("Open the unsafe compatibility target".into());
+        answer.resume_point = Some("b".repeat(220));
+        answer.recompute_product_projection();
+
+        let projection = &answer.product_projection;
+        assert_eq!(
+            projection.presentation_state,
+            ContinuePresentationStateV1::ActionKnown
+        );
+        assert_eq!(projection.primary_instruction.chars().count(), 160);
+        assert!(projection.primary_instruction.ends_with('…'));
+        assert!(!projection.primary_instruction.contains("unsafe"));
+        assert_eq!(
+            projection
+                .resume_context
+                .as_deref()
+                .unwrap()
+                .chars()
+                .count(),
+            180
+        );
+    }
+
+    #[test]
+    fn product_projection_has_precise_partial_and_failure_states() {
+        let mut answer = product_projection_answer();
+        answer.next_supported_action = None;
+        answer.unfinished_state = Some("This must never become the instruction".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::TaskKnownActionUnknown
+        );
+        assert_eq!(
+            answer.product_projection.primary_instruction,
+            "I found the task, but not a safe next step."
+        );
+
+        answer.unfinished_task = None;
+        answer.unresolved_or_failure_reason = Some("provider_timeout".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::ProviderFailure
+        );
+        assert_eq!(answer.stale_product_projection, answer.product_projection);
+
+        answer.unfinished_task = Some("Known task must not erase the provider failure".into());
+        answer.next_supported_action = Some("Unsafe action must not win".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::ProviderFailure
+        );
+        assert_eq!(answer.stale_product_projection, answer.product_projection);
+        answer.unfinished_task = None;
+        answer.next_supported_action = None;
+
+        answer.unresolved_or_failure_reason = Some("invalid_json_parse".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::ParserFailure
+        );
+        assert_eq!(answer.stale_product_projection, answer.product_projection);
+
+        answer.unresolved_or_failure_reason = Some("support_validation_failure".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::ValidationFailure
+        );
+        assert_eq!(answer.stale_product_projection, answer.product_projection);
+
+        answer.unresolved_or_failure_reason =
+            Some("manual_continue_boundary_capture_failed".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::CaptureFailure
+        );
+        assert_eq!(answer.stale_product_projection, answer.product_projection);
+
+        answer.unresolved_or_failure_reason = Some("semantic_unresolved".into());
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::TaskUnknown
+        );
+        assert_eq!(
+            answer.stale_product_projection, answer.product_projection,
+            "task acquisition failure must not become stale copy after evidence advances"
+        );
+        assert_ne!(
+            answer.stale_product_projection.primary_instruction,
+            "The saved answer is older than the latest work."
+        );
+    }
+
+    #[test]
+    fn product_projection_maps_direct_preview_and_stale_actions_safely() {
+        let mut answer = product_projection_answer();
+        answer.target_status = "direct_target_ready".into();
+        answer.direct_return_target = Some(ContinueReturnTarget {
+            artifact_id: Some("artifact-owned".into()),
+            artifact_kind: Some("browser_tab".into()),
+            title: Some("Owned target".into()),
+            browser_url: Some("https://example.invalid/owned".into()),
+            document_path: None,
+            openability: "openable".into(),
+            fallback_frame_id: Some("frame-owned".into()),
+        });
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.primary_action.kind,
+            ContinueProductActionKindV1::OpenDirectTarget
+        );
+        assert_eq!(
+            answer.stale_product_projection.primary_action.kind,
+            ContinueProductActionKindV1::RefreshContinue
+        );
+        assert_eq!(
+            answer.stale_product_projection.answer_identity,
+            answer.product_projection.answer_identity
+        );
+        assert!(answer.stale_product_projection.location_context.is_none());
+
+        answer.direct_return_target = None;
+        answer.target_status = "frame_preview_only".into();
+        answer.evidence_preview = Some(ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".into(),
+            preview_kind: "answer_evidence".into(),
+            frame_id: "frame-owned".into(),
+        });
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.primary_action.kind,
+            ContinueProductActionKindV1::InspectEvidence
+        );
+        assert_eq!(
+            answer.product_projection.primary_action.label,
+            "View last screen"
+        );
+
+        answer.target_status = "stale_decision".into();
+        answer.recompute_product_projection();
+        assert_eq!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::StaleDecision
+        );
+        assert_eq!(
+            answer.product_projection.primary_action.kind,
+            ContinueProductActionKindV1::RefreshContinue
+        );
+    }
+
+    #[test]
+    fn lca_06_fresh_target_failures_preserve_semantics_and_true_stale_refreshes() {
+        let mut unresolved = product_projection_answer();
+        unresolved.unfinished_task = None;
+        unresolved.next_supported_action = None;
+        unresolved.target_status = "no_task".into();
+        unresolved.recompute_product_projection();
+        assert_eq!(
+            unresolved.product_projection.presentation_state,
+            ContinuePresentationStateV1::TaskUnknown
+        );
+
+        let mut answer = product_projection_answer();
+        answer.target_status = "frame_preview_only".into();
+        answer.evidence_preview = Some(ContinueEvidencePreview {
+            schema: "smalltalk.continue_evidence_preview.v1".into(),
+            preview_kind: "answer_evidence".into(),
+            frame_id: "frame-current".into(),
+        });
+        answer.recompute_product_projection();
+        let instruction = answer.product_projection.primary_instruction.clone();
+        let mut decision = TaskTruthProductionDecisionV1 {
+            answer: Some(answer),
+            ..Default::default()
+        };
+        attach_strict_target(
+            &mut decision,
+            Some("thread-current"),
+            Some(2),
+            Some("thread-other"),
+            Some(1),
+            true,
+            Some(ContinueReturnTarget {
+                artifact_id: Some("artifact-other".into()),
+                artifact_kind: Some("browser_tab".into()),
+                title: Some("Unowned candidate".into()),
+                browser_url: Some("https://example.invalid/unowned".into()),
+                document_path: None,
+                openability: "openable".into(),
+                fallback_frame_id: None,
+            }),
+        );
+        let answer = decision.answer.as_ref().unwrap();
+        assert_eq!(answer.target_status, "target_suppressed");
+        assert_eq!(answer.product_projection.primary_instruction, instruction);
+        assert_ne!(
+            answer.product_projection.presentation_state,
+            ContinuePresentationStateV1::StaleDecision
+        );
+        assert!(answer.direct_return_target.is_none());
+
+        let mut stale = answer.clone();
+        stale.target_status = "stale_decision".into();
+        stale.unresolved_or_failure_reason = Some("material_evidence_watermark_advanced".into());
+        stale.recompute_product_projection();
+        assert_eq!(
+            stale.product_projection.presentation_state,
+            ContinuePresentationStateV1::StaleDecision
+        );
+        assert_eq!(
+            stale.product_projection.primary_action.kind,
+            ContinueProductActionKindV1::RefreshContinue
+        );
+    }
+
+    #[test]
+    fn product_projection_defaults_when_old_answer_is_deserialized() {
+        let mut value = serde_json::to_value(product_projection_answer()).unwrap();
+        value.as_object_mut().unwrap().remove("product_projection");
+        let restored: TaskTruthPublicAnswerV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.product_projection,
+            ContinueProductProjectionV1::default()
+        );
+        assert_eq!(
+            restored.stale_product_projection.presentation_state,
+            ContinuePresentationStateV1::StaleDecision
+        );
+    }
 
     fn arm_probe_case_for_run_fk(conn: &Connection, case_id: &str) {
         super::super::semantic_probe::arm_case(
@@ -2845,7 +3871,7 @@ mod tests {
         let persisted_identity = conn
             .query_row(
                 "SELECT observation_packet_id, snapshot_id, snapshot_revision,
-                        model_request_id, model_response_id
+                        model_request_id, model_response_id, answer_contract_json
                  FROM task_truth_v2_decision_contracts WHERE decision_id=?1",
                 params!["decision-attempt"],
                 |row| {
@@ -2855,6 +3881,7 @@ mod tests {
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
@@ -2864,6 +3891,9 @@ mod tests {
         assert_eq!(persisted_identity.2, Some(3));
         assert_eq!(persisted_identity.3.as_deref(), Some("request-attempt"));
         assert_eq!(persisted_identity.4.as_deref(), Some("response-attempt"));
+        let persisted_answer: TaskTruthPublicAnswerV1 =
+            serde_json::from_str(persisted_identity.5.as_deref().unwrap()).unwrap();
+        assert_eq!(&persisted_answer, answer);
     }
 
     #[test]
@@ -3835,11 +4865,11 @@ mod tests {
         assert_eq!(answer.resume_point, answer.current_subtask);
         assert_eq!(answer.next_supported_action, answer.next_action);
         assert_eq!(answer.completed_context, answer.last_meaningful_progress);
-        assert_eq!(answer.task_basis, "model_inferred");
+        assert_eq!(answer.task_basis, "verified_cloud_inferred_goal");
         assert!(answer.direct_return_target.is_none());
         assert_eq!(answer.response_id.as_deref(), Some("response-provider"));
         assert_eq!(answer.recent_context.len(), 3);
-        assert_eq!(answer.schema, "smalltalk.task_truth_public_answer.v5");
+        assert_eq!(answer.schema, "smalltalk.task_truth_public_answer.v6");
         assert_eq!(answer.recent_context[0].app_label, "ChatGPT");
         assert_eq!(
             answer.recent_context[0].semantic_role.as_deref(),
@@ -3913,7 +4943,7 @@ mod tests {
             .expect("field-limited result")
             .answer
             .expect("supported fields must remain public");
-        assert_eq!(field_limited.task_resolution_status, "partial");
+        assert_eq!(field_limited.task_resolution_status, "partly_resolved");
         assert_eq!(
             field_limited.task_summary.as_deref(),
             Some("Fix Continue so GPT answers stay visible")
@@ -3942,7 +4972,10 @@ mod tests {
         let field_limited_public = field_limited_decision
             .answer
             .expect("production must preserve the supported fields");
-        assert_eq!(field_limited_public.task_resolution_status, "partial");
+        assert_eq!(
+            field_limited_public.task_resolution_status,
+            "partly_resolved"
+        );
         assert_eq!(
             field_limited_public.task_summary.as_deref(),
             Some("Fix Continue so GPT answers stay visible")
@@ -4108,6 +5141,12 @@ mod tests {
                 diagnostic_status: "support_slot_validation_failure".into(),
                 validation_issues: Vec::new(),
                 recent_context: Vec::new(),
+                current_frame_id: "frame-where-only".into(),
+                packet_policy_version: "test-packet-policy".into(),
+                response_schema_version: super::super::semantic_probe::PROBE_RESPONSE_SCHEMA.into(),
+                explicit_goal_support_slots: Vec::new(),
+                correction_watermark: String::new(),
+                semantic_conflicts: Vec::new(),
             },
         );
 
@@ -4324,5 +5363,117 @@ mod tests {
             answer.recent_context[0].site_hostname.as_deref(),
             Some("platform.openai.com")
         );
+    }
+
+    fn complete_compact_output(
+        status: super::super::semantic_probe::ProbeResolutionStatus,
+    ) -> super::super::semantic_probe::ProbeModelOutput {
+        use super::super::semantic_probe::{
+            ProbeFieldVerifierResult, ProbeModelOutput, ProbeTaskState,
+        };
+        let fields = [
+            "unfinished_task",
+            "task_state",
+            "resume_point",
+            "next_supported_action",
+            "completed_context",
+            "where_summary",
+        ];
+        ProbeModelOutput {
+            unfinished_task: Some("Verify the completed visual cue".into()),
+            task_state: ProbeTaskState::NeedsUserVerification,
+            resume_point: Some("Implementation is complete and verification remains".into()),
+            next_supported_action: Some("Test the visual cue".into()),
+            completed_context: Some("Implementation and checks completed".into()),
+            where_summary: Some("The visual-cue task".into()),
+            visit_roles: BTreeMap::new(),
+            support_slots_by_field: fields
+                .into_iter()
+                .map(|field| (field.into(), vec![format!("{field}_slot")]))
+                .collect(),
+            missing_evidence: Vec::new(),
+            missing_evidence_by_field: fields
+                .into_iter()
+                .map(|field| (field.into(), Vec::new()))
+                .collect(),
+            confidence_by_field: fields
+                .into_iter()
+                .map(|field| (field.into(), 0.9))
+                .collect(),
+            verifier_result_by_field: fields
+                .into_iter()
+                .map(|field| (field.into(), ProbeFieldVerifierResult::Admitted))
+                .collect(),
+            status,
+        }
+    }
+
+    #[test]
+    fn compact_admission_status_is_monotonic_and_requires_complete_high_confidence_fields() {
+        use super::super::semantic_probe::ProbeResolutionStatus as Raw;
+        assert_eq!(
+            compact_admitted_status(&complete_compact_output(Raw::Resolved), &[]),
+            "resolved"
+        );
+        assert_eq!(
+            compact_admitted_status(&complete_compact_output(Raw::PartlyResolved), &[]),
+            "partly_resolved"
+        );
+        assert_eq!(
+            compact_admitted_status(&complete_compact_output(Raw::Unresolved), &[]),
+            "unresolved"
+        );
+        assert_eq!(
+            compact_admitted_status(&complete_compact_output(Raw::Refused), &[]),
+            "refused"
+        );
+
+        let mut missing_action = complete_compact_output(Raw::Resolved);
+        missing_action.next_supported_action = None;
+        assert_eq!(
+            compact_admitted_status(&missing_action, &[]),
+            "partly_resolved"
+        );
+
+        let mut low_confidence = complete_compact_output(Raw::Resolved);
+        low_confidence
+            .confidence_by_field
+            .insert("unfinished_task".into(), 0.74);
+        assert_eq!(
+            compact_admitted_status(&low_confidence, &[]),
+            "partly_resolved"
+        );
+
+        let mut qualified = complete_compact_output(Raw::Resolved);
+        qualified.unfinished_task = Some("Likely verify the completed visual cue".into());
+        assert_eq!(compact_admitted_status(&qualified, &[]), "partly_resolved");
+
+        assert_eq!(
+            compact_admitted_status(
+                &complete_compact_output(Raw::Resolved),
+                &["p6_compact_task_conflict".into()]
+            ),
+            "unresolved"
+        );
+    }
+
+    #[test]
+    fn field_admission_reasons_are_typed_without_collapsing_other_fields() {
+        use super::super::semantic_probe::{ProbeFieldVerifierResult, ProbeResolutionStatus};
+        let mut output = complete_compact_output(ProbeResolutionStatus::Resolved);
+        output.resume_point = None;
+        output
+            .verifier_result_by_field
+            .insert("resume_point".into(), ProbeFieldVerifierResult::Rejected);
+        let admissions = compact_field_admission(
+            &output,
+            &[
+                "resume_point:stale_slot".into(),
+                "visit_role:T1_VISIT:missing".into(),
+            ],
+        );
+        assert_eq!(admissions["resume_point"].verdict, "rejected_stale");
+        assert_eq!(admissions["unfinished_task"].verdict, "accepted");
+        assert_eq!(admissions["next_supported_action"].verdict, "accepted");
     }
 }

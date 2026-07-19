@@ -1,0 +1,25 @@
+{
+  "schema": "smalltalk.lca_05.replay_manifest.v1",
+  "cases": [
+    { "case_id": "LCA-CRIT-01", "fixture_case_id": "lca_05cd_product_need_review", "kind": "critical", "failure_class": "product_need_answer_review", "source_log_label": "05cd", "source_sha256": "c75cfc4e93f669edfe471a4e823acf9dd02180af609f8d4d396afd378a172bcc" },
+    { "case_id": "LCA-CRIT-02", "fixture_case_id": "lca_0d1c_visual_cue_request", "kind": "critical", "failure_class": "new_task_after_completion", "source_log_label": "0d1c", "source_sha256": "0665f4b001233a3773cfcd9629ba85d9a3e92b9874bdce79f8ad7398b41db410" },
+    { "case_id": "LCA-CRIT-03", "fixture_case_id": "lca_0056_verification", "kind": "critical", "failure_class": "verification_after_implementation", "source_log_label": "0056", "source_sha256": "ff4ea8b049c5d8b371b238c2dacf148c0422891bdbfcf344a8ca3edf05796a58" },
+    { "case_id": "LCA-CRIT-04", "fixture_case_id": "lca_0e34_unsent_draft", "kind": "critical", "failure_class": "qualified_unsent_regression_draft", "source_log_label": "0e34", "source_sha256": "b586978a1516b5ead8deb789689717e35c444769ed56f9ed2188ac53f636048e" },
+    { "case_id": "LCA-ADV-01", "fixture_case_id": "capture_button_adjacent_after_support_detour", "kind": "adversarial", "failure_class": "high_engagement_unrelated_pane" },
+    { "case_id": "LCA-ADV-02", "fixture_case_id": "capture_button_old_completion_visible", "kind": "adversarial", "failure_class": "old_completion_beside_new_task" },
+    { "case_id": "LCA-ADV-03", "fixture_case_id": "capture_button_fresh_task_only", "kind": "adversarial", "failure_class": "task_known_action_unsupported" },
+    { "case_id": "LCA-ADV-04", "fixture_case_id": "capture_button_adjacent_before_new_task", "kind": "adversarial", "failure_class": "genuinely_thin_evidence" }
+  ],
+  "response_variants": [
+    "valid_resolved",
+    "valid_partly_resolved",
+    "unsupported_semantic_field",
+    "wrong_task_real_slot",
+    "prior_completion",
+    "generic_next_action",
+    "confidence_inflating",
+    "invalid_inline_citation",
+    "invalid_structured_output",
+    "provider_incomplete_empty"
+  ]
+}

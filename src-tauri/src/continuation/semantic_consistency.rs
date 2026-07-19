@@ -156,7 +156,9 @@ pub(crate) fn evaluate_semantic_eligibility(
     }
 
     if terminal {
-        eligible_for_primary = relation == RelationToCurrentTask::SameTask;
+        // A completed object can support history or a newer verification
+        // task, but completion itself is never an unfinished primary task.
+        eligible_for_primary = false;
         eligible_for_objective = false;
         if relation != RelationToCurrentTask::SameTask {
             eligible_for_last_state = false;

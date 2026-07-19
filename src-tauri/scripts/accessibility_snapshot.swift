@@ -138,6 +138,25 @@ func children(_ element: AXUIElement) -> [AXUIElement] {
   return values
 }
 
+func prioritizedChildren(_ elements: [AXUIElement], insideWebArea: Bool) -> [(Int, AXUIElement)] {
+  let indexed = Array(elements.enumerated())
+  guard insideWebArea else { return indexed }
+
+  // Chat pages normally expose the navigation rail before the much larger
+  // conversation column. Walk larger visible branches first so the bounded
+  // global node budget reaches the active conversation instead of being spent
+  // on every sidebar item. Keep the original index in the node id so parent
+  // relationships still describe the real Accessibility tree.
+  return indexed.sorted { left, right in
+    let leftBounds = boundsFor(left.element)
+    let rightBounds = boundsFor(right.element)
+    let leftArea = max(0, (leftBounds?.w ?? 0) * (leftBounds?.h ?? 0))
+    let rightArea = max(0, (rightBounds?.w ?? 0) * (rightBounds?.h ?? 0))
+    if leftArea != rightArea { return leftArea > rightArea }
+    return left.offset < right.offset
+  }
+}
+
 func textForNode(_ node: AxNodePayload) -> String? {
   let pieces = [
     node.title,
@@ -203,9 +222,19 @@ func collectNode(
   id: String,
   parentId: String?,
   depth: Int,
+  insideWebArea: Bool = false,
   output: inout [AxNodePayload]
 ) {
-  if depth > 8 || output.count > 450 {
+  let role = stringAttr(element, kAXRoleAttribute)
+  let isInsideWebArea = insideWebArea || role == "AXWebArea"
+  // Browser wrappers often place AXWebArea at depth eight. Stopping there
+  // records only browser chrome and makes page-level message ownership
+  // impossible to prove. Real ChatGPT message descendants can sit more than
+  // twenty levels below the window root, so descend further only after the
+  // web-content boundary. The existing global node cap still limits runtime
+  // and output.
+  let maximumDepth = isInsideWebArea ? 32 : 8
+  if depth > maximumDepth || output.count > 450 {
     return
   }
 
@@ -213,7 +242,7 @@ func collectNode(
   let node = AxNodePayload(
     local_id: id,
     parent_id: parentId,
-    role: stringAttr(element, kAXRoleAttribute),
+    role: role,
     subrole: stringAttr(element, kAXSubroleAttribute),
     role_description: stringAttr(element, kAXRoleDescriptionAttribute),
     title: stringAttr(element, kAXTitleAttribute),
@@ -238,12 +267,13 @@ func collectNode(
 
   output.append(node)
 
-  for (index, child) in childElements.enumerated() {
+  for (index, child) in prioritizedChildren(childElements, insideWebArea: isInsideWebArea) {
     collectNode(
       child,
       id: "\(id).\(index)",
       parentId: id,
       depth: depth + 1,
+      insideWebArea: isInsideWebArea,
       output: &output
     )
   }

@@ -12,6 +12,7 @@ pub(crate) const AUDIT_IMPORT_CANDIDATE_SCHEMA_V1: &str =
     "smalltalk.continue_accuracy_import_candidate.v1";
 pub(crate) const LCA_COMPACT_MODEL_OUTPUT_SCHEMA_V1: &str =
     "smalltalk.lca_02.semantic_probe_response.v3";
+pub(crate) const LCA_REPLAY_MANIFEST_SCHEMA_V1: &str = "smalltalk.lca_05.replay_manifest.v1";
 pub(crate) const LCA_SEMANTIC_FIELDS_V1: [&str; 6] = [
     "unfinished_task",
     "task_state",
@@ -412,6 +413,51 @@ pub(crate) struct ContinueAccuracyFixtureV1 {
     pub(crate) expected_model_parity: ExpectedModelParityV1,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LcaReplayCaseKindV1 {
+    Critical,
+    Adversarial,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LcaResponseVariantV1 {
+    ValidResolved,
+    ValidPartlyResolved,
+    UnsupportedSemanticField,
+    WrongTaskRealSlot,
+    PriorCompletion,
+    GenericNextAction,
+    ConfidenceInflating,
+    InvalidInlineCitation,
+    InvalidStructuredOutput,
+    ProviderIncompleteEmpty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LcaReplayCaseV1 {
+    pub(crate) case_id: String,
+    pub(crate) fixture_case_id: String,
+    pub(crate) kind: LcaReplayCaseKindV1,
+    pub(crate) failure_class: String,
+    #[serde(default)]
+    pub(crate) source_log_label: Option<String>,
+    #[serde(default)]
+    pub(crate) source_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LcaReplayManifestV1 {
+    pub(crate) schema: String,
+    #[serde(default)]
+    pub(crate) cases: Vec<LcaReplayCaseV1>,
+    #[serde(default)]
+    pub(crate) response_variants: Vec<LcaResponseVariantV1>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -614,6 +660,109 @@ pub(crate) fn parse_accuracy_fixture_json(
     require_schema(&fixture.schema, ACCURACY_FIXTURE_SCHEMA_V1)?;
     validate_fixture_contract(&fixture)?;
     Ok(fixture)
+}
+
+pub(crate) fn parse_lca_replay_manifest_json(
+    bytes: &[u8],
+) -> Result<LcaReplayManifestV1, AccuracyFixtureError> {
+    let manifest: LcaReplayManifestV1 = serde_json::from_slice(bytes)?;
+    require_schema(&manifest.schema, LCA_REPLAY_MANIFEST_SCHEMA_V1)?;
+    let critical = manifest
+        .cases
+        .iter()
+        .filter(|case| case.kind == LcaReplayCaseKindV1::Critical)
+        .count();
+    let adversarial = manifest
+        .cases
+        .iter()
+        .filter(|case| case.kind == LcaReplayCaseKindV1::Adversarial)
+        .count();
+    if critical != 4 || adversarial != 4 {
+        return Err(AccuracyFixtureError::InvalidContract(format!(
+            "LCA replay manifest requires 4 critical and 4 adversarial cases; found {critical} and {adversarial}"
+        )));
+    }
+    let case_ids = manifest
+        .cases
+        .iter()
+        .map(|case| case.case_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let fixture_ids = manifest
+        .cases
+        .iter()
+        .map(|case| case.fixture_case_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if case_ids.len() != 8 || fixture_ids.len() != 8 {
+        return Err(AccuracyFixtureError::InvalidContract(
+            "LCA replay case and fixture references must be unique".to_string(),
+        ));
+    }
+    for case in &manifest.cases {
+        validate_short_identifier("lca case_id", &case.case_id, MAX_CASE_ID_CHARS)?;
+        validate_short_identifier(
+            "lca fixture_case_id",
+            &case.fixture_case_id,
+            MAX_CASE_ID_CHARS,
+        )?;
+        validate_short_identifier("lca failure_class", &case.failure_class, MAX_LABEL_CHARS)?;
+        match case.kind {
+            LcaReplayCaseKindV1::Critical => {
+                let label = case.source_log_label.as_deref().ok_or_else(|| {
+                    AccuracyFixtureError::InvalidContract(format!(
+                        "critical LCA replay case {} requires source_log_label",
+                        case.case_id
+                    ))
+                })?;
+                validate_short_identifier("lca source_log_label", label, MAX_LABEL_CHARS)?;
+                let hash = case.source_sha256.as_deref().ok_or_else(|| {
+                    AccuracyFixtureError::InvalidContract(format!(
+                        "critical LCA replay case {} requires source_sha256",
+                        case.case_id
+                    ))
+                })?;
+                if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(AccuracyFixtureError::InvalidContract(format!(
+                        "critical LCA replay case {} has an invalid source_sha256",
+                        case.case_id
+                    )));
+                }
+            }
+            LcaReplayCaseKindV1::Adversarial => {
+                if case.source_log_label.is_some() || case.source_sha256.is_some() {
+                    return Err(AccuracyFixtureError::InvalidContract(format!(
+                        "adversarial LCA replay case {} must not claim source-log provenance",
+                        case.case_id
+                    )));
+                }
+            }
+        }
+    }
+    let required_variants = [
+        LcaResponseVariantV1::ValidResolved,
+        LcaResponseVariantV1::ValidPartlyResolved,
+        LcaResponseVariantV1::UnsupportedSemanticField,
+        LcaResponseVariantV1::WrongTaskRealSlot,
+        LcaResponseVariantV1::PriorCompletion,
+        LcaResponseVariantV1::GenericNextAction,
+        LcaResponseVariantV1::ConfidenceInflating,
+        LcaResponseVariantV1::InvalidInlineCitation,
+        LcaResponseVariantV1::InvalidStructuredOutput,
+        LcaResponseVariantV1::ProviderIncompleteEmpty,
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_variants = manifest
+        .response_variants
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_variants != required_variants || manifest.response_variants.len() != 10 {
+        return Err(AccuracyFixtureError::InvalidContract(
+            "LCA replay manifest must enumerate each required response variant exactly once"
+                .to_string(),
+        ));
+    }
+    Ok(manifest)
 }
 
 /// Parse a fixture and enforce partition access in one operation. Evaluators should prefer this
@@ -2044,5 +2193,40 @@ mod tests {
             .iter()
             .all(|fixture| lint_accuracy_fixture(fixture).passed));
         assert_eq!(policy.partitions.len(), 3);
+    }
+
+    #[test]
+    fn lca_06_live_runtime_manifest_is_complete_and_privacy_safe() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continue_accuracy");
+        let raw = fs::read_to_string(root.join("lca-06-live-runtime-replay.v1.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cases = manifest["cases"].as_array().unwrap();
+        let ids = cases
+            .iter()
+            .filter_map(|case| case["case_id"].as_str())
+            .collect::<BTreeSet<_>>();
+        let expected = (1..=11)
+            .map(|index| format!("LCA-06-{index:02}"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids.into_iter().map(str::to_string).collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            manifest["privacy_class"].as_str(),
+            Some("synthetic_causal_shape_only")
+        );
+        for forbidden in [
+            "/Users/",
+            "https://",
+            "api_key",
+            "screenshot_path",
+            "raw_text",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "private fixture marker: {forbidden}"
+            );
+        }
     }
 }

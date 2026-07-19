@@ -20,6 +20,7 @@ pub enum WorkClass {
     CheapStatusRead,
     EventIngest,
     AccessibilitySnapshot,
+    ManualBoundaryCapture,
     ScreenshotCapture,
     Ocr,
     DerivedEvidenceUpdate,
@@ -41,8 +42,11 @@ pub enum Priority {
 impl WorkClass {
     pub fn priority(self) -> Priority {
         match self {
-            Self::ManualContinue | Self::ScreenshotCapture => Priority::User,
-            Self::IslandRefresh | Self::AccessibilitySnapshot | Self::Ocr => Priority::High,
+            Self::ManualContinue | Self::ManualBoundaryCapture => Priority::User,
+            Self::IslandRefresh
+            | Self::AccessibilitySnapshot
+            | Self::ScreenshotCapture
+            | Self::Ocr => Priority::High,
             Self::DerivedEvidenceUpdate => Priority::Normal,
             Self::BackgroundContinue | Self::AuditExport | Self::MaintenanceCleanup => {
                 Priority::Low
@@ -56,9 +60,10 @@ impl WorkClass {
             Self::ManualContinue | Self::BackgroundContinue | Self::IslandRefresh => {
                 Some(Group::Continue)
             }
-            Self::ScreenshotCapture | Self::AccessibilitySnapshot | Self::Ocr => {
-                Some(Group::Capture)
-            }
+            Self::ManualBoundaryCapture
+            | Self::ScreenshotCapture
+            | Self::AccessibilitySnapshot
+            | Self::Ocr => Some(Group::Capture),
             Self::AuditExport => Some(Group::Audit),
             Self::MaintenanceCleanup => Some(Group::Maintenance),
             Self::DerivedEvidenceUpdate => Some(Group::Derived),
@@ -79,7 +84,7 @@ impl WorkClass {
 
     fn default_deadline(self) -> Duration {
         match self {
-            Self::ManualContinue => Duration::from_secs(8),
+            Self::ManualContinue | Self::ManualBoundaryCapture => Duration::from_secs(8),
             Self::ScreenshotCapture | Self::AccessibilitySnapshot | Self::Ocr => {
                 Duration::from_secs(3)
             }
@@ -115,6 +120,14 @@ impl WorkCancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    fn cancel_once(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
     }
 }
 
@@ -177,6 +190,8 @@ struct State {
     started: BTreeMap<WorkClass, u64>,
     completed: BTreeMap<WorkClass, u64>,
     failed: BTreeMap<WorkClass, u64>,
+    cancelled: BTreeMap<WorkClass, u64>,
+    superseded: BTreeMap<WorkClass, u64>,
     rejected: BTreeMap<WorkClass, u64>,
     coalesced: u64,
     cancelled_or_superseded: u64,
@@ -218,11 +233,25 @@ pub struct Permit<'a> {
     cancellation: WorkCancellationToken,
     started: Instant,
     failed: bool,
+    cancelled: bool,
+    superseded: bool,
 }
 
 impl Permit<'_> {
     pub fn mark_failed(&mut self) {
         self.failed = true;
+    }
+
+    pub fn mark_cancelled(&mut self) {
+        self.cancelled = true;
+    }
+
+    pub fn mark_superseded(&mut self) {
+        self.superseded = true;
+    }
+
+    pub(crate) fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        self.cancellation.shared_flag()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -249,6 +278,12 @@ impl Drop for Permit<'_> {
         *state.completed.entry(self.class).or_default() += 1;
         if self.failed {
             *state.failed.entry(self.class).or_default() += 1;
+        }
+        if self.cancelled {
+            *state.cancelled.entry(self.class).or_default() += 1;
+        }
+        if self.superseded {
+            *state.superseded.entry(self.class).or_default() += 1;
         }
         let samples = state.durations_ms.entry(self.class).or_default();
         samples.push_back(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
@@ -284,6 +319,14 @@ impl WorkloadGovernor {
         if state.shutting_down {
             return Err("workload governor is shutting down".to_string());
         }
+        if class == WorkClass::ManualBoundaryCapture {
+            supersede_background_continue(&mut state);
+            supersede_automatic_capture(&mut state);
+            self.changed.notify_all();
+        } else if automatic_capture_waits_behind_manual_boundary(&state, class) {
+            *state.rejected.entry(class).or_default() += 1;
+            return Err("screenshotcapture deferred behind manual boundary capture".to_string());
+        }
         if !allowed_with_active(&state.active, class)
             || state
                 .queue
@@ -312,6 +355,8 @@ impl WorkloadGovernor {
             cancellation,
             started: Instant::now(),
             failed: false,
+            cancelled: false,
+            superseded: false,
         })
     }
 
@@ -326,6 +371,8 @@ impl WorkloadGovernor {
                 cancellation: request.cancellation,
                 started: Instant::now(),
                 failed: false,
+                cancelled: false,
+                superseded: false,
             });
         }
 
@@ -337,8 +384,18 @@ impl WorkloadGovernor {
             return Err("workload governor is shutting down".to_string());
         }
 
-        if request.class == WorkClass::ManualContinue {
+        if matches!(
+            request.class,
+            WorkClass::ManualContinue | WorkClass::ManualBoundaryCapture
+        ) {
             supersede_background_continue(&mut state);
+        }
+        if request.class == WorkClass::ManualBoundaryCapture {
+            supersede_automatic_capture(&mut state);
+            self.changed.notify_all();
+        } else if automatic_capture_waits_behind_manual_boundary(&state, request.class) {
+            *state.rejected.entry(request.class).or_default() += 1;
+            return Err("screenshotcapture deferred behind manual boundary capture".to_string());
         }
         if let Some(identity) = request.identity.as_deref() {
             if state.queue.iter().any(|waiter| {
@@ -416,6 +473,8 @@ impl WorkloadGovernor {
                     cancellation: request.cancellation,
                     started: Instant::now(),
                     failed: false,
+                    cancelled: false,
+                    superseded: false,
                 });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -452,21 +511,38 @@ impl WorkloadGovernor {
             .collect();
         let mut queued_by_class = BTreeMap::new();
         let mut queue_capacity_by_class = BTreeMap::new();
+        let mut started_by_class = BTreeMap::new();
+        let mut completed_by_class = BTreeMap::new();
+        let mut failed_by_class = BTreeMap::new();
+        let mut cancelled_by_class = BTreeMap::new();
+        let mut superseded_by_class = BTreeMap::new();
         let mut rejected_by_class = BTreeMap::new();
         for class in all_classes() {
+            let key = class.as_key();
             queued_by_class.insert(
-                class.as_key(),
+                key.clone(),
                 state
                     .queue
                     .iter()
                     .filter(|waiter| waiter.class == class)
                     .count() as u64,
             );
-            queue_capacity_by_class.insert(class.as_key(), class.queue_capacity() as u64);
-            rejected_by_class.insert(
-                class.as_key(),
-                state.rejected.get(&class).copied().unwrap_or(0),
+            queue_capacity_by_class.insert(key.clone(), class.queue_capacity() as u64);
+            started_by_class.insert(key.clone(), state.started.get(&class).copied().unwrap_or(0));
+            completed_by_class.insert(
+                key.clone(),
+                state.completed.get(&class).copied().unwrap_or(0),
             );
+            failed_by_class.insert(key.clone(), state.failed.get(&class).copied().unwrap_or(0));
+            cancelled_by_class.insert(
+                key.clone(),
+                state.cancelled.get(&class).copied().unwrap_or(0),
+            );
+            superseded_by_class.insert(
+                key.clone(),
+                state.superseded.get(&class).copied().unwrap_or(0),
+            );
+            rejected_by_class.insert(key, state.rejected.get(&class).copied().unwrap_or(0));
         }
         let mut duration_percentiles_ms = BTreeMap::new();
         for (class, samples) in &state.durations_ms {
@@ -489,6 +565,11 @@ impl WorkloadGovernor {
             queue_high_water_mark: state.queue_high_water_mark as u64,
             queued_by_class,
             queue_capacity_by_class,
+            started_by_class,
+            completed_by_class,
+            failed_by_class,
+            cancelled_by_class,
+            superseded_by_class,
             rejected_by_class,
             coalesced_requests: state.coalesced,
             cancelled_or_superseded_requests: state.cancelled_or_superseded,
@@ -525,7 +606,7 @@ fn make_capacity_for(state: &mut State, class: WorkClass) -> Result<(), String> 
     }
     if matches!(
         class,
-        WorkClass::ManualContinue | WorkClass::ScreenshotCapture
+        WorkClass::ManualContinue | WorkClass::ManualBoundaryCapture
     ) {
         if let Some(index) = state.queue.iter().position(|waiter| {
             matches!(
@@ -564,11 +645,45 @@ fn supersede_background_continue(state: &mut State) {
         if matches!(
             active.class,
             WorkClass::BackgroundContinue | WorkClass::IslandRefresh
-        ) {
-            active.cancellation.cancel();
+        ) && active.cancellation.cancel_once()
+        {
+            removed = removed.saturating_add(1);
         }
     }
     state.cancelled_or_superseded = state.cancelled_or_superseded.saturating_add(removed);
+}
+
+fn supersede_automatic_capture(state: &mut State) {
+    let mut superseded = 0_u64;
+    let mut queued_superseded = 0_u64;
+    state.queue.retain(|waiter| {
+        if waiter.class == WorkClass::ScreenshotCapture {
+            waiter.cancellation.cancel();
+            superseded = superseded.saturating_add(1);
+            queued_superseded = queued_superseded.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(active) = state.active.get(&Group::Capture) {
+        if active.class == WorkClass::ScreenshotCapture && active.cancellation.cancel_once() {
+            superseded = superseded.saturating_add(1);
+        }
+    }
+    state.cancelled_or_superseded = state.cancelled_or_superseded.saturating_add(superseded);
+    *state
+        .superseded
+        .entry(WorkClass::ScreenshotCapture)
+        .or_default() += queued_superseded;
+}
+
+fn automatic_capture_waits_behind_manual_boundary(state: &State, class: WorkClass) -> bool {
+    class == WorkClass::ScreenshotCapture
+        && state
+            .queue
+            .iter()
+            .any(|waiter| waiter.class == WorkClass::ManualBoundaryCapture)
 }
 
 fn remove_waiter(state: &mut State, id: u64) {
@@ -587,29 +702,51 @@ fn allowed_with_active(active: &BTreeMap<Group, ActiveWork>, class: WorkClass) -
         return false;
     }
     match class {
-        WorkClass::ManualContinue => true,
-        WorkClass::IslandRefresh => !active.contains_key(&Group::Capture),
+        // A manual Continue may use evidence that a capture is still
+        // finishing, but it must not overlap the other long-lived SQLite
+        // writers. Those jobs can hold the WAL writer slot long enough for a
+        // user request to surface `database is locked` instead of an answer.
+        WorkClass::ManualContinue => {
+            !active.contains_key(&Group::Audit)
+                && !active.contains_key(&Group::Maintenance)
+                && !active.contains_key(&Group::Derived)
+        }
+        WorkClass::IslandRefresh => {
+            !active.contains_key(&Group::Capture)
+                && !active.contains_key(&Group::Audit)
+                && !active.contains_key(&Group::Maintenance)
+                && !active.contains_key(&Group::Derived)
+        }
         WorkClass::BackgroundContinue => {
             !active.contains_key(&Group::Capture)
                 && !active.contains_key(&Group::Audit)
                 && !active.contains_key(&Group::Maintenance)
+                && !active.contains_key(&Group::Derived)
         }
-        WorkClass::ScreenshotCapture | WorkClass::AccessibilitySnapshot | WorkClass::Ocr => {
-            !active.contains_key(&Group::Continue)
-        }
+        WorkClass::ManualBoundaryCapture
+        | WorkClass::ScreenshotCapture
+        | WorkClass::AccessibilitySnapshot
+        | WorkClass::Ocr => !active.contains_key(&Group::Continue),
         WorkClass::AuditExport | WorkClass::MaintenanceCleanup => {
-            !active.contains_key(&Group::Continue) && !active.contains_key(&Group::Capture)
+            !active.contains_key(&Group::Continue)
+                && !active.contains_key(&Group::Capture)
+                && !active.contains_key(&Group::Derived)
         }
-        WorkClass::DerivedEvidenceUpdate => !active.contains_key(&Group::Maintenance),
+        WorkClass::DerivedEvidenceUpdate => {
+            !active.contains_key(&Group::Continue)
+                && !active.contains_key(&Group::Audit)
+                && !active.contains_key(&Group::Maintenance)
+        }
         WorkClass::CheapStatusRead | WorkClass::EventIngest => true,
     }
 }
 
-fn all_classes() -> [WorkClass; 11] {
+fn all_classes() -> [WorkClass; 12] {
     [
         WorkClass::CheapStatusRead,
         WorkClass::EventIngest,
         WorkClass::AccessibilitySnapshot,
+        WorkClass::ManualBoundaryCapture,
         WorkClass::ScreenshotCapture,
         WorkClass::Ocr,
         WorkClass::DerivedEvidenceUpdate,
@@ -635,6 +772,11 @@ pub struct WorkloadDiagnostics {
     pub queue_high_water_mark: u64,
     pub queued_by_class: BTreeMap<String, u64>,
     pub queue_capacity_by_class: BTreeMap<String, u64>,
+    pub started_by_class: BTreeMap<String, u64>,
+    pub completed_by_class: BTreeMap<String, u64>,
+    pub failed_by_class: BTreeMap<String, u64>,
+    pub cancelled_by_class: BTreeMap<String, u64>,
+    pub superseded_by_class: BTreeMap<String, u64>,
     pub rejected_by_class: BTreeMap<String, u64>,
     pub coalesced_requests: u64,
     pub cancelled_or_superseded_requests: u64,
@@ -648,6 +790,27 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    fn wait_for_queued_class(governor: &WorkloadGovernor, class: WorkClass, expected: u64) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let key = class.as_key();
+        loop {
+            let actual = governor
+                .diagnostics()
+                .queued_by_class
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {key} queue depth {expected}; observed {actual}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn policy_classifies_every_required_work_class() {
@@ -818,5 +981,161 @@ mod tests {
             .unwrap();
         assert_eq!(governor.diagnostics().active_operations.len(), 2);
         drop(manual);
+    }
+
+    #[test]
+    fn manual_continue_waits_for_active_database_maintenance() {
+        let governor = WorkloadGovernor::default();
+        let maintenance = governor.acquire(WorkClass::MaintenanceCleanup).unwrap();
+        let error = match governor
+            .acquire_with_timeout(WorkClass::ManualContinue, Duration::from_millis(10))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("manual Continue must not overlap SQLite maintenance"),
+        };
+        assert!(error.contains("timed out"));
+        drop(maintenance);
+        assert!(governor.acquire(WorkClass::ManualContinue).is_ok());
+    }
+
+    #[test]
+    fn derived_database_writes_wait_for_active_continue() {
+        let governor = WorkloadGovernor::default();
+        let manual = governor.acquire(WorkClass::ManualContinue).unwrap();
+        let error = match governor
+            .acquire_with_timeout(WorkClass::DerivedEvidenceUpdate, Duration::from_millis(10))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("derived SQLite writes must not overlap Continue"),
+        };
+        assert!(error.contains("timed out"));
+        drop(manual);
+        assert!(governor.acquire(WorkClass::DerivedEvidenceUpdate).is_ok());
+    }
+
+    #[test]
+    fn lca_06_manual_boundary_supersedes_queued_automatic_capture() {
+        let governor = Arc::new(WorkloadGovernor::default());
+        let held = governor.acquire(WorkClass::AccessibilitySnapshot).unwrap();
+
+        let automatic_governor = governor.clone();
+        let automatic = thread::spawn(move || {
+            automatic_governor
+                .acquire_request(
+                    WorkRequest::new(WorkClass::ScreenshotCapture)
+                        .identity("automatic-click")
+                        .deadline(Duration::from_millis(500)),
+                )
+                .map(|_| ())
+        });
+        wait_for_queued_class(&governor, WorkClass::ScreenshotCapture, 1);
+
+        let manual_governor = governor.clone();
+        let manual = thread::spawn(move || {
+            manual_governor
+                .acquire_request(
+                    WorkRequest::new(WorkClass::ManualBoundaryCapture)
+                        .identity("manual-boundary")
+                        .deadline(Duration::from_millis(500)),
+                )
+                .map(|_| ())
+        });
+        wait_for_queued_class(&governor, WorkClass::ManualBoundaryCapture, 1);
+
+        let automatic_error = automatic.join().unwrap().unwrap_err();
+        assert!(automatic_error.contains("superseded") || automatic_error.contains("cancelled"));
+        assert!(!held.is_cancelled());
+        drop(held);
+        assert!(manual.join().unwrap().is_ok());
+        assert!(governor.diagnostics().cancelled_or_superseded_requests >= 1);
+    }
+
+    #[test]
+    fn lca_06_active_automatic_capture_yields_and_cannot_requeue_ahead_of_manual() {
+        let governor = Arc::new(WorkloadGovernor::default());
+        let automatic = governor.acquire(WorkClass::ScreenshotCapture).unwrap();
+
+        let manual_governor = governor.clone();
+        let manual = thread::spawn(move || {
+            manual_governor
+                .acquire_request(
+                    WorkRequest::new(WorkClass::ManualBoundaryCapture)
+                        .deadline(Duration::from_millis(500)),
+                )
+                .map(|_| ())
+        });
+        wait_for_queued_class(&governor, WorkClass::ManualBoundaryCapture, 1);
+
+        assert!(automatic.is_cancelled());
+        let retry_error = match governor
+            .acquire_with_timeout(WorkClass::ScreenshotCapture, Duration::from_millis(10))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("automatic capture must not requeue ahead of a manual boundary"),
+        };
+        assert!(retry_error.contains("deferred behind manual boundary"));
+        assert_eq!(
+            governor
+                .diagnostics()
+                .rejected_by_class
+                .get("screenshotcapture"),
+            Some(&1)
+        );
+
+        drop(automatic);
+        assert!(manual.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn lca_06_diagnostics_separate_manual_boundary_and_automatic_outcomes() {
+        let governor = WorkloadGovernor::default();
+        {
+            let mut manual = governor.acquire(WorkClass::ManualBoundaryCapture).unwrap();
+            let active = governor.diagnostics();
+            assert_eq!(
+                active.active_operations,
+                vec!["manualboundarycapture".to_string()]
+            );
+            manual.mark_failed();
+        }
+        {
+            let mut automatic = governor.acquire(WorkClass::ScreenshotCapture).unwrap();
+            automatic.mark_superseded();
+        }
+        {
+            let mut ocr = governor.acquire(WorkClass::Ocr).unwrap();
+            ocr.mark_cancelled();
+        }
+
+        let diagnostics = governor.diagnostics();
+        assert_eq!(
+            diagnostics.started_by_class.get("manualboundarycapture"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics.completed_by_class.get("manualboundarycapture"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics.failed_by_class.get("manualboundarycapture"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics.started_by_class.get("screenshotcapture"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics.completed_by_class.get("screenshotcapture"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics.failed_by_class.get("screenshotcapture"),
+            Some(&0)
+        );
+        assert_eq!(
+            diagnostics.superseded_by_class.get("screenshotcapture"),
+            Some(&1)
+        );
+        assert_eq!(diagnostics.cancelled_by_class.get("ocr"), Some(&1));
     }
 }

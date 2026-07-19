@@ -42,8 +42,10 @@ pub(crate) fn authoritative_task_truth_answer(
         force_task_truth_unresolved(&mut answer, "authority_not_released");
         return Some(answer);
     }
-    if answer.task_resolution_status == "unresolved"
-        || has_complete_task_truth_atomic_identity(&answer)
+    if matches!(
+        answer.task_resolution_status.as_str(),
+        "unresolved" | "refused"
+    ) || has_complete_task_truth_atomic_identity(&answer)
     {
         return Some(answer);
     }
@@ -57,6 +59,13 @@ fn force_task_truth_unresolved(
     inference_status: &str,
 ) {
     answer.task_resolution_status = "unresolved".into();
+    answer.admitted_semantic_status = "unresolved".into();
+    answer.semantic_source_kind = "unresolved".into();
+    answer.unfinished_task = None;
+    answer.task_state = "unclear".into();
+    answer.resume_point = None;
+    answer.next_supported_action = None;
+    answer.completed_context = None;
     answer.observed_surface = None;
     answer.immediate_user_operation = None;
     answer.semantic_effect_of_operation = None;
@@ -76,10 +85,17 @@ fn force_task_truth_unresolved(
     answer.relationship_to_prior = "unrelated_or_unknown".into();
     answer.alternative_hypotheses.clear();
     answer.direct_return_target = None;
+    answer.target_status = "no_task".into();
+    answer.unresolved_or_failure_reason = Some(inference_status.into());
+    answer.semantic_conflicts.clear();
+    answer.atomic_answer_identity.clear();
+    answer.field_admission.clear();
+    answer.claim_confidence.clear();
     answer.field_support.clear();
     answer.task_understanding_source = "unresolved".into();
     answer.semantic_source = "unresolved".into();
     answer.inference_status = inference_status.into();
+    answer.recompute_product_projection();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,10 +461,11 @@ pub fn island_state_from_continue_decision(
     let task_truth_answer = task_truth_answer.as_ref();
     let current_focus = decision.current_focus.as_ref().and_then(focus_summary);
     let return_target = match task_truth_answer {
-        Some(answer) => answer
+        Some(answer) if answer.target_status == "direct_target_ready" => answer
             .direct_return_target
             .as_ref()
             .and_then(target_summary),
+        Some(_) => None,
         None => decision.return_target.as_ref().and_then(target_summary),
     };
     let resume_work_target = task_truth_answer
@@ -483,11 +500,14 @@ pub fn island_state_from_continue_decision(
         Some(answer) => answer.task_resolution_status == "unresolved",
         None => decision.task_resolution_status == "no_clear_current_task" && !work_supported,
     };
-    let decision_stale = freshness.decision_stale
-        || freshness
-            .newest_evidence_ms
-            .zip(freshness.decision_updated_at_ms)
-            .is_some_and(|(newest, decision_at)| newest > decision_at);
+    // The caller owns the material-watermark comparison. Wall-clock ordering
+    // and raw status counters are not evidence that the answer itself is old.
+    let decision_stale = freshness.decision_stale;
+    let semantic_stale = decision_stale
+        && task_truth_answer.map_or(true, |answer| {
+            answer.stale_product_projection.presentation_state
+                == crate::continuation::task_truth_v2::production::ContinuePresentationStateV1::StaleDecision
+        });
     let recap = &decision.activity_recap;
     let recent_context_summary = recap
         .recent_detours
@@ -507,10 +527,17 @@ pub fn island_state_from_continue_decision(
         || recent_context_summary.is_some();
     let missing_evidence = merge_safe_notes(&recap.missing_evidence, &decision.missing_evidence);
     let warnings = merge_safe_notes(&recap.warnings, &decision.warnings);
+    let semantic_answer = task_truth_answer.cloned().map(|mut answer| {
+        if decision_stale {
+            answer.product_projection = answer.stale_product_projection.clone();
+        }
+        answer
+    });
 
     let can_open = if let Some(answer) = task_truth_answer {
         !decision_stale
             && answer.task_resolution_status != "unresolved"
+            && answer.target_status == "direct_target_ready"
             && return_target.as_ref().is_some_and(|target| target.openable)
             && !decision.decision_id.trim().is_empty()
     } else {
@@ -528,7 +555,7 @@ pub fn island_state_from_continue_decision(
 
     let has_inspectable_evidence = inspect_anchor_count > 0
         || task_truth_answer.is_some_and(|answer| answer.evidence_preview.is_some());
-    let display_state = if decision_stale {
+    let display_state = if semantic_stale {
         IslandDisplayState::NeedsRefresh
     } else if task_truth_answer.is_some() {
         if no_clear_current_task {
@@ -725,27 +752,29 @@ pub fn island_state_from_continue_decision(
         decision_cache_hit: decision.cache_hit,
         evidence_watermark_ms: freshness.evidence_watermark_ms,
         decision_stale,
-        target_state: if decision_stale {
+        target_state: if semantic_stale {
             "stale_decision".to_string()
         } else if let Some(answer) = task_truth_answer {
             if answer.task_resolution_status == "unresolved" {
                 "no_clear_task".to_string()
-            } else if answer.direct_return_target.is_some() {
+            } else if answer.target_status == "direct_target_ready"
+                && answer.direct_return_target.is_some()
+            {
                 "direct_continue_ready".to_string()
             } else {
-                "task_known_target_unknown".to_string()
+                answer.target_status.clone()
             }
         } else {
             decision.target_truth.state.clone()
         },
-        target_reason_codes: if decision_stale {
-            vec!["target_stale".to_string()]
+        target_reason_codes: if semantic_stale {
+            vec!["material_evidence_watermark_advanced".to_string()]
         } else if task_truth_answer.is_some() {
             decision.task_truth_v2.reason_codes.clone()
         } else {
             decision.target_truth.reason_codes.clone()
         },
-        semantic_answer: task_truth_answer.cloned(),
+        semantic_answer,
         current_focus: task_truth_answer
             .is_none()
             .then_some(current_focus)
@@ -1047,17 +1076,22 @@ fn semantic_current_activity(
             .or(answer.current_activity.immediate_user_operation.as_deref())
             .or(answer.current_activity.observed_surface.as_deref()),
     )?;
-    let relationship = match answer.current_activity.relationship_to_primary.as_str() {
-        "continuation" => "This continues the primary task.",
-        "supporting_research" => "This supports the primary task.",
-        "verification" => "This verifies the primary task.",
-        "temporary_detour" => "This is a temporary detour.",
-        "interruption" => "This interrupted the task without completing it.",
-        "new_task" => "This appears to be a separate new task.",
-        "return_to_prior_task" => "This returns to the earlier task.",
-        _ => "Its relationship to the earlier task is not clear.",
-    };
-    Some(format!("{activity} {relationship}"))
+    Some(format!(
+        "{activity} · {}",
+        visit_role_label(&answer.current_activity.relationship_to_primary)
+    ))
+}
+
+fn visit_role_label(role: &str) -> &'static str {
+    match role {
+        "primary_work" | "continuation" | "return_to_prior_task" => "Primary work",
+        "supporting_work" | "supporting_research" | "verification" => "Supporting work",
+        "detour_or_unrelated" | "temporary_detour" | "interruption" | "new_task" => {
+            "Detour or unrelated"
+        }
+        "unclear" | "unrelated_or_unknown" => "Relationship unclear",
+        _ => "Relationship unclear",
+    }
 }
 
 fn safe_text(value: Option<&str>) -> Option<String> {
@@ -1648,6 +1682,8 @@ mod tests {
         let state = mapped(&decision);
 
         assert_eq!(state.display_state, IslandDisplayState::InspectOnly);
+        assert!(state.return_target.is_none());
+        assert!(state.resume_work_target.is_none());
         assert!(!state.allows_open_continue_target());
         assert!(state
             .available_actions
@@ -1859,6 +1895,60 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_target_status_contradiction_cannot_create_open_eligibility() {
+        let mut decision = base_decision();
+        let leftover_target = decision.return_target.clone().unwrap();
+        decision.task_truth_v2.effective_state =
+            crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative;
+        decision.task_truth_v2.release_gate_passed = true;
+        let mut answer = crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+            task_resolution_status: "resolved".into(),
+            admitted_semantic_status: "resolved".into(),
+            atomic_answer_identity: "answer-target-contradiction".into(),
+            unfinished_task: Some("Inspect the current result".into()),
+            task_state: "active".into(),
+            resume_point: Some("The result is ready for inspection".into()),
+            next_supported_action: Some("Inspect the current result".into()),
+            target_status: "task_known_target_unknown".into(),
+            direct_return_target: Some(leftover_target),
+            snapshot_id: "snapshot-target-contradiction".into(),
+            snapshot_revision: 5,
+            evidence_watermark: "watermark-target-contradiction".into(),
+            selected_hypothesis_id: Some("hypothesis-target-contradiction".into()),
+            atomic_identity:
+                crate::continuation::task_truth_v2::production::TaskTruthAtomicIdentityV1 {
+                    task_thread_id: Some("thread-target-contradiction".into()),
+                    task_thread_revision: Some(5),
+                    task_snapshot_id: "snapshot-target-contradiction".into(),
+                    snapshot_revision: 5,
+                    selected_hypothesis_id: Some("hypothesis-target-contradiction".into()),
+                    model_response_id: Some("response-target-contradiction".into()),
+                    observation_packet_id: "packet-target-contradiction".into(),
+                    evidence_watermark: "watermark-target-contradiction".into(),
+                    ..Default::default()
+                },
+            ..Default::default()
+        };
+        answer.recompute_product_projection();
+        decision.task_truth_v2.answer = Some(answer);
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::InspectOnly);
+        assert!(!state.allows_open_continue_target());
+        assert!(!state
+            .available_actions
+            .iter()
+            .any(|action| matches!(action.kind, IslandActionKind::OpenContinueTarget)));
+        let projection = &state.semantic_answer.unwrap().product_projection;
+        assert_eq!(projection.target_status, "task_known_target_unknown");
+        assert_ne!(
+            projection.primary_action.kind,
+            crate::continuation::task_truth_v2::production::ContinueProductActionKindV1::OpenDirectTarget
+        );
+    }
+
+    #[test]
     fn authoritative_task_truth_owns_island_copy_and_open_policy() {
         let mut decision = base_decision();
         let authoritative_target = decision.return_target.clone().unwrap();
@@ -1875,6 +1965,8 @@ mod tests {
         decision.task_truth_v2.answer = Some(
             crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
                 task_resolution_status: "resolved".into(),
+                admitted_semantic_status: "resolved".into(),
+                target_status: "direct_target_ready".into(),
                 task_summary: Some("Use the authoritative island contract".into()),
                 direct_return_target: Some(authoritative_target),
                 snapshot_id: "snapshot-authoritative".into(),
@@ -1983,7 +2075,7 @@ mod tests {
         assert!(state
             .current_activity
             .as_deref()
-            .is_some_and(|copy| copy.contains("supports the primary task")));
+            .is_some_and(|copy| copy.contains("Supporting work")));
         let scoped = state
             .available_actions
             .iter()
@@ -2030,6 +2122,25 @@ mod tests {
         decision.task_truth_v2.answer = Some(
             crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
                 task_resolution_status: "resolved".into(),
+                admitted_semantic_status: "resolved".into(),
+                semantic_source_kind: "verified_cloud_explicit_goal".into(),
+                unfinished_task: Some("This claim must not reach the island".into()),
+                task_state: "needs_user_verification".into(),
+                resume_point: Some("Implementation completed".into()),
+                next_supported_action: Some("Test the result".into()),
+                completed_context: Some("Checks passed".into()),
+                target_status: "direct_target_ready".into(),
+                atomic_answer_identity: "invalid-admitted-result".into(),
+                product_projection:
+                    crate::continuation::task_truth_v2::production::ContinueProductProjectionV1 {
+                        answer_identity: "unsafe-answer".into(),
+                        primary_instruction: "Open the unsafe target".into(),
+                        primary_action: crate::continuation::task_truth_v2::production::ContinueProductActionV1 {
+                            kind: crate::continuation::task_truth_v2::production::ContinueProductActionKindV1::OpenDirectTarget,
+                            label: "Continue here".into(),
+                        },
+                        ..Default::default()
+                    },
                 task_summary: Some("This claim must not reach the island".into()),
                 direct_return_target: decision.return_target.clone(),
                 snapshot_id: "snapshot-incomplete".into(),
@@ -2055,5 +2166,46 @@ mod tests {
         assert!(state.next_action.is_none());
         assert!(state.return_target.is_none());
         assert!(!state.allows_open_continue_target());
+        let sanitized = state.semantic_answer.as_ref().unwrap();
+        assert_eq!(sanitized.admitted_semantic_status, "unresolved");
+        assert_eq!(sanitized.semantic_source_kind, "unresolved");
+        assert!(sanitized.unfinished_task.is_none());
+        assert_eq!(sanitized.task_state, "unclear");
+        assert!(sanitized.resume_point.is_none());
+        assert!(sanitized.next_supported_action.is_none());
+        assert!(sanitized.completed_context.is_none());
+        assert_eq!(sanitized.target_status, "no_task");
+        assert!(sanitized.atomic_answer_identity.is_empty());
+        assert!(sanitized.product_projection.answer_identity.is_empty());
+        assert_eq!(
+            sanitized.product_projection.primary_instruction,
+            "The Continue answer did not pass validation."
+        );
+        assert!(matches!(
+            sanitized.product_projection.primary_action.kind,
+            crate::continuation::task_truth_v2::production::ContinueProductActionKindV1::None
+        ));
+    }
+
+    #[test]
+    fn visit_role_mapping_covers_current_and_legacy_values_without_primary_drift() {
+        for role in ["primary_work", "continuation", "return_to_prior_task"] {
+            assert_eq!(visit_role_label(role), "Primary work");
+        }
+        for role in ["supporting_work", "supporting_research", "verification"] {
+            assert_eq!(visit_role_label(role), "Supporting work");
+        }
+        for role in [
+            "detour_or_unrelated",
+            "temporary_detour",
+            "interruption",
+            "new_task",
+        ] {
+            assert_eq!(visit_role_label(role), "Detour or unrelated");
+        }
+        for role in ["unclear", "unrelated_or_unknown", "future_unknown_role"] {
+            assert_eq!(visit_role_label(role), "Relationship unclear");
+        }
+        assert_ne!(visit_role_label("primary_work"), "Relationship unclear");
     }
 }

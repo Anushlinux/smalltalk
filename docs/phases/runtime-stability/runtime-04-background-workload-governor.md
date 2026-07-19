@@ -190,3 +190,8 @@ Report:
 7. Commands and tests.
 8. Remaining scheduling limitations.
 
+## 2026-07-19 correction from LCA-06
+
+The earlier policy gave manual Continue priority over background semantic work, but manual boundary screenshot capture still shared the `ScreenshotCapture` class and deadline with automatic click, scroll, and timer captures. Automatic work could therefore consume the service window needed for the user's manual boundary.
+
+LCA-06 adds a user-priority `ManualBoundaryCapture` class. It supersedes queued automatic screenshots, requests bounded cancellation of an active automatic screenshot, prevents automatic requeue while a manual capture waits, and records separate outcomes. Manual preflight also drops its SQLite connection before waiting for capture ownership. Deterministic contention tests pass; live soak and normal-app contention remain user-owned.

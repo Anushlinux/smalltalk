@@ -8,9 +8,11 @@ use super::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 pub const CONTINUE_ACCURACY_REPORT_SCHEMA: &str = "smalltalk.continue_accuracy_report.v2";
@@ -188,6 +190,50 @@ pub struct P6ReleaseGateAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcaReplayMetricValue {
+    pub numerator: i64,
+    pub denominator: i64,
+    pub excluded: i64,
+    pub rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcaReplayBoundaryResult {
+    pub case_id: String,
+    pub fixture_case_id: String,
+    pub passed: bool,
+    pub violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcaReplayVariantResult {
+    pub case_id: String,
+    pub fixture_case_id: String,
+    pub variant: LcaResponseVariantV1,
+    pub diagnostic_status: String,
+    pub presentation_state: String,
+    pub primary_instruction: String,
+    pub primary_action_kind: String,
+    pub primary_action_label: String,
+    pub semantic_status: String,
+    pub semantic_slots_passed: bool,
+    pub first_screen_meaning_passed: bool,
+    pub provider_post_count: i64,
+    pub passed: bool,
+    pub violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcaReplayGateAssessment {
+    pub schema: String,
+    pub passed: bool,
+    pub boundary_a: Vec<LcaReplayBoundaryResult>,
+    pub boundary_b: Vec<LcaReplayVariantResult>,
+    pub metrics: BTreeMap<String, LcaReplayMetricValue>,
+    pub violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueAccuracyEvalReport {
     pub schema: String,
     pub fixture_schema: String,
@@ -210,6 +256,8 @@ pub struct ContinueAccuracyEvalReport {
     pub confidence_calibration: BTreeMap<String, ConfidenceCalibrationMetric>,
     pub probe_metrics: ProbeAccuracyMetrics,
     pub release_gate: P6ReleaseGateAssessment,
+    pub lca_replay_case_ids: BTreeMap<String, String>,
+    pub lca_replay_gate: LcaReplayGateAssessment,
     pub cases: Vec<ContinueAccuracyCaseResult>,
 }
 
@@ -217,8 +265,21 @@ pub struct ContinueAccuracyEvalReport {
 pub(crate) struct ReplaySnapshot {
     pub(crate) actual: BTreeMap<AccuracyCheckpointV1, BTreeMap<String, Value>>,
     pub(crate) decision: ContinueDecisionResult,
+    pub(crate) compact_probe_attempt: Option<PersistedCompactProbeAttemptV1>,
     pub(crate) model_parity: bool,
     pub(crate) duration_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PersistedCompactProbeAttemptV1 {
+    pub(crate) diagnostic_status: String,
+    pub(crate) provider_post_count: i64,
+    pub(crate) parsed_response: bool,
+    pub(crate) provider_request_id: Option<String>,
+    pub(crate) response_id: Option<String>,
+    pub(crate) response_model: Option<String>,
+    pub(crate) request_audit: Option<super::task_truth_v2::semantic_probe::ProbeRequestAudit>,
+    pub(crate) admitted_output: Option<super::task_truth_v2::semantic_probe::ProbeModelOutput>,
 }
 
 pub fn run_continue_accuracy_eval_from_dir(
@@ -227,8 +288,11 @@ pub fn run_continue_accuracy_eval_from_dir(
 ) -> Result<ContinueAccuracyEvalReport, String> {
     let policy_bytes = fs::read(root.join("eval-policy.v1.json")).map_err(to_string)?;
     let manifest_bytes = fs::read(root.join("known-failures.v1.json")).map_err(to_string)?;
+    let lca_manifest_bytes =
+        fs::read(root.join("lca-replay-manifest.v1.json")).map_err(to_string)?;
     let policy = parse_eval_policy_json(&policy_bytes).map_err(to_string)?;
     let manifest = parse_milestone_manifest_json(&manifest_bytes).map_err(to_string)?;
+    let lca_manifest = parse_lca_replay_manifest_json(&lca_manifest_bytes).map_err(to_string)?;
     let mode = if options.allow_locked_holdout {
         HoldoutAccessModeV1::ReleaseEvaluation
     } else {
@@ -246,6 +310,17 @@ pub fn run_continue_accuracy_eval_from_dir(
             parse_accuracy_fixture_json_for_access(&fs::read(path).map_err(to_string)?, mode)
                 .map_err(to_string)?,
         );
+    }
+    for replay_case in &lca_manifest.cases {
+        if !fixtures
+            .iter()
+            .any(|fixture| fixture.case_id == replay_case.fixture_case_id)
+        {
+            return Err(format!(
+                "LCA replay case {} references missing fixture {}",
+                replay_case.case_id, replay_case.fixture_case_id
+            ));
+        }
     }
     validate_initial_capture_case_set(&fixtures).map_err(to_string)?;
     let fixture_hash = stable_json_sha256(&fixtures).map_err(to_string)?;
@@ -318,6 +393,7 @@ pub fn run_continue_accuracy_eval_from_dir(
         options.allow_locked_holdout,
         milestone_violations.is_empty(),
     );
+    let lca_replay_gate = assess_lca_replay_gate(&lca_manifest, &fixtures, &cases)?;
     Ok(ContinueAccuracyEvalReport {
         schema: CONTINUE_ACCURACY_REPORT_SCHEMA.to_string(),
         fixture_schema: ACCURACY_FIXTURE_SCHEMA_V1.to_string(),
@@ -346,6 +422,12 @@ pub fn run_continue_accuracy_eval_from_dir(
         confidence_calibration,
         probe_metrics,
         release_gate,
+        lca_replay_case_ids: lca_manifest
+            .cases
+            .into_iter()
+            .map(|case| (case.case_id, case.fixture_case_id))
+            .collect(),
+        lca_replay_gate,
         cases,
     })
 }
@@ -519,6 +601,722 @@ fn assess_p6_release_gate(
     }
 }
 
+fn lca_metric(numerator: i64, denominator: i64) -> LcaReplayMetricValue {
+    LcaReplayMetricValue {
+        numerator,
+        denominator,
+        excluded: 0,
+        rate: (denominator > 0).then_some(numerator as f64 / denominator as f64),
+    }
+}
+
+fn assess_lca_replay_gate(
+    manifest: &LcaReplayManifestV1,
+    fixtures: &[ContinueAccuracyFixtureV1],
+    cases: &[ContinueAccuracyCaseResult],
+) -> Result<LcaReplayGateAssessment, String> {
+    let fixtures_by_id = fixtures
+        .iter()
+        .map(|fixture| (fixture.case_id.as_str(), fixture))
+        .collect::<BTreeMap<_, _>>();
+    let cases_by_id = cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect::<BTreeMap<_, _>>();
+    let mut boundary_a = Vec::new();
+    for replay_case in &manifest.cases {
+        let case = cases_by_id
+            .get(replay_case.fixture_case_id.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "missing evaluated LCA fixture {}",
+                    replay_case.fixture_case_id
+                )
+            })?;
+        let mut violations = Vec::new();
+        if case.status != "pass" {
+            violations.push(format!("fixture_status_{}", case.status));
+        }
+        if !case.privacy_lint_passed {
+            violations.push("privacy_fixture_violation".into());
+        }
+        if !case.deterministic_replay_match {
+            violations.push("deterministic_replay_disagreement".into());
+        }
+        boundary_a.push(LcaReplayBoundaryResult {
+            case_id: replay_case.case_id.clone(),
+            fixture_case_id: replay_case.fixture_case_id.clone(),
+            passed: violations.is_empty(),
+            violations,
+        });
+    }
+
+    let mut boundary_b = Vec::new();
+    for replay_case in manifest
+        .cases
+        .iter()
+        .filter(|case| case.kind == LcaReplayCaseKindV1::Critical)
+    {
+        let fixture = fixtures_by_id[replay_case.fixture_case_id.as_str()];
+        for variant in &manifest.response_variants {
+            boundary_b.push(evaluate_lca_response_variant(
+                replay_case,
+                fixture,
+                *variant,
+            )?);
+        }
+    }
+
+    let critical_cases = manifest
+        .cases
+        .iter()
+        .filter(|case| case.kind == LcaReplayCaseKindV1::Critical)
+        .count() as i64;
+    let critical_boundary_pass = boundary_a
+        .iter()
+        .filter(|result| result.case_id.starts_with("LCA-CRIT-") && result.passed)
+        .count() as i64;
+    let critical_semantic_slot_pass = boundary_b
+        .iter()
+        .filter(|result| {
+            result.variant == LcaResponseVariantV1::ValidPartlyResolved
+                && result.semantic_slots_passed
+        })
+        .count() as i64;
+    let first_screen_pass = boundary_b
+        .iter()
+        .filter(|result| {
+            result.variant == LcaResponseVariantV1::ValidPartlyResolved
+                && result.first_screen_meaning_passed
+        })
+        .count() as i64;
+    let variant_denominator = boundary_b.len() as i64;
+    let variant_pass = boundary_b.iter().filter(|result| result.passed).count() as i64;
+    let violation_count = |needle: &str| {
+        boundary_b
+            .iter()
+            .flat_map(|result| result.violations.iter())
+            .filter(|violation| violation.contains(needle))
+            .count() as i64
+    };
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "critical_evidence_checkpoint_pass".into(),
+        lca_metric(critical_boundary_pass, critical_cases),
+    );
+    metrics.insert(
+        "critical_semantic_slot_pass".into(),
+        lca_metric(critical_semantic_slot_pass, critical_cases),
+    );
+    metrics.insert(
+        "critical_first_screen_meaning_pass".into(),
+        lca_metric(first_screen_pass, critical_cases),
+    );
+    metrics.insert(
+        "deterministic_response_variant_pass".into(),
+        lca_metric(variant_pass, variant_denominator),
+    );
+    for (name, needle) in [
+        (
+            "completed_work_as_active_task_count",
+            "completed_work_active",
+        ),
+        (
+            "unrelated_pane_primary_leakage_count",
+            "wrong_task_survived",
+        ),
+        ("false_insufficient_evidence_count", "false_insufficient"),
+        ("uncertainty_upgrade_count", "uncertainty_upgraded"),
+        ("inferred_as_explicit_count", "inferred_as_explicit"),
+        (
+            "unsupported_next_action_count",
+            "unsupported_action_survived",
+        ),
+        (
+            "status_action_contradiction_count",
+            "status_action_contradiction",
+        ),
+        (
+            "inline_diagnostic_citation_leakage_count",
+            "inline_citation_leaked",
+        ),
+        (
+            "canonical_projection_identity_mismatch_count",
+            "canonical_projection_mismatch",
+        ),
+        (
+            "react_island_semantic_disagreement_count",
+            "canonical_projection_mismatch",
+        ),
+        (
+            "frame_preview_as_direct_target_count",
+            "frame_preview_direct_target",
+        ),
+        ("unsafe_open_or_open_policy_bypass_count", "unsafe_open"),
+        ("automatic_reconciliation_post_count", "reconciliation_post"),
+        ("background_semantic_upload_count", "background_upload"),
+    ] {
+        metrics.insert(
+            name.into(),
+            lca_metric(violation_count(needle), variant_denominator),
+        );
+    }
+    let supported_actions = boundary_b
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.variant,
+                LcaResponseVariantV1::ValidResolved | LcaResponseVariantV1::ValidPartlyResolved
+            )
+        })
+        .count() as i64;
+    let supported_actions_preserved = boundary_b
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.variant,
+                LcaResponseVariantV1::ValidResolved | LcaResponseVariantV1::ValidPartlyResolved
+            ) && result.semantic_slots_passed
+        })
+        .count() as i64;
+    metrics.insert(
+        "supported_next_action_precision".into(),
+        lca_metric(supported_actions_preserved, supported_actions),
+    );
+    let provider_post_maximum = boundary_b
+        .iter()
+        .map(|result| result.provider_post_count)
+        .max()
+        .unwrap_or(0);
+    metrics.insert(
+        "one_manual_attempt_provider_post_maximum".into(),
+        lca_metric(provider_post_maximum, 1),
+    );
+    let privacy_pass = cases.iter().filter(|case| case.privacy_lint_passed).count() as i64;
+    metrics.insert(
+        "privacy_fixture_violation_count".into(),
+        lca_metric(cases.len() as i64 - privacy_pass, cases.len() as i64),
+    );
+    let deterministic_pass = cases
+        .iter()
+        .filter(|case| case.deterministic_replay_match)
+        .count() as i64;
+    metrics.insert(
+        "deterministic_replay_disagreement_count".into(),
+        lca_metric(cases.len() as i64 - deterministic_pass, cases.len() as i64),
+    );
+    let mut violations = boundary_a
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| format!("{}:{:?}", result.case_id, result.violations))
+        .chain(
+            boundary_b
+                .iter()
+                .filter(|result| !result.passed)
+                .map(|result| {
+                    format!(
+                        "{}:{:?}:{:?}",
+                        result.case_id, result.variant, result.violations
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    if critical_boundary_pass != 4 {
+        violations.push("critical_boundary_a_not_4_of_4".into());
+    }
+    if critical_semantic_slot_pass != critical_cases {
+        violations.push(format!(
+            "critical_semantic_slots_passed_{critical_semantic_slot_pass}_of_{critical_cases}"
+        ));
+    }
+    if first_screen_pass != 4 {
+        violations.push("critical_first_screen_not_4_of_4".into());
+    }
+    if variant_pass != 40 {
+        violations.push(format!("response_variants_passed_{variant_pass}_of_40"));
+    }
+    for name in [
+        "critical_evidence_checkpoint_pass",
+        "critical_semantic_slot_pass",
+        "critical_first_screen_meaning_pass",
+        "deterministic_response_variant_pass",
+        "supported_next_action_precision",
+    ] {
+        let metric = &metrics[name];
+        if metric.denominator == 0 || metric.numerator != metric.denominator {
+            violations.push(format!("metric_{name}_must_be_100_percent"));
+        }
+    }
+    for name in [
+        "completed_work_as_active_task_count",
+        "unrelated_pane_primary_leakage_count",
+        "false_insufficient_evidence_count",
+        "uncertainty_upgrade_count",
+        "inferred_as_explicit_count",
+        "unsupported_next_action_count",
+        "status_action_contradiction_count",
+        "inline_diagnostic_citation_leakage_count",
+        "canonical_projection_identity_mismatch_count",
+        "react_island_semantic_disagreement_count",
+        "frame_preview_as_direct_target_count",
+        "unsafe_open_or_open_policy_bypass_count",
+        "automatic_reconciliation_post_count",
+        "background_semantic_upload_count",
+        "privacy_fixture_violation_count",
+        "deterministic_replay_disagreement_count",
+    ] {
+        if metrics[name].numerator != 0 {
+            violations.push(format!("metric_{name}_must_be_zero"));
+        }
+    }
+    if provider_post_maximum > 1 {
+        violations.push(format!(
+            "manual_attempt_provider_post_maximum_{provider_post_maximum}_exceeds_one"
+        ));
+    }
+    if boundary_b
+        .iter()
+        .any(|result| result.provider_post_count != 1)
+    {
+        violations.push("each_response_variant_must_record_one_provider_post".into());
+    }
+    Ok(LcaReplayGateAssessment {
+        schema: "smalltalk.lca_05.replay_gate.v1".into(),
+        passed: violations.is_empty(),
+        boundary_a,
+        boundary_b,
+        metrics,
+        violations,
+    })
+}
+
+fn lca_enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn lca_nonprimary_real_slot(
+    packet: &super::task_truth_v2::observation_packet::ObservationPacketV2,
+    request: &super::task_truth_v2::semantic_probe::ProbeRequest,
+) -> Option<String> {
+    use super::task_truth_v2::observation_packet::TaskEvidenceRoleV1 as Role;
+    use super::task_truth_v2::semantic_probe::SupportCategory;
+
+    request
+        .slots
+        .values()
+        .find(|slot| slot.category == SupportCategory::SurfaceIdentity)
+        .or_else(|| {
+            request.slots.values().find(|slot| {
+                let frame_id = slot.frame_id.as_deref().or_else(|| {
+                    (slot.source_kind == "keyframe").then_some(slot.record_id.as_str())
+                });
+                let roles = packet
+                    .task_relevance
+                    .spans
+                    .iter()
+                    .filter(|span| Some(span.frame_id.as_str()) == frame_id)
+                    .map(|span| span.evidence_role)
+                    .collect::<Vec<_>>();
+                !roles.is_empty()
+                    && roles.iter().all(|role| {
+                        matches!(
+                            role,
+                            Role::PriorTaskBoundary
+                                | Role::SupportingContext
+                                | Role::FlattenedFallback
+                                | Role::Unknown
+                        )
+                    })
+            })
+        })
+        .map(|slot| slot.slot.clone())
+}
+
+fn lca_variant_public_result(
+    replay_case: &LcaReplayCaseV1,
+    fixture: &ContinueAccuracyFixtureV1,
+    variant: LcaResponseVariantV1,
+    diagnostic_status: String,
+    projection: &super::task_truth_v2::production::ContinueProductProjectionV1,
+    semantic_slots_passed: bool,
+    first_screen_meaning_passed: bool,
+    provider_post_count: i64,
+    violations: Vec<String>,
+) -> LcaReplayVariantResult {
+    LcaReplayVariantResult {
+        case_id: replay_case.case_id.clone(),
+        fixture_case_id: fixture.case_id.clone(),
+        variant,
+        diagnostic_status,
+        presentation_state: lca_enum_label(&projection.presentation_state),
+        primary_instruction: projection.primary_instruction.clone(),
+        primary_action_kind: lca_enum_label(&projection.primary_action.kind),
+        primary_action_label: projection.primary_action.label.clone(),
+        semantic_status: projection.semantic_status.clone(),
+        semantic_slots_passed,
+        first_screen_meaning_passed,
+        provider_post_count,
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+fn lca_failure_product_projection(
+    reason: &str,
+    inference_status: &str,
+) -> super::task_truth_v2::production::ContinueProductProjectionV1 {
+    let mut answer = super::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+        unresolved_or_failure_reason: Some(reason.into()),
+        inference_status: inference_status.into(),
+        ..Default::default()
+    };
+    answer.recompute_product_projection();
+    answer.product_projection
+}
+
+fn evaluate_lca_response_variant(
+    replay_case: &LcaReplayCaseV1,
+    fixture: &ContinueAccuracyFixtureV1,
+    variant: LcaResponseVariantV1,
+) -> Result<LcaReplayVariantResult, String> {
+    use super::task_truth_v2::semantic_probe::{
+        ProbeDiagnosticStatus, ProbeResolutionStatus, SupportCategory,
+    };
+    let (packet, request) = deterministic_lca_packet_and_request(fixture)?;
+    if variant == LcaResponseVariantV1::InvalidStructuredOutput {
+        let error = super::task_truth_v2::semantic_probe::parse_probe_response(
+            &packet,
+            &request,
+            &json!({"output_text":"not json"}),
+        )
+        .unwrap_err();
+        let projection =
+            lca_failure_product_projection("structured_parser_failure", "structured_parse_failure");
+        let mut violations = Vec::new();
+        if error.0 != ProbeDiagnosticStatus::StructuredParseFailure {
+            violations.push("invalid_structured_not_parser_failure".into());
+        }
+        if projection.presentation_state
+            != super::task_truth_v2::production::ContinuePresentationStateV1::ParserFailure
+        {
+            violations.push("parser_failure_product_state_missing".into());
+        }
+        if projection.primary_action.kind
+            != super::task_truth_v2::production::ContinueProductActionKindV1::RefreshContinue
+        {
+            violations.push("parser_failure_refresh_action_missing".into());
+        }
+        if projection
+            .primary_instruction
+            .to_ascii_lowercase()
+            .contains("insufficient evidence")
+        {
+            violations.push("false_insufficient_evidence_parser_failure".into());
+        }
+        return Ok(lca_variant_public_result(
+            replay_case,
+            fixture,
+            variant,
+            format!("{:?}", error.0).to_ascii_lowercase(),
+            &projection,
+            false,
+            true,
+            1,
+            violations,
+        ));
+    }
+    if variant == LcaResponseVariantV1::ProviderIncompleteEmpty {
+        let incomplete = json!({"status":"incomplete","output":[]});
+        let error = super::task_truth_v2::semantic_probe::parse_probe_response(
+            &packet,
+            &request,
+            &incomplete,
+        )
+        .unwrap_err();
+        let projection =
+            lca_failure_product_projection("provider_no_usable_output", "provider_incomplete");
+        let mut violations = Vec::new();
+        if error.0 != ProbeDiagnosticStatus::ProviderNoUsableOutput {
+            violations.push("provider_incomplete_diagnostic_misclassified".into());
+        }
+        if projection.presentation_state
+            != super::task_truth_v2::production::ContinuePresentationStateV1::ProviderFailure
+        {
+            violations.push("provider_failure_product_state_missing".into());
+        }
+        if projection.primary_action.kind
+            != super::task_truth_v2::production::ContinueProductActionKindV1::RefreshContinue
+        {
+            violations.push("provider_failure_refresh_action_missing".into());
+        }
+        if projection
+            .primary_instruction
+            .to_ascii_lowercase()
+            .contains("insufficient evidence")
+        {
+            violations.push("false_insufficient_evidence_provider_failure".into());
+        }
+        return Ok(lca_variant_public_result(
+            replay_case,
+            fixture,
+            variant,
+            "provider_no_usable_output".into(),
+            &projection,
+            false,
+            true,
+            1,
+            violations,
+        ));
+    }
+
+    let mut proposed = fixture_probe_output(fixture, &request)?;
+    let original_status = proposed.status;
+    let original_task = proposed.unfinished_task.clone();
+    let original_task_state = lca_enum_label(&proposed.task_state);
+    let original_resume_point = proposed.resume_point.clone();
+    let original_action = proposed.next_supported_action.clone();
+    let original_completed_context = proposed.completed_context.clone();
+    let original_where_summary = proposed.where_summary.clone();
+    let user_slot = request
+        .slots
+        .values()
+        .find(|slot| slot.category == SupportCategory::UserAction)
+        .or_else(|| {
+            request
+                .slots
+                .values()
+                .find(|slot| slot.privacy_eligible && slot.ownership_eligible)
+        })
+        .map(|slot| slot.slot.clone())
+        .ok_or_else(|| "LCA variant request has no eligible support slot".to_string())?;
+    let passive_slot = request
+        .slots
+        .values()
+        .find(|slot| {
+            matches!(
+                slot.category,
+                SupportCategory::ContextImage
+                    | SupportCategory::ImageBefore
+                    | SupportCategory::ImageAfter
+            )
+        })
+        .map(|slot| slot.slot.clone())
+        .unwrap_or_else(|| user_slot.clone());
+    let nonsemantic_real_slot =
+        lca_nonprimary_real_slot(&packet, &request).unwrap_or_else(|| passive_slot.clone());
+    match variant {
+        LcaResponseVariantV1::ValidResolved => proposed.status = ProbeResolutionStatus::Resolved,
+        LcaResponseVariantV1::ValidPartlyResolved => {
+            proposed.status = ProbeResolutionStatus::PartlyResolved
+        }
+        LcaResponseVariantV1::UnsupportedSemanticField => {
+            proposed.where_summary = Some("An unsupported private location".into());
+            proposed.support_slots_by_field.insert(
+                "where_summary".into(),
+                vec!["B9_UNAVAILABLE_SUPPORT".into()],
+            );
+        }
+        LcaResponseVariantV1::WrongTaskRealSlot => {
+            proposed.unfinished_task = Some("Review an unrelated playback pane".into());
+            proposed.support_slots_by_field.insert(
+                "unfinished_task".into(),
+                vec![nonsemantic_real_slot.clone()],
+            );
+        }
+        LcaResponseVariantV1::PriorCompletion => {
+            proposed.unfinished_task = proposed
+                .completed_context
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| Some("A previously completed support step".into()));
+            proposed
+                .support_slots_by_field
+                .insert("unfinished_task".into(), vec![nonsemantic_real_slot]);
+        }
+        LcaResponseVariantV1::GenericNextAction => {
+            proposed.next_supported_action = Some("Continue working".into());
+            proposed
+                .support_slots_by_field
+                .insert("next_supported_action".into(), vec![user_slot.clone()]);
+        }
+        LcaResponseVariantV1::ConfidenceInflating => {
+            for confidence in proposed.confidence_by_field.values_mut() {
+                *confidence = 1.0;
+            }
+        }
+        LcaResponseVariantV1::InvalidInlineCitation => {
+            proposed.next_supported_action = Some(format!("Continue the task [{user_slot}]"));
+        }
+        LcaResponseVariantV1::InvalidStructuredOutput
+        | LcaResponseVariantV1::ProviderIncompleteEmpty => unreachable!(),
+    }
+    let response = json!({"output_text": serde_json::to_string(&proposed).map_err(to_string)?});
+    let (admitted, _, issues, _) =
+        super::task_truth_v2::semantic_probe::parse_probe_response(&packet, &request, &response)
+            .map_err(|(status, reason)| format!("{status:?}:{reason}"))?;
+    let answer = super::task_truth_v2::production::map_compact_probe_output_to_public_answer(
+        &admitted,
+        &request.slots,
+        &super::task_truth_v2::production::CompactProbePublicMappingContext {
+            decision_id: format!("lca-05:{}:{variant:?}", fixture.case_id),
+            session_id: Some(fixture_session_id(fixture)),
+            packet_id: packet.packet_id.clone(),
+            evidence_watermark: "lca-05-watermark".into(),
+            configured_model: "deterministic-fixture-model".into(),
+            response_model: Some("deterministic-fixture-model".into()),
+            request_id: Some(request.audit.request_id.clone()),
+            provider_request_id: Some("deterministic-request".into()),
+            provider_response_id: Some("deterministic-response".into()),
+            diagnostic_status: if issues.is_empty() {
+                "success".into()
+            } else {
+                "support_slot_validation_failure".into()
+            },
+            validation_issues: issues.clone(),
+            recent_context: Vec::new(),
+            current_frame_id: request.audit.final_frame_id.clone(),
+            packet_policy_version: request.audit.request_schema.clone(),
+            response_schema_version: super::task_truth_v2::semantic_probe::PROBE_RESPONSE_SCHEMA
+                .into(),
+            explicit_goal_support_slots: request.audit.explicit_goal_support_slots.clone(),
+            correction_watermark: String::new(),
+            semantic_conflicts: Vec::new(),
+        },
+    );
+    let mut violations = Vec::new();
+    let expected_status = match variant {
+        LcaResponseVariantV1::ValidResolved => ProbeResolutionStatus::Resolved,
+        LcaResponseVariantV1::ValidPartlyResolved => ProbeResolutionStatus::PartlyResolved,
+        _ => original_status,
+    };
+    if admitted.status != expected_status {
+        violations.push("uncertainty_upgraded".into());
+    }
+    if answer.direct_return_target.is_some() {
+        violations.push("unsafe_open_or_frame_preview_direct_target".into());
+    }
+    if answer.product_projection
+        != super::task_truth_v2::production::continue_product_projection(&answer)
+        || answer.product_projection.answer_identity != answer.atomic_answer_identity
+    {
+        violations.push("canonical_projection_mismatch".into());
+    }
+    if answer.product_projection.primary_instruction.contains('[') {
+        violations.push("inline_citation_leaked".into());
+    }
+    let public_status_disallows_action = matches!(
+        answer.admitted_semantic_status.as_str(),
+        "unresolved" | "refused"
+    );
+    let public_action_present = answer.next_supported_action.is_some();
+    let projection_action_known = answer.product_projection.presentation_state
+        == super::task_truth_v2::production::ContinuePresentationStateV1::ActionKnown;
+    if (public_status_disallows_action && public_action_present)
+        || public_action_present != projection_action_known
+    {
+        violations.push("status_action_contradiction".into());
+    }
+    match variant {
+        LcaResponseVariantV1::ValidResolved | LcaResponseVariantV1::ValidPartlyResolved => {
+            if answer.unfinished_task != original_task {
+                violations.push("supported_task_lost".into());
+            }
+            if answer.next_supported_action != original_action {
+                violations.push("supported_action_lost".into());
+            }
+        }
+        LcaResponseVariantV1::UnsupportedSemanticField => {
+            if answer.where_summary == proposed.where_summary {
+                violations.push("unsupported_field_survived".into());
+            }
+        }
+        LcaResponseVariantV1::WrongTaskRealSlot | LcaResponseVariantV1::PriorCompletion => {
+            if proposed
+                .unfinished_task
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && answer.unfinished_task == proposed.unfinished_task
+            {
+                violations.push("wrong_task_survived_or_completed_work_active".into());
+            }
+        }
+        LcaResponseVariantV1::GenericNextAction => {
+            if answer.next_supported_action == proposed.next_supported_action {
+                violations.push("unsupported_action_survived".into());
+            }
+        }
+        LcaResponseVariantV1::ConfidenceInflating => {
+            let admitted_status = serde_json::to_value(admitted.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string));
+            if Some(answer.admitted_semantic_status.clone()) != admitted_status {
+                violations.push("confidence_inflation_changed_status".into());
+            }
+        }
+        LcaResponseVariantV1::InvalidInlineCitation => {
+            if answer
+                .next_supported_action
+                .as_deref()
+                .is_some_and(|value| value.contains('['))
+            {
+                violations.push("inline_citation_leaked".into());
+            }
+        }
+        LcaResponseVariantV1::InvalidStructuredOutput
+        | LcaResponseVariantV1::ProviderIncompleteEmpty => unreachable!(),
+    }
+    let valid_semantic_variant = matches!(
+        variant,
+        LcaResponseVariantV1::ValidResolved | LcaResponseVariantV1::ValidPartlyResolved
+    );
+    if replay_case.case_id == "LCA-CRIT-04"
+        && valid_semantic_variant
+        && answer.semantic_source_kind != "verified_cloud_inferred_goal"
+    {
+        violations.push("inferred_as_explicit".into());
+    }
+    let semantic_slots_passed = valid_semantic_variant
+        && answer.unfinished_task == original_task
+        && answer.task_state == original_task_state
+        && answer.resume_point == original_resume_point
+        && answer.next_supported_action == original_action
+        && answer.completed_context == original_completed_context
+        && answer.where_summary == original_where_summary;
+    let first_screen_meaning_passed = valid_semantic_variant
+        && answer.product_projection.presentation_state
+            == super::task_truth_v2::production::ContinuePresentationStateV1::ActionKnown
+        && answer.product_projection.primary_instruction
+            == original_action.clone().unwrap_or_default()
+        && answer.product_projection.resume_context.is_some()
+        && answer.product_projection.semantic_status == answer.admitted_semantic_status
+        && answer.product_projection.primary_action.kind
+            != super::task_truth_v2::production::ContinueProductActionKindV1::OpenDirectTarget;
+    if valid_semantic_variant && !semantic_slots_passed {
+        violations.push("critical_semantic_slots_mismatch".into());
+    }
+    if valid_semantic_variant && !first_screen_meaning_passed {
+        violations.push("critical_first_screen_meaning_mismatch".into());
+    }
+    Ok(lca_variant_public_result(
+        replay_case,
+        fixture,
+        variant,
+        if issues.is_empty() {
+            "success".into()
+        } else {
+            "support_slot_validation_failure".into()
+        },
+        &answer.product_projection,
+        semantic_slots_passed,
+        first_screen_meaning_passed,
+        1,
+        violations,
+    ))
+}
+
 pub fn run_committed_continue_accuracy_eval(
     options: ContinueAccuracyEvalOptions,
 ) -> Result<ContinueAccuracyEvalReport, String> {
@@ -544,6 +1342,83 @@ pub fn write_accuracy_report(
         serde_json::to_vec_pretty(report).map_err(to_string)?,
     )
     .map_err(to_string)
+}
+
+fn load_persisted_compact_probe_attempt(
+    conn: &Connection,
+    decision_id: &str,
+) -> Result<Option<PersistedCompactProbeAttemptV1>, String> {
+    let table_exists = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='task_truth_v2_semantic_probe_runs'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(to_string)?;
+    if !table_exists {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT diagnostic_status, provider_post_count, parsed_response,
+                provider_request_id, response_id, response_model,
+                request_audit_json, admitted_output_json
+         FROM task_truth_v2_semantic_probe_runs
+         WHERE decision_id=?1
+         ORDER BY created_at_ms DESC, run_id DESC
+         LIMIT 1",
+        [decision_id],
+        |row| {
+            let request_audit_json = row.get::<_, Option<String>>(6)?;
+            let admitted_output_json = row.get::<_, Option<String>>(7)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                request_audit_json,
+                admitted_output_json,
+            ))
+        },
+    )
+    .optional()
+    .map_err(to_string)?
+    .map(
+        |(
+            diagnostic_status,
+            provider_post_count,
+            parsed_response,
+            provider_request_id,
+            response_id,
+            response_model,
+            request_audit_json,
+            admitted_output_json,
+        )| {
+            Ok(PersistedCompactProbeAttemptV1 {
+                diagnostic_status,
+                provider_post_count,
+                parsed_response,
+                provider_request_id,
+                response_id,
+                response_model,
+                request_audit: request_audit_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(to_string)?,
+                admitted_output: admitted_output_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(to_string)?,
+            })
+        },
+    )
+    .transpose()
 }
 
 pub(crate) fn run_fixture_once(
@@ -581,30 +1456,74 @@ pub(crate) fn run_fixture_once(
         },
     )?;
     inject_historical_state(&conn, fixture, anchor)?;
-    let decision = get_continue_decision(
-        &conn,
-        ContinueDecisionRequest {
-            session_id: Some(session_id),
-            lookback_ms: Some(45 * 60 * 1000),
-            limit: Some(200),
-            mode: Some("normal".to_string()),
-            rebuild_layers: Some(false),
-            micro_inference_enabled: Some(false),
-            activity_recap_model_enabled: Some(false),
-            model: None,
-            max_candidates_for_model: Some(5),
-            audit_output_enabled: Some(false),
-            audit_mode: None,
-            island_trigger_reason: None,
-            island_source: Some("accuracy_eval".to_string()),
-            request_trigger: Some("accuracy_eval".to_string()),
-            manual_continue_frame_id: None,
-            manual_continue_preflight_failure: None,
-            manual_continue_started_at_ms: None,
-        },
-    )?;
+    let lca_scenario = is_lca_scenario(&fixture.scenario);
+    let decision_request = ContinueDecisionRequest {
+        session_id: Some(session_id),
+        lookback_ms: Some(45 * 60 * 1000),
+        limit: Some(200),
+        mode: Some("normal".to_string()),
+        rebuild_layers: Some(false),
+        micro_inference_enabled: Some(false),
+        activity_recap_model_enabled: Some(false),
+        model: None,
+        max_candidates_for_model: Some(5),
+        audit_output_enabled: Some(false),
+        audit_mode: None,
+        island_trigger_reason: None,
+        island_source: Some("accuracy_eval".to_string()),
+        request_trigger: Some(if lca_scenario {
+            "manual".to_string()
+        } else {
+            "accuracy_eval".to_string()
+        }),
+        manual_continue_frame_id: None,
+        manual_continue_preflight_failure: None,
+        manual_continue_started_at_ms: None,
+    };
+    let transport_invocations = Rc::new(Cell::new(0usize));
+    let decision = if lca_scenario {
+        let transport_fixture = fixture.clone();
+        let transport_counter = Rc::clone(&transport_invocations);
+        super::task_truth_v2::semantic_probe::with_request_scoped_provider_transport(
+            move |request| {
+                transport_counter.set(transport_counter.get().saturating_add(1));
+                let output = fixture_probe_output(&transport_fixture, request)?;
+                Ok(json!({
+                    "id": format!("accuracy-lca-provider-response:{}", transport_fixture.case_id),
+                    "request_id": format!("accuracy-lca-provider-request:{}", transport_fixture.case_id),
+                    "model": super::task_truth_v2::semantic_probe::configured_model_name(),
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "total_tokens": 150
+                    },
+                    "output_text": serde_json::to_string(&output).map_err(to_string)?,
+                }))
+            },
+            || get_continue_decision(&conn, decision_request),
+        )?
+    } else {
+        get_continue_decision(&conn, decision_request)?
+    };
+    let compact_probe_attempt = load_persisted_compact_probe_attempt(&conn, &decision.decision_id)?;
+    if lca_scenario {
+        let attempt = compact_probe_attempt.as_ref().ok_or_else(|| {
+            format!(
+                "LCA production replay {} persisted no compact ProbeAttempt",
+                fixture.case_id
+            )
+        })?;
+        if attempt.provider_post_count != transport_invocations.get() as i64 {
+            return Err(format!(
+                "LCA production replay {} transport count {} disagrees with persisted provider_post_count {}",
+                fixture.case_id,
+                transport_invocations.get(),
+                attempt.provider_post_count
+            ));
+        }
+    }
     let mut actual = collect_checkpoints(&conn, &decision)?;
-    if is_lca_scenario(&fixture.scenario) {
+    if lca_scenario {
         let frames = super::load_evidence_frames(
             &conn,
             &ContinueSecondLayerRebuildRequest {
@@ -616,9 +1535,7 @@ pub(crate) fn run_fixture_once(
             },
         )?;
         let watermark = super::stable_hash(format!("accuracy-lca:{}", fixture.case_id).as_bytes());
-        let (packet, probe_request) =
-            super::task_truth_v2::deterministic_lca_probe_input(&conn, &frames, &watermark)?;
-        let (packet_checkpoint, request_checkpoint) =
+        let (packet_checkpoint, mut request_checkpoint) =
             super::task_truth_v2::deterministic_lca_request_checkpoints(
                 &conn, &frames, &watermark,
             )?;
@@ -626,46 +1543,53 @@ pub(crate) fn run_fixture_once(
             AccuracyCheckpointV1::TaskRelevantEvidencePacket,
             packet_checkpoint,
         );
+        let attempt = compact_probe_attempt.as_ref().expect("checked above");
+        if !attempt.parsed_response
+            || attempt.provider_post_count != 1
+            || attempt.provider_request_id.is_none()
+            || attempt.response_id.is_none()
+            || !attempt
+                .request_audit
+                .as_ref()
+                .is_some_and(|audit| audit.admission_feasibility.useful_partly_resolved_possible)
+        {
+            return Err(format!(
+                "LCA production replay {} did not persist one admissible parsed provider attempt: {attempt:?}",
+                fixture.case_id
+            ));
+        }
+        request_checkpoint.insert("production_transport_executed".into(), json!(true));
+        request_checkpoint.insert(
+            "persisted_provider_post_count".into(),
+            json!(attempt.provider_post_count),
+        );
+        request_checkpoint.insert(
+            "persisted_request_feasible".into(),
+            json!(attempt
+                .request_audit
+                .as_ref()
+                .is_some_and(|audit| audit.admission_feasibility.useful_partly_resolved_possible)),
+        );
         actual.insert(
             AccuracyCheckpointV1::CompactSemanticRequest,
             request_checkpoint,
         );
-        let proposed = fixture_probe_output(fixture, &probe_request)?;
-        let (admitted, field_local_issues) =
-            super::task_truth_v2::semantic_probe::admit_output(&packet, &probe_request, proposed);
+        let admitted = attempt.admitted_output.as_ref().ok_or_else(|| {
+            format!(
+                "LCA production replay {} persisted no admitted compact output",
+                fixture.case_id
+            )
+        })?;
         actual.insert(
             AccuracyCheckpointV1::CompactSemanticOutput,
-            compact_semantic_output_slots(&admitted),
+            compact_semantic_output_slots(admitted),
         );
-        let public_answer =
-            super::task_truth_v2::production::map_compact_probe_output_to_public_answer(
-                &admitted,
-                &probe_request.slots,
-                &super::task_truth_v2::production::CompactProbePublicMappingContext {
-                    decision_id: format!("accuracy-lca-decision:{}", fixture.case_id),
-                    session_id: Some(fixture_session_id(fixture)),
-                    packet_id: packet.packet_id.clone(),
-                    evidence_watermark: watermark.clone(),
-                    configured_model: "deterministic-fixture-model".into(),
-                    response_model: Some("deterministic-fixture-model".into()),
-                    request_id: Some(probe_request.audit.request_id.clone()),
-                    provider_request_id: Some(format!(
-                        "accuracy-lca-provider-request:{}",
-                        fixture.case_id
-                    )),
-                    provider_response_id: Some(format!(
-                        "accuracy-lca-provider-response:{}",
-                        fixture.case_id
-                    )),
-                    diagnostic_status: if field_local_issues.is_empty() {
-                        "success".into()
-                    } else {
-                        "support_slot_validation_failure".into()
-                    },
-                    validation_issues: field_local_issues,
-                    recent_context: Vec::new(),
-                },
-            );
+        let public_answer = decision.task_truth_v2.answer.as_ref().ok_or_else(|| {
+            format!(
+                "LCA production replay {} produced no public semantic answer",
+                fixture.case_id
+            )
+        })?;
         let compatibility_fields_match = public_answer.task_summary
             == public_answer.unfinished_task
             && public_answer.execution_state == public_answer.task_state
@@ -696,6 +1620,27 @@ pub(crate) fn run_fixture_once(
                     json!(public_answer.model_resolution_status),
                 ),
                 (
+                    "admitted_semantic_status".into(),
+                    json!(public_answer.admitted_semantic_status),
+                ),
+                (
+                    "semantic_source_kind".into(),
+                    json!(public_answer.semantic_source_kind),
+                ),
+                ("target_status".into(), json!(public_answer.target_status)),
+                (
+                    "unresolved_or_failure_reason".into(),
+                    json!(public_answer.unresolved_or_failure_reason),
+                ),
+                (
+                    "field_admission".into(),
+                    json!(public_answer.field_admission),
+                ),
+                (
+                    "atomic_answer_identity_present".into(),
+                    json!(!public_answer.atomic_answer_identity.is_empty()),
+                ),
+                (
                     "compatibility_fields_match".into(),
                     json!(compatibility_fields_match),
                 ),
@@ -706,6 +1651,34 @@ pub(crate) fn run_fixture_once(
                 (
                     "public_target_honest".into(),
                     json!(public_answer.direct_return_target.is_none()),
+                ),
+                (
+                    "answer_identity".into(),
+                    json!(public_answer.product_projection.answer_identity),
+                ),
+                (
+                    "presentation_state".into(),
+                    json!(public_answer.product_projection.presentation_state),
+                ),
+                (
+                    "primary_instruction".into(),
+                    json!(public_answer.product_projection.primary_instruction),
+                ),
+                (
+                    "resume_context".into(),
+                    json!(public_answer.product_projection.resume_context),
+                ),
+                (
+                    "location_context".into(),
+                    json!(public_answer.product_projection.location_context),
+                ),
+                (
+                    "primary_action".into(),
+                    json!(public_answer.product_projection.primary_action),
+                ),
+                (
+                    "inspect_available".into(),
+                    json!(public_answer.product_projection.inspect_available),
                 ),
             ]),
         );
@@ -721,6 +1694,7 @@ pub(crate) fn run_fixture_once(
     Ok(ReplaySnapshot {
         actual,
         decision,
+        compact_probe_attempt,
         model_parity,
         duration_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
@@ -900,6 +1874,58 @@ fn fixture_probe_output(
             .collect(),
         status: fixture_probe_resolution_status(output.status),
     })
+}
+
+fn deterministic_lca_packet_and_request(
+    fixture: &ContinueAccuracyFixtureV1,
+) -> Result<
+    (
+        super::task_truth_v2::observation_packet::ObservationPacketV2,
+        super::task_truth_v2::semantic_probe::ProbeRequest,
+    ),
+    String,
+> {
+    let conn = Connection::open_in_memory().map_err(to_string)?;
+    crate::capture::init_db(&conn)?;
+    let anchor = super::current_time_millis() - 60_000;
+    let frame_map = insert_source_records(&conn, fixture, anchor)?;
+    let _synthetic_image_assets = attach_lca_synthetic_images(&conn, fixture, &frame_map)?;
+    for frame_id in frame_map.values() {
+        let _ = crate::capture::resolve_accuracy_frame_text(&conn, *frame_id)?;
+    }
+    let session_id = fixture_session_id(fixture);
+    rebuild_continue_second_layer(
+        &conn,
+        ContinueSecondLayerRebuildRequest {
+            session_id: Some(session_id.clone()),
+            lookback_ms: None,
+            start_frame_id: None,
+            end_frame_id: None,
+            limit: Some(100),
+        },
+    )?;
+    rebuild_continue_third_layer(
+        &conn,
+        ContinueThirdLayerRebuildRequest {
+            session_id: Some(session_id),
+            lookback_ms: None,
+            start_frame_id: None,
+            end_frame_id: None,
+            limit: Some(100),
+        },
+    )?;
+    let frames = super::load_evidence_frames(
+        &conn,
+        &ContinueSecondLayerRebuildRequest {
+            session_id: Some(fixture_session_id(fixture)),
+            lookback_ms: None,
+            start_frame_id: None,
+            end_frame_id: None,
+            limit: Some(100),
+        },
+    )?;
+    let watermark = super::stable_hash(format!("accuracy-lca:{}", fixture.case_id).as_bytes());
+    super::task_truth_v2::deterministic_lca_probe_input(&conn, &frames, &watermark)
 }
 
 fn compact_semantic_output_slots(
@@ -3227,6 +4253,11 @@ fn to_string(error: impl std::fmt::Display) -> String {
 }
 
 #[cfg(test)]
+mod task_truth_v2 {
+    pub(crate) use crate::continuation::task_truth_v2::{production, semantic_probe};
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3343,7 +4374,7 @@ mod tests {
     }
 
     #[test]
-    fn lca_cases_exercise_real_packet_and_request_without_transport() {
+    fn lca_06_fixtures_replay_through_persisted_production_probe_and_projection() {
         let fixture_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continue_accuracy/cases");
         let mut fixture_paths = fs::read_dir(fixture_root)
@@ -3364,7 +4395,59 @@ mod tests {
                 HoldoutAccessModeV1::Development,
             )
             .unwrap();
+            assert_eq!(
+                fixture.deterministic_model_output.as_ref().unwrap().status,
+                FixtureProbeResolutionStatusV1::PartlyResolved,
+                "{} must preserve the raw partly_resolved log status",
+                fixture.case_id
+            );
             let snapshot = run_fixture_once(&fixture).unwrap();
+            let attempt = snapshot
+                .compact_probe_attempt
+                .as_ref()
+                .expect("manual replay must persist a compact ProbeAttempt");
+            assert_eq!(attempt.provider_post_count, 1, "{}", fixture.case_id);
+            assert!(attempt.parsed_response, "{}", fixture.case_id);
+            assert!(attempt.provider_request_id.is_some(), "{}", fixture.case_id);
+            assert!(attempt.response_id.is_some(), "{}", fixture.case_id);
+            assert_eq!(
+                attempt.response_model.as_deref(),
+                Some("gpt-5.6-luna"),
+                "{}",
+                fixture.case_id
+            );
+            assert!(
+                attempt.request_audit.as_ref().is_some_and(|audit| audit
+                    .admission_feasibility
+                    .useful_partly_resolved_possible),
+                "{}",
+                fixture.case_id
+            );
+            assert_eq!(
+                snapshot
+                    .decision
+                    .task_truth_v2
+                    .inference_diagnostic
+                    .as_ref()
+                    .map(|diagnostic| diagnostic.provider_attempt_count),
+                Some(1),
+                "{}",
+                fixture.case_id
+            );
+            let production_request =
+                &snapshot.actual[&AccuracyCheckpointV1::CompactSemanticRequest];
+            assert_eq!(
+                production_request.get("production_transport_executed"),
+                Some(&json!(true)),
+                "{}",
+                fixture.case_id
+            );
+            assert_eq!(
+                production_request.get("persisted_provider_post_count"),
+                Some(&json!(1)),
+                "{}",
+                fixture.case_id
+            );
             for checkpoint in [
                 AccuracyCheckpointV1::TaskRelevantEvidencePacket,
                 AccuracyCheckpointV1::CompactSemanticRequest,
@@ -3385,7 +4468,271 @@ mod tests {
                     result.mismatched_slots
                 );
             }
+            let product = &snapshot.actual[&AccuracyCheckpointV1::ProductAnswer];
+            assert_eq!(
+                product.get("model_resolution_status"),
+                Some(&json!("partly_resolved"))
+            );
+            assert_eq!(
+                product.get("admitted_semantic_status"),
+                Some(&json!("partly_resolved"))
+            );
+            assert_eq!(
+                product.get("semantic_source_kind"),
+                Some(&json!(if fixture.case_id.contains("0e34") {
+                    "verified_cloud_inferred_goal"
+                } else {
+                    "verified_cloud_explicit_goal"
+                }))
+            );
+            assert_eq!(
+                product.get("target_status"),
+                Some(&json!("frame_preview_only"))
+            );
+            assert_eq!(product.get("direct_return_target"), Some(&Value::Null));
         }
+    }
+
+    #[test]
+    fn lca_05_manifest_runs_four_critical_four_adversarial_and_all_response_variants() {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continue_accuracy");
+        let manifest = parse_lca_replay_manifest_json(
+            &fs::read(fixture_root.join("lca-replay-manifest.v1.json")).unwrap(),
+        )
+        .unwrap();
+        let fixtures = fs::read_dir(fixture_root.join("cases"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .map(|entry| {
+                parse_accuracy_fixture_json_for_access(
+                    &fs::read(entry.path()).unwrap(),
+                    HoldoutAccessModeV1::Development,
+                )
+                .unwrap()
+            })
+            .map(|fixture| (fixture.case_id.clone(), fixture))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(manifest.cases.len(), 8);
+        for replay_case in &manifest.cases {
+            let fixture = fixtures
+                .get(&replay_case.fixture_case_id)
+                .unwrap_or_else(|| panic!("missing fixture for {}", replay_case.case_id));
+            let snapshot = run_fixture_once(fixture).unwrap();
+            for expected in &fixture.expected_checkpoints {
+                let result = compare_checkpoint(
+                    expected.checkpoint,
+                    Some(expected),
+                    snapshot.actual.get(&expected.checkpoint),
+                );
+                assert_eq!(
+                    result.status,
+                    AccuracyCheckpointStatus::Match,
+                    "stable_id={} fixture={} checkpoint={:?} mismatches={:?}",
+                    replay_case.case_id,
+                    fixture.case_id,
+                    expected.checkpoint,
+                    result.mismatched_slots
+                );
+            }
+        }
+
+        let critical = manifest
+            .cases
+            .iter()
+            .filter(|case| case.kind == LcaReplayCaseKindV1::Critical)
+            .collect::<Vec<_>>();
+        let mut exercised = 0usize;
+        for replay_case in critical {
+            let fixture = &fixtures[&replay_case.fixture_case_id];
+            let (packet, request) = deterministic_lca_packet_and_request(fixture).unwrap();
+            let base = fixture_probe_output(fixture, &request).unwrap();
+            for variant in &manifest.response_variants {
+                exercised += 1;
+                if matches!(variant, LcaResponseVariantV1::InvalidStructuredOutput) {
+                    let error = super::task_truth_v2::semantic_probe::parse_probe_response(
+                        &packet,
+                        &request,
+                        &json!({"output_text":"not json"}),
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.0,
+                        super::task_truth_v2::semantic_probe::ProbeDiagnosticStatus::StructuredParseFailure
+                    );
+                    continue;
+                }
+                if matches!(variant, LcaResponseVariantV1::ProviderIncompleteEmpty) {
+                    let error = super::task_truth_v2::semantic_probe::parse_probe_response(
+                        &packet,
+                        &request,
+                        &json!({}),
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.0,
+                        super::task_truth_v2::semantic_probe::ProbeDiagnosticStatus::ProviderNoUsableOutput
+                    );
+                    continue;
+                }
+
+                let mut proposed = base.clone();
+                let raw_status = proposed.status;
+                let user_slot = request
+                    .slots
+                    .values()
+                    .find(|slot| {
+                        slot.category
+                            == super::task_truth_v2::semantic_probe::SupportCategory::UserAction
+                    })
+                    .or_else(|| {
+                        request
+                            .slots
+                            .values()
+                            .find(|slot| slot.privacy_eligible && slot.ownership_eligible)
+                    })
+                    .map(|slot| slot.slot.clone())
+                    .unwrap();
+                let passive_slot = request
+                    .slots
+                    .values()
+                    .find(|slot| {
+                        matches!(
+                            slot.category,
+                            super::task_truth_v2::semantic_probe::SupportCategory::ContextImage
+                                | super::task_truth_v2::semantic_probe::SupportCategory::ImageBefore
+                                | super::task_truth_v2::semantic_probe::SupportCategory::ImageAfter
+                        )
+                    })
+                    .map(|slot| slot.slot.clone())
+                    .unwrap_or_else(|| user_slot.clone());
+                let nonsemantic_real_slot = lca_nonprimary_real_slot(&packet, &request)
+                    .unwrap_or_else(|| passive_slot.clone());
+                match variant {
+                    LcaResponseVariantV1::ValidResolved => {
+                        proposed.status =
+                            super::task_truth_v2::semantic_probe::ProbeResolutionStatus::Resolved;
+                    }
+                    LcaResponseVariantV1::ValidPartlyResolved => {
+                        proposed.status = super::task_truth_v2::semantic_probe::ProbeResolutionStatus::PartlyResolved;
+                    }
+                    LcaResponseVariantV1::UnsupportedSemanticField => {
+                        proposed.where_summary = Some("An unsupported private location".into());
+                        proposed.support_slots_by_field.insert(
+                            "where_summary".into(),
+                            vec!["B9_UNAVAILABLE_SUPPORT".into()],
+                        );
+                    }
+                    LcaResponseVariantV1::WrongTaskRealSlot => {
+                        proposed.unfinished_task = Some("Review an unrelated playback pane".into());
+                        proposed.support_slots_by_field.insert(
+                            "unfinished_task".into(),
+                            vec![nonsemantic_real_slot.clone()],
+                        );
+                    }
+                    LcaResponseVariantV1::PriorCompletion => {
+                        proposed.unfinished_task = proposed
+                            .completed_context
+                            .clone()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| Some("A previously completed support step".into()));
+                        proposed.support_slots_by_field.insert(
+                            "unfinished_task".into(),
+                            vec![nonsemantic_real_slot.clone()],
+                        );
+                    }
+                    LcaResponseVariantV1::GenericNextAction => {
+                        proposed.next_supported_action = Some("Continue working".into());
+                        proposed
+                            .support_slots_by_field
+                            .insert("next_supported_action".into(), vec![user_slot.clone()]);
+                    }
+                    LcaResponseVariantV1::ConfidenceInflating => {
+                        for confidence in proposed.confidence_by_field.values_mut() {
+                            *confidence = 1.0;
+                        }
+                    }
+                    LcaResponseVariantV1::InvalidInlineCitation => {
+                        proposed.next_supported_action =
+                            Some(format!("Continue the task [{user_slot}]"));
+                    }
+                    LcaResponseVariantV1::InvalidStructuredOutput
+                    | LcaResponseVariantV1::ProviderIncompleteEmpty => unreachable!(),
+                }
+                let response = json!({"output_text": serde_json::to_string(&proposed).unwrap()});
+                let (admitted, _, issues, _) =
+                    super::task_truth_v2::semantic_probe::parse_probe_response(
+                        &packet, &request, &response,
+                    )
+                    .unwrap();
+                let answer =
+                    super::task_truth_v2::production::map_compact_probe_output_to_public_answer(
+                        &admitted,
+                        &request.slots,
+                        &super::task_truth_v2::production::CompactProbePublicMappingContext {
+                            decision_id: format!("lca-05:{}:{variant:?}", fixture.case_id),
+                            session_id: Some(fixture_session_id(fixture)),
+                            packet_id: packet.packet_id.clone(),
+                            evidence_watermark: "lca-05-watermark".into(),
+                            configured_model: "deterministic-fixture-model".into(),
+                            response_model: Some("deterministic-fixture-model".into()),
+                            request_id: Some(request.audit.request_id.clone()),
+                            provider_request_id: Some("deterministic-request".into()),
+                            provider_response_id: Some("deterministic-response".into()),
+                            diagnostic_status: if issues.is_empty() {
+                                "success".into()
+                            } else {
+                                "support_slot_validation_failure".into()
+                            },
+                            validation_issues: issues,
+                            recent_context: Vec::new(),
+                            current_frame_id: request.audit.final_frame_id.clone(),
+                            packet_policy_version: request.audit.request_schema.clone(),
+                            response_schema_version:
+                                super::task_truth_v2::semantic_probe::PROBE_RESPONSE_SCHEMA.into(),
+                            explicit_goal_support_slots: request
+                                .audit
+                                .explicit_goal_support_slots
+                                .clone(),
+                            correction_watermark: String::new(),
+                            semantic_conflicts: Vec::new(),
+                        },
+                    );
+                assert_eq!(admitted.status, match variant {
+                    LcaResponseVariantV1::ValidResolved => super::task_truth_v2::semantic_probe::ProbeResolutionStatus::Resolved,
+                    LcaResponseVariantV1::ValidPartlyResolved => super::task_truth_v2::semantic_probe::ProbeResolutionStatus::PartlyResolved,
+                    _ => raw_status,
+                });
+                assert!(answer.direct_return_target.is_none());
+                assert_eq!(
+                    answer.product_projection.answer_identity,
+                    answer.atomic_answer_identity
+                );
+                assert!(!answer.product_projection.primary_instruction.contains('['));
+                if matches!(
+                    variant,
+                    LcaResponseVariantV1::WrongTaskRealSlot | LcaResponseVariantV1::PriorCompletion
+                ) {
+                    assert_ne!(
+                        answer.unfinished_task.as_deref(),
+                        proposed.unfinished_task.as_deref(),
+                        "wrong/prior task survived for {}",
+                        replay_case.case_id
+                    );
+                }
+                if matches!(variant, LcaResponseVariantV1::UnsupportedSemanticField) {
+                    assert_ne!(
+                        answer.where_summary.as_deref(),
+                        proposed.where_summary.as_deref()
+                    );
+                }
+            }
+        }
+        assert_eq!(exercised, 40);
     }
 
     #[test]

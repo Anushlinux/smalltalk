@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::{ContinueDecisionRequest, ContinueDecisionResult};
+use crate::continuation::task_truth_v2::production::ContinueProductProjectionV1;
 
 pub(crate) const CONTINUE_HISTORY_OUTPUT_SCHEMA_V1: &str = "smalltalk.continue_history_output.v1";
 pub(crate) const CONTINUE_HISTORY_PAGE_SCHEMA_V1: &str = "smalltalk.continue_history_page.v1";
@@ -47,6 +48,7 @@ pub(crate) struct ContinueHistoryOutputV1 {
     pub origin: String,
     pub title: String,
     pub rows: Vec<ContinueHistoryAnswerRowV1>,
+    pub product_projection: ContinueProductProjectionV1,
 }
 
 pub(crate) fn ensure_continue_history_schema(conn: &Connection) -> Result<(), String> {
@@ -58,13 +60,23 @@ pub(crate) fn ensure_continue_history_schema(conn: &Connection) -> Result<(), St
           created_at_ms INTEGER NOT NULL,
           origin TEXT NOT NULL CHECK(origin IN ('island', 'main_app')),
           title TEXT NOT NULL,
-          rows_json TEXT NOT NULL
+          rows_json TEXT NOT NULL,
+          product_projection_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS idx_continue_answer_history_newest
           ON continue_answer_history(created_at_ms DESC, decision_id DESC);
         ",
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if !history_column_exists(conn, "product_projection_json")? {
+        conn.execute(
+            "ALTER TABLE continue_answer_history
+             ADD COLUMN product_projection_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn record_explicit_continue_output(
@@ -159,7 +171,7 @@ pub(crate) fn get_continue_history_output(
         return Ok(None);
     }
     conn.query_row(
-        "SELECT created_at_ms, origin, title, rows_json
+        "SELECT created_at_ms, origin, title, rows_json, product_projection_json
          FROM continue_answer_history
          WHERE decision_id = ?1 AND schema_version = ?2",
         params![decision_id, HISTORY_SCHEMA_VERSION],
@@ -172,6 +184,14 @@ pub(crate) fn get_continue_history_output(
                     Box::new(error),
                 )
             })?;
+            let projection_json: String = row.get(4)?;
+            let product_projection = serde_json::from_str(&projection_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
             Ok(ContinueHistoryOutputV1 {
                 schema: CONTINUE_HISTORY_OUTPUT_SCHEMA_V1.to_string(),
                 decision_id: decision_id.to_string(),
@@ -179,6 +199,7 @@ pub(crate) fn get_continue_history_output(
                 origin: row.get(1)?,
                 title: row.get(2)?,
                 rows,
+                product_projection,
             })
         },
     )
@@ -228,67 +249,8 @@ fn product_facing_output(
         },
     );
     let answer = state.semantic_answer.as_ref();
-    let title = answer
-        .and_then(|answer| nonempty(answer.task_summary.as_deref()))
-        .unwrap_or_else(|| "Couldn’t recover the task".to_string());
-    let mut rows = Vec::new();
-    append_row(
-        &mut rows,
-        "Task object",
-        answer.and_then(|answer| answer.task_object.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Current activity — observed surface",
-        answer.and_then(|answer| answer.current_activity.observed_surface.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Current activity — immediate operation",
-        answer.and_then(|answer| answer.current_activity.immediate_user_operation.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Current activity — operation effect",
-        answer.and_then(|answer| {
-            answer
-                .current_activity
-                .semantic_effect_of_operation
-                .as_deref()
-        }),
-    );
-    append_row(
-        &mut rows,
-        "Current activity — current subtask",
-        answer.and_then(|answer| answer.current_activity.current_subtask.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Current activity — relationship to primary",
-        answer.map(|answer| answer.current_activity.relationship_to_primary.as_str()),
-    );
-    append_row(
-        &mut rows,
-        "Last meaningful progress",
-        answer.and_then(|answer| answer.last_meaningful_progress.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Unfinished state",
-        answer.and_then(|answer| answer.unfinished_state.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Next action",
-        answer
-            .and_then(|answer| answer.next_action.as_deref())
-            .or(state.next_action.as_deref()),
-    );
-    append_row(
-        &mut rows,
-        "Where summary",
-        answer.and_then(|answer| answer.where_summary.as_deref()),
-    );
+    let projection = answer.map(|answer| &answer.product_projection);
+    let (title, rows) = history_copy_from_projection(projection);
     ContinueHistoryOutputV1 {
         schema: CONTINUE_HISTORY_OUTPUT_SCHEMA_V1.to_string(),
         decision_id: result.decision_id.clone(),
@@ -296,7 +258,43 @@ fn product_facing_output(
         origin: origin.to_string(),
         title,
         rows,
+        product_projection: projection.cloned().unwrap_or_default(),
     }
+}
+
+fn history_copy_from_projection(
+    projection: Option<
+        &crate::continuation::task_truth_v2::production::ContinueProductProjectionV1,
+    >,
+) -> (String, Vec<ContinueHistoryAnswerRowV1>) {
+    let title = projection
+        .and_then(|projection| nonempty(Some(&projection.primary_instruction)))
+        .unwrap_or_else(|| "Couldn’t recover the task".to_string());
+    let mut rows = Vec::new();
+    append_row(
+        &mut rows,
+        "Where you stopped",
+        projection.and_then(|projection| projection.resume_context.as_deref()),
+    );
+    append_row(
+        &mut rows,
+        "Location",
+        projection.and_then(|projection| projection.location_context.as_deref()),
+    );
+    let action_label = projection.and_then(|projection| {
+        (!matches!(
+            projection.primary_action.kind,
+            crate::continuation::task_truth_v2::production::ContinueProductActionKindV1::None
+        ))
+        .then_some(projection.primary_action.label.as_str())
+    });
+    append_row(&mut rows, "Action", action_label);
+    append_row(
+        &mut rows,
+        "Answer identity",
+        projection.map(|projection| projection.answer_identity.as_str()),
+    );
+    (title, rows)
 }
 
 fn append_row(rows: &mut Vec<ContinueHistoryAnswerRowV1>, label: &str, value: Option<&str>) {
@@ -321,10 +319,13 @@ fn persist_continue_history_output(
 ) -> Result<(), String> {
     ensure_continue_history_schema(conn)?;
     let rows_json = serde_json::to_string(&output.rows).map_err(|error| error.to_string())?;
+    let product_projection_json =
+        serde_json::to_string(&output.product_projection).map_err(|error| error.to_string())?;
     conn.execute(
         "INSERT OR IGNORE INTO continue_answer_history (
-           decision_id, schema_version, created_at_ms, origin, title, rows_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+           decision_id, schema_version, created_at_ms, origin, title, rows_json,
+           product_projection_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             output.decision_id,
             HISTORY_SCHEMA_VERSION,
@@ -332,6 +333,7 @@ fn persist_continue_history_output(
             output.origin,
             output.title,
             rows_json,
+            product_projection_json,
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -346,6 +348,21 @@ fn persist_continue_history_output(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn history_column_exists(conn: &Connection, column_name: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(continue_answer_history)")
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?;
+    for column in columns {
+        if column.map_err(|error| error.to_string())? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn has_continue_history_schema(conn: &Connection) -> Result<bool, String> {
@@ -374,6 +391,11 @@ mod tests {
                 label: "Next action".to_string(),
                 value: format!("Continue {id}"),
             }],
+            product_projection: ContinueProductProjectionV1 {
+                answer_identity: format!("answer-{id}"),
+                primary_instruction: title.to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -397,8 +419,40 @@ mod tests {
                 "created_at_ms",
                 "origin",
                 "title",
-                "rows_json"
+                "rows_json",
+                "product_projection_json"
             ]
+        );
+    }
+
+    #[test]
+    fn schema_migration_preserves_legacy_rows_and_adds_projection_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE continue_answer_history (
+               decision_id TEXT PRIMARY KEY,
+               schema_version INTEGER NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               origin TEXT NOT NULL,
+               title TEXT NOT NULL,
+               rows_json TEXT NOT NULL
+             );
+             INSERT INTO continue_answer_history (
+               decision_id, schema_version, created_at_ms, origin, title, rows_json
+             ) VALUES (
+               'legacy', 1, 10, 'main_app', 'Legacy answer', '[]'
+             );",
+        )
+        .unwrap();
+
+        ensure_continue_history_schema(&conn).unwrap();
+        let restored = get_continue_history_output(&conn, "legacy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.title, "Legacy answer");
+        assert_eq!(
+            restored.product_projection,
+            ContinueProductProjectionV1::default()
         );
     }
 
@@ -537,6 +591,11 @@ mod tests {
                     value: "Current location is unclear.".into(),
                 },
             ],
+            product_projection: ContinueProductProjectionV1 {
+                answer_identity: "answer-unresolved".into(),
+                primary_instruction: "Couldn’t recover the task".into(),
+                ..Default::default()
+            },
         };
         persist_continue_history_output(&conn, &unresolved).unwrap();
         assert_eq!(
@@ -545,6 +604,62 @@ mod tests {
                 .unwrap(),
             unresolved
         );
+    }
+
+    #[test]
+    fn history_copy_uses_only_saved_canonical_projection_and_identity() {
+        use crate::continuation::task_truth_v2::production::{
+            ContinuePresentationStateV1, ContinueProductActionKindV1, ContinueProductActionV1,
+            ContinueProductProjectionV1,
+        };
+
+        let projection = ContinueProductProjectionV1 {
+            answer_identity: "answer-atomic-1".into(),
+            presentation_state: ContinuePresentationStateV1::ActionKnown,
+            primary_instruction: "Test the answer-linked visual cue in Smalltalk.".into(),
+            resume_context: Some(
+                "Implementation passed its checks; user verification remains.".into(),
+            ),
+            location_context: Some("Smalltalk native island".into()),
+            semantic_status: "resolved".into(),
+            task_state: "needs_user_verification".into(),
+            target_status: "task_known_target_unknown".into(),
+            primary_action: ContinueProductActionV1 {
+                kind: ContinueProductActionKindV1::InspectEvidence,
+                label: "View last screen".into(),
+            },
+            inspect_available: true,
+            unresolved_reason: None,
+            ..ContinueProductProjectionV1::default()
+        };
+
+        let (title, rows) = history_copy_from_projection(Some(&projection));
+        assert_eq!(title, projection.primary_instruction);
+        assert_eq!(
+            rows,
+            vec![
+                ContinueHistoryAnswerRowV1 {
+                    label: "Where you stopped".into(),
+                    value: projection.resume_context.unwrap(),
+                },
+                ContinueHistoryAnswerRowV1 {
+                    label: "Location".into(),
+                    value: projection.location_context.unwrap(),
+                },
+                ContinueHistoryAnswerRowV1 {
+                    label: "Action".into(),
+                    value: "View last screen".into(),
+                },
+                ContinueHistoryAnswerRowV1 {
+                    label: "Answer identity".into(),
+                    value: "answer-atomic-1".into(),
+                },
+            ]
+        );
+        assert!(rows.iter().all(|row| !matches!(
+            row.label.as_str(),
+            "Task object" | "Last meaningful progress" | "Unfinished state" | "Next action"
+        )));
     }
 
     #[test]
@@ -570,6 +685,7 @@ mod tests {
                 "rows",
                 "schema",
                 "title",
+                "product_projection",
             ])
         );
         let row_fields = stored_json["rows"][0]

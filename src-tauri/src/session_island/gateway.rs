@@ -96,12 +96,10 @@ pub fn get_island_continue_state_for_status(
     }
 
     if !input.force_refresh {
-        let feedback_or_open_watermark_ms =
-            crate::capture::latest_continue_feedback_or_open_watermark_ms(&app)
-                .ok()
-                .flatten();
-        if let Some(state) = remembered_fresh_state(&status, &input, feedback_or_open_watermark_ms)
-        {
+        let feedback_watermark_ms = crate::capture::latest_continue_feedback_watermark_ms(&app)
+            .ok()
+            .flatten();
+        if let Some(state) = remembered_fresh_state(&status, &input, feedback_watermark_ms) {
             emit_gateway_state(&app, &state);
             return Ok(IslandContinueGatewayResult {
                 state,
@@ -170,11 +168,10 @@ pub fn get_island_continue_state_for_status(
         state.allows_open_continue_target(),
         None,
     );
-    let feedback_or_open_watermark_ms =
-        crate::capture::latest_continue_feedback_or_open_watermark_ms(&app)
-            .ok()
-            .flatten();
-    remember_gateway_decision(&decision, &state, &status, feedback_or_open_watermark_ms);
+    let feedback_watermark_ms = crate::capture::latest_continue_feedback_watermark_ms(&app)
+        .ok()
+        .flatten();
+    remember_gateway_decision(&decision, &state, &status, feedback_watermark_ms);
     emit_gateway_state(&app, &state);
 
     Ok(IslandContinueGatewayResult {
@@ -400,7 +397,7 @@ pub fn island_state_from_decision_status(
 fn remembered_fresh_state(
     status: &CaptureStatus,
     input: &IslandContinueStateInput,
-    feedback_or_open_watermark_ms: Option<i64>,
+    feedback_watermark_ms: Option<i64>,
 ) -> Option<IslandContinueState> {
     let remembered = LAST_CONTINUE_ISLAND_STATE
         .lock()
@@ -413,7 +410,7 @@ fn remembered_fresh_state(
     {
         return None;
     }
-    if remembered_state_is_stale(&remembered, status, feedback_or_open_watermark_ms) {
+    if remembered_state_is_stale(&remembered, status, feedback_watermark_ms) {
         return None;
     }
 
@@ -426,7 +423,7 @@ fn remembered_fresh_state(
 pub fn remembered_state_is_stale(
     remembered: &RememberedContinueIslandState,
     status: &CaptureStatus,
-    feedback_or_open_watermark_ms: Option<i64>,
+    feedback_watermark_ms: Option<i64>,
 ) -> bool {
     let status_session_id = status
         .active_session
@@ -442,20 +439,15 @@ pub fn remembered_state_is_stale(
     if remembered.session_id.as_deref() != status_session_id {
         return true;
     }
-    let latest_capture_at = status
-        .latest_frame
-        .as_ref()
-        .map(|frame| frame.captured_at)
-        .unwrap_or_default();
-    let remembered_evidence_at = remembered.evidence_updated_at_ms.unwrap_or_default();
-    status.frame_count.max(0) as u64 > remembered.frame_count
-        || status.signal_count.max(0) as u64 > remembered.signal_count
-        || status.event_count.max(0) as u64 > remembered.event_count
-        || latest_capture_at > remembered_evidence_at
-        || match (
-            feedback_or_open_watermark_ms,
-            remembered.feedback_or_open_watermark_ms,
-        ) {
+    status
+        .continue_evidence_watermark_hash
+        .as_deref()
+        .map(|current| current != remembered.evidence_watermark_hash)
+        // An absent material watermark is an unknown freshness state. Never
+        // reuse a remembered direct-open answer when the gateway cannot prove
+        // that it still matches the current admissible evidence.
+        .unwrap_or(true)
+        || match (feedback_watermark_ms, remembered.feedback_watermark_ms) {
             (Some(latest), Some(remembered)) => latest > remembered,
             (Some(_), None) => true,
             _ => false,
@@ -466,7 +458,7 @@ fn remember_gateway_decision(
     decision: &crate::continuation::ContinueDecisionResult,
     state: &IslandContinueState,
     status: &CaptureStatus,
-    feedback_or_open_watermark_ms: Option<i64>,
+    feedback_watermark_ms: Option<i64>,
 ) {
     super::remember_continue_decision_id(&decision.decision_id);
     let (task_turn_id, task_turn_revision) = adoption_task_identity(decision);
@@ -500,12 +492,10 @@ fn remember_gateway_decision(
             evidence_updated_at_ms: state
                 .evidence_watermark_ms
                 .or_else(|| newest_status_evidence_ms(status)),
+            evidence_watermark_hash: decision.evidence_watermark_hash.clone(),
             decision_updated_at_ms: Some(state.generated_at_ms),
             continue_openable: state.allows_open_continue_target(),
-            feedback_or_open_watermark_ms,
-            frame_count: status.frame_count.max(0) as u64,
-            signal_count: status.signal_count.max(0) as u64,
-            event_count: status.event_count.max(0) as u64,
+            feedback_watermark_ms,
             island_continue_state: state.clone(),
         });
     }
@@ -615,6 +605,7 @@ mod tests {
                 sck_capture_mode: None,
                 sck_audio_policy: None,
             }),
+            continue_evidence_watermark_hash: Some("material-current".to_string()),
             skipped_samples: 0,
             last_skipped_at: None,
             data_dir: String::new(),
@@ -663,12 +654,10 @@ mod tests {
             resume_warning: None,
             continue_freshness: "current".to_string(),
             evidence_updated_at_ms: Some(1_000),
+            evidence_watermark_hash: "material-current".to_string(),
             decision_updated_at_ms: Some(1_100),
             continue_openable: true,
-            feedback_or_open_watermark_ms: Some(900),
-            frame_count: 1,
-            signal_count: 2,
-            event_count: 3,
+            feedback_watermark_ms: Some(900),
             island_continue_state,
         }
     }
@@ -695,9 +684,9 @@ mod tests {
     }
 
     #[test]
-    fn island_continue_gateway_refreshes_for_event_only_evidence_growth() {
+    fn island_continue_gateway_ignores_count_growth_without_material_watermark_change() {
         let remembered = remembered();
-        assert!(remembered_state_is_stale(
+        assert!(!remembered_state_is_stale(
             &remembered,
             &status(1, 2, 4, Some(1_000)),
             Some(900)
@@ -705,9 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn island_continue_gateway_refreshes_for_new_frame_evidence() {
+    fn island_continue_gateway_ignores_new_frame_count_without_material_change() {
         let remembered = remembered();
-        assert!(remembered_state_is_stale(
+        assert!(!remembered_state_is_stale(
             &remembered,
             &status(2, 2, 3, Some(1_200)),
             Some(900)
@@ -715,7 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn island_continue_gateway_refreshes_for_feedback_or_open_watermark_growth() {
+    fn island_continue_gateway_refreshes_for_material_watermark_advance() {
+        let remembered = remembered();
+        let mut current = status(1, 2, 4, Some(1_000));
+        current.continue_evidence_watermark_hash = Some("material-advanced".to_string());
+        assert!(remembered_state_is_stale(&remembered, &current, Some(900)));
+    }
+
+    #[test]
+    fn island_continue_gateway_rejects_remembered_state_when_freshness_is_unknown() {
+        let remembered = remembered();
+        let mut current = status(1, 2, 3, Some(1_000));
+        current.continue_evidence_watermark_hash = None;
+
+        assert!(remembered_state_is_stale(&remembered, &current, Some(900)));
+    }
+
+    #[test]
+    fn island_continue_gateway_refreshes_for_feedback_watermark_growth() {
         let remembered = remembered();
         assert!(remembered_state_is_stale(
             &remembered,

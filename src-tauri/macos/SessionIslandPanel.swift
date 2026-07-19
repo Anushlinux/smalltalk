@@ -288,6 +288,53 @@ private struct IslandSemanticRecentContext: Decodable, Equatable {
     }
 }
 
+private enum IslandProductActionKind: String, Decodable, Equatable {
+    case openDirectTarget = "open_direct_target"
+    case inspectEvidence = "inspect_evidence"
+    case refreshContinue = "refresh_continue"
+    case none
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = IslandProductActionKind(rawValue: value) ?? .none
+    }
+}
+
+private struct IslandProductAction: Decodable, Equatable {
+    var kind: IslandProductActionKind
+    var label: String
+}
+
+private struct IslandProductProjection: Decodable, Equatable {
+    var schema: String?
+    var answerIdentity: String
+    var presentationState: String
+    var primaryInstruction: String
+    var resumeContext: String?
+    var locationContext: String?
+    var semanticStatus: String
+    var taskState: String
+    var targetStatus: String
+    var primaryAction: IslandProductAction
+    var inspectAvailable: Bool
+    var unresolvedReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case answerIdentity = "answer_identity"
+        case presentationState = "presentation_state"
+        case primaryInstruction = "primary_instruction"
+        case resumeContext = "resume_context"
+        case locationContext = "location_context"
+        case semanticStatus = "semantic_status"
+        case taskState = "task_state"
+        case targetStatus = "target_status"
+        case primaryAction = "primary_action"
+        case inspectAvailable = "inspect_available"
+        case unresolvedReason = "unresolved_reason"
+    }
+}
+
 private struct IslandSemanticAnswer: Decodable, Equatable {
     var schema: String
     var taskResolutionStatus: String
@@ -304,6 +351,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
     var alternativeHypotheses: [IslandSemanticAlternative]
     var inferenceStatus: String?
     var atomicIdentity: IslandSemanticAtomicIdentity
+    var productProjection: IslandProductProjection?
 
     enum CodingKeys: String, CodingKey {
         case schema
@@ -321,6 +369,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
         case alternativeHypotheses = "alternative_hypotheses"
         case inferenceStatus = "inference_status"
         case atomicIdentity = "atomic_identity"
+        case productProjection = "product_projection"
     }
 }
 
@@ -328,6 +377,7 @@ private struct IslandContinueState: Decodable, Equatable {
     var schema: String
     var displayState: IslandDisplayState
     var decisionId: String?
+    var decisionStale: Bool
     var targetState: String
     var targetReasonCodes: [String]
     var semanticAnswer: IslandSemanticAnswer?
@@ -354,6 +404,7 @@ private struct IslandContinueState: Decodable, Equatable {
         case schema
         case displayState = "display_state"
         case decisionId = "decision_id"
+        case decisionStale = "decision_stale"
         case targetState = "target_state"
         case targetReasonCodes = "target_reason_codes"
         case semanticAnswer = "semantic_answer"
@@ -381,6 +432,7 @@ private struct IslandContinueState: Decodable, Equatable {
         schema: String = "smalltalk.island_continue_state.v1",
         displayState: IslandDisplayState,
         decisionId: String? = nil,
+        decisionStale: Bool = false,
         targetState: String = "no_clear_task",
         targetReasonCodes: [String] = [],
         semanticAnswer: IslandSemanticAnswer? = nil,
@@ -406,6 +458,7 @@ private struct IslandContinueState: Decodable, Equatable {
         self.schema = schema
         self.displayState = displayState
         self.decisionId = decisionId
+        self.decisionStale = decisionStale
         self.targetState = targetState
         self.targetReasonCodes = targetReasonCodes
         self.semanticAnswer = semanticAnswer
@@ -434,6 +487,7 @@ private struct IslandContinueState: Decodable, Equatable {
         schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? "unknown"
         displayState = try container.decodeIfPresent(IslandDisplayState.self, forKey: .displayState) ?? .error
         decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
+        decisionStale = try container.decodeIfPresent(Bool.self, forKey: .decisionStale) ?? false
         targetState = try container.decodeIfPresent(String.self, forKey: .targetState) ?? "no_clear_task"
         targetReasonCodes = try container.decodeIfPresent([String].self, forKey: .targetReasonCodes) ?? []
         semanticAnswer = try container.decodeIfPresent(IslandSemanticAnswer.self, forKey: .semanticAnswer)
@@ -854,59 +908,80 @@ private struct WhisperFlowAnswerRow: Equatable {
 
 private struct WhisperFlowAnswerContent: Equatable {
     let decisionId: String?
+    let answerIdentity: String?
     let title: String
     let rows: [WhisperFlowAnswerRow]
+    let presentationState: String?
+    let semanticStatus: String?
+    let taskState: String?
+    let targetStatus: String?
+    let primaryAction: IslandProductAction?
+    let inspectAvailable: Bool
+    let unresolvedReason: String?
 
     static let unavailable = WhisperFlowAnswerContent(
         decisionId: nil,
+        answerIdentity: nil,
         title: "Continue unavailable",
-        rows: []
+        rows: [],
+        presentationState: nil,
+        semanticStatus: nil,
+        taskState: nil,
+        targetStatus: nil,
+        primaryAction: nil,
+        inspectAvailable: false,
+        unresolvedReason: nil
     )
 
-    private init(decisionId: String?, title: String, rows: [WhisperFlowAnswerRow]) {
+    private init(
+        decisionId: String?,
+        answerIdentity: String?,
+        title: String,
+        rows: [WhisperFlowAnswerRow],
+        presentationState: String?,
+        semanticStatus: String?,
+        taskState: String?,
+        targetStatus: String?,
+        primaryAction: IslandProductAction?,
+        inspectAvailable: Bool,
+        unresolvedReason: String?
+    ) {
         self.decisionId = decisionId
+        self.answerIdentity = answerIdentity
         self.title = title
         self.rows = rows
+        self.presentationState = presentationState
+        self.semanticStatus = semanticStatus
+        self.taskState = taskState
+        self.targetStatus = targetStatus
+        self.primaryAction = primaryAction
+        self.inspectAvailable = inspectAvailable
+        self.unresolvedReason = unresolvedReason
     }
 
     init(snapshot: IslandSnapshot) {
         let state = snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
         let answer = state.semanticAnswer
+        let projection = answer?.productProjection
         decisionId = state.decisionId ?? snapshot.continueDecisionId
-        title = Self.verbatim(answer?.taskSummary) ?? Self.fallbackTitle(for: state.displayState)
+        answerIdentity = Self.verbatim(projection?.answerIdentity)
+        title = Self.verbatim(projection?.primaryInstruction)
+            ?? Self.verbatim(answer?.taskSummary)
+            ?? Self.fallbackTitle(for: state.displayState)
 
         var nextRows: [WhisperFlowAnswerRow] = []
-        Self.append(&nextRows, label: "Task object", value: answer?.taskObject)
-        Self.append(
-            &nextRows,
-            label: "Current activity — observed surface",
-            value: answer?.currentActivity.observedSurface
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — immediate operation",
-            value: answer?.currentActivity.immediateUserOperation
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — operation effect",
-            value: answer?.currentActivity.semanticEffectOfOperation
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — current subtask",
-            value: answer?.currentActivity.currentSubtask
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — relationship to primary",
-            value: answer?.currentActivity.relationshipToPrimary
-        )
-        Self.append(&nextRows, label: "Last meaningful progress", value: answer?.lastMeaningfulProgress)
-        Self.append(&nextRows, label: "Unfinished state", value: answer?.unfinishedState)
-        Self.append(&nextRows, label: "Next action", value: answer?.nextAction ?? state.nextAction)
-        Self.append(&nextRows, label: "Where summary", value: answer?.whereSummary)
+        Self.append(&nextRows, label: "Where you stopped", value: projection?.resumeContext)
+        Self.append(&nextRows, label: "Location", value: projection?.locationContext)
         rows = nextRows
+        presentationState = Self.verbatim(projection?.presentationState)
+        semanticStatus = Self.verbatim(projection?.semanticStatus)
+        taskState = Self.verbatim(projection?.taskState)
+        targetStatus = Self.verbatim(projection?.targetStatus)
+        primaryAction = projection?.primaryAction.kind == IslandProductActionKind.none
+            ? nil
+            : projection?.primaryAction
+        inspectAvailable = projection?.inspectAvailable ?? false
+        unresolvedReason = Self.verbatim(projection?.unresolvedReason)
     }
 
     private static func append(
@@ -1562,6 +1637,7 @@ private struct WhisperFlowIslandView: View {
     let onAmbientBodyHover: (Bool) -> Void
     let onExpandAnswer: () -> Void
     let onCollapseAnswer: () -> Void
+    let onPrimaryAnswerAction: () -> Void
     let onToggleVisualCue: () -> Void
     let onToggleHistory: () -> Void
     let onHistoryButtonHover: (Bool) -> Void
@@ -2172,12 +2248,23 @@ private struct WhisperFlowIslandView: View {
     private var answerSummaryView: some View {
         let answer = model.answer ?? .unavailable
 
-        return HStack(spacing: s(2)) {
+        return HStack(spacing: s(6)) {
             Text(answer.title)
                 .foregroundColor(.white)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .layoutPriority(1)
+
+            if let action = answer.primaryAction,
+               let label = action.label.nonEmpty {
+                Button(action: onPrimaryAnswerAction) {
+                    Text(label)
+                        .foregroundColor(WhisperFlowStyle.accent)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(label)
+            }
 
             Button(action: onExpandAnswer) {
                 Text("See more")
@@ -2241,6 +2328,17 @@ private struct WhisperFlowIslandView: View {
                         .layoutPriority(1)
 
                     Spacer(minLength: s(8))
+
+                    if let action = answer.primaryAction,
+                       let label = action.label.nonEmpty {
+                        Button(action: onPrimaryAnswerAction) {
+                            Text(label)
+                                .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                .foregroundColor(WhisperFlowStyle.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(label)
+                    }
 
                     if model.visualCueImage != nil {
                         Button(action: onToggleVisualCue) {
@@ -2976,6 +3074,16 @@ private final class SessionIslandController: NSObject {
         } else if continueRequestInFlight,
                   snapshot.state == "resume_ready" || snapshot.state == "error" {
             finishContinueRequest(with: snapshot)
+        } else if let state = snapshot.islandContinueState,
+                  state.decisionStale,
+                  state.decisionId == latchedDecisionId {
+            // A material-watermark transition updates the live answer for the
+            // same decision identity. History remains immutable and a weaker
+            // background decision is not adopted here.
+            let answer = WhisperFlowAnswerContent(snapshot: snapshot)
+            latchedAnswer = answer
+            latchedDecisionId = answer.decisionId
+            refreshAnswerLayout()
         }
 
         let captureControlActive = snapshot.memoryActive || snapshot.state == "starting"
@@ -3279,9 +3387,14 @@ private final class SessionIslandController: NSObject {
             kWhisperFlowAnswerSummaryMinW,
             usableWidth - 32 - kWhisperFlowAnswerSummaryPanelMarginW
         )
+        let primaryActionWidth = answer.primaryAction
+            .flatMap { $0.label.nonEmpty }
+            .map { measuredTextWidth($0, font: summaryActionFont) + 6 }
+            ?? 0
         let summaryContentWidth = measuredTextWidth(answer.title, font: summaryFont)
+            + primaryActionWidth
             + measuredTextWidth("See more", font: summaryActionFont)
-            + 2
+            + (primaryActionWidth > 0 ? 12 : 6)
             + 20
         let summaryWidth = min(
             max(kWhisperFlowAnswerSummaryMinW, ceil(summaryContentWidth)),
@@ -3315,7 +3428,14 @@ private final class SessionIslandController: NSObject {
         let cueButtonWidth = visualCueImage == nil
             ? 0
             : measuredTextWidth("Visual cue", font: labelFont) + 16 + 8
-        let titleWidth = max(1, contentWidth - collapseWidth - cueButtonWidth - 16)
+        let expandedActionWidth = answer.primaryAction
+            .flatMap { $0.label.nonEmpty }
+            .map { measuredTextWidth($0, font: labelFont) + 8 }
+            ?? 0
+        let titleWidth = max(
+            1,
+            contentWidth - collapseWidth - cueButtonWidth - expandedActionWidth - 16
+        )
         let titleHeight = measuredTextHeight(answer.title, font: titleFont, width: titleWidth)
         let headerHeight = max(20, titleHeight)
 
@@ -4295,6 +4415,9 @@ private final class SessionIslandController: NSObject {
             onCollapseAnswer: { [weak self] in
                 self?.showAnswerSummary()
             },
+            onPrimaryAnswerAction: { [weak self] in
+                self?.performPrimaryAnswerAction()
+            },
             onToggleVisualCue: { [weak self] in
                 self?.toggleVisualCue()
             },
@@ -4381,6 +4504,34 @@ private final class SessionIslandController: NSObject {
         default:
             break
         }
+    }
+
+    private func performPrimaryAnswerAction() {
+        guard let productAction = latchedAnswer?.primaryAction else { return }
+        let actionKind: IslandActionKind
+        switch productAction.kind {
+        case .openDirectTarget:
+            actionKind = .openContinueTarget
+        case .inspectEvidence:
+            actionKind = .inspectEvidence
+        case .refreshContinue:
+            actionKind = .refreshContinue
+        case .none:
+            return
+        }
+
+        guard let action = snapshot.islandContinueState?.availableActions.first(where: {
+            $0.enabled && $0.kind == actionKind
+        }) else { return }
+        if actionKind == .openContinueTarget {
+            let decisionId = action.decisionId
+                ?? snapshot.islandContinueState?.decisionId
+                ?? snapshot.continueDecisionId
+            guard decisionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                return
+            }
+        }
+        handle(continueAction: action)
     }
 
     private func handle(continueAction action: IslandAvailableAction) {

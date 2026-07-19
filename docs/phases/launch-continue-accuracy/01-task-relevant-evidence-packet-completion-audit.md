@@ -143,3 +143,9 @@ LCA-01 intentionally does not redesign the public actionable-continuation answer
 Live app behavior, real provider output, native-island rendering, mixed-pane screenshot quality, crop readability, and the final five-phase visual acceptance remain user-owned manual tests.
 
 PASS — LCA-01 evidence packet is proven and LCA-02 may begin
+
+## 2026-07-19 correction from LCA-06 live runtime recovery
+
+The earlier pass proves deterministic packet transformations only after trustworthy role evidence reaches them. Live manual Continue use later showed that the manual boundary could lose causal typing attribution from the immediately preceding exact app/window frame. In that state, the packet correctly contained no current task turn, but the audit overstated production-path coverage.
+
+LCA-06 now carries a committed user turn across a manual boundary only with exact session, app, window, chronology, privacy, post-frame, and still-visible stable-text proof. A same-surface empty boundary may preserve that proven turn for 15 seconds; a wrong surface or prior-only row cannot. The original LCA-01 deterministic evidence remains useful, but its PASS line is not live-runtime approval.

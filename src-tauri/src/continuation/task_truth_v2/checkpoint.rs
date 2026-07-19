@@ -158,6 +158,15 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
            observation_packet_id TEXT,
            evidence_watermark TEXT,
            correction_fingerprint TEXT,
+           current_frame_id TEXT,
+           packet_policy_version TEXT,
+           response_schema_version TEXT,
+           admission_version TEXT,
+           admitted_result_id TEXT,
+           correction_watermark TEXT,
+           target_status TEXT,
+           target_identity TEXT,
+           answer_contract_json TEXT,
            return_target_artifact_id TEXT,
            created_at_ms INTEGER NOT NULL
          );",
@@ -225,6 +234,47 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<(), String> {
         (
             "task_truth_v2_decision_contracts",
             "correction_fingerprint",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "current_frame_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "packet_policy_version",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "response_schema_version",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "admission_version",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "admitted_result_id",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "correction_watermark",
+            "TEXT",
+        ),
+        ("task_truth_v2_decision_contracts", "target_status", "TEXT"),
+        (
+            "task_truth_v2_decision_contracts",
+            "target_identity",
+            "TEXT",
+        ),
+        (
+            "task_truth_v2_decision_contracts",
+            "answer_contract_json",
             "TEXT",
         ),
     ] {

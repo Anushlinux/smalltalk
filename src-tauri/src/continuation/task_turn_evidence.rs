@@ -14,6 +14,7 @@ const MAX_TOTAL_SAMPLE_CHARS: usize = 800;
 const MIN_TYPED_ROLE_CONFIDENCE: f64 = 0.64;
 const MIN_CAUSAL_TYPING_CONFIDENCE: f64 = 0.74;
 const MAX_LEGACY_TYPING_TO_FRAME_MS: i64 = 60_000;
+const MAX_MANUAL_TYPING_CARRY_FORWARD_MS: i64 = 15_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +162,19 @@ impl SpanGeometry {
             .max(1.0);
         (intersection / smaller).clamp(0.0, 1.0)
     }
+
+    fn contains_center(self, other: Self) -> bool {
+        let center_x = other.x + other.width / 2.0;
+        let center_y = other.y + other.height / 2.0;
+        center_x >= self.x
+            && center_x <= self.x + self.width
+            && center_y >= self.y
+            && center_y <= self.y + self.height
+    }
+
+    fn area(self) -> f64 {
+        (self.width * self.height).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,6 +262,8 @@ pub(crate) struct TypingBurstCausalAttribution {
     pub temporal_distance_ms: i64,
     pub association_source: String,
     pub association_confidence: f64,
+    #[serde(default)]
+    pub stable_text_hash: Option<String>,
     pub rejection_reasons: Vec<String>,
     pub capture_trigger_id: Option<String>,
     pub commit_event_id: Option<String>,
@@ -276,11 +292,13 @@ struct FrameContext {
     app_name: Option<String>,
     bundle_id: Option<String>,
     window_id: Option<i64>,
+    window_title: Option<String>,
     privacy_status: String,
     artifact_id: Option<String>,
     surface_key: Option<String>,
     family: SurfaceFamily,
     has_agent_status_event: bool,
+    is_manual_boundary: bool,
     causal_typing: Option<TypingBurstCausalAttribution>,
     pre_frame_text_hashes: BTreeSet<String>,
 }
@@ -453,6 +471,7 @@ pub(crate) fn rebuild_task_turn_evidence(
             )
         })?;
         let mut spans = build_ordered_spans(context, raw);
+        carry_structured_chat_role_across_manual_boundary(conn, context, &all_spans, &mut spans)?;
         for span in &spans {
             persist_span(conn, span)
                 .map_err(|error| format!("task-turn persist span {}: {error}", span.span_id))?;
@@ -483,11 +502,212 @@ pub(crate) fn rebuild_task_turn_evidence(
     Ok(result)
 }
 
+fn carry_structured_chat_role_across_manual_boundary(
+    conn: &Connection,
+    context: &FrameContext,
+    prior_spans: &[OrderedEvidenceSpan],
+    current_spans: &mut [OrderedEvidenceSpan],
+) -> Result<(), String> {
+    if !context.is_manual_boundary
+        || is_privacy_blocked(&context.privacy_status)
+        || !matches!(
+            context.family,
+            SurfaceFamily::AgentChat | SurfaceFamily::BrowserChat
+        )
+    {
+        return Ok(());
+    }
+
+    let context_app = context.bundle_id.as_deref().or(context.app_name.as_deref());
+    let candidate = prior_spans
+        .iter()
+        .filter(|span| {
+            span.session_id == context.session_id
+                && span.observed_at_ms <= context.observed_at_ms
+                && context.observed_at_ms.saturating_sub(span.observed_at_ms)
+                    <= MAX_MANUAL_TYPING_CARRY_FORWARD_MS
+                && !is_privacy_blocked(&span.privacy_status)
+                && span.conversational_role == ConversationalRole::User
+                && span
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == "structurally_proven_chat_user_turn")
+                && match (span.owner_app_id.as_deref(), context_app) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => false,
+                }
+                && match (span.surface_key.as_deref(), context.surface_key.as_deref()) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                }
+                && exact_span_window_matches_manual_context(conn, span, context)
+        })
+        .max_by_key(|span| (span.observed_at_ms, span.reading_order));
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+
+    let intervening_task_surface_count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM continue_salient_turn_evidence e
+             JOIN frames f ON CAST(f.id AS TEXT)=e.frame_id
+             WHERE e.session_id=?1 AND e.observed_at_ms>?2 AND e.observed_at_ms<?3
+               AND e.latest_user_span_ids_json NOT IN ('', '[]')
+               AND NOT (
+                 COALESCE(f.app_bundle_id, f.app_name, '')=COALESCE(?4, '')
+                 AND COALESCE(f.window_id, -1)=COALESCE(?5, -1)
+               )",
+            params![
+                context.session_id,
+                candidate.observed_at_ms,
+                context.observed_at_ms,
+                context_app,
+                context.window_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(to_string)?;
+    if intervening_task_surface_count > 0 {
+        return Ok(());
+    }
+
+    let current = current_spans.iter_mut().find(|span| {
+        span.text_hash == candidate.text_hash
+            && span_matches_context_surface(span, context)
+            && !matches!(
+                span.region_role,
+                RegionRole::Control | RegionRole::AppChrome
+            )
+    });
+    let Some(current) = current else {
+        return Ok(());
+    };
+    current.region_role = RegionRole::UserMessage;
+    current.conversational_role = ConversationalRole::User;
+    current.region_confidence = 0.70;
+    current.speaker_confidence = 0.70;
+    current.parent_or_group_id = current
+        .parent_or_group_id
+        .clone()
+        .or_else(|| candidate.parent_or_group_id.clone());
+    push_unique(
+        &mut current.reason_codes,
+        "structured_chat_role_carried_across_manual_boundary".to_string(),
+    );
+    push_unique(
+        &mut current.quality_flags,
+        "stable_structured_chat_text_hash_visible".to_string(),
+    );
+    current
+        .contributing_sources
+        .push(candidate.primary_source.clone());
+    current.contributing_sources.sort();
+    current.contributing_sources.dedup();
+    Ok(())
+}
+
+fn exact_span_window_matches_manual_context(
+    conn: &Connection,
+    span: &OrderedEvidenceSpan,
+    context: &FrameContext,
+) -> bool {
+    if let Some(window_id) = context.window_id {
+        if span.owner_window_id == Some(window_id) {
+            return true;
+        }
+        let current_title = normalized_identity(context.window_title.as_deref());
+        let prior_title = conn
+            .query_row(
+                "SELECT window_name FROM frames WHERE id=?1",
+                params![span.frame_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .and_then(|title| normalized_identity(Some(&title)));
+        return current_title.is_some()
+            && prior_title == current_title
+            && current_spans_owner_for_hash(conn, &span.frame_id, &span.text_hash)
+                == Some(window_id)
+            && current_spans_owner_for_hash(conn, &context.frame_id, &span.text_hash)
+                == Some(window_id);
+    }
+    let Some(current_title) = normalized_identity(context.window_title.as_deref()) else {
+        return false;
+    };
+    let prior_title = conn
+        .query_row(
+            "SELECT window_name FROM frames WHERE id=?1",
+            params![span.frame_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+        .and_then(|title| normalized_identity(Some(&title)));
+    prior_title.as_deref() == Some(current_title.as_str())
+        && span.owner_window_id.is_some()
+        && span.owner_window_id
+            == current_spans_owner_for_hash(conn, &context.frame_id, &span.text_hash)
+}
+
+fn current_spans_owner_for_hash(
+    conn: &Connection,
+    frame_id: &str,
+    stable_text_hash: &str,
+) -> Option<i64> {
+    for table in ["content_units", "ocr_spans"] {
+        if !table_exists(conn, table).ok()?
+            || !column_exists(conn, table, "owner_window_id").ok()?
+        {
+            continue;
+        }
+        let text_column = if table == "content_units" {
+            "text"
+        } else {
+            "text"
+        };
+        let sql = format!("SELECT {text_column}, owner_window_id FROM {table} WHERE frame_id=?1");
+        let mut statement = conn.prepare(&sql).ok()?;
+        let rows = statement
+            .query_map(params![frame_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            })
+            .ok()?;
+        for row in rows.flatten() {
+            if row
+                .0
+                .as_deref()
+                .is_some_and(|text| text_hash(text) == stable_text_hash)
+            {
+                return row.1;
+            }
+        }
+    }
+    None
+}
+
 fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext, String> {
-    let (session_id, observed_at_ms, app_name, bundle_id, window_id, privacy_status) = conn
+    let (
+        session_id,
+        observed_at_ms,
+        app_name,
+        bundle_id,
+        window_id,
+        window_title,
+        privacy_status,
+        capture_trigger,
+    ) = conn
         .query_row(
             "SELECT session_id, captured_at, app_name, app_bundle_id, window_id,
-                    COALESCE(privacy_status, 'normal')
+                    window_name, COALESCE(privacy_status, 'normal'), capture_trigger
              FROM frames WHERE id = ?1",
             params![frame_id],
             |row| {
@@ -497,7 +717,9 @@ fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -570,7 +792,13 @@ fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext,
         adapters.join(" ")
     )
     .to_ascii_lowercase();
-    let family = if contains_any(
+    let family = if family_haystack.contains("browser")
+        && contains_any(
+            &family_haystack,
+            &["chat", "chatgpt", "claude", "gemini", "conversation"],
+        ) {
+        SurfaceFamily::BrowserChat
+    } else if contains_any(
         &family_haystack,
         &[
             "agent",
@@ -582,8 +810,6 @@ fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext,
         ],
     ) {
         SurfaceFamily::AgentChat
-    } else if family_haystack.contains("browser") && family_haystack.contains("chat") {
-        SurfaceFamily::BrowserChat
     } else if contains_any(
         &family_haystack,
         &["editor", "xcode", "code_editor", "vscode"],
@@ -601,6 +827,7 @@ fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext,
         app_name,
         bundle_id,
         window_id,
+        window_title,
         privacy_status,
         artifact_id: artifact.as_ref().map(|item| item.0.clone()),
         surface_key: artifact.map(|item| item.1),
@@ -611,6 +838,7 @@ fn load_frame_context(conn: &Connection, frame_id: &str) -> Result<FrameContext,
                 &["ax_value_changed", "agent_status", "stream", "thinking"],
             )
         }),
+        is_manual_boundary: capture_trigger.as_deref() == Some("manual_continue_boundary"),
         causal_typing,
         pre_frame_text_hashes,
     })
@@ -734,6 +962,28 @@ fn load_causal_typing_attribution(
         )));
     }
 
+    if let Some(carried) = load_manual_boundary_typing_attribution(
+        conn,
+        frame_id,
+        session_id,
+        observed_at_ms,
+        frame_bundle_id,
+        frame_app_name,
+        frame_window_id,
+        frame_window_title.as_deref(),
+        raw_text_guard,
+        &source_expr,
+        &confidence_expr,
+        &trigger_expr,
+        &commit_event_expr,
+        &app_bundle_expr,
+        &app_name_expr,
+        &window_id_expr,
+        &window_title_expr,
+    )? {
+        return Ok(Some(carried));
+    }
+
     load_legacy_bounded_typing_attribution(
         conn,
         frame_id,
@@ -753,6 +1003,259 @@ fn load_causal_typing_attribution(
         &window_id_expr,
         &window_title_expr,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_manual_boundary_typing_attribution(
+    conn: &Connection,
+    frame_id: &str,
+    session_id: Option<&str>,
+    observed_at_ms: i64,
+    frame_bundle_id: Option<&str>,
+    frame_app_name: Option<&str>,
+    frame_window_id: Option<i64>,
+    frame_window_title: Option<&str>,
+    raw_text_guard: &str,
+    source_expr: &str,
+    confidence_expr: &str,
+    trigger_expr: &str,
+    commit_event_expr: &str,
+    app_bundle_expr: &str,
+    app_name_expr: &str,
+    window_id_expr: &str,
+    window_title_expr: &str,
+) -> Result<Option<TypingBurstCausalAttribution>, String> {
+    let capture_trigger = conn
+        .query_row(
+            "SELECT capture_trigger FROM frames WHERE id=?1",
+            params![frame_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let recorded_manual_reuse = table_exists(conn, "capture_triggers")?
+        && column_exists(conn, "capture_triggers", "dedupe_policy")?
+        && conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM capture_triggers
+                   WHERE post_frame_id=?1
+                     AND trigger_type='manual_continue_boundary'
+                     AND status='captured'
+                     AND dedupe_policy='exact_frame_reuse'
+                 )",
+                params![frame_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(to_string)?;
+    if capture_trigger.as_deref() != Some("manual_continue_boundary") && !recorded_manual_reuse {
+        return Ok(None);
+    }
+
+    let sql = format!(
+        "SELECT id, commit_signal, started_at_ms, ended_at_ms, pre_frame_id,
+                post_frame_id, {app_bundle_expr}, {app_name_expr},
+                {window_id_expr}, {window_title_expr},
+                {source_expr}, {confidence_expr}, {trigger_expr}, {commit_event_expr}
+         FROM typing_bursts
+         WHERE post_frame_id IS NOT NULL AND post_frame_id <> ?1
+           AND committed = 1 {raw_text_guard}
+           AND (?2 IS NULL OR session_id = ?2)
+           AND ended_at_ms BETWEEN ?3 AND ?4
+         ORDER BY ended_at_ms DESC, id DESC
+         LIMIT 8"
+    );
+    let mut statement = conn.prepare(&sql).map_err(to_string)?;
+    let candidates = statement
+        .query_map(
+            params![
+                frame_id,
+                session_id,
+                observed_at_ms.saturating_sub(MAX_MANUAL_TYPING_CARRY_FORWARD_MS),
+                observed_at_ms
+            ],
+            typing_candidate_from_row,
+        )
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    let current_hashes = load_frame_text_hashes(conn, frame_id)?;
+
+    for candidate in candidates {
+        if !typing_surface_matches(
+            &candidate,
+            frame_bundle_id,
+            frame_app_name,
+            frame_window_id,
+            frame_window_title,
+        ) {
+            continue;
+        }
+        let Some(post_frame_id) = candidate.post_frame_id.as_deref() else {
+            continue;
+        };
+        let post = conn
+            .query_row(
+                "SELECT captured_at, app_bundle_id, app_name, window_id, window_name,
+                        COALESCE(privacy_status, 'normal'), session_id
+                 FROM frames WHERE id=?1",
+                params![post_frame_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(to_string)?;
+        let Some((
+            post_at,
+            post_bundle,
+            post_app,
+            post_window,
+            post_title,
+            post_privacy,
+            post_session,
+        )) = post
+        else {
+            continue;
+        };
+        if post_at < candidate.ended_at_ms
+            || post_at > observed_at_ms
+            || post_session.as_deref() != session_id
+            || is_privacy_blocked(&post_privacy)
+            || !exact_surface_identity_matches(
+                post_bundle.as_deref(),
+                post_app.as_deref(),
+                post_window,
+                post_title.as_deref(),
+                frame_bundle_id,
+                frame_app_name,
+                frame_window_id,
+                frame_window_title,
+            )
+        {
+            continue;
+        }
+        let superseding_task_surface_count =
+            if table_exists(conn, "continue_salient_turn_evidence")? {
+                conn.query_row(
+                    "SELECT COUNT(*)
+                 FROM continue_salient_turn_evidence e
+                 JOIN frames f ON CAST(f.id AS TEXT)=e.frame_id
+                 WHERE e.session_id=?1 AND e.observed_at_ms>?2 AND e.observed_at_ms<?3
+                   AND e.latest_user_span_ids_json NOT IN ('', '[]')
+                   AND NOT (
+                     COALESCE(f.app_bundle_id, '')=COALESCE(?4, '')
+                     AND COALESCE(f.window_id, -1)=COALESCE(?5, -1)
+                   )",
+                    params![
+                        session_id,
+                        post_at,
+                        observed_at_ms,
+                        frame_bundle_id,
+                        frame_window_id
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(to_string)?
+            } else {
+                0
+            };
+        if superseding_task_surface_count > 0 {
+            continue;
+        }
+        let pre_hashes = candidate
+            .pre_frame_id
+            .as_deref()
+            .map(|pre| load_frame_text_hashes(conn, pre))
+            .transpose()?
+            .unwrap_or_default();
+        let post_hashes = load_frame_text_hashes(conn, post_frame_id)?;
+        let visible_novel = post_hashes
+            .difference(&pre_hashes)
+            .filter(|hash| current_hashes.contains(*hash))
+            .cloned()
+            .collect::<Vec<_>>();
+        // If the post-commit frame was already resolved, its selected user hash
+        // is the strongest causal bridge. This handles the normal case where an
+        // agent reply appeared after the submitted user bubble: both texts are
+        // novel, but only the submitted user turn may cross the manual boundary.
+        let selected_post_user_hash = if table_exists(conn, "continue_salient_turn_evidence")? {
+            conn.query_row(
+                "SELECT salient_user_goal_hash
+                 FROM continue_salient_turn_evidence
+                 WHERE frame_id=?1",
+                params![post_frame_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .flatten()
+            .filter(|hash| visible_novel.contains(hash))
+        } else {
+            None
+        };
+        let stable_text_hash = selected_post_user_hash
+            .or_else(|| (visible_novel.len() == 1).then(|| visible_novel[0].clone()));
+        let Some(stable_text_hash) = stable_text_hash else {
+            continue;
+        };
+        return Ok(Some(TypingBurstCausalAttribution {
+            typing_burst_id: candidate.id,
+            commit_signal: candidate.commit_signal,
+            started_at_ms: candidate.started_at_ms,
+            ended_at_ms: candidate.ended_at_ms,
+            pre_frame_id: candidate.pre_frame_id,
+            post_frame_id: candidate.post_frame_id,
+            bounded_inferred_frame_id: Some(frame_id.to_string()),
+            surface_match_result: "exact_app_and_window".to_string(),
+            temporal_distance_ms: observed_at_ms.saturating_sub(candidate.ended_at_ms),
+            association_source: "manual_boundary_visible_hash_carry_forward".to_string(),
+            association_confidence: round_confidence(
+                candidate.association_confidence.unwrap_or(0.90).min(0.82),
+            ),
+            stable_text_hash: Some(stable_text_hash),
+            rejection_reasons: Vec::new(),
+            capture_trigger_id: candidate.capture_trigger_id,
+            commit_event_id: candidate.commit_event_id,
+        }));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_surface_identity_matches(
+    left_bundle: Option<&str>,
+    left_app: Option<&str>,
+    left_window: Option<i64>,
+    left_title: Option<&str>,
+    right_bundle: Option<&str>,
+    right_app: Option<&str>,
+    right_window: Option<i64>,
+    right_title: Option<&str>,
+) -> bool {
+    let app_matches = match (left_bundle, right_bundle) {
+        (Some(left), Some(right)) if !left.trim().is_empty() && !right.trim().is_empty() => {
+            left == right
+        }
+        _ => normalized_identity(left_app)
+            .zip(normalized_identity(right_app))
+            .is_some_and(|(left, right)| left == right),
+    };
+    let window_matches = match (left_window, right_window) {
+        (Some(left), Some(right)) => left == right,
+        _ => normalized_identity(left_title)
+            .zip(normalized_identity(right_title))
+            .is_some_and(|(left, right)| left == right),
+    };
+    app_matches && window_matches
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -938,6 +1441,7 @@ fn attribution_from_candidate(
         } else {
             candidate.association_confidence.unwrap_or(0.90)
         }),
+        stable_text_hash: None,
         rejection_reasons: if inferred {
             vec!["legacy_null_post_frame_not_persisted".to_string()]
         } else {
@@ -1204,6 +1708,7 @@ fn load_raw_spans(conn: &Connection, context: &FrameContext) -> Result<Vec<RawSp
         spans.extend(rows.collect::<Result<Vec<_>, _>>().map_err(to_string)?);
     }
 
+    annotate_browser_chat_structure(context, &mut spans);
     spans.retain(|span| !span.text.trim().is_empty());
     if spans.is_empty() {
         let fallback_text = if table_exists(conn, "frame_text_resolutions")? {
@@ -1252,6 +1757,225 @@ fn load_raw_spans(conn: &Connection, context: &FrameContext) -> Result<Vec<RawSp
         }
     }
     Ok(spans)
+}
+
+fn annotate_browser_chat_structure(context: &FrameContext, spans: &mut [RawSpan]) {
+    if !matches!(
+        context.family,
+        SurfaceFamily::AgentChat | SurfaceFamily::BrowserChat
+    ) {
+        return;
+    }
+
+    // AXWebArea is the browser's content viewport. It is a stronger boundary
+    // than screenshot geometry because it excludes tabs, the address bar, and
+    // other browser-owned controls that can sit beside real conversation text.
+    let viewport = spans
+        .iter()
+        .filter(|span| {
+            span.source.source_kind == EvidenceSourceKind::AccessibilityNode
+                && contains_any(
+                    &span.structural_hint.to_ascii_lowercase(),
+                    &["axwebarea", "web area"],
+                )
+        })
+        .filter_map(|span| span.geometry)
+        .max_by(|left, right| left.area().total_cmp(&right.area()));
+    let Some(viewport) = viewport else {
+        return;
+    };
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ChatAuthor {
+        User,
+        Assistant,
+    }
+
+    let action_signals = spans
+        .iter()
+        .filter_map(|span| {
+            let geometry = span.geometry?;
+            let text = normalize_text(&span.text);
+            let hint = span.structural_hint.to_ascii_lowercase();
+            let author = if contains_any(
+                &format!("{text} {hint}"),
+                &["edit message", "you said", "user message", "message-user"],
+            ) {
+                Some(ChatAuthor::User)
+            } else if contains_any(
+                &format!("{text} {hint}"),
+                &[
+                    "chatgpt said",
+                    "assistant message",
+                    "read aloud",
+                    "good response",
+                    "bad response",
+                    "regenerate response",
+                    "message-assistant",
+                ],
+            ) {
+                Some(ChatAuthor::Assistant)
+            } else {
+                None
+            };
+            author.map(|author| (geometry, author))
+        })
+        .collect::<Vec<_>>();
+
+    let message_groups = spans
+        .iter()
+        .filter(|span| span.source.source_kind == EvidenceSourceKind::AccessibilityNode)
+        .filter_map(|span| {
+            let geometry = span.geometry?;
+            let hint = span.structural_hint.to_ascii_lowercase();
+            let text = normalize_text(&span.text);
+            let is_group = contains_any(&hint, &["axgroup", "message group", "chat-message"]);
+            let bounded_group = viewport.contains_center(geometry)
+                && geometry.area() <= viewport.area() * 0.70
+                && geometry.height <= viewport.height * 0.55;
+            (is_group && bounded_group).then(|| {
+                let explicit_author = if contains_any(
+                    &format!("{text} {hint}"),
+                    &["you said", "user-message", "user_message", "message-user"],
+                ) {
+                    Some(ChatAuthor::User)
+                } else if contains_any(
+                    &format!("{text} {hint}"),
+                    &[
+                        "chatgpt said",
+                        "assistant-message",
+                        "assistant_message",
+                        "message-assistant",
+                    ],
+                ) {
+                    Some(ChatAuthor::Assistant)
+                } else {
+                    None
+                };
+                let nearby_author = action_signals
+                    .iter()
+                    .filter(|(signal_geometry, _)| {
+                        geometry.contains_center(*signal_geometry)
+                            || geometry.overlap_ratio(*signal_geometry) >= 0.72
+                    })
+                    .min_by(|left, right| left.0.area().total_cmp(&right.0.area()))
+                    .map(|(_, author)| *author);
+                (
+                    span.source.source_record_id.clone(),
+                    geometry,
+                    contains_any(&hint, &["axpress", "press", "actions", "copy", "edit"])
+                        || nearby_author.is_some(),
+                    explicit_author.or(nearby_author),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for span in spans.iter_mut() {
+        let Some(geometry) = span.geometry else {
+            continue;
+        };
+        if !viewport.contains_center(geometry) {
+            span.structural_hint
+                .push_str(" browser_chrome_excluded_from_chat_role");
+            push_unique(
+                &mut span.quality_flags,
+                "browser_chrome_excluded_from_chat_role".to_string(),
+            );
+            continue;
+        }
+
+        if raw_span_has_exact_active_window_ownership(span, context) {
+            span.structural_hint
+                .push_str(" browser_content_viewport_owned");
+            push_unique(
+                &mut span.quality_flags,
+                "browser_content_viewport_owned".to_string(),
+            );
+        }
+
+        let semantic_role = span.semantic_role.as_deref().unwrap_or("");
+        let best_group = message_groups
+            .iter()
+            .filter(|(_, group, _, _)| {
+                group.contains_center(geometry) || group.overlap_ratio(geometry) >= 0.72
+            })
+            .min_by(|left, right| left.1.area().total_cmp(&right.1.area()));
+        let chat_message = semantic_role.eq_ignore_ascii_case("chat_message")
+            || contains_any(
+                &span.structural_hint.to_ascii_lowercase(),
+                &["chat_message", "chat-message"],
+            )
+            || best_group.is_some_and(|(_, _, _, author)| author.is_some());
+        if !chat_message || !raw_span_has_exact_active_window_ownership(span, context) {
+            continue;
+        }
+
+        if let Some((group_id, _, has_action_metadata, author)) = best_group {
+            span.parent_id = Some(group_id.clone());
+            span.structural_hint
+                .push_str(" structured_chat_message_group");
+            push_unique(
+                &mut span.quality_flags,
+                "structured_chat_message_group".to_string(),
+            );
+            if *has_action_metadata {
+                span.structural_hint
+                    .push_str(" structured_chat_action_metadata");
+                push_unique(
+                    &mut span.quality_flags,
+                    "structured_chat_action_metadata".to_string(),
+                );
+            }
+            match author {
+                Some(ChatAuthor::User) => {
+                    span.structural_hint
+                        .push_str(" structured_chat_user_authorship");
+                    push_unique(
+                        &mut span.quality_flags,
+                        "structured_chat_user_authorship".to_string(),
+                    );
+                }
+                Some(ChatAuthor::Assistant) => {
+                    span.structural_hint
+                        .push_str(" structured_chat_assistant_authorship");
+                    push_unique(
+                        &mut span.quality_flags,
+                        "structured_chat_assistant_authorship".to_string(),
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+fn raw_span_has_exact_active_window_ownership(span: &RawSpan, context: &FrameContext) -> bool {
+    let hint = span.structural_hint.to_ascii_lowercase();
+    let ax_backed_content = span.source.source_kind == EvidenceSourceKind::AccessibilityNode
+        || contains_any(&hint, &[" ax ", "source:ax", "accessibility"]);
+    let exact_scope = span.source_scope == "active_window"
+        || (span.source_scope == "active_element" && ax_backed_content);
+    if !exact_scope
+        || span.ownership_kind != "ActiveWindowOwned"
+        || span.ownership_confidence < 0.90
+        || span.active_match_confidence < 0.90
+    {
+        return false;
+    }
+    let window_matches = match (span.owner_window_id, context.window_id) {
+        (Some(left), Some(right)) => left == right,
+        (None, Some(_)) => ax_backed_content,
+        (None, None) => ax_backed_content,
+        _ => false,
+    };
+    let context_app = context.bundle_id.as_deref().or(context.app_name.as_deref());
+    let app_matches = match (span.owner_app_id.as_deref(), context_app) {
+        (Some(left), Some(right)) => left == right,
+        (None, Some(_)) => ax_backed_content,
+        _ => false,
+    };
+    window_matches && app_matches && !is_privacy_blocked(&context.privacy_status)
 }
 
 fn build_ordered_spans(context: &FrameContext, raw: Vec<RawSpan>) -> Vec<OrderedEvidenceSpan> {
@@ -1342,6 +2066,23 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
     }) else {
         return;
     };
+
+    // Codex and similar agent surfaces may embed a terminal beside the chat.
+    // A few wide rows can bridge the visual gutter and make the generic pane
+    // clustering collapse both sides into one pane. A typed terminal semantic
+    // anchor is stronger than that geometry, so use its left edge as the
+    // conversation boundary and keep terminal rows out of chat authorship.
+    let embedded_terminal_split_x = spans
+        .iter()
+        .filter(|span| span.region_role == RegionRole::TerminalOutput)
+        .filter_map(|span| span.geometry.map(|geometry| geometry.x))
+        .min_by(f64::total_cmp);
+    let is_on_conversation_side = |span: &OrderedEvidenceSpan| {
+        embedded_terminal_split_x.is_none_or(|split_x| {
+            span.geometry
+                .is_none_or(|geometry| geometry.center_x() < split_x)
+        })
+    };
     if panes.len() >= 3 {
         let navigation_pane = &panes[0].0;
         let terminal_pane = &panes[panes.len() - 1].0;
@@ -1366,15 +2107,45 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
             }
         }
     }
-    let Some((_, min_x, max_x, _)) = panes.iter().find(|pane| pane.0 == conversation_pane) else {
+    let conversation_bounds = spans
+        .iter()
+        .filter(|span| span.pane_id == conversation_pane && is_on_conversation_side(span))
+        .filter_map(|span| span.geometry)
+        .fold(None, |bounds: Option<(f64, f64)>, geometry| {
+            Some(match bounds {
+                Some((min_x, max_x)) => (
+                    min_x.min(geometry.x),
+                    max_x.max(geometry.x + geometry.width),
+                ),
+                None => (geometry.x, geometry.x + geometry.width),
+            })
+        });
+    let Some((min_x, max_x)) = conversation_bounds else {
         return;
     };
+
+    if let Some(split_x) = embedded_terminal_split_x {
+        for span in spans.iter_mut().filter(|span| {
+            span.region_role == RegionRole::Unknown
+                && span
+                    .geometry
+                    .is_some_and(|geometry| geometry.center_x() >= split_x)
+        }) {
+            span.region_role = RegionRole::TerminalOutput;
+            span.conversational_role = ConversationalRole::NonConversation;
+            span.region_confidence = 0.84;
+            span.speaker_confidence = 0.95;
+            span.reason_codes
+                .push("agent_surface_embedded_terminal_pane".to_string());
+        }
+    }
     let pane_width = (max_x - min_x).max(1.0);
     let right_alignment_threshold = min_x + pane_width * 0.58;
     let status_orders = spans
         .iter()
         .filter(|span| {
             span.pane_id == conversation_pane
+                && is_on_conversation_side(span)
                 && contains_any(
                     &normalize_text(&span.text),
                     &[
@@ -1404,6 +2175,7 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
     let composer_geometry = spans
         .iter()
         .find(|span| span.region_role == RegionRole::Composer)
+        .filter(|span| is_on_conversation_side(span))
         .and_then(|span| span.geometry);
     if let Some(composer) = composer_geometry {
         for span in spans.iter_mut().filter(|span| {
@@ -1426,6 +2198,7 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
         .iter()
         .filter(|span| {
             span.pane_id == conversation_pane
+                && is_on_conversation_side(span)
                 && span.region_role == RegionRole::Unknown
                 && user_goal_geometry_candidate_is_eligible(span)
                 && span
@@ -1442,9 +2215,28 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
         }
         let novel = geometric_user_candidates
             .iter()
-            .filter(|span| !context.pre_frame_text_hashes.contains(&span.text_hash))
+            .filter(|span| {
+                attribution.stable_text_hash.as_ref().map_or_else(
+                    || !context.pre_frame_text_hashes.contains(&span.text_hash),
+                    |hash| &span.text_hash == hash,
+                )
+            })
             .collect::<Vec<_>>();
-        (novel.len() == 1).then(|| novel[0].reading_order)
+        if novel.len() == 1 {
+            return Some(novel[0].reading_order);
+        }
+        let is_exact_post_commit = attribution.stable_text_hash.is_none()
+            && attribution.post_frame_id.as_deref() == Some(context.frame_id.as_str())
+            && attribution.commit_signal.as_deref() == Some("enter")
+            && attribution.association_source == "stored_capture_trigger_commit_event";
+        is_exact_post_commit
+            .then(|| {
+                novel
+                    .iter()
+                    .max_by_key(|span| span.reading_order)
+                    .map(|span| span.reading_order)
+            })
+            .flatten()
     });
     let latest_user_order = causal_user_order.or_else(|| {
         geometric_user_candidates
@@ -1459,12 +2251,18 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
         {
             user.region_role = RegionRole::UserMessage;
             user.conversational_role = ConversationalRole::User;
+            let structurally_proven = user
+                .quality_flags
+                .iter()
+                .any(|flag| flag == "structured_chat_message_group");
             let confidence = if causal_user_order == Some(user_order) {
                 context
                     .causal_typing
                     .as_ref()
                     .map(|attribution| attribution.association_confidence.min(0.82))
                     .unwrap_or(0.58)
+            } else if structurally_proven {
+                0.72
             } else {
                 0.58
             };
@@ -1473,6 +2271,8 @@ fn apply_surface_geometry_adapter(context: &FrameContext, spans: &mut [OrderedEv
             user.reason_codes
                 .push(if causal_user_order == Some(user_order) {
                     "causal_typing_novel_post_frame_span".to_string()
+                } else if structurally_proven {
+                    "structurally_proven_chat_user_turn".to_string()
                 } else {
                     "agent_surface_right_aligned_turn_unconfirmed".to_string()
                 });
@@ -1647,6 +2447,15 @@ fn classify_role(
     semantic_role: &str,
     focused: bool,
 ) -> (RegionRole, ConversationalRole, f64, f64, String) {
+    if contains_any(hint, &["browser_chrome_excluded_from_chat_role"]) {
+        return (
+            RegionRole::AppChrome,
+            ConversationalRole::NonConversation,
+            0.96,
+            0.99,
+            "browser_chrome_excluded_from_chat_role".to_string(),
+        );
+    }
     if is_categorical_control_hint(hint) {
         return (
             RegionRole::Control,
@@ -1733,6 +2542,17 @@ fn classify_role(
             "structural_tool_output".to_string(),
         );
     }
+    if contains_any(hint, &["terminal_output", "terminal-output"])
+        || semantic_role == "terminal_output"
+    {
+        return (
+            RegionRole::TerminalOutput,
+            ConversationalRole::NonConversation,
+            0.90,
+            0.95,
+            "structural_terminal_output".to_string(),
+        );
+    }
     if context.family == SurfaceFamily::Terminal {
         let input = contains_any(hint, &["prompt", "command", "terminal_input"]);
         return if input {
@@ -1766,6 +2586,30 @@ fn classify_role(
         context.family,
         SurfaceFamily::AgentChat | SurfaceFamily::BrowserChat
     ) {
+        if contains_any(hint, &["structured_chat_user_authorship"])
+            && (context.family != SurfaceFamily::BrowserChat
+                || contains_any(hint, &["browser_content_viewport_owned"]))
+        {
+            return (
+                RegionRole::UserMessage,
+                ConversationalRole::User,
+                0.76,
+                0.76,
+                "structurally_proven_chat_user_turn".to_string(),
+            );
+        }
+        if contains_any(hint, &["structured_chat_assistant_authorship"])
+            && (context.family != SurfaceFamily::BrowserChat
+                || contains_any(hint, &["browser_content_viewport_owned"]))
+        {
+            return (
+                RegionRole::AgentMessage,
+                ConversationalRole::AssistantOrAgent,
+                0.76,
+                0.76,
+                "structurally_proven_chat_assistant_turn".to_string(),
+            );
+        }
         if contains_any(
             hint,
             &[
@@ -1793,7 +2637,9 @@ fn classify_role(
                 "message-user",
                 "ax-user",
             ],
-        ) {
+        ) && (context.family != SurfaceFamily::BrowserChat
+            || contains_any(hint, &["browser_content_viewport_owned"]))
+        {
             return (
                 RegionRole::UserMessage,
                 ConversationalRole::User,
@@ -2745,11 +3591,13 @@ mod tests {
             app_name: Some("Codex".to_string()),
             bundle_id: Some("com.openai.codex".to_string()),
             window_id: Some(1),
+            window_title: Some("Task".to_string()),
             privacy_status: "normal".to_string(),
             artifact_id: Some("artifact".to_string()),
             surface_key: Some("surface".to_string()),
             family,
             has_agent_status_event: true,
+            is_manual_boundary: false,
             causal_typing: Some(TypingBurstCausalAttribution {
                 typing_burst_id: "typing".to_string(),
                 commit_signal: Some("enter".to_string()),
@@ -2762,6 +3610,7 @@ mod tests {
                 temporal_distance_ms: 10,
                 association_source: "stored_capture_trigger_commit_event".to_string(),
                 association_confidence: 0.98,
+                stable_text_hash: None,
                 rejection_reasons: Vec::new(),
                 capture_trigger_id: Some("trigger".to_string()),
                 commit_event_id: Some("event".to_string()),
@@ -2795,6 +3644,412 @@ mod tests {
             semantic_role: None,
             quality_flags: Vec::new(),
         }
+    }
+
+    fn browser_raw(
+        kind: EvidenceSourceKind,
+        id: &str,
+        text: &str,
+        hint: &str,
+        semantic_role: Option<&str>,
+        geometry: SpanGeometry,
+    ) -> RawSpan {
+        RawSpan {
+            source: source_ref(kind, id, text),
+            text: text.to_string(),
+            source_scope: "active_window".to_string(),
+            ownership_kind: "ActiveWindowOwned".to_string(),
+            owner_window_id: Some(261_365),
+            owner_app_id: Some("com.jordanbaird.Ice.Helium".to_string()),
+            geometry: Some(geometry),
+            parent_id: None,
+            source_order: geometry.y as i64,
+            focused: false,
+            selected: false,
+            source_confidence: 0.90,
+            ownership_confidence: 0.95,
+            active_match_confidence: 0.95,
+            structural_hint: hint.to_string(),
+            semantic_role: semantic_role.map(str::to_string),
+            quality_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn browser_web_area_excludes_chrome_and_structural_group_proves_user_turn() {
+        let mut context = context(SurfaceFamily::BrowserChat);
+        context.app_name = Some("Helium".to_string());
+        context.bundle_id = Some("com.jordanbaird.Ice.Helium".to_string());
+        context.window_id = Some(261_365);
+        context.causal_typing = None;
+        let viewport = SpanGeometry {
+            x: 0.0,
+            y: 120.0,
+            width: 1_000.0,
+            height: 760.0,
+        };
+        let group = SpanGeometry {
+            x: 560.0,
+            y: 280.0,
+            width: 380.0,
+            height: 130.0,
+        };
+        let mut raw = vec![
+            browser_raw(
+                EvidenceSourceKind::AccessibilityNode,
+                "web-area",
+                "",
+                "AXWebArea",
+                None,
+                viewport,
+            ),
+            browser_raw(
+                EvidenceSourceKind::AccessibilityNode,
+                "message-group",
+                "",
+                "AXGroup AXPress copy edit",
+                None,
+                group,
+            ),
+            browser_raw(
+                EvidenceSourceKind::ContentUnit,
+                "assistant",
+                "Here is the previous answer",
+                "content_unit",
+                Some("chat_message"),
+                SpanGeometry {
+                    x: 300.0,
+                    y: 200.0,
+                    width: 300.0,
+                    height: 56.0,
+                },
+            ),
+            browser_raw(
+                EvidenceSourceKind::ContentUnit,
+                "user",
+                "Repair the two real continuation bugs",
+                "content_unit",
+                Some("chat_message"),
+                SpanGeometry {
+                    x: 600.0,
+                    y: 310.0,
+                    width: 300.0,
+                    height: 56.0,
+                },
+            ),
+            browser_raw(
+                EvidenceSourceKind::ContentUnit,
+                "search-typing",
+                "Unrelated browser search typing",
+                "content_unit",
+                Some("chat_message"),
+                SpanGeometry {
+                    x: 600.0,
+                    y: 42.0,
+                    width: 300.0,
+                    height: 36.0,
+                },
+            ),
+        ];
+        annotate_browser_chat_structure(&context, &mut raw);
+        let spans = build_ordered_spans(&context, raw);
+        let user = spans
+            .iter()
+            .find(|span| span.text == "Repair the two real continuation bugs")
+            .unwrap();
+        assert_eq!(user.region_role, RegionRole::UserMessage);
+        assert_eq!(user.region_confidence, 0.72);
+        assert!(user
+            .reason_codes
+            .contains(&"structurally_proven_chat_user_turn".to_string()));
+        let chrome = spans
+            .iter()
+            .find(|span| span.text == "Unrelated browser search typing")
+            .unwrap();
+        assert_eq!(chrome.region_role, RegionRole::AppChrome);
+        assert!(chrome
+            .reason_codes
+            .contains(&"browser_chrome_excluded_from_chat_role".to_string()));
+        let selection = select_latest_turn(&context, &spans);
+        assert_eq!(
+            selection.salient_user_goal_sample.as_deref(),
+            Some("Repair the two real continuation bugs")
+        );
+    }
+
+    #[test]
+    fn focused_helium_ax_tree_proves_user_without_ax_window_number() {
+        let mut context = context(SurfaceFamily::BrowserChat);
+        context.app_name = Some("Helium".to_string());
+        context.bundle_id = Some("com.jordanbaird.Ice.Helium".to_string());
+        context.window_id = None;
+        context.causal_typing = None;
+        let viewport = SpanGeometry {
+            x: 0.0,
+            y: 97.0,
+            width: 2_560.0,
+            height: 1_343.0,
+        };
+        let message = SpanGeometry {
+            x: 900.0,
+            y: 420.0,
+            width: 1_050.0,
+            height: 180.0,
+        };
+        let mut web_area = browser_raw(
+            EvidenceSourceKind::AccessibilityNode,
+            "web-area",
+            "ChatGPT - smalltalk",
+            "AXWebArea",
+            None,
+            viewport,
+        );
+        let mut group = browser_raw(
+            EvidenceSourceKind::AccessibilityNode,
+            "user-message-group",
+            "You said:",
+            "AXGroup AXScrollToVisible",
+            None,
+            message,
+        );
+        let mut goal = browser_raw(
+            EvidenceSourceKind::AccessibilityNode,
+            "user-message-text",
+            "Repair live task attribution in the normal product path",
+            "AXStaticText",
+            None,
+            SpanGeometry {
+                x: 940.0,
+                y: 470.0,
+                width: 920.0,
+                height: 70.0,
+            },
+        );
+        for span in [&mut web_area, &mut group, &mut goal] {
+            span.owner_window_id = None;
+        }
+        let mut raw = vec![web_area, group, goal];
+        annotate_browser_chat_structure(&context, &mut raw);
+        let spans = build_ordered_spans(&context, raw);
+        let goal = spans
+            .iter()
+            .find(|span| span.text == "Repair live task attribution in the normal product path")
+            .unwrap();
+        assert_eq!(goal.conversational_role, ConversationalRole::User);
+        assert_eq!(goal.speaker_confidence, 0.76);
+        assert!(goal
+            .reason_codes
+            .contains(&"structurally_proven_chat_user_turn".to_string()));
+        let selection = select_latest_turn(&context, &spans);
+        assert_eq!(
+            selection.salient_user_goal_sample.as_deref(),
+            Some("Repair live task attribution in the normal product path")
+        );
+    }
+
+    #[test]
+    fn browser_geometry_without_structural_group_stays_below_typed_threshold() {
+        let mut context = context(SurfaceFamily::BrowserChat);
+        context.app_name = Some("Helium".to_string());
+        context.bundle_id = Some("com.jordanbaird.Ice.Helium".to_string());
+        context.window_id = Some(261_365);
+        context.causal_typing = None;
+        let mut raw = vec![
+            browser_raw(
+                EvidenceSourceKind::AccessibilityNode,
+                "web-area",
+                "",
+                "AXWebArea",
+                None,
+                SpanGeometry {
+                    x: 0.0,
+                    y: 120.0,
+                    width: 1_000.0,
+                    height: 760.0,
+                },
+            ),
+            browser_raw(
+                EvidenceSourceKind::ContentUnit,
+                "assistant",
+                "Previous assistant response",
+                "content_unit",
+                Some("chat_message"),
+                SpanGeometry {
+                    x: 300.0,
+                    y: 200.0,
+                    width: 300.0,
+                    height: 56.0,
+                },
+            ),
+            browser_raw(
+                EvidenceSourceKind::ContentUnit,
+                "prominent",
+                "Visually prominent but unproven task text",
+                "content_unit",
+                Some("chat_message"),
+                SpanGeometry {
+                    x: 600.0,
+                    y: 310.0,
+                    width: 300.0,
+                    height: 56.0,
+                },
+            ),
+        ];
+        annotate_browser_chat_structure(&context, &mut raw);
+        let spans = build_ordered_spans(&context, raw);
+        let candidate = spans
+            .iter()
+            .find(|span| span.text == "Visually prominent but unproven task text")
+            .unwrap();
+        assert_eq!(candidate.region_role, RegionRole::UserMessage);
+        assert_eq!(candidate.region_confidence, 0.58);
+        assert!(candidate
+            .reason_codes
+            .contains(&"agent_surface_right_aligned_turn_unconfirmed".to_string()));
+        let selection = select_latest_turn(&context, &spans);
+        assert!(selection.latest_user_span_ids.is_empty());
+        assert!(selection.salient_user_goal_sample.is_none());
+    }
+
+    #[test]
+    fn exact_post_commit_selects_chat_turn_without_promoting_embedded_terminal_text() {
+        let context = context(SurfaceFamily::AgentChat);
+        let mut terminal_anchor = raw(
+            "terminal-anchor",
+            "warning: field is never read",
+            "terminal_output",
+            1_550.0,
+            300.0,
+        );
+        terminal_anchor.semantic_role = Some("terminal_output".to_string());
+        let spans = build_ordered_spans(
+            &context,
+            vec![
+                raw("sidebar", "Project navigation", "sidebar", 50.0, 100.0),
+                raw(
+                    "assistant",
+                    "The previous answer remains visible",
+                    "conversation_history",
+                    300.0,
+                    240.0,
+                ),
+                raw("bridge-one", "Visible response detail", "", 600.0, 400.0),
+                raw("bridge-two", "More response detail", "", 1_100.0, 460.0),
+                raw("bridge-three", "Final response detail", "", 1_350.0, 520.0),
+                terminal_anchor,
+                raw(
+                    "user",
+                    "Fix the current task boundary capture bug",
+                    "",
+                    900.0,
+                    800.0,
+                ),
+                raw(
+                    "terminal-latest",
+                    "client hmr update src App tsx",
+                    "",
+                    1_750.0,
+                    900.0,
+                ),
+            ],
+        );
+
+        let user = spans
+            .iter()
+            .find(|span| span.text == "Fix the current task boundary capture bug")
+            .unwrap();
+        assert_eq!(user.region_role, RegionRole::UserMessage);
+        assert_eq!(user.conversational_role, ConversationalRole::User);
+        assert!(user.speaker_confidence >= MIN_TYPED_ROLE_CONFIDENCE);
+        assert!(user
+            .reason_codes
+            .contains(&"causal_typing_novel_post_frame_span".to_string()));
+
+        let terminal = spans
+            .iter()
+            .find(|span| span.text == "client hmr update src App tsx")
+            .unwrap();
+        assert_eq!(terminal.region_role, RegionRole::TerminalOutput);
+        assert_eq!(
+            terminal.conversational_role,
+            ConversationalRole::NonConversation
+        );
+
+        let selection = select_latest_turn(&context, &spans);
+        assert_eq!(
+            selection.salient_user_goal_sample.as_deref(),
+            Some("Fix the current task boundary capture bug")
+        );
+    }
+
+    #[test]
+    fn structured_manual_carry_is_bounded_by_window_age_and_privacy() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::capture::init_db(&conn).unwrap();
+        let mut prior_context = context(SurfaceFamily::AgentChat);
+        prior_context.observed_at_ms = 1_000;
+        prior_context.causal_typing = None;
+        let mut prior = build_ordered_spans(
+            &prior_context,
+            vec![raw(
+                "prior-structured-user",
+                "Repair live task attribution",
+                "user-message",
+                600.0,
+                300.0,
+            )],
+        );
+        prior[0].reason_codes = vec!["structurally_proven_chat_user_turn".to_string()];
+
+        let manual_spans = |manual_context: &FrameContext| {
+            let mut current = raw(
+                "manual-visible-text",
+                "Repair live task attribution",
+                "chat_message",
+                600.0,
+                300.0,
+            );
+            current.owner_window_id = manual_context.window_id;
+            build_ordered_spans(manual_context, vec![current])
+        };
+        let assert_not_carried = |manual_context: &FrameContext| {
+            let mut current = manual_spans(manual_context);
+            carry_structured_chat_role_across_manual_boundary(
+                &conn,
+                manual_context,
+                &prior,
+                &mut current,
+            )
+            .unwrap();
+            assert!(!current[0]
+                .reason_codes
+                .contains(&"structured_chat_role_carried_across_manual_boundary".to_string()));
+        };
+
+        let mut manual = prior_context.clone();
+        manual.frame_id = "8".to_string();
+        manual.observed_at_ms = 10_000;
+        manual.is_manual_boundary = true;
+        let mut current = manual_spans(&manual);
+        carry_structured_chat_role_across_manual_boundary(&conn, &manual, &prior, &mut current)
+            .unwrap();
+        assert_eq!(current[0].conversational_role, ConversationalRole::User);
+        assert_eq!(current[0].speaker_confidence, 0.70);
+        assert!(current[0]
+            .reason_codes
+            .contains(&"structured_chat_role_carried_across_manual_boundary".to_string()));
+
+        let mut wrong_window = manual.clone();
+        wrong_window.window_id = Some(99);
+        assert_not_carried(&wrong_window);
+
+        let mut over_age = manual.clone();
+        over_age.observed_at_ms = 1_000 + MAX_MANUAL_TYPING_CARRY_FORWARD_MS + 1;
+        assert_not_carried(&over_age);
+
+        let mut private = manual;
+        private.privacy_status = "private".to_string();
+        assert_not_carried(&private);
     }
 
     fn live_shaped_legacy_fixture(
@@ -3003,6 +4258,112 @@ mod tests {
         assert_eq!(attribution.commit_event_id.as_deref(), Some("event-enter"));
         assert_eq!(attribution.capture_trigger_id.as_deref(), Some("trigger-2"));
         assert_eq!(attribution.association_confidence, 0.98);
+    }
+
+    #[test]
+    fn lca_06_manual_boundary_carries_the_causal_user_turn_past_agent_output() {
+        let conn = live_shaped_legacy_fixture(true, 42, false);
+        conn.execute(
+            "UPDATE typing_bursts
+             SET post_frame_id='2', capture_trigger_id='trigger-2',
+                 commit_event_id='event-enter',
+                 post_frame_association_source='stored_capture_trigger_commit_event',
+                 post_frame_association_confidence=0.98
+             WHERE id='typing-live'",
+            [],
+        )
+        .unwrap();
+        rebuild_task_turn_evidence(&conn, &["2".to_string()]).unwrap();
+
+        conn.execute(
+            "INSERT INTO frames
+             (id, session_id, captured_at, snapshot_path, app_name, app_bundle_id,
+              window_name, window_id, focused, capture_trigger, privacy_status,
+              previous_frame_id, created_at)
+             VALUES (3, 'session-013', 3000, 'fixture', 'AgentChat',
+                     'com.example.agentchat', 'Synthetic task conversation', 42, 1,
+                     'surface_change', 'normal', 2, 3000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_triggers
+             (id, session_id, ts_ms, trigger_type, caused_by_event_ids,
+              settle_delay_ms, rate_limited, dedupe_policy, pre_frame_id,
+              post_frame_id, status, caused_event_count, omitted_event_count,
+              aggregation_json)
+             VALUES ('manual-reuse-3', 'session-013', 3001,
+                     'manual_continue_boundary', '[]', 0, 0,
+                     'exact_frame_reuse', '2', '3', 'captured', 0, 0,
+                     '{\"schema\":\"smalltalk.manual_continue_frame_reuse.v1\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_contexts
+             (id, frame_id, adapter_id, object_type, confidence)
+             VALUES ('context-3', '3', 'generic_agent_surface', 'chat_conversation', 0.9)",
+            [],
+        )
+        .unwrap();
+        for (id, role, text, order, x, y) in [
+            (
+                "manual-prior",
+                "AXStaticText",
+                "Earlier work was completed",
+                1,
+                280.0,
+                220.0,
+            ),
+            (
+                "manual-user",
+                "AXStaticText",
+                "Repair causal task evidence now",
+                2,
+                620.0,
+                420.0,
+            ),
+            ("manual-agent", "AXStaticText", "Working", 3, 280.0, 520.0),
+            (
+                "manual-control",
+                "AXButton",
+                "Approve for me",
+                4,
+                640.0,
+                700.0,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO ax_nodes
+                 (id, frame_id, role, value, enabled, bounds_x, bounds_y, bounds_w,
+                  bounds_h, depth, tree_order, actions_json, raw_json)
+                 VALUES (?1, '3', ?2, ?3, 1, ?4, ?5, 340, 54, 1, ?6,
+                         CASE WHEN ?2='AXButton' THEN '[\"AXPress\"]' ELSE '[]' END, '{}')",
+                params![id, role, text, x, y, order],
+            )
+            .unwrap();
+        }
+
+        rebuild_task_turn_evidence(&conn, &["3".to_string()]).unwrap();
+        let (user, attribution): (Option<String>, String) = conn
+            .query_row(
+                "SELECT salient_user_goal_sample, causal_typing_attribution_json
+                 FROM continue_salient_turn_evidence WHERE frame_id='3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let attribution: TypingBurstCausalAttribution = serde_json::from_str(&attribution).unwrap();
+        assert_eq!(user.as_deref(), Some("Repair causal task evidence now"));
+        assert_eq!(
+            attribution.association_source,
+            "manual_boundary_visible_hash_carry_forward"
+        );
+        let expected_hash = text_hash("Repair causal task evidence now");
+        assert_eq!(
+            attribution.stable_text_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
     }
 
     #[test]

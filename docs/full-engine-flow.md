@@ -615,79 +615,37 @@ Confidence caps:
 
 The local handoff intentionally becomes generic when output mode is thin or no-clear. That is not just copy. It reflects missing or blocked evidence.
 
-## Optional Bounded Micro-Inference
+## Normal Manual Compact Semantic Inference
 
-Micro-inference is enabled by the current UI and island, but it is still bounded and optional at the backend request level.
+The current UI and native island enter one compact Task Truth v2 semantic path for an explicit manual Continue. The older candidate-bounded micro-inference and activity-recap paths remain diagnostics and compatibility infrastructure; they cannot provide fallback meaning for the public compact answer.
 
-When enabled, Smalltalk builds a compact pack:
+Boundary A builds the exact provider request:
 
-- Schema: `smalltalk.continue_micro_inference_pack.v2`.
-- Current focus summary.
-- Current surface summary.
-- Selected workstreams.
-- Candidate ids.
-- Candidate kinds.
-- Target artifact ids/titles/kinds.
-- URL/path availability booleans.
-- Local score components.
-- Last meaningful action summary.
-- Open-loop or unresolved-state summary.
-- Evidence frame/action/episode ids.
-- Missing evidence notes.
-- Memory support/contradiction scores.
-- App-activity fields.
-- Continuation role and why-not-primary fields.
-- Evidence packs v2.
-- Artifact roles.
-- Breadcrumbs.
-- Continue dossier.
+1. Freeze the manual evidence cutoff.
+2. Load P6 attributed user, agent, pane, region, task-turn, completion, support, and detour facts through that cutoff.
+3. Build `ObservationPacketV2` with `smalltalk.task_relevance_evidence.v1`.
+4. Select at most two chronological boundaries and four unique prepared images.
+5. Keep structured text inside the compact byte/token limit and audit original/sent image dimensions.
+6. Reject private, stale, unowned, ambiguous, unrelated, or duplicate evidence before transport.
+7. Make at most one provider post, with zero reconciliation calls and zero HTTP retries.
 
-The model does not receive:
+The provider returns the strict compact schema with `unfinished_task`, `task_state`, `resume_point`, `next_supported_action`, `completed_context`, `where_summary`, visit roles, request-local support slots, missing evidence, field confidence, verifier state, and raw resolution status.
 
-- Raw screenshots.
-- Broad raw history.
-- Raw event timelines.
-- Raw typed characters.
-- Full clipboard text.
-- Arbitrary local file contents.
-- Permission to invent URLs, paths, artifacts, evidence, intent, or next actions.
+Boundary B turns that response into product truth:
 
-The request uses the OpenAI Responses API with Structured Outputs. The default model is `gpt-4.1-mini`, unless overridden by:
+1. Parse the structured response. Provider incomplete and structured parse failures remain distinct typed failures.
+2. Admit or reject each semantic field against the exact eligible request slots. Local code never writes replacement task meaning.
+3. Preserve raw uncertainty monotonically: admission can keep or weaken status, never upgrade it.
+4. Map the admitted fields, verdicts, source kind, correction watermark, and identity into one atomic `TaskTruthPublicAnswerV1`.
+5. Attach a direct target only through the separate strict decision/locator policy. A frame remains preview evidence.
+6. Build `smalltalk.continue_product_projection.v1` with one instruction, one resume-context sentence, optional location, typed action, target status, and atomic answer identity.
+7. Persist the exact canonical copy for read-only history and pass the same projection to React and Swift.
 
-- `SMALLTALK_CONTINUE_OPENAI_MODEL`
-- `SMALLTALK_OPENAI_MODEL`
-- `OPENAI_MODEL`
+Missing direct target does not erase supported text. Missing supported action does not create fake instruction text. Provider, parser, validation, task-unknown, task-known/action-unknown, and stale states remain separate.
 
-The API key can come from process environment or project `.env`.
+## Legacy Handoff Composition (Diagnostic Compatibility)
 
-The model can return:
-
-- `selected_candidate`
-- `need_more_evidence`
-- `no_clear_continuation`
-
-Validation rejects or downgrades output when:
-
-- Selected candidate id was not sent to the model.
-- Selected workstream id does not match the selected candidate.
-- Output contains unsupported URLs or paths.
-- Output exposes internal ids or frame/candidate references.
-- Required handoff lines are missing or too long.
-- `why_this` is empty or has too many items.
-- `next_action` is incompatible with the candidate.
-- High confidence is returned for thin local evidence.
-- Candidate evidence sufficiency is too low.
-- A suppressed candidate role is selected.
-- A branch/support target is promoted without strong local support.
-- The result claims an escape hatch but still selects a candidate.
-
-Some presentation failures are soft-recoverable: the engine can keep the selected candidate but replace model copy with local-safe copy and cap confidence. Hard failures produce local fallback behavior.
-
-Micro-inference cannot rescue bad local candidates. If candidate generation or recall omits the real work, the model never sees it.
-
-## Handoff Composition
-
-The final user-facing copy is `ContinueHandoff`.
+`ContinueHandoff` remains in the decision object for diagnostics and compatibility. It is not the canonical first-screen semantic answer for the normal manual compact path.
 
 Fields:
 
@@ -794,16 +752,16 @@ Persisting decisions matters because `open_resume_point` and feedback attach to 
 
 ## UI Presentation
 
-The React Continue card renders one answer.
+The React Continue card renders one canonical product answer.
 
 Key behavior:
 
-- It prefers `decision.handoff` over older presentation fallback.
-- It chooses `resume_work_target || return_target` as the resume target.
-- It disables the primary open button when there is no direct openable target.
-- It shows current focus only when current focus differs from the resume target or warnings indicate mismatch.
-- It productizes internal warnings for visible copy.
-- It can show low-confidence styling when confidence is low or copy looked internal.
+- It reads `decision.task_truth_v2.answer.product_projection` verbatim.
+- It leads with `primary_instruction`, followed by `resume_context` and optional `location_context`.
+- It routes only the typed `open_direct_target`, `inspect_evidence`, `refresh_continue`, or `none` action.
+- It cannot use legacy `next_action` or `unfinished_state` as an instruction fallback.
+- It disables direct open unless the current decision and strict target policy agree.
+- It keeps confidence, support slots, identities, warnings, recent context, and evidence diagnostics behind Inspect.
 
 The `Why this?` panel is not the same as the old resume-query bundle. It displays:
 
@@ -1202,3 +1160,13 @@ Full audit output is manual-only. One audit worker owns one active export and on
 `capture_status` reads maintained session counters, bounded recent signal windows, one maintenance snapshot query, and a lightweight latest-frame row. The status frame contains identity and provider metadata but not OCR text, Accessibility text or trees, URL/path contents, or image paths. Explicit evidence commands load heavy detail. Status records p50 and p95 latency and response bytes.
 
 The privacy-safe soak harness is described in `docs/runtime-stability-harness.md`. The complete live matrix remains a release gate; deterministic tests alone do not establish always-on stability.
+
+## LCA-06 live manual Continue correction
+
+The normal manual path establishes its external boundary before acquiring the Continue permit and without retaining a database connection while it waits. `ManualBoundaryCapture` has user priority over automatic screenshots. Automatic work may be superseded or asked to cancel, and it cannot requeue ahead of an already waiting manual boundary.
+
+Causal typing crosses from a committed post-frame to the manual frame only on the same exact session/app/window lineage, inside a 15-second bound, with eligible privacy and the attributed stable text still visible. A previously resolved post-frame user hash wins over a later agent message on the same screen. An empty manual sample can preserve that selected turn only on the same hashed surface; prior-only or wrong-surface evidence cannot transfer task authority.
+
+The semantic probe computes admission feasibility from the real field validator before transport. With no useful admissible field, it records zero provider posts and returns a typed acquisition failure. Strict target attachment is attempted only for an actual candidate. Target mismatch becomes `target_suppressed`; it does not make the answer stale.
+
+React and the native island compare the saved decision's material evidence watermark with the current material watermark. Ambient count or timestamp churn is not freshness proof. A true material change produces stale copy, disables open, and offers Refresh while immutable history remains unchanged.

@@ -181,30 +181,17 @@ The `Memory` menu contains:
 
 This is intentional: local capture is necessary infrastructure, but it should not be the primary product action.
 
-The main first screen is the `ContinueDecisionCard`. Depending on evidence state, it shows:
+The main first screen is the `ContinueDecisionCard`. Its semantic branch shows only the backend-owned `smalltalk.continue_product_projection.v1`:
 
-- No-evidence state.
-- Local-memory-active state.
-- Continue decision state.
-- Fresh openable enriched work state.
-- Fresh enriched-but-not-openable state.
-- Truthful thin current-work state.
-- Older context with fresher thin current work.
-- No-clear-continuation state.
-- `You were`: the supported task and work object.
-- `State`: last meaningful progress plus unfinished, waiting, or blocked state.
-- `Next`: one supported action when available; it is omitted when unsupported.
-- `Where`: app plus document, thread, or page identity at the supported precision.
-- Direct return target, inspectable evidence preview, or `Exact location unavailable`.
-- Answer freshness independently from task or target confidence.
-- Primary `Continue here` action.
-- `Inspect evidence` action.
-- Two bounded task choices only when two verified hypotheses are genuinely close.
-- `Not right` feedback scoped to the exact TaskSnapshot revision and affected field or hypothesis.
+- one canonical primary instruction;
+- one resume-context sentence when available;
+- optional evidence-backed location context;
+- one typed primary action when safe;
+- Inspect when aligned evidence or diagnostics are available.
 
-Candidate, workstream, detour, provenance, confidence, and evidence-strength details are diagnostics under `Why this answer?`; they are not first-screen content.
+Task-known/action-unknown, task-unknown, provider failure, parser failure, validation failure, and stale decision are separate typed presentation states. Candidate, workstream, detour, provenance, confidence, support-slot, identity, and evidence-strength details remain behind Inspect; they are not first-screen content.
 
-The product card always enables candidate-bounded target inference. It enables recap model phrasing only for an explicit manual Continue/Refresh/Rebuild action; startup and background refreshes keep recap synthesis local:
+The normal manual request enters the compact semantic path through the existing decision command:
 
 ```ts
 await invoke("get_continue_decision", {
@@ -212,16 +199,14 @@ await invoke("get_continue_decision", {
     mode: "normal",
     rebuild_layers: false,
     micro_inference_enabled: true,
-    activity_recap_model_enabled: trigger === "manual",
+    activity_recap_model_enabled: false,
     max_candidates_for_model: 5,
     audit_output_enabled: options.writeAudit === true
   }
 });
 ```
 
-The UI currently treats decision-source provenance as product-visible state. A `cloud_micro_inference` result with a real `response_id` is shown as `AI-assisted`; a failed or unavailable candidate-model path is shown as `Local fallback`; local scorer-only output is shown as `Local only`. This label describes the bounded candidate-routing path, not necessarily the wording shown on the card. The candidate model may validly return `need_more_evidence`, while `activity_recap.generated_by` independently remains `local` or `fallback`. Therefore the current `AI-assisted` badge does not prove that a model selected the task or wrote the displayed recap. This is a known provenance-presentation defect, documented in the P6 limitations below.
-
-Manual Continue/Refresh/Rebuild requests enable optional recap-model phrasing. Startup and background requests keep recap synthesis local. React and the native island now apply a quality-dominant adoption policy: a background result may replace a stronger manual result only when its evidence is causally newer and it does not downgrade task identity, revision, confidence, supported task/state/next/where coverage, target safety, or wording provenance. Rejected background results are retained as bounded diagnostics instead of replacing the displayed answer.
+Legacy decision-source and activity-recap provenance remains inspectable, but it does not identify the author of the canonical product instruction. The public answer records its compact provider request/response identity, raw model status, admitted status, semantic source kind, and atomic identity directly. Startup and background requests do not replace the manual canonical answer unless their evidence is causally newer and the normal freshness policy accepts them.
 
 The UI also filters user-facing handoff copy. If a backend or model handoff leaks internal ids or implementation labels such as candidate ids, workstream ids, artifact ids, frame fallback text, or target-metadata placeholders, the card falls back to honest thin-evidence copy instead of displaying those internals as product language.
 
@@ -1799,101 +1784,45 @@ Only explicit audit-enabled Continue actions write recap proof files. The asynch
 
 When recap model phrasing was disabled or explicit audit retention was not requested, model-related files contain honest skipped/not-retained status rather than invented request or response data. This is implemented proof export, not a claim that every future P5 audit/eval roadmap metric already exists.
 
-## Default Bounded Micro-Inference
+## Normal Manual Continue Inference
 
-OpenAI micro-inference is the default Continue path. It is still bounded to local candidate ids, locally validated, and cache-aware. It does not receive broad raw history.
+The normal manual Continue path uses the compact Task Truth v2 request. It does not use the older candidate-selection or recap model as a second semantic answer engine.
 
-This target-selection inference is separate from P5 recap phrasing. `micro_inference_enabled: true` may choose among locally eligible candidates. Recap phrasing defaults off in the backend and stays local for startup/background refreshes, while the React manual Continue path explicitly enables it. Neither model path can override hard local safety gates.
+The data flow is:
 
-The normal request is:
-
-```ts
-await invoke("get_continue_decision", {
-  input: {
-    mode: "normal",
-    rebuild_layers: false,
-    micro_inference_enabled: true,
-    activity_recap_model_enabled: false,
-    max_candidates_for_model: 5
-  }
-});
+```text
+manual cutoff
+  -> P6 attributed task-turn and pane evidence
+  -> task-relevant ObservationPacketV2
+  -> at most two chronological boundaries and four prepared images
+  -> one compact provider request with zero HTTP retries
+  -> strict structured response parser
+  -> field-local evidence admission
+  -> one atomic public answer
+  -> backend-owned product projection used by React and the native island
 ```
 
-OpenAI key lookup:
+The compact request separates the newest unfinished task from prior completion, supporting work, detours, and passive surfaces. Engagement and visual density cannot give an unrelated pane task authority. Structured text stays within the compact request limit, image candidates retain selection and dimension audits, and private or model-ineligible evidence is excluded before transport.
 
-- process environment `OPENAI_API_KEY`
-- project `.env`
+The provider response contains:
 
-Model selection priority:
+- `unfinished_task`
+- `task_state`
+- `resume_point`
+- `next_supported_action`
+- `completed_context`
+- `where_summary`
+- visit roles, request-local support slots, field confidence, missing evidence, verifier state, and raw resolution status
 
-1. request `model`
-2. `SMALLTALK_CONTINUE_OPENAI_MODEL`
-3. `SMALLTALK_OPENAI_MODEL`
-4. `OPENAI_MODEL`
-5. default `gpt-4.1-mini`
+Local code does not write replacement semantic prose. It admits or rejects each field against the exact request-local evidence. Raw `partly_resolved`, `unresolved`, or `refused` status cannot be upgraded. One rejected field does not erase separately supported fields. Provider failure, structured parse failure, admission failure, semantic unresolved, and target unavailable remain different typed outcomes.
 
-The model receives a compact candidate pack only. It contains:
+Semantic truth and target safety are separate. A useful instruction remains visible when no direct target exists. A frame is evidence preview only. `Continue here` is available only when the current decision ID and strict locator policy independently establish a direct target. Stale, suppressed, mismatched, or missing targets cannot be opened.
 
-- current focus facts
-- top workstreams
-- top continuation candidates
-- candidate ids generated locally
-- target artifact ids
-- target kinds and titles
-- booleans for URL/path availability
-- local score components
-- last meaningful action summaries
-- unresolved-state reasons
-- evidence frame/action/episode ids
-- missing evidence notes
-- artifact role map
-- short manual breadcrumbs
-- factual unresolved current-work state when present
-- bounded current-surface/enrichment quality and freshness facts
-- support evidence that is visible to reasoning but not selectable as a return target
-- feedback policy and branch-promotion eligibility already computed locally
+The public `smalltalk.task_truth_public_answer.v5` stores the admitted fields, raw and admitted statuses, semantic source kind, field verdicts, target status, correction watermark, and atomic answer identity. Its `smalltalk.continue_product_projection.v1` supplies one instruction, one resume-context sentence, optional location, typed action, and answer identity. React and Swift consume that projection rather than reconstructing meaning from legacy compatibility fields.
 
-The model does not receive:
+The older candidate-bounded micro-inference, local scorer, activity recap, workstream, and handoff fields remain diagnostic and compatibility infrastructure. They do not fill missing compact semantic fields or become the default first-screen answer. Background/startup paths do not upload semantic evidence. A manual attempt makes at most one provider post, with no reconciliation call and no automatic retry.
 
-- raw screenshots by default
-- raw timelines
-- raw database dumps
-- raw typed characters
-- full clipboard text
-- unredacted URLs
-- unredacted file paths
-- frames excluded by privacy policy
-
-Structured output fields:
-
-- `selected_candidate_id`
-- `selected_workstream_id`
-- `intent_label`
-- `next_action`
-- `reason`
-- `confidence`: `low`, `medium`, or `high`
-- `uncertainty_notes`
-
-The model output is validated locally. The validator rejects output when:
-
-- selected candidate id was not supplied locally
-- selected workstream id does not match the selected candidate
-- selected candidate was not sent to the model
-- output mentions unsupported URLs or paths
-- output leaks internal candidate, workstream, artifact, frame, or fallback identifiers into handoff copy
-- `next_action` is empty, too long, or incompatible with candidate semantics
-- high confidence is returned for thin evidence
-- a branch/support target is promoted without a strong local candidate
-- the candidate was suppressed by feedback, excluded by branch policy, or omitted from the filtered model pack
-- a stale target is selected over fresh strong/medium current work
-
-If the API fails, the key is missing, parsing fails, or validation fails, the decision source becomes `local_fallback` and the local scorer result is returned.
-
-Fallback decisions are still cached when their evidence watermark and inference policy match the next normal request. This matters because default micro-inference should not repeatedly attempt network/model work when the same local evidence already produced a validated local fallback.
-
-The decision layer keeps semantic task understanding separate from target safety. When a model answer exists but there is no human-readable, strictly supported return target, Smalltalk shows the model answer and changes the action to evidence inspection. It does not suppress the paid model response merely because direct opening is unavailable. Internal target metadata remains hidden, and no unsupported app, page, URL, or file is opened.
-
-Micro-inference cannot override the local safety gates. A model choice does not create promotion evidence, restore a feedback-suppressed candidate, make a thin snapshot openable, or turn diagnostic/support evidence into a public target.
+Deterministic LCA replay proves the local evidence, parser, admission, mapping, presentation, parity, privacy, cache, and target-safety contracts. It does not prove live provider interpretation or visual behavior. Final LCA approval requires the user-owned six-scenario script in the LCA-05 completion audit. The separate P6 100-case release gate remains authoritative and closed until its own corpus, calibration, performance, holdout, and manual macOS requirements pass.
 
 ## Feedback And Breadcrumbs
 
@@ -2267,25 +2196,13 @@ Diagnostics are intentionally detailed but should not be mistaken for the first-
 
 ## Session Island
 
-The macOS floating island is now a typed Continue-first consumer. Rust exposes `IslandContinueState` (`smalltalk.island_continue_state.v1`) with:
-
-- display state;
-- decision id;
-- current focus/activity;
-- activity label, summary, where, and state;
-- separate activity and target confidence labels;
-- bounded recent-context summary;
-- selected workstream title;
-- return and resume-work target summaries;
-- next action and confidence label;
-- missing evidence, warnings, and suppression reasons;
-- typed `available_actions`.
+The macOS floating island is a typed Continue-first consumer. Rust exposes `IslandContinueState` (`smalltalk.island_continue_state.v1`) with the canonical semantic answer and its `smalltalk.continue_product_projection.v1`, plus decision identity, strict target state, evidence preview, diagnostics, and typed `available_actions`.
 
 Swift decodes this nested DTO and dispatches typed actions such as `refresh_continue`, `open_continue_target`, `mark_wrong_target`, `mark_not_useful`, `inspect_evidence`, `open_smalltalk`, `start_local_memory`, and `capture_evidence_now`. Legacy cloud/session/trail/native-resume routes remain diagnostic-only and cannot supply the island's primary target/open behavior.
 
 The island obtains state from the same `get_continue_decision` backend contract as the main card or from a fresh remembered decision. Its primary open requires `source = island_primary`, `strict_continue_target = true`, and a non-empty `continue_decision_id`; legacy path/session/frame fallbacks are rejected before resolution. Feedback uses existing feedback kinds with `source = island_primary`. Frame/event, feedback, and open watermarks invalidate remembered island state.
 
-Rust maps the same persisted recap into island fields; Swift displays the compact hierarchy without recomputing or widening claims. Thin or no-clear states can still show useful activity memory, state, context, and missing evidence, but they cannot expose the primary open action unless the same decision is currently safe and openable in the main Continue contract.
+Swift displays the projection's instruction, resume context, optional location, and typed action without recomputing or widening claims. A missing action cannot be filled from legacy `next_action`; a frame preview cannot become a direct target; stale state recomputes the nested projection to refresh-only copy. Diagnostics and compatibility fields remain available for Inspect but cannot replace the canonical answer.
 
 P4 no-bypass coverage writes sanitized `decision/island_continue_audit.json` metadata and tracks island bypass, legacy primary route, open-without-decision-id, suppressed-target open, main-card disagreement, and valid-open counters. The repeatable manual checklist is `docs/p4-island-no-bypass-manual-qa.md`.
 
@@ -2301,16 +2218,16 @@ What is real now:
 - Capture events, sparse heavy frames, attributed text, weak-surface snapshots, artifacts/actions/semantic moments/episodes/workstreams/open loops/branches/candidates/decisions/opens/feedback are persisted locally.
 - Continue can run without stopping local memory.
 - Normal Continue mode can reuse cached decisions.
-- Default micro-inference can fall back locally and reuse that cached fallback when evidence has not changed.
+- Normal manual Continue uses one compact semantic request, zero reconciliation calls, and zero HTTP retries. Provider, parser, validation, semantic, and target failures remain typed; local compatibility layers do not invent a replacement semantic answer.
 - Every new Continue result carries `smalltalk.activity_recap.v1`, including independent activity/target confidence, current state, evidence-backed narrative fields, detours/support, missing evidence, and per-claim anchors.
 - Activity recap inputs are bounded and privacy-filtered; recap generation does not send broad raw history or use raw-history fallback as the normal path.
 - Deterministic P5 stitching distinguishes primary work, support, detours, interruptions, returns, and current-focus-only surfaces before inferring a work label or state.
 - Activity/location labels are designed and deterministically tested to use eligible actions, snapshots, segments, workstream evidence, and evidence spans. Generic chrome, private locators, support-only actions, and unsafe internal labels have rejection paths. The live Codex audit proves that role/region resolution can still feed the wrong upstream task truth, so this must not be generalized into a real-surface accuracy claim.
 - Last-state synthesis can distinguish active work, recent detour, pause after progress, blocker, complete/idle, and unclear state while keeping no-safe-target copy honest.
-- Recap model phrasing exists and defaults off in the backend. React manual Continue/Refresh/Rebuild and explicit island Continue actions enable it; startup/background recaps stay local. When enabled it uses a bounded Structured Outputs pack, local term/handle/target-policy validation, and deterministic fallback.
+- Legacy recap model phrasing remains available only as diagnostic/compatibility infrastructure. It is not a second semantic authority for the normal manual compact path, and startup/background recaps stay local.
 - Recap cache identity includes evidence plus recap/model policy. Matching cache hits reuse the exact stored recap and proof without rerunning synthesis.
 - Valid grounded recap memory can be promoted and adjusted by feedback, but narrative memory is isolated from candidate ranking, target eligibility, alternatives, openability, and strict open.
-- React and the native island consume the same persisted recap and display compact activity, location, context, state, next action, confidence, and missing-evidence copy.
+- React and the native island consume the same persisted `smalltalk.continue_product_projection.v1` and display one canonical instruction, resume context, optional location, and typed action. Diagnostics and confidence remain behind Inspect.
 - Explicit audit-enabled Continue outputs include an `activity_recap/` proof directory; background/startup decisions still do not create audit bundles.
 - Continue handoff copy is persisted and filtered so internal candidate/workstream/artifact/frame ids do not become user-facing product text.
 - Only explicit audit-enabled Continue actions schedule a `continue_outputs/` bundle. Startup/background calls do not write one. Folder names begin with the resolved capture session label.
@@ -2557,3 +2474,11 @@ Continue, capture, audit, and maintenance use one finite workload policy. Manual
 Status is a lightweight product snapshot. It reads maintained session counters and a latest-frame projection that omits OCR text, Accessibility text, Accessibility trees, URLs, document paths, and image paths. Heavy evidence is loaded only through explicit evidence commands. Event-driven updates are primary; the slow heartbeat is recovery insurance.
 
 The runtime policy and developer harness are documented in `docs/runtime-stability-harness.md` and versioned in `docs/runtime-stability-policy-v1.json`. Automated pressure tests are not a substitute for the required live soak matrix. Until every live scenario passes, the truthful release state remains **automated and synthetic proof complete; live always-on proof pending**.
+
+## Live Continue recovery boundary
+
+A Continue answer is stale only when its material evidence identity is older or invalidated. Target readiness is independent. A missing, preview-only, or ownership-mismatched target may remove `Continue here`; it cannot replace a supported instruction with stale copy.
+
+Manual Continue owns a distinct user-priority capture boundary. Automatic screenshot work may yield, coalesce, or be cancelled ahead of it. The manual path does not hold a SQLite connection while waiting for capture ownership. Exact frame reuse requires post-event chronology, exact app/window identity, eligible privacy, and a readable asset.
+
+The provider is called only when local admission feasibility finds a useful semantic field that could pass the same validator used after the response. Otherwise Continue returns a typed local acquisition failure and records zero provider posts. These corrections do not open the P6 release gate or replace required normal-app verification.
