@@ -13,19 +13,19 @@ const MAX_PAGE_SIZE: usize = 50;
 const MAX_HISTORY_ENTRIES: i64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ContinueHistoryCursorV1 {
+pub struct ContinueHistoryCursorV1 {
     pub created_at_ms: i64,
     pub decision_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ContinueHistoryAnswerRowV1 {
+pub struct ContinueHistoryAnswerRowV1 {
     pub label: String,
     pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ContinueHistorySummaryV1 {
+pub struct ContinueHistorySummaryV1 {
     pub decision_id: String,
     pub created_at_ms: i64,
     pub origin: String,
@@ -33,14 +33,14 @@ pub(crate) struct ContinueHistorySummaryV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ContinueHistoryPageV1 {
+pub struct ContinueHistoryPageV1 {
     pub schema: String,
     pub items: Vec<ContinueHistorySummaryV1>,
     pub next_cursor: Option<ContinueHistoryCursorV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ContinueHistoryOutputV1 {
+pub struct ContinueHistoryOutputV1 {
     pub schema: String,
     pub decision_id: String,
     pub created_at_ms: i64,

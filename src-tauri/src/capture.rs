@@ -4930,6 +4930,25 @@ pub(crate) fn get_continue_history_output_for_island(
     crate::continuation::history::get_continue_history_output(&conn, decision_id)
 }
 
+#[tauri::command]
+pub fn list_continue_history(
+    app: AppHandle,
+    cursor: Option<crate::continuation::history::ContinueHistoryCursorV1>,
+    limit: Option<usize>,
+) -> Result<crate::continuation::history::ContinueHistoryPageV1, String> {
+    let conn = open_readonly_db(&app)?;
+    crate::continuation::history::list_continue_history(&conn, cursor.as_ref(), limit)
+}
+
+#[tauri::command]
+pub fn get_continue_history_output(
+    app: AppHandle,
+    decision_id: String,
+) -> Result<Option<crate::continuation::history::ContinueHistoryOutputV1>, String> {
+    let conn = open_readonly_db(&app)?;
+    crate::continuation::history::get_continue_history_output(&conn, &decision_id)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ContinueOutputExportSummary {
     schema: String,

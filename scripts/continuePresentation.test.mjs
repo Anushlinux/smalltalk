@@ -315,7 +315,7 @@ test("recent context compresses repeated shell visits without losing the latest 
   assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
 });
 
-test("public projection gives one continuation instruction and one memory line", () => {
+test("public projection keeps screenshots as context and labels only safe open targets", () => {
   const decision = authoritativeDecision();
   Object.assign(decision.task_truth_v2.answer, {
     task_summary: "Smalltalk's always-on repair",
@@ -331,9 +331,13 @@ test("public projection gives one continuation instruction and one memory line",
       headline: "Continue in Codex to finish the two manual checks for Smalltalk's always-on repair.",
       memoryLine: "You were working on Smalltalk's always-on repair; the build and automated tests had already passed.",
       resumeSurface: "Codex",
-      openActionLabel: "View Codex screen",
+      openActionLabel: null,
       exactTargetNote: "Exact task link not captured",
     },
+  );
+  assert.equal(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), true).openActionLabel,
+    "Open Codex",
   );
 });
 
@@ -387,7 +391,7 @@ test("field-limited model output remains visible instead of becoming the default
       headline: "Continue to the visible Continue card still needs confirmation.",
       memoryLine: "Verify the repaired Continue output; the model response was parsed and locally admitted.",
       resumeSurface: null,
-      openActionLabel: "Try Continue again",
+      openActionLabel: null,
       exactTargetNote: null,
     },
   );

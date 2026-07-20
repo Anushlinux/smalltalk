@@ -6,12 +6,35 @@ mod continuation;
 mod session_island;
 mod workload;
 
+#[cfg(target_os = "macos")]
+fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
+    use objc2_app_kit::{NSColor, NSWindow};
+    use tauri::Manager;
+
+    let window = app.get_webview_window("main").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "main window is unavailable")
+    })?;
+    let ns_window = window.ns_window().map_err(std::io::Error::other)? as *mut NSWindow;
+    let ns_window = unsafe { &*ns_window };
+    let background = NSColor::colorWithRed_green_blue_alpha(
+        245.0 / 255.0,
+        244.0 / 255.0,
+        241.0 / 255.0,
+        1.0,
+    );
+
+    unsafe { ns_window.setBackgroundColor(Some(&background)) };
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            set_main_window_background(app)?;
             capture::initialize_runtime_database(app.handle()).map_err(std::io::Error::other)?;
             session_island::init_session_island(app.handle().clone());
             capture::start_runtime_soak_harness(app.handle().clone())
@@ -67,6 +90,8 @@ pub fn run() {
             capture::get_continue_workstream_detail,
             capture::get_continue_decision,
             capture::get_continue_decision_trace,
+            capture::list_continue_history,
+            capture::get_continue_history_output,
             capture::add_continue_breadcrumb,
             capture::infer_continue_feedback,
             capture::record_continue_feedback,

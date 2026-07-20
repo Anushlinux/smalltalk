@@ -116,7 +116,7 @@ export type ContinuePublicProjection = {
   headline: string;
   memoryLine: string | null;
   resumeSurface: string | null;
-  openActionLabel: string;
+  openActionLabel: string | null;
   exactTargetNote: string | null;
 };
 
@@ -605,9 +605,7 @@ export function buildContinuePublicProjection(
 
   const openActionLabel = targetOpenable
     ? surface ? `Open ${surface}` : "Open continuation"
-    : answer.evidence_preview
-      ? surface ? `View ${surface} screen` : "View last screen"
-      : "Try Continue again";
+    : null;
 
   return {
     headline,
