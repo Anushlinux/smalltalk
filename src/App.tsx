@@ -5126,6 +5126,7 @@ function ContinuationAnswer({
             </button>
           </div>
         </div>
+        <ContinuationDetailsPlaceholder hasEvidence={hasEvidence} running={running} />
       </section>
     );
   }
