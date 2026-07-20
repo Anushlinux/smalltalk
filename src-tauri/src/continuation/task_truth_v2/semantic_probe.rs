@@ -10,7 +10,7 @@ use super::observation_packet::{
 };
 
 pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v5";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v6";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
@@ -25,6 +25,9 @@ const MAX_OUTPUT_TOKENS: usize = 6_000;
 const MAX_OBSERVATIONS_PER_BOUNDARY: usize = 6;
 const MAX_ACTIONS_PER_BOUNDARY: usize = 4;
 const MAX_DELTAS_PER_BOUNDARY: usize = 3;
+const MAX_PRIMARY_TASK_CHARS: usize = 72;
+const MAX_CURRENT_STEP_CHARS: usize = 96;
+const MAX_STATE_DETAIL_CHARS: usize = 160;
 const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
 const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
 const MAX_ARMED_CASE_AGE_MS: i64 = 15 * 60 * 1_000;
@@ -1436,7 +1439,8 @@ fn response_schema(
     slots: &BTreeMap<String, SupportSlot>,
     visits: &[RequestSurfaceVisit<'_>],
 ) -> Value {
-    let nullable_string = || json!({"anyOf":[{"type":"null"},{"type":"string","maxLength":320}]});
+    let nullable_string =
+        |max_length| json!({"anyOf":[{"type":"null"},{"type":"string","maxLength":max_length}]});
     let support_properties = SEMANTIC_FIELDS
         .iter()
         .map(|field| {
@@ -1500,10 +1504,10 @@ fn response_schema(
             "support_slots_by_field","missing_evidence","confidence_by_field","status"
         ],
         "properties":{
-            "primary_task":nullable_string(),
-            "current_step":nullable_string(),
-            "last_progress":nullable_string(),
-            "unfinished_state":nullable_string(),
+            "primary_task":nullable_string(MAX_PRIMARY_TASK_CHARS),
+            "current_step":nullable_string(MAX_CURRENT_STEP_CHARS),
+            "last_progress":nullable_string(MAX_STATE_DETAIL_CHARS),
+            "unfinished_state":nullable_string(MAX_STATE_DETAIL_CHARS),
             "visit_roles":{
                 "type":"object","additionalProperties":false,
                 "required":role_required,"properties":role_properties
@@ -1542,7 +1546,7 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
 }
 
 fn system_instruction() -> &'static str {
-    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, a qualified primary task using words such as likely or appears to be is allowed if it cites the relevant source and current images; do not invent a narrower purpose than those images support. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. current_step may describe the exact current surface and its relationship to earlier evidence. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
+    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, primary_task must be null unless the images support a concrete purpose without qualification; express uncertainty only in confidence_by_field and missing_evidence, never with words such as likely or appears to be in primary_task. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. primary_task is the main-card title: write 5 to 9 plain words when natural, allow a shorter natural title such as 'Fix Continue output status', never add filler, and never start it with Continue, Likely, or The user. Do not use ending punctuation or narrate an app window, captured screen, evidence, confidence, or analysis in primary_task. current_step must be a concrete activity phrase of at most 12 words. last_progress and unfinished_state must each be one plain sentence of at most 20 words. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -6080,8 +6084,34 @@ mod tests {
         assert!(instruction.contains("primary_task must be null"));
         assert!(instruction.contains("carried_into_current_surface"));
         assert!(instruction.contains("committed_input"));
-        assert!(instruction.contains("a qualified primary task"));
-        assert!(instruction.contains("do not invent a narrower purpose"));
+        assert!(instruction.contains("primary_task is the main-card title"));
+        assert!(instruction.contains("5 to 9 plain words"));
+        assert!(instruction.contains("at most 12 words"));
+        assert!(instruction.contains("at most 20 words"));
+        assert!(instruction.contains("express uncertainty only in confidence_by_field"));
+    }
+
+    #[test]
+    fn compact_response_schema_enforces_product_copy_limits() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        assert_eq!(
+            request.audit.request_schema,
+            "smalltalk.pftu_01.semantic_probe_request.v6"
+        );
+
+        for (field, max_length) in [
+            ("primary_task", MAX_PRIMARY_TASK_CHARS),
+            ("current_step", MAX_CURRENT_STEP_CHARS),
+            ("last_progress", MAX_STATE_DETAIL_CHARS),
+            ("unfinished_state", MAX_STATE_DETAIL_CHARS),
+        ] {
+            let pointer = format!("/text/format/schema/properties/{field}/anyOf/1/maxLength");
+            assert_eq!(
+                request.body.pointer(&pointer).and_then(Value::as_u64),
+                Some(max_length as u64),
+                "wrong compact-copy limit for {field}"
+            );
+        }
     }
 
     #[test]

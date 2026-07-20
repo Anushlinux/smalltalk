@@ -583,23 +583,7 @@ export function buildContinuePublicProjection(
   const action = publicClause(answer.next_action || answer.unfinished_state);
   const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
   const surface = publicClause(answer.where_summary) || null;
-
-  const destination = surface ? ` in ${surface}` : "";
-  const actionClause = action
-    ? ` to ${lowerFirst(stripLeadingTo(action))}`
-    : task
-      ? ` with ${task}`
-      : "";
-  const taskClause = action && task ? ` for ${task}` : "";
-  const headline = task || action
-    ? sentence(`Continue${destination}${actionClause}${taskClause}`)
-    : sentence(currentStep || progress || "Continue");
-
-  const memoryParts = [
-    task ? `You were working on ${task}` : null,
-    !task && currentStep ? currentStep : null,
-    progress ? lowerFirst(progress) : null,
-  ].filter((part): part is string => Boolean(part));
+  const headline = task || currentStep || action || progress || "Continue";
 
   const openActionLabel = targetOpenable
     ? surface ? `Open ${surface}` : "Open continuation"
@@ -607,13 +591,31 @@ export function buildContinuePublicProjection(
 
   return {
     headline,
-    memoryLine: memoryParts.length ? sentence(memoryParts.join("; ")) : null,
+    memoryLine: null,
     resumeSurface: surface,
     openActionLabel,
     exactTargetNote: targetOpenable || !surface
       ? null
       : "Exact task link not captured",
   };
+}
+
+export function buildContinueTaskTruthDetailRows(
+  answer: ContinueTaskTruthAnswer,
+): Array<[string, string]> {
+  const rows: Array<[string, string | null | undefined]> = [
+    ["What you were doing", answer.current_subtask || answer.task_summary],
+    [
+      "Where you left off",
+      [answer.last_meaningful_progress, answer.unfinished_state]
+        .filter(Boolean)
+        .join(" "),
+    ],
+    ["Continue in", answer.where_summary],
+    ["Next step", answer.next_action],
+  ];
+
+  return rows.filter((row): row is [string, string] => Boolean(row[1]?.trim()));
 }
 
 export function hasVisibleTaskTruthSemantics(
@@ -638,19 +640,6 @@ function publicClause(value?: string | null) {
     .trim()
     .replace(/[\s.!?;:]+$/, "")
     .replace(/\s+/g, " ");
-}
-
-function stripLeadingTo(value: string) {
-  return value.replace(/^to\s+/i, "");
-}
-
-function lowerFirst(value: string) {
-  return value ? `${value.charAt(0).toLowerCase()}${value.slice(1)}` : value;
-}
-
-function sentence(value: string) {
-  const trimmed = value.trim();
-  return trimmed ? `${trimmed}${/[.!?]$/.test(trimmed) ? "" : "."}` : "Continue.";
 }
 
 export function recentContextRoleLabel(

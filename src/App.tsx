@@ -32,6 +32,7 @@ import {
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthTarget,
   buildContinuePublicProjection,
+  buildContinueTaskTruthDetailRows,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
   hasVisibleTaskTruthSemantics,
@@ -3079,7 +3080,7 @@ function App() {
       <header className={`product-toolbar ${viewMode === "continue" ? "continue-toolbar" : ""}`}>
         {viewMode === "continue" ? (
           <h1 className="continue-greeting">
-            Hey Anushrut, get back into work with <kbd aria-label="Option">⌥</kbd>
+            Pick up where you left off <kbd aria-label="Option">⌥</kbd>
           </h1>
         ) : (
           <div>
@@ -4790,30 +4791,27 @@ function ContinuationAnswer({
     ? buildContinuePublicProjection(cardTaskTruthAnswer, canOpenResumeTarget)
     : null;
   const publicHeadline = publicProjection?.headline || workstreamLine;
-  const publicMemoryLine = publicProjection?.memoryLine || (
-    !noClearCurrentTask && lastStateLine ? sentenceCase(lastStateLine) : null
-  );
+  const publicMemoryLine = publicProjection
+    ? publicProjection.memoryLine
+    : !noClearCurrentTask && lastStateLine
+      ? sentenceCase(lastStateLine)
+      : null;
   const publicActionLabel = busyAction === "open_continue_target"
     ? "Opening"
     : publicProjection?.openActionLabel || actionState?.label || "Continue here";
   const detailSemanticRows = (
     cardTaskTruthAnswer
-      ? [
-          ["Return to", cardTaskTruthAnswer.where_summary],
-          ["Next step", cardTaskTruthAnswer.next_action],
-          ["What you were doing", cardTaskTruthAnswer.task_summary],
-          [
-            "Where you left it",
-            [
-              cardTaskTruthAnswer.last_meaningful_progress,
-              cardTaskTruthAnswer.unfinished_state,
-            ].filter(Boolean).join(" "),
-          ],
-        ]
+      ? buildContinueTaskTruthDetailRows(cardTaskTruthAnswer)
       : [
-          ["Return to", activityWhereLine],
-          ["What you were doing", currentFocusLine],
-          ["Where you left it", lastStateLine],
+          [
+            "What you were doing",
+            decision?.answer?.what_you_were_doing
+              || activityRecap?.primary_work_summary
+              || currentFocusLine,
+          ],
+          ["Where you left off", lastStateLine],
+          ["Continue in", activityWhereLine],
+          ["Next step", productState?.nextActionLine],
         ]
   ).filter((row): row is [string, string] => Boolean(row[1]?.trim()));
   const hasDetails = Boolean(
@@ -5025,9 +5023,9 @@ function ContinuationAnswer({
         <section className="answer-details-surface" aria-label="Continue details">
           <div className="context-heading">
             <div>
-              <h3>Where to continue</h3>
+              <h3>Continue details</h3>
             </div>
-            <p>Your return point, next step, and the path that led here.</p>
+            <p>What you were doing, where you left off, and what comes next.</p>
           </div>
           {detailSemanticRows.length > 0 ? (
             <dl className="answer-semantic-grid">
@@ -5043,7 +5041,7 @@ function ContinuationAnswer({
           {recentContext.length > 0 ? (
           <section className="answer-memory-section" aria-labelledby="travel-path-heading">
             <div className="answer-section-heading">
-              <span className="answer-section-label" id="travel-path-heading">App and page path</span>
+              <span className="answer-section-label" id="travel-path-heading">Recent trail</span>
               <small>Oldest to newest</small>
             </div>
             <ol className="answer-context-list">

@@ -6,6 +6,7 @@ import {
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
   buildContinuePublicProjection,
+  buildContinueTaskTruthDetailRows,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
   hasVisibleTaskTruthSemantics,
@@ -315,29 +316,48 @@ test("recent context compresses repeated shell visits without losing the latest 
   assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
 });
 
-test("public projection keeps screenshots as context and labels only safe open targets", () => {
+test("public projection uses the task title without repeating details in the hero", () => {
   const decision = authoritativeDecision();
   Object.assign(decision.task_truth_v2.answer, {
-    task_summary: "Smalltalk's always-on repair",
+    task_summary: "Fix Continue output status",
+    current_subtask: "Make new Continue answers shorter and clearer",
     where_summary: "Codex",
     next_action: "Finish the two manual checks",
     last_meaningful_progress: "The build and automated tests had already passed",
+    unfinished_state: "A fresh result still needs visual confirmation",
     evidence_preview: { frame_id: "frame-1" },
   });
 
   assert.deepEqual(
     buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false),
     {
-      headline: "Continue in Codex to finish the two manual checks for Smalltalk's always-on repair.",
-      memoryLine: "You were working on Smalltalk's always-on repair; the build and automated tests had already passed.",
+      headline: "Fix Continue output status",
+      memoryLine: null,
       resumeSurface: "Codex",
       openActionLabel: null,
       exactTargetNote: "Exact task link not captured",
     },
   );
   assert.equal(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false)
+      .headline.includes("Continue in"),
+    false,
+  );
+  assert.equal(
     buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), true).openActionLabel,
     "Open Codex",
+  );
+  assert.deepEqual(
+    buildContinueTaskTruthDetailRows(authoritativeTaskTruthAnswer(decision)),
+    [
+      ["What you were doing", "Make new Continue answers shorter and clearer"],
+      [
+        "Where you left off",
+        "The build and automated tests had already passed A fresh result still needs visual confirmation",
+      ],
+      ["Continue in", "Codex"],
+      ["Next step", "Finish the two manual checks"],
+    ],
   );
 });
 
@@ -388,8 +408,8 @@ test("field-limited model output remains visible instead of becoming the default
   assert.deepEqual(
     buildContinuePublicProjection(answer, false),
     {
-      headline: "Continue to the visible Continue card still needs confirmation.",
-      memoryLine: "Verify the repaired Continue output; the model response was parsed and locally admitted.",
+      headline: "Verify the repaired Continue output",
+      memoryLine: null,
       resumeSurface: null,
       openActionLabel: null,
       exactTargetNote: null,
