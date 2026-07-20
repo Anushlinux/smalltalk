@@ -3150,7 +3150,7 @@ function App() {
       <header className={`product-toolbar ${viewMode === "continue" ? "continue-toolbar" : ""}`}>
         {viewMode === "continue" ? (
           <h1 className="continue-greeting">
-            Pick up where you left off
+            Hey Anushrut, pick up where you left off
           </h1>
         ) : (
           <div>
@@ -3199,6 +3199,7 @@ function App() {
             selectedFrame={selectedFrame}
             imageData={imageData}
             openResult={continueOpenResult}
+            onStartMemory={() => void runAction("start_capture")}
             onOpenTarget={() => void openContinueTarget()}
             feedbackStatus={feedbackStatus}
             onRecordFeedback={(kind, options) => void recordContinueFeedback(kind, options)}
@@ -4841,6 +4842,7 @@ function ContinuationAnswer({
   imageData,
   openResult,
   feedbackStatus,
+  onStartMemory,
   onOpenTarget,
   onRecordFeedback,
   onUseAlternative,
@@ -4856,6 +4858,7 @@ function ContinuationAnswer({
   imageData: string | null;
   openResult: OpenResumePointResult | null;
   feedbackStatus: string | null;
+  onStartMemory: () => void;
   onOpenTarget: () => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
   onRevealVisualCue: (frameId?: string | null) => void;
@@ -5096,6 +5099,36 @@ function ContinuationAnswer({
     : running && !hasEvidence
       ? "Keep working. Smalltalk will surface a continuation when there is enough evidence."
       : "Smalltalk can answer from local evidence without stopping memory first.";
+  const showMemoryStartState = !running && (
+    !hasEvidence
+    || !decision
+    || noClearCurrentTask
+  );
+
+  if (showMemoryStartState) {
+    return (
+      <section className="continue-card continuation-answer empty memory-start" aria-label="Start local memory">
+        <div className="answer-shell">
+          <MosaicLeafBackground />
+          <div className="answer-hero memory-start-hero">
+            <h2>Keep your place</h2>
+            <span>
+              Smalltalk quietly remembers your work, so you can pick it back up later.
+            </span>
+            <button
+              className="memory-start-button"
+              type="button"
+              disabled={busyAction !== null}
+              aria-busy={busyAction === "start_capture"}
+              onClick={onStartMemory}
+            >
+              {busyAction === "start_capture" ? "Starting memory…" : "Start memory"}
+            </button>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   if (busyAction === "get_continue_decision") {
     return (
