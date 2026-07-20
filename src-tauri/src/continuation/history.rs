@@ -79,6 +79,9 @@ pub(crate) fn record_explicit_continue_output(
     if result.decision_id.trim().is_empty() {
         return Ok(false);
     }
+    if crate::session_island::continue_decision_is_failed_empty_refresh(result) {
+        return Ok(false);
+    }
     let output = product_facing_output(result, created_at_ms, origin);
     persist_continue_history_output(conn, &output)?;
     Ok(true)

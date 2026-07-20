@@ -798,6 +798,21 @@ export function compareContinueDecisionAdoption({
     return { adopt: true, reasonCodes: ["adopted:no_incumbent"] };
   }
 
+  const explicitRequest = challengerTrigger === "manual" || challengerTrigger === "island";
+  if (
+    explicitRequest &&
+    hasVisibleTaskTruthSemantics(authoritativeTaskTruthAnswer(incumbent)) &&
+    isFailedEmptySemanticRefresh(challenger)
+  ) {
+    return {
+      adopt: false,
+      reasonCodes: [
+        "rejected:explicit_refresh_failed_without_semantics",
+        "retained:last_usable_continue_answer",
+      ],
+    };
+  }
+
   const incumbentTask = adoptionTaskIdentity(incumbent);
   const challengerTask = adoptionTaskIdentity(challenger);
   const sameTask = Boolean(
@@ -805,7 +820,6 @@ export function compareContinueDecisionAdoption({
       challengerTask?.task_turn_id &&
       incumbentTask.task_turn_id === challengerTask.task_turn_id,
   );
-  const explicitManual = challengerTrigger === "manual";
   const reasons: string[] = [];
 
   if (
@@ -817,7 +831,7 @@ export function compareContinueDecisionAdoption({
     reasons.push("rejected:older_task_revision");
   }
 
-  if (!explicitManual) {
+  if (!explicitRequest) {
     const incumbentStatus = decisionTaskResolutionStatus(incumbent);
     const challengerStatus = decisionTaskResolutionStatus(challenger);
     const challengerEvidenceIsNewer = hasCausallyNewerEvidence(incumbent, challenger);
@@ -862,11 +876,26 @@ export function compareContinueDecisionAdoption({
       reasons.push("rejected:wording_source_downgrade");
     }
 
+    // An island press is an explicit Continue request. Its full decision may
+    // reach the React window through an event or startup hydration. Do not let
+    // a later quiet refresh replace that exact provider-backed answer; another
+    // explicit manual or island request is still allowed to replace it.
     if (
-      incumbentTrigger === "manual" &&
+      incumbentTrigger === "island" &&
+      hasProviderBackedVisibleTaskTruth(incumbent)
+    ) {
+      reasons.push("rejected:background_cannot_replace_explicit_island_answer");
+    }
+
+    if (
+      (incumbentTrigger === "manual" || incumbentTrigger === "island") &&
       reasons.length > 0
     ) {
-      reasons.push("retained:stronger_manual_result");
+      reasons.push(
+        incumbentTrigger === "island"
+          ? "retained:explicit_island_result"
+          : "retained:stronger_manual_result",
+      );
     }
   }
 
@@ -876,8 +905,39 @@ export function compareContinueDecisionAdoption({
   }
   return {
     adopt: true,
-    reasonCodes: [explicitManual ? "adopted:explicit_manual_result" : "adopted:quality_not_lower"],
+    reasonCodes: [
+      challengerTrigger === "manual"
+        ? "adopted:explicit_manual_result"
+        : challengerTrigger === "island"
+          ? "adopted:explicit_island_result"
+          : "adopted:quality_not_lower",
+    ],
   };
+}
+
+function hasProviderBackedVisibleTaskTruth(
+  decision: ContinueAdoptionComparableDecision,
+) {
+  const answer = authoritativeTaskTruthAnswer(decision);
+  return Boolean(
+    answer &&
+      hasVisibleTaskTruthSemantics(answer) &&
+      (answer.response_id?.trim() || answer.atomic_identity.model_response_id?.trim()),
+  );
+}
+
+function isFailedEmptySemanticRefresh(
+  decision: ContinueAdoptionComparableDecision,
+) {
+  const answer = decision.task_truth_v2?.answer || null;
+  const diagnosticStatus = normalizeToken(
+    decision.task_truth_v2?.inference_diagnostic?.status,
+  );
+  return Boolean(
+    diagnosticStatus &&
+      diagnosticStatus !== "success" &&
+      !hasVisibleTaskTruthSemantics(answer),
+  );
 }
 
 function decisionTaskResolutionStatus(

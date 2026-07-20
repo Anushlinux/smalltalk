@@ -763,7 +763,7 @@ test("genuinely newer stronger background task can replace the older answer", ()
   });
 });
 
-test("weaker native-island update also retains the stronger manual answer", () => {
+test("explicit native-island result replaces the previous main-window answer", () => {
   const incumbent = adoptionDecision();
   const challenger = adoptionDecision({
     decision_id: "decision-island",
@@ -782,8 +782,117 @@ test("weaker native-island update also retains the stronger manual answer", () =
     incumbentTrigger: "manual",
     challengerTrigger: "island",
   });
+  assert.deepEqual(comparison, {
+    adopt: true,
+    reasonCodes: ["adopted:explicit_island_result"],
+  });
+});
+
+test("failed explicit island refresh keeps the last usable provider answer", () => {
+  const incumbent = authoritativeDecision({
+    overrides: { decision_id: "decision-last-usable" },
+  });
+  incumbent.task_truth_v2.answer.current_subtask =
+    "You were working in Codex on Smalltalk, repairing Continue output validation.";
+  const challenger = authoritativeDecision({
+    status: "unresolved",
+    overrides: { decision_id: "decision-failed-island" },
+  });
+  Object.assign(challenger.task_truth_v2.answer, {
+    task_summary: null,
+    task_object: null,
+    current_subtask: null,
+    last_meaningful_progress: null,
+    unfinished_state: null,
+    next_action: null,
+    where_summary: null,
+  });
+  challenger.task_truth_v2.inference_diagnostic = {
+    status: "support_slot_validation_failure",
+    origin: "live_cloud",
+  };
+
+  assert.deepEqual(
+    compareContinueDecisionAdoption({
+      incumbent,
+      challenger,
+      incumbentTrigger: "island",
+      challengerTrigger: "island",
+    }),
+    {
+      adopt: false,
+      reasonCodes: [
+        "rejected:explicit_refresh_failed_without_semantics",
+        "retained:last_usable_continue_answer",
+      ],
+    },
+  );
+});
+
+test("failed explicit manual preflight also keeps the last usable answer", () => {
+  const incumbent = authoritativeDecision();
+  const challenger = authoritativeDecision({ status: "unresolved" });
+  Object.assign(challenger.task_truth_v2.answer, {
+    task_summary: null,
+    task_object: null,
+    current_subtask: null,
+    last_meaningful_progress: null,
+    unfinished_state: null,
+    next_action: null,
+    where_summary: null,
+  });
+  challenger.task_truth_v2.inference_diagnostic = {
+    status: "request_not_built",
+    origin: "none",
+  };
+
+  const comparison = compareContinueDecisionAdoption({
+    incumbent,
+    challenger,
+    incumbentTrigger: "manual",
+    challengerTrigger: "manual",
+  });
+
   assert.equal(comparison.adopt, false);
-  assert.ok(comparison.reasonCodes.includes("retained:stronger_manual_result"));
+  assert.ok(comparison.reasonCodes.includes("retained:last_usable_continue_answer"));
+});
+
+test("background refresh cannot replace an explicit provider-backed island answer", () => {
+  const incumbent = authoritativeDecision({
+    status: "unresolved",
+    overrides: { decision_id: "decision-island" },
+  });
+  Object.assign(incumbent.task_truth_v2.answer, {
+    current_subtask:
+      "You were in Codex on Smalltalk, validating Continue's task-title behavior after implementing output-clarity fixes.",
+    task_summary: null,
+    last_meaningful_progress: "The clearer output was visible in the island",
+    unfinished_state: "The main window still needed to show the same answer",
+    response_id: "provider-response-one",
+  });
+  const challenger = adoptionDecision({
+    decision_id: "decision-background-no-clear",
+    request_trigger: "background",
+    task_resolution_status: "no_clear_current_task",
+    current_task_turn: null,
+    continue_output_mode: "no_clear_continuation",
+    task_truth_v2: null,
+  });
+
+  const comparison = compareContinueDecisionAdoption({
+    incumbent,
+    challenger,
+    incumbentTrigger: "island",
+    challengerTrigger: "background",
+  });
+
+  assert.equal(comparison.adopt, false);
+  assert.ok(
+    comparison.reasonCodes.includes(
+      "rejected:background_cannot_replace_explicit_island_answer",
+    ),
+  );
+  assert.ok(comparison.reasonCodes.includes("retained:explicit_island_result"));
 });
 
 test("explicit manual refresh may replace an old answer with an honest no-clear state", () => {

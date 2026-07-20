@@ -20062,7 +20062,10 @@ fn should_skip_heavy_capture_for_budget(
 }
 
 fn is_manual_or_start_capture(capture_trigger: &str) -> bool {
-    matches!(capture_trigger, "manual" | "session_start")
+    matches!(
+        capture_trigger,
+        "manual" | "manual_continue_boundary" | "session_start"
+    )
 }
 
 fn is_important_capture_trigger(capture_trigger: &str) -> bool {
@@ -31557,6 +31560,39 @@ mod tests {
 
         assert_eq!(decision.as_deref(), Some("smalltalk_self_observation"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manual_continue_boundary_is_never_blocked_by_background_capture_budgets() {
+        let conn = Connection::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "smalltalk-manual-continue-budget-test-{}",
+            now_millis()
+        ));
+        let paths = CapturePaths {
+            root_dir: root.clone(),
+            snapshot_dir: root.join("snapshots"),
+            db_path: root.join("smalltalk-capture.sqlite"),
+        };
+        let context = AccessibilityContext::default();
+        let fingerprint = SemanticFingerprint::from_context(&context);
+
+        assert!(is_manual_or_start_capture("manual_continue_boundary"));
+        assert!(!is_manual_or_start_capture("accessibility_change"));
+        assert_eq!(
+            should_skip_heavy_capture_for_budget(
+                &conn,
+                &paths,
+                "session-a",
+                "manual_continue_boundary",
+                now_millis(),
+                &context,
+                &fingerprint,
+                None,
+            )
+            .unwrap(),
+            None,
+        );
     }
 
     #[test]

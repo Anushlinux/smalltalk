@@ -1535,6 +1535,7 @@ function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [continueMemory, setContinueMemory] = useState<ContinueMemoryStatus | null>(null);
   const [continueDecision, setContinueDecision] = useState<ContinueDecisionResult | null>(null);
+  const [islandDecisionHydrationComplete, setIslandDecisionHydrationComplete] = useState(false);
   const [continueDecisionFrameCount, setContinueDecisionFrameCount] = useState<number | null>(null);
   const [continueDecisionEvidenceSnapshot, setContinueDecisionEvidenceSnapshot] =
     useState<ContinueEvidenceSnapshot | null>(null);
@@ -1860,6 +1861,14 @@ function App() {
           );
           setBackgroundContinueError(
             "A quiet refresh returned a weaker answer. Keeping the stronger Continue answer.",
+          );
+        } else if (
+          comparison.reasonCodes.includes(
+            "rejected:explicit_refresh_failed_without_semantics",
+          )
+        ) {
+          setContinueError(
+            "Couldn’t refresh Continue. Keeping the previous answer instead.",
           );
         }
         return false;
@@ -2559,7 +2568,38 @@ function App() {
   }, [diagnosticsOpen, isDeleting, refreshContinueMemory, refreshStatus, refreshTimeline, refreshWorkstreams, runSearch, status.running]);
 
   useEffect(() => {
+    let disposed = false;
+
+    const hydrateLatestIslandDecision = async () => {
+      if (continueDecisionRef.current) {
+        if (!disposed) setIslandDecisionHydrationComplete(true);
+        return;
+      }
+      try {
+        const decision = await invoke<ContinueDecisionResult | null>(
+          "get_latest_island_continue_decision",
+        );
+        if (!disposed && decision) {
+          await applyContinueDecision(decision, "island");
+        }
+      } catch {
+        // The remembered decision is an optimization for a missed native
+        // event. If none is available, the normal startup request remains the
+        // source of truth.
+      } finally {
+        if (!disposed) setIslandDecisionHydrationComplete(true);
+      }
+    };
+
+    void hydrateLatestIslandDecision();
+    return () => {
+      disposed = true;
+    };
+  }, [applyContinueDecision]);
+
+  useEffect(() => {
     if (
+      !islandDecisionHydrationComplete ||
       autoContinueRef.current ||
       busyAction !== null ||
       continueDecision ||
@@ -2569,7 +2609,13 @@ function App() {
     }
     autoContinueRef.current = true;
     void runContinueDecision({ writeAudit: false, trigger: "startup" });
-  }, [busyAction, continueDecision, runContinueDecision, status.frame_count]);
+  }, [
+    busyAction,
+    continueDecision,
+    islandDecisionHydrationComplete,
+    runContinueDecision,
+    status.frame_count,
+  ]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {

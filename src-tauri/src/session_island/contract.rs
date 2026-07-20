@@ -82,7 +82,7 @@ fn force_task_truth_unresolved(
     answer.inference_status = inference_status.into();
 }
 
-fn has_visible_task_truth_semantics(
+pub(super) fn has_visible_task_truth_semantics(
     answer: &crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1,
 ) -> bool {
     [
@@ -104,6 +104,25 @@ fn has_visible_task_truth_semantics(
     .into_iter()
     .flatten()
     .any(|value| !value.trim().is_empty())
+}
+
+pub(super) fn decision_has_visible_task_truth_semantics(decision: &ContinueDecisionResult) -> bool {
+    decision
+        .task_truth_v2
+        .answer
+        .as_ref()
+        .is_some_and(has_visible_task_truth_semantics)
+}
+
+pub(super) fn decision_is_failed_empty_semantic_refresh(decision: &ContinueDecisionResult) -> bool {
+    if decision_has_visible_task_truth_semantics(decision) {
+        return false;
+    }
+    decision
+        .task_truth_v2
+        .inference_diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| diagnostic.status.trim() != "success")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1332,6 +1351,51 @@ mod tests {
         decision.direct_target_policy.openable = true;
         decision.direct_target_policy.target_identity_confident = true;
         decision
+    }
+
+    fn failed_inference_diagnostic(
+        status: &str,
+    ) -> crate::continuation::task_truth_v2::production::TaskTruthInferenceDiagnosticV1 {
+        crate::continuation::task_truth_v2::production::TaskTruthInferenceDiagnosticV1 {
+            schema: "smalltalk.task_truth_inference_diagnostic.v1".into(),
+            status: status.into(),
+            origin: "live_cloud".into(),
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            request_id: Some("request-test".into()),
+            provider_request_id: Some("provider-request-test".into()),
+            response_id: Some("response-test".into()),
+            provider_attempt_count: 1,
+            latency_ms: 100,
+            image_count: 2,
+            image_bytes: 1_024,
+            estimated_tokens: 500,
+            input_tokens: Some(400),
+            output_tokens: Some(100),
+            total_tokens: Some(500),
+            estimated_cost_usd: None,
+            verification_status: "support_slot_validation_failure".into(),
+            selected_hypothesis_id: None,
+        }
+    }
+
+    #[test]
+    fn failed_empty_semantic_refresh_is_distinct_from_a_useful_partial_answer() {
+        let mut failed = base_decision();
+        failed.task_truth_v2.answer = Some(Default::default());
+        failed.task_truth_v2.inference_diagnostic = Some(failed_inference_diagnostic(
+            "support_slot_validation_failure",
+        ));
+        assert!(decision_is_failed_empty_semantic_refresh(&failed));
+
+        failed
+            .task_truth_v2
+            .answer
+            .as_mut()
+            .unwrap()
+            .current_subtask = Some("You were validating Continue output in Smalltalk.".into());
+        assert!(decision_has_visible_task_truth_semantics(&failed));
+        assert!(!decision_is_failed_empty_semantic_refresh(&failed));
     }
 
     #[test]

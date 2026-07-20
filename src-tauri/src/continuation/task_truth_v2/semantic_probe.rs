@@ -10,7 +10,7 @@ use super::observation_packet::{
 };
 
 pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v7";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v8";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
@@ -937,20 +937,27 @@ fn selected_context_image_visits(
     packet: &ObservationPacketV2,
     cutoff: i64,
 ) -> Vec<&super::observation_packet::SurfaceVisitV2> {
-    let current_identity = packet
+    let current_visit = packet
         .surface_timeline
         .iter()
-        .find(|visit| visit.is_current)
-        .map(surface_visit_identity);
+        .find(|visit| visit.is_current);
+    let current_identity = current_visit.map(surface_visit_identity);
     let mut best_by_surface = BTreeMap::<String, &super::observation_packet::SurfaceVisitV2>::new();
     for visit in &packet.surface_timeline {
         let identity = surface_visit_identity(visit);
         let Some(frame) = visit.representative_frame.as_ref() else {
             continue;
         };
+        let is_grounded_prior_visit_to_current_surface = current_visit.is_some_and(|current| {
+            current.revisited
+                && visit.sequence_index < current.sequence_index
+                && current_identity.as_deref() == Some(identity.as_str())
+                && visit.engagement_score > current.engagement_score
+        });
         if visit.is_current
             || visit.private
-            || current_identity.as_deref() == Some(identity.as_str())
+            || (current_identity.as_deref() == Some(identity.as_str())
+                && !is_grounded_prior_visit_to_current_surface)
             || frame.observed_at_ms > cutoff
             || !frame.model_eligible
             || is_private_status(Some(&frame.privacy_status))
@@ -1550,17 +1557,19 @@ fn system_instruction() -> &'static str {
 
 Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. App names, hostnames, duration, recency, and interaction count prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task, and it is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null.
 
+When the final boundary is a momentary switch back to a previously engaged surface, use the earlier same-surface context image together with the current image. Cite both when they jointly establish the continuing task. Do not treat a return to established work as an unrelated final-screen task, and do not use the return relationship alone to invent task meaning.
+
 carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, primary_task must be null unless the images support a concrete purpose without qualification. Express uncertainty only in confidence_by_field and missing_evidence, never with words such as likely or appears to be in primary_task.
 
 Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null.
 
 primary_task is the compact task title used by history and the native island. Write 5 to 9 plain words when natural, allow a shorter natural title such as 'Fix Continue output status', never add filler, and never start it with Continue, Likely, or The user. Do not use ending punctuation or narrate an app window, captured screen, evidence, confidence, or analysis in primary_task. A visible conversation, thread, or task title is only one clue. Do not copy it as the whole task when the conversation body or surrounding images establish the broader product purpose.
 
-current_step is the human-facing main answer. When primary_task is non-null, write one standalone second-person sentence, normally 14 to 24 words and never more than 160 characters. Start with 'You were' when natural. Include the grounded workspace or application, project or product, concrete purpose, and immediate activity when they are visibly supported. The sentence must make sense without a heading or the compact primary_task title. When primary_task is null, current_step may state only directly observed activity and must make the uncertainty plain, for example: 'You were in Codex with Smalltalk open, but the specific task was not visible.'
+current_step is the human-facing main answer. When primary_task is non-null, write one standalone second-person sentence, normally 10 to 20 words and never more than 160 characters. Start with 'You were' when natural. State the project or product and what the person was trying to do, using everyday words and one clear main clause. Mention the app only when it helps the person recognize the work. Put completed work in last_progress and remaining work in unfinished_state instead of cramming status details into current_step. Prefer direct verbs such as fixing, testing, writing, comparing, or checking. Avoid release-report wording and abstract phrases such as 'validating output clarity', 'after implementation', 'verification checks', 'live validation', and 'remained unfinished' when a common verb says the same thing. For example, prefer 'You were testing whether Smalltalk clearly explains what to continue' over 'You were validating Smalltalk's Continue output clarity after implementation.' The sentence must make sense without a heading or the compact primary_task title. When primary_task is null, current_step may state only directly observed activity and must make the uncertainty plain, for example: 'You were in Codex with Smalltalk open, but the specific task was not visible.'
 
-Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing Recent Trail copy: describe what the person did and whether it was primary work, support, a detour, an interruption, or a return. Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
+Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing Recent Trail copy: use a short, everyday description of what the person did and whether it was primary work, support, a detour, an interruption, or a return. Prefer wording such as 'You checked the API docs' or 'You briefly switched to email.' Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
 
-last_progress and unfinished_state must each be one plain sentence of at most 20 words. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
+last_progress and unfinished_state must each be one plain sentence of at most 20 words. Use direct, everyday wording. Prefer 'The code and automated checks were done' over 'The implementation completed with verification checks passing.' Prefer 'You still needed to restart the app and test Continue' over 'Live validation remained unfinished.' Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -4592,6 +4601,97 @@ mod tests {
     }
 
     #[test]
+    fn momentary_return_includes_the_earlier_engaged_same_surface_image() {
+        let mut packet = inkling_brief_codex_switch_packet();
+        let prior_codex = named_frame(
+            52,
+            1_784_162_150_000,
+            EvidencePartitionV2::Support,
+            "ChatGPT",
+            "com.openai.codex",
+            Some(747_444),
+            None,
+        );
+        packet.semantic_keyframes.insert(0, prior_codex.clone());
+        packet.surface_timeline.insert(
+            0,
+            SurfaceVisitV2 {
+                sequence_index: 0,
+                app_label: "ChatGPT".into(),
+                site_hostname: None,
+                first_observed_at_ms: prior_codex.observed_at_ms - 30_000,
+                last_observed_at_ms: prior_codex.observed_at_ms,
+                is_current: false,
+                revisited: false,
+                private: false,
+                interaction_count: 40,
+                frame_count: 3,
+                engagement_score: 40_450,
+                committed_input: true,
+                carried_into_current_surface: false,
+                evidence_refs: vec![prior_codex.frame_id.clone()],
+                representative_frame: Some(prior_codex),
+            },
+        );
+        packet
+            .surface_timeline
+            .iter_mut()
+            .find(|visit| visit.is_current)
+            .unwrap()
+            .revisited = true;
+
+        let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
+        let prior_slot = request
+            .slots
+            .values()
+            .find(|slot| slot.category == SupportCategory::ContextImage && slot.record_id == "52")
+            .expect("earlier engaged Codex context image")
+            .slot
+            .clone();
+        let current_slot = latest_slot(&request, SupportCategory::ImageAfter);
+        assert!(request.audit.supplied_image_slots.contains(&prior_slot));
+        assert!(system_instruction().contains(
+            "use the earlier same-surface context image together with the current image"
+        ));
+
+        let supports = vec![prior_slot, current_slot];
+        let proposed = ProbeModelOutput {
+            primary_task: Some("Fix Continue output status".into()),
+            current_step: Some(
+                "You were in Codex updating Smalltalk's Continue output handling and validating the repaired result."
+                    .into(),
+            ),
+            last_progress: Some("The Continue presentation checks passed.".into()),
+            unfinished_state: Some("Live validation still remained.".into()),
+            visit_roles: visit_roles(&request),
+            support_slots_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), supports.clone()))
+                .collect(),
+            missing_evidence: Vec::new(),
+            confidence_by_field: SEMANTIC_FIELDS
+                .iter()
+                .map(|field| ((*field).into(), 0.95))
+                .collect(),
+            status: ProbeResolutionStatus::Resolved,
+        };
+
+        let (admitted, issues) = admit_output(&packet, &request, proposed);
+
+        assert_eq!(
+            admitted.primary_task.as_deref(),
+            Some("Fix Continue output status")
+        );
+        assert!(admitted.current_step.is_some());
+        assert!(admitted.last_progress.is_some());
+        assert!(admitted.unfinished_state.is_some());
+        assert!(!issues.iter().any(|issue| {
+            issue.contains("passive_evidence_cannot_establish_primary_task")
+                || issue.contains("depends_on_rejected_momentary_primary_task")
+        }));
+    }
+
+    #[test]
     fn inkling_fixture_rejects_codex_only_task_state_and_primary_role() {
         let packet = inkling_brief_codex_switch_packet();
         let request = build_probe_request(&packet, DEFAULT_LUNA_MODEL).expect("request");
@@ -6101,16 +6201,24 @@ mod tests {
         assert!(instruction.contains("primary_task is the compact task title"));
         assert!(instruction.contains("5 to 9 plain words"));
         assert!(instruction.contains("current_step is the human-facing main answer"));
-        assert!(instruction.contains("14 to 24 words"));
+        assert!(instruction.contains("10 to 20 words"));
         assert!(instruction.contains("never more than 160 characters"));
         assert!(instruction.contains("Start with 'You were' when natural"));
+        assert!(instruction.contains("using everyday words and one clear main clause"));
+        assert!(instruction.contains("instead of cramming status details into current_step"));
+        assert!(instruction.contains("Avoid release-report wording"));
+        assert!(instruction
+            .contains("You were testing whether Smalltalk clearly explains what to continue"));
         assert!(instruction.contains("conversation, thread, or task title is only one clue"));
         assert!(instruction.contains("specific task was not visible"));
         assert!(
             instruction.contains("relationship_to_primary_task is user-facing Recent Trail copy")
         );
+        assert!(instruction.contains("You briefly switched to email"));
         assert!(instruction.contains("Do not say 'this image shows'"));
         assert!(instruction.contains("at most 20 words"));
+        assert!(instruction.contains("The code and automated checks were done"));
+        assert!(instruction.contains("You still needed to restart the app and test Continue"));
         assert!(instruction.contains("Express uncertainty only in confidence_by_field"));
     }
 
@@ -6119,7 +6227,7 @@ mod tests {
         let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
         assert_eq!(
             request.audit.request_schema,
-            "smalltalk.pftu_01.semantic_probe_request.v7"
+            "smalltalk.pftu_01.semantic_probe_request.v8"
         );
         assert_eq!(MAX_CURRENT_STEP_CHARS, 160);
 

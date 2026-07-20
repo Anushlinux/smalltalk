@@ -29,6 +29,8 @@ static EXPANDED: AtomicBool = AtomicBool::new(false);
 #[allow(dead_code)]
 static LAST_CLOUD_RESUME_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CONTINUE_DECISION_ID: Mutex<Option<String>> = Mutex::new(None);
+static LAST_CONTINUE_DECISION: Mutex<Option<crate::continuation::ContinueDecisionResult>> =
+    Mutex::new(None);
 static LAST_CONTINUE_ISLAND_STATE: Mutex<Option<RememberedContinueIslandState>> = Mutex::new(None);
 
 #[derive(Debug, Clone)]
@@ -789,6 +791,15 @@ pub fn get_island_continue_state(
 }
 
 #[tauri::command]
+pub fn get_latest_island_continue_decision(
+    app: AppHandle,
+    state: tauri::State<crate::capture::CaptureState>,
+) -> Result<Option<crate::continuation::ContinueDecisionResult>, String> {
+    let status = crate::capture::capture_status(app, state)?;
+    Ok(latest_island_continue_decision_for_status(&status))
+}
+
+#[tauri::command]
 pub fn perform_island_continue_action(
     app: AppHandle,
     state: tauri::State<crate::capture::CaptureState>,
@@ -1244,8 +1255,21 @@ fn continue_from_island() {
                 let mut snapshot =
                     snapshot_from_status(&next_status, SessionIslandState::ResumeReady);
                 if let Some(decision) = gateway_result.decision.as_ref() {
-                    apply_continue_decision_to_snapshot(&mut snapshot, decision);
-                    let _ = app.emit("smalltalk-continue-updated", decision.clone());
+                    let retained_decision = continue_decision_is_failed_empty_refresh(decision)
+                        .then(remembered_continue_decision)
+                        .flatten()
+                        .filter(contract::decision_has_visible_task_truth_semantics);
+                    let decision_to_present = retained_decision.as_ref().unwrap_or(decision);
+                    apply_continue_decision_to_snapshot(
+                        &mut snapshot,
+                        decision_to_present,
+                        retained_decision.is_none(),
+                    );
+                    if retained_decision.is_some() {
+                        snapshot.resume_warning =
+                            Some("Couldn’t refresh Continue; keeping the previous answer.".into());
+                    }
+                    let _ = app.emit("smalltalk-continue-updated", decision_to_present.clone());
                 } else {
                     apply_island_continue_state_to_snapshot(&mut snapshot, &gateway_result.state);
                 }
@@ -1345,6 +1369,7 @@ fn island_continue_decision_request() -> crate::continuation::ContinueDecisionRe
 fn apply_continue_decision_to_snapshot(
     snapshot: &mut SessionIslandSnapshot,
     decision: &crate::continuation::ContinueDecisionResult,
+    remember: bool,
 ) {
     let decision_updated_at_ms = now_millis();
     let freshness = IslandFreshness {
@@ -1391,13 +1416,21 @@ fn apply_continue_decision_to_snapshot(
         .or_else(|| island_state.warnings.first())
         .and_then(|warning| clean_one_line(Some(warning)));
     snapshot.island_continue_state = Some(island_state.clone());
-    remember_continue_decision_from_snapshot(
-        decision,
-        snapshot,
-        snapshot.continue_freshness.clone().unwrap_or_default(),
-        continue_openable,
-        island_state,
-    );
+    if remember {
+        remember_continue_decision_from_snapshot(
+            decision,
+            snapshot,
+            snapshot.continue_freshness.clone().unwrap_or_default(),
+            continue_openable,
+            island_state,
+        );
+    }
+}
+
+pub(crate) fn continue_decision_is_failed_empty_refresh(
+    decision: &crate::continuation::ContinueDecisionResult,
+) -> bool {
+    contract::decision_is_failed_empty_semantic_refresh(decision)
 }
 
 fn apply_island_continue_state_to_snapshot(
@@ -2090,6 +2123,40 @@ fn open_continue_target_from_island(
 
 fn remember_continue_decision(decision: &crate::continuation::ContinueDecisionResult) {
     remember_continue_decision_id(&decision.decision_id);
+    if let Ok(mut slot) = LAST_CONTINUE_DECISION.lock() {
+        *slot = Some(decision.clone());
+    }
+}
+
+fn latest_island_continue_decision_for_status(
+    status: &CaptureStatus,
+) -> Option<crate::continuation::ContinueDecisionResult> {
+    let remembered = LAST_CONTINUE_ISLAND_STATE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())?;
+    let decision = LAST_CONTINUE_DECISION
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())?;
+    let status_session_id = status
+        .active_session
+        .as_ref()
+        .or(status.latest_session.as_ref())
+        .map(|session| session.id.as_str())
+        .or_else(|| {
+            status
+                .latest_frame
+                .as_ref()
+                .and_then(|frame| frame.session_id.as_deref())
+        });
+
+    if remembered.decision_id != decision.decision_id
+        || remembered.session_id.as_deref() != status_session_id
+    {
+        return None;
+    }
+    Some(decision)
 }
 
 fn remember_continue_decision_from_snapshot(
@@ -2141,6 +2208,13 @@ fn remember_continue_decision_id(decision_id: &str) {
 
 fn remembered_continue_decision_id() -> Option<String> {
     LAST_CONTINUE_DECISION_ID
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn remembered_continue_decision() -> Option<crate::continuation::ContinueDecisionResult> {
+    LAST_CONTINUE_DECISION
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
