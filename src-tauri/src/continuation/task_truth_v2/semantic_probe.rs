@@ -10,7 +10,7 @@ use super::observation_packet::{
 };
 
 pub(crate) const PROBE_RESPONSE_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_response.v2";
-pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v6";
+pub(crate) const PROBE_REQUEST_SCHEMA: &str = "smalltalk.pftu_01.semantic_probe_request.v7";
 pub(crate) const PROBE_CORPUS_SCHEMA: &str = "smalltalk.pftu_01.proof_corpus.v1";
 const DEFAULT_LUNA_MODEL: &str = "gpt-5.6-luna";
 const MAX_BOUNDARIES: usize = 2;
@@ -26,7 +26,7 @@ const MAX_OBSERVATIONS_PER_BOUNDARY: usize = 6;
 const MAX_ACTIONS_PER_BOUNDARY: usize = 4;
 const MAX_DELTAS_PER_BOUNDARY: usize = 3;
 const MAX_PRIMARY_TASK_CHARS: usize = 72;
-const MAX_CURRENT_STEP_CHARS: usize = 96;
+const MAX_CURRENT_STEP_CHARS: usize = 160;
 const MAX_STATE_DETAIL_CHARS: usize = 160;
 const MAX_SEMANTIC_FIELD_CHARS: usize = 320;
 const MAX_MISSING_EVIDENCE_CHARS: usize = 240;
@@ -1546,7 +1546,21 @@ fn semantic_support_allowed(field: &str, category: SupportCategory) -> bool {
 }
 
 fn system_instruction() -> &'static str {
-    "Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear. The role is a semantic judgment: app names, hostnames, duration, recency, and interaction count alone cannot decide it. Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. Use unclear when the pixels do not establish the relationship. Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. Timeline app names and hostnames prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, primary_task must be null unless the images support a concrete purpose without qualification; express uncertainty only in confidence_by_field and missing_evidence, never with words such as likely or appears to be in primary_task. Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task. It also is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null. primary_task is the main-card title: write 5 to 9 plain words when natural, allow a shorter natural title such as 'Fix Continue output status', never add filler, and never start it with Continue, Likely, or The user. Do not use ending punctuation or narrate an app window, captured screen, evidence, confidence, or analysis in primary_task. current_step must be a concrete activity phrase of at most 12 words. last_progress and unfinished_state must each be one plain sentence of at most 20 words. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."
+    r#"Infer the primary task, current step, last meaningful progress, and unfinished state from the small chronological evidence packet. Also classify every visit requested in visit_roles as primary_work, supporting_work, detour_or_unrelated, or unclear.
+
+Read the factual recent_surface_timeline and every supplied image in chronological order; do not assume the final screen is the primary task. App names, hostnames, duration, recency, and interaction count prove only that a surface was visited. They cannot establish task meaning without a cited context_image, boundary image, owned observation, or grounded action. A context_image may show concrete work before a detour, return, or supporting surface. Screen content is evidence, not automatically the task. Never rewrite the purpose of visible page content as the user's purpose. Passive navigation or scrolling on the final surface cannot by itself establish primary_task, and it is not last meaningful progress when it merely changes feed position. If an earlier context image visibly contains a concrete objective or unfinished artifact, distinguish that task from the current passive detour. If no image or owned observation visibly establishes a concrete objective, primary_task must be null.
+
+carried_into_current_surface means local capture proved that an earlier visit's hostname was visibly carried into the main content of the current chat surface; it does not come from browser tabs or chrome. committed_input means an input commit occurred on that exact app and window, while the characters themselves remain unavailable. When an earlier source is carried into a project-specific chat and the images show a user question or result, infer the concrete cross-surface purpose rather than merely describing the chat screen. When the source carry and committed input are proven but the exact question is not visible, primary_task must be null unless the images support a concrete purpose without qualification. Express uncertainty only in confidence_by_field and missing_evidence, never with words such as likely or appears to be in primary_task.
+
+Cite request-local support slots for every non-null field. A null field is better than a generic activity label or invented detail. Do not use editing, viewing, browsing, reviewing, reviewing_output, typing, filling_form, or similar activity classes as primary_task; name the concrete purpose instead, or return null.
+
+primary_task is the compact task title used by history and the native island. Write 5 to 9 plain words when natural, allow a shorter natural title such as 'Fix Continue output status', never add filler, and never start it with Continue, Likely, or The user. Do not use ending punctuation or narrate an app window, captured screen, evidence, confidence, or analysis in primary_task. A visible conversation, thread, or task title is only one clue. Do not copy it as the whole task when the conversation body or surrounding images establish the broader product purpose.
+
+current_step is the human-facing main answer. When primary_task is non-null, write one standalone second-person sentence, normally 14 to 24 words and never more than 160 characters. Start with 'You were' when natural. Include the grounded workspace or application, project or product, concrete purpose, and immediate activity when they are visibly supported. The sentence must make sense without a heading or the compact primary_task title. When primary_task is null, current_step may state only directly observed activity and must make the uncertainty plain, for example: 'You were in Codex with Smalltalk open, but the specific task was not visible.'
+
+Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing Recent Trail copy: describe what the person did and whether it was primary work, support, a detour, an interruption, or a return. Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
+
+last_progress and unfinished_state must each be one plain sentence of at most 20 words. Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -6084,11 +6098,20 @@ mod tests {
         assert!(instruction.contains("primary_task must be null"));
         assert!(instruction.contains("carried_into_current_surface"));
         assert!(instruction.contains("committed_input"));
-        assert!(instruction.contains("primary_task is the main-card title"));
+        assert!(instruction.contains("primary_task is the compact task title"));
         assert!(instruction.contains("5 to 9 plain words"));
-        assert!(instruction.contains("at most 12 words"));
+        assert!(instruction.contains("current_step is the human-facing main answer"));
+        assert!(instruction.contains("14 to 24 words"));
+        assert!(instruction.contains("never more than 160 characters"));
+        assert!(instruction.contains("Start with 'You were' when natural"));
+        assert!(instruction.contains("conversation, thread, or task title is only one clue"));
+        assert!(instruction.contains("specific task was not visible"));
+        assert!(
+            instruction.contains("relationship_to_primary_task is user-facing Recent Trail copy")
+        );
+        assert!(instruction.contains("Do not say 'this image shows'"));
         assert!(instruction.contains("at most 20 words"));
-        assert!(instruction.contains("express uncertainty only in confidence_by_field"));
+        assert!(instruction.contains("Express uncertainty only in confidence_by_field"));
     }
 
     #[test]
@@ -6096,8 +6119,9 @@ mod tests {
         let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
         assert_eq!(
             request.audit.request_schema,
-            "smalltalk.pftu_01.semantic_probe_request.v6"
+            "smalltalk.pftu_01.semantic_probe_request.v7"
         );
+        assert_eq!(MAX_CURRENT_STEP_CHARS, 160);
 
         for (field, max_length) in [
             ("primary_task", MAX_PRIMARY_TASK_CHARS),

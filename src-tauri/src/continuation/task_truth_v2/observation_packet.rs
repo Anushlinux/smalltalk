@@ -816,7 +816,10 @@ fn select_keyframes(
     selected
 }
 
-fn safe_surface_label(value: Option<&str>) -> String {
+fn safe_surface_label(value: Option<&str>, bundle_id: Option<&str>) -> String {
+    if bundle_id.is_some_and(|bundle| bundle.eq_ignore_ascii_case("com.openai.codex")) {
+        return "Codex".into();
+    }
     let normalized = value
         .unwrap_or("Unknown application")
         .split_whitespace()
@@ -1030,7 +1033,12 @@ fn build_surface_timeline(
             let app_label = if private {
                 "Private activity".into()
             } else {
-                safe_surface_label(last.app_name.as_deref().or(first.app_name.as_deref()))
+                safe_surface_label(
+                    last.app_name.as_deref().or(first.app_name.as_deref()),
+                    last.app_bundle_id
+                        .as_deref()
+                        .or(first.app_bundle_id.as_deref()),
+                )
             };
             let site_hostname = (!private)
                 .then(|| {
@@ -2532,6 +2540,27 @@ mod tests {
         );
         assert!(packet.surface_timeline[2].revisited);
         assert!(packet.surface_timeline[2].is_current);
+    }
+
+    #[test]
+    fn codex_bundle_corrects_misreported_chatgpt_label_without_renaming_chatgpt() {
+        let mut codex = frame("codex", 1_000, "manual");
+        codex.app_name = Some("ChatGPT".into());
+        codex.app_bundle_id = Some("com.openai.codex".into());
+        let codex_packet =
+            build_observation_packet(&[codex], "watermark-codex-label", None).unwrap();
+
+        assert_eq!(codex_packet.surface_timeline.len(), 1);
+        assert_eq!(codex_packet.surface_timeline[0].app_label, "Codex");
+
+        let mut chatgpt = frame("chatgpt", 2_000, "manual");
+        chatgpt.app_name = Some("ChatGPT".into());
+        chatgpt.app_bundle_id = Some("com.openai.chat".into());
+        let chatgpt_packet =
+            build_observation_packet(&[chatgpt], "watermark-chatgpt-label", None).unwrap();
+
+        assert_eq!(chatgpt_packet.surface_timeline.len(), 1);
+        assert_eq!(chatgpt_packet.surface_timeline[0].app_label, "ChatGPT");
     }
 
     #[test]

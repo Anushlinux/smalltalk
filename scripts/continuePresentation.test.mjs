@@ -316,11 +316,11 @@ test("recent context compresses repeated shell visits without losing the latest 
   assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
 });
 
-test("public projection uses the task title without repeating details in the hero", () => {
+test("public projection uses the human current-step sentence while preserving the compact task title", () => {
   const decision = authoritativeDecision();
   Object.assign(decision.task_truth_v2.answer, {
     task_summary: "Fix Continue output status",
-    current_subtask: "Make new Continue answers shorter and clearer",
+    current_subtask: "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer.",
     where_summary: "Codex",
     next_action: "Finish the two manual checks",
     last_meaningful_progress: "The build and automated tests had already passed",
@@ -331,7 +331,7 @@ test("public projection uses the task title without repeating details in the her
   assert.deepEqual(
     buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false),
     {
-      headline: "Fix Continue output status",
+      headline: "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer",
       memoryLine: null,
       resumeSurface: "Codex",
       openActionLabel: null,
@@ -347,10 +347,17 @@ test("public projection uses the task title without repeating details in the her
     buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), true).openActionLabel,
     "Open Codex",
   );
+  assert.equal(
+    authoritativeTaskTruthAnswer(decision).task_summary,
+    "Fix Continue output status",
+  );
   assert.deepEqual(
     buildContinueTaskTruthDetailRows(authoritativeTaskTruthAnswer(decision)),
     [
-      ["What you were doing", "Make new Continue answers shorter and clearer"],
+      [
+        "What you were doing",
+        "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer.",
+      ],
       [
         "Where you left off",
         "The build and automated tests had already passed A fresh result still needs visual confirmation",
@@ -358,6 +365,13 @@ test("public projection uses the task title without repeating details in the her
       ["Continue in", "Codex"],
       ["Next step", "Finish the two manual checks"],
     ],
+  );
+  assert.equal(
+    buildContinuePublicProjection({
+      ...authoritativeTaskTruthAnswer(decision),
+      current_subtask: null,
+    }, false).headline,
+    "Fix Continue output status",
   );
 });
 
@@ -373,7 +387,7 @@ test("field-limited model output remains visible instead of becoming the default
   const decision = authoritativeDecision({ status: "partial" });
   Object.assign(decision.task_truth_v2.answer, {
     task_summary: null,
-    current_subtask: "Verify the repaired Continue output",
+    current_subtask: "You were verifying the repaired Continue output, but the broader task title was not supported.",
     last_meaningful_progress: "The model response was parsed and locally admitted",
     unfinished_state: "The visible Continue card still needs confirmation",
     next_action: null,
@@ -391,7 +405,10 @@ test("field-limited model output remains visible instead of becoming the default
   const answer = authoritativeTaskTruthAnswer(decision);
   assert.equal(answer?.task_resolution_status, "partial");
   assert.equal(answer?.task_summary, null);
-  assert.equal(answer?.current_subtask, "Verify the repaired Continue output");
+  assert.equal(
+    answer?.current_subtask,
+    "You were verifying the repaired Continue output, but the broader task title was not supported.",
+  );
   assert.equal(
     answer?.last_meaningful_progress,
     "The model response was parsed and locally admitted",
@@ -408,7 +425,7 @@ test("field-limited model output remains visible instead of becoming the default
   assert.deepEqual(
     buildContinuePublicProjection(answer, false),
     {
-      headline: "Verify the repaired Continue output",
+      headline: "You were verifying the repaired Continue output, but the broader task title was not supported",
       memoryLine: null,
       resumeSurface: null,
       openActionLabel: null,

@@ -583,7 +583,7 @@ export function buildContinuePublicProjection(
   const action = publicClause(answer.next_action || answer.unfinished_state);
   const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
   const surface = publicClause(answer.where_summary) || null;
-  const headline = task || currentStep || action || progress || "Continue";
+  const headline = currentStep || task || action || progress || "Continue";
 
   const openActionLabel = targetOpenable
     ? surface ? `Open ${surface}` : "Open continuation"
