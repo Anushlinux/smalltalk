@@ -3164,7 +3164,18 @@ mod tests {
         assert!(
             answer_content.contains("decisionId = state.decisionId ?? snapshot.continueDecisionId")
         );
-        assert!(answer_content.contains("title = Self.verbatim(answer?.taskSummary)"));
+        for title_source in [
+            "title = Self.verbatim(answer?.taskSummary)",
+            "Self.verbatim(answer?.currentActivity.currentSubtask)",
+            "Self.verbatim(answer?.nextAction)",
+            "Self.verbatim(answer?.unfinishedState)",
+            "Self.verbatim(answer?.lastMeaningfulProgress)",
+        ] {
+            assert!(
+                answer_content.contains(title_source),
+                "missing semantic answer title source {title_source:?}"
+            );
+        }
         let ordered_labels = [
             "Task object",
             "Current activity — observed surface",

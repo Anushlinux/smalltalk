@@ -229,7 +229,7 @@ fn product_facing_output(
     );
     let answer = state.semantic_answer.as_ref();
     let title = answer
-        .and_then(|answer| nonempty(answer.task_summary.as_deref()))
+        .and_then(semantic_answer_title)
         .unwrap_or_else(|| "Couldn’t recover the task".to_string());
     let mut rows = Vec::new();
     append_row(
@@ -313,6 +313,21 @@ fn nonempty(value: Option<&str>) -> Option<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+}
+
+fn semantic_answer_title(
+    answer: &crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1,
+) -> Option<String> {
+    [
+        answer.task_summary.as_deref(),
+        answer.current_subtask.as_deref(),
+        answer.current_activity.current_subtask.as_deref(),
+        answer.next_action.as_deref(),
+        answer.unfinished_state.as_deref(),
+        answer.last_meaningful_progress.as_deref(),
+    ]
+    .into_iter()
+    .find_map(nonempty)
 }
 
 fn persist_continue_history_output(
@@ -438,6 +453,21 @@ mod tests {
         request.request_trigger = Some("startup".into());
         request.island_trigger_reason = Some("evidence_changed".into());
         assert_eq!(explicit_request_origin(&request), None);
+    }
+
+    #[test]
+    fn partial_semantic_answer_uses_admitted_current_step_as_history_title() {
+        let answer = crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+            task_summary: None,
+            current_subtask: Some("Review the admitted Continue response".into()),
+            unfinished_state: Some("The exact primary task remains uncertain".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            semantic_answer_title(&answer).as_deref(),
+            Some("Review the admitted Continue response")
+        );
     }
 
     #[test]

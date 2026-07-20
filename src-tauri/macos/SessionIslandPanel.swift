@@ -873,7 +873,12 @@ private struct WhisperFlowAnswerContent: Equatable {
         let state = snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
         let answer = state.semanticAnswer
         decisionId = state.decisionId ?? snapshot.continueDecisionId
-        title = Self.verbatim(answer?.taskSummary) ?? Self.fallbackTitle(for: state.displayState)
+        title = Self.verbatim(answer?.taskSummary)
+            ?? Self.verbatim(answer?.currentActivity.currentSubtask)
+            ?? Self.verbatim(answer?.nextAction)
+            ?? Self.verbatim(answer?.unfinishedState)
+            ?? Self.verbatim(answer?.lastMeaningfulProgress)
+            ?? Self.fallbackTitle(for: state.displayState)
 
         var nextRows: [WhisperFlowAnswerRow] = []
         Self.append(&nextRows, label: "Task object", value: answer?.taskObject)

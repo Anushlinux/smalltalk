@@ -450,6 +450,12 @@ test("task inference failures have distinct user-facing states and retry policy"
     "evidence_verifier_rejected",
   );
   assert.equal(
+    taskInferenceFailurePresentation(
+      "cloud_inference_unresolved:insufficient_evidence:request_invalid",
+    ).kind,
+    "insufficient_evidence",
+  );
+  assert.equal(
     taskInferenceFailurePresentation("provider_rejected").kind,
     "provider_request_rejected",
   );

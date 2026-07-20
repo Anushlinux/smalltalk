@@ -360,8 +360,6 @@ export function taskInferenceFailurePresentation(
   }
   if (
     ["privacy_blocked", "request_invalid", "capture_unavailable"].includes(normalized)
-    || normalized.includes("requestinvalid")
-    || normalized.includes("privacyblocked")
   ) {
     return {
       kind: "capture_unavailable" as TaskInferenceFailureKind,

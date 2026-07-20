@@ -466,22 +466,21 @@ fn record_manual_continue_shadow_with_lookback(
     // Every explicit Continue has exactly one semantic authority: the compact
     // Luna request persisted above. The legacy full-packet resolver remains
     // available to offline evaluation code, but it is never called here.
-    let compact_attempt_reason = semantic_probe_error
-        .as_deref()
-        .or(preflight_failure.as_deref())
-        .unwrap_or("compact_semantic_continue_owns_manual_attempt");
+    let compact_attempt_reason = manual_boundary_snapshot_reason(
+        preflight_failure.as_deref(),
+        semantic_probe_error.as_deref(),
+    );
     let (verified_snapshot, multimodal_audit) = (
         None,
-        unresolved_manual_preflight_audit(compact_attempt_reason),
+        unresolved_manual_preflight_audit(&compact_attempt_reason),
     );
     let snapshot = verified_snapshot.unwrap_or_else(|| {
-        let reason = preflight_failure.clone().unwrap_or_else(|| {
-            format!(
-                "cloud_inference_unresolved:{:?}:{:?}",
-                multimodal_audit.resolver.status, multimodal_audit.resolver.diagnostic_status
-            )
-            .to_ascii_lowercase()
-        });
+        // The legacy multimodal resolver is intentionally not called for a
+        // manual Continue. Its synthetic audit uses `request_invalid` to mark
+        // that non-attempt, but that is not the outcome of the compact probe.
+        // Persist the real compact/preflight reason so later read-only
+        // projections cannot mistake the placeholder for a capture failure.
+        let reason = compact_attempt_reason.clone();
         let mut unresolved = unresolved_snapshot(&packet, prior.as_ref(), &reason);
         unresolved.provider_name = Some(multimodal_audit.resolver.provider.clone());
         unresolved.provider_model = Some(multimodal_audit.resolver.model.clone());
@@ -526,6 +525,16 @@ fn record_manual_continue_shadow_with_lookback(
         eprintln!("[mfti_04_performance] sample persistence failed: {error}");
     }
     Ok(summary)
+}
+
+fn manual_boundary_snapshot_reason(
+    preflight_failure: Option<&str>,
+    semantic_probe_error: Option<&str>,
+) -> String {
+    semantic_probe_error
+        .or(preflight_failure)
+        .unwrap_or("compact_semantic_continue_owns_manual_attempt")
+        .to_string()
 }
 
 fn unresolved_manual_preflight_audit(reason: &str) -> MultimodalShadowAuditV1 {
@@ -4140,5 +4149,21 @@ mod tests {
         assert!(!metrics.contains_key("model_on_off_unexplained_task_disagreement"));
         assert!(metrics["provider_failure_honest_unresolved"].passed);
         assert!(metrics["provider_failure_local_semantic_fallback"].passed);
+    }
+
+    #[test]
+    fn successful_compact_probe_does_not_persist_legacy_request_invalid_as_its_outcome() {
+        assert_eq!(
+            manual_boundary_snapshot_reason(None, None),
+            "compact_semantic_continue_owns_manual_attempt"
+        );
+        assert_eq!(
+            manual_boundary_snapshot_reason(Some("current_frame_missing"), None),
+            "current_frame_missing"
+        );
+        assert_eq!(
+            manual_boundary_snapshot_reason(None, Some("compact_probe_failed")),
+            "compact_probe_failed"
+        );
     }
 }
