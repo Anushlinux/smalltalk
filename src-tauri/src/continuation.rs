@@ -15,6 +15,7 @@ pub(crate) mod activity_recap_validation;
 pub(crate) mod confidence;
 pub(crate) mod enrichment;
 pub(crate) mod feedback_policy;
+pub(crate) mod history;
 pub(crate) mod semantic_consistency;
 pub(crate) mod task_truth_v2;
 pub(crate) mod task_turn;
@@ -62,7 +63,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const CONTINUE_SCHEMA_NAME: &str = "smalltalk.continue_memory.v1";
-pub const CONTINUE_SCHEMA_VERSION: i64 = 9;
+pub const CONTINUE_SCHEMA_VERSION: i64 = 10;
 
 const FEEDBACK_INFERENCE_MIN_AGE_MS: i64 = 2 * 60 * 1000;
 const FEEDBACK_ACCEPTED_MIN_DWELL_MS: i64 = 30 * 1000;
@@ -120,6 +121,7 @@ const CONTINUE_TABLES: &[&str] = &[
     "continue_activity_classifications",
     "continue_candidates",
     "continue_decisions",
+    "continue_answer_history",
     "continue_decision_open_events",
     "continue_feedback_events",
     "continue_feedback_policy_evaluations",
@@ -1559,7 +1561,7 @@ impl Default for ContinueDecisionRequest {
             limit: Some(700),
             mode: Some("normal".to_string()),
             rebuild_layers: Some(false),
-            micro_inference_enabled: Some(true),
+            micro_inference_enabled: Some(false),
             activity_recap_model_enabled: Some(false),
             model: None,
             max_candidates_for_model: Some(5),
@@ -3165,6 +3167,13 @@ struct EvidenceFrameDiff {
 #[derive(Debug, Clone)]
 struct EvidenceTypingBurst {
     id: String,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_id: Option<i64>,
+    window_title: Option<String>,
+    char_count: i64,
     enter_count: i64,
     paste_count: i64,
     committed: bool,
@@ -4359,6 +4368,29 @@ fn latest_evidence_session_id(conn: &Connection) -> Result<Option<String>, Strin
     .map_err(to_string)
 }
 
+fn continue_decision_id_for_request(
+    evidence_identity: &str,
+    selected_candidate_id: Option<&str>,
+    current_focus_frame_id: Option<&str>,
+    validation_status: &str,
+    manual_request_nonce: Option<i64>,
+) -> String {
+    format!(
+        "continue-decision-{}",
+        stable_hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                evidence_identity,
+                selected_candidate_id.unwrap_or("none"),
+                current_focus_frame_id.unwrap_or("none"),
+                validation_status,
+                manual_request_nonce.unwrap_or_default()
+            )
+            .as_bytes()
+        )
+    )
+}
+
 pub fn get_continue_decision(
     conn: &Connection,
     request: ContinueDecisionRequest,
@@ -4374,8 +4406,11 @@ pub fn get_continue_decision(
         limit: request.limit.or(Some(700)),
         mode: request.mode.or(Some("normal".to_string())),
         rebuild_layers: request.rebuild_layers.or(Some(false)),
-        micro_inference_enabled: request.micro_inference_enabled.or(Some(true)),
-        activity_recap_model_enabled: request.activity_recap_model_enabled.or(Some(false)),
+        // The compact Luna boundary is the only cloud semantic path. These
+        // legacy model calls remain decodable for historical audits, but a
+        // normal, background, or startup Continue cannot execute them.
+        micro_inference_enabled: Some(false),
+        activity_recap_model_enabled: Some(false),
         model: request.model,
         max_candidates_for_model: request.max_candidates_for_model.or(Some(5)),
         audit_output_enabled: request.audit_output_enabled.or(Some(false)),
@@ -4411,6 +4446,8 @@ pub fn get_continue_decision(
             Some(&activity_recap_effective_model),
         );
     let requested_at_ms = current_time_millis();
+    let manual_request = request.request_trigger.as_deref() == Some("manual")
+        || request.island_trigger_reason.as_deref() == Some("user_pressed_continue");
     let pre_decision_enrichment = run_continue_request_weak_surface_enrichment(
         conn,
         request.session_id.as_deref(),
@@ -4434,7 +4471,7 @@ pub fn get_continue_decision(
             micro_inference_enabled,
         )?
     };
-    let mut cached_meta = if !force_rebuild && request.session_id.is_some() {
+    let mut cached_meta = if !force_rebuild && !manual_request && request.session_id.is_some() {
         fresh_cached_continue_decision_for_recap(
             conn,
             request.session_id.as_deref(),
@@ -4533,9 +4570,7 @@ pub fn get_continue_decision(
             .or(focus.app_name.as_deref())
             .and_then(|value| clean_user_handoff_line(value.to_string(), 120))
     });
-    let request_trigger = if request.request_trigger.as_deref() == Some("manual")
-        || request.island_trigger_reason.as_deref() == Some("user_pressed_continue")
-    {
+    let request_trigger = if manual_request {
         "manual".to_string()
     } else {
         request
@@ -5646,34 +5681,16 @@ pub fn get_continue_decision(
     }
     continue_dossier.stale_target_suppression = Some(stale_target_suppression.clone());
     continue_dossier.active_current_work_unresolved = active_current_work_unresolved.clone();
-    let decision_watermark = Some(evidence_freshness_ledger.decision_watermark_ms)
-        .or(current_watermark
-            .latest_semantic_moment_at_ms
-            .or(current_watermark.latest_frame_at_ms)
-            .or(current_watermark.latest_ui_event_at_ms))
-        .unwrap_or(requested_at_ms);
     let decision_id = cached_meta
         .as_ref()
         .map(|cached| cached.decision_id.clone())
         .unwrap_or_else(|| {
-            format!(
-                "continue-decision-{}",
-                stable_hash(
-                    format!(
-                        "{}:{}:{}:{}",
-                        decision_watermark,
-                        selected
-                            .as_ref()
-                            .map(|candidate| candidate.id.as_str())
-                            .unwrap_or("none"),
-                        current_focus
-                            .as_ref()
-                            .map(|focus| focus.frame_id.as_str())
-                            .unwrap_or("none"),
-                        validation_status
-                    )
-                    .as_bytes()
-                )
+            continue_decision_id_for_request(
+                &current_watermark.hash,
+                selected.as_ref().map(|candidate| candidate.id.as_str()),
+                current_focus.as_ref().map(|focus| focus.frame_id.as_str()),
+                &validation_status,
+                manual_request.then_some(requested_at_ms),
             )
         });
 
@@ -10243,8 +10260,11 @@ fn build_continue_evidence_watermark(
         "latest_material_evidence_probe_id": latest_evidence_probe_id,
         "latest_material_evidence_probe_at_ms": latest_evidence_probe_at_ms,
         "latest_boundary_revision": latest_boundary_revision,
-        "latest_memory_cell_at_ms": latest_memory_cell_at_ms,
-        "latest_memory_edge_at_ms": latest_memory_edge_at_ms,
+        // Memory cells and edges are derived from Continue decisions. Including
+        // their write timestamps here makes a decision invalidate its own
+        // cache identity and creates one new decision on every startup.
+        // Feedback, observations, task actions, and semantic graph material
+        // remain independent invalidators.
         "latest_surface_snapshot_id": latest_surface_snapshot_id,
         "latest_surface_snapshot_at_ms": latest_surface_snapshot_at_ms,
         "latest_app_activity_segment_id": latest_app_activity_segment_id,
@@ -21674,7 +21694,9 @@ fn candidate_recency_then_score(
 }
 
 fn continue_openai_config(model_override: Option<String>) -> Result<ContinueOpenAiConfig, String> {
-    let project_env = project_dotenv_values()?;
+    // A process-level configuration must remain usable even if the optional
+    // development dotenv file is absent or temporarily unreadable.
+    let project_env = project_dotenv_values().unwrap_or_default();
     let process_key = std::env::var("OPENAI_API_KEY").ok().and_then(non_empty);
     let project_key = project_env
         .get("OPENAI_API_KEY")
@@ -21711,6 +21733,33 @@ fn continue_openai_config(model_override: Option<String>) -> Result<ContinueOpen
     Ok(ContinueOpenAiConfig { api_key, model })
 }
 
+/// Controls whether OpenAI keeps Responses API results for later inspection.
+/// Development builds store responses by default so they remain visible and
+/// retrievable in the OpenAI Platform. Release builds remain privacy-first.
+/// `SMALLTALK_OPENAI_STORE_RESPONSES` can explicitly override either default.
+pub(crate) fn openai_response_storage_enabled() -> bool {
+    let configured = std::env::var("SMALLTALK_OPENAI_STORE_RESPONSES")
+        .ok()
+        .or_else(|| {
+            project_dotenv_values()
+                .ok()
+                .and_then(|values| values.get("SMALLTALK_OPENAI_STORE_RESPONSES").cloned())
+        });
+
+    configured
+        .as_deref()
+        .and_then(parse_configured_bool)
+        .unwrap_or(cfg!(debug_assertions))
+}
+
+fn parse_configured_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ContinueOpenAiConfig {
     api_key: Option<String>,
@@ -21741,7 +21790,7 @@ fn build_continue_openai_request(
 ) -> Result<Value, String> {
     Ok(serde_json::json!({
         "model": model,
-        "store": false,
+        "store": openai_response_storage_enabled(),
         "max_output_tokens": 900,
         "text": {
             "format": {
@@ -22816,6 +22865,12 @@ fn infer_feedback_for_decision(
                 Some(open_event.source.as_str()),
             )
             .map(Some);
+        }
+        if target_artifact_id.is_none() {
+            // A no-clear Continue with no target cannot be meaningfully
+            // "ignored". Writing inferred negative feedback here creates a
+            // self-sustaining startup loop even when no user evidence changed.
+            return Ok(None);
         }
         return insert_feedback_event(
             conn,
@@ -28126,6 +28181,256 @@ fn load_evidence_frames(
     Ok(frames)
 }
 
+const MAX_SESSION_SURFACE_VISITS: usize = 8;
+
+fn privacy_status_is_private(status: Option<&str>) -> bool {
+    let normalized = status.unwrap_or("unknown").trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "private" | "blocked" | "secure" | "sensitive" | "denied" | "redacted"
+    ) || normalized.contains("private")
+        || normalized.contains("blocked")
+        || normalized.contains("secure")
+}
+
+fn session_surface_is_diagnostic(frame: &EvidenceFrame) -> bool {
+    let bundle = frame
+        .app_bundle_id
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let app = frame
+        .app_name
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // Codex can be the user's primary workspace. Only Smalltalk's own UI is
+    // categorically excluded from session evidence.
+    bundle == "com.smalltalk.app" || app == "smalltalk"
+}
+
+fn session_surface_key(frame: &EvidenceFrame) -> String {
+    let app = frame
+        .app_bundle_id
+        .as_deref()
+        .or(frame.app_name.as_deref())
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase();
+    if privacy_status_is_private(frame.privacy_status.as_deref()) {
+        return format!("private:{app}");
+    }
+    if let Some(host) = frame
+        .browser_url
+        .as_deref()
+        .and_then(session_browser_hostname)
+    {
+        return format!("browser:{app}:{}", host.to_ascii_lowercase());
+    }
+    format!("app:{app}")
+}
+
+fn session_browser_hostname(url: &str) -> Option<String> {
+    let raw = url.trim();
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let hostname = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    (!hostname.is_empty()).then_some(hostname)
+}
+
+fn session_surface_frame_score(frame: &EvidenceFrame) -> (i64, i64, i64) {
+    let trigger = frame.capture_trigger.to_ascii_lowercase();
+    let activity_weight = if trigger.contains("typing")
+        || trigger.contains("event_burst")
+        || trigger.contains("manual")
+        || trigger.contains("submit")
+    {
+        3
+    } else if trigger.contains("surface_change") || trigger.contains("app_switch") {
+        1
+    } else {
+        2
+    };
+    (
+        i64::from(!privacy_status_is_private(frame.privacy_status.as_deref())),
+        activity_weight,
+        frame.captured_at,
+    )
+}
+
+#[derive(Debug)]
+struct SessionSurfaceVisitAccumulator {
+    key: String,
+    first: EvidenceFrame,
+    last: EvidenceFrame,
+    representative: EvidenceFrame,
+    has_hostname: bool,
+    all_new_tab: bool,
+    grounded_interaction_hint: bool,
+    private: bool,
+}
+
+impl SessionSurfaceVisitAccumulator {
+    fn new(frame: EvidenceFrame) -> Self {
+        let has_hostname = frame
+            .browser_url
+            .as_deref()
+            .and_then(session_browser_hostname)
+            .is_some();
+        let all_new_tab = frame
+            .window_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("new tab");
+        let grounded_interaction_hint = session_frame_has_interaction_hint(&frame);
+        let private = privacy_status_is_private(frame.privacy_status.as_deref());
+        Self {
+            key: session_surface_key(&frame),
+            first: frame.clone(),
+            last: frame.clone(),
+            representative: frame,
+            has_hostname,
+            all_new_tab,
+            grounded_interaction_hint,
+            private,
+        }
+    }
+
+    fn push(&mut self, frame: EvidenceFrame) {
+        self.has_hostname |= frame
+            .browser_url
+            .as_deref()
+            .and_then(session_browser_hostname)
+            .is_some();
+        self.all_new_tab &= frame
+            .window_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("new tab");
+        self.grounded_interaction_hint |= session_frame_has_interaction_hint(&frame);
+        self.private |= privacy_status_is_private(frame.privacy_status.as_deref());
+        if session_surface_frame_score(&frame) > session_surface_frame_score(&self.representative) {
+            self.representative = frame.clone();
+        }
+        self.last = frame;
+    }
+
+    fn is_meaningful(&self) -> bool {
+        self.private || self.has_hostname || !self.all_new_tab || self.grounded_interaction_hint
+    }
+
+    fn selected_frames(self) -> Vec<EvidenceFrame> {
+        let mut selected = HashMap::new();
+        selected.insert(self.first.id.clone(), self.first);
+        selected.insert(self.last.id.clone(), self.last);
+        selected.insert(self.representative.id.clone(), self.representative);
+        selected.into_values().collect()
+    }
+}
+
+fn session_frame_has_interaction_hint(frame: &EvidenceFrame) -> bool {
+    let trigger = frame.capture_trigger.trim().to_ascii_lowercase();
+    ["click", "scroll", "typing", "submit", "event_burst"]
+        .iter()
+        .any(|signal| trigger.contains(signal))
+}
+
+/// Load a bounded set of lightweight frames that represents the current
+/// session's meaningful foreground-surface chronology. The ordinary evidence
+/// loader remains capped at 24 detailed frames. This pass streams metadata from
+/// session start through the exact cutoff, keeps only the latest eight visit
+/// summaries in memory, then hydrates screenshot ownership and event grounding
+/// for each visit's first, last, and representative frames.
+fn load_session_surface_context_frames(
+    conn: &Connection,
+    session_id: &str,
+    cutoff_ms: i64,
+) -> Result<Vec<EvidenceFrame>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT f.id, f.captured_at, f.app_name, f.window_name, f.browser_url,
+                    f.document_path, f.capture_trigger, f.text_source, f.full_text,
+                    f.content_hash, f.image_hash, f.privacy_status, f.app_bundle_id,
+                    f.previous_frame_id, f.session_id
+             FROM frames f
+             WHERE f.session_id = ?1 AND f.captured_at <= ?2
+             ORDER BY f.captured_at ASC, f.id ASC",
+        )
+        .map_err(to_string)?;
+    let rows = statement
+        .query_map(params![session_id, cutoff_ms], evidence_frame_from_row)
+        .map_err(to_string)?;
+    let mut current_visit: Option<SessionSurfaceVisitAccumulator> = None;
+    let mut visits = std::collections::VecDeque::<SessionSurfaceVisitAccumulator>::new();
+    let retain_visit =
+        |visit: SessionSurfaceVisitAccumulator,
+         visits: &mut std::collections::VecDeque<SessionSurfaceVisitAccumulator>| {
+            if !visit.is_meaningful() {
+                return;
+            }
+            visits.push_back(visit);
+            if visits.len() > MAX_SESSION_SURFACE_VISITS {
+                visits.pop_front();
+            }
+        };
+    for row in rows {
+        let frame = row.map_err(to_string)?;
+        if session_surface_is_diagnostic(&frame) {
+            if let Some(previous) = current_visit.take() {
+                retain_visit(previous, &mut visits);
+            }
+            continue;
+        }
+        let key = session_surface_key(&frame);
+        if current_visit.as_ref().is_some_and(|visit| visit.key == key) {
+            current_visit.as_mut().expect("visit exists").push(frame);
+        } else {
+            if let Some(previous) = current_visit.take() {
+                retain_visit(previous, &mut visits);
+            }
+            current_visit = Some(SessionSurfaceVisitAccumulator::new(frame));
+        }
+    }
+    if let Some(previous) = current_visit {
+        retain_visit(previous, &mut visits);
+    }
+
+    let mut selected = visits
+        .into_iter()
+        .flat_map(SessionSurfaceVisitAccumulator::selected_frames)
+        .collect::<Vec<_>>();
+
+    for frame in &mut selected {
+        load_frame_capture_attribution(conn, frame)?;
+        frame.visible_windows = load_frame_visible_windows(conn, &frame.id)?;
+        frame.ui_events = load_frame_ui_events(conn, frame)?;
+        frame.trigger = load_frame_trigger(conn, &frame.id)?;
+        frame.transition = load_frame_transition(conn, &frame.id)?;
+        frame.frame_diff = load_frame_diff(conn, &frame.id)?;
+        frame.typing_bursts = load_frame_typing_bursts(conn, &frame.id, frame.captured_at)?;
+    }
+    selected.sort_by_key(|frame| {
+        (
+            frame.captured_at,
+            frame.id.parse::<i64>().unwrap_or(i64::MAX),
+        )
+    });
+    Ok(selected)
+}
+
 #[derive(Debug)]
 struct EventEvidenceRow {
     id: String,
@@ -28862,12 +29167,32 @@ fn load_frame_ui_events(
     if !table_exists(conn, "ui_events")? {
         return Ok(Vec::new());
     }
+    let previous_captured_at = frame
+        .previous_frame_id
+        .as_deref()
+        .map(|previous_frame_id| {
+            conn.query_row(
+                "SELECT captured_at FROM frames WHERE CAST(id AS TEXT) = ?1 LIMIT 1",
+                params![previous_frame_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(to_string)
+        })
+        .transpose()?
+        .flatten();
+    let belongs_to_incoming_edge = |event: &EvidenceUiEvent| {
+        event.ts_ms.is_some_and(|observed_at_ms| {
+            observed_at_ms <= frame.captured_at
+                && previous_captured_at.is_none_or(|previous_at_ms| observed_at_ms > previous_at_ms)
+        })
+    };
     let mut events = Vec::new();
     let mut seen = HashSet::new();
     if let Some(trigger) = &frame.trigger {
         for event_id in &trigger.caused_by_event_ids {
             if let Some(event) = load_ui_event_by_id(conn, event_id)? {
-                if seen.insert(event.id.clone()) {
+                if belongs_to_incoming_edge(&event) && seen.insert(event.id.clone()) {
                     events.push(event);
                 }
             }
@@ -28880,11 +29205,18 @@ fn load_frame_ui_events(
             "NULL".to_string()
         })
     };
+    // A captured frame is the post-state of the edge that led into it. Nearby
+    // events therefore belong only to (previous_frame, current_frame]. The old
+    // +/- 2.5 second window attached the same event to both adjacent frames and
+    // allowed actions after the manual cutoff to contaminate the cutoff frame.
+    let lower_bound_ms =
+        previous_captured_at.unwrap_or_else(|| frame.captured_at.saturating_sub(2_500));
     let sql = format!(
         "SELECT id, ts_ms, event_type, key_category, {}, {}, {}, {}, {}, {}, {}
              FROM ui_events
              WHERE (?1 IS NULL OR session_id = ?1)
-               AND ABS(ts_ms - ?2) <= 2500
+               AND ts_ms > ?2
+               AND ts_ms <= ?3
              ORDER BY ts_ms ASC
              LIMIT 12",
         event_column("x")?,
@@ -28898,7 +29230,11 @@ fn load_frame_ui_events(
     let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(
-            params![frame.session_id.as_deref(), frame.captured_at],
+            params![
+                frame.session_id.as_deref(),
+                lower_bound_ms,
+                frame.captured_at
+            ],
             |row| {
                 Ok(EvidenceUiEvent {
                     id: row.get(0)?,
@@ -28917,7 +29253,7 @@ fn load_frame_ui_events(
         )
         .map_err(to_string)?;
     for event in rows.collect::<Result<Vec<_>, _>>().map_err(to_string)? {
-        if seen.insert(event.id.clone()) {
+        if belongs_to_incoming_edge(&event) && seen.insert(event.id.clone()) {
             events.push(event);
         }
     }
@@ -28977,7 +29313,7 @@ fn load_frame_trigger(
     conn.query_row(
         "SELECT id, trigger_type, caused_by_event_ids
          FROM capture_triggers
-         WHERE post_frame_id = ?1 OR pre_frame_id = ?1
+         WHERE post_frame_id = ?1
          ORDER BY ts_ms DESC
          LIMIT 1",
         params![frame_id],
@@ -29010,7 +29346,7 @@ fn load_frame_transition(
         "SELECT id, primary_event_id, transition_type, summary, confidence,
                 pre_frame_id, post_frame_id, {changed_region_expr}
          FROM event_transitions
-         WHERE post_frame_id = ?1 OR pre_frame_id = ?1
+         WHERE post_frame_id = ?1
          ORDER BY ts_end_ms DESC
          LIMIT 1"
     );
@@ -29070,26 +29406,85 @@ fn load_frame_typing_bursts(
     if !table_exists(conn, "typing_bursts")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, enter_count, paste_count, committed, commit_signal
-             FROM typing_bursts
-             WHERE pre_frame_id = ?1
-                OR post_frame_id = ?1
-                OR (?2 BETWEEN started_at_ms - 250 AND ended_at_ms + 1500)
-             ORDER BY ended_at_ms DESC
-             LIMIT 8",
-        )
-        .map_err(to_string)?;
+    let columns = {
+        let mut schema = conn
+            .prepare("PRAGMA table_info(typing_bursts)")
+            .map_err(to_string)?;
+        let columns = schema
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(to_string)?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(to_string)?;
+        columns
+    };
+    if [
+        "started_at_ms",
+        "ended_at_ms",
+        "enter_count",
+        "paste_count",
+        "committed",
+        "commit_signal",
+        "pre_frame_id",
+        "post_frame_id",
+    ]
+    .iter()
+    .any(|column| !columns.contains(*column))
+    {
+        return Ok(Vec::new());
+    }
+    let app_bundle_expr = if columns.contains("app_bundle_id") {
+        "app_bundle_id"
+    } else {
+        "NULL"
+    };
+    let app_name_expr = if columns.contains("app_name") {
+        "app_name"
+    } else {
+        "NULL"
+    };
+    let window_id_expr = if columns.contains("window_id") {
+        "window_id"
+    } else {
+        "NULL"
+    };
+    let window_title_expr = if columns.contains("window_title") {
+        "window_title"
+    } else {
+        "NULL"
+    };
+    let char_count_expr = if columns.contains("char_count") {
+        "char_count"
+    } else {
+        "0"
+    };
+    let sql = format!(
+        "SELECT id, started_at_ms, ended_at_ms, {app_bundle_expr}, {app_name_expr},
+                {window_id_expr}, {window_title_expr}, {char_count_expr}, enter_count, paste_count,
+                committed, commit_signal
+         FROM typing_bursts
+         WHERE pre_frame_id = ?1
+            OR post_frame_id = ?1
+            OR (?2 BETWEEN started_at_ms - 250 AND ended_at_ms + 1500)
+         ORDER BY ended_at_ms DESC
+         LIMIT 8"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(to_string)?;
     let rows = stmt
         .query_map(params![frame_id, captured_at], |row| {
-            let committed: i64 = row.get(3)?;
+            let committed: i64 = row.get(10)?;
             Ok(EvidenceTypingBurst {
                 id: row.get(0)?,
-                enter_count: row.get(1)?,
-                paste_count: row.get(2)?,
+                started_at_ms: row.get(1)?,
+                ended_at_ms: row.get(2)?,
+                app_bundle_id: row.get(3)?,
+                app_name: row.get(4)?,
+                window_id: row.get(5)?,
+                window_title: row.get(6)?,
+                char_count: row.get(7)?,
+                enter_count: row.get(8)?,
+                paste_count: row.get(9)?,
                 committed: committed != 0,
-                commit_signal: row.get(4)?,
+                commit_signal: row.get(11)?,
             })
         })
         .map_err(to_string)?;
@@ -39303,6 +39698,24 @@ fn current_time_millis() -> i64 {
 }
 
 pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
+    let schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .map_err(to_string)?;
+    let expected_marker = format!("continue_runtime_schema_version_{schema_version}");
+    let schema_is_current = conn
+        .query_row(
+            "SELECT name FROM continue_schema_migrations WHERE version = 10",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|marker| marker.as_deref() == Some(expected_marker.as_str()))
+        .unwrap_or(false);
+    if schema_is_current && history::has_continue_history_schema(conn)? {
+        return Ok(());
+    }
+
+    history::ensure_continue_history_schema(conn)?;
     ensure_weak_surface_enrichment_schema(conn)?;
     conn.execute_batch(
         "
@@ -40824,10 +41237,26 @@ pub fn ensure_continue_schema(conn: &Connection) -> Result<(), String> {
     task_turn_evidence::ensure_task_turn_evidence_schema(conn)?;
     task_turn::ensure_task_turn_schema(conn)?;
     task_truth_v2::ensure_shadow_schema(conn)?;
+    let initialized_schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .map_err(to_string)?;
+    conn.execute(
+        "INSERT INTO continue_schema_migrations (version, name, applied_at_ms)
+         VALUES (10, ?1, ?2)
+         ON CONFLICT(version) DO UPDATE SET
+           name = excluded.name,
+           applied_at_ms = excluded.applied_at_ms",
+        params![
+            format!("continue_runtime_schema_version_{initialized_schema_version}"),
+            current_time_millis()
+        ],
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
 pub fn clear_continue_semantic_rows(conn: &Connection) -> Result<(), String> {
+    history::clear_continue_history(conn)?;
     if !table_exists(conn, "continue_artifacts")? {
         return Ok(());
     }
@@ -41039,6 +41468,100 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn initialized_continue_schema_is_query_only_until_schema_generation_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let initialized_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let initialized_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        ensure_continue_schema(&conn).unwrap();
+
+        let repeated_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let repeated_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repeated_version, initialized_version);
+        assert_eq!(repeated_marker, initialized_marker);
+
+        conn.execute_batch("CREATE TABLE external_schema_change (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        let refreshed_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let refreshed_marker: String = conn
+            .query_row(
+                "SELECT name FROM continue_schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(refreshed_version > repeated_version);
+        assert_eq!(
+            refreshed_marker,
+            format!("continue_runtime_schema_version_{refreshed_version}")
+        );
+    }
+
+    #[test]
+    fn manual_continue_attempts_never_reuse_a_cached_decision_identity() {
+        let normal_a = continue_decision_id_for_request(
+            "watermark-a",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        let normal_b = continue_decision_id_for_request(
+            "watermark-a",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        assert_eq!(normal_a, normal_b);
+        let normal_changed = continue_decision_id_for_request(
+            "watermark-b",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            None,
+        );
+        assert_ne!(normal_a, normal_changed);
+
+        let manual_a = continue_decision_id_for_request(
+            "watermark-a",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            Some(1_000),
+        );
+        let manual_b = continue_decision_id_for_request(
+            "watermark-a",
+            Some("candidate"),
+            Some("frame"),
+            "supported",
+            Some(1_001),
+        );
+        assert_ne!(manual_a, manual_b);
+        assert_ne!(normal_a, manual_a);
+    }
 
     #[test]
     fn audit_mode_preserves_full_legacy_and_defaults_manual_to_review() {
@@ -42780,6 +43303,71 @@ mod tests {
             events[0].target_artifact_id.as_deref(),
             Some("artifact-wrong")
         );
+    }
+
+    #[test]
+    fn p1_no_target_decision_does_not_infer_ignored_feedback() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "UPDATE continue_decisions
+             SET requested_at_ms = ?1,
+                 return_target_artifact_id = NULL,
+                 current_focus_artifact_id = NULL
+             WHERE id = 'decision-p4'",
+            params![current_time_millis() - 120_000],
+        )
+        .unwrap();
+
+        let event = infer_feedback_for_decision(&conn, "decision-p4", 60_000).unwrap();
+
+        assert!(event.is_none());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM continue_feedback_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn decision_derived_memory_timestamp_churn_does_not_change_evidence_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_continue_schema(&conn).unwrap();
+        insert_p4_learning_rows(&conn);
+        conn.execute(
+            "INSERT INTO continue_memory_cells (
+                id, memory_type, summary, source_anchor_json, created_at_ms,
+                last_seen_at_ms, confidence, importance, decay_score,
+                redaction_level, created_by, updated_at_ms
+             ) VALUES (
+                'memory-derived', 'decision_summary', 'bounded fixture', '{}',
+                1, 1, 0.5, 0.5, 1.0, 'safe', 'continue_decision', 1
+             )",
+            [],
+        )
+        .unwrap();
+        let before = build_continue_evidence_watermark(&conn, None).unwrap();
+
+        conn.execute(
+            "UPDATE continue_memory_cells SET updated_at_ms = updated_at_ms + 10000",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continue_memory_edges SET updated_at_ms = updated_at_ms + 10000",
+            [],
+        )
+        .unwrap();
+        let after = build_continue_evidence_watermark(&conn, None).unwrap();
+
+        assert_ne!(
+            before.latest_memory_cell_at_ms,
+            after.latest_memory_cell_at_ms
+        );
+        assert_eq!(before.hash, after.hash);
     }
 
     #[test]
@@ -48396,6 +48984,119 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn evidence_frame_owns_only_its_incoming_events_trigger_and_transition() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_evidence_schema(&conn);
+        insert_frame(
+            &conn,
+            1,
+            "Helium",
+            "Earlier page",
+            Some("https://example.com/earlier"),
+            None,
+            "periodic",
+            "Earlier page",
+            Some("net.imput.helium"),
+            None,
+        );
+        insert_frame(
+            &conn,
+            2,
+            "Helium",
+            "Current page",
+            Some("https://example.com/current"),
+            None,
+            "accessibility_change",
+            "Current page",
+            Some("net.imput.helium"),
+            Some(1),
+        );
+        insert_frame(
+            &conn,
+            3,
+            "ChatGPT",
+            "ChatGPT",
+            None,
+            None,
+            "app_switch",
+            "Diagnostic surface",
+            Some("com.openai.codex"),
+            Some(2),
+        );
+        insert_ui_event(
+            &conn,
+            "event-into-2",
+            "session-a",
+            1_500,
+            "click",
+            "Helium",
+            "net.imput.helium",
+            "Current page",
+            None,
+        );
+        insert_ui_event(
+            &conn,
+            "event-after-2",
+            "session-a",
+            2_500,
+            "app_switch",
+            "ChatGPT",
+            "com.openai.codex",
+            "ChatGPT",
+            None,
+        );
+        insert_trigger_with_events(&conn, 2, &["event-into-2"]);
+        insert_trigger_with_events(&conn, 3, &["event-after-2"]);
+        conn.execute(
+            "INSERT INTO event_transitions (
+                id, session_id, trigger_id, primary_event_id, pre_frame_id, post_frame_id,
+                ts_start_ms, ts_end_ms, transition_type, confidence, summary
+             ) VALUES
+                ('transition-into-2','session-a','trigger-2','event-into-2','1','2',1400,2000,'navigation',0.9,'1 -> 2'),
+                ('transition-after-2','session-a','trigger-3','event-after-2','2','3',2400,3000,'switched_app',0.9,'2 -> 3')",
+            [],
+        )
+        .unwrap();
+
+        let frames = load_evidence_frames(
+            &conn,
+            &ContinueSecondLayerRebuildRequest {
+                start_frame_id: Some(1),
+                end_frame_id: Some(2),
+                session_id: Some("session-a".into()),
+                limit: Some(10),
+                lookback_ms: None,
+            },
+        )
+        .unwrap();
+        let current = frames.iter().find(|frame| frame.id == "2").unwrap();
+
+        assert_eq!(
+            current.trigger.as_ref().map(|trigger| trigger.id.as_str()),
+            Some("trigger-2")
+        );
+        assert_eq!(
+            current
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.post_frame_id.as_deref()),
+            Some("2")
+        );
+        assert_eq!(
+            current
+                .ui_events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-into-2"]
+        );
+        assert!(current
+            .ui_events
+            .iter()
+            .all(|event| event.ts_ms.is_some_and(|ts| ts <= current.captured_at)));
+    }
+
     fn action_kind_for_frame(conn: &Connection, frame_id: i64) -> String {
         conn.query_row(
             "SELECT action_kind FROM continue_task_actions WHERE frame_id = ?1",
@@ -52885,9 +53586,9 @@ mod tests {
     }
 
     #[test]
-    fn continue_decision_defaults_to_bounded_micro_inference() {
+    fn continue_decision_defaults_to_compact_semantic_inference_only() {
         let request = ContinueDecisionRequest::default();
-        assert_eq!(request.micro_inference_enabled, Some(true));
+        assert_eq!(request.micro_inference_enabled, Some(false));
         assert_eq!(request.activity_recap_model_enabled, Some(false));
         assert_eq!(request.max_candidates_for_model, Some(5));
     }

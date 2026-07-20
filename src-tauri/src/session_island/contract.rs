@@ -82,6 +82,49 @@ fn force_task_truth_unresolved(
     answer.inference_status = inference_status.into();
 }
 
+pub(super) fn has_visible_task_truth_semantics(
+    answer: &crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1,
+) -> bool {
+    [
+        answer.task_summary.as_deref(),
+        answer.task_object.as_deref(),
+        answer.current_subtask.as_deref(),
+        answer.current_activity.observed_surface.as_deref(),
+        answer.current_activity.immediate_user_operation.as_deref(),
+        answer
+            .current_activity
+            .semantic_effect_of_operation
+            .as_deref(),
+        answer.current_activity.current_subtask.as_deref(),
+        answer.last_meaningful_progress.as_deref(),
+        answer.unfinished_state.as_deref(),
+        answer.next_action.as_deref(),
+        answer.where_summary.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+pub(super) fn decision_has_visible_task_truth_semantics(decision: &ContinueDecisionResult) -> bool {
+    decision
+        .task_truth_v2
+        .answer
+        .as_ref()
+        .is_some_and(has_visible_task_truth_semantics)
+}
+
+pub(super) fn decision_is_failed_empty_semantic_refresh(decision: &ContinueDecisionResult) -> bool {
+    if decision_has_visible_task_truth_semantics(decision) {
+        return false;
+    }
+    decision
+        .task_truth_v2
+        .inference_diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| diagnostic.status.trim() != "success")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IslandContinueSource {
@@ -480,7 +523,10 @@ pub fn island_state_from_continue_decision(
         "task_supported" | "activity_supported"
     );
     let no_clear_current_task = match task_truth_answer {
-        Some(answer) => answer.task_resolution_status == "unresolved",
+        Some(answer) => {
+            answer.task_resolution_status == "unresolved"
+                && !has_visible_task_truth_semantics(answer)
+        }
         None => decision.task_resolution_status == "no_clear_current_task" && !work_supported,
     };
     let decision_stale = freshness.decision_stale
@@ -728,7 +774,9 @@ pub fn island_state_from_continue_decision(
         target_state: if decision_stale {
             "stale_decision".to_string()
         } else if let Some(answer) = task_truth_answer {
-            if answer.task_resolution_status == "unresolved" {
+            if answer.task_resolution_status == "unresolved"
+                && !has_visible_task_truth_semantics(answer)
+            {
                 "no_clear_task".to_string()
             } else if answer.direct_return_target.is_some() {
                 "direct_continue_ready".to_string()
@@ -1036,7 +1084,7 @@ fn suppression_reasons(decision: &ContinueDecisionResult) -> Vec<String> {
 fn semantic_current_activity(
     answer: &crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1,
 ) -> Option<String> {
-    if answer.task_resolution_status == "unresolved" {
+    if answer.task_resolution_status == "unresolved" && !has_visible_task_truth_semantics(answer) {
         return None;
     }
     let activity = safe_text(
@@ -1303,6 +1351,51 @@ mod tests {
         decision.direct_target_policy.openable = true;
         decision.direct_target_policy.target_identity_confident = true;
         decision
+    }
+
+    fn failed_inference_diagnostic(
+        status: &str,
+    ) -> crate::continuation::task_truth_v2::production::TaskTruthInferenceDiagnosticV1 {
+        crate::continuation::task_truth_v2::production::TaskTruthInferenceDiagnosticV1 {
+            schema: "smalltalk.task_truth_inference_diagnostic.v1".into(),
+            status: status.into(),
+            origin: "live_cloud".into(),
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            request_id: Some("request-test".into()),
+            provider_request_id: Some("provider-request-test".into()),
+            response_id: Some("response-test".into()),
+            provider_attempt_count: 1,
+            latency_ms: 100,
+            image_count: 2,
+            image_bytes: 1_024,
+            estimated_tokens: 500,
+            input_tokens: Some(400),
+            output_tokens: Some(100),
+            total_tokens: Some(500),
+            estimated_cost_usd: None,
+            verification_status: "support_slot_validation_failure".into(),
+            selected_hypothesis_id: None,
+        }
+    }
+
+    #[test]
+    fn failed_empty_semantic_refresh_is_distinct_from_a_useful_partial_answer() {
+        let mut failed = base_decision();
+        failed.task_truth_v2.answer = Some(Default::default());
+        failed.task_truth_v2.inference_diagnostic = Some(failed_inference_diagnostic(
+            "support_slot_validation_failure",
+        ));
+        assert!(decision_is_failed_empty_semantic_refresh(&failed));
+
+        failed
+            .task_truth_v2
+            .answer
+            .as_mut()
+            .unwrap()
+            .current_subtask = Some("You were validating Continue output in Smalltalk.".into());
+        assert!(decision_has_visible_task_truth_semantics(&failed));
+        assert!(!decision_is_failed_empty_semantic_refresh(&failed));
     }
 
     #[test]
@@ -1910,6 +2003,45 @@ mod tests {
         assert!(state.next_action.is_none());
         assert_eq!(state.target_state, "direct_continue_ready");
         assert_eq!(state.validation_status.as_deref(), Some("resolved"));
+    }
+
+    #[test]
+    fn unresolved_model_answer_with_admitted_fields_is_inspectable_not_no_clear() {
+        let mut decision = base_decision();
+        decision.task_truth_v2.effective_state =
+            crate::continuation::task_truth_v2::production::TaskTruthAuthorityStateV1::Authoritative;
+        decision.task_truth_v2.release_gate_passed = true;
+        decision.task_truth_v2.answer = Some(
+            crate::continuation::task_truth_v2::production::TaskTruthPublicAnswerV1 {
+                task_resolution_status: "unresolved".into(),
+                current_subtask: Some("Review the admitted Continue response".into()),
+                current_activity:
+                    crate::continuation::task_truth_v2::production::TaskTruthCurrentActivityV1 {
+                        current_subtask: Some("Review the admitted Continue response".into()),
+                        relationship_to_primary: "unclear".into(),
+                        ..Default::default()
+                    },
+                last_meaningful_progress: Some("The provider returned usable evidence".into()),
+                unfinished_state: Some("The exact primary task remains uncertain".into()),
+                inference_status: "model_answer_visible_with_validation_limits".into(),
+                ..Default::default()
+            },
+        );
+
+        let state = mapped(&decision);
+
+        assert_eq!(state.display_state, IslandDisplayState::InspectOnly);
+        assert_eq!(state.target_state, "task_known_target_unknown");
+        assert_eq!(
+            state.activity_summary.as_deref(),
+            None,
+            "a current step must not be relabeled as the primary task"
+        );
+        assert_eq!(
+            state.current_activity.as_deref(),
+            Some("Review the admitted Continue response Its relationship to the earlier task is not clear.")
+        );
+        assert!(!state.allows_open_continue_target());
     }
 
     #[test]

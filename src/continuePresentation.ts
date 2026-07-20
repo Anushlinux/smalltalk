@@ -97,6 +97,47 @@ export type ContinueTaskTruthAlternative = {
   semantic_payload?: unknown | null;
 };
 
+export type ContinueTaskTruthRecentContext = {
+  sequence_index: number;
+  app_label: string;
+  site_hostname?: string | null;
+  first_observed_at_ms: number;
+  last_observed_at_ms: number;
+  is_current: boolean;
+  revisited: boolean;
+  evidence_refs?: string[];
+  semantic_role?: "primary_work" | "supporting_work" | "detour_or_unrelated" | "unclear" | null;
+  role_confidence?: number | null;
+  relationship_to_primary_task?: string | null;
+  role_evidence_refs?: string[];
+};
+
+export type ContinuePublicProjection = {
+  headline: string;
+  memoryLine: string | null;
+  resumeSurface: string | null;
+  openActionLabel: string | null;
+  exactTargetNote: string | null;
+};
+
+export type ContinueSurfaceProjection = {
+  label: string;
+  kind: "App" | "Page";
+  appLabel: string | null;
+  siteHostname: string | null;
+};
+
+export type ContinueContinuationFieldProjection = {
+  checkpoint: string | null;
+  continuation: string;
+  checkpointSurface: ContinueSurfaceProjection | null;
+  continuationSurface: ContinueSurfaceProjection | null;
+  locationLabel: string | null;
+  targetStatus: string | null;
+  openActionLabel: string | null;
+  recentContext: ContinueTaskTruthRecentContext[];
+};
+
 export type ContinueTaskTruthAnswer = {
   schema: string;
   task_basis?: string | null;
@@ -120,6 +161,7 @@ export type ContinueTaskTruthAnswer = {
   next_action?: string | null;
   where_summary?: string | null;
   relationship_to_prior?: string | null;
+  recent_context?: ContinueTaskTruthRecentContext[];
   alternative_hypotheses: ContinueTaskTruthAlternative[];
   direct_return_target?: ContinueAdoptionTarget | null;
   evidence_preview?: {
@@ -199,15 +241,15 @@ export type ContinueAdoptionComparison = {
   reasonCodes: string[];
 };
 
-export const NO_CLEAR_CURRENT_TASK_HEADLINE = "The exact task could not be determined";
+export const NO_CLEAR_CURRENT_TASK_HEADLINE = "I couldn't determine where to resume";
 
 export const NO_CLEAR_CURRENT_TASK_COPY = {
-  heroLabel: "Recent activity was captured",
-  targetBlockLabel: "Evidence available",
-  targetLine: "Recent activity is available to inspect",
-  targetMeta: "The current evidence does not support one exact task or return location.",
-  lastStateLine: "No current task state is supported by the available evidence.",
-  nextActionLine: "Inspect the recent evidence or keep working until the task becomes clear.",
+  heroLabel: "No safe continuation yet",
+  targetBlockLabel: "What to do",
+  targetLine: "Return to the work you want to continue, then try Continue again",
+  targetMeta: "Smalltalk did not find a verified page, conversation, or file to reopen.",
+  lastStateLine: "Your recent activity did not establish one safe continuation point.",
+  nextActionLine: "Keep the work surface visible briefly before trying again.",
   uncertaintyLine:
     "Smalltalk will not turn older activity into a current task without supporting evidence.",
 } as const;
@@ -248,20 +290,23 @@ function normalizeToken(value?: string | null) {
 
 export function isTaskInferenceUnavailable(status?: string | null) {
   return [
-    "disabled",
-    "credentials_missing",
     "model_unavailable",
-    "timeout",
     "provider_error",
     "provider_failure",
-    "request_invalid",
-    "invalid_response",
+    "provider_unavailable",
   ].includes(normalizeToken(status));
 }
 
 export type TaskInferenceFailureKind =
   | "capture_unavailable"
+  | "provider_disabled"
+  | "credentials_missing"
+  | "model_unavailable"
+  | "provider_timeout"
+  | "provider_request_rejected"
+  | "provider_failure"
   | "provider_unavailable"
+  | "provider_no_usable_output"
   | "model_response_invalid"
   | "evidence_verifier_rejected"
   | "insufficient_evidence";
@@ -287,10 +332,27 @@ export function taskInferenceFailurePresentation(
       retryable: true,
     };
   }
+  if (normalized === "support_slot_validation_failure") {
+    return {
+      kind: "evidence_verifier_rejected" as TaskInferenceFailureKind,
+      headline: "The proposed task did not match the captured evidence",
+      detail: "Cloud inference returned an answer, but its cited evidence did not pass local validation.",
+      retryable: true,
+    };
+  }
+  if (normalized === "provider_no_usable_output") {
+    return {
+      kind: "provider_no_usable_output" as TaskInferenceFailureKind,
+      headline: "Cloud task inference did not return a usable answer",
+      detail: "The provider did not return one complete, valid task answer.",
+      retryable: true,
+    };
+  }
   if ([
     "invalid_response",
     "invalid_atomic_identity",
     "missing_model_response_identity",
+    "structured_parse_failure",
     "unsupported_semantic_source",
   ].includes(normalized)) {
     return {
@@ -303,11 +365,12 @@ export function taskInferenceFailurePresentation(
     };
   }
   if (
-    normalized === "request_invalid"
-    && providerWasAttempted
+    normalized === "request_rejected"
+    || normalized === "provider_rejected"
+    || (normalized === "request_invalid" && providerWasAttempted)
   ) {
     return {
-      kind: "provider_unavailable" as TaskInferenceFailureKind,
+      kind: "provider_request_rejected" as TaskInferenceFailureKind,
       headline: "Cloud task inference could not accept this request",
       detail: "The provider rejected the bounded inference request before returning a task answer.",
       retryable: true,
@@ -315,30 +378,59 @@ export function taskInferenceFailurePresentation(
   }
   if (
     ["privacy_blocked", "request_invalid", "capture_unavailable"].includes(normalized)
-    || normalized.includes("requestinvalid")
-    || normalized.includes("privacyblocked")
   ) {
     return {
       kind: "capture_unavailable" as TaskInferenceFailureKind,
       headline: "Capture was unavailable for this Continue attempt",
-      detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+      detail: "Smalltalk could not prepare a readable current-work packet for this request.",
       retryable: false,
     };
   }
-  if ([
-    "disabled",
-    "credentials_missing",
-    "model_unavailable",
-    "timeout",
-    "provider_error",
-    "provider_failure",
-  ].includes(normalized)) {
+  if (normalized === "disabled") {
+    return {
+      kind: "provider_disabled" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is disabled in this build",
+      detail: "No provider request was attempted. Enable Task Truth inference and run Continue again.",
+      retryable: false,
+    };
+  }
+  if (normalized === "credentials_missing") {
+    return {
+      kind: "credentials_missing" as TaskInferenceFailureKind,
+      headline: "Cloud task inference is not configured",
+      detail: "No provider request was attempted because an OpenAI API key was not available.",
+      retryable: false,
+    };
+  }
+  if (normalized === "model_unavailable") {
+    return {
+      kind: "model_unavailable" as TaskInferenceFailureKind,
+      headline: "The configured inference model is unavailable",
+      detail: "The provider could not use the configured model for this request.",
+      retryable: true,
+    };
+  }
+  if (normalized === "provider_unavailable") {
     return {
       kind: "provider_unavailable" as TaskInferenceFailureKind,
-      headline: "Cloud task inference is unavailable right now",
-      detail: normalized === "timeout"
-        ? "The provider timed out before a verified answer was returned."
-        : "The provider could not return a verified task answer.",
+      headline: "Cloud task inference is unavailable",
+      detail: "Smalltalk could not complete the provider request. Check the provider configuration or try Continue again.",
+      retryable: true,
+    };
+  }
+  if (normalized === "timeout") {
+    return {
+      kind: "provider_timeout" as TaskInferenceFailureKind,
+      headline: "Cloud task inference timed out",
+      detail: "The provider did not return a verified answer before the request deadline.",
+      retryable: true,
+    };
+  }
+  if (["provider_error", "provider_failure"].includes(normalized)) {
+    return {
+      kind: "provider_failure" as TaskInferenceFailureKind,
+      headline: "Cloud task inference failed",
+      detail: "The provider request failed before Smalltalk received a verified task answer.",
       retryable: true,
     };
   }
@@ -446,6 +538,324 @@ export function authoritativeTaskTruthTarget(
   return answer ? answer.direct_return_target || null : null;
 }
 
+export function recentContextForPresentation(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  const visible: ContinueTaskTruthRecentContext[] = [];
+  for (const visit of answer?.recent_context || []) {
+    if (
+      !["primary_work", "supporting_work"].includes(visit.semantic_role || "")
+      || !visit.relationship_to_primary_task?.trim()
+    ) {
+      continue;
+    }
+    const previous = visible[visible.length - 1];
+    const sameSurface = previous
+      && recentContextSurfaceLabel(previous) === recentContextSurfaceLabel(visit);
+    const sameRole = previous?.semantic_role === visit.semantic_role;
+    const sameRelationship = (previous?.relationship_to_primary_task || "").trim()
+      === (visit.relationship_to_primary_task || "").trim();
+
+    if (sameSurface && sameRole && sameRelationship) {
+      visible[visible.length - 1] = {
+        ...previous,
+        ...visit,
+        first_observed_at_ms: previous.first_observed_at_ms,
+        evidence_refs: [
+          ...(previous.evidence_refs || []),
+          ...(visit.evidence_refs || []),
+        ],
+      };
+      continue;
+    }
+
+    visible.push(visit);
+  }
+  if (visible.length > 0) return visible.slice(-4);
+
+  const currentObservedSurface = [...(answer?.recent_context || [])]
+    .reverse()
+    .find((visit) => (
+      visit.is_current
+      && visit.app_label.trim()
+      && normalizeToken(visit.app_label) !== "smalltalk"
+    ));
+  return currentObservedSurface ? [currentObservedSurface] : [];
+}
+
+export function recentContextSurfaceLabel(
+  visit: ContinueTaskTruthRecentContext,
+) {
+  const app = visit.app_label.trim();
+  const hostname = (visit.site_hostname || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
+  const appKey = app.toLowerCase();
+
+  if (appKey === "code" || appKey === "visual studio code") return "VS Code";
+  if (hostname === "thinkingmachines.ai") return "Thinking Machines";
+  if (hostname === "chatgpt.com") return "ChatGPT";
+  if (hostname === "platform.openai.com") return "OpenAI Platform";
+
+  const browserShells = ["helium", "safari", "google chrome", "chrome", "arc", "firefox"];
+  if (hostname && browserShells.includes(appKey)) {
+    return hostname;
+  }
+
+  return app || "Work surface";
+}
+
+export function recentContextSurfaceKind(
+  visit: ContinueTaskTruthRecentContext,
+): ContinueSurfaceProjection["kind"] {
+  return visit.site_hostname?.trim() ? "Page" : "App";
+}
+
+function surfaceProjectionFromVisit(
+  visit?: ContinueTaskTruthRecentContext | null,
+): ContinueSurfaceProjection | null {
+  if (!visit?.app_label.trim() || normalizeToken(visit.app_label) === "smalltalk") {
+    return null;
+  }
+  return {
+    label: recentContextSurfaceLabel(visit),
+    kind: recentContextSurfaceKind(visit),
+    appLabel: publicClause(visit.app_label) || null,
+    siteHostname: publicClause(visit.site_hostname) || null,
+  };
+}
+
+function surfaceProjectionFromLabel(
+  label?: string | null,
+): ContinueSurfaceProjection | null {
+  const cleanLabel = publicClause(label);
+  if (!cleanLabel) return null;
+  const looksLikePage = /^(?:https?:\/\/|www\.)/i.test(cleanLabel)
+    || /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(cleanLabel);
+  const knownAppLabels = [
+    "arc",
+    "chatgpt",
+    "chrome",
+    "codex",
+    "discord",
+    "figma",
+    "firefox",
+    "github",
+    "helium",
+    "notion",
+    "openai",
+    "safari",
+    "slack",
+    "terminal",
+    "visual studio code",
+    "vs code",
+  ];
+  if (!looksLikePage && !knownAppLabels.some((app) => normalizeToken(cleanLabel).includes(app))) {
+    return null;
+  }
+  return {
+    label: cleanLabel,
+    kind: looksLikePage ? "Page" : "App",
+    appLabel: looksLikePage ? null : cleanLabel,
+    siteHostname: looksLikePage
+      ? cleanLabel.replace(/^https?:\/\//i, "").replace(/^www\./i, "").split("/")[0] || null
+      : null,
+  };
+}
+
+export function continuationSurfacesForPresentation(
+  answer?: ContinueTaskTruthAnswer | null,
+  fallbackLabel?: string | null,
+) {
+  const visits = (answer?.recent_context || []).filter(
+    (visit) => visit.app_label.trim() && normalizeToken(visit.app_label) !== "smalltalk",
+  );
+  const visitNamedIn = (copy?: string | null) => {
+    const normalizedCopy = normalizeToken(copy || "");
+    if (!normalizedCopy) return null;
+    return [...visits].reverse().find((visit) => {
+      const candidates = [
+        visit.app_label,
+        visit.site_hostname,
+        recentContextSurfaceLabel(visit),
+      ]
+        .map((value) => normalizeToken(value || ""))
+        .filter((value) => value.length >= 3);
+      return candidates.some((value) => normalizedCopy.includes(value));
+    }) || null;
+  };
+  const currentVisit = [...visits].reverse().find((visit) => visit.is_current) || null;
+  const primaryVisit = [...visits].reverse().find((visit) => (
+    visit.semantic_role === "primary_work"
+    && Boolean(visit.relationship_to_primary_task?.trim())
+  )) || null;
+  const meaningfulVisit = [...visits].reverse().find((visit) => (
+    ["primary_work", "supporting_work"].includes(visit.semantic_role || "")
+    && Boolean(visit.relationship_to_primary_task?.trim())
+  )) || null;
+  const checkpointVisit = visitNamedIn(answer?.last_meaningful_progress)
+    || primaryVisit
+    || meaningfulVisit
+    || currentVisit;
+  const continuationVisit = visitNamedIn(answer?.unfinished_state || answer?.next_action)
+    || null;
+  const fallback = surfaceProjectionFromLabel(fallbackLabel);
+  const checkpointSurface = surfaceProjectionFromVisit(checkpointVisit) || fallback;
+  const continuationSurface = surfaceProjectionFromVisit(continuationVisit) || fallback;
+
+  return { checkpointSurface, continuationSurface };
+}
+
+export function buildContinuePublicProjection(
+  answer: ContinueTaskTruthAnswer,
+  targetOpenable: boolean,
+): ContinuePublicProjection {
+  const task = publicClause(answer.task_summary);
+  const currentStep = publicClause(answer.current_subtask);
+  const action = publicClause(answer.next_action || answer.unfinished_state);
+  const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
+  const continuationField = buildContinueContinuationFieldProjection(
+    answer,
+    targetOpenable,
+  );
+  const surface = continuationField.locationLabel;
+  const headline = currentStep || task || action || progress || "Continue";
+
+  return {
+    headline,
+    memoryLine: null,
+    resumeSurface: surface,
+    openActionLabel: continuationField.openActionLabel,
+    exactTargetNote: continuationField.targetStatus,
+  };
+}
+
+export function buildContinueContinuationFieldProjection(
+  answer: ContinueTaskTruthAnswer,
+  targetOpenable: boolean,
+  preciseTargetLabel?: string | null,
+): ContinueContinuationFieldProjection {
+  const checkpoint = publicSentence(answer.last_meaningful_progress) || null;
+  const supportedContinuation = publicSentence(
+    answer.unfinished_state || answer.next_action,
+  );
+  const executionState = normalizeToken(answer.execution_state);
+  const explicitlyComplete = ["complete", "completed", "complete_or_idle"].includes(
+    executionState,
+  );
+  const locationLabel = publicClause(preciseTargetLabel)
+    || publicClause(answer.where_summary)
+    || null;
+  const projectedSurfaces = continuationSurfacesForPresentation(
+    answer,
+    preciseTargetLabel || answer.where_summary,
+  );
+  const genericAppDestination = /\b(?:the )?(?:running|current) app\b/i.test(
+    supportedContinuation,
+  );
+  const taskNamesSmalltalk = [
+    answer.task_summary,
+    answer.task_object,
+    answer.current_subtask,
+  ].some((value) => normalizeToken(value || "").includes("smalltalk"));
+  const continuationNamesSmalltalk = normalizeToken(supportedContinuation).includes("smalltalk");
+  const continuationSurface = (genericAppDestination || continuationNamesSmalltalk)
+    && taskNamesSmalltalk
+    ? {
+        label: "Smalltalk",
+        kind: "App" as const,
+        appLabel: "Smalltalk",
+        siteHostname: null,
+      }
+    : projectedSurfaces.continuationSurface;
+  const contextualContinuation = continuationSurface
+    ? supportedContinuation
+        .replace(/\bin the (?:running|current) app\b/gi, `in ${continuationSurface.label}`)
+        .replace(/\bthe (?:running|current) app\b/gi, continuationSurface.label)
+    : supportedContinuation;
+  const continuation = contextualContinuation || (
+    explicitlyComplete
+      ? "No unfinished step remains."
+      : "No unfinished step was clearly captured."
+  );
+
+  return {
+    checkpoint,
+    continuation,
+    checkpointSurface: projectedSurfaces.checkpointSurface,
+    continuationSurface,
+    locationLabel,
+    targetStatus: targetOpenable
+      ? null
+      : locationLabel
+        ? "Exact place not captured"
+        : "Return location not captured",
+    openActionLabel: targetOpenable
+      ? locationLabel ? `Open ${locationLabel}` : "Open continuation"
+      : null,
+    recentContext: recentContextForPresentation(answer),
+  };
+}
+
+export function hasVisibleTaskTruthSemantics(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  return [
+    answer?.task_summary,
+    answer?.task_object,
+    answer?.current_subtask,
+    answer?.observed_surface,
+    answer?.immediate_user_operation,
+    answer?.semantic_effect_of_operation,
+    answer?.last_meaningful_progress,
+    answer?.unfinished_state,
+    answer?.next_action,
+    answer?.where_summary,
+  ].some((value) => Boolean(value?.trim()));
+}
+
+export function hasVisibleTaskTruthContinuationDetails(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  return [
+    answer?.last_meaningful_progress,
+    answer?.unfinished_state,
+    answer?.next_action,
+    answer?.where_summary,
+  ].some((value) => Boolean(value?.trim()));
+}
+
+function publicClause(value?: string | null) {
+  return (value || "")
+    .trim()
+    .replace(/[\s.!?;:]+$/, "")
+    .replace(/\s+/g, " ");
+}
+
+function publicSentence(value?: string | null) {
+  return (value || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+export function recentContextRoleLabel(
+  role?: ContinueTaskTruthRecentContext["semantic_role"],
+) {
+  switch (role) {
+    case "primary_work":
+      return "Primary work";
+    case "supporting_work":
+      return "Supporting work";
+    case "detour_or_unrelated":
+      return "Detour or unrelated";
+    case "unclear":
+      return "Relationship unclear";
+    default:
+      return null;
+  }
+}
+
 export function authoritativeTaskTruthActionState(
   decision?: ContinueAdoptionComparableDecision | null,
 ): ContinuePresentationActionState | null {
@@ -505,11 +915,11 @@ export function getContinuePresentationActionState(
 }
 
 export function inspectTargetCopy(input: InspectTargetCopyInput) {
-  const targetLine = input.evidencePreviewAvailable
-    ? "Captured evidence is available to inspect"
+  const targetLine = input.taskKnown
+    ? "The task is understood, but no exact return point is ready"
     : input.appFocusOnly
       ? "The app is known, but the exact page, conversation, or file is unavailable"
-      : "No direct page or file locator is available";
+      : "No exact return point is ready";
   const targetMeta = input.targetNote?.trim() || (
     input.taskKnown
       ? "I know the task, but I do not have a direct page or file locator."
@@ -519,7 +929,7 @@ export function inspectTargetCopy(input: InspectTargetCopyInput) {
     targetBlockLabel: "Exact location unavailable",
     targetLine,
     targetMeta,
-    actionLabel: "Inspect evidence" as const,
+    actionLabel: "Try Continue again" as const,
   };
 }
 
@@ -585,6 +995,21 @@ export function compareContinueDecisionAdoption({
     return { adopt: true, reasonCodes: ["adopted:no_incumbent"] };
   }
 
+  const explicitRequest = challengerTrigger === "manual" || challengerTrigger === "island";
+  if (
+    explicitRequest &&
+    hasVisibleTaskTruthSemantics(authoritativeTaskTruthAnswer(incumbent)) &&
+    isFailedEmptySemanticRefresh(challenger)
+  ) {
+    return {
+      adopt: false,
+      reasonCodes: [
+        "rejected:explicit_refresh_failed_without_semantics",
+        "retained:last_usable_continue_answer",
+      ],
+    };
+  }
+
   const incumbentTask = adoptionTaskIdentity(incumbent);
   const challengerTask = adoptionTaskIdentity(challenger);
   const sameTask = Boolean(
@@ -592,7 +1017,6 @@ export function compareContinueDecisionAdoption({
       challengerTask?.task_turn_id &&
       incumbentTask.task_turn_id === challengerTask.task_turn_id,
   );
-  const explicitManual = challengerTrigger === "manual";
   const reasons: string[] = [];
 
   if (
@@ -604,7 +1028,7 @@ export function compareContinueDecisionAdoption({
     reasons.push("rejected:older_task_revision");
   }
 
-  if (!explicitManual) {
+  if (!explicitRequest) {
     const incumbentStatus = decisionTaskResolutionStatus(incumbent);
     const challengerStatus = decisionTaskResolutionStatus(challenger);
     const challengerEvidenceIsNewer = hasCausallyNewerEvidence(incumbent, challenger);
@@ -649,11 +1073,26 @@ export function compareContinueDecisionAdoption({
       reasons.push("rejected:wording_source_downgrade");
     }
 
+    // An island press is an explicit Continue request. Its full decision may
+    // reach the React window through an event or startup hydration. Do not let
+    // a later quiet refresh replace that exact provider-backed answer; another
+    // explicit manual or island request is still allowed to replace it.
     if (
-      incumbentTrigger === "manual" &&
+      incumbentTrigger === "island" &&
+      hasProviderBackedVisibleTaskTruth(incumbent)
+    ) {
+      reasons.push("rejected:background_cannot_replace_explicit_island_answer");
+    }
+
+    if (
+      (incumbentTrigger === "manual" || incumbentTrigger === "island") &&
       reasons.length > 0
     ) {
-      reasons.push("retained:stronger_manual_result");
+      reasons.push(
+        incumbentTrigger === "island"
+          ? "retained:explicit_island_result"
+          : "retained:stronger_manual_result",
+      );
     }
   }
 
@@ -663,8 +1102,39 @@ export function compareContinueDecisionAdoption({
   }
   return {
     adopt: true,
-    reasonCodes: [explicitManual ? "adopted:explicit_manual_result" : "adopted:quality_not_lower"],
+    reasonCodes: [
+      challengerTrigger === "manual"
+        ? "adopted:explicit_manual_result"
+        : challengerTrigger === "island"
+          ? "adopted:explicit_island_result"
+          : "adopted:quality_not_lower",
+    ],
   };
+}
+
+function hasProviderBackedVisibleTaskTruth(
+  decision: ContinueAdoptionComparableDecision,
+) {
+  const answer = authoritativeTaskTruthAnswer(decision);
+  return Boolean(
+    answer &&
+      hasVisibleTaskTruthSemantics(answer) &&
+      (answer.response_id?.trim() || answer.atomic_identity.model_response_id?.trim()),
+  );
+}
+
+function isFailedEmptySemanticRefresh(
+  decision: ContinueAdoptionComparableDecision,
+) {
+  const answer = decision.task_truth_v2?.answer || null;
+  const diagnosticStatus = normalizeToken(
+    decision.task_truth_v2?.inference_diagnostic?.status,
+  );
+  return Boolean(
+    diagnosticStatus &&
+      diagnosticStatus !== "success" &&
+      !hasVisibleTaskTruthSemantics(answer),
+  );
 }
 
 function decisionTaskResolutionStatus(

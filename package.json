@@ -6,26 +6,32 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs",
+    "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs scripts/continueRequest.test.mjs",
     "test:webview": "npm run test:continue-presentation",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:dev:mfti": "./scripts/tauri-dev-mfti.sh",
+    "tauri:dev:pftu": "./scripts/tauri-dev-pftu.sh",
     "tauri:build:macos:qa": "./scripts/build-macos-qa.sh",
     "tauri:build:macos:release": "SMALLTALK_SIGNING_PROFILE=release ./scripts/build-macos-qa.sh",
     "tauri:verify:macos": "./scripts/verify-macos-bundle.sh"
   },
   "dependencies": {
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
+    "@fontsource/instrument-serif": "^5.3.0",
+    "@gsap/react": "^2.1.2",
+    "@phosphor-icons/react": "^2.1.10",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "gsap": "^3.15.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4",
-    "@tauri-apps/cli": "^2"
+    "vite": "^7.0.4"
   }
 }

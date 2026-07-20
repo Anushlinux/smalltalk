@@ -12,11 +12,15 @@ use super::observation_packet::{
 use super::task_snapshot::TaskSnapshotV2;
 
 pub(crate) const TASK_TRUTH_MODEL_OUTPUT_SCHEMA_V1: &str = "smalltalk.task_truth_model_output.v2";
-pub(crate) const TASK_TRUTH_RESOLVER_VERSION: &str = "task_truth_v2.multimodal_resolver.v2";
+pub(crate) const TASK_TRUTH_RESOLVER_VERSION: &str = "task_truth_v2.multimodal_resolver.v3";
 
 const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+const MAX_PRIMARY_TASK_CHARS: usize = 72;
+const MAX_CURRENT_SUBTASK_CHARS: usize = 96;
+const MAX_STATE_DETAIL_CHARS: usize = 160;
+const MAX_NEXT_ACTION_CHARS: usize = 96;
 pub(crate) const MODEL_SEMANTIC_FIELDS: [&str; 16] = [
     "observed_surface",
     "immediate_user_operation",
@@ -57,6 +61,7 @@ pub(crate) enum ProviderDiagnosticStatusV1 {
     ModelUnavailable,
     PrivacyBlocked,
     RequestInvalid,
+    RequestRejected,
     Timeout,
     ProviderError,
     InvalidResponse,
@@ -180,6 +185,7 @@ pub(crate) struct TaskTruthModelOutputV1 {
 pub(crate) enum ModelFailureKindV1 {
     Unavailable,
     RequestInvalid,
+    RequestRejected,
     Timeout,
     InvalidJson,
     PolicyRefusal,
@@ -314,11 +320,12 @@ pub(crate) fn diagnostic_for_failure(failure: &ModelFailureV1) -> ProviderDiagno
         }
         ModelFailureKindV1::Unavailable => ProviderDiagnosticStatusV1::ModelUnavailable,
         ModelFailureKindV1::RequestInvalid => ProviderDiagnosticStatusV1::RequestInvalid,
+        ModelFailureKindV1::RequestRejected | ModelFailureKindV1::PolicyRefusal => {
+            ProviderDiagnosticStatusV1::RequestRejected
+        }
         ModelFailureKindV1::Timeout => ProviderDiagnosticStatusV1::Timeout,
         ModelFailureKindV1::InvalidJson => ProviderDiagnosticStatusV1::InvalidResponse,
-        ModelFailureKindV1::PolicyRefusal | ModelFailureKindV1::ProviderError => {
-            ProviderDiagnosticStatusV1::ProviderError
-        }
+        ModelFailureKindV1::ProviderError => ProviderDiagnosticStatusV1::ProviderError,
     }
 }
 
@@ -328,6 +335,7 @@ pub(crate) fn resolution_for_failure(failure: &ModelFailureV1) -> ResolutionStat
         ModelFailureKindV1::InvalidJson => ResolutionStatusV1::InvalidResponse,
         ModelFailureKindV1::RequestInvalid => ResolutionStatusV1::InvalidResponse,
         ModelFailureKindV1::Timeout
+        | ModelFailureKindV1::RequestRejected
         | ModelFailureKindV1::PolicyRefusal
         | ModelFailureKindV1::ProviderError => ResolutionStatusV1::ProviderFailure,
     }
@@ -473,7 +481,7 @@ fn mime_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(super) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -497,7 +505,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn read_model_image(
+pub(super) fn read_model_image(
     frame: &super::observation_packet::KeyframeReferenceV2,
 ) -> Result<(Vec<u8>, String), String> {
     let raw_path = frame
@@ -906,7 +914,7 @@ pub(crate) fn build_multimodal_request(
     content.insert(0, json!({"type":"input_text", "text": structured_text}));
     let body = json!({
         "model": model,
-        "store": false,
+        "store": crate::continuation::openai_response_storage_enabled(),
         "max_output_tokens": 6000,
         "text": {"format": {
             "type": "json_schema",
@@ -951,7 +959,7 @@ pub(crate) fn build_multimodal_request(
 }
 
 fn system_instruction() -> &'static str {
-    "You are Smalltalk's cloud multimodal semantic sensor. Reconstruct the chronological sequence, not a text recap: (1) what every selected screen is about, (2) which owned object or control the user interacted with, (3) what changed after that interaction, (4) which immediate activity the causal sequence supports, and (5) whether it continues, supports, verifies, interrupts, temporarily detours from, returns to, or replaces the earlier task. Return observed_surface, immediate_user_operation, semantic_effect_of_operation, current_subtask, likely_primary_task, task_object, relationship_to_prior, last_meaningful_progress, unfinished_state, and possible_next_action as separate fields. Evidence priority is: grounded user action plus resulting state change; repeated coherent work-object interaction; focus, committed typing, submit, navigation, app switch, or tool-output boundaries; foreground content; passive visible text; then chrome or historical text. Passive page vocabulary and window titles prove only observation. Browser/app chrome cannot establish the task. Distinguish user-authored input from application/agent output and third-party content. Prior task threads are bounded hypotheses, not truth. For continuation, supporting_research, verification, temporary_detour, interruption, or return_to_prior_task, copy one exact continuity_thread_id, continuity_thread_revision, and continuity_identity_token from prior_task_threads and cite both current evidence and the prior revision. For new_task or unrelated_or_unknown, continuity fields must be null. Set supersedes_thread_id only when current contradictory evidence explicitly supports replacing that exact prior thread; otherwise null. A prior snapshot cannot override newer contradictory evidence. When relatedness is weak, preserve an unrelated_or_unknown alternative. Return one to three hypotheses for resolved or ambiguous evidence, with field-level support, contradictions, and confidence. claim_evidence is keyed by semantic field: use an evidence object for every non-null field and for relationship_to_prior, and use null only when the corresponding semantic field is null. Explain null fields in missing_evidence. Evidence references must be opaque string keys copied exactly from evidence_reference_catalog. Never return record ids, frame ids, hashes, or evidence objects directly. Obey every field-specific key requirement in request_policy.evidence_reference_rules. Identity hashes, thread identities, and return anchors are opaque exact values constrained by the response schema; use null rather than descriptive prose. Give a next action only when the unfinished state and a user-authored plan key support it. Write semantic values as concise product-copy fragments, not analyst narration. Never refer to 'the user', and do not put uncertainty words such as 'likely', 'appears', or 'looks like' inside the task summary; confidence and alternative hypotheses carry uncertainty. likely_primary_task and current_subtask should be short activity phrases. last_meaningful_progress and unfinished_state should each contain one concrete sentence, not reasoning or a recap. Do not invent task objects, identifiers, intent, or actions. Return strict JSON only."
+    "You are Smalltalk's cloud multimodal semantic sensor. Reconstruct the chronological sequence, not a text recap: (1) what every selected screen is about, (2) which owned object or control the user interacted with, (3) what changed after that interaction, (4) which immediate activity the causal sequence supports, and (5) whether it continues, supports, verifies, interrupts, temporarily detours from, returns to, or replaces the earlier task. Return observed_surface, immediate_user_operation, semantic_effect_of_operation, current_subtask, likely_primary_task, task_object, relationship_to_prior, last_meaningful_progress, unfinished_state, and possible_next_action as separate fields. Evidence priority is: grounded user action plus resulting state change; repeated coherent work-object interaction; focus, committed typing, submit, navigation, app switch, or tool-output boundaries; foreground content; passive visible text; then chrome or historical text. Passive page vocabulary and window titles prove only observation. Browser/app chrome cannot establish the task. Distinguish user-authored input from application/agent output and third-party content. Prior task threads are bounded hypotheses, not truth. For continuation, supporting_research, verification, temporary_detour, interruption, or return_to_prior_task, copy one exact continuity_thread_id, continuity_thread_revision, and continuity_identity_token from prior_task_threads and cite both current evidence and the prior revision. For new_task or unrelated_or_unknown, continuity fields must be null. Set supersedes_thread_id only when current contradictory evidence explicitly supports replacing that exact prior thread; otherwise null. A prior snapshot cannot override newer contradictory evidence. When relatedness is weak, preserve an unrelated_or_unknown alternative. Return one to three hypotheses for resolved or ambiguous evidence, with field-level support, contradictions, and confidence. claim_evidence is keyed by semantic field: use an evidence object for every non-null field and for relationship_to_prior, and use null only when the corresponding semantic field is null. Explain null fields in missing_evidence. Evidence references must be opaque string keys copied exactly from evidence_reference_catalog. Never return record ids, frame ids, hashes, or evidence objects directly. Obey every field-specific key requirement in request_policy.evidence_reference_rules. Identity hashes, thread identities, and return anchors are opaque exact values constrained by the response schema; use null rather than descriptive prose. Give a next action only when the unfinished state and a user-authored plan key support it. Write semantic values as concise product copy, not analyst narration. likely_primary_task is the main-card title: write 5 to 9 plain words when that can be done naturally, allow a shorter natural title such as 'Fix Continue output status', and never add filler just to reach five words. It must not start with 'Continue', 'Likely', or 'The user', use ending punctuation, narrate an app window or captured screen, or mention evidence, confidence, or analysis. current_subtask must be a concrete activity phrase of at most 12 words. last_meaningful_progress and unfinished_state must each be one plain sentence of at most 20 words, not reasoning or a recap. possible_next_action must be one supported action of at most 12 words. Never refer to 'the user', and do not put uncertainty words such as 'likely', 'appears', or 'looks like' inside the task summary; confidence and alternative hypotheses carry uncertainty. Do not invent task objects, identifiers, intent, or actions. Return strict JSON only."
 }
 
 fn nullable_bounded_string(max_length: usize) -> Value {
@@ -1137,14 +1145,14 @@ fn hypothesis_schema(
             "observed_surface":nullable_bounded_string(240),
             "immediate_user_operation":if evidence_policy.causal.is_empty() { json!({"type":"null"}) } else { nullable_bounded_string(180) },
             "semantic_effect_of_operation":if evidence_policy.delta.is_empty() { json!({"type":"null"}) } else { nullable_bounded_string(180) },
-            "current_subtask":task_identity(140),
-            "likely_primary_task":task_identity(140),
+            "current_subtask":task_identity(MAX_CURRENT_SUBTASK_CHARS),
+            "likely_primary_task":task_identity(MAX_PRIMARY_TASK_CHARS),
             "task_object":task_object, "app_identity":nullable_exact_strings(app_identities),
             "surface_identity_hash":nullable_exact_strings(surface_identities), "document_or_thread_identity_hash":nullable_exact_strings(document_identities),
             "execution_state":nullable_enum(&["active","composing","editing","reviewing","waiting","debugging","searching","comparing","blocked","interrupted","suspended","completed","superseded","idle_after_progress","unclear"]),
             "current_actor":nullable_enum(&["user","assistant_or_agent","application","unknown"]),
             "waiting_on":nullable_enum(&["user","assistant_or_agent","application","external","nothing","unknown"]),
-            "last_meaningful_progress":nullable_bounded_string(220), "unfinished_state":nullable_bounded_string(220), "possible_next_action":if evidence_policy.user_plan.is_empty() { json!({"type":"null"}) } else { nullable_bounded_string(180) },
+            "last_meaningful_progress":nullable_bounded_string(MAX_STATE_DETAIL_CHARS), "unfinished_state":nullable_bounded_string(MAX_STATE_DETAIL_CHARS), "possible_next_action":if evidence_policy.user_plan.is_empty() { json!({"type":"null"}) } else { nullable_bounded_string(MAX_NEXT_ACTION_CHARS) },
             "relationship_to_prior":{"type":"string","enum":relationship_values},
             "continuity_thread_id":nullable_exact_strings(continuity_thread_ids.clone()),
             "continuity_thread_revision":nullable_exact_i64(continuity_revisions),
@@ -1318,7 +1326,7 @@ impl TaskTruthModelClient for OpenAiTaskTruthModelClient {
     }
 }
 
-fn provider_attempt_metadata(response: &Value) -> ProviderAttemptMetadataV1 {
+pub(super) fn provider_attempt_metadata(response: &Value) -> ProviderAttemptMetadataV1 {
     let usage = response.get("usage");
     ProviderAttemptMetadataV1 {
         response_id: response
@@ -1367,24 +1375,22 @@ fn contract_correction(
     request: &TaskTruthModelRequestV1,
     rejected_response: &Value,
 ) -> Option<Value> {
-    let (field, reason) = if let Some(detail) = failure
-        .reason
-        .strip_prefix("evidence_policy_mismatch:")
-    {
-        detail.split_once(':')?
-    } else {
-        match failure.reason.as_str() {
-            "partial_thread_continuity_identity"
-            | "continuity_relationship_without_exact_thread_head"
-            | "new_or_unrelated_task_reused_prior_thread"
-            | "invalid_supersedes_thread_id"
-            | "supersession_missing_prior_and_current_evidence"
-            | "continuity_relationship_missing_prior_and_current_evidence" => {
-                ("relationship_to_prior", failure.reason.as_str())
+    let (field, reason) =
+        if let Some(detail) = failure.reason.strip_prefix("evidence_policy_mismatch:") {
+            detail.split_once(':')?
+        } else {
+            match failure.reason.as_str() {
+                "partial_thread_continuity_identity"
+                | "continuity_relationship_without_exact_thread_head"
+                | "new_or_unrelated_task_reused_prior_thread"
+                | "invalid_supersedes_thread_id"
+                | "supersession_missing_prior_and_current_evidence"
+                | "continuity_relationship_missing_prior_and_current_evidence" => {
+                    ("relationship_to_prior", failure.reason.as_str())
+                }
+                _ => return None,
             }
-            _ => return None,
-        }
-    };
+        };
     let allowed_keys = allowed_evidence_keys_for_field(
         field,
         &request.evidence_catalog.keys().cloned().collect::<Vec<_>>(),
@@ -1547,6 +1553,12 @@ fn classify_transport_failure(error: String) -> ModelFailureV1 {
         ModelFailureKindV1::Timeout
     } else if lower.contains("400") || lower.contains("invalid_request") {
         ModelFailureKindV1::RequestInvalid
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("permission")
+    {
+        ModelFailureKindV1::RequestRejected
     } else if lower.contains("404") || lower.contains("model_not_found") {
         ModelFailureKindV1::Unavailable
     } else {
@@ -1985,6 +1997,30 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    #[test]
+    fn system_prompt_requires_compact_product_copy_fields() {
+        let instruction = system_instruction();
+
+        assert_eq!(
+            TASK_TRUTH_RESOLVER_VERSION,
+            "task_truth_v2.multimodal_resolver.v3"
+        );
+        for required_rule in [
+            "likely_primary_task is the main-card title",
+            "5 to 9 plain words",
+            "allow a shorter natural title such as 'Fix Continue output status'",
+            "must not start with 'Continue', 'Likely', or 'The user'",
+            "current_subtask must be a concrete activity phrase of at most 12 words",
+            "last_meaningful_progress and unfinished_state must each be one plain sentence of at most 20 words",
+            "possible_next_action must be one supported action of at most 12 words",
+        ] {
+            assert!(
+                instruction.contains(required_rule),
+                "missing compact-copy rule: {required_rule}"
+            );
+        }
+    }
+
     struct PreservedFailureClient {
         attempts: Vec<ProviderAttemptMetadataV1>,
     }
@@ -2129,6 +2165,7 @@ mod tests {
             },
             current_frame: frame.clone(),
             semantic_keyframes: vec![frame],
+            surface_timeline: Vec::new(),
             canonical_elements: Vec::new(),
             focused_element_ids: Vec::new(),
             editable_element_ids: Vec::new(),
@@ -2818,5 +2855,21 @@ mod tests {
             assert!(attempt.output.is_none());
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_rejection_timeout_and_model_unavailable_remain_distinct() {
+        let rejected = classify_transport_failure("curl failed with HTTP 401".into());
+        assert_eq!(rejected.kind, ModelFailureKindV1::RequestRejected);
+        assert_eq!(
+            diagnostic_for_failure(&rejected),
+            ProviderDiagnosticStatusV1::RequestRejected
+        );
+
+        let timed_out = classify_transport_failure("request timed out".into());
+        assert_eq!(timed_out.kind, ModelFailureKindV1::Timeout);
+
+        let unavailable = classify_transport_failure("HTTP 404 model_not_found".into());
+        assert_eq!(unavailable.kind, ModelFailureKindV1::Unavailable);
     }
 }

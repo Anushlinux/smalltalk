@@ -6,13 +6,48 @@ mod continuation;
 mod session_island;
 mod workload;
 
+#[cfg(target_os = "macos")]
+fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
+    use objc2_app_kit::{NSColor, NSWindow};
+    use tauri::Manager;
+
+    let window = app.get_webview_window("main").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "main window is unavailable")
+    })?;
+    let ns_window = window.ns_window().map_err(std::io::Error::other)? as *mut NSWindow;
+    let ns_window = unsafe { &*ns_window };
+    let background = NSColor::colorWithRed_green_blue_alpha(
+        245.0 / 255.0,
+        244.0 / 255.0,
+        241.0 / 255.0,
+        1.0,
+    );
+
+    unsafe { ns_window.setBackgroundColor(Some(&background)) };
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            set_main_window_background(app)?;
+            capture::initialize_runtime_database(app.handle()).map_err(std::io::Error::other)?;
             session_island::init_session_island(app.handle().clone());
+            capture::start_runtime_soak_harness(app.handle().clone())
+                .map_err(std::io::Error::other)?;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[pftu_dev] model={} probe_enabled={} case={}",
+                continuation::task_truth_v2::semantic_probe::configured_model_name(),
+                continuation::task_truth_v2::semantic_probe::probe_enabled(),
+                continuation::task_truth_v2::semantic_probe::configured_case_id()
+                    .as_deref()
+                    .unwrap_or("none")
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -55,6 +90,8 @@ pub fn run() {
             capture::get_continue_workstream_detail,
             capture::get_continue_decision,
             capture::get_continue_decision_trace,
+            capture::list_continue_history,
+            capture::get_continue_history_output,
             capture::add_continue_breadcrumb,
             capture::infer_continue_feedback,
             capture::record_continue_feedback,
@@ -63,6 +100,7 @@ pub fn run() {
             capture::run_continue_accuracy_eval,
             capture::open_resume_point,
             session_island::get_island_continue_state,
+            session_island::get_latest_island_continue_decision,
             session_island::perform_island_continue_action,
             capture::get_native_storyboard_dossier,
             capture::classify_episode_transitions,
@@ -75,8 +113,33 @@ pub fn run() {
             capture::list_exclusion_rules,
             capture::delete_recent_captures,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.run(move |app, event| match event {
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            use std::sync::atomic::Ordering;
+
+            // The first exit request is converted into bounded asynchronous
+            // capture shutdown. The second request is issued by `exit` after
+            // cleanup and is allowed through without blocking the UI thread.
+            if !shutdown_started.swap(true, Ordering::AcqRel) {
+                api.prevent_exit();
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    capture::shutdown_audit_executor();
+                    workload::shutdown();
+                    if let Err(error) = capture::shutdown_capture(&app) {
+                        eprintln!("[capture] bounded shutdown reported: {error}");
+                    }
+                    app.exit(code.unwrap_or(0));
+                });
+            }
+        }
+        tauri::RunEvent::Exit => session_island::shutdown_session_island(),
+        _ => {}
+    });
 }
 
 /// Public, side-effect-bounded entry point used by the repository accuracy CLI.
@@ -141,4 +204,37 @@ pub fn build_task_truth_v2_candidate_cli(
         dry_run,
     )?;
     serde_json::to_value(manifest).map_err(|error| error.to_string())
+}
+
+/// Arm one private PFTU-01 case before its model output exists.
+pub fn arm_pftu_01_case_cli(
+    database_path: String,
+    input_path: String,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::arm_case_from_path(
+        std::path::Path::new(&database_path),
+        std::path::Path::new(&input_path),
+    )
+}
+
+/// Export a private, local-only PFTU-01 review bundle. The caller chooses the path.
+pub fn export_pftu_01_review_cli(
+    database_path: String,
+    output_path: String,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::export_private_review_bundle(
+        std::path::Path::new(&database_path),
+        std::path::Path::new(&output_path),
+    )
+}
+
+/// Evaluate only redacted, human-reviewed PFTU-01 corpus rows.
+pub fn evaluate_pftu_01_corpus_cli(
+    input_path: String,
+    output_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    continuation::task_truth_v2::semantic_probe::evaluate_corpus_path(
+        std::path::Path::new(&input_path),
+        output_path.as_deref().map(std::path::Path::new),
+    )
 }

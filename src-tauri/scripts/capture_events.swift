@@ -50,6 +50,10 @@ var droppedAtSource: Int64 = 0
 
 let smalltalkBundleId = "com.smalltalk.app"
 let frontmostContextCacheMs: Int64 = 250
+// These source windows intentionally match capture/event_pipeline.rs. Swift
+// collapses the native callback floods it can summarize losslessly; Rust owns
+// the finite priority lanes, click/typing pressure aggregation, and overflow
+// diagnostics. Neither layer records typed characters.
 let scrollCoalesceMs: Int64 = 650
 let axDefaultThrottleMs: Int64 = 900
 let axValueThrottleMs: Int64 = 1800

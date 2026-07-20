@@ -8,6 +8,7 @@ struct ScreenshotRequest: Decodable {
   let target_window_id: Int?
   let target_bundle_id: String?
   let exclude_bundle_ids: [String]?
+  let exclude_process_ids: [Int]?
   let output_path: String
   let max_width: Int?
   let quality: Double?
@@ -146,13 +147,15 @@ func writeJpeg(_ image: CGImage, request: ScreenshotRequest) throws -> (Int, Int
 func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse {
   let mode = request.mode ?? "display"
   let excludedBundleIds = Set((request.exclude_bundle_ids ?? []).filter { !$0.isEmpty })
+  let excludedProcessIds = Set((request.exclude_process_ids ?? []).filter { $0 > 0 })
   let content = try await SCShareableContent.excludingDesktopWindows(
     false,
     onScreenWindowsOnly: true
   )
   let excludedWindows = content.windows.filter { window in
-    guard let bundleId = window.owningApplication?.bundleIdentifier else { return false }
-    return excludedBundleIds.contains(bundleId)
+    guard let application = window.owningApplication else { return false }
+    return excludedProcessIds.contains(Int(application.processID))
+      || excludedBundleIds.contains(application.bundleIdentifier)
   }
 
   let filter: SCContentFilter
@@ -188,8 +191,10 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
         NSLocalizedDescriptionKey: "active window was not present in ScreenCaptureKit shareable content"
       ])
     }
-    if let bundleId = selectedWindow.owningApplication?.bundleIdentifier,
-       excludedBundleIds.contains(bundleId) {
+    let selectedApplication = selectedWindow.owningApplication
+    let selectedProcessId = selectedApplication.map { Int($0.processID) }
+    if selectedProcessId.map(excludedProcessIds.contains) == true
+      || selectedApplication.map({ excludedBundleIds.contains($0.bundleIdentifier) }) == true {
       throw NSError(domain: "SmalltalkSCK", code: 4, userInfo: [
         NSLocalizedDescriptionKey: "active window belongs to an excluded application"
       ])
@@ -297,8 +302,10 @@ func runCapture(_ request: ScreenshotRequest) async throws -> ScreenshotResponse
     filter_summary_json: jsonString([
       "scope": filterScope,
       "excluded_bundle_ids": Array(excludedBundleIds).sorted(),
+      "excluded_process_ids": Array(excludedProcessIds).sorted(),
       "excluded_window_ids": excludedWindows.map { Int($0.windowID) },
-      "self_exclusion_requested": excludedBundleIds.contains(Bundle.main.bundleIdentifier ?? "")
+      "self_exclusion_requested": !excludedProcessIds.isEmpty || !excludedBundleIds.isEmpty,
+      "self_exclusion_applied": !excludedWindows.isEmpty
     ]),
     configuration_summary_json: configurationSummary(configuration, request: request),
     frame_metadata_json: jsonString([

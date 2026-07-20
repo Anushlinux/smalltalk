@@ -18,11 +18,16 @@ dist
 dist-ssr
 *.local
 target/
+# Cargo output when CARGO_TARGET_DIR points at src-tauri.
+/src-tauri/debug/
+/src-tauri/release/
+/src-tauri/build/
 src-tauri/binaries/*-apple-darwin
 
 reference/
 
-docs/
+output/
+
 
 cloud_resume_exports/
 continue_outputs/

@@ -1,5 +1,8 @@
 import AppKit
+import Combine
+import CoreText
 import Foundation
+import ImageIO
 import QuartzCore
 import SwiftUI
 
@@ -8,6 +11,7 @@ private var gActionCallback: SmalltalkIslandActionCallback?
 
 private struct IslandSnapshot: Decodable {
     var state: String = "hidden"
+    var memoryActive = false
     var elapsedMs: Int64 = 0
     var frameCount: Int64 = 0
     var eventCount: Int64?
@@ -35,11 +39,15 @@ private struct IslandSnapshot: Decodable {
     var continueOpenable: Bool?
     var resumeWarning: String?
     var islandContinueState: IslandContinueState?
+    var visualCue: IslandVisualCue?
+    var continueHistoryPage: ContinueHistoryPageV1?
+    var continueHistoryOutput: ContinueHistoryOutputV1?
     var privacyLabel: String?
     var isSensitive: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case state
+        case memoryActive = "memory_active"
         case elapsedMs = "elapsed_ms"
         case frameCount = "frame_count"
         case eventCount = "event_count"
@@ -67,6 +75,9 @@ private struct IslandSnapshot: Decodable {
         case continueOpenable = "continue_openable"
         case resumeWarning = "resume_warning"
         case islandContinueState = "island_continue_state"
+        case visualCue = "visual_cue"
+        case continueHistoryPage = "continue_history_page"
+        case continueHistoryOutput = "continue_history_output"
         case privacyLabel = "privacy_label"
         case isSensitive = "is_sensitive"
     }
@@ -77,6 +88,106 @@ private struct IslandSnapshot: Decodable {
         snapshot.lastError = "Continue state could not be decoded."
         snapshot.islandContinueState = IslandContinueState.errorFallback()
         return snapshot
+    }
+}
+
+private struct ContinueHistoryCursorV1: Decodable, Equatable {
+    var createdAtMs: Int64
+    var decisionId: String
+
+    enum CodingKeys: String, CodingKey {
+        case createdAtMs = "created_at_ms"
+        case decisionId = "decision_id"
+    }
+}
+
+private struct ContinueHistorySummaryV1: Decodable, Equatable, Identifiable {
+    var decisionId: String
+    var createdAtMs: Int64
+    var origin: String
+    var title: String
+
+    var id: String { decisionId }
+
+    enum CodingKeys: String, CodingKey {
+        case decisionId = "decision_id"
+        case createdAtMs = "created_at_ms"
+        case origin
+        case title
+    }
+}
+
+private struct ContinueHistoryPageV1: Decodable, Equatable {
+    var schema: String?
+    var items: [ContinueHistorySummaryV1]
+    var nextCursor: ContinueHistoryCursorV1?
+    var requestId: UInt64
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case items
+        case nextCursor = "next_cursor"
+        case requestId = "request_id"
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        items = try container.decodeIfPresent([ContinueHistorySummaryV1].self, forKey: .items) ?? []
+        nextCursor = try container.decodeIfPresent(ContinueHistoryCursorV1.self, forKey: .nextCursor)
+        requestId = try container.decodeIfPresent(UInt64.self, forKey: .requestId) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+private struct ContinueHistoryAnswerRowV1: Decodable, Equatable, Identifiable {
+    var label: String
+    var value: String
+
+    var id: String { "\(label)\u{1f}\(value)" }
+}
+
+private struct ContinueHistoryOutputV1: Decodable, Equatable {
+    var schema: String?
+    var decisionId: String
+    var createdAtMs: Int64
+    var origin: String
+    var title: String
+    var rows: [ContinueHistoryAnswerRowV1]
+    var requestId: UInt64
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case decisionId = "decision_id"
+        case createdAtMs = "created_at_ms"
+        case origin
+        case title
+        case rows
+        case requestId = "request_id"
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema)
+        decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId) ?? ""
+        createdAtMs = try container.decodeIfPresent(Int64.self, forKey: .createdAtMs) ?? 0
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? ""
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        rows = try container.decodeIfPresent([ContinueHistoryAnswerRowV1].self, forKey: .rows) ?? []
+        requestId = try container.decodeIfPresent(UInt64.self, forKey: .requestId) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+private struct IslandVisualCue: Decodable, Equatable {
+    var imagePath: String
+
+    enum CodingKeys: String, CodingKey {
+        case imagePath = "image_path"
     }
 }
 
@@ -152,6 +263,32 @@ private struct IslandSemanticAlternative: Decodable, Equatable {
     }
 }
 
+private struct IslandSemanticRecentContext: Decodable, Equatable {
+    var sequenceIndex: Int
+    var appLabel: String
+    var siteHostname: String?
+    var firstObservedAtMs: Int64
+    var lastObservedAtMs: Int64
+    var isCurrent: Bool
+    var revisited: Bool
+    var semanticRole: String?
+    var roleConfidence: Double?
+    var relationshipToPrimaryTask: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sequenceIndex = "sequence_index"
+        case appLabel = "app_label"
+        case siteHostname = "site_hostname"
+        case firstObservedAtMs = "first_observed_at_ms"
+        case lastObservedAtMs = "last_observed_at_ms"
+        case isCurrent = "is_current"
+        case revisited
+        case semanticRole = "semantic_role"
+        case roleConfidence = "role_confidence"
+        case relationshipToPrimaryTask = "relationship_to_primary_task"
+    }
+}
+
 private struct IslandSemanticAnswer: Decodable, Equatable {
     var schema: String
     var taskResolutionStatus: String
@@ -164,6 +301,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
     var nextAction: String?
     var whereSummary: String?
     var relationshipToPrior: String
+    var recentContext: [IslandSemanticRecentContext]?
     var alternativeHypotheses: [IslandSemanticAlternative]
     var inferenceStatus: String?
     var atomicIdentity: IslandSemanticAtomicIdentity
@@ -180,6 +318,7 @@ private struct IslandSemanticAnswer: Decodable, Equatable {
         case nextAction = "next_action"
         case whereSummary = "where_summary"
         case relationshipToPrior = "relationship_to_prior"
+        case recentContext = "recent_context"
         case alternativeHypotheses = "alternative_hypotheses"
         case inferenceStatus = "inference_status"
         case atomicIdentity = "atomic_identity"
@@ -491,6 +630,25 @@ private extension String {
     }
 }
 
+private func historyDate(_ timestampMs: Int64) -> Date {
+    Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1_000)
+}
+
+private func historyRelativeTimestamp(_ timestampMs: Int64) -> String {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.locale = .current
+    formatter.unitsStyle = .full
+    return formatter.localizedString(for: historyDate(timestampMs), relativeTo: Date())
+}
+
+private func historyFullTimestamp(_ timestampMs: Int64) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = .current
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    return formatter.string(from: historyDate(timestampMs))
+}
+
 private struct OverlayMetrics {
     var screenActive = false
     var captureFps = 0.0
@@ -498,84 +656,77 @@ private struct OverlayMetrics {
 }
 
 private enum Brand {
+    private static let instrumentSerifPostScriptName = "InstrumentSerif-Regular"
+
+    private static let instrumentSerifRegistered: Bool = {
+        if NSFont(name: instrumentSerifPostScriptName, size: 16) != nil {
+            return true
+        }
+
+        let fileName = "InstrumentSerif-Regular.ttf"
+        let resourceCandidates = [
+            Bundle.main.url(
+                forResource: "InstrumentSerif-Regular",
+                withExtension: "ttf"
+            ),
+            Bundle.main.resourceURL?
+                .appendingPathComponent("resources/fonts")
+                .appendingPathComponent(fileName),
+            Bundle.main.resourceURL?
+                .appendingPathComponent("fonts")
+                .appendingPathComponent(fileName),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("src-tauri/resources/fonts")
+                .appendingPathComponent(fileName),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("resources/fonts")
+                .appendingPathComponent(fileName),
+        ].compactMap { $0 }
+
+        for url in resourceCandidates where FileManager.default.fileExists(atPath: url.path) {
+            var registrationError: Unmanaged<CFError>?
+            if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &registrationError)
+                || NSFont(name: instrumentSerifPostScriptName, size: 16) != nil {
+                return true
+            }
+        }
+        return false
+    }()
+
     static func swiftUIFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.system(size: size, weight: weight, design: .default)
     }
 
-    static func swiftUIMonoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        let name: String
-        switch weight {
-        case .medium:
-            name = "IBMPlexMono-Medium"
-        case .semibold, .bold:
-            name = "IBMPlexMono-SemiBold"
-        default:
-            name = "IBMPlexMono"
-        }
-        if NSFont(name: name, size: size) != nil {
-            return Font.custom(name, fixedSize: size)
-        }
-        return Font.system(size: size, weight: weight, design: .monospaced)
+    static func instrumentSerifFont(size: CGFloat) -> Font {
+        _ = instrumentSerifRegistered
+        return Font.custom(instrumentSerifPostScriptName, size: size)
+    }
+
+    static func instrumentSerifNSFont(size: CGFloat) -> NSFont {
+        _ = instrumentSerifRegistered
+        return NSFont(name: instrumentSerifPostScriptName, size: size)
+            ?? NSFont.systemFont(ofSize: size, weight: .semibold)
     }
 }
 
 private enum IslandMotion {
     static func quick(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.25, 1, 0.5, 1, duration: reduceMotion ? 0.01 : 0.14)
+        .timingCurve(0.23, 1, 0.32, 1, duration: reduceMotion ? 0.01 : 0.14)
     }
 
-    static func settle(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.20, 0.88, 0.20, 1, duration: reduceMotion ? 0.01 : 0.26)
-    }
-
-    static func reveal(_ reduceMotion: Bool) -> Animation {
-        .timingCurve(0.18, 0.92, 0.18, 1, duration: reduceMotion ? 0.01 : 0.34)
+    static func memoryContinuityMorph(_ reduceMotion: Bool) -> Animation? {
+        guard !reduceMotion else { return nil }
+        return .timingCurve(
+            0.77,
+            0,
+            0.175,
+            1,
+            duration: kWhisperFlowMicroAmbientTransitionDuration
+        )
     }
 
     static func panelTimingFunction() -> CAMediaTimingFunction {
-        CAMediaTimingFunction(controlPoints: 0.18, 0.92, 0.18, 1.0)
-    }
-
-    static func microTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.74, blur: 6, y: -3),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.82, blur: 7, y: 2),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
-    }
-
-    static func compactTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.72, blur: 8, y: 4),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.92, blur: 6, y: -2),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
-    }
-
-    static func expandedTransition(_ reduceMotion: Bool) -> AnyTransition {
-        guard !reduceMotion else { return .opacity }
-        return .asymmetric(
-            insertion: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.88, blur: 8, y: -5),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            ),
-            removal: .modifier(
-                active: IslandMorphModifier(opacity: 0, scale: 0.96, blur: 5, y: 3),
-                identity: IslandMorphModifier(opacity: 1, scale: 1, blur: 0, y: 0)
-            )
-        )
+        CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
     }
 }
 
@@ -583,1338 +734,2301 @@ private enum IslandMotion {
 private struct IslandMorphModifier: ViewModifier {
     let opacity: Double
     let scale: CGFloat
-    let blur: CGFloat
-    let y: CGFloat
 
     func body(content: Content) -> some View {
         content
             .opacity(opacity)
             .scaleEffect(scale, anchor: .top)
-            .blur(radius: blur)
-            .offset(y: y)
     }
 }
 
 @available(macOS 13.0, *)
-private final class AnimationTick: ObservableObject {
-    static let shared = AnimationTick()
-    @Published var value = 0.0
-    private var timer: Timer?
+private struct TopAnchoredCapsuleShape: Shape {
+    var width: CGFloat
+    var height: CGFloat
 
-    func start() {
-        guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            value += 1.0 / 60.0
-            objectWillChange.send()
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(width, height) }
+        set {
+            width = newValue.first
+            height = newValue.second
         }
-        RunLoop.main.add(timer!, forMode: .common)
     }
 
-    func stop() {
-        timer?.invalidate()
-        timer = nil
+    func path(in rect: CGRect) -> Path {
+        let clampedWidth = min(max(0, width), rect.width)
+        let clampedHeight = min(max(0, height), rect.height)
+        let capsuleRect = CGRect(
+            x: rect.midX - clampedWidth / 2,
+            y: rect.minY,
+            width: clampedWidth,
+            height: clampedHeight
+        )
+        return Path(
+            roundedRect: capsuleRect,
+            cornerRadius: clampedHeight / 2,
+            style: .continuous
+        )
     }
 }
 
-@available(macOS 13.0, *)
-private struct EvidenceTapeView: View {
-    let active: Bool
-    let processing: Bool
-    let error: Bool
-    let privateMode: Bool
-    let thinEvidence: Bool
-    let ready: Bool
-    let frameCount: Int64
-    let density: Double
-    let pulseNonce: UInt64?
-    let scale: CGFloat
-    let width: CGFloat
-    let height: CGFloat
-    let cornerRadius: CGFloat
-    let compact: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ObservedObject private var anim = AnimationTick.shared
-    @State private var lastPulseNonce: UInt64?
-    @State private var pulseStartedAt: Double?
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius * scale, style: .continuous)
-        let pulseAge = pulseStartedAt.map { max(0, anim.value - $0) } ?? 999
-        let pulseProgress = reduceMotion ? 1 : min(1, pulseAge / 0.46)
-        let pulseStrength = max(0, 1 - pulseProgress)
-        let heat = active && !reduceMotion ? 0.5 + 0.5 * sin(anim.value * 4.6) : 0.0
-
-        Canvas { context, size in
-            drawTape(context: &context, size: size, pulseStrength: pulseStrength, heat: heat)
-        }
-        .frame(width: width * scale, height: height * scale)
-        .background(
-            shape.fill(
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.018, green: 0.020, blue: 0.024).opacity(0.96),
-                        Color(red: 0.045, green: 0.048, blue: 0.056).opacity(0.94),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
-        )
-        .overlay(
-            shape.stroke(
-                tapeAccent.opacity(active || processing || error || thinEvidence || ready || privateMode ? 0.28 + 0.12 * heat : 0.10),
-                lineWidth: 0.7
-            )
-        )
-        .overlay(alignment: .top) {
-            shape
-                .stroke(Color.white.opacity(active || ready ? 0.08 : 0.055), lineWidth: 1)
-                .blur(radius: 0.25)
-                .offset(y: -0.5 * scale)
-        }
-        .overlay(
-            shape.fill(
-                tapeAccent.opacity(pulseStrength * (compact ? 0.13 : 0.11))
-            )
-        )
-        .shadow(
-            color: tapeAccent.opacity(active || ready || pulseStrength > 0 || error ? 0.10 + 0.06 * heat : 0),
-            radius: 9 * scale,
-            x: 0,
-            y: 0
-        )
-        .clipShape(shape)
-        .drawingGroup()
-        .onAppear {
-            lastPulseNonce = pulseNonce
-        }
-        .onChange(of: pulseNonce) { next in
-            guard next != nil, next != lastPulseNonce else {
-                lastPulseNonce = next
-                return
-            }
-            lastPulseNonce = next
-            pulseStartedAt = anim.value
-        }
-        .animation(IslandMotion.settle(reduceMotion), value: active)
-        .animation(IslandMotion.settle(reduceMotion), value: processing)
-        .animation(IslandMotion.settle(reduceMotion), value: error)
-        .animation(IslandMotion.settle(reduceMotion), value: privateMode)
-        .animation(IslandMotion.settle(reduceMotion), value: thinEvidence)
-        .animation(IslandMotion.settle(reduceMotion), value: ready)
-        .animation(IslandMotion.settle(reduceMotion), value: frameCount)
-    }
-
-    private var tapeAccent: Color {
-        if error {
-            return Color(red: 1.0, green: 0.62, blue: 0.24)
-        }
-        if thinEvidence || processing {
-            return Color(red: 1.0, green: 0.68, blue: 0.28)
-        }
-        if privateMode {
-            return Color.white.opacity(0.62)
-        }
-        if active || ready {
-            return active ? Color(red: 1.0, green: 0.22, blue: 0.16) : Color(red: 0.36, green: 0.84, blue: 0.68)
-        }
-        return Color.white.opacity(0.42)
-    }
-
-    private func drawTape(
-        context: inout GraphicsContext,
-        size: CGSize,
-        pulseStrength: Double,
-        heat: Double
-    ) {
-        let tick = anim.value
-        let tapeRect = CGRect(origin: .zero, size: size)
-        let accent = tapeAccent
-        let phase = scanPhase(tick)
-        let scanX = round(phase * size.width)
-
-        context.fill(Path(tapeRect), with: .color(.black.opacity(0.18)))
-
-        let rows = max(3, Int(round(density)))
-        for index in 1..<rows {
-            let offset = index % 2 == 0 ? 0.18 : -0.08
-            let y = round((Double(index) + offset) * size.height / Double(rows))
-            context.fill(
-                Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                with: .color(.white.opacity(active || ready ? 0.040 : 0.028))
-            )
-        }
-
-        let columns = max(4, Int(round(density + 2)))
-        for index in 1..<columns {
-            let skew = (index % 3 == 0 ? 0.30 : index % 2 == 0 ? -0.16 : 0.06)
-            let x = round((Double(index) + skew) * size.width / Double(columns))
-            context.fill(
-                Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
-                with: .color(.white.opacity(active || ready ? 0.028 : 0.017))
-            )
-        }
-
-        if active || ready || pulseStrength > 0 {
-            let filledWidth = max(0, min(size.width, scanX))
-            context.fill(
-                Path(CGRect(x: 0, y: 0, width: filledWidth, height: size.height)),
-                with: .color(accent.opacity(active ? 0.035 + 0.025 * heat : 0.018 + 0.018 * pulseStrength))
-            )
-        }
-
-        drawFrameTicks(context: &context, size: size, accent: accent, pulseStrength: pulseStrength)
-
-        if active || ready || pulseStrength > 0 || processing {
-            let width = processing ? max(2, 2 * scale) : max(1, 1.2 * scale)
-            context.fill(
-                Path(CGRect(x: scanX, y: 1 * scale, width: width, height: max(1, size.height - 2 * scale))),
-                with: .color((processing ? Color.white : accent).opacity(processing ? 0.30 : 0.44 + 0.20 * heat))
-            )
-        }
-
-        if pulseStrength > 0 {
-            let bloomX = max(0, min(size.width - 2 * scale, scanX - 1 * scale))
-            let bloomRect = CGRect(
-                x: max(0, bloomX - size.width * 0.22),
-                y: 0,
-                width: min(size.width * 0.44, size.width),
-                height: size.height
-            )
-            let bloom = GraphicsContext.Shading.linearGradient(
-                Gradient(stops: [
-                    .init(color: .white.opacity(0), location: 0.0),
-                    .init(color: .white.opacity(0.24 * pulseStrength), location: 0.42),
-                    .init(color: accent.opacity(0.24 * pulseStrength), location: 0.58),
-                    .init(color: .white.opacity(0), location: 1.0),
-                ]),
-                startPoint: CGPoint(x: bloomRect.minX, y: bloomRect.midY),
-                endPoint: CGPoint(x: bloomRect.maxX, y: bloomRect.midY)
-            )
-            context.fill(Path(bloomRect), with: bloom)
-        }
-
-        if processing {
-            let shimmerPhase = reduceMotion ? 0.72 : fmod(tick * 0.82, 1.0)
-            let shimmerRect = CGRect(
-                x: shimmerPhase * (size.width + size.width * 0.32) - size.width * 0.28,
-                y: 0,
-                width: size.width * 0.28,
-                height: size.height
-            )
-            let shimmer = GraphicsContext.Shading.linearGradient(
-                Gradient(stops: [
-                    .init(color: .white.opacity(0), location: 0),
-                    .init(color: .white.opacity(0.18), location: 0.52),
-                    .init(color: .white.opacity(0), location: 1),
-                ]),
-                startPoint: CGPoint(x: shimmerRect.minX, y: shimmerRect.midY),
-                endPoint: CGPoint(x: shimmerRect.maxX, y: shimmerRect.midY)
-            )
-            context.fill(Path(shimmerRect), with: shimmer)
-        }
-
-        if error || privateMode {
-            let y = round(size.height * 0.63)
-            context.fill(
-                Path(CGRect(x: size.width * 0.12, y: y, width: size.width * 0.76, height: max(1, 1 * scale))),
-                with: .color(accent.opacity(error ? 0.50 : 0.36))
-            )
-            context.fill(
-                Path(CGRect(x: size.width * 0.58, y: max(0, y - 3 * scale), width: max(1, 1 * scale), height: min(size.height, 6 * scale))),
-                with: .color(accent.opacity(error ? 0.72 : 0.48))
-            )
-        }
-    }
-
-    private func drawFrameTicks(
-        context: inout GraphicsContext,
-        size: CGSize,
-        accent: Color,
-        pulseStrength: Double
-    ) {
-        let count = max(0, frameCount)
-        guard count > 0 else { return }
-        let tickCount = Int(min(count, compact ? 9 : 18))
-        let first = count - Int64(tickCount) + 1
-
-        for offset in 0..<tickCount {
-            let frameOrdinal = first + Int64(offset)
-            let fraction = tickFraction(frameOrdinal)
-            let tickHeight = size.height * (0.34 + 0.10 * Double((frameOrdinal % 3 + 3) % 3))
-            let x = round(max(1, min(size.width - 2, fraction * size.width)))
-            let y = round((size.height - tickHeight) / 2.0)
-            let isNewest = offset == tickCount - 1
-            let alpha = isNewest ? 0.55 + 0.32 * pulseStrength : 0.20 + 0.07 * Double(offset % 3)
-            let color = isNewest && (active || ready || pulseStrength > 0) ? accent.opacity(alpha) : Color.white.opacity(alpha)
-            context.fill(
-                Path(CGRect(x: x, y: y, width: max(1, 1 * scale), height: tickHeight)),
-                with: .color(color)
-            )
-        }
-    }
-
-    private func scanPhase(_ tick: Double) -> Double {
-        if processing {
-            return 0.78
-        }
-        if reduceMotion {
-            return active || ready ? 0.62 : 0.38
-        }
-        let speed = active ? 0.18 : ready ? 0.060 : 0.030
-        return fmod(tick * speed + (active ? 0.12 : 0.04), 1.0)
-    }
-
-    private func tickFraction(_ value: Int64) -> Double {
-        let raw = fmod(Double(value) * 0.61803398875 + Double((value % 7 + 7) % 7) * 0.031, 1.0)
-        return 0.08 + raw * 0.84
-    }
-}
-
-private let kBaseCollapsedW: CGFloat = 222
-private let kBaseCollapsedH: CGFloat = 48
 private let kBaseMicroHitW: CGFloat = 86
 private let kBaseMicroHitH: CGFloat = 24
 private let kBaseMicroVisualW: CGFloat = 58
 private let kBaseMicroVisualH: CGFloat = 10
-private let kBaseExpandedW: CGFloat = 520
-private let kBaseExpandedH: CGFloat = 304
-private let kAnimDur = 0.2
-private let kIdleMicroDelay: TimeInterval = 5.0
-private let kPanelFrameAnimDur = 0.32
-
-private enum IslandPresentation: Equatable {
-    case micro
-    case compact
-    case expanded
-}
 
 @available(macOS 13.0, *)
-private struct SessionIslandView: View {
-    let snapshot: IslandSnapshot
-    let metrics: OverlayMetrics
-    let scale: CGFloat
-    let onAction: (String) -> Void
-    let onContinueAction: (IslandAvailableAction) -> Void
-    @Binding var presentation: IslandPresentation
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ObservedObject private var anim = AnimationTick.shared
-    @State private var signalHovered = false
+private struct WhisperFlowPressButtonStyle: ButtonStyle {
+    let reduceMotion: Bool
 
-    private func s(_ value: CGFloat) -> CGFloat { value * scale }
-
-    private var continueState: IslandContinueState {
-        snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.96 : 1)
+            .animation(IslandMotion.quick(reduceMotion), value: configuration.isPressed)
     }
+}
 
-    private var displayState: IslandDisplayState {
-        continueState.displayState
-    }
+private let kWhisperFlowCapturePanelW: CGFloat = 187
+private let kWhisperFlowCapturePanelH: CGFloat = 49
+private let kWhisperFlowCaptureW: CGFloat = 168
+private let kWhisperFlowCaptureH: CGFloat = 34
+private let kWhisperFlowCaptureActionW: CGFloat = 28
+private let kWhisperFlowCaptureActionH: CGFloat = 24
+private let kWhisperFlowCaptureContentW: CGFloat = 123
+private let kWhisperFlowDotMatrixSize: CGFloat = 11
+private let kWhisperFlowCaptureStatusLabelW: CGFloat = 108
+private let kWhisperFlowNotificationPanelW: CGFloat = 255
+private let kWhisperFlowNotificationPanelH: CGFloat = 61
+private let kWhisperFlowNotificationW: CGFloat = 236
+private let kWhisperFlowNotificationH: CGFloat = 46
+private let kWhisperFlowNotificationActionW: CGFloat = 32
+private let kWhisperFlowNotificationActionH: CGFloat = 28
+private let kWhisperFlowNotificationContentW: CGFloat = 175
+private let kWhisperFlowNotificationDotMatrixSize: CGFloat = 13
+private let kWhisperFlowNotificationStatusLabelW: CGFloat = 156
+private let kWhisperFlowNotificationFontSize: CGFloat = 14
+private let kWhisperFlowNotificationCountdownLineH: CGFloat = 2
+private let kWhisperFlowMemoryTransitionDuration: TimeInterval = 3.0
+private let kWhisperFlowAmbientHoverReturnDelay: TimeInterval = 1.0
+private let kWhisperFlowCountdownLineH: CGFloat = 1
+private let kWhisperFlowAmbientBodyHoverArmDelay: TimeInterval = 0.20
+private let kWhisperFlowAnswerSummaryPanelH: CGFloat = 49
+private let kWhisperFlowAnswerSummaryMinW: CGFloat = 152
+private let kWhisperFlowAnswerSummaryH: CGFloat = 30
+private let kWhisperFlowAnswerSummaryPanelMarginW: CGFloat = 35
+private let kWhisperFlowAnswerExpandedMinW: CGFloat = 320
+private let kWhisperFlowAnswerExpandedMaxW: CGFloat = 640
+private let kWhisperFlowAnswerExpandedMinH: CGFloat = 104
+private let kWhisperFlowAnswerExpandedMaxScreenFraction: CGFloat = 0.70
+private let kWhisperFlowAnswerHorizontalPadding: CGFloat = 24
+private let kWhisperFlowAnswerVerticalPadding: CGFloat = 20
+private let kWhisperFlowAnswerHeaderSpacing: CGFloat = 18
+private let kWhisperFlowAnswerRowSpacing: CGFloat = 14
+private let kWhisperFlowAnswerLabelValueSpacing: CGFloat = 5
+private let kWhisperFlowVisualCueCardGap: CGFloat = 8
+private let kWhisperFlowVisualCueCardRadius: CGFloat = 18
+private let kWhisperFlowVisualCuePadding: CGFloat = 12
+private let kWhisperFlowVisualCueTitleImageGap: CGFloat = 8
+private let kWhisperFlowVisualCueImageRadius: CGFloat = 12
+private let kWhisperFlowVisualCueImageMaxH: CGFloat = 220
+private let kWhisperFlowMicroPulseDuration: TimeInterval = 3.2
+private let kWhisperFlowMicroPulseScale: CGFloat = 1.018
+private let kWhisperFlowMicroPulseOutlineMinOpacity = 0.72
+private let kWhisperFlowMorphDuration: TimeInterval = 0.18
+private let kWhisperFlowMicroAmbientTransitionDuration: TimeInterval = 0.18
+private let kWhisperFlowReducedMotionFadeDuration: TimeInterval = 0.12
+private let kWhisperFlowHistoryButtonVisualSize: CGFloat = 30
+private let kWhisperFlowHistoryButtonHitSize: CGFloat = 40
+private let kWhisperFlowHistoryButtonGap: CGFloat = 8
+private let kWhisperFlowHistoryAccessoryAllowance: CGFloat =
+    kWhisperFlowHistoryButtonHitSize + kWhisperFlowHistoryButtonGap
+private let kWhisperFlowHistoryCardPreferredW: CGFloat = 360
+private let kWhisperFlowHistoryCardMinW: CGFloat = 320
+private let kWhisperFlowHistoryCardMaxW: CGFloat = 380
+private let kWhisperFlowHistoryCardPreferredH: CGFloat = 420
+private let kWhisperFlowHistoryCardGap: CGFloat = 8
+private let kWhisperFlowHistoryCardRadius: CGFloat = 24
+private let kWhisperFlowHistoryHeaderH: CGFloat = 54
+private let kWhisperFlowHistoryRowMinH: CGFloat = 58
+private let kWhisperFlowHistoryTransitionDuration: TimeInterval = 0.14
 
-    private var captureActive: Bool {
-        snapshot.state == "starting" ||
-            snapshot.state == "recording_compact" ||
-            snapshot.state == "recording_expanded" ||
-            displayState == .localMemoryWarming
-    }
+private enum WhisperFlowPresentation: Equatable {
+    case micro
+    case ambientMemory
+    case generating
+    case answerSummary
+    case answerExpanded
+    case historyLoading
+    case historyList
+    case historyDetail
 
-    private var signalReady: Bool {
-        displayState == .continueReady
-    }
-
-    private var signalThin: Bool {
-        displayState == .thinCurrentWork ||
-            displayState == .targetSuppressed ||
-            displayState == .supportBlocked ||
-            displayState == .inspectOnly ||
-            displayState == .noClearContinuation ||
-            displayState == .needsRefresh
-    }
-
-    private var signalPrivate: Bool {
-        isPrivateOrExcluded
-    }
-
-    private var isBusy: Bool {
-        displayState == .checkingContinue || snapshot.state == "starting" || snapshot.state == "processing"
-    }
-
-    private var isProcessing: Bool {
-        isBusy
-    }
-
-    private var hasError: Bool {
-        displayState == .error || snapshot.lastError != nil || snapshot.state == "error"
-    }
-
-    private var isPrivateOrExcluded: Bool {
-        snapshot.isSensitive || isPrivatePrivacyLabel(snapshot.privacyLabel)
-    }
-
-    private var primaryDisplayText: String {
-        switch displayState {
-        case .noLocalMemory:
-            return "Smalltalk"
-        case .localMemoryWarming:
-            return "Smalltalk Continue"
-        case .checkingContinue:
-            return "Checking Continue"
-        case .continueReady:
-            return "Continue"
-        case .thinCurrentWork:
-            return "Recent work seen"
-        case .targetSuppressed:
-            return "Continue needs more evidence"
-        case .supportBlocked:
-            return "Support surface seen"
-        case .needsRefresh:
-            return "Continue needs refresh"
-        case .inspectOnly, .noClearContinuation:
-            return taskInferenceUnavailable ? "Task inference unavailable" : "Exact task unavailable"
-        case .error:
-            return "Continue unavailable"
+    var isHistory: Bool {
+        switch self {
+        case .historyLoading, .historyList, .historyDetail:
+            return true
+        default:
+            return false
         }
     }
+}
 
-    private var secondaryDisplayText: String {
-        switch displayState {
-        case .noLocalMemory:
-            return "Local memory is off"
-        case .localMemoryWarming:
-            return "Collecting local evidence"
-        case .checkingContinue:
-            return "Checking task and location"
-        case .continueReady:
-            return compactActivityLine ?? shortTargetTitle
-        case .thinCurrentWork, .targetSuppressed, .supportBlocked:
-            return compactUncertainActivityLine ?? "Exact return target is unclear"
-        case .needsRefresh:
-            return "Newer local evidence is available"
-        case .inspectOnly, .noClearContinuation:
-            return taskInferenceUnavailable
-                ? "Recent activity was captured, but inference failed"
-                : compactUncertainActivityLine ?? "Evidence is available to inspect"
-        case .error:
-            return "Open Smalltalk to inspect local memory"
+private enum WhisperFlowCaptureStatus: Equatable {
+    case active
+    case starting
+    case processing
+    case generating
+    case inactive
+    case suppressed
+    case error
+}
+
+private enum WhisperFlowMemoryLifecyclePhase: Equatable {
+    case paused
+    case starting
+    case active
+    case stopping
+    case unavailable
+}
+
+private enum WhisperFlowStyle {
+    static let surface = Color(red: 0, green: 0, blue: 0)
+    static let outline = Color(red: 48 / 255, green: 48 / 255, blue: 47 / 255)
+    static let accent = Color(red: 245 / 255, green: 191 / 255, blue: 239 / 255)
+}
+
+private struct WhisperFlowAnswerRow: Equatable {
+    let label: String
+    let value: String
+
+    var isCheckpoint: Bool { label == "Last checkpoint" }
+    var isContinuation: Bool { label == "Continue from here" }
+}
+
+private struct WhisperFlowAnswerContent: Equatable {
+    let decisionId: String?
+    let title: String
+    let rows: [WhisperFlowAnswerRow]
+
+    static let unavailable = WhisperFlowAnswerContent(
+        decisionId: nil,
+        title: "Continue unavailable",
+        rows: []
+    )
+
+    private init(decisionId: String?, title: String, rows: [WhisperFlowAnswerRow]) {
+        self.decisionId = decisionId
+        self.title = title
+        self.rows = rows
+    }
+
+    init(snapshot: IslandSnapshot) {
+        let state = snapshot.islandContinueState ?? IslandContinueState.fallback(from: snapshot)
+        let answer = state.semanticAnswer
+        decisionId = state.decisionId ?? snapshot.continueDecisionId
+        title = Self.verbatim(answer?.taskSummary)
+            ?? Self.verbatim(answer?.currentActivity.currentSubtask)
+            ?? Self.verbatim(answer?.nextAction)
+            ?? Self.verbatim(answer?.unfinishedState)
+            ?? Self.verbatim(answer?.lastMeaningfulProgress)
+            ?? Self.fallbackTitle(for: state.displayState)
+
+        var nextRows: [WhisperFlowAnswerRow] = []
+        Self.append(
+            &nextRows,
+            label: "Current activity",
+            value: Self.currentActivitySummary(answer, excluding: title)
+        )
+        Self.append(&nextRows, label: "Last checkpoint", value: answer?.lastMeaningfulProgress)
+        Self.append(
+            &nextRows,
+            label: "Continue from here",
+            value: Self.usefulContinuation(answer, fallback: state.nextAction)
+        )
+        Self.append(&nextRows, label: "Return to", value: answer?.whereSummary)
+        rows = nextRows
+    }
+
+    private static func currentActivitySummary(
+        _ answer: IslandSemanticAnswer?,
+        excluding title: String
+    ) -> String? {
+        guard let answer else { return nil }
+        var details: [String] = []
+        for value in [
+            answer.currentActivity.currentSubtask,
+            answer.currentActivity.immediateUserOperation,
+            answer.currentActivity.semanticEffectOfOperation,
+            answer.taskObject,
+        ] {
+            guard let value = verbatim(value) else { continue }
+            appendUnique(value, to: &details, excluding: title)
         }
-    }
 
-    private var primaryActionLabel: String {
-        actionLabel(primaryContinueAction, compact: false)
-    }
-
-    private var compactActionLabel: String {
-        actionLabel(primaryContinueAction, compact: true)
-    }
-
-    private var secondaryActionLabel: String {
-        secondaryContinueAction.map { actionLabel($0, compact: false) } ?? "Open Smalltalk"
-    }
-
-    private var primaryActionDisabled: Bool {
-        !primaryContinueAction.enabled || primaryContinueAction.kind == .unknown
-    }
-
-    private var secondaryActionDisabled: Bool {
-        guard let action = secondaryContinueAction else { return true }
-        return !action.enabled || action.kind == .unknown
-    }
-
-    private var primaryContinueAction: IslandAvailableAction {
-        let priority: [IslandActionKind]
-        switch displayState {
-        case .continueReady:
-            priority = [.openContinueTarget, .inspectEvidence, .openSmalltalk, .refreshContinue]
-        case .needsRefresh, .checkingContinue:
-            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk]
-        case .thinCurrentWork, .targetSuppressed, .supportBlocked, .noClearContinuation:
-            priority = [.refreshContinue, .inspectEvidence, .openSmalltalk, .captureEvidenceNow]
-        case .inspectOnly:
-            priority = [.inspectEvidence, .refreshContinue, .openSmalltalk]
-        case .noLocalMemory:
-            priority = [.startLocalMemory, .openSmalltalk]
-        case .localMemoryWarming:
-            priority = [.refreshContinue, .openSmalltalk, .captureEvidenceNow]
-        case .error:
-            priority = [.openSmalltalk]
+        if let surface = verbatim(answer.currentActivity.observedSurface),
+           !details.contains(where: { normalized($0).contains(normalized(surface)) }) {
+            appendUnique("Working in \(surface).", to: &details, excluding: title)
         }
-        return firstEnabledAction(in: priority)
-            ?? IslandAvailableAction(kind: .openSmalltalk, label: "Open Smalltalk", enabled: true)
+        return details.isEmpty ? nil : details.joined(separator: "\n\n")
     }
 
-    private var secondaryContinueAction: IslandAvailableAction? {
-        let primary = primaryContinueAction
-        if displayState == .localMemoryWarming,
-           let updateEvidence = firstEnabledAction(in: [.captureEvidenceNow]),
-           updateEvidence.kind != primary.kind {
-            return updateEvidence
-        }
-        return continueState.availableActions.first { action in
-            action.enabled &&
-                action.kind != .unknown &&
-                action.kind != primary.kind &&
-                actionLabel(action, compact: false) != actionLabel(primary, compact: false)
-        }
+    private static func appendUnique(
+        _ value: String,
+        to values: inout [String],
+        excluding title: String
+    ) {
+        let normalizedValue = normalized(value)
+        guard !normalizedValue.isEmpty,
+              normalizedValue != normalized(title),
+              !values.contains(where: { normalized($0) == normalizedValue }) else { return }
+        values.append(value)
     }
 
-    private var semanticCorrectionActions: [IslandAvailableAction] {
-        continueState.availableActions.filter { action in
-            action.enabled && [
-                .chooseTaskAlternative,
-                .rejectSelectedTask,
-                .rejectTaskAlternative,
-                .markSupportingWork,
-                .markUnrelatedActivity,
-                .markTaskCompleted,
-                .reactivateTask,
-            ].contains(action.kind)
-        }
-    }
-
-    private func firstEnabledAction(in kinds: [IslandActionKind]) -> IslandAvailableAction? {
-        for kind in kinds {
-            if let action = continueState.availableActions.first(where: { $0.enabled && $0.kind == kind }) {
-                if kind == .openContinueTarget && trimmed(action.decisionId ?? continueState.decisionId).isEmpty {
-                    continue
-                }
-                return action
-            }
+    private static func usefulContinuation(
+        _ answer: IslandSemanticAnswer?,
+        fallback: String?
+    ) -> String? {
+        for candidate in [answer?.nextAction, fallback, answer?.unfinishedState] {
+            guard let value = verbatim(candidate), !isGenericUnresolvedCopy(value) else { continue }
+            return value
         }
         return nil
     }
 
-    private func actionLabel(_ action: IslandAvailableAction, compact: Bool) -> String {
-        switch action.kind {
-        case .openContinueTarget:
-            return compact ? "Continue" : "Continue here"
-        case .markWrongTarget:
-            return compact ? "Not right" : "Not right"
-        case .markNotUseful:
-            return compact ? "Skip" : "Not useful"
-        case .chooseTaskAlternative:
-            return compact ? "Choose" : action.label
-        case .rejectSelectedTask, .rejectTaskAlternative:
-            return compact ? "Reject" : action.label
-        case .markSupportingWork, .markUnrelatedActivity, .markTaskCompleted, .reactivateTask:
-            return compact ? "Correct" : action.label
-        case .refreshContinue:
-            return compact ? "Refresh" : "Refresh"
-        case .inspectEvidence:
-            return compact ? "Inspect" : "Inspect evidence"
-        case .openSmalltalk:
-            return compact ? "Open" : "Open Smalltalk"
-        case .startLocalMemory:
-            return compact ? "Start" : "Start local memory"
-        case .captureEvidenceNow:
-            return compact ? "Update" : "Update local evidence"
-        case .unknown:
-            return compact ? "Open" : "Open Smalltalk"
+    private static func isGenericUnresolvedCopy(_ value: String) -> Bool {
+        let value = normalized(value)
+        return value.contains("task remains unresolved")
+            || value.contains("no active task or test is visible")
+            || value.contains("no unfinished step was clearly captured")
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    private static func append(
+        _ rows: inout [WhisperFlowAnswerRow],
+        label: String,
+        value: String?
+    ) {
+        guard let value = verbatim(value) else { return }
+        rows.append(WhisperFlowAnswerRow(label: label, value: value))
+    }
+
+    private static func verbatim(_ value: String?) -> String? {
+        guard let value,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
+    }
+
+    private static func fallbackTitle(for state: IslandDisplayState) -> String {
+        switch state {
+        case .error:
+            return "Continue unavailable"
+        case .noLocalMemory, .localMemoryWarming:
+            return "Not enough local memory"
+        case .needsRefresh:
+            return "Continue needs refreshing"
+        case .checkingContinue:
+            return "Generating answer…"
+        case .continueReady,
+             .thinCurrentWork,
+             .targetSuppressed,
+             .supportBlocked,
+             .inspectOnly,
+             .noClearContinuation:
+            return "Couldn’t recover the task"
+        }
+    }
+}
+
+private struct WhisperFlowAnswerLayout: Equatable {
+    var summaryWidth: CGFloat = kWhisperFlowAnswerSummaryMinW
+    var summaryPanelWidth: CGFloat = kWhisperFlowAnswerSummaryMinW
+        + kWhisperFlowAnswerSummaryPanelMarginW
+    var expandedWidth: CGFloat = kWhisperFlowAnswerExpandedMinW
+    var expandedHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+    var answerCardHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+    var contentViewportHeight: CGFloat = kWhisperFlowAnswerExpandedMinH
+        - kWhisperFlowAnswerVerticalPadding * 2
+    var visualCueCardHeight: CGFloat = 0
+    var visualCueImageHeight: CGFloat = 0
+}
+
+private struct WhisperFlowHistoryLayout: Equatable {
+    var cardWidth: CGFloat = kWhisperFlowHistoryCardPreferredW
+    var cardHeight: CGFloat = kWhisperFlowHistoryCardPreferredH
+    var canvasWidth: CGFloat = kWhisperFlowHistoryCardPreferredW
+    var canvasHeight: CGFloat = kWhisperFlowHistoryCardPreferredH
+    var capsuleOffsetX: CGFloat = 0
+    var controlOnLeft = true
+}
+
+@available(macOS 13.0, *)
+private final class WhisperFlowIslandModel: ObservableObject {
+    @Published var presentation: WhisperFlowPresentation = .micro
+    @Published var isPanelVisible = false
+    @Published var memoryActive = false
+    @Published var memoryHasStarted = false
+    @Published var microPulseActive = false
+    @Published var capturePulseNonce: UInt64?
+    @Published var startingFeedbackNonce: UInt64?
+    @Published var captureStatus: WhisperFlowCaptureStatus = .inactive
+    @Published var memoryTransitionCountdownActive = false
+    @Published var memoryTransitionCountdownNonce: UInt64 = 0
+    @Published var continueGenerating = false
+    @Published var blockedContinueShakeNonce: UInt64 = 0
+    @Published var answer: WhisperFlowAnswerContent?
+    @Published var answerLayout = WhisperFlowAnswerLayout()
+    @Published var visualCueImage: NSImage? = nil
+    @Published var visualCuePresented = false
+    @Published var historyOriginPresentation: WhisperFlowPresentation = .ambientMemory
+    @Published var historyButtonVisible = false
+    @Published var historyItems: [ContinueHistorySummaryV1] = []
+    @Published var historyNextCursor: ContinueHistoryCursorV1? = nil
+    @Published var historyError: String? = nil
+    @Published var historyLoadingOlder = false
+    @Published var historySelectedOutput: ContinueHistoryOutputV1? = nil
+    @Published var historySelectedDecisionId: String? = nil
+    @Published var historyDetailLoading = false
+    @Published var historyDetailError: String? = nil
+    @Published var currentDecisionId: String? = nil
+    @Published var historyLayout = WhisperFlowHistoryLayout()
+}
+
+@available(macOS 13.0, *)
+private final class DotMatrixIndicatorView: NSView {
+    private struct Configuration: Equatable {
+        let status: WhisperFlowCaptureStatus
+        let capturePulseNonce: UInt64?
+        let startingFeedbackNonce: UInt64?
+        let panelVisible: Bool
+        let reduceMotion: Bool
+        let restartInvited: Bool
+    }
+
+    private static let captureAnimationKey = "smalltalk.dot-matrix-capture"
+    private static let startingAnimationKey = "smalltalk.dot-matrix-starting"
+    private static let generatingAnimationKey = "smalltalk.dot-matrix-generating"
+    private static let inactiveOpacity: Float = 0.15
+    private static let activeOpacity: Float = 0.82
+    private static let capturePulseDuration: TimeInterval = 0.72
+    private static let capturePulseCooldown: TimeInterval = 1.75
+    private static let startingDuration: TimeInterval = 0.60
+    private static let reducedMotionDuration: TimeInterval = 0.40
+    private static let gatherFraction: CGFloat = 0.32
+    private static let activePattern = Set([7, 11, 12, 13, 17])
+    private static let pausedPattern = Set([6, 8, 11, 13, 16, 18])
+    private static let filteredPattern = Set([1, 3, 5, 9, 10, 14, 16, 18, 22])
+    private static let errorPattern = Set([2, 7, 12, 22])
+    private static let generatingPattern = Set([2, 3, 4, 9, 14])
+    private static let generatingPerimeter = [
+        20, 21, 22, 23, 24, 19, 14, 9, 4, 3, 2, 1, 0, 5, 10, 15,
+    ]
+    private static let generatingDuration: TimeInterval = 0.82
+    private static let restartPattern = Set([1, 6, 7, 11, 12, 13, 16, 17, 21])
+    private static let restartTransitionDuration: TimeInterval = 0.12
+
+    private let dotLayers: [CAShapeLayer]
+    private var configuration: Configuration?
+    private var restingPositions = Array(repeating: CGPoint.zero, count: 25)
+    private var hasCapturePulseBaseline = false
+    private var latestCapturePulseNonce: UInt64?
+    private var latestStartingFeedbackNonce: UInt64?
+    private var lastCapturePulseAt: CFTimeInterval?
+    private var pendingCapturePulseNonce: UInt64?
+    private var pendingCapturePulseWorkItem: DispatchWorkItem?
+    private var startingAnimationPending = false
+    private var startingAnimationHasRunForCurrentState = false
+    private var startingAnimationEndsAt: CFTimeInterval?
+
+    override init(frame frameRect: NSRect) {
+        var layers: [CAShapeLayer] = []
+        for _ in 0..<25 {
+            let dot = CAShapeLayer()
+            dot.backgroundColor = NSColor.white.cgColor
+            dot.opacity = Self.inactiveOpacity
+            layers.append(dot)
+        }
+        dotLayers = layers
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        for dot in dotLayers {
+            layer?.addSublayer(dot)
+        }
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        cancelAnimationsAndPendingPulse()
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func layout() {
+        super.layout()
+        let side = min(bounds.width, bounds.height)
+        let dotDiameter = side * 0.145
+        let gap = max(0, (side - dotDiameter * 5) / 4)
+        let originX = (bounds.width - side) / 2
+        let originY = (bounds.height - side) / 2
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for row in 0..<5 {
+            for column in 0..<5 {
+                let index = row * 5 + column
+                dotLayers[index].frame = CGRect(
+                    x: originX + CGFloat(column) * (dotDiameter + gap),
+                    y: originY + CGFloat(row) * (dotDiameter + gap),
+                    width: dotDiameter,
+                    height: dotDiameter
+                )
+                dotLayers[index].cornerRadius = dotDiameter / 2
+                dotLayers[index].contentsScale = window?.backingScaleFactor
+                    ?? NSScreen.main?.backingScaleFactor
+                    ?? 2
+                restingPositions[index] = dotLayers[index].position
+            }
+        }
+        CATransaction.commit()
+        applyStaticState()
+        if startingAnimationPending {
+            runStartingAnimation()
+        } else if configuration?.status == .generating {
+            runGeneratingAnimation()
         }
     }
 
-    private var trailMomentCount: Int64 {
-        max(0, snapshot.trailMomentCount ?? snapshot.frameCount)
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else {
+            cancelAnimationsAndPendingPulse()
+            return
+        }
+        applyStaticState()
+        if configuration?.status == .starting, !startingAnimationHasRunForCurrentState {
+            startingAnimationPending = true
+            runStartingAnimation()
+        } else if configuration?.status == .generating {
+            runGeneratingAnimation()
+        }
     }
 
-    private var trailAppCount: Int64 {
-        max(0, snapshot.trailAppCount ?? Int64(snapshot.trailLabels?.count ?? 0))
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if superview == nil {
+            cancelAnimationsAndPendingPulse()
+        }
     }
 
-    private var signalEvidenceCount: Int64 {
-        switch displayState {
-        case .checkingContinue, .continueReady, .thinCurrentWork, .targetSuppressed, .supportBlocked, .needsRefresh, .inspectOnly, .noClearContinuation:
-            return trailMomentCount
+    func configure(
+        status: WhisperFlowCaptureStatus,
+        capturePulseNonce: UInt64?,
+        startingFeedbackNonce: UInt64?,
+        panelVisible: Bool,
+        reduceMotion: Bool,
+        restartInvited: Bool
+    ) {
+        let next = Configuration(
+            status: status,
+            capturePulseNonce: capturePulseNonce,
+            startingFeedbackNonce: startingFeedbackNonce,
+            panelVisible: panelVisible,
+            reduceMotion: reduceMotion,
+            restartInvited: restartInvited
+        )
+        guard next != configuration else { return }
+        let previous = configuration
+        configuration = next
+
+        let statusChanged = previous?.status != status
+        let panelVisibilityChanged = previous?.panelVisible != panelVisible
+        let reduceMotionChanged = previous?.reduceMotion != reduceMotion
+        let preservesStartingAnimation = previous?.status == .starting &&
+            status == .active &&
+            !panelVisibilityChanged &&
+            !reduceMotionChanged
+
+        if panelVisibilityChanged || (statusChanged && !preservesStartingAnimation) {
+            removeLayerAnimations()
+            if statusChanged {
+                startingAnimationHasRunForCurrentState = false
+            }
+            startingAnimationEndsAt = nil
+            startingAnimationPending = status == .starting &&
+                panelVisible &&
+                !startingAnimationHasRunForCurrentState
+            if status != .active {
+                cancelPendingCapturePulse()
+            }
+            applyStaticState()
+            if startingAnimationPending, window != nil {
+                runStartingAnimation()
+            } else if status == .generating, window != nil {
+                runGeneratingAnimation()
+            }
+        } else if reduceMotionChanged {
+            removeLayerAnimations()
+            startingAnimationEndsAt = nil
+            applyStaticState()
+            if status == .generating, window != nil {
+                runGeneratingAnimation()
+            }
+        } else if preservesStartingAnimation,
+                  startingAnimationPending,
+                  window != nil {
+            runStartingAnimation()
+        } else if previous?.restartInvited != restartInvited {
+            applyRestartPatternTransition()
+        }
+
+        // A confirmed start event is controller-owned so it survives the
+        // matrix view being absent in micro. This lets a newly created active
+        // matrix play the activation even when `starting` already became
+        // `active` before SwiftUI constructed the view.
+        if let startingFeedbackNonce,
+           startingFeedbackNonce != latestStartingFeedbackNonce {
+            latestStartingFeedbackNonce = startingFeedbackNonce
+            if (status == .starting || status == .active),
+               panelVisible,
+               !startingAnimationHasRunForCurrentState {
+                startingAnimationPending = true
+                if window != nil {
+                    runStartingAnimation()
+                }
+            }
+        }
+
+        // Process capture events only after status cleanup. Otherwise a pulse
+        // started above can be removed later in this same configuration pass.
+        if !hasCapturePulseBaseline, let capturePulseNonce {
+            hasCapturePulseBaseline = true
+            latestCapturePulseNonce = capturePulseNonce
+        } else if let capturePulseNonce, capturePulseNonce != latestCapturePulseNonce {
+            latestCapturePulseNonce = capturePulseNonce
+            requestCapturePulse(capturePulseNonce)
+        }
+    }
+
+    private var shouldReduceMotion: Bool {
+        configuration?.reduceMotion == true ||
+            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func pattern(for status: WhisperFlowCaptureStatus) -> Set<Int> {
+        if status == .inactive, configuration?.restartInvited == true {
+            return Self.restartPattern
+        }
+        switch status {
+        case .active, .starting:
+            return Self.activePattern
+        case .processing, .inactive:
+            return Self.pausedPattern
+        case .generating:
+            return Self.generatingPattern
+        case .suppressed:
+            return Self.filteredPattern
+        case .error:
+            return Self.errorPattern
+        }
+    }
+
+    private func requestCapturePulse(_ nonce: UInt64) {
+        guard let configuration,
+              configuration.status == .active,
+              configuration.panelVisible,
+              window != nil else { return }
+
+        let now = CACurrentMediaTime()
+        if startingAnimationPending {
+            pendingCapturePulseNonce = nonce
+            return
+        }
+
+        let cooldownReadyAt = lastCapturePulseAt.map {
+            $0 + Self.capturePulseCooldown
+        } ?? now
+        let startingReadyAt = startingAnimationEndsAt ?? now
+        let readyAt = max(cooldownReadyAt, startingReadyAt)
+        if now >= readyAt {
+            runCapturePulse(nonce)
+            return
+        }
+
+        pendingCapturePulseNonce = nonce
+        guard pendingCapturePulseWorkItem == nil else { return }
+        let delay = readyAt - now
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingCapturePulseWorkItem = nil
+            guard let pendingNonce = self.pendingCapturePulseNonce else { return }
+            self.pendingCapturePulseNonce = nil
+            guard self.configuration?.status == .active,
+                  self.configuration?.panelVisible == true,
+                  self.window != nil else { return }
+            self.requestCapturePulse(pendingNonce)
+        }
+        pendingCapturePulseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func runCapturePulse(_ nonce: UInt64) {
+        guard latestCapturePulseNonce == nonce || pendingCapturePulseNonce == nil else { return }
+        lastCapturePulseAt = CACurrentMediaTime()
+        removeLayerAnimations()
+        applyStaticState()
+
+        if shouldReduceMotion {
+            let center = dotLayers[12]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [Self.activeOpacity, 1.0, Self.activeOpacity]
+            animation.keyTimes = [0, 0.5, 1]
+            animation.duration = Self.reducedMotionDuration
+            animation.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+            center.add(animation, forKey: Self.captureAnimationKey)
+            return
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let center = restingPositions[12]
+        for (index, dot) in dotLayers.enumerated() {
+            let rest = restingPositions[index]
+            let gathered = CGPoint(
+                x: rest.x + (center.x - rest.x) * Self.gatherFraction,
+                y: rest.y + (center.y - rest.y) * Self.gatherFraction
+            )
+            let baseOpacity = staticOpacity(for: index)
+            let peakOpacity: Float = index == 12
+                ? 1.0
+                : Self.activePattern.contains(index) ? 0.95 : 0.55
+
+            let position = CAKeyframeAnimation(keyPath: "position")
+            position.values = [rest, gathered, rest]
+            position.keyTimes = [0, 0.45, 1]
+            position.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+
+            let opacity = CAKeyframeAnimation(keyPath: "opacity")
+            opacity.values = [baseOpacity, peakOpacity, baseOpacity]
+            opacity.keyTimes = [0, 0.45, 1]
+            opacity.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+            ]
+
+            let group = CAAnimationGroup()
+            group.animations = [position, opacity]
+            group.duration = Self.capturePulseDuration
+            dot.position = rest
+            dot.opacity = baseOpacity
+            dot.add(group, forKey: Self.captureAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
+    private func runStartingAnimation() {
+        guard !startingAnimationHasRunForCurrentState else {
+            startingAnimationPending = false
+            return
+        }
+        guard bounds.width > 0, bounds.height > 0 else {
+            startingAnimationPending = true
+            return
+        }
+        startingAnimationPending = false
+        startingAnimationHasRunForCurrentState = true
+        removeLayerAnimations()
+        applyStaticState()
+        if shouldReduceMotion {
+            startingAnimationEndsAt = CACurrentMediaTime() + Self.reducedMotionDuration
+            let center = dotLayers[12]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [Self.inactiveOpacity, 1.0, Self.activeOpacity]
+            animation.keyTimes = [0, 0.5, 1]
+            animation.duration = Self.reducedMotionDuration
+            center.add(animation, forKey: Self.startingAnimationKey)
+            schedulePendingCapturePulseAfterStartingIfNeeded()
+            return
+        }
+
+        let center = restingPositions[12]
+        let sharedStartTime = CACurrentMediaTime() + 0.02
+        startingAnimationEndsAt = sharedStartTime + Self.startingDuration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for row in 0..<5 {
+            for column in 0..<5 {
+                let index = row * 5 + column
+                let dot = dotLayers[index]
+                let rest = restingPositions[index]
+                let gathered = CGPoint(
+                    x: rest.x + (center.x - rest.x) * 0.18,
+                    y: rest.y + (center.y - rest.y) * 0.18
+                )
+                let distance = abs(row - 2) + abs(column - 2)
+                let inwardDelay = TimeInterval(max(0, 4 - distance)) * 0.045
+                let baseOpacity = staticOpacity(for: index)
+
+                let position = CAKeyframeAnimation(keyPath: "position")
+                position.values = [rest, gathered, rest]
+                position.keyTimes = [0, 0.45, 1]
+                position.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                ]
+
+                let opacity = CAKeyframeAnimation(keyPath: "opacity")
+                opacity.values = [Self.inactiveOpacity, 0.72, baseOpacity]
+                opacity.keyTimes = [0, 0.45, 1]
+                opacity.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                ]
+
+                let group = CAAnimationGroup()
+                group.animations = [position, opacity]
+                group.duration = Self.startingDuration - inwardDelay
+                group.beginTime = sharedStartTime + inwardDelay
+                dot.position = rest
+                dot.opacity = baseOpacity
+                dot.add(group, forKey: Self.startingAnimationKey)
+            }
+        }
+        CATransaction.commit()
+        schedulePendingCapturePulseAfterStartingIfNeeded()
+    }
+
+    private func runGeneratingAnimation() {
+        guard configuration?.status == .generating,
+              configuration?.panelVisible == true,
+              window != nil else { return }
+        removeLayerAnimations()
+        applyStaticState()
+        guard !shouldReduceMotion else { return }
+
+        let sharedStartTime = CACurrentMediaTime()
+        let phaseStep = Self.generatingDuration
+            / TimeInterval(Self.generatingPerimeter.count)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (position, index) in Self.generatingPerimeter.enumerated() {
+            let dot = dotLayers[index]
+            let animation = CAKeyframeAnimation(keyPath: "opacity")
+            animation.values = [
+                Self.inactiveOpacity,
+                Self.inactiveOpacity,
+                1.0,
+                0.42,
+                Self.inactiveOpacity,
+            ]
+            animation.keyTimes = [0, 0.48, 0.58, 0.72, 1]
+            animation.duration = Self.generatingDuration
+            animation.beginTime = sharedStartTime
+            animation.timeOffset = TimeInterval(position) * phaseStep
+            animation.repeatCount = .infinity
+            animation.timingFunctions = [
+                CAMediaTimingFunction(name: .linear),
+                CAMediaTimingFunction(name: .linear),
+                CAMediaTimingFunction(name: .easeOut),
+                CAMediaTimingFunction(name: .linear),
+            ]
+            dot.opacity = Self.inactiveOpacity
+            dot.add(animation, forKey: Self.generatingAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
+    private func schedulePendingCapturePulseAfterStartingIfNeeded() {
+        guard configuration?.status == .active,
+              let pendingNonce = pendingCapturePulseNonce else { return }
+        requestCapturePulse(pendingNonce)
+    }
+
+    private func staticOpacity(for index: Int) -> Float {
+        let status = configuration?.status ?? .inactive
+        return pattern(for: status).contains(index) ? Self.activeOpacity : Self.inactiveOpacity
+    }
+
+    private func removeLayerAnimations() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            dot.removeAllAnimations()
+            dot.position = restingPositions[index]
+        }
+        CATransaction.commit()
+    }
+
+    private func applyStaticState() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            dot.position = restingPositions[index]
+            dot.opacity = staticOpacity(for: index)
+        }
+        CATransaction.commit()
+    }
+
+    private func applyRestartPatternTransition() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, dot) in dotLayers.enumerated() {
+            let targetOpacity = staticOpacity(for: index)
+            let animation = CABasicAnimation(keyPath: "opacity")
+            animation.fromValue = dot.presentation()?.opacity ?? dot.opacity
+            animation.toValue = targetOpacity
+            animation.duration = Self.restartTransitionDuration
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            dot.opacity = targetOpacity
+            dot.add(animation, forKey: "smalltalk.dot-matrix-restart")
+        }
+        CATransaction.commit()
+    }
+
+    private func cancelPendingCapturePulse() {
+        pendingCapturePulseWorkItem?.cancel()
+        pendingCapturePulseWorkItem = nil
+        pendingCapturePulseNonce = nil
+    }
+
+    private func cancelAnimationsAndPendingPulse() {
+        cancelPendingCapturePulse()
+        startingAnimationEndsAt = nil
+        removeLayerAnimations()
+    }
+}
+
+@available(macOS 13.0, *)
+private struct DotMatrixIndicator: NSViewRepresentable {
+    let status: WhisperFlowCaptureStatus
+    let capturePulseNonce: UInt64?
+    let startingFeedbackNonce: UInt64?
+    let panelVisible: Bool
+    let reduceMotion: Bool
+    let restartInvited: Bool
+
+    func makeNSView(context: Context) -> DotMatrixIndicatorView {
+        DotMatrixIndicatorView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: DotMatrixIndicatorView, context: Context) {
+        nsView.configure(
+            status: status,
+            capturePulseNonce: capturePulseNonce,
+            startingFeedbackNonce: startingFeedbackNonce,
+            panelVisible: panelVisible,
+            reduceMotion: reduceMotion,
+            restartInvited: restartInvited
+        )
+    }
+
+    static func dismantleNSView(_ nsView: DotMatrixIndicatorView, coordinator: ()) {
+        nsView.configure(
+            status: .inactive,
+            capturePulseNonce: nil,
+            startingFeedbackNonce: nil,
+            panelVisible: false,
+            reduceMotion: true,
+            restartInvited: false
+        )
+    }
+}
+
+@available(macOS 13.0, *)
+private struct WhisperFlowIslandView: View {
+    let scale: CGFloat
+    @ObservedObject var model: WhisperFlowIslandModel
+    let onRevealAmbientMemory: () -> Void
+    let onMicroHover: (Bool) -> Void
+    let onReadyAction: () -> Void
+    let onStartMemory: () -> Void
+    let onAmbientHover: (Bool) -> Void
+    let onAmbientBodyHover: (Bool) -> Void
+    let onExpandAnswer: () -> Void
+    let onCollapseAnswer: () -> Void
+    let onToggleVisualCue: () -> Void
+    let onToggleHistory: () -> Void
+    let onHistoryButtonHover: (Bool) -> Void
+    let onLoadOlderHistory: () -> Void
+    let onRetryHistory: () -> Void
+    let onRetryHistoryDetail: () -> Void
+    let onSelectHistoryOutput: (String) -> Void
+    let onBackFromHistoryDetail: () -> Void
+    let onDismissOneLevel: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AccessibilityFocusState private var historyHeadingFocused: Bool
+    @AccessibilityFocusState private var historyDetailFocused: Bool
+    @AccessibilityFocusState private var historyButtonFocused: Bool
+    @State private var microPulseExpanded = false
+    @State private var ambientBodyHovered = false
+    @State private var ambientBodyHoverArmed = false
+    @State private var blockedAmbientBodyHoverObserved = false
+    @State private var ambientCapsuleHovered = false
+    @State private var pausedRestartHovered = false
+    @State private var arrowHovered = false
+    @State private var historyButtonHovered = false
+    @State private var memoryTransitionCountdownProgress: CGFloat = 0
+    @State private var blockedContinueShakeOffset: CGFloat = 0
+    @State private var blockedContinueShakeSequence: UInt64 = 0
+
+    private func s(_ value: CGFloat) -> CGFloat { value * scale }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            currentIslandContent(for: renderedIslandPresentation)
+                .offset(x: s(model.historyLayout.capsuleOffsetX))
+                .allowsHitTesting(!model.presentation.isHistory)
+
+            if model.historyButtonVisible || model.presentation.isHistory {
+                historyButton
+                    .offset(
+                        x: s(historyButtonOffsetX),
+                        y: s(historyButtonOffsetY)
+                    )
+            }
+
+            if model.presentation.isHistory {
+                historyCard
+                    .padding(.top, s(historyCardTop))
+                    .transition(stateTransition(scale: 0.97))
+            }
+        }
+        .frame(
+            width: s(model.historyLayout.canvasWidth),
+            height: s(model.historyLayout.canvasHeight),
+            alignment: .top
+        )
+        .background(Color.clear)
+        .animation(presentationAnimation, value: model.presentation)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onChange(of: model.presentation) { presentation in
+            if presentation == .historyLoading || presentation == .historyList {
+                DispatchQueue.main.async {
+                    historyHeadingFocused = true
+                }
+            } else if presentation == .historyDetail {
+                DispatchQueue.main.async {
+                    historyDetailFocused = true
+                }
+            } else if !presentation.isHistory {
+                DispatchQueue.main.async {
+                    historyButtonFocused = true
+                }
+            }
+        }
+        .onExitCommand(perform: onDismissOneLevel)
+    }
+
+    @ViewBuilder
+    private func currentIslandContent(
+        for presentation: WhisperFlowPresentation
+    ) -> some View {
+        switch presentation {
+        case .micro, .ambientMemory, .generating:
+            memoryContinuityView
+        case .answerSummary:
+            answerSummaryView
+                .transition(.opacity)
+        case .answerExpanded:
+            answerExpandedView
+                .transition(stateTransition(scale: 0.97))
+        case .historyLoading, .historyList, .historyDetail:
+            EmptyView()
+        }
+    }
+
+    private var renderedIslandPresentation: WhisperFlowPresentation {
+        model.presentation.isHistory
+            ? model.historyOriginPresentation
+            : model.presentation
+    }
+
+    private var memoryContinuityView: some View {
+        let expanded = renderedIslandPresentation == .ambientMemory
+            || renderedIslandPresentation == .generating
+        let visualWidth = expanded
+            ? ambientCapsuleWidth
+            : kBaseMicroVisualW * microScale
+        let visualHeight = expanded
+            ? ambientCapsuleHeight
+            : kBaseMicroVisualH * microScale
+
+        return ZStack(alignment: .top) {
+            TopAnchoredCapsuleShape(
+                width: s(visualWidth),
+                height: s(visualHeight)
+            )
+            .fill(WhisperFlowStyle.surface)
+            .allowsHitTesting(false)
+
+            TopAnchoredCapsuleShape(
+                width: s(visualWidth),
+                height: s(visualHeight)
+            )
+            .stroke(
+                WhisperFlowStyle.outline.opacity(
+                    expanded ? 1 : microOutlineOpacity
+                ),
+                lineWidth: s(1)
+            )
+            .allowsHitTesting(false)
+
+            ambientMemoryContent
+                .opacity(expanded ? 1 : 0)
+                .allowsHitTesting(expanded)
+                .accessibilityHidden(!expanded)
+                .animation(ambientContentAnimation(expanded: expanded), value: expanded)
+
+            microHitTarget
+                .opacity(expanded ? 0 : 1)
+                .allowsHitTesting(!expanded)
+                .accessibilityHidden(expanded)
+        }
+        .frame(
+            width: s(ambientPanelWidth),
+            height: s(ambientPanelHeight),
+            alignment: .top
+        )
+        .offset(x: s(blockedContinueShakeOffset))
+        .contentShape(Rectangle())
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: visualWidth
+        )
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: visualHeight
+        )
+        .onAppear {
+            handleMemoryPresentationChange(model.presentation)
+        }
+        .onChange(of: model.presentation) { presentation in
+            handleMemoryPresentationChange(presentation)
+        }
+        .onChange(of: model.blockedContinueShakeNonce) { _ in
+            runBlockedContinueShake()
+        }
+        .onDisappear {
+            microPulseExpanded = false
+            blockedContinueShakeSequence &+= 1
+            blockedContinueShakeOffset = 0
+            cleanUpAmbientInteractionState()
+        }
+    }
+
+    private var microHitTarget: some View {
+        Button(action: onRevealAmbientMemory) {
+            Rectangle()
+                .fill(Color.clear)
+                .frame(
+                    width: s(kBaseMicroHitW),
+                    height: s(kBaseMicroHitH),
+                    alignment: .top
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(model.memoryActive ? "Smalltalk memory is active" : "Show Smalltalk")
+        .onHover(perform: onMicroHover)
+    }
+
+    private var ambientMemoryContent: some View {
+        HStack(spacing: s(ambientControlSpacing)) {
+            ambientStatusRegion
+
+            if model.continueGenerating {
+                Color.clear
+                    .frame(
+                        width: s(ambientActionWidth),
+                        height: s(ambientActionHeight)
+                    )
+                    .accessibilityHidden(true)
+            } else {
+                Button(action: onReadyAction) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: s(ambientArrowFontSize), weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(
+                            width: s(ambientActionWidth),
+                            height: s(ambientActionHeight)
+                        )
+                        .background(
+                            Capsule()
+                                .fill(
+                                    arrowHovered
+                                        ? Color(red: 58 / 255, green: 58 / 255, blue: 56 / 255)
+                                        : WhisperFlowStyle.outline
+                                )
+                        )
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+                .accessibilityLabel(
+                    model.memoryActive
+                        ? "Show what I was doing"
+                        : "Start memory before generating an answer"
+                )
+                .help(model.memoryActive ? "Show what I was doing" : "Start memory first")
+                .onHover { hovering in
+                    arrowHovered = hovering
+                    if hovering {
+                        NSCursor.pointingHand.set()
+                    } else {
+                        NSCursor.arrow.set()
+                    }
+                }
+            }
+        }
+        .padding(.leading, s(ambientLeadingPadding))
+        .padding(.trailing, s(ambientTrailingPadding))
+        .frame(
+            width: s(ambientCapsuleWidth),
+            height: s(ambientCapsuleHeight)
+        )
+        .overlay(alignment: .bottomLeading) {
+            memoryTransitionCountdownLine
+        }
+        .clipShape(Capsule())
+        .contentShape(Capsule())
+        .onHover { hovering in
+            ambientCapsuleHovered = hovering
+            onAmbientHover(hovering)
+        }
+        .animation(
+            IslandMotion.memoryContinuityMorph(shouldReduceMotion),
+            value: model.memoryTransitionCountdownActive || model.continueGenerating
+        )
+        .accessibilityElement(children: .contain)
+        .onChange(of: model.captureStatus) { status in
+            if status != .inactive {
+                pausedRestartHovered = false
+            }
+            ambientBodyHovered = false
+            onAmbientBodyHover(false)
+            if status == .active {
+                resetAmbientBodyHoverGate()
+            } else {
+                ambientBodyHoverArmed = false
+                blockedAmbientBodyHoverObserved = false
+            }
+        }
+        .onChange(of: model.memoryTransitionCountdownNonce) { _ in
+            refreshMemoryTransitionCountdown()
+        }
+        .onChange(of: model.memoryTransitionCountdownActive) { active in
+            if !active {
+                memoryTransitionCountdownProgress = 0
+            }
+        }
+    }
+
+    private func runBlockedContinueShake() {
+        blockedContinueShakeSequence &+= 1
+        let sequence = blockedContinueShakeSequence
+        blockedContinueShakeOffset = 0
+
+        let offsets: [CGFloat] = shouldReduceMotion
+            ? [-2, 2, 0]
+            : [-10, 10, -10, 10, -10, 10, -10, 8, -8, 0]
+        let stepDuration = shouldReduceMotion ? 0.06 : 0.05
+
+        for (index, offset) in offsets.enumerated() {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + stepDuration * Double(index + 1)
+            ) {
+                guard blockedContinueShakeSequence == sequence else { return }
+                withAnimation(.linear(duration: stepDuration)) {
+                    blockedContinueShakeOffset = offset
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var ambientStatusRegion: some View {
+        if model.captureStatus == .inactive {
+            Button(action: onStartMemory) {
+                ambientStatusContent
+            }
+            .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+            .accessibilityLabel("Start memory")
+            .help("Start memory")
+            .onHover { hovering in
+                if hovering {
+                    pausedRestartHovered = true
+                    NSCursor.pointingHand.set()
+                } else {
+                    NSCursor.arrow.set()
+                    DispatchQueue.main.async {
+                        guard model.presentation == .ambientMemory,
+                              ambientCapsuleHovered,
+                              model.captureStatus == .inactive else { return }
+                        pausedRestartHovered = false
+                    }
+                }
+            }
+        } else {
+            ambientStatusContent
+                .onHover { hovering in
+                    if hovering {
+                        if ambientBodyHoverArmed {
+                            ambientBodyHovered = true
+                            onAmbientBodyHover(model.captureStatus == .active)
+                        } else {
+                            blockedAmbientBodyHoverObserved = true
+                        }
+                        NSCursor.arrow.set()
+                    } else {
+                        if blockedAmbientBodyHoverObserved {
+                            ambientBodyHoverArmed = true
+                            blockedAmbientBodyHoverObserved = false
+                        }
+                        // The parent capsule receives its hover-out in the same
+                        // event turn. Defer contraction so a dismissal can move
+                        // straight to micro without exposing normal medium first.
+                        DispatchQueue.main.async {
+                            guard model.presentation == .ambientMemory,
+                                  ambientCapsuleHovered else { return }
+                            ambientBodyHovered = false
+                            onAmbientBodyHover(false)
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(displayedStatusPhrase)
+        }
+    }
+
+    private var ambientStatusContent: some View {
+        HStack(spacing: s(ambientStatusSpacing)) {
+            DotMatrixIndicator(
+                status: model.captureStatus,
+                capturePulseNonce: model.capturePulseNonce,
+                startingFeedbackNonce: model.startingFeedbackNonce,
+                panelVisible: model.isPanelVisible,
+                reduceMotion: shouldReduceMotion,
+                restartInvited: pausedRestartHovered && model.captureStatus == .inactive
+            )
+            .frame(
+                width: s(ambientDotMatrixSize),
+                height: s(ambientDotMatrixSize)
+            )
+            .accessibilityHidden(true)
+
+            ZStack(alignment: .leading) {
+                Text(displayedStatusPhrase)
+                    .id(displayedStatusPhrase)
+                    .font(Brand.swiftUIFont(size: s(ambientFontSize), weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .transition(.opacity)
+            }
+            .frame(
+                width: s(ambientStatusLabelWidth),
+                height: s(ambientActionHeight),
+                alignment: .leading
+            )
+            .clipped()
+            .animation(statusCopyAnimation, value: displayedStatusPhrase)
+        }
+        .frame(
+            width: s(ambientContentWidth),
+            height: s(ambientActionHeight),
+            alignment: .leading
+        )
+        .contentShape(Rectangle())
+    }
+
+    private var memoryTransitionCountdownLine: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.88))
+            .frame(maxWidth: .infinity)
+            .frame(height: s(ambientCountdownLineHeight))
+            .scaleEffect(
+                x: model.memoryTransitionCountdownActive
+                    ? memoryTransitionCountdownProgress
+                    : 0,
+                y: 1,
+                anchor: .leading
+            )
+            .allowsHitTesting(false)
+    }
+
+    private var ambientCapsuleWidth: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationW
+            : kWhisperFlowCaptureW
+    }
+
+    private var ambientCapsuleHeight: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationH
+            : kWhisperFlowCaptureH
+    }
+
+    private var ambientPanelWidth: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationPanelW
+            : kWhisperFlowCapturePanelW
+    }
+
+    private var ambientPanelHeight: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationPanelH
+            : kWhisperFlowCapturePanelH
+    }
+
+    private var ambientContentWidth: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationContentW
+            : kWhisperFlowCaptureContentW
+    }
+
+    private var ambientStatusLabelWidth: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationStatusLabelW
+            : kWhisperFlowCaptureStatusLabelW
+    }
+
+    private var ambientActionWidth: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationActionW
+            : kWhisperFlowCaptureActionW
+    }
+
+    private var ambientActionHeight: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationActionH
+            : kWhisperFlowCaptureActionH
+    }
+
+    private var ambientDotMatrixSize: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationDotMatrixSize
+            : kWhisperFlowDotMatrixSize
+    }
+
+    private var ambientFontSize: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationFontSize
+            : 12
+    }
+
+    private var ambientCountdownLineHeight: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating
+            ? kWhisperFlowNotificationCountdownLineH
+            : kWhisperFlowCountdownLineH
+    }
+
+    private var ambientControlSpacing: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 7 : 5
+    }
+
+    private var ambientStatusSpacing: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 5 : 4
+    }
+
+    private var ambientLeadingPadding: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 10 : 8
+    }
+
+    private var ambientTrailingPadding: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 6 : 4
+    }
+
+    private var ambientArrowFontSize: CGFloat {
+        model.memoryTransitionCountdownActive || model.continueGenerating ? 13 : 11
+    }
+
+    private func refreshMemoryTransitionCountdown() {
+        guard model.memoryTransitionCountdownActive else {
+            memoryTransitionCountdownProgress = 0
+            return
+        }
+
+        var resetTransaction = Transaction()
+        resetTransaction.animation = nil
+        withTransaction(resetTransaction) {
+            memoryTransitionCountdownProgress = 1
+        }
+        DispatchQueue.main.async {
+            guard model.memoryTransitionCountdownActive else { return }
+            withAnimation(.linear(duration: kWhisperFlowMemoryTransitionDuration)) {
+                memoryTransitionCountdownProgress = 0
+            }
+        }
+    }
+
+    private func prepareAmbientAppearance() {
+        var resetTransaction = Transaction()
+        resetTransaction.animation = nil
+        withTransaction(resetTransaction) {
+            ambientBodyHovered = false
+            ambientBodyHoverArmed = false
+            blockedAmbientBodyHoverObserved = false
+            ambientCapsuleHovered = false
+            pausedRestartHovered = false
+            arrowHovered = false
+        }
+        resetAmbientBodyHoverGate()
+        refreshMemoryTransitionCountdown()
+    }
+
+    private func ambientContentAnimation(expanded: Bool) -> Animation? {
+        if shouldReduceMotion {
+            return .easeOut(duration: kWhisperFlowReducedMotionFadeDuration)
+        }
+        return expanded
+            ? .easeOut(duration: 0.12).delay(0.04)
+            : .easeOut(duration: 0.10)
+    }
+
+    private func handleMemoryPresentationChange(
+        _ presentation: WhisperFlowPresentation
+    ) {
+        switch presentation {
+        case .micro:
+            arrowHovered = false
+            onAmbientHover(false)
+            NSCursor.arrow.set()
+            scheduleAmbientLocalStateCleanup()
+            refreshMicroPulse()
+        case .ambientMemory:
+            microPulseExpanded = false
+            prepareAmbientAppearance()
+        case .generating:
+            microPulseExpanded = false
+            arrowHovered = false
+            prepareAmbientAppearance()
+        case .answerSummary, .answerExpanded:
+            break
+        case .historyLoading, .historyList, .historyDetail:
+            microPulseExpanded = false
+            cleanUpAmbientInteractionState()
+        }
+    }
+
+    private func cleanUpAmbientInteractionState() {
+        arrowHovered = false
+        ambientBodyHovered = false
+        ambientBodyHoverArmed = false
+        blockedAmbientBodyHoverObserved = false
+        ambientCapsuleHovered = false
+        pausedRestartHovered = false
+        onAmbientHover(false)
+        onAmbientBodyHover(false)
+        NSCursor.arrow.set()
+    }
+
+    private func resetAmbientBodyHoverGate() {
+        ambientBodyHoverArmed = false
+        blockedAmbientBodyHoverObserved = false
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + kWhisperFlowAmbientBodyHoverArmDelay
+        ) {
+            guard model.presentation == .ambientMemory,
+                  model.captureStatus == .active,
+                  !blockedAmbientBodyHoverObserved else { return }
+            ambientBodyHoverArmed = true
+        }
+    }
+
+    private func scheduleAmbientLocalStateCleanup() {
+        let delay = shouldReduceMotion ? 0 : kWhisperFlowMicroAmbientTransitionDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard model.presentation != .ambientMemory else { return }
+            ambientBodyHovered = false
+            ambientBodyHoverArmed = false
+            blockedAmbientBodyHoverObserved = false
+            ambientCapsuleHovered = false
+            pausedRestartHovered = false
+        }
+    }
+
+    private var shouldReduceMotion: Bool {
+        reduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private var displayedStatusPhrase: String {
+        switch model.captureStatus {
+        case .active:
+            return "Capturing context"
+        case .starting:
+            return "Starting memory…"
+        case .processing:
+            return "Pausing memory…"
+        case .generating:
+            return "Generating answer…"
+        case .inactive:
+            return model.memoryHasStarted ? "Memory paused" : "Start memory"
+        case .suppressed:
+            return "Not saving this app"
+        case .error:
+            return "Memory needs attention"
+        }
+    }
+
+    private var ambientMorphAnimation: Animation? {
+        guard !shouldReduceMotion else { return nil }
+        return .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: kWhisperFlowMorphDuration
+        )
+    }
+
+    private var statusCopyAnimation: Animation? {
+        if shouldReduceMotion {
+            return .easeOut(duration: 0.12)
+        }
+        return ambientMorphAnimation
+    }
+
+    private var answerSummaryView: some View {
+        let answer = model.answer ?? .unavailable
+
+        return HStack(spacing: s(2)) {
+            Text(answer.title)
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+
+            Button(action: onExpandAnswer) {
+                Text("See more")
+                    .foregroundColor(WhisperFlowStyle.accent)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("See more of the island answer")
+        }
+        .padding(.horizontal, s(10))
+        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+        .frame(
+            width: s(model.answerLayout.summaryWidth),
+            height: s(kWhisperFlowAnswerSummaryH)
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            Capsule()
+                .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(Capsule())
+        .frame(
+            width: s(model.answerLayout.summaryPanelWidth),
+            height: s(kWhisperFlowAnswerSummaryPanelH),
+            alignment: .top
+        )
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(answer.title). See more")
+    }
+
+    private var answerExpandedView: some View {
+        VStack(alignment: .leading, spacing: s(kWhisperFlowVisualCueCardGap)) {
+            answerExpandedCard
+
+            if model.visualCuePresented,
+               let image = model.visualCueImage,
+               model.answerLayout.visualCueCardHeight > 0 {
+                visualCueCard(image)
+                    .transition(.opacity)
+            }
+        }
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.expandedHeight),
+            alignment: .top
+        )
+        .accessibilityElement(children: .contain)
+    }
+
+    private var answerExpandedCard: some View {
+        let answer = model.answer ?? .unavailable
+
+        return ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
+                HStack(spacing: s(8)) {
+                    Text(answer.title)
+                        .font(Brand.instrumentSerifFont(size: s(24)))
+                        .foregroundColor(.white)
+                        .lineSpacing(s(1))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Spacer(minLength: s(8))
+
+                    if model.visualCueImage != nil {
+                        Button(action: onToggleVisualCue) {
+                            Text("Visual cue")
+                                .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                .foregroundColor(WhisperFlowStyle.accent)
+                                .padding(.horizontal, s(8))
+                                .padding(.vertical, s(4))
+                                .background(
+                                    Capsule()
+                                        .fill(
+                                            WhisperFlowStyle.accent.opacity(
+                                                model.visualCuePresented ? 0.18 : 0.07
+                                            )
+                                        )
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(
+                                            model.visualCuePresented
+                                                ? WhisperFlowStyle.accent.opacity(0.48)
+                                                : WhisperFlowStyle.outline,
+                                            lineWidth: s(1)
+                                        )
+                                )
+                        }
+                        .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+                        .accessibilityLabel(
+                            model.visualCuePresented ? "Hide visual cue" : "Show visual cue"
+                        )
+                    }
+
+                    Button(action: onCollapseAnswer) {
+                        Text("See less")
+                            .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                            .foregroundColor(WhisperFlowStyle.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("See less of the island answer")
+                }
+
+                if !answer.rows.isEmpty {
+                    VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerRowSpacing)) {
+                        ForEach(Array(answer.rows.enumerated()), id: \.offset) { _, row in
+                            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerLabelValueSpacing)) {
+                                Text(row.label)
+                                    .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                    .foregroundColor(WhisperFlowStyle.accent)
+
+                                Text(row.value)
+                                    .font(
+                                        Brand.swiftUIFont(
+                                            size: s(row.isContinuation ? 17 : row.isCheckpoint ? 16 : 14),
+                                            weight: row.isContinuation || row.isCheckpoint
+                                                ? .semibold
+                                                : .regular
+                                        )
+                                    )
+                                    .foregroundColor(
+                                        row.isContinuation
+                                            ? .white
+                                            : .white.opacity(row.isCheckpoint ? 0.96 : 0.88)
+                                    )
+                                    .lineSpacing(s(3))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(height: s(model.answerLayout.contentViewportHeight))
+        .padding(.horizontal, s(kWhisperFlowAnswerHorizontalPadding))
+        .padding(.vertical, s(kWhisperFlowAnswerVerticalPadding))
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.answerCardHeight),
+            alignment: .top
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            RoundedRectangle(cornerRadius: s(24), style: .continuous)
+                .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: s(24), style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+
+    private func visualCueCard(_ image: NSImage) -> some View {
+        VStack(alignment: .leading, spacing: s(kWhisperFlowVisualCueTitleImageGap)) {
+            Text("Visual cue")
+                .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                .foregroundColor(WhisperFlowStyle.accent)
+                .accessibilityLabel("Visual cue")
+
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: s(model.answerLayout.visualCueImageHeight),
+                    maxHeight: s(model.answerLayout.visualCueImageHeight),
+                    alignment: .center
+                )
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: s(kWhisperFlowVisualCueImageRadius),
+                        style: .continuous
+                    )
+                )
+                .accessibilityLabel("Full-screen evidence used for this answer")
+        }
+        .padding(s(kWhisperFlowVisualCuePadding))
+        .frame(
+            width: s(model.answerLayout.expandedWidth),
+            height: s(model.answerLayout.visualCueCardHeight),
+            alignment: .topLeading
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowVisualCueCardRadius),
+                style: .continuous
+            )
+            .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowVisualCueCardRadius),
+                style: .continuous
+            )
+        )
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historyButton: some View {
+        Button(action: onToggleHistory) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: s(13), weight: .semibold))
+                .foregroundColor(
+                    model.presentation.isHistory || historyButtonHovered
+                        ? WhisperFlowStyle.accent
+                        : .white.opacity(0.86)
+                )
+                .frame(
+                    width: s(kWhisperFlowHistoryButtonVisualSize),
+                    height: s(kWhisperFlowHistoryButtonVisualSize)
+                )
+                .background(
+                    Circle()
+                        .fill(WhisperFlowStyle.surface)
+                )
+                .overlay(
+                    Circle()
+                        .stroke(
+                            model.presentation.isHistory
+                                ? WhisperFlowStyle.accent.opacity(0.58)
+                                : WhisperFlowStyle.outline,
+                            lineWidth: s(1)
+                        )
+                )
+                .offset(
+                    y: s((renderedCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2)
+                )
+                .frame(
+                    width: s(kWhisperFlowHistoryButtonHitSize),
+                    height: s(kWhisperFlowHistoryButtonHitSize)
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: shouldReduceMotion))
+        .accessibilityLabel("Continue history")
+        .accessibilityHint(
+            model.presentation.isHistory
+                ? "Closes Continue history"
+                : "Shows previous Continue answers"
+        )
+        .accessibilityFocused($historyButtonFocused)
+        .help("Continue history")
+        .onHover { hovering in
+            historyButtonHovered = hovering
+            onHistoryButtonHover(hovering)
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+
+    private var historyCard: some View {
+        Group {
+            switch model.presentation {
+            case .historyLoading:
+                historyLoadingCard
+            case .historyList:
+                historyListCard
+            case .historyDetail:
+                historyDetailCard
+            default:
+                EmptyView()
+            }
+        }
+        .id(model.presentation)
+        .transition(stateTransition(scale: 0.97))
+        .frame(
+            width: s(model.historyLayout.cardWidth),
+            height: s(model.historyLayout.cardHeight),
+            alignment: .top
+        )
+        .background(WhisperFlowStyle.surface)
+        .overlay(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowHistoryCardRadius),
+                style: .continuous
+            )
+            .stroke(WhisperFlowStyle.outline, lineWidth: s(1))
+        )
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: s(kWhisperFlowHistoryCardRadius),
+                style: .continuous
+            )
+        )
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historyLoadingCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            historyHeader(title: "History")
+
+            VStack(spacing: s(8)) {
+                ForEach(0..<4, id: \.self) { index in
+                    VStack(alignment: .leading, spacing: s(8)) {
+                        RoundedRectangle(cornerRadius: s(3), style: .continuous)
+                            .fill(Color.white.opacity(0.12))
+                            .frame(
+                                width: s(index == 3 ? 164 : 226),
+                                height: s(10)
+                            )
+                        RoundedRectangle(cornerRadius: s(3), style: .continuous)
+                            .fill(Color.white.opacity(0.07))
+                            .frame(width: s(78), height: s(8))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, s(18))
+                    .padding(.vertical, s(10))
+                    .accessibilityHidden(true)
+                }
+            }
+            .padding(.top, s(4))
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityLabel("Loading Continue history")
+    }
+
+    private var historyListCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            historyHeader(title: "History")
+
+            if let error = model.historyError?.nonEmpty {
+                historyErrorState(error)
+            } else if model.historyItems.isEmpty {
+                historyEmptyState
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.historyItems) { item in
+                            historyRow(item)
+                        }
+
+                        if model.historyNextCursor != nil {
+                            Button(action: onLoadOlderHistory) {
+                                HStack(spacing: s(7)) {
+                                    if model.historyLoadingOlder {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .tint(WhisperFlowStyle.accent)
+                                    }
+                                    Text(
+                                        model.historyLoadingOlder
+                                            ? "Loading older answers…"
+                                            : "Load older answers"
+                                    )
+                                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                                    .foregroundColor(WhisperFlowStyle.accent)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, s(15))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.historyLoadingOlder)
+                            .accessibilityLabel(
+                                model.historyLoadingOlder
+                                    ? "Loading older Continue answers"
+                                    : "Load older Continue answers"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func historyHeader(title: String) -> some View {
+        HStack(spacing: s(8)) {
+            Text(title)
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityFocused($historyHeadingFocused)
+
+            Spacer(minLength: 0)
+
+            Text("Latest 100")
+                .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                .foregroundColor(.white.opacity(0.58))
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, s(18))
+        .frame(height: s(kWhisperFlowHistoryHeaderH))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(WhisperFlowStyle.outline.opacity(0.74))
+                .frame(height: s(1))
+        }
+    }
+
+    private func historyRow(_ item: ContinueHistorySummaryV1) -> some View {
+        let fullTimestamp = historyFullTimestamp(item.createdAtMs)
+        let isCurrent = item.decisionId == model.currentDecisionId
+
+        return Button {
+            onSelectHistoryOutput(item.decisionId)
+        } label: {
+            HStack(alignment: .center, spacing: s(12)) {
+                VStack(alignment: .leading, spacing: s(6)) {
+                    Text(item.title)
+                        .font(Brand.swiftUIFont(size: s(13), weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Text(historyRelativeTimestamp(item.createdAtMs))
+                        .font(Brand.swiftUIFont(size: s(11), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+
+                if isCurrent {
+                    Text("Current")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .semibold))
+                        .foregroundColor(WhisperFlowStyle.accent)
+                        .padding(.horizontal, s(7))
+                        .padding(.vertical, s(4))
+                        .background(
+                            Capsule()
+                                .fill(WhisperFlowStyle.accent.opacity(0.10))
+                        )
+                        .overlay(
+                            Capsule()
+                                .stroke(WhisperFlowStyle.accent.opacity(0.34), lineWidth: s(1))
+                        )
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: s(9), weight: .semibold))
+                        .foregroundColor(.white.opacity(0.36))
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, s(18))
+            .padding(.vertical, s(11))
+            .frame(minHeight: s(kWhisperFlowHistoryRowMinH))
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(WhisperFlowStyle.outline.opacity(0.64))
+                    .frame(height: s(1))
+                    .padding(.leading, s(18))
+            }
+        }
+        .buttonStyle(.plain)
+        .help(fullTimestamp)
+        .accessibilityLabel(
+            "\(item.title). \(fullTimestamp). \(isCurrent ? "Current answer" : "Past answer")"
+        )
+        .accessibilityHint("Opens this saved Continue answer")
+    }
+
+    private var historyEmptyState: some View {
+        VStack(spacing: s(7)) {
+            Spacer(minLength: 0)
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: s(18), weight: .medium))
+                .foregroundColor(.white.opacity(0.46))
+                .accessibilityHidden(true)
+            Text("No previous answers yet")
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+            Text("Use Continue to create one")
+                .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                .foregroundColor(.white.opacity(0.62))
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func historyErrorState(_ error: String) -> some View {
+        VStack(spacing: s(8)) {
+            Spacer(minLength: 0)
+            Text("History unavailable")
+                .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                .foregroundColor(.white)
+            Text(error)
+                .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                .foregroundColor(.white.opacity(0.62))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+            Button("Retry", action: onRetryHistory)
+                .buttonStyle(.plain)
+                .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                .foregroundColor(WhisperFlowStyle.accent)
+                .padding(.top, s(3))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, s(28))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historyDetailCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: s(10)) {
+                Button(action: onBackFromHistoryDetail) {
+                    HStack(spacing: s(5)) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: s(9), weight: .bold))
+                        Text("Back")
+                    }
+                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                    .foregroundColor(WhisperFlowStyle.accent)
+                    .frame(minWidth: s(54), minHeight: s(30), alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Back to Continue history")
+                .accessibilityFocused($historyDetailFocused)
+
+                Spacer(minLength: 0)
+
+                if let output = model.historySelectedOutput {
+                    Text("Past answer · \(historyFullTimestamp(output.createdAtMs))")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .help(historyFullTimestamp(output.createdAtMs))
+                } else {
+                    Text("Past answer")
+                        .font(Brand.swiftUIFont(size: s(10), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                }
+            }
+            .padding(.horizontal, s(18))
+            .frame(height: s(kWhisperFlowHistoryHeaderH))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(WhisperFlowStyle.outline.opacity(0.74))
+                    .frame(height: s(1))
+            }
+
+            if model.historyDetailLoading {
+                VStack(spacing: s(9)) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(WhisperFlowStyle.accent)
+                    Text("Loading saved answer…")
+                        .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement(children: .combine)
+            } else if let error = model.historyDetailError?.nonEmpty {
+                VStack(spacing: s(8)) {
+                    Spacer(minLength: 0)
+                    Text("Answer unavailable")
+                        .font(Brand.swiftUIFont(size: s(14), weight: .semibold))
+                        .foregroundColor(.white)
+                    Text(error)
+                        .font(Brand.swiftUIFont(size: s(12), weight: .regular))
+                        .foregroundColor(.white.opacity(0.62))
+                        .multilineTextAlignment(.center)
+                    Button("Retry", action: onRetryHistoryDetail)
+                        .buttonStyle(.plain)
+                        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                        .foregroundColor(WhisperFlowStyle.accent)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, s(28))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let output = model.historySelectedOutput {
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
+                        Text(output.title)
+                            .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                            .foregroundColor(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if !output.rows.isEmpty {
+                            VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerRowSpacing)) {
+                                ForEach(output.rows) { row in
+                                    VStack(
+                                        alignment: .leading,
+                                        spacing: s(kWhisperFlowAnswerLabelValueSpacing)
+                                    ) {
+                                        Text(row.label)
+                                            .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
+                                            .foregroundColor(WhisperFlowStyle.accent)
+                                        Text(row.value)
+                                            .font(Brand.swiftUIFont(size: s(14), weight: .regular))
+                                            .foregroundColor(.white)
+                                            .lineSpacing(s(3))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, s(18))
+                    .padding(.vertical, s(18))
+                }
+                .accessibilityLabel(
+                    "Past Continue answer from \(historyFullTimestamp(output.createdAtMs))"
+                )
+            }
+        }
+    }
+
+    private var historyButtonOffsetX: CGFloat {
+        let direction: CGFloat = model.historyLayout.controlOnLeft ? -1 : 1
+        return model.historyLayout.capsuleOffsetX
+            + direction * (
+                renderedCapsuleWidth / 2
+                    + kWhisperFlowHistoryButtonGap
+                    + kWhisperFlowHistoryButtonVisualSize / 2
+            )
+    }
+
+    private var historyButtonOffsetY: CGFloat {
+        max(0, (renderedCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2)
+    }
+
+    private var renderedCapsuleWidth: CGFloat {
+        switch renderedIslandPresentation {
+        case .answerSummary:
+            return model.answerLayout.summaryWidth
+        case .ambientMemory:
+            return ambientCapsuleWidth
         default:
             return 0
         }
     }
 
-    private var shortTargetTitle: String {
-        trimmed(continueState.resumeWorkTarget?.title)
-            .nonEmpty
-            ?? trimmed(continueState.returnTarget?.title).nonEmpty
-            ?? "Return target ready"
-    }
-
-    private var activitySummaryLine: String? {
-        trimmed(continueState.semanticAnswer?.taskSummary).nonEmpty
-            ?? trimmed(continueState.activitySummary).nonEmpty
-    }
-
-    private var taskInferenceUnavailable: Bool {
-        let status = trimmed(continueState.semanticAnswer?.inferenceStatus).lowercased()
-        return [
-            "disabled", "credentials_missing", "model_unavailable", "timeout",
-            "provider_error", "provider_failure", "request_invalid", "invalid_response",
-        ].contains(status)
-    }
-
-    private var currentActivityLine: String? {
-        trimmed(continueState.currentActivity).nonEmpty
-    }
-
-    private var compactActivityLine: String? {
-        trimmed(continueState.activityLabel).nonEmpty
-            ?? trimmed(continueState.activitySummary).nonEmpty
-    }
-
-    private var compactUncertainActivityLine: String? {
-        if let activity = compactActivityLine {
-            return activity
-        }
-        let whereLine = trimmed(continueState.activityWhere).nonEmpty
-        let contextLine = trimmed(continueState.recentContextSummary).nonEmpty
-        if let whereLine, let contextLine {
-            return "\(whereLine) · \(contextLine)"
-        }
-        return whereLine ?? contextLine
-    }
-
-    private var activityWhereLine: String? {
-        trimmed(continueState.activityWhere).nonEmpty
-    }
-
-    private var activityStateLine: String? {
-        trimmed(continueState.activityState).nonEmpty
-    }
-
-    private var nextActionLine: String? {
-        trimmed(continueState.nextAction).nonEmpty
-    }
-
-    private func trimmed(_ value: String?) -> String {
-        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
-    private func isPrivatePrivacyLabel(_ value: String?) -> Bool {
-        let label = trimmed(value).lowercased()
-        guard !label.isEmpty else { return false }
-        return !["normal", "ok", "allowed"].contains(label)
-    }
-
-    private var displayTrailLabels: [String] {
-        let labels = (snapshot.trailLabels ?? [])
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return Array(labels.suffix(4))
-    }
-
-    private var activeBreath: Double {
-        guard captureActive && !reduceMotion else { return 0 }
-        return 0.5 + 0.5 * sin(anim.value * 1.85)
-    }
-
-    private var signalColor: Color {
-        if hasError {
-            return Color(red: 1.0, green: 0.36, blue: 0.28)
-        }
-        if isPrivateOrExcluded {
-            return Color.white.opacity(0.64)
-        }
-        switch displayState {
-        case .needsRefresh, .thinCurrentWork, .targetSuppressed, .supportBlocked, .checkingContinue:
-            return Color(red: 1.0, green: 0.68, blue: 0.28)
-        case .localMemoryWarming, .continueReady:
-            return Color(red: 0.36, green: 0.84, blue: 0.68)
-        case .noLocalMemory, .inspectOnly, .noClearContinuation, .error:
-            return Color.white.opacity(0.42)
+    private var renderedCapsuleHeight: CGFloat {
+        switch renderedIslandPresentation {
+        case .answerSummary:
+            return kWhisperFlowAnswerSummaryH
+        case .ambientMemory:
+            return ambientCapsuleHeight
+        default:
+            return 0
         }
     }
 
-    var body: some View {
-        ZStack {
-            switch presentation {
-            case .micro:
-                microView
-                    .transition(IslandMotion.microTransition(reduceMotion))
-            case .compact:
-                collapsedView
-                    .transition(IslandMotion.compactTransition(reduceMotion))
-            case .expanded:
-                expandedView
-                    .transition(IslandMotion.expandedTransition(reduceMotion))
-            }
-        }
-        .fixedSize()
-        .background(Color.clear)
-        .accessibilityLabel(accessibilityLabel)
-        .animation(IslandMotion.reveal(reduceMotion), value: presentation)
-        .animation(IslandMotion.settle(reduceMotion), value: primaryDisplayText)
-        .animation(IslandMotion.settle(reduceMotion), value: captureActive)
-        .animation(IslandMotion.settle(reduceMotion), value: metrics.screenActive)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    private var historyCardTop: CGFloat {
+        renderedCapsuleHeight + kWhisperFlowHistoryCardGap
     }
 
-    private var accessibilityLabel: String {
-        if isPrivateOrExcluded {
-            return "Smalltalk is not observing this app"
-        }
-        switch displayState {
-        case .noLocalMemory:
-            return "Smalltalk local memory is off"
-        case .localMemoryWarming:
-            return "Smalltalk is collecting local evidence"
-        case .checkingContinue:
-            return "Smalltalk is checking Continue"
-        case .continueReady:
-            return "Smalltalk Continue is ready"
-        case .thinCurrentWork:
-            return "Smalltalk saw recent work but the return target is unclear"
-        case .targetSuppressed:
-            return "Smalltalk needs more evidence before continuing"
-        case .supportBlocked:
-            return "Smalltalk saw a support surface but will not return there"
-        case .needsRefresh:
-            return "Smalltalk Continue needs refresh"
-        case .inspectOnly, .noClearContinuation:
-            return "Smalltalk has evidence to inspect but no safe return target"
-        case .error:
-            return "Smalltalk Continue is unavailable"
-        }
-    }
-
-    private var microView: some View {
-        Button {
-            presentation = .compact
-            onAction("reveal_compact")
-        } label: {
-            EvidenceTapeView(
-                active: captureActive,
-                processing: isProcessing,
-                error: hasError,
-                privateMode: signalPrivate,
-                thinEvidence: signalThin,
-                ready: signalReady,
-                frameCount: signalEvidenceCount,
-                density: 3,
-                pulseNonce: snapshot.capturePulseNonce,
-                scale: scale,
-                width: kBaseMicroVisualW,
-                height: kBaseMicroVisualH,
-                cornerRadius: 999,
-                compact: true
-            )
-                .shadow(color: .black.opacity(0.26), radius: s(4), x: 0, y: s(2))
-                .frame(width: kBaseMicroHitW * scale, height: kBaseMicroHitH * scale)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
-        .onHover { hovering in
-            if hovering {
-                presentation = .compact
-                onAction("reveal_compact")
-            }
-        }
-    }
-
-    private var collapsedView: some View {
-        HStack(spacing: s(7)) {
-            EvidenceTapeView(
-                active: captureActive,
-                processing: isProcessing,
-                error: hasError,
-                privateMode: signalPrivate,
-                thinEvidence: signalThin,
-                ready: signalReady,
-                frameCount: signalEvidenceCount,
-                density: 5,
-                pulseNonce: snapshot.capturePulseNonce,
-                scale: scale,
-                width: 34,
-                height: 24,
-                cornerRadius: 8,
-                compact: true
-            )
-            .frame(width: s(38), height: s(30))
-
-            VStack(alignment: .leading, spacing: s(1)) {
-                Text(primaryDisplayText)
-                    .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
-                    .foregroundColor(.white.opacity(0.92))
-                    .lineLimit(1)
-                    .monospacedDigit()
-                    .fixedSize(horizontal: true, vertical: false)
-                    .id("compact-primary-\(primaryDisplayText)")
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                Text(secondaryDisplayText)
-                    .font(Brand.swiftUIFont(size: s(10.5), weight: .medium))
-                    .foregroundColor(.white.opacity(0.54))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .id("compact-secondary-\(secondaryDisplayText)")
-                    .transition(.opacity)
-            }
-            .frame(width: s(106), alignment: .leading)
-
-            Spacer(minLength: s(2))
-
-            Button {
-                onContinueAction(primaryContinueAction)
-            } label: {
-                Text(compactActionLabel)
-                    .font(Brand.swiftUIFont(size: s(10.5), weight: .semibold))
-                    .foregroundColor(.white.opacity(primaryActionDisabled ? 0.36 : signalHovered ? 0.96 : 0.78))
-                    .lineLimit(1)
-                    .frame(width: s(48), height: s(26))
-                    .background(
-                        Capsule()
-                            .fill(Color.white.opacity(primaryActionDisabled ? 0.035 : signalHovered ? 0.14 : 0.075))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(primaryActionDisabled ? 0.05 : signalHovered ? 0.18 : 0.09), lineWidth: 0.6)
-                    )
-                    .scaleEffect(signalHovered && !primaryActionDisabled && !reduceMotion ? 1.035 : 1)
-            }
-            .buttonStyle(.plain)
-            .disabled(primaryActionDisabled)
-            .frame(width: s(52), height: s(30))
-            .contentShape(Rectangle())
-            .accessibilityLabel(primaryActionLabel)
-            .onHover { hovering in
-                withAnimation(IslandMotion.quick(reduceMotion)) {
-                    signalHovered = hovering
-                }
-            }
-        }
-        .padding(.leading, s(7))
-        .padding(.trailing, s(7))
-        .frame(width: kBaseCollapsedW * scale, height: kBaseCollapsedH * scale)
-        .background(capsuleFill(active: captureActive))
-        .overlay(capsuleStroke(active: captureActive))
-        .overlay(alignment: .top) {
-            Capsule()
-                .fill(Color.white.opacity(captureActive ? 0.07 + 0.035 * activeBreath : 0.08))
-                .frame(height: max(1, 1 * scale))
-                .padding(.horizontal, s(18))
-                .padding(.top, s(1))
-                .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            Capsule()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.clear,
-                            signalColor.opacity(captureActive ? 0.08 + 0.04 * activeBreath : 0),
-                            Color.clear,
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: s(8))
-                .blur(radius: s(4))
-                .padding(.horizontal, s(20))
-                .allowsHitTesting(false)
-        }
-        .clipShape(Capsule())
-        .shadow(color: .black.opacity(0.24), radius: s(13), x: 0, y: s(7))
-        .shadow(color: signalColor.opacity(captureActive ? 0.08 + 0.025 * activeBreath : 0), radius: s(10), x: 0, y: 0)
-        .onHover { hovering in
-            if hovering {
-                onAction("keep_compact")
-            }
-        }
-    }
-
-    private var expandedView: some View {
-        VStack(alignment: .leading, spacing: s(13)) {
-            HStack(alignment: .center, spacing: s(11)) {
-                EvidenceTapeView(
-                    active: captureActive,
-                    processing: isProcessing,
-                    error: hasError,
-                    privateMode: signalPrivate,
-                    thinEvidence: signalThin,
-                    ready: signalReady,
-                    frameCount: signalEvidenceCount,
-                    density: 6,
-                    pulseNonce: snapshot.capturePulseNonce,
-                    scale: scale,
-                    width: 46,
-                    height: 32,
-                    cornerRadius: 10,
-                    compact: false
-                )
-                .frame(width: s(48), height: s(34))
-
-                VStack(alignment: .leading, spacing: s(3)) {
-                    Text(primaryDisplayText)
-                        .font(Brand.swiftUIFont(size: s(13.5), weight: .semibold))
-                        .foregroundColor(.white.opacity(0.94))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .monospacedDigit()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .id("expanded-primary-\(primaryDisplayText)")
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    Text(secondaryDisplayText)
-                        .font(Brand.swiftUIFont(size: s(11.5), weight: .medium))
-                        .foregroundColor(.white.opacity(0.58))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .transition(.opacity)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Spacer(minLength: s(8))
-
-                EvidenceTapeView(
-                    active: captureActive,
-                    processing: isProcessing,
-                    error: hasError,
-                    privateMode: signalPrivate,
-                    thinEvidence: signalThin,
-                    ready: signalReady,
-                    frameCount: signalEvidenceCount,
-                    density: 7,
-                    pulseNonce: snapshot.capturePulseNonce,
-                    scale: scale,
-                    width: 104,
-                    height: 30,
-                    cornerRadius: 7,
-                    compact: false
-                )
-                .frame(width: s(104), alignment: .trailing)
-            }
-
-            VStack(alignment: .leading, spacing: s(6)) {
-                if let activitySummaryLine {
-                    ContinueDetailRow(label: "You were", value: activitySummaryLine, scale: scale)
-                } else if taskInferenceUnavailable {
-                    ContinueDetailRow(
-                        label: "Task",
-                        value: "Inference is unavailable right now",
-                        scale: scale
-                    )
-                }
-                if let currentActivityLine {
-                    ContinueDetailRow(label: "Currently", value: currentActivityLine, scale: scale)
-                }
-                if let activityStateLine {
-                    ContinueDetailRow(label: "State", value: activityStateLine, scale: scale)
-                }
-                if let nextActionLine {
-                    ContinueDetailRow(label: "Next", value: nextActionLine, scale: scale)
-                }
-                if let activityWhereLine {
-                    ContinueDetailRow(label: "Where", value: activityWhereLine, scale: scale)
-                }
-            }
-            .padding(.horizontal, s(10))
-            .padding(.vertical, s(10))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                    .fill(Color.white.opacity(0.055))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: s(11), style: .continuous)
-                    .stroke(Color.white.opacity(0.075), lineWidth: 0.7)
-            )
-            .transition(.opacity.combined(with: .move(edge: .top)))
-
-            Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.02), Color.white.opacity(0.095), Color.white.opacity(0.02)],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: max(1, 1 * scale))
-                .padding(.horizontal, s(1))
-
-            HStack(spacing: s(9)) {
-                GlassActionButton(
-                    label: primaryActionLabel,
-                    scale: scale,
-                    prominent: true,
-                    disabled: primaryActionDisabled
-                ) {
-                    onContinueAction(primaryContinueAction)
-                }
-
-                GlassActionButton(
-                    label: secondaryActionLabel,
-                    scale: scale,
-                    prominent: false,
-                    disabled: secondaryActionDisabled
-                ) {
-                    if let secondaryContinueAction {
-                        onContinueAction(secondaryContinueAction)
-                    }
-                }
-
-                if !semanticCorrectionActions.isEmpty {
-                    Menu {
-                        ForEach(Array(semanticCorrectionActions.enumerated()), id: \.offset) { _, action in
-                            Button(action.label) {
-                                onContinueAction(action)
-                            }
-                        }
-                    } label: {
-                        Text("Correct")
-                            .font(Brand.swiftUIFont(size: s(11.5), weight: .semibold))
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                }
-            }
-        }
-        .padding(.horizontal, s(18))
-        .padding(.vertical, s(17))
-        .frame(width: kBaseExpandedW * scale, height: kBaseExpandedH * scale)
-        .background(expandedGlassFill(active: captureActive))
-        .overlay(expandedGlassStroke(active: captureActive))
-        .clipShape(RoundedRectangle(cornerRadius: s(18), style: .continuous))
-        .shadow(color: .black.opacity(0.34), radius: s(22), x: 0, y: s(12))
-        .shadow(color: signalColor.opacity(captureActive ? 0.10 + 0.035 * activeBreath : 0), radius: s(22), x: 0, y: 0)
-    }
-
-    private func capsuleFill(active: Bool) -> some ShapeStyle {
-        LinearGradient(
-            colors: active
-                ? [
-                    Color(red: 0.06, green: 0.15, blue: 0.13).opacity(0.98),
-                    Color(red: 0.055, green: 0.078, blue: 0.080).opacity(0.98),
-                ]
-                : [
-                    Color(red: 0.12, green: 0.125, blue: 0.135).opacity(0.98),
-                    Color(red: 0.075, green: 0.08, blue: 0.09).opacity(0.98),
-                ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
+    private var morphAnimation: Animation {
+        .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: reduceMotion
+                ? kWhisperFlowReducedMotionFadeDuration
+                : kWhisperFlowMorphDuration
         )
     }
 
-    private func capsuleStroke(active: Bool) -> some View {
-        Capsule()
-            .stroke(
-                active ? signalColor.opacity(0.34) : Color.white.opacity(0.16),
-                lineWidth: 0.7
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.black.opacity(0.44), lineWidth: 1)
-                    .offset(y: s(0.5))
-                    .blur(radius: 0.4)
-            )
-    }
-
-    private func expandedGlassFill(active: Bool) -> some ShapeStyle {
-        LinearGradient(
-            colors: active
-                ? [
-                    Color(red: 0.055, green: 0.135, blue: 0.12).opacity(0.99),
-                    Color(red: 0.060, green: 0.072, blue: 0.080).opacity(0.99),
-                ]
-                : [
-                    Color(red: 0.115, green: 0.12, blue: 0.13).opacity(0.99),
-                    Color(red: 0.065, green: 0.07, blue: 0.08).opacity(0.99),
-                ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
+    private var presentationAnimation: Animation {
+        guard model.presentation.isHistory else { return morphAnimation }
+        return .timingCurve(
+            0.23,
+            1,
+            0.32,
+            1,
+            duration: shouldReduceMotion
+                ? kWhisperFlowReducedMotionFadeDuration
+                : kWhisperFlowHistoryTransitionDuration
         )
     }
 
-    private func expandedGlassStroke(active: Bool) -> some View {
-        let shape = RoundedRectangle(cornerRadius: s(18), style: .continuous)
-        return shape
-            .stroke(active ? signalColor.opacity(0.32) : Color.white.opacity(0.14), lineWidth: 0.8)
-            .overlay(
-                shape
-                    .stroke(Color.black.opacity(0.48), lineWidth: 1)
-                    .offset(y: s(0.5))
-                    .blur(radius: 0.5)
-            )
-            .overlay(alignment: .topLeading) {
-                shape
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    .frame(height: kBaseExpandedH * scale)
-                    .allowsHitTesting(false)
-            }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct ContinueDetailRow: View {
-    let label: String
-    let value: String
-    let scale: CGFloat
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
-            Text(label)
-                .font(Brand.swiftUIMonoFont(size: 8.5 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(0.48))
-                .lineLimit(1)
-                .frame(width: 82 * scale, alignment: .leading)
-
-            Text(value)
-                .font(Brand.swiftUIFont(size: 11 * scale, weight: .medium))
-                .foregroundColor(.white.opacity(0.74))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct LiveDot: View {
-    let active: Bool
-    let state: String
-    let scale: CGFloat
-    @ObservedObject private var anim = AnimationTick.shared
-
-    private var color: Color {
-        if state == "processing" || state == "stopped_toast" {
-            return Color(red: 1.0, green: 0.72, blue: 0.25)
-        }
-        if active {
-            return Color(red: 0.36, green: 0.84, blue: 0.68)
-        }
-        return .white.opacity(0.38)
+    private var microScale: CGFloat {
+        guard model.microPulseActive, !reduceMotion else { return 1 }
+        return microPulseExpanded ? kWhisperFlowMicroPulseScale : 1
     }
 
-    var body: some View {
-        let pulse = active ? 0.68 + 0.32 * abs(sin(anim.value * 4.0)) : 1.0
-        Circle()
-            .fill(color.opacity(pulse))
-            .frame(width: 5 * scale, height: 5 * scale)
-            .overlay(
-                Circle()
-                    .stroke(color.opacity(active ? 0.32 : 0.12), lineWidth: 2 * scale)
-                    .scaleEffect(active ? 1.35 : 1)
-            )
+    private var microOutlineOpacity: Double {
+        guard model.microPulseActive, !reduceMotion else { return 1 }
+        return microPulseExpanded ? 1 : kWhisperFlowMicroPulseOutlineMinOpacity
     }
-}
 
-@available(macOS 13.0, *)
-private struct IslandPressButtonStyle: ButtonStyle {
-    let reduceMotion: Bool
-    let pressedScale: CGFloat
+    private func refreshMicroPulse() {
+        microPulseExpanded = false
+        guard model.microPulseActive, !reduceMotion else { return }
 
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
-            .animation(IslandMotion.quick(reduceMotion), value: configuration.isPressed)
-    }
-}
-
-@available(macOS 13.0, *)
-private struct EvidenceChip: View {
-    let label: String
-    let scale: CGFloat
-
-    var body: some View {
-        Text(label)
-            .font(Brand.swiftUIMonoFont(size: 7.5 * scale, weight: .medium))
-            .foregroundColor(.white.opacity(0.58))
-            .lineLimit(1)
-            .fixedSize()
-            .padding(.horizontal, 5 * scale)
-            .frame(height: 14 * scale)
-            .background(
-                Capsule()
-                    .fill(Color.white.opacity(0.07))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
-            )
-    }
-}
-
-@available(macOS 13.0, *)
-private struct TrailRouteView: View {
-    let labels: [String]
-    let scale: CGFloat
-
-    var body: some View {
-        HStack(spacing: 5 * scale) {
-            ForEach(Array(labels.enumerated()), id: \.offset) { index, label in
-                Text(label)
-                    .font(Brand.swiftUIFont(size: 9.5 * scale, weight: index == labels.count - 1 ? .semibold : .medium))
-                    .foregroundColor(.white.opacity(index == labels.count - 1 ? 0.82 : 0.58))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 68 * scale, alignment: .leading)
-                    .padding(.horizontal, 7 * scale)
-                    .frame(height: 20 * scale)
-                    .background(
-                        Capsule()
-                            .fill(Color.white.opacity(index == labels.count - 1 ? 0.085 : 0.045))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(index == labels.count - 1 ? 0.13 : 0.07), lineWidth: 0.6)
-                    )
-
-                if index < labels.count - 1 {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 6.5 * scale, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.30))
-                        .frame(width: 6 * scale)
-                }
-            }
-        }
-        .frame(height: 20 * scale)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
-        .allowsHitTesting(false)
-    }
-}
-
-@available(macOS 13.0, *)
-private struct TextActionButton: View {
-    let label: String
-    let scale: CGFloat
-    let action: () -> Void
-    @State private var hovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(Brand.swiftUIMonoFont(size: 8 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(hovered ? 0.95 : 0.72))
-                .lineLimit(1)
-                .fixedSize()
-                .frame(width: 48 * scale, height: 26 * scale)
-                .background(
-                    Capsule()
-                        .fill(hovered ? Color.white.opacity(0.14) : Color.white.opacity(0.065))
+        DispatchQueue.main.async {
+            guard model.microPulseActive, !reduceMotion else { return }
+            withAnimation(
+                .timingCurve(
+                    0.77,
+                    0,
+                    0.175,
+                    1,
+                    duration: kWhisperFlowMicroPulseDuration / 2
                 )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(hovered ? 0.18 : 0.08), lineWidth: 0.5)
-                )
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
-    }
-}
-
-@available(macOS 13.0, *)
-private struct GlassActionButton: View {
-    let label: String
-    let scale: CGFloat
-    let prominent: Bool
-    let disabled: Bool
-    let action: () -> Void
-    @State private var hovered = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button {
-            if !disabled {
-                action()
-            }
-        } label: {
-            Text(label)
-                .font(Brand.swiftUIFont(size: 11 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(disabled ? 0.34 : prominent ? 0.92 : hovered ? 0.86 : 0.66))
-                .lineLimit(1)
-                .fixedSize()
-                .frame(maxWidth: .infinity)
-                .frame(height: 30 * scale)
-                .background(buttonFill)
-                .overlay(buttonStroke)
-                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
-                .contentShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
-                .scaleEffect(hovered && !disabled && !reduceMotion ? 1.015 : 1)
-                .shadow(
-                    color: prominent && !disabled
-                        ? Color.white.opacity(hovered ? 0.08 : 0.025)
-                        : Color.clear,
-                    radius: 7 * scale,
-                    x: 0,
-                    y: 0
-                )
-        }
-        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.965))
-        .disabled(disabled)
-        .onHover { hovering in
-            withAnimation(IslandMotion.quick(reduceMotion)) {
-                hovered = hovering
+                    .repeatForever(autoreverses: true)
+            ) {
+                microPulseExpanded = true
             }
         }
     }
 
-    private var buttonFill: some View {
-        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-            .fill(
-                prominent
-                    ? Color.white.opacity(disabled ? 0.055 : hovered ? 0.16 : 0.115)
-                    : Color.white.opacity(disabled ? 0.025 : hovered ? 0.075 : 0.045)
-            )
-    }
-
-    private var buttonStroke: some View {
-        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-            .stroke(Color.white.opacity(disabled ? 0.045 : prominent ? hovered ? 0.20 : 0.13 : hovered ? 0.13 : 0.075), lineWidth: 0.7)
-    }
-}
-
-@available(macOS 13.0, *)
-private struct PlayPauseButton: View {
-    let isActive: Bool
-    let scale: CGFloat
-    let disabled: Bool
-    let action: () -> Void
-    @State private var hovered = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button {
-            if !disabled {
-                action()
-            }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(
-                        isActive
-                            ? Color(red: 0.36, green: 0.84, blue: 0.68).opacity(disabled ? 0.38 : hovered ? 0.96 : 0.86)
-                            : Color.white.opacity(disabled ? 0.045 : hovered ? 0.12 : 0.075)
-                    )
-                Circle()
-                    .stroke(Color.white.opacity(disabled ? 0.055 : isActive ? 0.22 : hovered ? 0.16 : 0.09), lineWidth: 0.6)
-
-                Image(systemName: isActive ? "pause.fill" : "play.fill")
-                    .font(.system(size: 9.5 * scale, weight: .semibold))
-                    .foregroundColor(disabled ? .white.opacity(0.32) : isActive ? .white.opacity(0.94) : (hovered ? .white.opacity(0.82) : .white.opacity(0.58)))
-                    .offset(x: isActive ? 0 : 0.7 * scale)
-                    .rotationEffect(.degrees(isActive || reduceMotion ? 0 : hovered ? -4 : 0))
-                    .animation(IslandMotion.quick(reduceMotion), value: isActive)
-            }
-            .frame(width: 28 * scale, height: 28 * scale)
-            .frame(width: 32 * scale, height: 32 * scale)
-            .contentShape(Circle())
-            .scaleEffect(hovered && !disabled && !reduceMotion ? 1.045 : 1)
-            .shadow(
-                color: isActive
-                    ? Color(red: 0.36, green: 0.84, blue: 0.68).opacity(hovered ? 0.28 : 0.16)
-                    : Color.white.opacity(hovered ? 0.08 : 0),
-                radius: 8 * scale,
-                x: 0,
-                y: 0
-            )
-        }
-        .buttonStyle(IslandPressButtonStyle(reduceMotion: reduceMotion, pressedScale: 0.92))
-        .disabled(disabled)
-        .onHover { hovering in
-            withAnimation(IslandMotion.quick(reduceMotion)) {
-                hovered = hovering
-            }
-        }
-        .animation(IslandMotion.settle(reduceMotion), value: isActive)
+    private func stateTransition(scale: CGFloat) -> AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(
+                active: IslandMorphModifier(opacity: 0, scale: scale),
+                identity: IslandMorphModifier(opacity: 1, scale: 1)
+            ),
+            removal: .opacity
+        )
     }
 }
 
@@ -1927,16 +3041,49 @@ private final class SessionIslandController: NSObject {
     private var panel: NSPanel?
     private var hostingView: NSHostingView<AnyView>?
     private var trackingView: IslandTrackingView?
-    private var presentation: IslandPresentation = .micro
+    private let islandModel = WhisperFlowIslandModel()
+    private var presentation: WhisperFlowPresentation = .micro
     private var visible = false
     private var snapshot = IslandSnapshot()
     private var metrics = OverlayMetrics()
     private var previousFrameCount: Int64?
+    private var previousMemoryLifecyclePhase: WhisperFlowMemoryLifecyclePhase?
+    private var memoryHasStarted = false
+    private var ambientHovered = false
+    private var ambientBodyHovered = false
+    private var hoverRevealArmed = true
+    private var blockedMicroHoverObserved = false
     private var outsideGlobalClickMonitor: Any?
     private var outsideLocalClickMonitor: Any?
-    private var idleMicroTimer: Timer?
-    private var lastCompactRevealAt: Date?
-    private var suppressOpenExpandedUntil: Date?
+    private var continueRequestInFlight = false
+    private var blockedContinueShakeNonce: UInt64 = 0
+    private var latchedAnswer: WhisperFlowAnswerContent?
+    private var latchedDecisionId: String?
+    private var latchedVisualCue: IslandVisualCue?
+    private var visualCueImage: NSImage?
+    private var visualCuePresented = false
+    private var visualCueLoadNonce: UInt64 = 0
+    private var answerLayout = WhisperFlowAnswerLayout()
+    private var memoryTransitionTimer: Timer?
+    private var ambientHoverReturnTimer: Timer?
+    private var memoryTransitionCountdownActive = false
+    private var memoryTransitionCountdownNonce: UInt64 = 0
+    private var startingFeedbackNonceCounter: UInt64 = 0
+    private var activeStartingFeedbackNonce: UInt64?
+    private var historyOriginPresentation: WhisperFlowPresentation = .ambientMemory
+    private var historyItems: [ContinueHistorySummaryV1] = []
+    private var historyNextCursor: ContinueHistoryCursorV1?
+    private var historyError: String?
+    private var historyLoadingOlder = false
+    private var historySelectedOutput: ContinueHistoryOutputV1?
+    private var historySelectedDecisionId: String?
+    private var historyDetailLoading = false
+    private var historyDetailError: String?
+    private var historyRequestId: UInt64 = 0
+    private var activeHistoryPageRequestId: UInt64?
+    private var activeHistoryDetailRequestId: UInt64?
+    private var historyAnchor: NSPoint?
+    private var historyLayout = WhisperFlowHistoryLayout()
 
     func initializeIfNeeded() {
         if panel == nil {
@@ -1947,8 +3094,6 @@ private final class SessionIslandController: NSObject {
     }
 
     func update(json: String) {
-        let wasMicroEligible = canUseMicro
-
         if let data = json.data(using: .utf8) {
             do {
                 snapshot = try JSONDecoder().decode(IslandSnapshot.self, from: data)
@@ -1958,36 +3103,43 @@ private final class SessionIslandController: NSObject {
             }
         }
 
+        processHistoryResponses(from: snapshot)
+
+        if snapshot.memoryActive ||
+            snapshot.state == "starting" ||
+            snapshot.state == "processing" {
+            memoryHasStarted = true
+        }
+
         if snapshot.state == "hidden" {
             hide()
             return
         }
 
-        let recording = isRecording(snapshot.state)
-        let captureControlActive = recording || snapshot.state == "starting" || snapshot.state == "processing"
+        if snapshot.state == "trail_reconstructing" {
+            if presentation.isHistory {
+                closeHistory()
+            }
+            continueRequestInFlight = true
+            setPresentation(.generating)
+        } else if continueRequestInFlight,
+                  snapshot.state == "resume_ready" || snapshot.state == "error" {
+            finishContinueRequest(with: snapshot)
+        }
+
+        let captureControlActive = snapshot.memoryActive || snapshot.state == "starting"
         metrics.meetingActive = captureControlActive
 
         if let previousFrameCount {
             let delta = max(0, snapshot.frameCount - previousFrameCount)
-            metrics.screenActive = recording && delta > 0
-            metrics.captureFps = recording ? Double(delta) : 0
+            metrics.screenActive = snapshot.memoryActive && delta > 0
+            metrics.captureFps = snapshot.memoryActive ? Double(delta) : 0
         } else {
-            metrics.screenActive = recording
-            metrics.captureFps = recording ? 1 : 0
+            metrics.screenActive = snapshot.memoryActive
+            metrics.captureFps = snapshot.memoryActive ? 1 : 0
         }
         previousFrameCount = snapshot.frameCount
-
-        if snapshot.state == "starting" || snapshot.state == "processing" || snapshot.state == "stopped_toast" {
-            setPresentation(.compact, resetIdleTimer: false)
-        } else if canUseMicro {
-            if !wasMicroEligible && presentation == .compact {
-                scheduleMicroReturn()
-            }
-        } else if presentation == .micro {
-            setPresentation(.compact, resetIdleTimer: false)
-        } else {
-            cancelMicroReturn()
-        }
+        observeMemoryLifecycleTransition()
 
         initializeIfNeeded()
         updateContent()
@@ -1998,17 +3150,33 @@ private final class SessionIslandController: NSObject {
     func show() {
         initializeIfNeeded()
         visible = true
+        if !islandModel.isPanelVisible {
+            islandModel.isPanelVisible = true
+        }
         updateOutsideClickMonitors()
         panel?.orderFrontRegardless()
-        AnimationTick.shared.start()
     }
 
     func hide() {
         visible = false
+        if islandModel.isPanelVisible {
+            islandModel.isPanelVisible = false
+        }
         presentation = .micro
-        cancelMicroReturn()
+        previousMemoryLifecyclePhase = nil
+        activeStartingFeedbackNonce = nil
+        ambientHovered = false
+        ambientBodyHovered = false
+        hoverRevealArmed = true
+        blockedMicroHoverObserved = false
+        continueRequestInFlight = false
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        clearVisualCue()
+        clearHistoryState()
+        answerLayout = WhisperFlowAnswerLayout()
+        cancelPresentationTimers()
         updateOutsideClickMonitors()
-        AnimationTick.shared.stop()
         DispatchQueue.main.async { [self] in
             panel?.orderOut(nil)
             updateContent()
@@ -2016,127 +3184,1050 @@ private final class SessionIslandController: NSObject {
     }
 
     func setExpanded(_ expanded: Bool) {
-        setPresentation(expanded ? .expanded : .compact)
+        if expanded {
+            expandAnswer()
+        } else {
+            showAnswerSummary()
+        }
     }
 
     func reposition() {
         initializeIfNeeded()
+        refreshAnswerLayout()
         positionPanel(preserveCurrentAnchor: false, animated: false)
     }
 
     func shutdown() {
-        AnimationTick.shared.stop()
-        cancelMicroReturn()
+        cancelPresentationTimers()
         removeOutsideClickMonitors()
+        islandModel.isPanelVisible = false
         panel?.orderOut(nil)
         panel = nil
         hostingView = nil
         trackingView = nil
         visible = false
+        presentation = .micro
+        previousMemoryLifecyclePhase = nil
+        memoryHasStarted = false
+        activeStartingFeedbackNonce = nil
+        ambientHovered = false
+        ambientBodyHovered = false
+        hoverRevealArmed = true
+        blockedMicroHoverObserved = false
+        continueRequestInFlight = false
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        clearVisualCue()
+        clearHistoryState()
+        answerLayout = WhisperFlowAnswerLayout()
     }
 
-    private func isRecording(_ state: String) -> Bool {
-        state == "recording_compact" || state == "recording_expanded"
+    private var memoryActive: Bool {
+        snapshot.memoryActive
     }
 
-    private var canUseMicro: Bool {
-        snapshot.lastError == nil &&
-            (
-                snapshot.state == "ready" ||
-                    snapshot.state == "recording_compact" ||
-                    snapshot.state == "recording_expanded" ||
-                    snapshot.state == "resume_ready"
-            )
+    private var microPulseActive: Bool {
+        captureStatus == .active || captureStatus == .starting
     }
 
-    private func setPresentation(
-        _ nextPresentation: IslandPresentation,
-        resetIdleTimer: Bool = true
-    ) {
-        let normalized = normalizePresentation(nextPresentation)
-        let changed = presentation != normalized
-        presentation = normalized
+    private var captureStatus: WhisperFlowCaptureStatus {
+        if continueRequestInFlight {
+            return .generating
+        }
+        if snapshot.state == "error" || snapshot.lastError != nil {
+            return .error
+        }
+        if !snapshotAllowsCaptureIndication {
+            return .suppressed
+        }
+        if snapshot.state == "starting" {
+            return .starting
+        }
+        if snapshot.state == "processing" {
+            return .processing
+        }
+        return snapshot.memoryActive ? .active : .inactive
+    }
+
+    private var memoryLifecyclePhase: WhisperFlowMemoryLifecyclePhase {
+        if snapshot.state == "error" || snapshot.lastError != nil {
+            return .unavailable
+        }
+        if snapshot.state == "starting" {
+            return .starting
+        }
+        if snapshot.state == "processing" {
+            return .stopping
+        }
+        return snapshot.memoryActive ? .active : .paused
+    }
+
+    private var snapshotAllowsCaptureIndication: Bool {
+        guard snapshot.state != "hidden", snapshot.state != "error", !snapshot.isSensitive else {
+            return false
+        }
+        let privacyLabel = snapshot.privacyLabel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return privacyLabel.isEmpty || ["normal", "ok", "allowed"].contains(privacyLabel)
+    }
+
+    private func setPresentation(_ nextPresentation: WhisperFlowPresentation) {
+        let changed = presentation != nextPresentation
+        if nextPresentation != .ambientMemory {
+            cancelAmbientHoverReturn()
+            ambientHovered = false
+            ambientBodyHovered = false
+        }
+        presentation = nextPresentation
 
         if changed {
             updateOutsideClickMonitors()
-            updateContent()
             positionPanel(preserveCurrentAnchor: true, animated: visible)
+            updateContent()
         }
+    }
 
-        if presentation == .compact && canUseMicro {
-            if resetIdleTimer || idleMicroTimer == nil {
-                scheduleMicroReturn()
+    private func revealAmbientMemory() {
+        guard !continueRequestInFlight else {
+            setPresentation(.generating)
+            return
+        }
+        setPresentation(.ambientMemory)
+    }
+
+    private func microHoverChanged(_ hovering: Bool) {
+        if !hoverRevealArmed {
+            if hovering {
+                blockedMicroHoverObserved = true
+            } else if blockedMicroHoverObserved {
+                hoverRevealArmed = true
+                blockedMicroHoverObserved = false
             }
-        } else {
-            cancelMicroReturn()
-        }
-    }
-
-    private func normalizePresentation(_ nextPresentation: IslandPresentation) -> IslandPresentation {
-        if nextPresentation == .micro && !canUseMicro {
-            return .compact
-        }
-        return nextPresentation
-    }
-
-    private func revealCompact() {
-        lastCompactRevealAt = Date()
-        setPresentation(.compact, resetIdleTimer: true)
-    }
-
-    private func openExpandedFromCompact() {
-        if let suppressOpenExpandedUntil,
-           Date() < suppressOpenExpandedUntil {
-            revealCompact()
             return
         }
-        if let lastCompactRevealAt,
-           Date().timeIntervalSince(lastCompactRevealAt) < 0.25 {
-            revealCompact()
+        if !hovering {
             return
         }
-        setPresentation(.expanded)
+        revealAmbientMemory()
     }
 
-    private func markPanelDragBegan() {
-        suppressOpenExpandedUntil = Date().addingTimeInterval(0.35)
-        revealCompact()
+    private func requestContinue() {
+        guard !continueRequestInFlight else { return }
+        guard memoryActive else {
+            blockedContinueShakeNonce &+= 1
+            updateContent()
+            return
+        }
+        cancelPresentationTimers()
+        continueRequestInFlight = true
+        latchedAnswer = nil
+        latchedDecisionId = nil
+        clearVisualCue()
+        answerLayout = WhisperFlowAnswerLayout()
+        setPresentation(.generating)
+        updateContent()
+
+        guard sendAction("continue") else {
+            snapshot = IslandSnapshot.continueDecodeError()
+            finishContinueRequest(with: snapshot)
+            return
+        }
     }
 
-    private func scheduleMicroReturn() {
-        guard canUseMicro, presentation == .compact else {
-            cancelMicroReturn()
+    private func finishContinueRequest(with snapshot: IslandSnapshot) {
+        continueRequestInFlight = false
+        cancelMemoryTransitionCountdown()
+        clearVisualCue()
+        let answer = WhisperFlowAnswerContent(snapshot: snapshot)
+        latchedAnswer = answer
+        latchedDecisionId = answer.decisionId
+        latchedVisualCue = snapshot.visualCue
+        refreshAnswerLayout()
+        setPresentation(.answerSummary)
+        updateContent()
+        beginVisualCueLoad(for: snapshot.visualCue, decisionId: answer.decisionId)
+    }
+
+    private func clearVisualCue() {
+        visualCueLoadNonce &+= 1
+        latchedVisualCue = nil
+        visualCueImage = nil
+        visualCuePresented = false
+        if islandModel.visualCueImage != nil {
+            islandModel.visualCueImage = nil
+        }
+        if islandModel.visualCuePresented {
+            islandModel.visualCuePresented = false
+        }
+    }
+
+    private func beginVisualCueLoad(for cue: IslandVisualCue?, decisionId: String?) {
+        guard let cue,
+              !cue.imagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
 
-        cancelMicroReturn()
-        let timer = Timer(timeInterval: kIdleMicroDelay, repeats: false) { [weak self] _ in
+        visualCueLoadNonce &+= 1
+        let loadNonce = visualCueLoadNonce
+        let imagePath = cue.imagePath
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let data = try? Data(
+                contentsOf: URL(fileURLWithPath: imagePath),
+                options: [.mappedIfSafe]
+            ),
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let decodedImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                return
+            }
+
             DispatchQueue.main.async {
-                self?.returnToMicroIfIdle()
+                guard let self,
+                      self.visualCueLoadNonce == loadNonce,
+                      self.latchedDecisionId == decisionId,
+                      self.latchedVisualCue?.imagePath == imagePath else { return }
+
+                let image = NSImage(
+                    cgImage: decodedImage,
+                    size: NSSize(width: decodedImage.width, height: decodedImage.height)
+                )
+                self.visualCueImage = image
+                self.refreshAnswerLayout()
+
+                let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                if reduceMotion {
+                    self.updateContent()
+                } else {
+                    withAnimation(.easeOut(duration: kWhisperFlowReducedMotionFadeDuration)) {
+                        self.islandModel.visualCueImage = image
+                        self.islandModel.answerLayout = self.answerLayout
+                    }
+                }
+
+                if self.presentation == .answerExpanded {
+                    self.positionPanel(
+                        preserveCurrentAnchor: true,
+                        animated: self.visible && !reduceMotion
+                    )
+                }
+            }
+        }
+    }
+
+    private func refreshAnswerLayout() {
+        guard let answer = latchedAnswer else {
+            answerLayout = WhisperFlowAnswerLayout()
+            return
+        }
+
+        let screen = panel?.screen
+            ?? screenContaining(NSEvent.mouseLocation)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleSize = screen?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
+        let usableWidth = max(1, visibleSize.width / gOverlayScale)
+        let usableHeight = max(1, visibleSize.height / gOverlayScale)
+        let summaryFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let summaryActionFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let summaryMaximum = max(
+            kWhisperFlowAnswerSummaryMinW,
+            usableWidth - 32 - kWhisperFlowAnswerSummaryPanelMarginW
+        )
+        let summaryContentWidth = measuredTextWidth(answer.title, font: summaryFont)
+            + measuredTextWidth("See more", font: summaryActionFont)
+            + 2
+            + 20
+        let summaryWidth = min(
+            max(kWhisperFlowAnswerSummaryMinW, ceil(summaryContentWidth)),
+            summaryMaximum
+        )
+
+        let titleFont = Brand.instrumentSerifNSFont(size: 24)
+        let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let collapseFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let measuredAnswerWidths: [CGFloat] = [
+            measuredTextWidth(answer.title, font: titleFont),
+        ] + answer.rows.flatMap { row -> [CGFloat] in
+                let valueFont = answerValueNSFont(for: row)
+                return [
+                    measuredTextWidth(row.label, font: labelFont),
+                    measuredTextWidth(row.value, font: valueFont),
+                ]
+            }
+        let longestTextWidth = measuredAnswerWidths.max() ?? 0
+        let expandedMaximum = max(
+            kWhisperFlowAnswerExpandedMinW,
+            min(kWhisperFlowAnswerExpandedMaxW, usableWidth - 32)
+        )
+        let expandedWidth = min(
+            max(
+                kWhisperFlowAnswerExpandedMinW,
+                ceil(longestTextWidth + kWhisperFlowAnswerHorizontalPadding * 2)
+            ),
+            expandedMaximum
+        )
+        let contentWidth = max(1, expandedWidth - kWhisperFlowAnswerHorizontalPadding * 2)
+        let collapseWidth = measuredTextWidth("See less", font: collapseFont)
+        let cueButtonWidth = visualCueImage == nil
+            ? 0
+            : measuredTextWidth("Visual cue", font: labelFont) + 16 + 8
+        let titleWidth = max(1, contentWidth - collapseWidth - cueButtonWidth - 16)
+        let titleHeight = measuredTextHeight(answer.title, font: titleFont, width: titleWidth)
+        let headerHeight = max(20, titleHeight)
+
+        var bodyHeight: CGFloat = 0
+        for (index, row) in answer.rows.enumerated() {
+            if index > 0 {
+                bodyHeight += kWhisperFlowAnswerRowSpacing
+            }
+            bodyHeight += measuredTextHeight(row.label, font: labelFont, width: contentWidth)
+            bodyHeight += kWhisperFlowAnswerLabelValueSpacing
+            bodyHeight += measuredTextHeight(
+                row.value,
+                font: answerValueNSFont(for: row),
+                width: contentWidth,
+                lineSpacing: 3
+            )
+        }
+
+        let bodySpacing = answer.rows.isEmpty ? 0 : kWhisperFlowAnswerHeaderSpacing
+        let naturalAnswerHeight = max(
+            kWhisperFlowAnswerExpandedMinH,
+            ceil(
+                kWhisperFlowAnswerVerticalPadding * 2
+                    + headerHeight
+                    + bodySpacing
+                    + bodyHeight
+            )
+        )
+        let maximumStackHeight = max(
+            kWhisperFlowAnswerExpandedMinH,
+            usableHeight * kWhisperFlowAnswerExpandedMaxScreenFraction
+        )
+        var answerCardHeight = min(naturalAnswerHeight, maximumStackHeight)
+        var visualCueCardHeight: CGFloat = 0
+        var visualCueImageHeight: CGFloat = 0
+
+        if visualCuePresented,
+           let image = visualCueImage,
+           image.size.width > 0,
+           image.size.height > 0 {
+            let cueContentWidth = max(
+                1,
+                expandedWidth - kWhisperFlowVisualCuePadding * 2
+            )
+            let titleHeight = measuredTextHeight(
+                "Visual cue",
+                font: labelFont,
+                width: cueContentWidth
+            )
+            let cueChromeHeight = kWhisperFlowVisualCuePadding * 2
+                + titleHeight
+                + kWhisperFlowVisualCueTitleImageGap
+            let naturalImageHeight = min(
+                kWhisperFlowVisualCueImageMaxH,
+                cueContentWidth * image.size.height / image.size.width
+            )
+            let imageRoomAfterMinimumAnswer = maximumStackHeight
+                - kWhisperFlowAnswerExpandedMinH
+                - kWhisperFlowVisualCueCardGap
+                - cueChromeHeight
+
+            if imageRoomAfterMinimumAnswer >= 1 {
+                visualCueImageHeight = min(naturalImageHeight, imageRoomAfterMinimumAnswer)
+                visualCueCardHeight = cueChromeHeight + visualCueImageHeight
+                let answerRoom = maximumStackHeight
+                    - kWhisperFlowVisualCueCardGap
+                    - visualCueCardHeight
+                answerCardHeight = min(
+                    naturalAnswerHeight,
+                    max(kWhisperFlowAnswerExpandedMinH, answerRoom)
+                )
+            }
+        }
+
+        let expandedHeight = answerCardHeight
+            + (visualCueCardHeight > 0
+                ? kWhisperFlowVisualCueCardGap + visualCueCardHeight
+                : 0)
+        let contentViewportHeight = max(
+            0,
+            answerCardHeight - kWhisperFlowAnswerVerticalPadding * 2
+        )
+
+        answerLayout = WhisperFlowAnswerLayout(
+            summaryWidth: summaryWidth,
+            summaryPanelWidth: summaryWidth + kWhisperFlowAnswerSummaryPanelMarginW,
+            expandedWidth: expandedWidth,
+            expandedHeight: expandedHeight,
+            answerCardHeight: answerCardHeight,
+            contentViewportHeight: contentViewportHeight,
+            visualCueCardHeight: visualCueCardHeight,
+            visualCueImageHeight: visualCueImageHeight
+        )
+    }
+
+    private func answerValueNSFont(for row: WhisperFlowAnswerRow) -> NSFont {
+        if row.isContinuation {
+            return NSFont.systemFont(ofSize: 17, weight: .semibold)
+        }
+        if row.isCheckpoint {
+            return NSFont.systemFont(ofSize: 16, weight: .semibold)
+        }
+        return NSFont.systemFont(ofSize: 14, weight: .regular)
+    }
+
+    private func measuredTextWidth(_ text: String, font: NSFont) -> CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    private func measuredTextHeight(
+        _ text: String,
+        font: NSFont,
+        width: CGFloat,
+        lineSpacing: CGFloat = 0
+    ) -> CGFloat {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = lineSpacing
+        let bounds = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font, .paragraphStyle: paragraph]
+        )
+        return max(ceil(font.ascender - font.descender), ceil(bounds.height))
+    }
+
+    private func showAnswerSummary() {
+        guard latchedAnswer != nil else {
+            returnToDefaultPresentation()
+            return
+        }
+        visualCuePresented = false
+        refreshAnswerLayout()
+        setPresentation(.answerSummary)
+    }
+
+    private func expandAnswer() {
+        guard latchedAnswer != nil else { return }
+        visualCuePresented = false
+        refreshAnswerLayout()
+        setPresentation(.answerExpanded)
+    }
+
+    private func toggleVisualCue() {
+        guard presentation == .answerExpanded, visualCueImage != nil else { return }
+        visualCuePresented.toggle()
+        refreshAnswerLayout()
+
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        withAnimation(
+            .timingCurve(
+                0.23,
+                1,
+                0.32,
+                1,
+                duration: reduceMotion
+                    ? kWhisperFlowReducedMotionFadeDuration
+                    : kWhisperFlowMorphDuration
+            )
+        ) {
+            islandModel.visualCuePresented = visualCuePresented
+            islandModel.answerLayout = answerLayout
+        }
+        positionPanel(
+            preserveCurrentAnchor: true,
+            animated: visible && !reduceMotion
+        )
+    }
+
+    private func toggleHistory() {
+        if presentation.isHistory {
+            closeHistory()
+        } else {
+            openHistory()
+        }
+    }
+
+    private func openHistory() {
+        guard historyButtonShouldBeVisible,
+              presentation == .ambientMemory || presentation == .answerSummary else { return }
+        cancelPresentationTimers()
+        historyOriginPresentation = presentation
+        if let panel {
+            historyAnchor = NSPoint(x: panel.frame.midX, y: panel.frame.maxY)
+        }
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        setPresentation(.historyLoading)
+        if !sendAction(
+            "open_continue_history",
+            historyRequestId: requestId
+        ) {
+            activeHistoryPageRequestId = nil
+            historyError = "Smalltalk could not request saved answers."
+            setPresentation(.historyList)
+        }
+    }
+
+    private func closeHistory() {
+        guard presentation.isHistory else { return }
+        let origin = historyOriginPresentation
+        setPresentation(origin)
+        historyAnchor = nil
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryPageRequestId = nil
+        historyLoadingOlder = false
+        activeHistoryDetailRequestId = nil
+        refreshHistoryLayout()
+        updateContent()
+        if origin == .ambientMemory, !ambientHovered {
+            scheduleAmbientHoverReturn()
+        }
+    }
+
+    private func showHistoryList() {
+        guard presentation == .historyDetail else { return }
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryDetailRequestId = nil
+        setPresentation(.historyList)
+    }
+
+    private func loadOlderHistory() {
+        guard presentation == .historyList,
+              !historyLoadingOlder,
+              let cursor = historyNextCursor else { return }
+        historyLoadingOlder = true
+        historyError = nil
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        updateContent()
+        if !sendAction(
+            "load_older_continue_history",
+            historyRequestId: requestId,
+            historyCursor: cursor
+        ) {
+            activeHistoryPageRequestId = nil
+            historyLoadingOlder = false
+            historyError = "Smalltalk could not load older answers."
+            updateContent()
+        }
+    }
+
+    private func retryHistory() {
+        guard presentation == .historyList || presentation == .historyLoading else { return }
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        let requestId = nextHistoryRequestId()
+        activeHistoryPageRequestId = requestId
+        setPresentation(.historyLoading)
+        if !sendAction(
+            "retry_continue_history",
+            historyRequestId: requestId
+        ) {
+            activeHistoryPageRequestId = nil
+            historyError = "Smalltalk could not retry saved answers."
+            setPresentation(.historyList)
+        }
+    }
+
+    private func selectHistoryOutput(_ decisionId: String) {
+        let cleanDecisionId = decisionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard presentation == .historyList, !cleanDecisionId.isEmpty else { return }
+        historySelectedDecisionId = cleanDecisionId
+        historySelectedOutput = nil
+        historyDetailError = nil
+        historyDetailLoading = true
+        let requestId = nextHistoryRequestId()
+        activeHistoryDetailRequestId = requestId
+        setPresentation(.historyDetail)
+        if !sendAction(
+            "select_continue_history_output",
+            decisionId: cleanDecisionId,
+            historyRequestId: requestId
+        ) {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            historyDetailError = "Smalltalk could not load this saved answer."
+            updateContent()
+        }
+    }
+
+    private func retryHistoryDetail() {
+        guard presentation == .historyDetail,
+              let decisionId = historySelectedDecisionId else { return }
+        historySelectedOutput = nil
+        historyDetailError = nil
+        historyDetailLoading = true
+        let requestId = nextHistoryRequestId()
+        activeHistoryDetailRequestId = requestId
+        updateContent()
+        if !sendAction(
+            "select_continue_history_output",
+            decisionId: decisionId,
+            historyRequestId: requestId
+        ) {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            historyDetailError = "Smalltalk could not retry this saved answer."
+            updateContent()
+        }
+    }
+
+    private func nextHistoryRequestId() -> UInt64 {
+        historyRequestId &+= 1
+        return historyRequestId
+    }
+
+    private func processHistoryResponses(from snapshot: IslandSnapshot) {
+        if let page = snapshot.continueHistoryPage,
+           page.requestId == activeHistoryPageRequestId {
+            activeHistoryPageRequestId = nil
+            let wasLoadingOlder = historyLoadingOlder
+            historyLoadingOlder = false
+
+            if let error = page.error?.nonEmpty {
+                historyError = error
+            } else {
+                historyError = nil
+                if wasLoadingOlder {
+                    var knownDecisionIds = Set(historyItems.map(\.decisionId))
+                    for item in page.items where knownDecisionIds.insert(item.decisionId).inserted {
+                        historyItems.append(item)
+                    }
+                } else {
+                    historyItems = page.items
+                }
+                historyNextCursor = page.nextCursor
+            }
+
+            if presentation == .historyLoading {
+                setPresentation(.historyList)
+            } else {
+                updateContent()
+            }
+        }
+
+        if let output = snapshot.continueHistoryOutput,
+           output.requestId == activeHistoryDetailRequestId {
+            activeHistoryDetailRequestId = nil
+            historyDetailLoading = false
+            if let error = output.error?.nonEmpty {
+                historySelectedOutput = nil
+                historyDetailError = error
+            } else if output.decisionId == historySelectedDecisionId {
+                historySelectedOutput = output
+                historyDetailError = nil
+            }
+            updateContent()
+        }
+    }
+
+    private func clearHistoryState() {
+        historyOriginPresentation = .ambientMemory
+        historyItems = []
+        historyNextCursor = nil
+        historyError = nil
+        historyLoadingOlder = false
+        historySelectedOutput = nil
+        historySelectedDecisionId = nil
+        historyDetailLoading = false
+        historyDetailError = nil
+        activeHistoryPageRequestId = nil
+        activeHistoryDetailRequestId = nil
+        historyAnchor = nil
+        historyLayout = WhisperFlowHistoryLayout()
+    }
+
+    private func dismissOnePresentationLevel() {
+        if presentation == .historyDetail {
+            showHistoryList()
+        } else if presentation == .historyList || presentation == .historyLoading {
+            closeHistory()
+        } else if presentation == .answerExpanded {
+            showAnswerSummary()
+        } else if presentation == .answerSummary {
+            returnToDefaultPresentation()
+        }
+    }
+
+    private func returnToDefaultPresentation() {
+        cancelMemoryTransitionCountdown()
+        setPresentation(.micro)
+    }
+
+    private func ambientBodyHoverChanged(_ hovering: Bool) {
+        let next = hovering && presentation == .ambientMemory && captureStatus == .active
+        guard ambientBodyHovered != next else { return }
+        ambientBodyHovered = next
+    }
+
+    private func ambientHoverChanged(_ hovering: Bool) {
+        ambientHovered = hovering
+        if hovering {
+            cancelAmbientHoverReturn()
+            return
+        }
+        guard presentation == .ambientMemory,
+              !memoryTransitionCountdownActive else { return }
+        scheduleAmbientHoverReturn()
+    }
+
+    private func scheduleAmbientHoverReturn() {
+        cancelAmbientHoverReturn()
+        let timer = Timer(
+            timeInterval: kWhisperFlowAmbientHoverReturnDelay,
+            repeats: false
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.presentation == .ambientMemory,
+                      !self.ambientHovered,
+                      !self.memoryTransitionCountdownActive else { return }
+                self.ambientHoverReturnTimer = nil
+                self.setPresentation(.micro)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
-        idleMicroTimer = timer
+        ambientHoverReturnTimer = timer
     }
 
-    private func cancelMicroReturn() {
-        idleMicroTimer?.invalidate()
-        idleMicroTimer = nil
+    private func cancelAmbientHoverReturn() {
+        ambientHoverReturnTimer?.invalidate()
+        ambientHoverReturnTimer = nil
     }
 
-    private func returnToMicroIfIdle() {
-        guard canUseMicro, presentation == .compact else { return }
-        setPresentation(.micro, resetIdleTimer: false)
+    private func observeMemoryLifecycleTransition() {
+        let current = memoryLifecyclePhase
+        guard let previous = previousMemoryLifecyclePhase else {
+            previousMemoryLifecyclePhase = current
+            return
+        }
+        previousMemoryLifecyclePhase = current
+
+        guard !continueRequestInFlight,
+              current != .unavailable,
+              captureStatus != .error,
+              captureStatus != .suppressed else { return }
+
+        let beganStarting = previous == .paused &&
+            (current == .starting || current == .active)
+        let beganStopping = (previous == .starting || previous == .active) &&
+            (current == .stopping || current == .paused)
+        guard beganStarting || beganStopping else { return }
+        beginMemoryTransitionCountdown(forMemoryStart: beganStarting)
+    }
+
+    private func beginMemoryTransitionCountdown(forMemoryStart: Bool) {
+        if presentation.isHistory {
+            closeHistory()
+        }
+        cancelAmbientHoverReturn()
+        cancelMemoryTransitionCountdown()
+        memoryTransitionCountdownActive = true
+        memoryTransitionCountdownNonce &+= 1
+        if forMemoryStart {
+            startingFeedbackNonceCounter &+= 1
+            activeStartingFeedbackNonce = startingFeedbackNonceCounter
+        }
+        let ambientWasAlreadyVisible = presentation == .ambientMemory
+        setPresentation(.ambientMemory)
+        updateContent()
+        if ambientWasAlreadyVisible {
+            positionPanel(preserveCurrentAnchor: true, animated: visible)
+        }
+
+        let nonce = memoryTransitionCountdownNonce
+        let timer = Timer(
+            timeInterval: kWhisperFlowMemoryTransitionDuration,
+            repeats: false
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.memoryTransitionCountdownActive,
+                      self.memoryTransitionCountdownNonce == nonce else { return }
+                self.memoryTransitionTimer = nil
+                self.memoryTransitionCountdownActive = false
+                self.activeStartingFeedbackNonce = nil
+                if self.ambientHovered {
+                    self.hoverRevealArmed = false
+                    self.blockedMicroHoverObserved = false
+                }
+                self.setPresentation(.micro)
+                self.updateContent()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        memoryTransitionTimer = timer
+    }
+
+    private func cancelMemoryTransitionCountdown() {
+        memoryTransitionTimer?.invalidate()
+        memoryTransitionTimer = nil
+        memoryTransitionCountdownActive = false
+        activeStartingFeedbackNonce = nil
+        if islandModel.memoryTransitionCountdownActive {
+            islandModel.memoryTransitionCountdownActive = false
+        }
+        if islandModel.startingFeedbackNonce != nil {
+            islandModel.startingFeedbackNonce = nil
+        }
+    }
+
+    private func markPanelDragBegan() {}
+
+    private func markPanelDragEnded() {
+        if presentation.isHistory, let panel {
+            historyAnchor = NSPoint(
+                x: panel.frame.midX
+                    + historyLayout.capsuleOffsetX * gOverlayScale,
+                y: panel.frame.maxY
+            )
+        }
+        positionPanel(preserveCurrentAnchor: true, animated: false)
+    }
+
+    private func shouldBeginWindowDrag(at point: NSPoint) -> Bool {
+        if historyControlRect.contains(point) {
+            return false
+        }
+        if presentation.isHistory {
+            let capsuleCenterX = targetPanelSize.width / 2
+                + historyLayout.capsuleOffsetX * gOverlayScale
+            let capsuleWidth = historyCapsuleWidth * gOverlayScale
+            let capsuleHeight = historyCapsuleHeight * gOverlayScale
+            let capsuleRect = NSRect(
+                x: capsuleCenterX - capsuleWidth / 2,
+                y: targetPanelSize.height - capsuleHeight,
+                width: capsuleWidth,
+                height: capsuleHeight
+            )
+            return capsuleRect.contains(point)
+        }
+        return true
+    }
+
+    private var historyControlRect: NSRect {
+        guard historyButtonShouldBeVisible else { return .zero }
+        let direction: CGFloat = historyLayout.controlOnLeft ? -1 : 1
+        let controlCenterX = targetPanelSize.width / 2
+            + historyLayout.capsuleOffsetX * gOverlayScale
+            + direction * (
+                historyCapsuleWidth / 2
+                    + kWhisperFlowHistoryButtonGap
+                    + kWhisperFlowHistoryButtonVisualSize / 2
+            ) * gOverlayScale
+        let controlTop = max(
+            0,
+            (historyCapsuleHeight - kWhisperFlowHistoryButtonHitSize) / 2
+        ) * gOverlayScale
+        let controlCenterY = targetPanelSize.height
+            - controlTop
+            - kWhisperFlowHistoryButtonHitSize * gOverlayScale / 2
+        let radius = kWhisperFlowHistoryButtonHitSize * gOverlayScale / 2
+        return NSRect(
+            x: controlCenterX - radius,
+            y: controlCenterY - radius,
+            width: radius * 2,
+            height: radius * 2
+        )
+    }
+
+    private var historyCapsuleHeight: CGFloat {
+        let target = presentation.isHistory ? historyOriginPresentation : presentation
+        switch target {
+        case .answerSummary:
+            return kWhisperFlowAnswerSummaryH
+        case .ambientMemory:
+            return memoryTransitionCountdownActive || continueRequestInFlight
+                ? kWhisperFlowNotificationH
+                : kWhisperFlowCaptureH
+        default:
+            return 0
+        }
+    }
+
+    private func cancelPresentationTimers() {
+        cancelAmbientHoverReturn()
+        cancelMemoryTransitionCountdown()
     }
 
     private var targetPanelSize: NSSize {
-        switch presentation {
+        let base = basePanelSize(
+            for: presentation.isHistory ? historyOriginPresentation : presentation
+        )
+        if presentation.isHistory {
+            return NSSize(
+                width: historyLayout.canvasWidth * gOverlayScale,
+                height: historyLayout.canvasHeight * gOverlayScale
+            )
+        }
+        if historyButtonShouldBeVisible {
+            return NSSize(
+                width: base.width
+                    + kWhisperFlowHistoryAccessoryAllowance * 2 * gOverlayScale,
+                height: base.height
+            )
+        }
+        return base
+    }
+
+    private func basePanelSize(for targetPresentation: WhisperFlowPresentation) -> NSSize {
+        switch targetPresentation {
         case .micro:
-            return NSSize(width: kBaseMicroHitW * gOverlayScale, height: kBaseMicroHitH * gOverlayScale)
-        case .compact:
-            return NSSize(width: kBaseCollapsedW * gOverlayScale, height: kBaseCollapsedH * gOverlayScale)
-        case .expanded:
-            return NSSize(width: kBaseExpandedW * gOverlayScale, height: kBaseExpandedH * gOverlayScale)
+            return NSSize(
+                width: kWhisperFlowCapturePanelW * gOverlayScale,
+                height: kWhisperFlowCapturePanelH * gOverlayScale
+            )
+        case .ambientMemory, .generating:
+            return NSSize(
+                width: (
+                    memoryTransitionCountdownActive || continueRequestInFlight
+                        ? kWhisperFlowNotificationPanelW
+                        : kWhisperFlowCapturePanelW
+                ) * gOverlayScale,
+                height: (
+                    memoryTransitionCountdownActive || continueRequestInFlight
+                        ? kWhisperFlowNotificationPanelH
+                        : kWhisperFlowCapturePanelH
+                ) * gOverlayScale
+            )
+        case .answerSummary:
+            return NSSize(
+                width: answerLayout.summaryPanelWidth * gOverlayScale,
+                height: kWhisperFlowAnswerSummaryPanelH * gOverlayScale
+            )
+        case .answerExpanded:
+            return NSSize(
+                width: answerLayout.expandedWidth * gOverlayScale,
+                height: answerLayout.expandedHeight * gOverlayScale
+            )
+        case .historyLoading, .historyList, .historyDetail:
+            return basePanelSize(for: historyOriginPresentation)
+        }
+    }
+
+    private var historyButtonShouldBeVisible: Bool {
+        if presentation.isHistory || presentation == .answerSummary {
+            return true
+        }
+        return presentation == .ambientMemory
+            && !continueRequestInFlight
+            && !memoryTransitionCountdownActive
+            && snapshot.state != "starting"
+            && snapshot.state != "processing"
+    }
+
+    private func refreshHistoryLayout() {
+        let screen = historyAnchor.flatMap(screenContaining)
+            ?? panel?.screen
+            ?? screenContaining(NSEvent.mouseLocation)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleSize = screen?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
+        let usableWidth = max(1, visibleSize.width / gOverlayScale)
+        let usableHeight = max(1, visibleSize.height / gOverlayScale)
+        let availableHeightBelowAnchor = historyAnchor.map { anchor in
+            max(1, (anchor.y - (screen?.visibleFrame.minY ?? 0)) / gOverlayScale)
+        } ?? usableHeight
+        let basePresentation = presentation.isHistory
+            ? historyOriginPresentation
+            : presentation
+        let base = basePanelSize(for: basePresentation)
+        let baseWidth = base.width / gOverlayScale
+        let baseHeight = base.height / gOverlayScale
+
+        if presentation.isHistory {
+            let cardWidth = min(
+                kWhisperFlowHistoryCardMaxW,
+                max(
+                    kWhisperFlowHistoryCardMinW,
+                    min(kWhisperFlowHistoryCardPreferredW, usableWidth - 24)
+                )
+            )
+            let cardHeight = max(
+                1,
+                min(
+                    kWhisperFlowHistoryCardPreferredH,
+                    usableHeight * 0.60,
+                    availableHeightBelowAnchor
+                        - historyCapsuleHeight
+                        - kWhisperFlowHistoryCardGap
+                        - 12
+                )
+            )
+            historyLayout.cardWidth = cardWidth
+            historyLayout.cardHeight = cardHeight
+            historyLayout.canvasWidth = min(
+                usableWidth,
+                max(
+                    cardWidth,
+                    baseWidth + kWhisperFlowHistoryAccessoryAllowance * 2
+                )
+            )
+            historyLayout.canvasHeight = historyCapsuleHeight
+                + kWhisperFlowHistoryCardGap
+                + cardHeight
+        } else {
+            historyLayout.cardWidth = kWhisperFlowHistoryCardPreferredW
+            historyLayout.cardHeight = kWhisperFlowHistoryCardPreferredH
+            historyLayout.canvasWidth = baseWidth
+                + (historyButtonShouldBeVisible
+                    ? kWhisperFlowHistoryAccessoryAllowance * 2
+                    : 0)
+            historyLayout.canvasHeight = baseHeight
+            historyLayout.capsuleOffsetX = 0
+        }
+    }
+
+    private func updateHistoryPlacement(for frame: NSRect) {
+        let anchor = historyAnchor
+            ?? NSPoint(x: frame.midX, y: frame.maxY)
+        historyLayout.capsuleOffsetX = presentation.isHistory
+            ? (anchor.x - frame.midX) / gOverlayScale
+            : 0
+
+        let screen = screenContaining(anchor)
+            ?? panel?.screen
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visibleFrame = screen?.visibleFrame ?? frame
+        let capsuleWidth = historyCapsuleWidth
+        let leftEdge = anchor.x
+            - (capsuleWidth / 2
+                + kWhisperFlowHistoryButtonGap
+                + kWhisperFlowHistoryButtonVisualSize / 2
+                + kWhisperFlowHistoryButtonHitSize / 2) * gOverlayScale
+        historyLayout.controlOnLeft = leftEdge >= visibleFrame.minX + 4
+    }
+
+    private var historyCapsuleWidth: CGFloat {
+        let target = presentation.isHistory ? historyOriginPresentation : presentation
+        switch target {
+        case .answerSummary:
+            return answerLayout.summaryWidth
+        case .ambientMemory:
+            return memoryTransitionCountdownActive || continueRequestInFlight
+                ? kWhisperFlowNotificationW
+                : kWhisperFlowCaptureW
+        default:
+            return 0
         }
     }
 
@@ -2170,18 +4261,24 @@ private final class SessionIslandController: NSObject {
 
     private func positionPanel(preserveCurrentAnchor: Bool, animated: Bool) {
         guard panel != nil else { return }
-        setPanelFrame(
-            resolvedPanelFrame(preserveCurrentAnchor: preserveCurrentAnchor),
-            animated: animated
-        )
+        refreshHistoryLayout()
+        let frame = resolvedPanelFrame(preserveCurrentAnchor: preserveCurrentAnchor)
+        updateHistoryPlacement(for: frame)
+        setPanelFrame(frame, animated: animated)
+        updateContent()
     }
 
     private func resolvedPanelFrame(preserveCurrentAnchor: Bool) -> NSRect {
         let size = targetPanelSize
         let currentFrame = panel?.frame ?? .zero
-        let anchor = preserveCurrentAnchor && currentFrame.width > 0 && currentFrame.height > 0
-            ? NSPoint(x: currentFrame.midX, y: currentFrame.maxY)
-            : initialTopCenterAnchor(for: size)
+        let anchor: NSPoint
+        if let historyAnchor {
+            anchor = historyAnchor
+        } else if preserveCurrentAnchor && currentFrame.width > 0 && currentFrame.height > 0 {
+            anchor = NSPoint(x: currentFrame.midX, y: currentFrame.maxY)
+        } else {
+            anchor = initialTopCenterAnchor(for: size)
+        }
         let screen = screenContaining(anchor)
             ?? screenContaining(NSEvent.mouseLocation)
             ?? NSScreen.main
@@ -2237,7 +4334,7 @@ private final class SessionIslandController: NSObject {
         guard let panel else { return }
         if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = kPanelFrameAnimDur
+                context.duration = kWhisperFlowMorphDuration
                 context.timingFunction = IslandMotion.panelTimingFunction()
                 panel.animator().setFrame(frame, display: visible)
             }
@@ -2248,36 +4345,169 @@ private final class SessionIslandController: NSObject {
 
     private func updateContent() {
         guard let panel, let contentView = panel.contentView else { return }
-        let controller = self
-        let view = SessionIslandView(
-            snapshot: snapshot,
-            metrics: metrics,
+        panel.isMovableByWindowBackground = !presentation.isHistory
+        if islandModel.presentation != presentation {
+            islandModel.presentation = presentation
+        }
+        if islandModel.memoryActive != memoryActive {
+            islandModel.memoryActive = memoryActive
+        }
+        if islandModel.memoryHasStarted != memoryHasStarted {
+            islandModel.memoryHasStarted = memoryHasStarted
+        }
+        if islandModel.microPulseActive != microPulseActive {
+            islandModel.microPulseActive = microPulseActive
+        }
+        let resolvedCaptureStatus = captureStatus
+        if resolvedCaptureStatus != .active {
+            ambientBodyHovered = false
+        }
+        if islandModel.captureStatus != resolvedCaptureStatus {
+            islandModel.captureStatus = resolvedCaptureStatus
+        }
+        if islandModel.startingFeedbackNonce != activeStartingFeedbackNonce {
+            islandModel.startingFeedbackNonce = activeStartingFeedbackNonce
+        }
+        if islandModel.capturePulseNonce != snapshot.capturePulseNonce {
+            islandModel.capturePulseNonce = snapshot.capturePulseNonce
+        }
+        if islandModel.memoryTransitionCountdownActive != memoryTransitionCountdownActive {
+            islandModel.memoryTransitionCountdownActive = memoryTransitionCountdownActive
+        }
+        if islandModel.memoryTransitionCountdownNonce != memoryTransitionCountdownNonce {
+            islandModel.memoryTransitionCountdownNonce = memoryTransitionCountdownNonce
+        }
+        if islandModel.continueGenerating != continueRequestInFlight {
+            islandModel.continueGenerating = continueRequestInFlight
+        }
+        if islandModel.blockedContinueShakeNonce != blockedContinueShakeNonce {
+            islandModel.blockedContinueShakeNonce = blockedContinueShakeNonce
+        }
+        if islandModel.answer != latchedAnswer {
+            islandModel.answer = latchedAnswer
+        }
+        if islandModel.answerLayout != answerLayout {
+            islandModel.answerLayout = answerLayout
+        }
+        if islandModel.visualCueImage !== visualCueImage {
+            islandModel.visualCueImage = visualCueImage
+        }
+        if islandModel.visualCuePresented != visualCuePresented {
+            islandModel.visualCuePresented = visualCuePresented
+        }
+        if islandModel.historyOriginPresentation != historyOriginPresentation {
+            islandModel.historyOriginPresentation = historyOriginPresentation
+        }
+        if islandModel.historyButtonVisible != historyButtonShouldBeVisible {
+            islandModel.historyButtonVisible = historyButtonShouldBeVisible
+        }
+        if islandModel.historyItems != historyItems {
+            islandModel.historyItems = historyItems
+        }
+        if islandModel.historyNextCursor != historyNextCursor {
+            islandModel.historyNextCursor = historyNextCursor
+        }
+        if islandModel.historyError != historyError {
+            islandModel.historyError = historyError
+        }
+        if islandModel.historyLoadingOlder != historyLoadingOlder {
+            islandModel.historyLoadingOlder = historyLoadingOlder
+        }
+        if islandModel.historySelectedOutput != historySelectedOutput {
+            islandModel.historySelectedOutput = historySelectedOutput
+        }
+        if islandModel.historySelectedDecisionId != historySelectedDecisionId {
+            islandModel.historySelectedDecisionId = historySelectedDecisionId
+        }
+        if islandModel.historyDetailLoading != historyDetailLoading {
+            islandModel.historyDetailLoading = historyDetailLoading
+        }
+        if islandModel.historyDetailError != historyDetailError {
+            islandModel.historyDetailError = historyDetailError
+        }
+        let currentDecisionId = latchedDecisionId
+            ?? snapshot.islandContinueState?.decisionId
+            ?? snapshot.continueDecisionId
+        if islandModel.currentDecisionId != currentDecisionId {
+            islandModel.currentDecisionId = currentDecisionId
+        }
+        if islandModel.historyLayout != historyLayout {
+            islandModel.historyLayout = historyLayout
+        }
+
+        guard hostingView == nil else { return }
+
+        let view = WhisperFlowIslandView(
             scale: gOverlayScale,
-            onAction: { [weak self] action in
-                self?.handle(action: action)
+            model: islandModel,
+            onRevealAmbientMemory: { [weak self] in
+                self?.revealAmbientMemory()
             },
-            onContinueAction: { [weak self] action in
-                self?.handle(continueAction: action)
+            onMicroHover: { [weak self] hovering in
+                self?.microHoverChanged(hovering)
             },
-            presentation: Binding(
-                get: { controller.presentation },
-                set: { controller.setPresentation($0) }
-            )
+            onReadyAction: { [weak self] in
+                self?.requestContinue()
+            },
+            onStartMemory: { [weak self] in
+                self?.handle(action: "start_memory")
+            },
+            onAmbientHover: { [weak self] hovering in
+                self?.ambientHoverChanged(hovering)
+            },
+            onAmbientBodyHover: { [weak self] hovering in
+                self?.ambientBodyHoverChanged(hovering)
+            },
+            onExpandAnswer: { [weak self] in
+                self?.expandAnswer()
+            },
+            onCollapseAnswer: { [weak self] in
+                self?.showAnswerSummary()
+            },
+            onToggleVisualCue: { [weak self] in
+                self?.toggleVisualCue()
+            },
+            onToggleHistory: { [weak self] in
+                self?.toggleHistory()
+            },
+            onHistoryButtonHover: { [weak self] hovering in
+                self?.ambientHoverChanged(hovering)
+            },
+            onLoadOlderHistory: { [weak self] in
+                self?.loadOlderHistory()
+            },
+            onRetryHistory: { [weak self] in
+                self?.retryHistory()
+            },
+            onRetryHistoryDetail: { [weak self] in
+                self?.retryHistoryDetail()
+            },
+            onSelectHistoryOutput: { [weak self] decisionId in
+                self?.selectHistoryOutput(decisionId)
+            },
+            onBackFromHistoryDetail: { [weak self] in
+                self?.showHistoryList()
+            },
+            onDismissOneLevel: { [weak self] in
+                self?.dismissOnePresentationLevel()
+            }
         )
 
-        if let hostingView {
-            hostingView.rootView = AnyView(view)
-        } else {
-            let hosting = DraggableHostingView(rootView: AnyView(view))
-            hosting.onDragBegan = { [weak self] in
-                self?.markPanelDragBegan()
-            }
-            hosting.configureTransparentLayer()
-            hosting.frame = contentView.bounds
-            hosting.autoresizingMask = [.width, .height]
-            contentView.addSubview(hosting)
-            hostingView = hosting
+        let hosting = DraggableHostingView(rootView: AnyView(view))
+        hosting.onDragBegan = { [weak self] in
+            self?.markPanelDragBegan()
         }
+        hosting.onDragEnded = { [weak self] in
+            self?.markPanelDragEnded()
+        }
+        hosting.shouldBeginWindowDrag = { [weak self] point in
+            self?.shouldBeginWindowDrag(at: point) ?? false
+        }
+        hosting.configureTransparentLayer()
+        hosting.frame = contentView.bounds
+        hosting.autoresizingMask = [.width, .height]
+        contentView.addSubview(hosting)
+        hostingView = hosting
     }
 
     private func handle(action: String) {
@@ -2289,17 +4519,15 @@ private final class SessionIslandController: NSObject {
         case "open_search":
             sendAction("open_main_window")
         case "continue":
-            setPresentation(.expanded, resetIdleTimer: false)
-            sendAction("continue")
+            requestContinue()
         case "start_memory":
-            revealCompact()
+            setPresentation(.ambientMemory)
             sendAction("start_capture")
         case "pause_memory":
-            revealCompact()
+            setPresentation(.ambientMemory)
             sendAction("stop_capture")
         case "reconstruct_trail":
-            setPresentation(.expanded, resetIdleTimer: false)
-            sendAction("continue")
+            requestContinue()
         case "show_trail":
             sendAction("show_trail")
         case "open_resume_point":
@@ -2307,15 +4535,15 @@ private final class SessionIslandController: NSObject {
         case "open_main_window":
             sendAction("open_main_window")
         case "open_expanded":
-            openExpandedFromCompact()
+            setPresentation(.answerExpanded)
         case "toggle_meeting":
-            revealCompact()
+            setPresentation(.ambientMemory)
             sendAction(metrics.meetingActive ? "stop_capture" : "start_capture")
         case "capture_once":
-            revealCompact()
+            setPresentation(.ambientMemory)
             sendAction("capture_once")
         case "reveal_compact", "keep_compact":
-            revealCompact()
+            revealAmbientMemory()
         case "close":
             setExpanded(false)
             sendAction("collapse")
@@ -2327,9 +4555,9 @@ private final class SessionIslandController: NSObject {
     private func handle(continueAction action: IslandAvailableAction) {
         switch action.kind {
         case .openContinueTarget:
-            setPresentation(.expanded, resetIdleTimer: false)
+            setPresentation(.answerExpanded)
         case .refreshContinue, .markWrongTarget, .markNotUseful, .startLocalMemory, .captureEvidenceNow:
-            revealCompact()
+            setPresentation(.answerSummary)
         case .chooseTaskAlternative,
              .rejectSelectedTask,
              .rejectTaskAlternative,
@@ -2337,7 +4565,7 @@ private final class SessionIslandController: NSObject {
              .markUnrelatedActivity,
              .markTaskCompleted,
              .reactivateTask:
-            revealCompact()
+            setPresentation(.answerSummary)
         case .inspectEvidence, .openSmalltalk:
             break
         case .unknown:
@@ -2356,7 +4584,11 @@ private final class SessionIslandController: NSObject {
     }
 
     private func updateOutsideClickMonitors() {
-        if visible && presentation == .expanded {
+        if visible && (
+            presentation == .answerSummary
+                || presentation == .answerExpanded
+                || presentation.isHistory
+        ) {
             installOutsideClickMonitors()
         } else {
             removeOutsideClickMonitors()
@@ -2392,7 +4624,10 @@ private final class SessionIslandController: NSObject {
     }
 
     private func collapseIfOutside(_ event: NSEvent) {
-        guard presentation == .expanded, let panel else { return }
+        guard presentation == .answerSummary
+                || presentation == .answerExpanded
+                || presentation.isHistory,
+              let panel else { return }
         if event.window === panel {
             return
         }
@@ -2401,11 +4636,11 @@ private final class SessionIslandController: NSObject {
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.setExpanded(false)
-            self?.sendAction("collapse")
+            self?.dismissOnePresentationLevel()
         }
     }
 
+    @discardableResult
     private func sendAction(
         _ action: String,
         decisionId: String? = nil,
@@ -2413,9 +4648,11 @@ private final class SessionIslandController: NSObject {
         taskSnapshotId: String? = nil,
         taskSnapshotRevision: Int64? = nil,
         affectedTaskField: String? = nil,
-        taskHypothesisId: String? = nil
-    ) {
-        guard let callback = gActionCallback else { return }
+        taskHypothesisId: String? = nil,
+        historyRequestId: UInt64? = nil,
+        historyCursor: ContinueHistoryCursorV1? = nil
+    ) -> Bool {
+        guard let callback = gActionCallback else { return false }
         var fields = ["\"action\":\"\(jsonEscaped(action))\""]
         if let decisionId, !decisionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             fields.append("\"decision_id\":\"\(jsonEscaped(decisionId))\"")
@@ -2435,11 +4672,21 @@ private final class SessionIslandController: NSObject {
         if let taskHypothesisId, !taskHypothesisId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             fields.append("\"task_hypothesis_id\":\"\(jsonEscaped(taskHypothesisId))\"")
         }
+        if let historyRequestId {
+            fields.append("\"history_request_id\":\(historyRequestId)")
+        }
+        if let historyCursor {
+            fields.append(
+                "\"history_cursor\":{\"created_at_ms\":\(historyCursor.createdAtMs),"
+                    + "\"decision_id\":\"\(jsonEscaped(historyCursor.decisionId))\"}"
+            )
+        }
         fields.append("\"source\":\"native_island\"")
         let json = "{\(fields.joined(separator: ","))}"
         json.withCString { pointer in
             callback(pointer)
         }
+        return true
     }
 
     private func jsonEscaped(_ value: String) -> String {
@@ -2482,38 +4729,13 @@ private final class IslandTrackingView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        for trackingArea in trackingAreas {
-            removeTrackingArea(trackingArea)
-        }
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        ))
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        window?.disableCursorRects()
-        NSCursor.pointingHand.set()
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        NSCursor.pointingHand.set()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        window?.enableCursorRects()
-        NSCursor.arrow.set()
-    }
 }
 
 @available(macOS 13.0, *)
 private final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     var onDragBegan: (() -> Void)?
+    var onDragEnded: (() -> Void)?
+    var shouldBeginWindowDrag: ((NSPoint) -> Bool)?
     private var dragMonitor: Any?
     private var dragStartLocation = NSPoint.zero
 
@@ -2539,6 +4761,7 @@ private final class DraggableHostingView<Content: View>: NSHostingView<Content> 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         guard let window else { return }
+        guard shouldBeginWindowDrag?(event.locationInWindow) ?? true else { return }
 
         if let dragMonitor {
             NSEvent.removeMonitor(dragMonitor)
@@ -2566,6 +4789,7 @@ private final class DraggableHostingView<Content: View>: NSHostingView<Content> 
                     }
                     self.onDragBegan?()
                     window.performDrag(with: event)
+                    self.onDragEnded?()
                     return nil
                 }
                 return event

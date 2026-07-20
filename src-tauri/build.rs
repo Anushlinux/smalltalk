@@ -49,10 +49,21 @@ fn build_capture_helpers() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is required"));
     let helper_dir = out_dir.join("swift-helpers");
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("OUT_DIR must be inside target/<profile>/build/<crate>/out");
+    let stable_dev_helper_dir = profile_dir.join("smalltalk-capture-sidecars");
     let module_cache_path = out_dir.join("swift-helper-module-cache");
     std::fs::create_dir_all(&helper_dir).expect("failed to create Swift helper output directory");
+    std::fs::create_dir_all(&stable_dev_helper_dir)
+        .expect("failed to create stable development helper directory");
     std::fs::create_dir_all(&module_cache_path)
         .expect("failed to create Swift helper module cache directory");
+    println!(
+        "cargo:rustc-env=SMALLTALK_DEV_HELPER_DIR={}",
+        stable_dev_helper_dir.display()
+    );
 
     let sdk_path = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
@@ -82,7 +93,23 @@ fn build_capture_helpers() {
             swift_target,
             &module_cache_path,
         );
+        install_stable_dev_helper(&out_helper, &stable_dev_helper_dir.join(name));
     }
+}
+
+#[cfg(target_os = "macos")]
+fn install_stable_dev_helper(source: &std::path::Path, destination: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // OUT_DIR changes whenever Cargo creates a new build-script hash. Copying
+    // to target/<profile>/smalltalk-capture-sidecars keeps the executable path
+    // stable across ordinary `tauri dev` rebuilds, which gives macOS Screen
+    // Recording permission one predictable development identity.
+    let temporary = destination.with_extension(format!("installing-{}", std::process::id()));
+    std::fs::copy(source, &temporary).expect("failed to stage stable development helper");
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make stable development helper executable");
+    std::fs::rename(&temporary, destination).expect("failed to install stable development helper");
 }
 
 #[cfg(target_os = "macos")]

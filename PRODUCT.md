@@ -1891,7 +1891,7 @@ If the API fails, the key is missing, parsing fails, or validation fails, the de
 
 Fallback decisions are still cached when their evidence watermark and inference policy match the next normal request. This matters because default micro-inference should not repeatedly attempt network/model work when the same local evidence already produced a validated local fallback.
 
-The decision layer also refuses to present a selected candidate as a clear continuation when there is no human-readable return target. In that case it adds `thin_evidence:no_human_return_target`, lowers confidence, suppresses model handoff output, and returns no-clear-continuation copy rather than exposing internal target metadata.
+The decision layer keeps semantic task understanding separate from target safety. When a model answer exists but there is no human-readable, strictly supported return target, Smalltalk shows the model answer and changes the action to evidence inspection. It does not suppress the paid model response merely because direct opening is unavailable. Internal target metadata remains hidden, and no unsupported app, page, URL, or file is opened.
 
 Micro-inference cannot override the local safety gates. A model choice does not create promotion evidence, restore a feedback-suppressed candidate, make a thin snapshot openable, or turn diagnostic/support evidence into a public target.
 
@@ -2545,3 +2545,15 @@ A provider failure must never fall back to a title-derived label such as "Browsi
 Every public model-first answer is one atomic revision. The session, observation packet, task thread and revision, selected hypothesis, model request and response, evidence watermark, and correction state travel together. React and the native island consume that same answer. A direct `Continue here` action is attached only after local validation proves that the return anchor belongs to the same task-thread revision. Understanding the task does not imply that a safe target exists.
 
 Production authority is fail-closed behind the model-first release report. Deterministic tests and a successful provider transport call are necessary but not sufficient. The gate also requires independently reviewed live decision boundaries, the locked application-level holdout, non-zero denominators for every required slice and surface family, provider-failure honesty, latency/cost/privacy measurements, and the manual macOS scenarios. Missing human review or a zero denominator keeps `passed = false`; it never re-enables legacy local semantic authority.
+
+## Always-On Runtime Boundary
+
+Smalltalk's runtime now treats pressure as a finite resource. Native event metadata crosses three bounded queues with capacity reserved for app, window, error, permission, and commit boundaries. Scroll, Accessibility changes, repeated keys, ordinary character-category keys, and repeated clicks can coalesce only within documented surface and time windows. Coalescing preserves timestamps, counts, surface identity, and privacy-safe aggregate diagnostics. A capture-loop turn persists at most 32 events and then returns to Stop, pending capture, and idle-capture checks.
+
+Database creation and migration run at an explicit database-generation boundary. Startup initializes the selected database once. Reset or file replacement invalidates that generation and initializes the replacement. Ordinary event, frame, status, counter, and Continue operations open configured connections without running schema discovery or Data Definition Language (DDL) statements. The capture worker owns its event-ingest connection and uses short atomic batches with bounded busy retry.
+
+Continue, capture, audit, and maintenance use one finite workload policy. Manual Continue supersedes queued background work. A cancelled background result cannot replace the later manual result on the product surface. Full audits are manual-only and use one worker with one pending request. Maintenance is single-flight and chunked. Neither system may create a thread per request.
+
+Status is a lightweight product snapshot. It reads maintained session counters and a latest-frame projection that omits OCR text, Accessibility text, Accessibility trees, URLs, document paths, and image paths. Heavy evidence is loaded only through explicit evidence commands. Event-driven updates are primary; the slow heartbeat is recovery insurance.
+
+The runtime policy and developer harness are documented in `docs/runtime-stability-harness.md` and versioned in `docs/runtime-stability-policy-v1.json`. Automated pressure tests are not a substitute for the required live soak matrix. Until every live scenario passes, the truthful release state remains **automated and synthetic proof complete; live always-on proof pending**.

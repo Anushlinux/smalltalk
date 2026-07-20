@@ -22,6 +22,7 @@ pub(crate) mod observation_packet;
 pub(crate) mod production;
 pub(crate) mod review;
 pub(crate) mod selection;
+pub(crate) mod semantic_probe;
 pub(crate) mod task_snapshot;
 pub(crate) mod task_thread;
 pub(crate) mod verifier;
@@ -55,6 +56,7 @@ pub(crate) struct MultimodalShadowAuditV1 {
     pub(crate) production_authority_changed: bool,
 }
 
+#[allow(dead_code)]
 fn multimodal_provider_enabled() -> bool {
     let configured = std::env::var("SMALLTALK_TASK_TRUTH_PROVIDER_MODE")
         .ok()
@@ -72,6 +74,7 @@ fn multimodal_provider_enabled() -> bool {
     })
 }
 
+#[allow(dead_code)]
 fn run_multimodal_shadow(
     packet: &observation_packet::ObservationPacketV2,
     prior: Option<&task_snapshot::TaskSnapshotV2>,
@@ -83,17 +86,8 @@ fn run_multimodal_shadow(
     use self::model::{TaskTruthModelClient, TaskTruthResolver};
     let enabled = multimodal_provider_enabled();
     let mut config = super::continue_openai_config(None).ok();
-    let task_truth_model = std::env::var("SMALLTALK_TASK_TRUTH_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            super::project_dotenv_values()
-                .ok()
-                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_MODEL").cloned())
-                .filter(|value| !value.trim().is_empty())
-        });
-    if let (Some(config), Some(task_truth_model)) = (config.as_mut(), task_truth_model) {
-        config.model = task_truth_model;
+    if let Some(config) = config.as_mut() {
+        config.model = semantic_probe::configured_model_name();
     }
     let model_name = config
         .as_ref()
@@ -403,8 +397,31 @@ fn record_manual_continue_shadow_with_lookback(
                 .last()
                 .and_then(|frame| frame.session_id.as_deref())
                 .filter(|value| !value.trim().is_empty())
+        })
+        .map(str::to_string);
+    if let (Some(resolved_session_id), Some(cutoff_ms)) = (
+        resolved_session_id.as_deref(),
+        frames.last().map(|frame| frame.captured_at),
+    ) {
+        let context_frames =
+            super::load_session_surface_context_frames(conn, resolved_session_id, cutoff_ms)?;
+        let detailed_frame_ids = frames
+            .iter()
+            .map(|frame| frame.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        frames.extend(
+            context_frames
+                .into_iter()
+                .filter(|frame| !detailed_frame_ids.contains(&frame.id)),
+        );
+        frames.sort_by_key(|frame| {
+            (
+                frame.captured_at,
+                frame.id.parse::<i64>().unwrap_or(i64::MAX),
+            )
         });
-    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id)?;
+    }
+    let prior = checkpoint::load_latest_snapshot(conn, resolved_session_id.as_deref())?;
     let bounded_watermark = super::stable_hash(
         serde_json::json!({
             "schema": "smalltalk.task_truth_bounded_watermark.v1",
@@ -428,24 +445,42 @@ fn record_manual_continue_shadow_with_lookback(
         &bounded_watermark,
         prior.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
     )?;
+    let semantic_probe_error = if let Err(error) = semantic_probe::run_manual_probe(
+        conn,
+        decision_id,
+        resolved_session_id.as_deref(),
+        &packet,
+        preflight_failure.as_deref(),
+    ) {
+        // Compact inference failures must not crash Continue. The public
+        // projection below will return a typed unresolved answer instead.
+        eprintln!("[compact_semantic_continue] {error}");
+        Some(error)
+    } else {
+        None
+    };
     let capture_to_packet_ms = manual_continue_started_at_ms
         .map(|started_at_ms| super::current_time_millis().saturating_sub(started_at_ms))
         .unwrap_or_else(|| capture_to_packet_started.elapsed().as_millis() as i64);
     let legacy_turn = super::task_turn::selected_current_task_turn(conn)?;
-    let prior_threads = task_thread::load_prior_thread_contexts(conn, resolved_session_id, 6)?;
-    let (verified_snapshot, multimodal_audit) = if let Some(reason) = preflight_failure.as_deref() {
-        (None, unresolved_manual_preflight_audit(reason))
-    } else {
-        run_multimodal_shadow(&packet, prior.as_ref(), &prior_threads)
-    };
+    // Every explicit Continue has exactly one semantic authority: the compact
+    // Luna request persisted above. The legacy full-packet resolver remains
+    // available to offline evaluation code, but it is never called here.
+    let compact_attempt_reason = manual_boundary_snapshot_reason(
+        preflight_failure.as_deref(),
+        semantic_probe_error.as_deref(),
+    );
+    let (verified_snapshot, multimodal_audit) = (
+        None,
+        unresolved_manual_preflight_audit(&compact_attempt_reason),
+    );
     let snapshot = verified_snapshot.unwrap_or_else(|| {
-        let reason = preflight_failure.clone().unwrap_or_else(|| {
-            format!(
-                "cloud_inference_unresolved:{:?}:{:?}",
-                multimodal_audit.resolver.status, multimodal_audit.resolver.diagnostic_status
-            )
-            .to_ascii_lowercase()
-        });
+        // The legacy multimodal resolver is intentionally not called for a
+        // manual Continue. Its synthetic audit uses `request_invalid` to mark
+        // that non-attempt, but that is not the outcome of the compact probe.
+        // Persist the real compact/preflight reason so later read-only
+        // projections cannot mistake the placeholder for a capture failure.
+        let reason = compact_attempt_reason.clone();
         let mut unresolved = unresolved_snapshot(&packet, prior.as_ref(), &reason);
         unresolved.provider_name = Some(multimodal_audit.resolver.provider.clone());
         unresolved.provider_model = Some(multimodal_audit.resolver.model.clone());
@@ -456,7 +491,7 @@ fn record_manual_continue_shadow_with_lookback(
     });
     let persistence_started = std::time::Instant::now();
     let boundary = task_thread::persist_boundary_atomic(conn, &packet, snapshot)?;
-    let snapshots = checkpoint::load_recent_snapshots(conn, resolved_session_id, 24)?;
+    let snapshots = checkpoint::load_recent_snapshots(conn, resolved_session_id.as_deref(), 24)?;
     // The manual Continue attempt is one atomic boundary. Its audit selection
     // must describe that boundary, not re-run selection over unrelated recent
     // snapshots from the same session.
@@ -492,17 +527,18 @@ fn record_manual_continue_shadow_with_lookback(
     Ok(summary)
 }
 
+fn manual_boundary_snapshot_reason(
+    preflight_failure: Option<&str>,
+    semantic_probe_error: Option<&str>,
+) -> String {
+    semantic_probe_error
+        .or(preflight_failure)
+        .unwrap_or("compact_semantic_continue_owns_manual_attempt")
+        .to_string()
+}
+
 fn unresolved_manual_preflight_audit(reason: &str) -> MultimodalShadowAuditV1 {
-    let model_name = std::env::var("SMALLTALK_TASK_TRUTH_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            super::project_dotenv_values()
-                .ok()
-                .and_then(|values| values.get("SMALLTALK_TASK_TRUTH_MODEL").cloned())
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "unconfigured".to_string());
+    let model_name = semantic_probe::configured_model_name();
     let resolver = model::ResolverAttemptV1 {
         status: model::ResolutionStatusV1::InsufficientEvidence,
         diagnostic_status: model::ProviderDiagnosticStatusV1::RequestInvalid,
@@ -4113,5 +4149,21 @@ mod tests {
         assert!(!metrics.contains_key("model_on_off_unexplained_task_disagreement"));
         assert!(metrics["provider_failure_honest_unresolved"].passed);
         assert!(metrics["provider_failure_local_semantic_fallback"].passed);
+    }
+
+    #[test]
+    fn successful_compact_probe_does_not_persist_legacy_request_invalid_as_its_outcome() {
+        assert_eq!(
+            manual_boundary_snapshot_reason(None, None),
+            "compact_semantic_continue_owns_manual_attempt"
+        );
+        assert_eq!(
+            manual_boundary_snapshot_reason(Some("current_frame_missing"), None),
+            "current_frame_missing"
+        );
+        assert_eq!(
+            manual_boundary_snapshot_reason(None, Some("compact_probe_failed")),
+            "compact_probe_failed"
+        );
     }
 }

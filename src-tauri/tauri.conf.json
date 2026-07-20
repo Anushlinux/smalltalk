@@ -15,7 +15,9 @@
       {
         "title": "smalltalk",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "titleBarStyle": "Transparent",
+        "theme": "Light"
       }
     ],
     "security": {
@@ -25,6 +27,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "resources/fonts/InstrumentSerif-Regular.ttf",
+      "resources/fonts/InstrumentSerif-OFL.txt"
+    ],
     "externalBin": [
       "binaries/capture_events",
       "binaries/window_snapshot",

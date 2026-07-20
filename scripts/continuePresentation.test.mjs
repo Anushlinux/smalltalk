@@ -5,10 +5,19 @@ import {
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
+  buildContinueContinuationFieldProjection,
+  buildContinuePublicProjection,
   compareContinueDecisionAdoption,
+  continuationSurfacesForPresentation,
   getContinuePresentationActionState,
+  hasVisibleTaskTruthContinuationDetails,
+  hasVisibleTaskTruthSemantics,
   inspectTargetCopy,
   isTaskInferenceUnavailable,
+  recentContextForPresentation,
+  recentContextRoleLabel,
+  recentContextSurfaceLabel,
+  recentContextSurfaceKind,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
@@ -250,18 +259,410 @@ test("provider-failure unresolved answer remains usable without task identity", 
   });
 });
 
-test("typed provider failures share one unavailable-state policy", () => {
-  for (const status of [
-    "disabled",
-    "credentials_missing",
-    "model_unavailable",
-    "timeout",
-    "provider_error",
-    "provider_failure",
-    "request_invalid",
-    "invalid_response",
-  ]) {
+test("recent context keeps the latest four meaningful visits for every answer state", () => {
+  const visits = Array.from({ length: 10 }, (_, index) => ({
+    sequence_index: index + 1,
+    app_label: index === 1 ? "Private activity" : "Helium",
+    site_hostname: index === 1 ? null : `site-${index}.example`,
+    first_observed_at_ms: index * 100,
+    last_observed_at_ms: index * 100 + 50,
+    is_current: index === 9,
+    revisited: index > 4,
+    semantic_role: index === 2
+      ? "detour_or_unrelated"
+      : index === 5
+        ? "unclear"
+        : index % 2 === 0 ? "primary_work" : "supporting_work",
+    relationship_to_primary_task: index === 2 || index === 5
+      ? "Unrelated visit"
+      : index % 2 === 0 ? "Worked on the task" : "Checked supporting context",
+    evidence_refs: [`frame-${index}`],
+  }));
+
+  for (const status of ["resolved", "partial", "unresolved"]) {
+    const decision = authoritativeDecision({ status });
+    decision.task_truth_v2.answer.recent_context = visits;
+    const answer = authoritativeTaskTruthAnswer(decision);
+    const visible = recentContextForPresentation(answer);
+    assert.equal(visible.length, 4);
+    assert.equal(visible[0].sequence_index, 7);
+    assert.equal(visible.at(-1).sequence_index, 10);
+    assert.equal(visible.some((visit) => visit.semantic_role === "unclear"), false);
+    assert.equal(visible.some((visit) => visit.semantic_role === "detour_or_unrelated"), false);
+  }
+});
+
+test("recent context compresses repeated shell visits without losing the latest state", () => {
+  const decision = authoritativeDecision();
+  decision.task_truth_v2.answer.recent_context = [
+    {
+      sequence_index: 1,
+      app_label: "Helium",
+      site_hostname: "thinkingmachines.ai",
+      first_observed_at_ms: 100,
+      last_observed_at_ms: 120,
+      is_current: false,
+      revisited: false,
+      semantic_role: "primary_work",
+      relationship_to_primary_task: "Worked on the task",
+      evidence_refs: ["frame-1"],
+    },
+    {
+      sequence_index: 2,
+      app_label: "Helium",
+      site_hostname: "thinkingmachines.ai",
+      first_observed_at_ms: 130,
+      last_observed_at_ms: 180,
+      is_current: false,
+      revisited: true,
+      semantic_role: "primary_work",
+      relationship_to_primary_task: "Worked on the task",
+      evidence_refs: ["frame-2"],
+    },
+  ];
+
+  const visible = recentContextForPresentation(authoritativeTaskTruthAnswer(decision));
+  assert.equal(visible.length, 1);
+  assert.equal(visible[0].sequence_index, 2);
+  assert.equal(visible[0].first_observed_at_ms, 100);
+  assert.deepEqual(visible[0].evidence_refs, ["frame-1", "frame-2"]);
+  assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
+  assert.equal(recentContextSurfaceKind(visible[0]), "Page");
+});
+
+test("public projection uses the human current-step sentence while preserving the compact task title", () => {
+  const decision = authoritativeDecision();
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: "Fix Continue output status",
+    current_subtask: "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer.",
+    where_summary: "Codex",
+    next_action: "Finish the two manual checks",
+    last_meaningful_progress: "The build and automated tests had already passed",
+    unfinished_state: "A fresh result still needs visual confirmation",
+    evidence_preview: { frame_id: "frame-1" },
+  });
+
+  assert.deepEqual(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false),
+    {
+      headline: "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer",
+      memoryLine: null,
+      resumeSurface: "Codex",
+      openActionLabel: null,
+      exactTargetNote: "Exact place not captured",
+    },
+  );
+  assert.equal(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), false)
+      .headline.includes("Continue in"),
+    false,
+  );
+  assert.equal(
+    buildContinuePublicProjection(authoritativeTaskTruthAnswer(decision), true).openActionLabel,
+    "Open Codex",
+  );
+  assert.equal(
+    authoritativeTaskTruthAnswer(decision).task_summary,
+    "Fix Continue output status",
+  );
+  assert.deepEqual(
+    buildContinueContinuationFieldProjection(
+      authoritativeTaskTruthAnswer(decision),
+      false,
+    ),
+    {
+      checkpoint: "The build and automated tests had already passed",
+      continuation: "A fresh result still needs visual confirmation",
+      checkpointSurface: {
+        label: "Codex",
+        kind: "App",
+        appLabel: "Codex",
+        siteHostname: null,
+      },
+      continuationSurface: {
+        label: "Codex",
+        kind: "App",
+        appLabel: "Codex",
+        siteHostname: null,
+      },
+      locationLabel: "Codex",
+      targetStatus: "Exact place not captured",
+      openActionLabel: null,
+      recentContext: [],
+    },
+  );
+  assert.equal(
+    buildContinuePublicProjection({
+      ...authoritativeTaskTruthAnswer(decision),
+      current_subtask: null,
+    }, false).headline,
+    "Fix Continue output status",
+  );
+});
+
+test("continuation field prefers unfinished state and falls back without inventing completion", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  assert.deepEqual(continuationSurfacesForPresentation(answer, answer.where_summary), {
+    checkpointSurface: null,
+    continuationSurface: null,
+  });
+  Object.assign(answer, {
+    unfinished_state: null,
+    next_action: "Run the final presentation checks.",
+    execution_state: "paused_after_progress",
+  });
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "Run the final presentation checks.",
+  );
+
+  answer.next_action = null;
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "No unfinished step was clearly captured.",
+  );
+
+  answer.execution_state = "complete";
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "No unfinished step remains.",
+  );
+});
+
+test("unresolved answers keep individually supported continuation details visible", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision({ status: "unresolved" }));
+  Object.assign(answer, {
+    current_subtask: "You were refining the Continue view.",
+    last_meaningful_progress: "The information hierarchy was clarified.",
+    unfinished_state: "Implement the refinements and verify the result.",
+    where_summary: null,
+  });
+
+  assert.equal(hasVisibleTaskTruthContinuationDetails(answer), true);
+  assert.deepEqual(
+    buildContinueContinuationFieldProjection(answer, false),
+    {
+      checkpoint: "The information hierarchy was clarified.",
+      continuation: "Implement the refinements and verify the result.",
+      checkpointSurface: null,
+      continuationSurface: null,
+      locationLabel: null,
+      targetStatus: "Return location not captured",
+      openActionLabel: null,
+      recentContext: [],
+    },
+  );
+});
+
+test("context trail omits detours but keeps the current observed work surface", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  answer.recent_context = [
+    {
+      sequence_index: 1,
+      app_label: "Spotify",
+      first_observed_at_ms: 1,
+      last_observed_at_ms: 2,
+      is_current: false,
+      revisited: false,
+      semantic_role: "detour_or_unrelated",
+      relationship_to_primary_task: "Brief detour",
+    },
+    {
+      sequence_index: 2,
+      app_label: "Codex",
+      first_observed_at_ms: 3,
+      last_observed_at_ms: 4,
+      is_current: true,
+      revisited: true,
+      semantic_role: "primary_work",
+      relationship_to_primary_task: null,
+    },
+  ];
+  assert.deepEqual(recentContextForPresentation(answer), [answer.recent_context[1]]);
+  assert.deepEqual(continuationSurfacesForPresentation(answer), {
+    checkpointSurface: {
+      label: "Codex",
+      kind: "App",
+      appLabel: "Codex",
+      siteHostname: null,
+    },
+    continuationSurface: null,
+  });
+});
+
+test("browser surfaces are presented as pages with their hostname", () => {
+  const visit = {
+    sequence_index: 1,
+    app_label: "Helium",
+    site_hostname: "docs.example.com",
+    first_observed_at_ms: 1,
+    last_observed_at_ms: 2,
+    is_current: true,
+    revisited: false,
+    semantic_role: "supporting_work",
+    relationship_to_primary_task: "Checked the API docs",
+  };
+  assert.equal(recentContextSurfaceLabel(visit), "docs.example.com");
+  assert.equal(recentContextSurfaceKind(visit), "Page");
+});
+
+test("checkpoint and continuation badges follow the surfaces named in their copy", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  Object.assign(answer, {
+    last_meaningful_progress: "The presentation tests passed in Codex.",
+    unfinished_state: "In Helium, confirm the Continue result in the running app.",
+    recent_context: [
+      {
+        sequence_index: 1,
+        app_label: "Codex",
+        site_hostname: null,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        is_current: false,
+        revisited: false,
+        semantic_role: "primary_work",
+        relationship_to_primary_task: "Implemented and tested the changes",
+      },
+      {
+        sequence_index: 2,
+        app_label: "Helium",
+        site_hostname: null,
+        first_observed_at_ms: 3,
+        last_observed_at_ms: 4,
+        is_current: true,
+        revisited: false,
+        semantic_role: "supporting_work",
+        relationship_to_primary_task: "Prepared the live confirmation",
+      },
+    ],
+  });
+
+  assert.deepEqual(continuationSurfacesForPresentation(answer), {
+    checkpointSurface: {
+      label: "Codex",
+      kind: "App",
+      appLabel: "Codex",
+      siteHostname: null,
+    },
+    continuationSurface: {
+      label: "Helium",
+      kind: "App",
+      appLabel: "Helium",
+      siteHostname: null,
+    },
+  });
+});
+
+test("generic running-app copy is grounded to Smalltalk instead of the current unrelated surface", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  Object.assign(answer, {
+    current_subtask: "You were improving Smalltalk's Continue card UX.",
+    unfinished_state: "A real Continue interaction still needs confirmation in the running app.",
+    where_summary: null,
+    recent_context: [
+      {
+        sequence_index: 1,
+        app_label: "Helium",
+        site_hostname: null,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        is_current: true,
+        revisited: false,
+        semantic_role: "supporting_work",
+        relationship_to_primary_task: "Searched for interface references",
+      },
+    ],
+  });
+
+  const field = buildContinueContinuationFieldProjection(answer, false);
+  assert.equal(
+    field.continuation,
+    "A real Continue interaction still needs confirmation in Smalltalk.",
+  );
+  assert.deepEqual(field.continuationSurface, {
+    label: "Smalltalk",
+    kind: "App",
+    appLabel: "Smalltalk",
+    siteHostname: null,
+  });
+
+  answer.unfinished_state = "Open Smalltalk and run one real Continue interaction.";
+  assert.deepEqual(
+    buildContinueContinuationFieldProjection(answer, false).continuationSurface,
+    {
+      label: "Smalltalk",
+      kind: "App",
+      appLabel: "Smalltalk",
+      siteHostname: null,
+    },
+  );
+});
+
+test("recent context roles use concise user-facing labels", () => {
+  assert.equal(recentContextRoleLabel("primary_work"), "Primary work");
+  assert.equal(recentContextRoleLabel("supporting_work"), "Supporting work");
+  assert.equal(recentContextRoleLabel("detour_or_unrelated"), "Detour or unrelated");
+  assert.equal(recentContextRoleLabel("unclear"), "Relationship unclear");
+  assert.equal(recentContextRoleLabel(null), null);
+});
+
+test("field-limited model output remains visible instead of becoming the default state", () => {
+  const decision = authoritativeDecision({ status: "partial" });
+  Object.assign(decision.task_truth_v2.answer, {
+    task_summary: null,
+    current_subtask: "You were verifying the repaired Continue output, but the broader task title was not supported.",
+    last_meaningful_progress: "The model response was parsed and locally admitted",
+    unfinished_state: "The visible Continue card still needs confirmation",
+    next_action: null,
+    where_summary: null,
+    direct_return_target: null,
+    evidence_preview: null,
+    inference_status: "model_answer_visible_with_validation_limits",
+  });
+  decision.task_truth_v2.answer.field_support.task_summary = {
+    confidence: 0,
+    support_status: "unsupported",
+    evidence_refs: [],
+  };
+
+  const answer = authoritativeTaskTruthAnswer(decision);
+  assert.equal(answer?.task_resolution_status, "partial");
+  assert.equal(answer?.task_summary, null);
+  assert.equal(
+    answer?.current_subtask,
+    "You were verifying the repaired Continue output, but the broader task title was not supported.",
+  );
+  assert.equal(
+    answer?.last_meaningful_progress,
+    "The model response was parsed and locally admitted",
+  );
+  assert.equal(
+    answer?.unfinished_state,
+    "The visible Continue card still needs confirmation",
+  );
+  assert.deepEqual(authoritativeTaskTruthActionState(decision), {
+    kind: "thin_current_work",
+    label: "Inspect evidence",
+  });
+  assert.equal(hasVisibleTaskTruthSemantics(answer), true);
+  assert.deepEqual(
+    buildContinuePublicProjection(answer, false),
+    {
+      headline: "You were verifying the repaired Continue output, but the broader task title was not supported",
+      memoryLine: null,
+      resumeSurface: null,
+      openActionLabel: null,
+      exactTargetNote: "Return location not captured",
+    },
+  );
+});
+
+test("task inference availability names only actual provider availability failures", () => {
+  for (const status of ["model_unavailable", "provider_error", "provider_failure", "provider_unavailable"]) {
     assert.equal(isTaskInferenceUnavailable(status), true, status);
+  }
+  for (const status of ["disabled", "credentials_missing", "timeout", "request_invalid", "invalid_response"]) {
+    assert.equal(isTaskInferenceUnavailable(status), false, status);
   }
   assert.equal(isTaskInferenceUnavailable("insufficient_evidence"), false);
   assert.equal(isTaskInferenceUnavailable("privacy_blocked"), false);
@@ -271,14 +672,18 @@ test("task inference failures have distinct user-facing states and retry policy"
   assert.deepEqual(taskInferenceFailurePresentation("request_invalid"), {
     kind: "capture_unavailable",
     headline: "Capture was unavailable for this Continue attempt",
-    detail: "Smalltalk could not prepare a privacy-safe, readable current-work packet.",
+    detail: "Smalltalk could not prepare a readable current-work packet for this request.",
     retryable: false,
   });
-  assert.equal(taskInferenceFailurePresentation("timeout").kind, "provider_unavailable");
+  assert.equal(taskInferenceFailurePresentation("disabled").kind, "provider_disabled");
+  assert.equal(taskInferenceFailurePresentation("credentials_missing").kind, "credentials_missing");
+  assert.equal(taskInferenceFailurePresentation("model_unavailable").kind, "model_unavailable");
+  assert.equal(taskInferenceFailurePresentation("timeout").kind, "provider_timeout");
   assert.equal(taskInferenceFailurePresentation("timeout").retryable, true);
+  assert.equal(taskInferenceFailurePresentation("request_rejected").kind, "provider_request_rejected");
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 1).kind,
-    "provider_unavailable",
+    "provider_request_rejected",
   );
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 0).kind,
@@ -286,10 +691,38 @@ test("task inference failures have distinct user-facing states and retry policy"
   );
   assert.equal(
     taskInferenceFailurePresentation("request_invalid", null, "live_cloud", 0, 1).kind,
-    "provider_unavailable",
+    "provider_request_rejected",
   );
   assert.equal(taskInferenceFailurePresentation("invalid_response").kind, "model_response_invalid");
   assert.equal(taskInferenceFailurePresentation("invalid_response").retryable, true);
+  assert.deepEqual(taskInferenceFailurePresentation("provider_no_usable_output"), {
+    kind: "provider_no_usable_output",
+    headline: "Cloud task inference did not return a usable answer",
+    detail: "The provider did not return one complete, valid task answer.",
+    retryable: true,
+  });
+  assert.equal(
+    taskInferenceFailurePresentation("structured_parse_failure").kind,
+    "model_response_invalid",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("support_slot_validation_failure").kind,
+    "evidence_verifier_rejected",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation(
+      "cloud_inference_unresolved:insufficient_evidence:request_invalid",
+    ).kind,
+    "insufficient_evidence",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("provider_rejected").kind,
+    "provider_request_rejected",
+  );
+  assert.equal(
+    taskInferenceFailurePresentation("provider_unavailable").kind,
+    "provider_unavailable",
+  );
   assert.equal(
     taskInferenceFailurePresentation("success", "verification_rejected").kind,
     "evidence_verifier_rejected",
@@ -300,7 +733,7 @@ test("task inference failures have distinct user-facing states and retry policy"
   );
 });
 
-test("frame preview is inspect-only and contains no target-shaped action copy", () => {
+test("frame preview does not masquerade as a continuation target", () => {
   const action = getContinuePresentationActionState({
     decisionId: "decision",
     outputMode: "thin_continue",
@@ -317,8 +750,19 @@ test("frame preview is inspect-only and contains no target-shaped action copy", 
     appFocusOnly: false,
   });
   assert.equal(action.label, "Inspect evidence");
-  assert.equal(copy.targetLine, "Captured evidence is available to inspect");
+  assert.equal(copy.targetLine, "The task is understood, but no exact return point is ready");
+  assert.equal(copy.actionLabel, "Try Continue again");
   assert.doesNotMatch(JSON.stringify({ action, copy }), /Continue here|safest return point|open the work/i);
+});
+
+test("a known task without an attached target does not claim the observed page was missing", () => {
+  const copy = inspectTargetCopy({
+    taskKnown: true,
+    evidencePreviewAvailable: true,
+    appFocusOnly: false,
+  });
+  assert.equal(copy.targetLine, "The task is understood, but no exact return point is ready");
+  assert.doesNotMatch(copy.targetLine, /no verified page|was not found/i);
 });
 
 test("task-known target-null copy stays specific about task understanding", () => {
@@ -542,7 +986,7 @@ test("genuinely newer stronger background task can replace the older answer", ()
   });
 });
 
-test("weaker native-island update also retains the stronger manual answer", () => {
+test("explicit native-island result replaces the previous main-window answer", () => {
   const incumbent = adoptionDecision();
   const challenger = adoptionDecision({
     decision_id: "decision-island",
@@ -561,8 +1005,117 @@ test("weaker native-island update also retains the stronger manual answer", () =
     incumbentTrigger: "manual",
     challengerTrigger: "island",
   });
+  assert.deepEqual(comparison, {
+    adopt: true,
+    reasonCodes: ["adopted:explicit_island_result"],
+  });
+});
+
+test("failed explicit island refresh keeps the last usable provider answer", () => {
+  const incumbent = authoritativeDecision({
+    overrides: { decision_id: "decision-last-usable" },
+  });
+  incumbent.task_truth_v2.answer.current_subtask =
+    "You were working in Codex on Smalltalk, repairing Continue output validation.";
+  const challenger = authoritativeDecision({
+    status: "unresolved",
+    overrides: { decision_id: "decision-failed-island" },
+  });
+  Object.assign(challenger.task_truth_v2.answer, {
+    task_summary: null,
+    task_object: null,
+    current_subtask: null,
+    last_meaningful_progress: null,
+    unfinished_state: null,
+    next_action: null,
+    where_summary: null,
+  });
+  challenger.task_truth_v2.inference_diagnostic = {
+    status: "support_slot_validation_failure",
+    origin: "live_cloud",
+  };
+
+  assert.deepEqual(
+    compareContinueDecisionAdoption({
+      incumbent,
+      challenger,
+      incumbentTrigger: "island",
+      challengerTrigger: "island",
+    }),
+    {
+      adopt: false,
+      reasonCodes: [
+        "rejected:explicit_refresh_failed_without_semantics",
+        "retained:last_usable_continue_answer",
+      ],
+    },
+  );
+});
+
+test("failed explicit manual preflight also keeps the last usable answer", () => {
+  const incumbent = authoritativeDecision();
+  const challenger = authoritativeDecision({ status: "unresolved" });
+  Object.assign(challenger.task_truth_v2.answer, {
+    task_summary: null,
+    task_object: null,
+    current_subtask: null,
+    last_meaningful_progress: null,
+    unfinished_state: null,
+    next_action: null,
+    where_summary: null,
+  });
+  challenger.task_truth_v2.inference_diagnostic = {
+    status: "request_not_built",
+    origin: "none",
+  };
+
+  const comparison = compareContinueDecisionAdoption({
+    incumbent,
+    challenger,
+    incumbentTrigger: "manual",
+    challengerTrigger: "manual",
+  });
+
   assert.equal(comparison.adopt, false);
-  assert.ok(comparison.reasonCodes.includes("retained:stronger_manual_result"));
+  assert.ok(comparison.reasonCodes.includes("retained:last_usable_continue_answer"));
+});
+
+test("background refresh cannot replace an explicit provider-backed island answer", () => {
+  const incumbent = authoritativeDecision({
+    status: "unresolved",
+    overrides: { decision_id: "decision-island" },
+  });
+  Object.assign(incumbent.task_truth_v2.answer, {
+    current_subtask:
+      "You were in Codex on Smalltalk, validating Continue's task-title behavior after implementing output-clarity fixes.",
+    task_summary: null,
+    last_meaningful_progress: "The clearer output was visible in the island",
+    unfinished_state: "The main window still needed to show the same answer",
+    response_id: "provider-response-one",
+  });
+  const challenger = adoptionDecision({
+    decision_id: "decision-background-no-clear",
+    request_trigger: "background",
+    task_resolution_status: "no_clear_current_task",
+    current_task_turn: null,
+    continue_output_mode: "no_clear_continuation",
+    task_truth_v2: null,
+  });
+
+  const comparison = compareContinueDecisionAdoption({
+    incumbent,
+    challenger,
+    incumbentTrigger: "island",
+    challengerTrigger: "background",
+  });
+
+  assert.equal(comparison.adopt, false);
+  assert.ok(
+    comparison.reasonCodes.includes(
+      "rejected:background_cannot_replace_explicit_island_answer",
+    ),
+  );
+  assert.ok(comparison.reasonCodes.includes("retained:explicit_island_result"));
 });
 
 test("explicit manual refresh may replace an old answer with an honest no-clear state", () => {

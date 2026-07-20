@@ -40,6 +40,11 @@ name = "mfti_04_performance_report"
 path = "src/bin/mfti_04_performance_report.rs"
 required-features = ["eval-binaries"]
 
+[[bin]]
+name = "pftu_01_probe"
+path = "src/bin/pftu_01_probe.rs"
+required-features = ["eval-binaries"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -59,8 +64,14 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = "0.25"
 foreign-types = "0.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSColor", "NSWindow", "objc2-core-foundation"] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }

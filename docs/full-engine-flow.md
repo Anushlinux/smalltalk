@@ -1180,3 +1180,25 @@ git diff --check docs/full-engine-flow.md
 ```
 
 No frontend or Rust build is required for this doc-only update.
+
+## Bounded runtime scheduling and storage
+
+The production flow now has explicit pressure boundaries before semantic processing:
+
+1. `capture_events.swift` summarizes native callback floods without recording characters.
+2. Rust admits each JSON line to a reserved high, normal, or pressure lane. Total capacity is 320.
+3. One capture-loop turn consumes at most 32 events and yields after a 12 millisecond drain budget.
+4. The capture worker writes the batch through one generation-owned SQLite connection and one short transaction.
+5. The transaction persists events, typing effects, capture-trigger links, and maintained session counters together. Cancellation rolls the batch back.
+6. A pending trigger retains 128 causal ids plus a versioned aggregate mapping instead of growing forever.
+7. Capture, Continue, audit, and maintenance enter the finite workload governor before expensive work starts.
+
+The governor has a total waiting capacity of 48 plus smaller class limits. Manual Continue cancels queued background and island work. Capture and manual actions can displace queued maintenance, audit, or derived work. Every waiter has a deadline and cancellation token. Shutdown cancels active and queued tokens and wakes all waiters.
+
+Continue opens its preflight connection only long enough to resolve session scope, establish the manual capture boundary, and compute the semantic watermark. It drops that connection before waiting for admission. After admission it opens a fresh connection. A superseded background result is rejected before audit or visible-surface publication. Unchanged semantic evidence continues to reuse the existing decision identity.
+
+Full audit output is manual-only. One audit worker owns one active export and one pending export. Equivalent decision ids coalesce. A newer pending decision supersedes the older pending job. Export construction remains in a temporary directory and becomes complete only through atomic rename.
+
+`capture_status` reads maintained session counters, bounded recent signal windows, one maintenance snapshot query, and a lightweight latest-frame row. The status frame contains identity and provider metadata but not OCR text, Accessibility text or trees, URL/path contents, or image paths. Explicit evidence commands load heavy detail. Status records p50 and p95 latency and response bytes.
+
+The privacy-safe soak harness is described in `docs/runtime-stability-harness.md`. The complete live matrix remains a release gate; deterministic tests alone do not establish always-on stability.

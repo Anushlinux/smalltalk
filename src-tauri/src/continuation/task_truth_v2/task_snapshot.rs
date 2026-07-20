@@ -430,6 +430,7 @@ mod tests {
             },
             current_frame: current_frame.clone(),
             semantic_keyframes: vec![current_frame],
+            surface_timeline: Vec::new(),
             canonical_elements: Vec::new(),
             focused_element_ids: Vec::new(),
             editable_element_ids: Vec::new(),
