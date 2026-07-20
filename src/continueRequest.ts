@@ -31,6 +31,12 @@ export function isContinueRequestTimeout(error: unknown): boolean {
   return error instanceof ContinueRequestTimeoutError;
 }
 
+export function isTransientScreenshotCaptureContention(error: unknown): boolean {
+  return /workload governor timed out waiting for screenshot(?:capture|memory)/i.test(
+    String(error),
+  );
+}
+
 export function continueRequestErrorCopy(error: unknown): string {
   if (isContinueRequestTimeout(error)) {
     return "Continue stopped because capture or inference exceeded the two-minute safety limit. The previous answer is still available; you can try again.";

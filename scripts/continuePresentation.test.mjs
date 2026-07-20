@@ -5,10 +5,11 @@ import {
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthTarget,
+  buildContinueContinuationFieldProjection,
   buildContinuePublicProjection,
-  buildContinueTaskTruthDetailRows,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
+  hasVisibleTaskTruthContinuationDetails,
   hasVisibleTaskTruthSemantics,
   inspectTargetCopy,
   isTaskInferenceUnavailable,
@@ -256,7 +257,7 @@ test("provider-failure unresolved answer remains usable without task identity", 
   });
 });
 
-test("recent context keeps the latest six meaningful visits for every answer state", () => {
+test("recent context keeps the latest four meaningful visits for every answer state", () => {
   const visits = Array.from({ length: 10 }, (_, index) => ({
     sequence_index: index + 1,
     app_label: index === 1 ? "Private activity" : "Helium",
@@ -265,6 +266,14 @@ test("recent context keeps the latest six meaningful visits for every answer sta
     last_observed_at_ms: index * 100 + 50,
     is_current: index === 9,
     revisited: index > 4,
+    semantic_role: index === 2
+      ? "detour_or_unrelated"
+      : index === 5
+        ? "unclear"
+        : index % 2 === 0 ? "primary_work" : "supporting_work",
+    relationship_to_primary_task: index === 2 || index === 5
+      ? "Unrelated visit"
+      : index % 2 === 0 ? "Worked on the task" : "Checked supporting context",
     evidence_refs: [`frame-${index}`],
   }));
 
@@ -273,9 +282,11 @@ test("recent context keeps the latest six meaningful visits for every answer sta
     decision.task_truth_v2.answer.recent_context = visits;
     const answer = authoritativeTaskTruthAnswer(decision);
     const visible = recentContextForPresentation(answer);
-    assert.equal(visible.length, 6);
-    assert.equal(visible[0].sequence_index, 5);
+    assert.equal(visible.length, 4);
+    assert.equal(visible[0].sequence_index, 7);
     assert.equal(visible.at(-1).sequence_index, 10);
+    assert.equal(visible.some((visit) => visit.semantic_role === "unclear"), false);
+    assert.equal(visible.some((visit) => visit.semantic_role === "detour_or_unrelated"), false);
   }
 });
 
@@ -290,8 +301,8 @@ test("recent context compresses repeated shell visits without losing the latest 
       last_observed_at_ms: 120,
       is_current: false,
       revisited: false,
-      semantic_role: "detour_or_unrelated",
-      relationship_to_primary_task: "Brief detour",
+      semantic_role: "primary_work",
+      relationship_to_primary_task: "Worked on the task",
       evidence_refs: ["frame-1"],
     },
     {
@@ -302,8 +313,8 @@ test("recent context compresses repeated shell visits without losing the latest 
       last_observed_at_ms: 180,
       is_current: false,
       revisited: true,
-      semantic_role: "detour_or_unrelated",
-      relationship_to_primary_task: "Brief detour",
+      semantic_role: "primary_work",
+      relationship_to_primary_task: "Worked on the task",
       evidence_refs: ["frame-2"],
     },
   ];
@@ -335,7 +346,7 @@ test("public projection uses the human current-step sentence while preserving th
       memoryLine: null,
       resumeSurface: "Codex",
       openActionLabel: null,
-      exactTargetNote: "Exact task link not captured",
+      exactTargetNote: "Exact place not captured",
     },
   );
   assert.equal(
@@ -352,19 +363,18 @@ test("public projection uses the human current-step sentence while preserving th
     "Fix Continue output status",
   );
   assert.deepEqual(
-    buildContinueTaskTruthDetailRows(authoritativeTaskTruthAnswer(decision)),
-    [
-      [
-        "What you were doing",
-        "You were working in Codex on Smalltalk, making new Continue answers shorter and clearer.",
-      ],
-      [
-        "Where you left off",
-        "The build and automated tests had already passed A fresh result still needs visual confirmation",
-      ],
-      ["Continue in", "Codex"],
-      ["Next step", "Finish the two manual checks"],
-    ],
+    buildContinueContinuationFieldProjection(
+      authoritativeTaskTruthAnswer(decision),
+      false,
+    ),
+    {
+      checkpoint: "The build and automated tests had already passed",
+      continuation: "A fresh result still needs visual confirmation",
+      locationLabel: "Codex",
+      targetStatus: "Exact place not captured",
+      openActionLabel: null,
+      recentContext: [],
+    },
   );
   assert.equal(
     buildContinuePublicProjection({
@@ -373,6 +383,81 @@ test("public projection uses the human current-step sentence while preserving th
     }, false).headline,
     "Fix Continue output status",
   );
+});
+
+test("continuation field prefers unfinished state and falls back without inventing completion", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  Object.assign(answer, {
+    unfinished_state: null,
+    next_action: "Run the final presentation checks.",
+    execution_state: "paused_after_progress",
+  });
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "Run the final presentation checks.",
+  );
+
+  answer.next_action = null;
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "No unfinished step was clearly captured.",
+  );
+
+  answer.execution_state = "complete";
+  assert.equal(
+    buildContinueContinuationFieldProjection(answer, false).continuation,
+    "No unfinished step remains.",
+  );
+});
+
+test("unresolved answers keep individually supported continuation details visible", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision({ status: "unresolved" }));
+  Object.assign(answer, {
+    current_subtask: "You were refining the Continue view.",
+    last_meaningful_progress: "The information hierarchy was clarified.",
+    unfinished_state: "Implement the refinements and verify the result.",
+    where_summary: null,
+  });
+
+  assert.equal(hasVisibleTaskTruthContinuationDetails(answer), true);
+  assert.deepEqual(
+    buildContinueContinuationFieldProjection(answer, false),
+    {
+      checkpoint: "The information hierarchy was clarified.",
+      continuation: "Implement the refinements and verify the result.",
+      locationLabel: null,
+      targetStatus: "Return location not captured",
+      openActionLabel: null,
+      recentContext: [],
+    },
+  );
+});
+
+test("context trail omits visits without a grounded useful relationship", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  answer.recent_context = [
+    {
+      sequence_index: 1,
+      app_label: "Spotify",
+      first_observed_at_ms: 1,
+      last_observed_at_ms: 2,
+      is_current: false,
+      revisited: false,
+      semantic_role: "detour_or_unrelated",
+      relationship_to_primary_task: "Brief detour",
+    },
+    {
+      sequence_index: 2,
+      app_label: "Codex",
+      first_observed_at_ms: 3,
+      last_observed_at_ms: 4,
+      is_current: true,
+      revisited: true,
+      semantic_role: "primary_work",
+      relationship_to_primary_task: null,
+    },
+  ];
+  assert.deepEqual(recentContextForPresentation(answer), []);
 });
 
 test("recent context roles use concise user-facing labels", () => {
@@ -429,7 +514,7 @@ test("field-limited model output remains visible instead of becoming the default
       memoryLine: null,
       resumeSurface: null,
       openActionLabel: null,
-      exactTargetNote: null,
+      exactTargetNote: "Return location not captured",
     },
   );
 });

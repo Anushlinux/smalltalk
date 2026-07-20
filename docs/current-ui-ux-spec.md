@@ -6,7 +6,7 @@ This is the product contract for the main Tauri app. It covers the public inform
 
 Primary implementation files:
 
-- `src/App.tsx` — product navigation, Continue presentation, always-visible supporting details, History, Settings, Privacy, and developer Inspect.
+- `src/App.tsx` — product navigation, Continue presentation and continuation field, History, Settings, Privacy, and developer Inspect.
 - `src/App.css` — the warm application shell, dark Continue canvas, responsive layouts, motion, and accessibility preferences.
 - `src-tauri/src/continuation/history.rs` — the bounded read-only history model for explicit Continue answers.
 - `src-tauri/src/capture.rs` and `src-tauri/src/lib.rs` — Tauri commands that expose that history to the main app.
@@ -78,14 +78,15 @@ Changing destinations always resets the page scroll to the top. Content must nev
 
 The Continue screen is a warm page containing one dark answer canvas. The contrast gives the continuation moment focus without forcing the entire application into a dark theme.
 
-The canvas must answer, in order:
+The dark canvas restores recognition with one dominant, untruncated answer headline. It does not repeat progress, location, or the next step. A compact overflow action remains when correction options are available.
 
-1. **What to continue** — one dominant, untruncated answer headline.
-2. **Where to return** — an artifact, app, document, or page only when grounded.
-3. **What to do next** — one concrete next action when supported.
-4. **Primary action** — open the safe return target only when one is validated.
+The full Continue screen then answers, in order:
 
-The main canvas contains a primary action only when the backend supplies a validated openable target. A compact overflow action remains when correction options are available.
+1. **What to continue** — the dark hero headline.
+2. **What was completed** — the last checkpoint.
+3. **What to do next** — the first supported unresolved step.
+4. **Where to return** — a grounded artifact, app, document, or page.
+5. **Primary action** — beside the location, and only when the return target is validated.
 
 ### 4.1 States
 
@@ -103,26 +104,31 @@ Replace the answer content with a polite status, one supporting line, and the bo
 
 #### Resolved
 
-Show the exact supported headline, memory line, safe primary action when available, and the correction overflow. Do not truncate generated answer text.
+Show the exact supported headline and correction overflow in the hero, followed by the checkpoint, continuation point, and safe return action when available. Do not truncate generated answer text.
 
 #### Unresolved
 
 Lead with the honest abstention. Supporting details may explain what is missing, but the public card must not show retry, evidence-only, or fake-target actions.
 
-## 5. Supporting details
+## 5. Continuation field
 
-Supporting details are always visible in a light surface attached below the dark answer canvas. There is no Context, See more, or Why this disclosure control. The detail heading is **Where to continue**. Its default reading order is:
+The July 21 Continue-view taste direction supersedes the older always-visible supporting-details layout. The area below the dark answer canvas is a borderless continuation field on the page background, not a second raised card or report.
 
-- Return to
-- Next step
-- What you were doing
-- Where you left it
-- App and page path, shown as a connected oldest-to-newest trail
-- Visual cue, always last
+Its default reading order is:
 
-Only non-empty, applicable rows are shown. A safe visual cue loads automatically from the decision's existing evidence-preview frame but remains at the bottom, after the return details and app/page path. Screenshot evidence never creates a `View last screen` or similar primary action.
+- **Last checkpoint** — the last meaningful completed outcome.
+- **Continue from here** — the earliest concrete unresolved step, or an honest statement that no exact step was captured.
+- **Location** — the most precise grounded work surface available.
+- **Return action** — shown only when the existing direct-target policy says the target is safely openable.
+- **Context trail** — one collapsed horizontal sequence of up to four meaningful surfaces.
 
-Supporting details must not expose:
+The hero remains the only task explanation. The continuation field must not repeat it as `What you were doing`, combine completed and unfinished work into one paragraph, or expose the recent trail as a large default timeline.
+
+The public context trail includes only grounded primary work, useful supporting work, and returns to that work. Detours, unrelated surfaces, unclear relationships, duplicate visits, and diagnostic evidence remain available in Inspect. Expanding the trail shows one short relationship sentence per meaningful surface and lazily loads the existing evidence-preview frame as the final visual cue. Screenshot evidence never creates a primary action.
+
+When a task is understood but its target is unavailable, show a quiet inline `Exact place not captured` status. Do not replace the useful task answer or turn ordinary uncertainty into a warning card. When no clear task exists, lead with the abstention and do not render a confident continuation field or detailed public trail.
+
+The continuation field must not expose:
 
 - Decision, request, frame, event, artifact, or response identifiers.
 - Candidate scores, confidence arithmetic, provider diagnostics, or model prompts.
@@ -179,7 +185,7 @@ Inspect remains the existing developer workspace for:
 - Workstreams and engine diagnostics.
 - Storage, capture, evaluation, audit, and provider information.
 
-Inspect can be dense because it serves verification. That density must not leak into Continue, its supporting details, History, Settings, or Privacy.
+Inspect can be dense because it serves verification. That density must not leak into Continue, its continuation field, History, Settings, or Privacy.
 
 ## 9. Visual system
 
@@ -189,7 +195,7 @@ Inspect can be dense because it serves verification. That density must not leak 
 | --- | --- | --- |
 | App background | `#F3F2EE` | Main canvas and toolbar |
 | Sidebar | `#EBEAE5` with translucency | Navigation rail |
-| Raised panel | `#FFFEFA` | History, Settings, supporting details |
+| Raised panel | `#FFFEFA` | History and Settings surfaces |
 | Primary ink | `#1B1917` | Headings and main controls |
 | Secondary ink | `#68635D` | Supporting copy |
 | Quiet ink | `#918B83` | Labels and metadata |
@@ -249,4 +255,4 @@ Do not add these to the public main app:
 - Team, billing, invite, or upgrade surfaces.
 - Separate `See more` and `Why this?` actions.
 
-Those additions would dilute the launch promise. Continue with always-visible supporting details, History, Settings, and onboarding/permission recovery are sufficient for the first product surface.
+Those additions would dilute the launch promise. Continue with its compact continuation field, History, Settings, and onboarding/permission recovery are sufficient for the first product surface.

@@ -16585,7 +16585,7 @@ fn capture_and_emit(
             dedupe,
         )?),
     };
-    let outcome = capture_frame(
+    let outcome = match capture_frame(
         app,
         session_id,
         capture_trigger,
@@ -16598,7 +16598,17 @@ fn capture_and_emit(
         trigger_id.as_deref(),
         pre_frame_id.as_deref(),
         None,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) if is_transient_screenshot_capture_contention(&error) => {
+            if let Some(id) = trigger_id.as_deref() {
+                finalize_capture_trigger_by_id(app, id, false)?;
+            }
+            update_skip(state);
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
 
     *previous_image_hash = Some(outcome.image_hash.clone());
     *previous_content_hash = outcome
@@ -16627,6 +16637,12 @@ fn capture_and_emit(
         update_skip(state);
         Ok(false)
     }
+}
+
+fn is_transient_screenshot_capture_contention(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("workload governor timed out waiting for screenshotcapture")
+        || normalized.contains("workload governor timed out waiting for screenshotmemory")
 }
 
 fn refresh_island_after_event(
@@ -30955,6 +30971,19 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+
+    #[test]
+    fn screenshot_governor_timeout_is_a_transient_capture_skip() {
+        assert!(is_transient_screenshot_capture_contention(
+            "workload governor timed out waiting for screenshotcapture"
+        ));
+        assert!(is_transient_screenshot_capture_contention(
+            "workload governor timed out waiting for screenshotmemory"
+        ));
+        assert!(!is_transient_screenshot_capture_contention(
+            "screen recording permission denied"
+        ));
+    }
 
     fn fingerprint(
         app: &str,

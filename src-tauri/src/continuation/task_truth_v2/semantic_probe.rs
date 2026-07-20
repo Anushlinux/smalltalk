@@ -1567,9 +1567,11 @@ primary_task is the compact task title used by history and the native island. Wr
 
 current_step is the human-facing main answer. When primary_task is non-null, write one standalone second-person sentence, normally 10 to 20 words and never more than 160 characters. Start with 'You were' when natural. State the project or product and what the person was trying to do, using everyday words and one clear main clause. Mention the app only when it helps the person recognize the work. Put completed work in last_progress and remaining work in unfinished_state instead of cramming status details into current_step. Prefer direct verbs such as fixing, testing, writing, comparing, or checking. Avoid release-report wording and abstract phrases such as 'validating output clarity', 'after implementation', 'verification checks', 'live validation', and 'remained unfinished' when a common verb says the same thing. For example, prefer 'You were testing whether Smalltalk clearly explains what to continue' over 'You were validating Smalltalk's Continue output clarity after implementation.' The sentence must make sense without a heading or the compact primary_task title. When primary_task is null, current_step may state only directly observed activity and must make the uncertainty plain, for example: 'You were in Codex with Smalltalk open, but the specific task was not visible.'
 
-Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing Recent Trail copy: use a short, everyday description of what the person did and whether it was primary work, support, a detour, an interruption, or a return. Prefer wording such as 'You checked the API docs' or 'You briefly switched to email.' Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
+Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing context-trail copy: write 4 to 10 plain words describing the visit's useful contribution, support, return, interruption, or detour. Prefer wording such as 'Checked the API docs' or 'Returned for the live test.' Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
 
-last_progress and unfinished_state must each be one plain sentence of at most 20 words. Use direct, everyday wording. Prefer 'The code and automated checks were done' over 'The implementation completed with verification checks passing.' Prefer 'You still needed to restart the app and test Continue' over 'Live validation remained unfinished.' Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
+last_progress must be one result-first plain sentence, normally 8 to 18 words and never more than 20 words. Describe the last meaningful completed outcome, not the app or a list of checks. Compress multiple successful checks into one human result unless a specific failure matters. Prefer 'The code and automated checks were done' over 'The implementation completed with verification checks passing.'
+
+unfinished_state must be one direct plain sentence, normally 12 to 26 words. State the earliest concrete unresolved step and begin with a clear action when that action is visibly supported. If the exact action is unsupported, state what remains unresolved without manufacturing a step. Prefer 'Restart the app and test Continue once' over 'Live validation remained unfinished.' Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -6212,13 +6214,18 @@ mod tests {
         assert!(instruction.contains("conversation, thread, or task title is only one clue"));
         assert!(instruction.contains("specific task was not visible"));
         assert!(
-            instruction.contains("relationship_to_primary_task is user-facing Recent Trail copy")
+            instruction.contains("relationship_to_primary_task is user-facing context-trail copy")
         );
-        assert!(instruction.contains("You briefly switched to email"));
+        assert!(instruction.contains("4 to 10 plain words"));
+        assert!(instruction.contains("Returned for the live test"));
         assert!(instruction.contains("Do not say 'this image shows'"));
-        assert!(instruction.contains("at most 20 words"));
+        assert!(instruction.contains("normally 8 to 18 words"));
+        assert!(instruction.contains("last meaningful completed outcome"));
+        assert!(instruction.contains("normally 12 to 26 words"));
+        assert!(instruction.contains("earliest concrete unresolved step"));
+        assert!(instruction.contains("without manufacturing a step"));
         assert!(instruction.contains("The code and automated checks were done"));
-        assert!(instruction.contains("You still needed to restart the app and test Continue"));
+        assert!(instruction.contains("Restart the app and test Continue once"));
         assert!(instruction.contains("Express uncertainty only in confidence_by_field"));
     }
 

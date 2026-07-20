@@ -120,6 +120,15 @@ export type ContinuePublicProjection = {
   exactTargetNote: string | null;
 };
 
+export type ContinueContinuationFieldProjection = {
+  checkpoint: string | null;
+  continuation: string;
+  locationLabel: string | null;
+  targetStatus: string | null;
+  openActionLabel: string | null;
+  recentContext: ContinueTaskTruthRecentContext[];
+};
+
 export type ContinueTaskTruthAnswer = {
   schema: string;
   task_basis?: string | null;
@@ -525,6 +534,12 @@ export function recentContextForPresentation(
 ) {
   const visible: ContinueTaskTruthRecentContext[] = [];
   for (const visit of answer?.recent_context || []) {
+    if (
+      !["primary_work", "supporting_work"].includes(visit.semantic_role || "")
+      || !visit.relationship_to_primary_task?.trim()
+    ) {
+      continue;
+    }
     const previous = visible[visible.length - 1];
     const sameSurface = previous
       && recentContextSurfaceLabel(previous) === recentContextSurfaceLabel(visit);
@@ -547,7 +562,7 @@ export function recentContextForPresentation(
 
     visible.push(visit);
   }
-  return visible.slice(-6);
+  return visible.slice(-4);
 }
 
 export function recentContextSurfaceLabel(
@@ -582,40 +597,58 @@ export function buildContinuePublicProjection(
   const currentStep = publicClause(answer.current_subtask);
   const action = publicClause(answer.next_action || answer.unfinished_state);
   const progress = publicClause(answer.last_meaningful_progress || answer.unfinished_state);
-  const surface = publicClause(answer.where_summary) || null;
+  const continuationField = buildContinueContinuationFieldProjection(
+    answer,
+    targetOpenable,
+  );
+  const surface = continuationField.locationLabel;
   const headline = currentStep || task || action || progress || "Continue";
-
-  const openActionLabel = targetOpenable
-    ? surface ? `Open ${surface}` : "Open continuation"
-    : null;
 
   return {
     headline,
     memoryLine: null,
     resumeSurface: surface,
-    openActionLabel,
-    exactTargetNote: targetOpenable || !surface
-      ? null
-      : "Exact task link not captured",
+    openActionLabel: continuationField.openActionLabel,
+    exactTargetNote: continuationField.targetStatus,
   };
 }
 
-export function buildContinueTaskTruthDetailRows(
+export function buildContinueContinuationFieldProjection(
   answer: ContinueTaskTruthAnswer,
-): Array<[string, string]> {
-  const rows: Array<[string, string | null | undefined]> = [
-    ["What you were doing", answer.current_subtask || answer.task_summary],
-    [
-      "Where you left off",
-      [answer.last_meaningful_progress, answer.unfinished_state]
-        .filter(Boolean)
-        .join(" "),
-    ],
-    ["Continue in", answer.where_summary],
-    ["Next step", answer.next_action],
-  ];
+  targetOpenable: boolean,
+  preciseTargetLabel?: string | null,
+): ContinueContinuationFieldProjection {
+  const checkpoint = publicSentence(answer.last_meaningful_progress) || null;
+  const supportedContinuation = publicSentence(
+    answer.unfinished_state || answer.next_action,
+  );
+  const executionState = normalizeToken(answer.execution_state);
+  const explicitlyComplete = ["complete", "completed", "complete_or_idle"].includes(
+    executionState,
+  );
+  const continuation = supportedContinuation || (
+    explicitlyComplete
+      ? "No unfinished step remains."
+      : "No unfinished step was clearly captured."
+  );
+  const locationLabel = publicClause(preciseTargetLabel)
+    || publicClause(answer.where_summary)
+    || null;
 
-  return rows.filter((row): row is [string, string] => Boolean(row[1]?.trim()));
+  return {
+    checkpoint,
+    continuation,
+    locationLabel,
+    targetStatus: targetOpenable
+      ? null
+      : locationLabel
+        ? "Exact place not captured"
+        : "Return location not captured",
+    openActionLabel: targetOpenable
+      ? locationLabel ? `Open ${locationLabel}` : "Open continuation"
+      : null,
+    recentContext: recentContextForPresentation(answer),
+  };
 }
 
 export function hasVisibleTaskTruthSemantics(
@@ -635,10 +668,27 @@ export function hasVisibleTaskTruthSemantics(
   ].some((value) => Boolean(value?.trim()));
 }
 
+export function hasVisibleTaskTruthContinuationDetails(
+  answer?: ContinueTaskTruthAnswer | null,
+) {
+  return [
+    answer?.last_meaningful_progress,
+    answer?.unfinished_state,
+    answer?.next_action,
+    answer?.where_summary,
+  ].some((value) => Boolean(value?.trim()));
+}
+
 function publicClause(value?: string | null) {
   return (value || "")
     .trim()
     .replace(/[\s.!?;:]+$/, "")
+    .replace(/\s+/g, " ");
+}
+
+function publicSentence(value?: string | null) {
+  return (value || "")
+    .trim()
     .replace(/\s+/g, " ");
 }
 

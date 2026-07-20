@@ -11,18 +11,22 @@ import {
   ArrowBendDownRight,
   ArrowsClockwise,
   Brain,
+  Browser,
   CaretDown,
   CaretLeft,
   CaretRight,
   CaretUp,
   ClockCounterClockwise,
+  Code,
   Database,
   DotsThree,
   Eye,
+  ChatCircleText,
   Monitor,
   ShieldCheck,
   SidebarSimple,
   SlidersHorizontal,
+  TerminalWindow,
 } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -31,14 +35,14 @@ import {
   authoritativeTaskTruthActionState,
   authoritativeTaskTruthAnswer,
   authoritativeTaskTruthTarget,
+  buildContinueContinuationFieldProjection,
   buildContinuePublicProjection,
-  buildContinueTaskTruthDetailRows,
   compareContinueDecisionAdoption,
   getContinuePresentationActionState,
+  hasVisibleTaskTruthContinuationDetails,
   hasVisibleTaskTruthSemantics,
   inspectTargetCopy,
   isDirectPresentationTargetOpenable,
-  recentContextForPresentation,
   recentContextSurfaceLabel,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_COPY,
@@ -57,6 +61,7 @@ import {
 } from "./continuePresentation";
 import {
   continueRequestErrorCopy,
+  isTransientScreenshotCaptureContention,
   withContinueRequestTimeout,
 } from "./continueRequest";
 import { MosaicLeafBackground } from "./MosaicLeafBackground";
@@ -2798,13 +2803,20 @@ function App() {
 
   const latestEvidenceFrame = status.latest_frame;
   const memorySurfacePrivate = isPrivateMemorySurface(status);
+  const persistentCaptureError = status.last_error
+    && !isTransientScreenshotCaptureContention(status.last_error)
+    ? status.last_error
+    : null;
+  const visibleRuntimeError = [error, persistentCaptureError]
+    .find((message) => message && !isTransientScreenshotCaptureContention(message))
+    || null;
   const memoryProductStatus = deriveMemoryProductStatus(
-    status,
+    { ...status, last_error: persistentCaptureError },
     continueHasEvidence,
     busyAction,
     memorySurfacePrivate,
   );
-  const memoryProduct = getMemoryProductCopy(memoryProductStatus, status.last_error);
+  const memoryProduct = getMemoryProductCopy(memoryProductStatus, persistentCaptureError);
   const continuePrimaryMessage = status.running && !continueDecision && !continueHasEvidence
     ? "Local memory is on."
     : !continueHasEvidence
@@ -3179,6 +3191,7 @@ function App() {
             feedbackStatus={feedbackStatus}
             onRecordFeedback={(kind, options) => void recordContinueFeedback(kind, options)}
             onUseAlternative={(candidate) => void continueFromAlternative(candidate)}
+            onRevealVisualCue={(frameId) => void revealContinueFrame(frameId)}
           />
 	        </div>
 	      </section>
@@ -3229,8 +3242,8 @@ function App() {
                 />
               ) : null}
 
-		      {viewMode === "continue" && (error || status.last_error) ? (
-	        <MemoryErrorBox message={error || status.last_error || ""} />
+		      {viewMode === "continue" && visibleRuntimeError ? (
+	        <MemoryErrorBox message={visibleRuntimeError} />
 	      ) : null}
 
       {viewMode === "history" ? (
@@ -4630,17 +4643,18 @@ function RecentContextVisit({ visit }: { visit: ContinueTaskTruthRecentContext }
 
 function SurfaceGlyph({ label }: { label: string }) {
   const normalized = label.toLowerCase();
-  const glyph = normalized.includes("vs code")
-    ? "VS"
-    : normalized.includes("thinking machines")
-      ? "TM"
-      : normalized.includes("openai")
-        ? "O"
-        : normalized.includes("codex")
-          ? "C"
-          : normalized.includes("chatgpt")
-            ? "C"
-            : label.split(/\s+/).slice(0, 2).map((word) => word[0]).join("").toUpperCase() || "•";
+  const Icon = normalized.includes("terminal")
+    ? TerminalWindow
+    : normalized.includes("vs code") || normalized.includes("codex") || normalized.includes("code")
+      ? Code
+      : normalized.includes("chatgpt") || normalized.includes("chat")
+        ? ChatCircleText
+        : normalized.includes("openai")
+          || normalized.includes("thinking machines")
+          || normalized.includes("http")
+          || normalized.includes("www")
+          ? Browser
+          : Monitor;
   const tone = normalized.includes("vs code")
     ? "code"
     : normalized.includes("openai") || normalized.includes("codex") || normalized.includes("chatgpt")
@@ -4649,7 +4663,11 @@ function SurfaceGlyph({ label }: { label: string }) {
         ? "research"
         : "neutral";
 
-  return <span className="surface-glyph" data-tone={tone} aria-hidden="true">{glyph}</span>;
+  return (
+    <span className="surface-glyph" data-tone={tone} aria-hidden="true" title={label}>
+      <Icon size={17} weight="regular" />
+    </span>
+  );
 }
 
 const continueMatrixPerimeterOrder = new Map(
@@ -4695,6 +4713,7 @@ function ContinuationAnswer({
   onOpenTarget,
   onRecordFeedback,
   onUseAlternative,
+  onRevealVisualCue,
 }: {
   decision: ContinueDecisionResult | null;
   primaryMessage: string;
@@ -4708,6 +4727,7 @@ function ContinuationAnswer({
   feedbackStatus: string | null;
   onOpenTarget: () => void;
   onUseAlternative: (candidate: ContinueCandidateSummary) => void;
+  onRevealVisualCue: (frameId?: string | null) => void;
   onRecordFeedback: (
     feedbackKind: string,
     options?: {
@@ -4758,7 +4778,6 @@ function ContinuationAnswer({
         && !hasSupportedWorkTruth(decision),
       );
   const canOpenResumeTarget = actionState?.kind === "openable_return_target";
-  const isInspectPrimary = Boolean(actionState && actionState.kind !== "openable_return_target");
   const lowConfidence = cardTaskTruthAnswer
     ? noClearCurrentTask
     : decision ? decision.confidence < 0.55 || noClearCurrentTask : false;
@@ -4768,13 +4787,13 @@ function ContinuationAnswer({
     : usableActivityRecap(decision?.activity_recap);
   const presentation = decision ? presentContinueDecision(decision) : null;
   const [alternativesOpen, setAlternativesOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
   const answerRef = useRef<HTMLElement | null>(null);
   const alternatives = noClearCurrentTask || cardTaskTruthAnswer
     ? []
     : (decision?.alternatives || []).filter(isPublicAlternativeCandidate);
   const visibleAlternatives = alternativesOpen ? alternatives.slice(0, 4) : [];
   const taskTruthAlternatives = cardTaskTruthAnswer?.alternative_hypotheses || [];
-  const recentContext = recentContextForPresentation(cardTaskTruthAnswer);
   const taskTruthActionState = actionState || {
     kind: "no_clear_continuation",
     label: "Inspect evidence",
@@ -4795,7 +4814,6 @@ function ContinuationAnswer({
   );
   const targetLine = productState?.targetLine || safeProductLine(rawTargetLine, "No stable place to continue yet.");
   const targetLooksInternal = isInternalFacingText(targetLine);
-  const targetMeta = productState?.targetMeta || presentation?.targetMeta || humanTargetMeta(resumeTarget);
   const lastStateLine = cardTaskTruthAnswer
     ? productState?.lastStateLine || taskInferenceFailure?.detail || ""
     : productState?.lastStateLine
@@ -4815,13 +4833,6 @@ function ContinuationAnswer({
           : decision?.answer?.where_label || activityRecap?.primary_where_summary || currentFocusLine,
         "",
       );
-  const targetBlockLabel = productState?.targetBlockLabel || (
-    isInspectPrimary
-      ? "Exact location unavailable"
-      : lowConfidence
-        ? "Best available place to continue"
-        : "Continue at"
-  );
   const uncertaintyLine = productState?.uncertaintyLine || (
     targetLooksInternal
       ? "I saw the current focus, but I don't have a reliable return target yet."
@@ -4842,32 +4853,63 @@ function ContinuationAnswer({
     : !noClearCurrentTask && lastStateLine
       ? sentenceCase(lastStateLine)
       : null;
+  const defaultOpenActionLabel = publicProjection?.openActionLabel
+    || actionState?.label
+    || "Continue here";
+  const continuationField = cardTaskTruthAnswer
+    ? buildContinueContinuationFieldProjection(
+        cardTaskTruthAnswer,
+        canOpenResumeTarget,
+        humanTargetLabel(resumeTarget) || null,
+      )
+    : {
+        checkpoint: safeProductLine(
+          activityRecap?.last_meaningful_state || decision?.answer?.where_you_left_off || lastStateLine,
+          "",
+        ) || null,
+        continuation: safeProductLine(
+          activityRecap?.unfinished_state
+            || productState?.nextActionLine
+            || decision?.answer?.next
+            || "",
+          "No unfinished step was clearly captured.",
+        ),
+        locationLabel: safeProductLine(
+          humanTargetLabel(resumeTarget) || activityWhereLine || currentFocusLine,
+          "",
+        ) || null,
+        targetStatus: canOpenResumeTarget
+          ? null
+          : activityWhereLine || currentFocusLine
+            ? "Exact place not captured"
+            : "Return location not captured",
+        openActionLabel: canOpenResumeTarget ? defaultOpenActionLabel : null,
+        recentContext: [],
+      };
   const publicActionLabel = busyAction === "open_continue_target"
     ? "Opening"
-    : publicProjection?.openActionLabel || actionState?.label || "Continue here";
-  const detailSemanticRows = (
-    cardTaskTruthAnswer
-      ? buildContinueTaskTruthDetailRows(cardTaskTruthAnswer)
-      : [
-          [
-            "What you were doing",
-            decision?.answer?.what_you_were_doing
-              || activityRecap?.primary_work_summary
-              || currentFocusLine,
-          ],
-          ["Where you left off", lastStateLine],
-          ["Continue in", activityWhereLine],
-          ["Next step", productState?.nextActionLine],
-        ]
-  ).filter((row): row is [string, string] => Boolean(row[1]?.trim()));
+    : continuationField.openActionLabel || defaultOpenActionLabel;
+  const recentContext = continuationField.recentContext;
+  const evidencePreviewFrameId = cardTaskTruthAnswer?.evidence_preview?.frame_id || null;
+  const visualCueMatchesAnswer = Boolean(
+    contextOpen
+    && evidencePreviewFrameId
+    && visualCueVisible
+    && selectedFrame
+    && String(selectedFrame.id) === String(evidencePreviewFrameId)
+    && imageData,
+  );
+  const hasSupportedContinuationDetails = hasVisibleTaskTruthContinuationDetails(
+    cardTaskTruthAnswer,
+  );
+  const showCoreContinuation = !noClearCurrentTask || hasSupportedContinuationDetails;
+  const hasContextDisclosure = showCoreContinuation && (
+    recentContext.length > 0 || Boolean(evidencePreviewFrameId)
+  );
   const hasDetails = Boolean(
-    detailSemanticRows.length
-    || (visualCueVisible && selectedFrame && imageData)
-    || recentContext.length
-    || !publicProjection
-    || productState?.olderContextLine
-    || lowConfidence
-    || uncertaintyLine
+    showCoreContinuation
+    || visualCueMatchesAnswer
+    || hasContextDisclosure
     || taskTruthAlternatives.length
     || feedbackStatus
     || visibleAlternatives.length,
@@ -4875,12 +4917,13 @@ function ContinuationAnswer({
 
   useEffect(() => {
     setAlternativesOpen(false);
+    setContextOpen(false);
   }, [decision?.decision_id]);
 
   useGSAP(() => {
     if (!decision || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const elements = answerRef.current?.querySelectorAll(
-      ":scope > .answer-shell, :scope > .answer-details-surface",
+      ":scope > .answer-shell, :scope > .continuation-field",
     );
     if (!elements?.length) return;
     gsap.fromTo(
@@ -4907,6 +4950,13 @@ function ContinuationAnswer({
     },
   ) => {
     onRecordFeedback(feedbackKind, scope);
+  };
+  const toggleContext = () => {
+    const nextOpen = !contextOpen;
+    setContextOpen(nextOpen);
+    if (nextOpen && evidencePreviewFrameId) {
+      onRevealVisualCue(evidencePreviewFrameId);
+    }
   };
   const emptySubcopy = !hasEvidence && !running
     ? "Smalltalk will quietly keep enough context to help you continue later."
@@ -4948,41 +4998,19 @@ function ContinuationAnswer({
     >
       <div className="answer-shell">
         <MosaicLeafBackground />
-        {publicProjection?.resumeSurface ? (
-          <div className="answer-destination">
-            <SurfaceGlyph label={publicProjection.resumeSurface} />
-            <div>
-              <span>Continue from</span>
-              <strong>{publicProjection.resumeSurface}</strong>
-            </div>
-          </div>
-        ) : null}
-
         <div className="answer-hero answer-hero-public" aria-live="polite">
           {!publicProjection ? <p>{noClearCurrentTask ? "Continue" : "You were"}</p> : null}
           <h2>{publicHeadline}</h2>
           {publicMemoryLine ? <p className="answer-memory-line">{publicMemoryLine}</p> : null}
         </div>
 
-        {canOpenResumeTarget || !noClearCurrentTask ? (
+        {!noClearCurrentTask ? (
         <div className="answer-actions answer-primary-actions">
-          {canOpenResumeTarget ? (
-            <button
-              className="primary-button"
-              type="button"
-              disabled={busyAction !== null}
-              aria-busy={busyAction === "open_continue_target"}
-              onClick={onOpenTarget}
-            >
-              {publicActionLabel}
-            </button>
-          ) : null}
-          {!noClearCurrentTask ? (
-            <details className="answer-more-menu">
-              <summary aria-label="More actions" title="More actions">
-                <ProductIcon name="more" />
-              </summary>
-              <div>
+          <details className="answer-more-menu">
+            <summary aria-label="More actions" title="More actions">
+              <ProductIcon name="more" />
+            </summary>
+            <div>
                 <button
                   type="button"
                   disabled={busyAction !== null}
@@ -5047,76 +5075,132 @@ function ContinuationAnswer({
                     {alternativesOpen ? "Hide other possibilities" : "Show other possibilities"}
                   </button>
                 ) : null}
-              </div>
-            </details>
-          ) : null}
+            </div>
+          </details>
         </div>
-        ) : null}
-
-        {publicProjection?.exactTargetNote ? (
-          <p className="answer-target-note">{publicProjection.exactTargetNote}</p>
-        ) : null}
-
-        {openResult ? (
-          <div className="continue-open-result" role="status">
-            <strong>Open target</strong>
-            <span>{presentOpenResult(openResult)}</span>
-          </div>
         ) : null}
       </div>
 
       {hasDetails ? (
-        <section className="answer-details-surface" aria-label="Continue details">
-          <div className="context-heading">
-            <div>
-              <h3>Continue details</h3>
-            </div>
-            <p>What you were doing, where you left off, and what comes next.</p>
-          </div>
-          {detailSemanticRows.length > 0 ? (
-            <dl className="answer-semantic-grid">
-              {detailSemanticRows.map(([label, value]) => (
-                <div key={label}>
-                  <dt>{label}</dt>
-                  <dd>{value}</dd>
+        <section className="continuation-field" aria-label="Continuation">
+          {showCoreContinuation ? (
+            <div className="continuation-core">
+              {continuationField.checkpoint ? (
+                <section className="continuation-copy-block" aria-labelledby="last-checkpoint-heading">
+                  <h3 id="last-checkpoint-heading">Last checkpoint</h3>
+                  <p>{continuationField.checkpoint}</p>
+                </section>
+              ) : null}
+              <section className="continuation-copy-block continuation-next" aria-labelledby="continue-from-here-heading">
+                <h3 id="continue-from-here-heading">Continue from here</h3>
+                <p>{continuationField.continuation}</p>
+              </section>
+
+              <div className="continuation-location">
+                {continuationField.locationLabel ? (
+                  <SurfaceGlyph label={continuationField.locationLabel} />
+                ) : (
+                  <span className="surface-glyph surface-glyph-neutral" aria-hidden="true">
+                    <Monitor size={17} weight="regular" />
+                  </span>
+                )}
+                <div className="continuation-location-copy">
+                  <strong>{continuationField.locationLabel || "Return location"}</strong>
+                  {continuationField.targetStatus ? (
+                    <span>{continuationField.targetStatus}</span>
+                  ) : (
+                    <span>Safe return point</span>
+                  )}
                 </div>
-              ))}
-            </dl>
-          ) : null}
+                {canOpenResumeTarget ? (
+                  <button
+                    className="primary-button continuation-open-action"
+                    type="button"
+                    disabled={busyAction !== null}
+                    aria-busy={busyAction === "open_continue_target"}
+                    onClick={onOpenTarget}
+                  >
+                    {publicActionLabel}
+                  </button>
+                ) : null}
+              </div>
 
-          {recentContext.length > 0 ? (
-          <section className="answer-memory-section" aria-labelledby="travel-path-heading">
-            <div className="answer-section-heading">
-              <span className="answer-section-label" id="travel-path-heading">Recent trail</span>
-              <small>Oldest to newest</small>
+              {openResult ? (
+                <div className="continue-open-result" role="status">
+                  <strong>Open target</strong>
+                  <span>{presentOpenResult(openResult)}</span>
+                </div>
+              ) : null}
+
+              {hasContextDisclosure ? (
+                <section className={`continuation-context ${contextOpen ? "open" : ""}`} aria-label="Context trail">
+                  <button
+                    className="continuation-context-trigger"
+                    type="button"
+                    aria-expanded={contextOpen}
+                    aria-controls="continuation-context-content"
+                    onClick={toggleContext}
+                  >
+                    <span>Context trail</span>
+                    {recentContext.length > 0 ? (
+                      <span className="continuation-trail-preview" aria-hidden="true">
+                        {recentContext.map((visit, index) => (
+                          <span key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}>
+                            {index > 0 ? <CaretRight size={12} weight="bold" /> : null}
+                            {recentContextSurfaceLabel(visit)}
+                          </span>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="continuation-trail-preview" aria-hidden="true">Visual cue available</span>
+                    )}
+                    <span className="continuation-context-action">
+                      {contextOpen ? "Hide" : "Show"}
+                      <CaretDown size={14} weight="bold" aria-hidden="true" />
+                    </span>
+                  </button>
+
+                  {contextOpen ? (
+                    <div className="continuation-context-content" id="continuation-context-content">
+                      {recentContext.length > 0 ? (
+                        <ol className="answer-context-list">
+                          {recentContext.map((visit) => (
+                            <RecentContextVisit
+                              key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}
+                              visit={visit}
+                            />
+                          ))}
+                        </ol>
+                      ) : null}
+
+                      {visualCueMatchesAnswer && selectedFrame && imageData ? (
+                        <section className="context-visual-cue" aria-label="Visual cue">
+                          <div>
+                            <span>Visual cue</span>
+                            <strong>{evidenceAnchorLabel(selectedFrame)}</strong>
+                          </div>
+                          <div className="context-visual-image" style={stageStyle(selectedFrame)}>
+                            <img src={imageData} alt={`Visual cue from ${evidenceAnchorLabel(selectedFrame)}`} />
+                          </div>
+                        </section>
+                      ) : evidencePreviewFrameId ? (
+                        <p className="continuation-visual-loading" role="status">Loading the last meaningful screen…</p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </section>
+              ) : null}
+
+              {productState?.olderContextLine ? (
+                <p className="continuation-note">{productState.olderContextLine}</p>
+              ) : null}
+
+              {!publicProjection && (lowConfidence || uncertaintyLine) ? (
+                <p className="continuation-note">
+                  {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
+                </p>
+              ) : null}
             </div>
-            <ol className="answer-context-list">
-              {recentContext.map((visit) => (
-                <RecentContextVisit
-                  key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}
-                  visit={visit}
-                />
-              ))}
-            </ol>
-          </section>
-          ) : null}
-
-          {!publicProjection ? <div className="answer-target">
-            <div>
-              <span>{targetBlockLabel}</span>
-              <strong>{targetLine}</strong>
-              <small>{targetMeta}</small>
-            </div>
-          </div> : null}
-
-          {productState?.olderContextLine ? (
-            <p className="answer-context">{productState.olderContextLine}</p>
-          ) : null}
-
-          {lowConfidence || uncertaintyLine ? (
-            <p className="answer-uncertainty">
-              {uncertaintyLine || "Evidence is thin, so this is the best available local recommendation."}
-            </p>
           ) : null}
 
           {taskTruthAlternatives.length > 0 ? (
@@ -5197,17 +5281,6 @@ function ContinuationAnswer({
             </div>
           ) : null}
 
-          {visualCueVisible && selectedFrame && imageData ? (
-            <section className="context-visual-cue" aria-label="Visual cue">
-              <div>
-                <span>Visual cue</span>
-                <strong>{evidenceAnchorLabel(selectedFrame)}</strong>
-              </div>
-              <div className="context-visual-image" style={stageStyle(selectedFrame)}>
-                <img src={imageData} alt={`Visual cue from ${evidenceAnchorLabel(selectedFrame)}`} />
-              </div>
-            </section>
-          ) : null}
         </section>
       ) : null}
     </section>

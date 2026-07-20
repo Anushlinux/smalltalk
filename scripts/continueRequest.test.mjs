@@ -5,6 +5,7 @@ import {
   ContinueRequestTimeoutError,
   continueRequestErrorCopy,
   isContinueRequestTimeout,
+  isTransientScreenshotCaptureContention,
   withContinueRequestTimeout,
 } from "../src/continueRequest.ts";
 
@@ -32,5 +33,24 @@ test("turns backend coordination timeouts into clear product copy", () => {
       "workload governor timed out waiting for manualcontinue",
     ),
     "Continue could not start because an earlier capture or refresh was still finishing. The previous answer is still available; please try again.",
+  );
+});
+
+test("recognizes transient screenshot admission collisions", () => {
+  assert.equal(
+    isTransientScreenshotCaptureContention(
+      "workload governor timed out waiting for screenshotcapture",
+    ),
+    true,
+  );
+  assert.equal(
+    isTransientScreenshotCaptureContention(
+      "workload governor timed out waiting for screenshotmemory",
+    ),
+    true,
+  );
+  assert.equal(
+    isTransientScreenshotCaptureContention("screen recording permission denied"),
+    false,
   );
 });
