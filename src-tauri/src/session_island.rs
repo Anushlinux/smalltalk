@@ -2957,9 +2957,16 @@ mod tests {
             .and_then(|suffix| suffix.split("private var shouldReduceMotion").next())
             .expect("Swift must keep bounded ambient-memory content");
         assert!(ambient.contains("Button(action: onReadyAction)"));
+        assert!(ambient.contains("model.memoryActive"));
+        assert!(ambient.contains("Start memory before generating an answer"));
+        assert!(ambient.contains("runBlockedContinueShake()"));
+        assert!(ambient.contains("? [-2, 2, 0]"));
+        assert!(ambient.contains(": [-10, 10, -10, 10, -10, 10, -10, 8, -8, 0]"));
+        assert!(ambient.contains("withAnimation(.linear(duration: stepDuration))"));
         assert!(ambient.contains("if model.continueGenerating"));
         assert!(ambient.contains("Color.clear"));
-        assert!(ambient.contains(".help(\"Show what I was doing\")"));
+        assert!(ambient.contains("model.memoryActive ? \"Show what I was doing\""));
+        assert!(ambient.contains("\"Start memory first\""));
         assert!(ambient.contains("Button(action: onStartMemory)"));
         assert!(ambient.contains(".accessibilityLabel(\"Start memory\")"));
         assert!(ambient.contains(".help(\"Start memory\")"));
@@ -3112,8 +3119,10 @@ mod tests {
         assert!(finish_continue.contains("setPresentation(.answerSummary)"));
         assert!(source.contains("@Published var presentation: WhisperFlowPresentation = .micro"));
         assert!(source.contains("@Published var continueGenerating = false"));
+        assert!(source.contains("@Published var blockedContinueShakeNonce: UInt64 = 0"));
         assert!(source.contains("@Published var answer: WhisperFlowAnswerContent?"));
         assert!(source.contains("private var continueRequestInFlight = false"));
+        assert!(source.contains("private var blockedContinueShakeNonce: UInt64 = 0"));
         assert!(source.contains("private var latchedAnswer: WhisperFlowAnswerContent?"));
         assert!(source.contains("private var latchedDecisionId: String?"));
         assert!(source.contains("@Published var startingFeedbackNonce: UInt64?"));
@@ -3121,6 +3130,15 @@ mod tests {
         assert!(source.contains("private var activeStartingFeedbackNonce: UInt64?"));
         assert!(source.contains("private var presentation: WhisperFlowPresentation = .micro"));
         assert!(source.contains("self?.handle(action: \"start_memory\")"));
+        let request_continue = source
+            .split("private func requestContinue()")
+            .nth(1)
+            .and_then(|suffix| suffix.split("private func finishContinueRequest").next())
+            .expect("Swift must keep a bounded Continue request gate");
+        assert!(request_continue.contains("guard memoryActive else"));
+        assert!(request_continue.contains("blockedContinueShakeNonce &+= 1"));
+        assert!(request_continue.contains("updateContent()"));
+        assert!(request_continue.contains("guard sendAction(\"continue\") else"));
         assert!(!source.contains("answerRevealTimer"));
         assert!(!source.contains("answerReturnTimer"));
         assert!(!source.contains("kWhisperFlowAnswerRevealDelay"));
@@ -3251,16 +3269,10 @@ mod tests {
             );
         }
         let ordered_labels = [
-            "Task object",
-            "Current activity — observed surface",
-            "Current activity — immediate operation",
-            "Current activity — operation effect",
-            "Current activity — current subtask",
-            "Current activity — relationship to primary",
-            "Last meaningful progress",
-            "Unfinished state",
-            "Next action",
-            "Where summary",
+            "Current activity",
+            "Last checkpoint",
+            "Continue from here",
+            "Return to",
         ];
         let mut previous = 0;
         for label in ordered_labels {
@@ -3270,6 +3282,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing semantic field label {label:?}"));
             previous = position + label.len();
         }
+        for internal_label in [
+            "Current activity — relationship to primary",
+            "Last meaningful progress",
+            "Unfinished state",
+            "Where summary",
+        ] {
+            assert!(
+                !answer_content.contains(internal_label),
+                "answer content must not expose internal label {internal_label:?}"
+            );
+        }
+        assert!(answer_content.contains("Self.currentActivitySummary(answer, excluding: title)"));
+        assert!(
+            answer_content.contains("Self.usefulContinuation(answer, fallback: state.nextAction)")
+        );
+        assert!(answer_content.contains("task remains unresolved"));
         for forbidden in [
             "activityLabel",
             "activitySummary",
@@ -3308,6 +3336,7 @@ mod tests {
             .and_then(|suffix| suffix.split("private var morphAnimation").next())
             .expect("Swift must keep the content-driven expanded answer");
         assert!(answer_expanded.contains("Text(answer.title)"));
+        assert!(answer_expanded.contains("Brand.instrumentSerifFont(size: s(24))"));
         assert!(answer_expanded.contains("Text(row.value)"));
         assert!(answer_expanded.contains("ScrollView(.vertical, showsIndicators: true)"));
         assert!(answer_expanded.contains("width: s(model.answerLayout.expandedWidth)"));
@@ -3330,6 +3359,7 @@ mod tests {
             .nth(1)
             .and_then(|suffix| suffix.split("private func measuredTextWidth").next())
             .expect("Swift must measure answer geometry from rendered content");
+        assert!(adaptive_layout.contains("Brand.instrumentSerifNSFont(size: 24)"));
         assert!(adaptive_layout.contains("measuredTextWidth(answer.title"));
         assert!(adaptive_layout.contains("row.value,"));
         assert!(adaptive_layout.contains("lineSpacing: 3"));

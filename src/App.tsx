@@ -18,13 +18,22 @@ import {
   CaretUp,
   ClockCounterClockwise,
   Code,
+  Compass,
   Database,
+  DiscordLogo,
   DotsThree,
   Eye,
+  FigmaLogo,
+  GithubLogo,
+  GlobeSimple,
+  GoogleChromeLogo,
   ChatCircleText,
   Monitor,
+  NotionLogo,
+  OpenAiLogo,
   ShieldCheck,
   SidebarSimple,
+  SlackLogo,
   SlidersHorizontal,
   TerminalWindow,
 } from "@phosphor-icons/react";
@@ -44,6 +53,7 @@ import {
   inspectTargetCopy,
   isDirectPresentationTargetOpenable,
   recentContextSurfaceLabel,
+  recentContextSurfaceKind,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_COPY,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
@@ -58,6 +68,7 @@ import {
   type ContinueTaskResolutionStatus,
   type ContinueTaskTruthAnswer,
   type ContinueTaskTruthRecentContext,
+  type ContinueSurfaceProjection,
 } from "./continuePresentation";
 import {
   continueRequestErrorCopy,
@@ -66,6 +77,7 @@ import {
 } from "./continueRequest";
 import { MosaicLeafBackground } from "./MosaicLeafBackground";
 import smalltalkLogo from "./assets/smalltalk-logo.png";
+import "@fontsource/instrument-serif/400.css";
 import "./App.css";
 
 gsap.registerPlugin(useGSAP);
@@ -3138,7 +3150,7 @@ function App() {
       <header className={`product-toolbar ${viewMode === "continue" ? "continue-toolbar" : ""}`}>
         {viewMode === "continue" ? (
           <h1 className="continue-greeting">
-            Pick up where you left off <kbd aria-label="Option">⌥</kbd>
+            Pick up where you left off
           </h1>
         ) : (
           <div>
@@ -4612,12 +4624,13 @@ function latestTimestamp(snapshot: ContinueEvidenceSnapshot) {
 
 function RecentContextVisit({ visit }: { visit: ContinueTaskTruthRecentContext }) {
   const surfaceLabel = recentContextSurfaceLabel(visit);
+  const surfaceKind = recentContextSurfaceKind(visit);
   const relationship = safeProductLine(visit.relationship_to_primary_task || "", "");
   const activityLabel = relationship || {
     primary_work: "Worked on the task",
     supporting_work: "Supported the task",
     detour_or_unrelated: "Brief detour",
-    unclear: "Recent work",
+    unclear: visit.is_current ? "Current work surface" : "Observed work surface",
   }[visit.semantic_role || "unclear"];
   const marker = visit.is_current ? "Current" : visit.revisited ? "Returned" : null;
 
@@ -4628,34 +4641,81 @@ function RecentContextVisit({ visit }: { visit: ContinueTaskTruthRecentContext }
         visit.semantic_role ? `role-${visit.semantic_role}` : "",
       ].filter(Boolean).join(" ")}
     >
-      <SurfaceGlyph label={surfaceLabel} />
-      <div className="answer-context-copy">
+      <div className="continuation-trail-stop-heading">
+        <SurfaceGlyph
+          label={surfaceLabel}
+          appLabel={visit.app_label}
+          siteHostname={visit.site_hostname}
+        />
         <div className="answer-context-surface">
           <strong>{surfaceLabel}</strong>
-          {surfaceLabel === visit.app_label && visit.site_hostname ? <span>{visit.site_hostname}</span> : null}
+          <span>{[surfaceKind, marker].filter(Boolean).join(" · ")}</span>
         </div>
-        <small>{activityLabel}</small>
       </div>
-      {marker ? <em>{marker}</em> : null}
+      <small>{activityLabel}</small>
     </li>
   );
 }
 
-function SurfaceGlyph({ label }: { label: string }) {
-  const normalized = label.toLowerCase();
-  const Icon = normalized.includes("terminal")
+function SurfaceGlyph({
+  label,
+  appLabel,
+  siteHostname,
+}: {
+  label: string;
+  appLabel?: string | null;
+  siteHostname?: string | null;
+}) {
+  const normalized = `${label} ${appLabel || ""} ${siteHostname || ""}`.toLowerCase();
+  if (normalized.includes("smalltalk")) {
+    return (
+      <span className="surface-glyph surface-glyph-smalltalk" aria-hidden="true" title={label}>
+        <img src={smalltalkLogo} alt="" />
+      </span>
+    );
+  }
+  const isBrandIcon = [
+    "codex",
+    "chatgpt",
+    "openai",
+    "google chrome",
+    "chrome",
+    "github",
+    "figma",
+    "notion",
+    "slack",
+    "discord",
+  ].some((brand) => normalized.includes(brand));
+  const Icon = normalized.includes("codex")
+    || normalized.includes("chatgpt")
+    || normalized.includes("openai")
+    ? OpenAiLogo
+    : normalized.includes("chrome")
+      ? GoogleChromeLogo
+      : normalized.includes("github")
+        ? GithubLogo
+        : normalized.includes("figma")
+          ? FigmaLogo
+          : normalized.includes("notion")
+            ? NotionLogo
+            : normalized.includes("slack")
+              ? SlackLogo
+              : normalized.includes("discord")
+                ? DiscordLogo
+                : normalized.includes("safari")
+                  ? Compass
+                  : normalized.includes("terminal")
     ? TerminalWindow
-    : normalized.includes("vs code") || normalized.includes("codex") || normalized.includes("code")
+    : normalized.includes("vs code") || normalized.includes("visual studio code") || normalized.includes("code")
       ? Code
-      : normalized.includes("chatgpt") || normalized.includes("chat")
+      : siteHostname
+        ? GlobeSimple
+        : normalized.includes("chat")
         ? ChatCircleText
-        : normalized.includes("openai")
-          || normalized.includes("thinking machines")
-          || normalized.includes("http")
-          || normalized.includes("www")
+        : normalized.includes("http") || normalized.includes("www")
           ? Browser
           : Monitor;
-  const tone = normalized.includes("vs code")
+  const tone = normalized.includes("vs code") || normalized.includes("visual studio code")
     ? "code"
     : normalized.includes("openai") || normalized.includes("codex") || normalized.includes("chatgpt")
       ? "openai"
@@ -4665,8 +4725,31 @@ function SurfaceGlyph({ label }: { label: string }) {
 
   return (
     <span className="surface-glyph" data-tone={tone} aria-hidden="true" title={label}>
-      <Icon size={17} weight="regular" />
+      <Icon size={18} weight={isBrandIcon ? "fill" : "regular"} />
     </span>
+  );
+}
+
+function ContinuationSurfaceBadge({
+  surface,
+}: {
+  surface: ContinueSurfaceProjection;
+}) {
+  return (
+    <div
+      className="continuation-surface-badge"
+      aria-label={`${surface.label}, ${surface.kind}`}
+    >
+      <SurfaceGlyph
+        label={surface.label}
+        appLabel={surface.appLabel}
+        siteHostname={surface.siteHostname}
+      />
+      <span>
+        <strong>{surface.label}</strong>
+        <small>{surface.kind}</small>
+      </span>
+    </div>
   );
 }
 
@@ -4696,6 +4779,54 @@ function ContinueGeneratingIndicator() {
         <span>Reconstructing the last meaningful place to continue.</span>
       </div>
     </div>
+  );
+}
+
+function ContinuationDetailsPlaceholder({
+  generating = false,
+  hasEvidence,
+  running,
+  checkpointCopy: checkpointCopyOverride,
+  continuationCopy: continuationCopyOverride,
+}: {
+  generating?: boolean;
+  hasEvidence: boolean;
+  running: boolean;
+  checkpointCopy?: string | null;
+  continuationCopy?: string | null;
+}) {
+  const checkpointCopy = checkpointCopyOverride || (generating
+    ? "Finding the last clear point you reached…"
+    : hasEvidence
+      ? "Your last clear checkpoint will appear here when an answer is ready."
+      : running
+        ? "Keep working. Your last clear checkpoint will appear here once Smalltalk has enough context."
+        : "Turn on local memory so Smalltalk can remember the last clear point you reached.");
+  const continuationCopy = continuationCopyOverride || (generating
+    ? "Working out the most useful next step…"
+    : hasEvidence
+      ? "Your next supported step will appear here when an answer is ready."
+      : running
+        ? "Smalltalk will suggest where to continue once it understands enough of your work."
+        : "Once local memory is on, Smalltalk can help you return to unfinished work.");
+
+  return (
+    <section className="continuation-field continuation-field-placeholder" aria-label="Continuation preview">
+      <div className="continuation-core">
+        <section className="continuation-copy-block">
+          <div className="continuation-copy-heading">
+            <h3>Last checkpoint</h3>
+          </div>
+          <p>{checkpointCopy}</p>
+        </section>
+        <section className="continuation-copy-block continuation-next">
+          <div className="continuation-copy-heading">
+            <h3>Continue from here</h3>
+          </div>
+          <p>{continuationCopy}</p>
+        </section>
+      </div>
+    </section>
   );
 }
 
@@ -4874,6 +5005,8 @@ function ContinuationAnswer({
             || "",
           "No unfinished step was clearly captured.",
         ),
+        checkpointSurface: null,
+        continuationSurface: null,
         locationLabel: safeProductLine(
           humanTargetLabel(resumeTarget) || activityWhereLine || currentFocusLine,
           "",
@@ -4971,6 +5104,7 @@ function ContinuationAnswer({
           <MosaicLeafBackground />
           <ContinueGeneratingIndicator />
         </div>
+        <ContinuationDetailsPlaceholder generating hasEvidence={hasEvidence} running={running} />
       </section>
     );
   }
@@ -4986,6 +5120,7 @@ function ContinuationAnswer({
             <span>{emptySubcopy}</span>
           </div>
         </div>
+        <ContinuationDetailsPlaceholder hasEvidence={hasEvidence} running={running} />
       </section>
     );
   }
@@ -5004,82 +5139,23 @@ function ContinuationAnswer({
           {publicMemoryLine ? <p className="answer-memory-line">{publicMemoryLine}</p> : null}
         </div>
 
-        {!noClearCurrentTask ? (
-        <div className="answer-actions answer-primary-actions">
-          <details className="answer-more-menu">
-            <summary aria-label="More actions" title="More actions">
-              <ProductIcon name="more" />
-            </summary>
-            <div>
-                <button
-                  type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => recordAndClose("rejected", taskTruthAnswer ? {
-                    taskSnapshotId: taskTruthAnswer.snapshot_id,
-                    taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
-                    affectedTaskField: "task_summary",
-                  } : undefined)}
-                >
-                  This isn’t right
-                </button>
-                <button
-                  type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => recordAndClose(
-                    taskTruthAnswer ? "supporting_work" : "artifact_only_evidence",
-                    taskTruthAnswer ? {
-                      taskSnapshotId: taskTruthAnswer.snapshot_id,
-                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
-                      affectedTaskField: "relationship",
-                      taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
-                    } : undefined,
-                  )}
-                >
-                  This was supporting work
-                </button>
-                <button
-                  type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => recordAndClose(
-                    taskTruthAnswer ? "unrelated_activity" : "ignored_workstream",
-                    taskTruthAnswer ? {
-                      taskSnapshotId: taskTruthAnswer.snapshot_id,
-                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
-                      affectedTaskField: "relationship",
-                      taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
-                    } : undefined,
-                  )}
-                >
-                  This was unrelated
-                </button>
-                {taskTruthAnswer ? (
-                  <button
-                    type="button"
-                    disabled={busyAction !== null}
-                    onClick={() => recordAndClose("completed", {
-                      taskSnapshotId: taskTruthAnswer.snapshot_id,
-                      taskSnapshotRevision: taskTruthAnswer.snapshot_revision,
-                      affectedTaskField: "task_status",
-                      taskHypothesisId: taskTruthAnswer.selected_hypothesis_id,
-                    })}
-                  >
-                    Mark task complete
-                  </button>
-                ) : null}
-                {alternatives.length > 0 ? (
-                  <button
-                    type="button"
-                    disabled={busyAction !== null}
-                    onClick={() => setAlternativesOpen((open) => !open)}
-                  >
-                    {alternativesOpen ? "Hide other possibilities" : "Show other possibilities"}
-                  </button>
-                ) : null}
-            </div>
-          </details>
-        </div>
-        ) : null}
       </div>
+
+      {!showCoreContinuation ? (
+        <ContinuationDetailsPlaceholder
+          hasEvidence={hasEvidence}
+          running={running}
+          checkpointCopy={
+            productState?.lastStateLine
+              || taskInferenceFailure?.detail
+              || NO_CLEAR_CURRENT_TASK_COPY.lastStateLine
+          }
+          continuationCopy={
+            productState?.nextActionLine
+              || NO_CLEAR_CURRENT_TASK_COPY.nextActionLine
+          }
+        />
+      ) : null}
 
       {hasDetails ? (
         <section className="continuation-field" aria-label="Continuation">
@@ -5087,31 +5163,23 @@ function ContinuationAnswer({
             <div className="continuation-core">
               {continuationField.checkpoint ? (
                 <section className="continuation-copy-block" aria-labelledby="last-checkpoint-heading">
-                  <h3 id="last-checkpoint-heading">Last checkpoint</h3>
+                  <div className="continuation-copy-heading">
+                    <h3 id="last-checkpoint-heading">Last checkpoint</h3>
+                    {continuationField.checkpointSurface ? (
+                      <ContinuationSurfaceBadge surface={continuationField.checkpointSurface} />
+                    ) : null}
+                  </div>
                   <p>{continuationField.checkpoint}</p>
                 </section>
               ) : null}
               <section className="continuation-copy-block continuation-next" aria-labelledby="continue-from-here-heading">
-                <h3 id="continue-from-here-heading">Continue from here</h3>
-                <p>{continuationField.continuation}</p>
-              </section>
-
-              <div className="continuation-location">
-                {continuationField.locationLabel ? (
-                  <SurfaceGlyph label={continuationField.locationLabel} />
-                ) : (
-                  <span className="surface-glyph surface-glyph-neutral" aria-hidden="true">
-                    <Monitor size={17} weight="regular" />
-                  </span>
-                )}
-                <div className="continuation-location-copy">
-                  <strong>{continuationField.locationLabel || "Return location"}</strong>
-                  {continuationField.targetStatus ? (
-                    <span>{continuationField.targetStatus}</span>
-                  ) : (
-                    <span>Safe return point</span>
-                  )}
+                <div className="continuation-copy-heading">
+                  <h3 id="continue-from-here-heading">Continue from here</h3>
+                  {continuationField.continuationSurface ? (
+                    <ContinuationSurfaceBadge surface={continuationField.continuationSurface} />
+                  ) : null}
                 </div>
+                <p>{continuationField.continuation}</p>
                 {canOpenResumeTarget ? (
                   <button
                     className="primary-button continuation-open-action"
@@ -5123,7 +5191,7 @@ function ContinuationAnswer({
                     {publicActionLabel}
                   </button>
                 ) : null}
-              </div>
+              </section>
 
               {openResult ? (
                 <div className="continue-open-result" role="status">
@@ -5134,45 +5202,39 @@ function ContinuationAnswer({
 
               {hasContextDisclosure ? (
                 <section className={`continuation-context ${contextOpen ? "open" : ""}`} aria-label="Context trail">
-                  <button
-                    className="continuation-context-trigger"
-                    type="button"
-                    aria-expanded={contextOpen}
-                    aria-controls="continuation-context-content"
-                    onClick={toggleContext}
-                  >
-                    <span>Context trail</span>
-                    {recentContext.length > 0 ? (
-                      <span className="continuation-trail-preview" aria-hidden="true">
-                        {recentContext.map((visit, index) => (
-                          <span key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}>
-                            {index > 0 ? <CaretRight size={12} weight="bold" /> : null}
-                            {recentContextSurfaceLabel(visit)}
-                          </span>
-                        ))}
-                      </span>
-                    ) : (
-                      <span className="continuation-trail-preview" aria-hidden="true">Visual cue available</span>
-                    )}
-                    <span className="continuation-context-action">
-                      {contextOpen ? "Hide" : "Show"}
-                      <CaretDown size={14} weight="bold" aria-hidden="true" />
-                    </span>
-                  </button>
+                  <div className="continuation-context-heading">
+                    <h3>Context trail</h3>
+                    {evidencePreviewFrameId ? (
+                      <button
+                        className="continuation-context-trigger"
+                        type="button"
+                        aria-expanded={contextOpen}
+                        aria-controls="continuation-context-content"
+                        onClick={toggleContext}
+                      >
+                        <span>{contextOpen ? "Hide visual cue" : "Show visual cue"}</span>
+                        <CaretDown size={14} weight="bold" aria-hidden="true" />
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {recentContext.length > 0 ? (
+                    <ol
+                      className="continuation-context-rail"
+                      aria-label="Work surfaces in chronological order"
+                      tabIndex={0}
+                    >
+                      {recentContext.map((visit) => (
+                        <RecentContextVisit
+                          key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}
+                          visit={visit}
+                        />
+                      ))}
+                    </ol>
+                  ) : null}
 
                   {contextOpen ? (
                     <div className="continuation-context-content" id="continuation-context-content">
-                      {recentContext.length > 0 ? (
-                        <ol className="answer-context-list">
-                          {recentContext.map((visit) => (
-                            <RecentContextVisit
-                              key={`${visit.sequence_index}:${visit.first_observed_at_ms}`}
-                              visit={visit}
-                            />
-                          ))}
-                        </ol>
-                      ) : null}
-
                       {visualCueMatchesAnswer && selectedFrame && imageData ? (
                         <section className="context-visual-cue" aria-label="Visual cue">
                           <div>

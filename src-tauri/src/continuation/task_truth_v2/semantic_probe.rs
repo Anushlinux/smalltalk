@@ -1569,9 +1569,9 @@ current_step is the human-facing main answer. When primary_task is non-null, wri
 
 Each visit role must cite that visit's own image slot, may cite other request-local slots to explain its relationship, and must include a short evidence-grounded relationship to the inferred primary task. relationship_to_primary_task is user-facing context-trail copy: write 4 to 10 plain words describing the visit's useful contribution, support, return, interruption, or detour. Prefer wording such as 'Checked the API docs' or 'Returned for the live test.' Do not say 'this image shows', 'this screen shows', 'the evidence shows', or 'this visit shows'. Use unclear when the pixels do not establish the relationship.
 
-last_progress must be one result-first plain sentence, normally 8 to 18 words and never more than 20 words. Describe the last meaningful completed outcome, not the app or a list of checks. Compress multiple successful checks into one human result unless a specific failure matters. Prefer 'The code and automated checks were done' over 'The implementation completed with verification checks passing.'
+last_progress must be one result-first plain sentence, normally 8 to 18 words and never more than 20 words. Describe the last meaningful completed outcome, not the app or a list of checks. When cited evidence clearly identifies the app or page and naming it materially helps recognition, name it once while keeping the completed result primary. Compress multiple successful checks into one human result unless a specific failure matters. Prefer 'The code and automated checks were done in Codex' over 'The implementation completed with verification checks passing.'
 
-unfinished_state must be one direct plain sentence, normally 12 to 26 words. State the earliest concrete unresolved step and begin with a clear action when that action is visibly supported. If the exact action is unsupported, state what remains unresolved without manufacturing a step. Prefer 'Restart the app and test Continue once' over 'Live validation remained unfinished.' Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
+unfinished_state must be one direct plain sentence, normally 12 to 26 words. State the earliest concrete unresolved step and begin with a clear action when that action is visibly supported. When cited evidence identifies where the action belongs, the sentence itself must name that app, product, or page, for example: 'Open Smalltalk and run one real Continue interaction to confirm the redesigned card' or 'In Codex, run one real Continue test.' Never use placeholder destinations such as 'the running app', 'the current app', 'the app', 'the browser', or 'the page' when a supported name is available. Never attach an app or page from an unrelated or unclear visit. If the exact action or destination is unsupported, state what remains unresolved without manufacturing a step or destination. Prefer 'Open Smalltalk and test Continue once' over 'Live validation remained unfinished.' Do not invent intent, progress, unfinished work, paths, URLs, identifiers, or next actions. confidence_by_field expresses confidence in either the asserted value or the decision that the field is null. Return strict JSON matching the supplied schema."#
 }
 
 fn request_size_allowed(structured_bytes: usize, estimated_text_tokens: usize) -> bool {
@@ -6221,11 +6221,17 @@ mod tests {
         assert!(instruction.contains("Do not say 'this image shows'"));
         assert!(instruction.contains("normally 8 to 18 words"));
         assert!(instruction.contains("last meaningful completed outcome"));
+        assert!(instruction.contains("naming it materially helps recognition"));
         assert!(instruction.contains("normally 12 to 26 words"));
         assert!(instruction.contains("earliest concrete unresolved step"));
+        assert!(instruction.contains("the sentence itself must name that app, product, or page"));
+        assert!(instruction.contains("Open Smalltalk and run one real Continue interaction"));
+        assert!(instruction.contains("placeholder destinations such as 'the running app'"));
+        assert!(instruction.contains("In Codex, run one real Continue test"));
+        assert!(instruction.contains("unrelated or unclear visit"));
         assert!(instruction.contains("without manufacturing a step"));
         assert!(instruction.contains("The code and automated checks were done"));
-        assert!(instruction.contains("Restart the app and test Continue once"));
+        assert!(instruction.contains("Open Smalltalk and test Continue once"));
         assert!(instruction.contains("Express uncertainty only in confidence_by_field"));
     }
 

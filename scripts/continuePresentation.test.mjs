@@ -8,6 +8,7 @@ import {
   buildContinueContinuationFieldProjection,
   buildContinuePublicProjection,
   compareContinueDecisionAdoption,
+  continuationSurfacesForPresentation,
   getContinuePresentationActionState,
   hasVisibleTaskTruthContinuationDetails,
   hasVisibleTaskTruthSemantics,
@@ -16,6 +17,7 @@ import {
   recentContextForPresentation,
   recentContextRoleLabel,
   recentContextSurfaceLabel,
+  recentContextSurfaceKind,
   taskInferenceFailurePresentation,
   NO_CLEAR_CURRENT_TASK_HEADLINE,
   selectPrimaryTaskHeadline,
@@ -325,6 +327,7 @@ test("recent context compresses repeated shell visits without losing the latest 
   assert.equal(visible[0].first_observed_at_ms, 100);
   assert.deepEqual(visible[0].evidence_refs, ["frame-1", "frame-2"]);
   assert.equal(recentContextSurfaceLabel(visible[0]), "Thinking Machines");
+  assert.equal(recentContextSurfaceKind(visible[0]), "Page");
 });
 
 test("public projection uses the human current-step sentence while preserving the compact task title", () => {
@@ -370,6 +373,18 @@ test("public projection uses the human current-step sentence while preserving th
     {
       checkpoint: "The build and automated tests had already passed",
       continuation: "A fresh result still needs visual confirmation",
+      checkpointSurface: {
+        label: "Codex",
+        kind: "App",
+        appLabel: "Codex",
+        siteHostname: null,
+      },
+      continuationSurface: {
+        label: "Codex",
+        kind: "App",
+        appLabel: "Codex",
+        siteHostname: null,
+      },
       locationLabel: "Codex",
       targetStatus: "Exact place not captured",
       openActionLabel: null,
@@ -387,6 +402,10 @@ test("public projection uses the human current-step sentence while preserving th
 
 test("continuation field prefers unfinished state and falls back without inventing completion", () => {
   const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  assert.deepEqual(continuationSurfacesForPresentation(answer, answer.where_summary), {
+    checkpointSurface: null,
+    continuationSurface: null,
+  });
   Object.assign(answer, {
     unfinished_state: null,
     next_action: "Run the final presentation checks.",
@@ -425,6 +444,8 @@ test("unresolved answers keep individually supported continuation details visibl
     {
       checkpoint: "The information hierarchy was clarified.",
       continuation: "Implement the refinements and verify the result.",
+      checkpointSurface: null,
+      continuationSurface: null,
       locationLabel: null,
       targetStatus: "Return location not captured",
       openActionLabel: null,
@@ -433,7 +454,7 @@ test("unresolved answers keep individually supported continuation details visibl
   );
 });
 
-test("context trail omits visits without a grounded useful relationship", () => {
+test("context trail omits detours but keeps the current observed work surface", () => {
   const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
   answer.recent_context = [
     {
@@ -457,7 +478,124 @@ test("context trail omits visits without a grounded useful relationship", () => 
       relationship_to_primary_task: null,
     },
   ];
-  assert.deepEqual(recentContextForPresentation(answer), []);
+  assert.deepEqual(recentContextForPresentation(answer), [answer.recent_context[1]]);
+  assert.deepEqual(continuationSurfacesForPresentation(answer), {
+    checkpointSurface: {
+      label: "Codex",
+      kind: "App",
+      appLabel: "Codex",
+      siteHostname: null,
+    },
+    continuationSurface: null,
+  });
+});
+
+test("browser surfaces are presented as pages with their hostname", () => {
+  const visit = {
+    sequence_index: 1,
+    app_label: "Helium",
+    site_hostname: "docs.example.com",
+    first_observed_at_ms: 1,
+    last_observed_at_ms: 2,
+    is_current: true,
+    revisited: false,
+    semantic_role: "supporting_work",
+    relationship_to_primary_task: "Checked the API docs",
+  };
+  assert.equal(recentContextSurfaceLabel(visit), "docs.example.com");
+  assert.equal(recentContextSurfaceKind(visit), "Page");
+});
+
+test("checkpoint and continuation badges follow the surfaces named in their copy", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  Object.assign(answer, {
+    last_meaningful_progress: "The presentation tests passed in Codex.",
+    unfinished_state: "In Helium, confirm the Continue result in the running app.",
+    recent_context: [
+      {
+        sequence_index: 1,
+        app_label: "Codex",
+        site_hostname: null,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        is_current: false,
+        revisited: false,
+        semantic_role: "primary_work",
+        relationship_to_primary_task: "Implemented and tested the changes",
+      },
+      {
+        sequence_index: 2,
+        app_label: "Helium",
+        site_hostname: null,
+        first_observed_at_ms: 3,
+        last_observed_at_ms: 4,
+        is_current: true,
+        revisited: false,
+        semantic_role: "supporting_work",
+        relationship_to_primary_task: "Prepared the live confirmation",
+      },
+    ],
+  });
+
+  assert.deepEqual(continuationSurfacesForPresentation(answer), {
+    checkpointSurface: {
+      label: "Codex",
+      kind: "App",
+      appLabel: "Codex",
+      siteHostname: null,
+    },
+    continuationSurface: {
+      label: "Helium",
+      kind: "App",
+      appLabel: "Helium",
+      siteHostname: null,
+    },
+  });
+});
+
+test("generic running-app copy is grounded to Smalltalk instead of the current unrelated surface", () => {
+  const answer = authoritativeTaskTruthAnswer(authoritativeDecision());
+  Object.assign(answer, {
+    current_subtask: "You were improving Smalltalk's Continue card UX.",
+    unfinished_state: "A real Continue interaction still needs confirmation in the running app.",
+    where_summary: null,
+    recent_context: [
+      {
+        sequence_index: 1,
+        app_label: "Helium",
+        site_hostname: null,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        is_current: true,
+        revisited: false,
+        semantic_role: "supporting_work",
+        relationship_to_primary_task: "Searched for interface references",
+      },
+    ],
+  });
+
+  const field = buildContinueContinuationFieldProjection(answer, false);
+  assert.equal(
+    field.continuation,
+    "A real Continue interaction still needs confirmation in Smalltalk.",
+  );
+  assert.deepEqual(field.continuationSurface, {
+    label: "Smalltalk",
+    kind: "App",
+    appLabel: "Smalltalk",
+    siteHostname: null,
+  });
+
+  answer.unfinished_state = "Open Smalltalk and run one real Continue interaction.";
+  assert.deepEqual(
+    buildContinueContinuationFieldProjection(answer, false).continuationSurface,
+    {
+      label: "Smalltalk",
+      kind: "App",
+      appLabel: "Smalltalk",
+      siteHostname: null,
+    },
+  );
 });
 
 test("recent context roles use concise user-facing labels", () => {

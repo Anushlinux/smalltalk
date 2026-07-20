@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CoreText
 import Foundation
 import ImageIO
 import QuartzCore
@@ -655,8 +656,56 @@ private struct OverlayMetrics {
 }
 
 private enum Brand {
+    private static let instrumentSerifPostScriptName = "InstrumentSerif-Regular"
+
+    private static let instrumentSerifRegistered: Bool = {
+        if NSFont(name: instrumentSerifPostScriptName, size: 16) != nil {
+            return true
+        }
+
+        let fileName = "InstrumentSerif-Regular.ttf"
+        let resourceCandidates = [
+            Bundle.main.url(
+                forResource: "InstrumentSerif-Regular",
+                withExtension: "ttf"
+            ),
+            Bundle.main.resourceURL?
+                .appendingPathComponent("resources/fonts")
+                .appendingPathComponent(fileName),
+            Bundle.main.resourceURL?
+                .appendingPathComponent("fonts")
+                .appendingPathComponent(fileName),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("src-tauri/resources/fonts")
+                .appendingPathComponent(fileName),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("resources/fonts")
+                .appendingPathComponent(fileName),
+        ].compactMap { $0 }
+
+        for url in resourceCandidates where FileManager.default.fileExists(atPath: url.path) {
+            var registrationError: Unmanaged<CFError>?
+            if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &registrationError)
+                || NSFont(name: instrumentSerifPostScriptName, size: 16) != nil {
+                return true
+            }
+        }
+        return false
+    }()
+
     static func swiftUIFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.system(size: size, weight: weight, design: .default)
+    }
+
+    static func instrumentSerifFont(size: CGFloat) -> Font {
+        _ = instrumentSerifRegistered
+        return Font.custom(instrumentSerifPostScriptName, size: size)
+    }
+
+    static func instrumentSerifNSFont(size: CGFloat) -> NSFont {
+        _ = instrumentSerifRegistered
+        return NSFont(name: instrumentSerifPostScriptName, size: size)
+            ?? NSFont.systemFont(ofSize: size, weight: .semibold)
     }
 }
 
@@ -850,6 +899,9 @@ private enum WhisperFlowStyle {
 private struct WhisperFlowAnswerRow: Equatable {
     let label: String
     let value: String
+
+    var isCheckpoint: Bool { label == "Last checkpoint" }
+    var isContinuation: Bool { label == "Continue from here" }
 }
 
 private struct WhisperFlowAnswerContent: Equatable {
@@ -881,37 +933,80 @@ private struct WhisperFlowAnswerContent: Equatable {
             ?? Self.fallbackTitle(for: state.displayState)
 
         var nextRows: [WhisperFlowAnswerRow] = []
-        Self.append(&nextRows, label: "Task object", value: answer?.taskObject)
         Self.append(
             &nextRows,
-            label: "Current activity — observed surface",
-            value: answer?.currentActivity.observedSurface
+            label: "Current activity",
+            value: Self.currentActivitySummary(answer, excluding: title)
         )
+        Self.append(&nextRows, label: "Last checkpoint", value: answer?.lastMeaningfulProgress)
         Self.append(
             &nextRows,
-            label: "Current activity — immediate operation",
-            value: answer?.currentActivity.immediateUserOperation
+            label: "Continue from here",
+            value: Self.usefulContinuation(answer, fallback: state.nextAction)
         )
-        Self.append(
-            &nextRows,
-            label: "Current activity — operation effect",
-            value: answer?.currentActivity.semanticEffectOfOperation
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — current subtask",
-            value: answer?.currentActivity.currentSubtask
-        )
-        Self.append(
-            &nextRows,
-            label: "Current activity — relationship to primary",
-            value: answer?.currentActivity.relationshipToPrimary
-        )
-        Self.append(&nextRows, label: "Last meaningful progress", value: answer?.lastMeaningfulProgress)
-        Self.append(&nextRows, label: "Unfinished state", value: answer?.unfinishedState)
-        Self.append(&nextRows, label: "Next action", value: answer?.nextAction ?? state.nextAction)
-        Self.append(&nextRows, label: "Where summary", value: answer?.whereSummary)
+        Self.append(&nextRows, label: "Return to", value: answer?.whereSummary)
         rows = nextRows
+    }
+
+    private static func currentActivitySummary(
+        _ answer: IslandSemanticAnswer?,
+        excluding title: String
+    ) -> String? {
+        guard let answer else { return nil }
+        var details: [String] = []
+        for value in [
+            answer.currentActivity.currentSubtask,
+            answer.currentActivity.immediateUserOperation,
+            answer.currentActivity.semanticEffectOfOperation,
+            answer.taskObject,
+        ] {
+            guard let value = verbatim(value) else { continue }
+            appendUnique(value, to: &details, excluding: title)
+        }
+
+        if let surface = verbatim(answer.currentActivity.observedSurface),
+           !details.contains(where: { normalized($0).contains(normalized(surface)) }) {
+            appendUnique("Working in \(surface).", to: &details, excluding: title)
+        }
+        return details.isEmpty ? nil : details.joined(separator: "\n\n")
+    }
+
+    private static func appendUnique(
+        _ value: String,
+        to values: inout [String],
+        excluding title: String
+    ) {
+        let normalizedValue = normalized(value)
+        guard !normalizedValue.isEmpty,
+              normalizedValue != normalized(title),
+              !values.contains(where: { normalized($0) == normalizedValue }) else { return }
+        values.append(value)
+    }
+
+    private static func usefulContinuation(
+        _ answer: IslandSemanticAnswer?,
+        fallback: String?
+    ) -> String? {
+        for candidate in [answer?.nextAction, fallback, answer?.unfinishedState] {
+            guard let value = verbatim(candidate), !isGenericUnresolvedCopy(value) else { continue }
+            return value
+        }
+        return nil
+    }
+
+    private static func isGenericUnresolvedCopy(_ value: String) -> Bool {
+        let value = normalized(value)
+        return value.contains("task remains unresolved")
+            || value.contains("no active task or test is visible")
+            || value.contains("no unfinished step was clearly captured")
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     private static func append(
@@ -985,6 +1080,7 @@ private final class WhisperFlowIslandModel: ObservableObject {
     @Published var memoryTransitionCountdownActive = false
     @Published var memoryTransitionCountdownNonce: UInt64 = 0
     @Published var continueGenerating = false
+    @Published var blockedContinueShakeNonce: UInt64 = 0
     @Published var answer: WhisperFlowAnswerContent?
     @Published var answerLayout = WhisperFlowAnswerLayout()
     @Published var visualCueImage: NSImage? = nil
@@ -1589,6 +1685,8 @@ private struct WhisperFlowIslandView: View {
     @State private var arrowHovered = false
     @State private var historyButtonHovered = false
     @State private var memoryTransitionCountdownProgress: CGFloat = 0
+    @State private var blockedContinueShakeOffset: CGFloat = 0
+    @State private var blockedContinueShakeSequence: UInt64 = 0
 
     private func s(_ value: CGFloat) -> CGFloat { value * scale }
 
@@ -1708,6 +1806,7 @@ private struct WhisperFlowIslandView: View {
             height: s(ambientPanelHeight),
             alignment: .top
         )
+        .offset(x: s(blockedContinueShakeOffset))
         .contentShape(Rectangle())
         .animation(
             IslandMotion.memoryContinuityMorph(shouldReduceMotion),
@@ -1723,8 +1822,13 @@ private struct WhisperFlowIslandView: View {
         .onChange(of: model.presentation) { presentation in
             handleMemoryPresentationChange(presentation)
         }
+        .onChange(of: model.blockedContinueShakeNonce) { _ in
+            runBlockedContinueShake()
+        }
         .onDisappear {
             microPulseExpanded = false
+            blockedContinueShakeSequence &+= 1
+            blockedContinueShakeOffset = 0
             cleanUpAmbientInteractionState()
         }
     }
@@ -1776,8 +1880,12 @@ private struct WhisperFlowIslandView: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
-                .accessibilityLabel("Show what I was doing")
-                .help("Show what I was doing")
+                .accessibilityLabel(
+                    model.memoryActive
+                        ? "Show what I was doing"
+                        : "Start memory before generating an answer"
+                )
+                .help(model.memoryActive ? "Show what I was doing" : "Start memory first")
                 .onHover { hovering in
                     arrowHovered = hovering
                     if hovering {
@@ -1827,6 +1935,28 @@ private struct WhisperFlowIslandView: View {
         .onChange(of: model.memoryTransitionCountdownActive) { active in
             if !active {
                 memoryTransitionCountdownProgress = 0
+            }
+        }
+    }
+
+    private func runBlockedContinueShake() {
+        blockedContinueShakeSequence &+= 1
+        let sequence = blockedContinueShakeSequence
+        blockedContinueShakeOffset = 0
+
+        let offsets: [CGFloat] = shouldReduceMotion
+            ? [-2, 2, 0]
+            : [-10, 10, -10, 10, -10, 10, -10, 8, -8, 0]
+        let stepDuration = shouldReduceMotion ? 0.06 : 0.05
+
+        for (index, offset) in offsets.enumerated() {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + stepDuration * Double(index + 1)
+            ) {
+                guard blockedContinueShakeSequence == sequence else { return }
+                withAnimation(.linear(duration: stepDuration)) {
+                    blockedContinueShakeOffset = offset
+                }
             }
         }
     }
@@ -2240,10 +2370,12 @@ private struct WhisperFlowIslandView: View {
             VStack(alignment: .leading, spacing: s(kWhisperFlowAnswerHeaderSpacing)) {
                 HStack(spacing: s(8)) {
                     Text(answer.title)
-                        .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
+                        .font(Brand.instrumentSerifFont(size: s(24)))
                         .foregroundColor(.white)
+                        .lineSpacing(s(1))
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
+                        .accessibilityAddTraits(.isHeader)
 
                     Spacer(minLength: s(8))
 
@@ -2296,8 +2428,19 @@ private struct WhisperFlowIslandView: View {
                                     .foregroundColor(WhisperFlowStyle.accent)
 
                                 Text(row.value)
-                                    .font(Brand.swiftUIFont(size: s(14), weight: .regular))
-                                    .foregroundColor(.white)
+                                    .font(
+                                        Brand.swiftUIFont(
+                                            size: s(row.isContinuation ? 17 : row.isCheckpoint ? 16 : 14),
+                                            weight: row.isContinuation || row.isCheckpoint
+                                                ? .semibold
+                                                : .regular
+                                        )
+                                    )
+                                    .foregroundColor(
+                                        row.isContinuation
+                                            ? .white
+                                            : .white.opacity(row.isCheckpoint ? 0.96 : 0.88)
+                                    )
                                     .lineSpacing(s(3))
                                     .fixedSize(horizontal: false, vertical: true)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2913,6 +3056,7 @@ private final class SessionIslandController: NSObject {
     private var outsideGlobalClickMonitor: Any?
     private var outsideLocalClickMonitor: Any?
     private var continueRequestInFlight = false
+    private var blockedContinueShakeNonce: UInt64 = 0
     private var latchedAnswer: WhisperFlowAnswerContent?
     private var latchedDecisionId: String?
     private var latchedVisualCue: IslandVisualCue?
@@ -3170,6 +3314,11 @@ private final class SessionIslandController: NSObject {
 
     private func requestContinue() {
         guard !continueRequestInFlight else { return }
+        guard memoryActive else {
+            blockedContinueShakeNonce &+= 1
+            updateContent()
+            return
+        }
         cancelPresentationTimers()
         continueRequestInFlight = true
         latchedAnswer = nil
@@ -3293,17 +3442,19 @@ private final class SessionIslandController: NSObject {
             summaryMaximum
         )
 
-        let titleFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let titleFont = Brand.instrumentSerifNSFont(size: 24)
         let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        let valueFont = NSFont.systemFont(ofSize: 14, weight: .regular)
         let collapseFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let longestTextWidth = ([measuredTextWidth(answer.title, font: titleFont)]
-            + answer.rows.flatMap { row in
-                [
+        let measuredAnswerWidths: [CGFloat] = [
+            measuredTextWidth(answer.title, font: titleFont),
+        ] + answer.rows.flatMap { row -> [CGFloat] in
+                let valueFont = answerValueNSFont(for: row)
+                return [
                     measuredTextWidth(row.label, font: labelFont),
                     measuredTextWidth(row.value, font: valueFont),
                 ]
-            }).max() ?? 0
+            }
+        let longestTextWidth = measuredAnswerWidths.max() ?? 0
         let expandedMaximum = max(
             kWhisperFlowAnswerExpandedMinW,
             min(kWhisperFlowAnswerExpandedMaxW, usableWidth - 32)
@@ -3333,7 +3484,7 @@ private final class SessionIslandController: NSObject {
             bodyHeight += kWhisperFlowAnswerLabelValueSpacing
             bodyHeight += measuredTextHeight(
                 row.value,
-                font: valueFont,
+                font: answerValueNSFont(for: row),
                 width: contentWidth,
                 lineSpacing: 3
             )
@@ -3414,6 +3565,16 @@ private final class SessionIslandController: NSObject {
             visualCueCardHeight: visualCueCardHeight,
             visualCueImageHeight: visualCueImageHeight
         )
+    }
+
+    private func answerValueNSFont(for row: WhisperFlowAnswerRow) -> NSFont {
+        if row.isContinuation {
+            return NSFont.systemFont(ofSize: 17, weight: .semibold)
+        }
+        if row.isCheckpoint {
+            return NSFont.systemFont(ofSize: 16, weight: .semibold)
+        }
+        return NSFont.systemFont(ofSize: 14, weight: .regular)
     }
 
     private func measuredTextWidth(_ text: String, font: NSFont) -> CGFloat {
@@ -4218,6 +4379,9 @@ private final class SessionIslandController: NSObject {
         }
         if islandModel.continueGenerating != continueRequestInFlight {
             islandModel.continueGenerating = continueRequestInFlight
+        }
+        if islandModel.blockedContinueShakeNonce != blockedContinueShakeNonce {
+            islandModel.blockedContinueShakeNonce = blockedContinueShakeNonce
         }
         if islandModel.answer != latchedAnswer {
             islandModel.answer = latchedAnswer

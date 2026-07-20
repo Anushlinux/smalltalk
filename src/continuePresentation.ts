@@ -120,9 +120,18 @@ export type ContinuePublicProjection = {
   exactTargetNote: string | null;
 };
 
+export type ContinueSurfaceProjection = {
+  label: string;
+  kind: "App" | "Page";
+  appLabel: string | null;
+  siteHostname: string | null;
+};
+
 export type ContinueContinuationFieldProjection = {
   checkpoint: string | null;
   continuation: string;
+  checkpointSurface: ContinueSurfaceProjection | null;
+  continuationSurface: ContinueSurfaceProjection | null;
   locationLabel: string | null;
   targetStatus: string | null;
   openActionLabel: string | null;
@@ -562,7 +571,16 @@ export function recentContextForPresentation(
 
     visible.push(visit);
   }
-  return visible.slice(-4);
+  if (visible.length > 0) return visible.slice(-4);
+
+  const currentObservedSurface = [...(answer?.recent_context || [])]
+    .reverse()
+    .find((visit) => (
+      visit.is_current
+      && visit.app_label.trim()
+      && normalizeToken(visit.app_label) !== "smalltalk"
+    ));
+  return currentObservedSurface ? [currentObservedSurface] : [];
 }
 
 export function recentContextSurfaceLabel(
@@ -582,11 +600,111 @@ export function recentContextSurfaceLabel(
 
   const browserShells = ["helium", "safari", "google chrome", "chrome", "arc", "firefox"];
   if (hostname && browserShells.includes(appKey)) {
-    const product = hostname.split(".")[0]?.replace(/[-_]+/g, " ") || hostname;
-    return product.replace(/\b\w/g, (letter) => letter.toUpperCase());
+    return hostname;
   }
 
   return app || "Work surface";
+}
+
+export function recentContextSurfaceKind(
+  visit: ContinueTaskTruthRecentContext,
+): ContinueSurfaceProjection["kind"] {
+  return visit.site_hostname?.trim() ? "Page" : "App";
+}
+
+function surfaceProjectionFromVisit(
+  visit?: ContinueTaskTruthRecentContext | null,
+): ContinueSurfaceProjection | null {
+  if (!visit?.app_label.trim() || normalizeToken(visit.app_label) === "smalltalk") {
+    return null;
+  }
+  return {
+    label: recentContextSurfaceLabel(visit),
+    kind: recentContextSurfaceKind(visit),
+    appLabel: publicClause(visit.app_label) || null,
+    siteHostname: publicClause(visit.site_hostname) || null,
+  };
+}
+
+function surfaceProjectionFromLabel(
+  label?: string | null,
+): ContinueSurfaceProjection | null {
+  const cleanLabel = publicClause(label);
+  if (!cleanLabel) return null;
+  const looksLikePage = /^(?:https?:\/\/|www\.)/i.test(cleanLabel)
+    || /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(cleanLabel);
+  const knownAppLabels = [
+    "arc",
+    "chatgpt",
+    "chrome",
+    "codex",
+    "discord",
+    "figma",
+    "firefox",
+    "github",
+    "helium",
+    "notion",
+    "openai",
+    "safari",
+    "slack",
+    "terminal",
+    "visual studio code",
+    "vs code",
+  ];
+  if (!looksLikePage && !knownAppLabels.some((app) => normalizeToken(cleanLabel).includes(app))) {
+    return null;
+  }
+  return {
+    label: cleanLabel,
+    kind: looksLikePage ? "Page" : "App",
+    appLabel: looksLikePage ? null : cleanLabel,
+    siteHostname: looksLikePage
+      ? cleanLabel.replace(/^https?:\/\//i, "").replace(/^www\./i, "").split("/")[0] || null
+      : null,
+  };
+}
+
+export function continuationSurfacesForPresentation(
+  answer?: ContinueTaskTruthAnswer | null,
+  fallbackLabel?: string | null,
+) {
+  const visits = (answer?.recent_context || []).filter(
+    (visit) => visit.app_label.trim() && normalizeToken(visit.app_label) !== "smalltalk",
+  );
+  const visitNamedIn = (copy?: string | null) => {
+    const normalizedCopy = normalizeToken(copy || "");
+    if (!normalizedCopy) return null;
+    return [...visits].reverse().find((visit) => {
+      const candidates = [
+        visit.app_label,
+        visit.site_hostname,
+        recentContextSurfaceLabel(visit),
+      ]
+        .map((value) => normalizeToken(value || ""))
+        .filter((value) => value.length >= 3);
+      return candidates.some((value) => normalizedCopy.includes(value));
+    }) || null;
+  };
+  const currentVisit = [...visits].reverse().find((visit) => visit.is_current) || null;
+  const primaryVisit = [...visits].reverse().find((visit) => (
+    visit.semantic_role === "primary_work"
+    && Boolean(visit.relationship_to_primary_task?.trim())
+  )) || null;
+  const meaningfulVisit = [...visits].reverse().find((visit) => (
+    ["primary_work", "supporting_work"].includes(visit.semantic_role || "")
+    && Boolean(visit.relationship_to_primary_task?.trim())
+  )) || null;
+  const checkpointVisit = visitNamedIn(answer?.last_meaningful_progress)
+    || primaryVisit
+    || meaningfulVisit
+    || currentVisit;
+  const continuationVisit = visitNamedIn(answer?.unfinished_state || answer?.next_action)
+    || null;
+  const fallback = surfaceProjectionFromLabel(fallbackLabel);
+  const checkpointSurface = surfaceProjectionFromVisit(checkpointVisit) || fallback;
+  const continuationSurface = surfaceProjectionFromVisit(continuationVisit) || fallback;
+
+  return { checkpointSurface, continuationSurface };
 }
 
 export function buildContinuePublicProjection(
@@ -626,18 +744,47 @@ export function buildContinueContinuationFieldProjection(
   const explicitlyComplete = ["complete", "completed", "complete_or_idle"].includes(
     executionState,
   );
-  const continuation = supportedContinuation || (
+  const locationLabel = publicClause(preciseTargetLabel)
+    || publicClause(answer.where_summary)
+    || null;
+  const projectedSurfaces = continuationSurfacesForPresentation(
+    answer,
+    preciseTargetLabel || answer.where_summary,
+  );
+  const genericAppDestination = /\b(?:the )?(?:running|current) app\b/i.test(
+    supportedContinuation,
+  );
+  const taskNamesSmalltalk = [
+    answer.task_summary,
+    answer.task_object,
+    answer.current_subtask,
+  ].some((value) => normalizeToken(value || "").includes("smalltalk"));
+  const continuationNamesSmalltalk = normalizeToken(supportedContinuation).includes("smalltalk");
+  const continuationSurface = (genericAppDestination || continuationNamesSmalltalk)
+    && taskNamesSmalltalk
+    ? {
+        label: "Smalltalk",
+        kind: "App" as const,
+        appLabel: "Smalltalk",
+        siteHostname: null,
+      }
+    : projectedSurfaces.continuationSurface;
+  const contextualContinuation = continuationSurface
+    ? supportedContinuation
+        .replace(/\bin the (?:running|current) app\b/gi, `in ${continuationSurface.label}`)
+        .replace(/\bthe (?:running|current) app\b/gi, continuationSurface.label)
+    : supportedContinuation;
+  const continuation = contextualContinuation || (
     explicitlyComplete
       ? "No unfinished step remains."
       : "No unfinished step was clearly captured."
   );
-  const locationLabel = publicClause(preciseTargetLabel)
-    || publicClause(answer.where_summary)
-    || null;
 
   return {
     checkpoint,
     continuation,
+    checkpointSurface: projectedSurfaces.checkpointSurface,
+    continuationSurface,
     locationLabel,
     targetStatus: targetOpenable
       ? null

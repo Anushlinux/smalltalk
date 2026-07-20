@@ -116,15 +116,17 @@ The July 21 Continue-view taste direction supersedes the older always-visible su
 
 Its default reading order is:
 
-- **Last checkpoint** — the last meaningful completed outcome.
-- **Continue from here** — the earliest concrete unresolved step, or an honest statement that no exact step was captured.
+- **Last checkpoint** — the last meaningful completed outcome, paired with the observed app or page when that identity is supported.
+- **Continue from here** — the earliest concrete unresolved step, or an honest statement that no exact step was captured. When the destination is supported, the sentence itself names the app, product, or page; a nearby badge is reinforcement, not a substitute for clear copy.
 - **Location** — the most precise grounded work surface available.
 - **Return action** — shown only when the existing direct-target policy says the target is safely openable.
-- **Context trail** — one collapsed horizontal sequence of up to four meaningful surfaces.
+- **Context trail** — one horizontal icon rail of up to four meaningful surfaces. App surfaces are labeled `App`; browser surfaces are labeled `Page`.
 
 The hero remains the only task explanation. The continuation field must not repeat it as `What you were doing`, combine completed and unfinished work into one paragraph, or expose the recent trail as a large default timeline.
 
-The public context trail includes only grounded primary work, useful supporting work, and returns to that work. Detours, unrelated surfaces, unclear relationships, duplicate visits, and diagnostic evidence remain available in Inspect. Expanding the trail shows one short relationship sentence per meaningful surface and lazily loads the existing evidence-preview frame as the final visual cue. Screenshot evidence never creates a primary action.
+Do not use placeholder destinations such as `the running app`, `the current app`, `the app`, `the browser`, or `the page` when a supported name is available. Prefer direct wording such as `Open Smalltalk and run one real Continue interaction` or `In Codex, run the final check`.
+
+The public context trail includes grounded primary work, useful supporting work, and returns to that work. When those relationships are unavailable, it may show the single current observed non-Smalltalk surface so the user can recognize where the answer belongs; this fallback does not make that surface a return target. Detours, unrelated surfaces, duplicate visits, and diagnostic evidence remain available in Inspect. The trail stays horizontal at every supported width and scrolls sideways when it cannot fit. Each stop shows a known app icon or a quiet generic fallback plus one short relationship sentence. The optional visual-cue disclosure lazily loads the existing evidence-preview frame after the rail. Screenshot evidence never creates a primary action.
 
 When a task is understood but its target is unavailable, show a quiet inline `Exact place not captured` status. Do not replace the useful task answer or turn ordinary uncertainty into a warning card. When no clear task exists, lead with the abstention and do not render a confident continuation field or detailed public trail.
 
