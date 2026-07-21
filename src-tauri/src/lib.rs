@@ -16,12 +16,8 @@ fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
     })?;
     let ns_window = window.ns_window().map_err(std::io::Error::other)? as *mut NSWindow;
     let ns_window = unsafe { &*ns_window };
-    let background = NSColor::colorWithRed_green_blue_alpha(
-        245.0 / 255.0,
-        244.0 / 255.0,
-        241.0 / 255.0,
-        1.0,
-    );
+    let background =
+        NSColor::colorWithRed_green_blue_alpha(245.0 / 255.0, 244.0 / 255.0, 241.0 / 255.0, 1.0);
 
     unsafe { ns_window.setBackgroundColor(Some(&background)) };
     Ok(())
@@ -30,6 +26,7 @@ fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {

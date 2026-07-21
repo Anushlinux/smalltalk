@@ -76,6 +76,7 @@ import {
   withContinueRequestTimeout,
 } from "./continueRequest";
 import { MosaicLeafBackground } from "./MosaicLeafBackground";
+import { useAuth } from "./auth/AuthProvider";
 import smalltalkLogo from "./assets/smalltalk-logo.png";
 import "@fontsource/instrument-serif/400.css";
 import "./App.css";
@@ -1537,6 +1538,13 @@ const emptyTimeline: Timeline = {
 };
 
 function App() {
+  const {
+    profile,
+    user,
+    loading: authLoading,
+    error: authError,
+    signOut,
+  } = useAuth();
   const [status, setStatus] = useState<CaptureStatus>(initialStatus);
   const [screenCapturePermission, setScreenCapturePermission] =
     useState<ScreenCapturePermissionStatus | null>(null);
@@ -2868,6 +2876,7 @@ function App() {
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No evidence selected";
   const showInspectEntry = import.meta.env.DEV;
+  const greetingName = profile?.full_name?.trim().split(/\s+/)[0] || "there";
   const openProductView = useCallback((nextView: Exclude<ViewMode, "developer">) => {
     setMemoryMenuOpen(false);
     setEvidenceOpen(false);
@@ -3150,7 +3159,7 @@ function App() {
       <header className={`product-toolbar ${viewMode === "continue" ? "continue-toolbar" : ""}`}>
         {viewMode === "continue" ? (
           <h1 className="continue-greeting">
-            Hey Anushrut, pick up where you left off
+            Hey {greetingName}, pick up where you left off
           </h1>
         ) : (
           <div>
@@ -3289,10 +3298,14 @@ function App() {
           busyAction={busyAction}
           hasEvidence={continueHasEvidence}
           showInspectEntry={showInspectEntry}
+          accountEmail={user?.email || profile?.email || "Signed in"}
+          authBusy={authLoading}
+          authError={authError}
           onOpenPrivacy={openPrivacyPanel}
           onRequestPermission={() => void requestScreenCapturePermission()}
           onDeleteMemory={deleteAllFrames}
           onInspect={openDeveloperMode}
+          onSignOut={() => void signOut()}
         />
       ) : null}
 
@@ -4061,10 +4074,14 @@ function SettingsHome({
   busyAction,
   hasEvidence,
   showInspectEntry,
+  accountEmail,
+  authBusy,
+  authError,
   onOpenPrivacy,
   onRequestPermission,
   onDeleteMemory,
   onInspect,
+  onSignOut,
 }: {
   memoryProductStatus: MemoryProductStatus;
   memoryProduct: { label: string; detail: string };
@@ -4074,10 +4091,14 @@ function SettingsHome({
   busyAction: string | null;
   hasEvidence: boolean;
   showInspectEntry: boolean;
+  accountEmail: string;
+  authBusy: boolean;
+  authError: string | null;
   onOpenPrivacy: () => void;
   onRequestPermission: () => void;
   onDeleteMemory: () => void;
   onInspect: () => void;
+  onSignOut: () => void;
 }) {
   return (
     <section className="settings-screen" aria-label="Settings">
@@ -4090,6 +4111,29 @@ function SettingsHome({
       </div>
 
       <div className="settings-stack">
+        <section className="settings-section">
+          <div className="settings-icon"><ProductIcon name="settings" /></div>
+          <div className="settings-section-copy">
+            <span>Account</span>
+            <h3>{accountEmail}</h3>
+            <p>
+              Your Smalltalk account is signed in with Google. Signing out does not delete local memory or captures.
+              {authError ? ` ${authError}` : ""}
+            </p>
+          </div>
+          <div className="settings-actions">
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={authBusy}
+              aria-busy={authBusy}
+              onClick={onSignOut}
+            >
+              {authBusy ? "Signing out" : "Sign out"}
+            </button>
+          </div>
+        </section>
+
         <section className="settings-section">
           <div className="settings-icon"><ProductIcon name="memory" /></div>
           <div className="settings-section-copy">
