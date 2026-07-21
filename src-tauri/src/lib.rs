@@ -1,5 +1,8 @@
 #![recursion_limit = "256"]
 
+use tauri::Manager;
+
+mod auth_callback;
 mod capture;
 mod capture_core;
 mod continuation;
@@ -9,7 +12,6 @@ mod workload;
 #[cfg(target_os = "macos")]
 fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
     use objc2_app_kit::{NSColor, NSWindow};
-    use tauri::Manager;
 
     let window = app.get_webview_window("main").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "main window is unavailable")
@@ -30,6 +32,7 @@ pub fn run() {
         .manage(capture::CaptureState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            app.manage(auth_callback::start(app.handle().clone()));
             #[cfg(target_os = "macos")]
             set_main_window_background(app)?;
             capture::initialize_runtime_database(app.handle()).map_err(std::io::Error::other)?;
@@ -48,6 +51,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            auth_callback::get_auth_redirect_url,
             capture::start_capture,
             capture::get_screen_capture_permission_status,
             capture::request_screen_capture_permission,

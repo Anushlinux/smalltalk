@@ -11,12 +11,13 @@ import {
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Session, User } from "@supabase/supabase-js";
 import { parseAuthCallback } from "./authCallback";
 import {
   AuthConfigurationError,
   getSupabaseClient,
-  getSupabaseRedirectUrl,
   isTrustedSupabaseOAuthUrl,
 } from "./supabase";
 
@@ -161,6 +162,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     mountedRef.current = true;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
+    let unlistenLoopback: (() => void) | undefined;
     let unsubscribeAuth: (() => void) | undefined;
 
     const initialize = async () => {
@@ -188,22 +190,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       unsubscribeAuth = () => data.subscription.unsubscribe();
 
       try {
+        unlistenLoopback = await listen<string[]>("auth-callback", (event) => {
+          void processIncomingUrls(event.payload);
+        });
+      } catch {
+        if (!cancelled) {
+          setError("Smalltalk could not start its secure Google sign-in callback listener.");
+        }
+      }
+
+      try {
         unlisten = await onOpenUrl((urls) => {
           void processIncomingUrls(urls);
         });
       } catch {
-        if (!cancelled) {
-          setError("Smalltalk could not start its secure sign-in callback listener.");
-        }
+        // Keep the custom-URL listener as a compatibility fallback. The normal
+        // browser flow returns through the loopback listener above.
       }
 
       try {
         const startUrls = await getCurrent();
         if (startUrls?.length) await processIncomingUrls(startUrls);
       } catch {
-        if (!cancelled) {
-          setError("Smalltalk could not read the secure sign-in callback.");
-        }
+        // There may be no launch URL, and the loopback callback remains active.
       }
 
       try {
@@ -233,6 +242,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       mountedRef.current = false;
       unlisten?.();
+      unlistenLoopback?.();
       unsubscribeAuth?.();
     };
   }, [loadProfile, processIncomingUrls]);
@@ -245,10 +255,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     try {
       const client = getSupabaseClient();
+      const redirectTo = await invoke<string>("get_auth_redirect_url");
       const { data, error: signInError } = await client.auth.signInWithOAuth({
         provider: "google",
         options: {
-          redirectTo: getSupabaseRedirectUrl(),
+          redirectTo,
           skipBrowserRedirect: true,
           queryParams: {
             prompt: "select_account",

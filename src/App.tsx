@@ -33,6 +33,7 @@ import {
   OpenAiLogo,
   ShieldCheck,
   SidebarSimple,
+  SignOut,
   SlackLogo,
   SlidersHorizontal,
   TerminalWindow,
@@ -3146,6 +3147,18 @@ function App() {
               <span>Inspect</span>
             </button>
           ) : null}
+          <button
+            className="logout-nav-button"
+            type="button"
+            disabled={authLoading}
+            aria-busy={authLoading}
+            aria-label="Log out"
+            title="Log out"
+            onClick={() => void signOut()}
+          >
+            <ProductIcon name="logout" />
+            <span>{authLoading ? "Logging out" : "Log out"}</span>
+          </button>
         </nav>
       </aside>
 
@@ -3916,6 +3929,7 @@ type ProductIconName =
   | "continue"
   | "history"
   | "settings"
+  | "logout"
   | "inspect"
   | "refresh"
   | "chevron"
@@ -3934,6 +3948,7 @@ function ProductIcon({ name }: { name: ProductIconName }) {
   if (name === "continue") return <ArrowBendDownRight {...common} />;
   if (name === "history") return <ClockCounterClockwise {...common} />;
   if (name === "settings") return <SlidersHorizontal {...common} />;
+  if (name === "logout") return <SignOut {...common} />;
   if (name === "inspect") return <Eye {...common} />;
   if (name === "refresh") return <ArrowsClockwise {...common} />;
   if (name === "chevron") return <CaretRight {...common} />;

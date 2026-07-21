@@ -42,12 +42,12 @@ export function AuthScreen() {
           readOnly
         />
 
-        <button className="auth-email-button" type="button" aria-disabled="true">
+        <button className="auth-email-button" type="button" disabled>
           Continue with email
         </button>
 
         <p className="auth-privacy-copy">
-          By continuing, you acknowledge Anthropic’s <span>Privacy Policy.</span>
+          By continuing, you acknowledge smalltalk's <span>Privacy Policy.</span>
         </p>
       </section>
     </main>

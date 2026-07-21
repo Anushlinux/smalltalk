@@ -5122,6 +5122,16 @@ button[aria-busy="true"] {
   transform: scale(0.97);
 }
 
+.secondary-nav .logout-nav-button {
+  color: #7d4b46;
+}
+
+.secondary-nav .logout-nav-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+  transform: none;
+}
+
 .product-sidebar .topbar-status {
   display: none;
 }

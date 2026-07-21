@@ -1,8 +1,6 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { browserAuthStorage } from "./authStorage";
 
-const DEFAULT_REDIRECT_URL = "smalltalk://auth/callback";
-
 let sharedSupabaseClient: SupabaseClient | null = null;
 
 export class AuthConfigurationError extends Error {
@@ -20,10 +18,6 @@ function requiredEnvironmentValue(name: string, value: string | undefined) {
     );
   }
   return normalized;
-}
-
-export function getSupabaseRedirectUrl() {
-  return import.meta.env.VITE_SUPABASE_REDIRECT_URL?.trim() || DEFAULT_REDIRECT_URL;
 }
 
 export function getSupabaseClient() {
