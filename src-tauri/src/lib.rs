@@ -5,6 +5,7 @@ use tauri::Manager;
 mod auth_callback;
 mod capture;
 mod capture_core;
+mod cloud_auth;
 mod continuation;
 mod session_island;
 mod workload;
@@ -30,6 +31,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .manage(capture::CaptureState::default())
+        .manage(cloud_auth::CloudAuthState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(auth_callback::start(app.handle().clone()));
@@ -52,6 +54,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             auth_callback::get_auth_redirect_url,
+            cloud_auth::set_cloud_auth_session,
             capture::start_capture,
             capture::get_screen_capture_permission_status,
             capture::request_screen_capture_permission,

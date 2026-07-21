@@ -2384,6 +2384,7 @@ private struct WhisperFlowIslandView: View {
                             Text("Visual cue")
                                 .font(Brand.swiftUIFont(size: s(11), weight: .semibold))
                                 .foregroundColor(WhisperFlowStyle.accent)
+                                .fixedSize(horizontal: true, vertical: false)
                                 .padding(.horizontal, s(8))
                                 .padding(.vertical, s(4))
                                 .background(
@@ -2405,6 +2406,8 @@ private struct WhisperFlowIslandView: View {
                                 )
                         }
                         .buttonStyle(WhisperFlowPressButtonStyle(reduceMotion: reduceMotion))
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(2)
                         .accessibilityLabel(
                             model.visualCuePresented ? "Hide visual cue" : "Show visual cue"
                         )
@@ -2414,8 +2417,11 @@ private struct WhisperFlowIslandView: View {
                         Text("See less")
                             .font(Brand.swiftUIFont(size: s(12), weight: .semibold))
                             .foregroundColor(WhisperFlowStyle.accent)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(2)
                     .accessibilityLabel("See less of the island answer")
                 }
 

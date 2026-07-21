@@ -12,6 +12,7 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import type { Session, User } from "@supabase/supabase-js";
 import { parseAuthCallback } from "./authCallback";
@@ -44,6 +45,15 @@ export type AuthState = {
 };
 
 const AuthContext = createContext<AuthState | null>(null);
+const INSTALLATION_ID_KEY = "smalltalk.installation_id.v1";
+
+function getInstallationId() {
+  const existing = window.localStorage.getItem(INSTALLATION_ID_KEY);
+  if (existing && /^[0-9a-f-]{16,64}$/i.test(existing)) return existing;
+  const created = crypto.randomUUID();
+  window.localStorage.setItem(INSTALLATION_ID_KEY, created);
+  return created;
+}
 
 function errorMessage(error: unknown, fallback: string) {
   if (error instanceof AuthConfigurationError) return error.message;
@@ -246,6 +256,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       unsubscribeAuth?.();
     };
   }, [loadProfile, processIncomingUrls]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const synchronizeCloudSession = async () => {
+      try {
+        if (!session) {
+          await invoke("set_cloud_auth_session", {
+            accessToken: null,
+            installationId: null,
+            appVersion: null,
+          });
+          return;
+        }
+        const appVersion = await getVersion();
+        if (cancelled) return;
+        await invoke("set_cloud_auth_session", {
+          accessToken: session.access_token,
+          installationId: getInstallationId(),
+          appVersion,
+        });
+      } catch {
+        if (!cancelled) {
+          setError("You are signed in, but secure cloud inference could not be initialized.");
+        }
+      }
+    };
+    void synchronizeCloudSession();
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
 
   const signInWithGoogle = useCallback(async () => {
     if (loginInFlightRef.current) return;

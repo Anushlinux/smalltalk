@@ -4411,6 +4411,9 @@ pub fn get_continue_decision(
     request.manual_continue_started_at_ms = (trigger == "manual").then_some(now_millis());
     request.manual_continue_frame_id = None;
     request.manual_continue_preflight_failure = None;
+    if trigger == "manual" || request.island_source.is_some() {
+        request.cloud_auth = app.state::<crate::cloud_auth::CloudAuthState>().snapshot();
+    }
     let material_watermark = {
         let preflight_conn = open_db(&app)?;
         // Resolve scope and manual capture before admission. The connection is
