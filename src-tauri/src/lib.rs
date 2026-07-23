@@ -27,6 +27,15 @@ fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn reveal_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -36,6 +45,20 @@ pub fn run() {
         .manage(capture::CaptureState::default())
         .manage(cloud_auth::CloudAuthState::default())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            {
+                if window.label() != "main" {
+                    return;
+                }
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
         .setup(|app| {
             app.manage(auth_callback::start(app.handle().clone()));
             #[cfg(target_os = "macos")]
@@ -147,6 +170,8 @@ pub fn run() {
                 });
             }
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => reveal_main_window(app),
         tauri::RunEvent::Exit => session_island::shutdown_session_island(),
         _ => {}
     });
