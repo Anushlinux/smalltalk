@@ -34,7 +34,7 @@ pub fn get_auth_redirect_url(state: tauri::State<'_, AuthCallbackState>) -> Resu
     if let Some(error) = state
         .startup_error
         .lock()
-        .map_err(|_| "The Google sign-in callback state is unavailable.".to_string())?
+        .map_err(|_| "The sign-in callback state is unavailable.".to_string())?
         .as_ref()
     {
         return Err(error.clone());
@@ -48,7 +48,7 @@ pub fn start(app: tauri::AppHandle) -> AuthCallbackState {
         Ok(listener) => listener,
         Err(error) => {
             let message = format!(
-                "Smalltalk could not start the Google sign-in callback on {AUTH_CALLBACK_ADDRESS}: {error}"
+                "Smalltalk could not start the sign-in callback on {AUTH_CALLBACK_ADDRESS}: {error}"
             );
             eprintln!("[auth] {message}");
             return AuthCallbackState::unavailable(message);
@@ -148,13 +148,13 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.flush();
 }
 
-const SUCCESS_PAGE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Google sign-in complete</title><style>
+const SUCCESS_PAGE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Smalltalk sign-in complete</title><style>
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f4f1; color: #18251f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   main { width: min(440px, calc(100vw - 48px)); text-align: center; }
   .mark { width: 48px; height: 48px; margin: 0 auto 24px; display: grid; place-items: center; border-radius: 50%; background: #00693c; color: white; font-size: 26px; }
   h1 { margin: 0 0 12px; font-size: 28px; letter-spacing: -0.03em; }
   p { margin: 0; color: #5c6761; font-size: 16px; line-height: 1.55; }
-</style></head><body><main><div class="mark">&#10003;</div><h1>Google sign-in complete</h1><p>Smalltalk is finishing your sign-in. You can close this tab and return to the app.</p></main></body></html>"#;
+</style></head><body><main><div class="mark">&#10003;</div><h1>Smalltalk sign-in complete</h1><p>Smalltalk is finishing your sign-in. You can close this tab and return to the app.</p></main></body></html>"#;
 
 const ERROR_PAGE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Smalltalk sign-in was not completed</title><style>
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f4f1; color: #18251f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }

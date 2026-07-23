@@ -1,5 +1,7 @@
+import { useState, type FormEvent } from "react";
 import smalltalkLogo from "../assets/smalltalk-logo.png";
 import { useAuth } from "./AuthProvider";
+import { isValidEmailAddress, normalizeEmailAddress } from "./emailAuth";
 import "./AuthScreen.css";
 
 function GoogleIcon() {
@@ -14,41 +16,116 @@ function GoogleIcon() {
 }
 
 export function AuthScreen() {
-  const { loading, error, signInWithGoogle } = useAuth();
+  const { loading, error, signInWithEmail, signInWithGoogle } = useAuth();
+  const [email, setEmail] = useState("");
+  const [emailPending, setEmailPending] = useState(false);
+  const [emailSentTo, setEmailSentTo] = useState<string | null>(null);
+  const normalizedEmail = normalizeEmailAddress(email);
+  const canSubmitEmail = isValidEmailAddress(normalizedEmail) && !loading;
+
+  const submitEmail = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canSubmitEmail) return;
+
+    setEmailPending(true);
+    try {
+      const sent = await signInWithEmail(normalizedEmail);
+      if (sent) setEmailSentTo(normalizedEmail);
+    } finally {
+      setEmailPending(false);
+    }
+  };
+
+  const resendEmail = async () => {
+    if (!emailSentTo || loading) return;
+
+    setEmailPending(true);
+    try {
+      await signInWithEmail(emailSentTo);
+    } finally {
+      setEmailPending(false);
+    }
+  };
 
   return (
     <main className="auth-screen">
       <section className="auth-card" aria-labelledby="auth-title">
         <header className="auth-heading">
-          <h1 id="auth-title">Sign in to Smalltalk</h1>
+          <h1 id="auth-title">{emailSentTo ? "Check your email" : "Sign in to Smalltalk"}</h1>
         </header>
 
-        <button
-          className="auth-google-button"
-          type="button"
-          disabled={loading}
-          aria-busy={loading}
-          onClick={() => void signInWithGoogle()}
-        >
-          <GoogleIcon />
-          <span>{loading ? "Opening Google…" : "Continue with Google"}</span>
-        </button>
+        {emailSentTo ? (
+          <div className="auth-email-sent" aria-live="polite">
+            <p>
+              We sent a secure sign-in link to <strong>{emailSentTo}</strong>.
+              Open it on this Mac to finish signing in.
+            </p>
 
-        {error ? <p className="auth-error" role="alert">{error}</p> : null}
+            {error ? <p className="auth-error" role="alert">{error}</p> : null}
 
-        <p className="auth-divider">OR</p>
+            <button
+              className="auth-email-button"
+              type="button"
+              disabled={loading}
+              aria-busy={emailPending}
+              onClick={() => void resendEmail()}
+            >
+              {emailPending ? "Sending again…" : "Resend email"}
+            </button>
+            <button
+              className="auth-change-email-button"
+              type="button"
+              disabled={loading}
+              onClick={() => setEmailSentTo(null)}
+            >
+              Use a different email
+            </button>
+          </div>
+        ) : (
+          <>
+            <button
+              className="auth-google-button"
+              type="button"
+              disabled={loading}
+              aria-busy={loading && !emailPending}
+              onClick={() => void signInWithGoogle()}
+            >
+              <GoogleIcon />
+              <span>
+                {loading && !emailPending ? "Opening Google…" : "Continue with Google"}
+              </span>
+            </button>
 
-        <input
-          className="auth-email-input"
-          type="email"
-          aria-label="Email"
-          placeholder="Enter your email"
-          readOnly
-        />
+            {error ? <p className="auth-error" role="alert">{error}</p> : null}
 
-        <button className="auth-email-button" type="button" disabled>
-          Continue with email
-        </button>
+            <p className="auth-divider">OR</p>
+
+            <form className="auth-email-form" onSubmit={(event) => void submitEmail(event)}>
+              <input
+                className="auth-email-input"
+                type="email"
+                name="email"
+                autoComplete="email"
+                inputMode="email"
+                aria-label="Email"
+                placeholder="Enter your email"
+                value={email}
+                disabled={loading}
+                required
+                onChange={(event) => setEmail(event.target.value)}
+              />
+
+              <button
+                className="auth-email-button"
+                type="submit"
+                disabled={!canSubmitEmail}
+                aria-busy={emailPending}
+              >
+                {emailPending ? "Sending sign-in link…" : "Continue with email"}
+              </button>
+            </form>
+          </>
+        )}
 
         <p className="auth-privacy-copy">
           By continuing, you acknowledge smalltalk's <span>Privacy Policy.</span>

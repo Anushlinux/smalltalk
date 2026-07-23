@@ -1,13 +1,13 @@
 {
   "name": "smalltalk",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.1.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "auth:check-config": "node scripts/checkAuthConfig.mjs",
-    "test:auth": "node --experimental-strip-types --test scripts/authCallback.test.mjs",
+    "test:auth": "node --experimental-strip-types --test scripts/authCallback.test.mjs scripts/emailAuth.test.mjs",
     "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs scripts/continueRequest.test.mjs",
     "test:updates": "node --experimental-strip-types --test scripts/appUpdates.test.mjs",
     "test:webview": "npm run test:continue-presentation && npm run test:auth && npm run test:updates",

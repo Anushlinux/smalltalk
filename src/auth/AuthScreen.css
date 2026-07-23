@@ -70,12 +70,15 @@
 }
 
 .auth-google-button:focus-visible,
-.auth-email-input:focus-visible {
+.auth-email-input:focus-visible,
+.auth-email-button:focus-visible,
+.auth-change-email-button:focus-visible {
   border-color: #858581;
   box-shadow: 0 0 0 3px rgba(20, 20, 18, 0.1);
 }
 
-.auth-google-button:active:not(:disabled) {
+.auth-google-button:active:not(:disabled),
+.auth-email-button:active:not(:disabled) {
   transform: scale(0.995);
 }
 
@@ -118,6 +121,10 @@
   opacity: 1;
 }
 
+.auth-email-form {
+  display: grid;
+}
+
 .auth-email-button {
   min-height: 48px;
   margin-top: 12px;
@@ -127,8 +134,55 @@
   font-size: 15px;
   font-weight: 540;
   letter-spacing: -0.005em;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    opacity 150ms ease,
+    transform 120ms ease;
+}
+
+.auth-email-button:disabled {
   cursor: not-allowed;
-  opacity: 1;
+  opacity: 0.5;
+}
+
+.auth-email-sent {
+  display: grid;
+  text-align: center;
+}
+
+.auth-email-sent > p:first-child {
+  margin: 0;
+  color: #5f5f5a;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.auth-email-sent strong {
+  color: #20201e;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.auth-change-email-button {
+  justify-self: center;
+  margin-top: 14px;
+  border: 0;
+  padding: 4px;
+  color: #565653;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+  cursor: pointer;
+}
+
+.auth-change-email-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .auth-privacy-copy {
@@ -164,6 +218,11 @@
   .auth-google-button:hover:not(:disabled) {
     border-color: #9d9d98;
     background: #fff;
+  }
+
+  .auth-email-button:hover:not(:disabled) {
+    border-color: #242422;
+    background: #242422;
   }
 }
 

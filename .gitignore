@@ -14,14 +14,19 @@ lerna-debug.log*
 
 
 node_modules
+.pnpm-store/
 dist
 dist-ssr
 *.local
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 target/
 # Cargo output when CARGO_TARGET_DIR points at src-tauri.
 /src-tauri/debug/
 /src-tauri/release/
 /src-tauri/build/
+/src-tauri/.rustc_info.json
 src-tauri/binaries/*-apple-darwin
 
 reference/

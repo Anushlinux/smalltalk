@@ -4138,7 +4138,7 @@ function SettingsHome({
             <span>Account</span>
             <h3>{accountEmail}</h3>
             <p>
-              Your Smalltalk account is signed in with Google. Signing out does not delete local memory or captures.
+              Your Smalltalk account is signed in. Signing out does not delete local memory or captures.
               {authError ? ` ${authError}` : ""}
             </p>
           </div>

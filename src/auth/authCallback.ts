@@ -1,6 +1,6 @@
 export type AuthCallbackResult =
   | { kind: "ignored" }
-  | { kind: "oauth_error"; message: string }
+  | { kind: "auth_error"; message: string }
   | { kind: "missing_code" }
   | { kind: "code"; code: string };
 
@@ -21,18 +21,18 @@ export function parseAuthCallback(rawUrl: string): AuthCallbackResult {
     return { kind: "ignored" };
   }
 
-  const oauthError = url.searchParams.get("error_description") || url.searchParams.get("error");
-  if (oauthError) {
-    const normalizedError = oauthError.replace(/\+/g, " ").trim();
+  const authError = url.searchParams.get("error_description") || url.searchParams.get("error");
+  if (authError) {
+    const normalizedError = authError.replace(/\+/g, " ").trim();
     const wasCancelled =
       normalizedError.toLowerCase().includes("access_denied") ||
       normalizedError.toLowerCase().includes("cancel");
 
     return {
-      kind: "oauth_error",
+      kind: "auth_error",
       message: wasCancelled
-        ? "Google authorization was cancelled."
-        : `Google authentication failed: ${normalizedError}`,
+        ? "Sign-in was cancelled."
+        : `Authentication failed: ${normalizedError}`,
     };
   }
 

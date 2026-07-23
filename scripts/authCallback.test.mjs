@@ -19,7 +19,7 @@ test("rejects callbacks with the wrong scheme, host, or path", () => {
 test("returns a concise cancellation error without exposing the callback URL", () => {
   assert.deepEqual(
     parseAuthCallback("smalltalk://auth/callback?error=access_denied&error_description=cancelled"),
-    { kind: "oauth_error", message: "Google authorization was cancelled." },
+    { kind: "auth_error", message: "Sign-in was cancelled." },
   );
 });
 

@@ -21,6 +21,7 @@ import {
   getSupabaseClient,
   isTrustedSupabaseOAuthUrl,
 } from "./supabase";
+import { requestPasswordlessEmail } from "./emailAuth";
 
 export type Profile = {
   id: string;
@@ -41,6 +42,7 @@ export type AuthState = {
   profile: Profile | null;
   error: string | null;
   signInWithGoogle: () => Promise<void>;
+  signInWithEmail: (email: string) => Promise<boolean>;
   signOut: () => Promise<void>;
 };
 
@@ -122,14 +124,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         await revealMainWindow();
 
-        if (callback.kind === "oauth_error") {
+        if (callback.kind === "auth_error") {
           if (mountedRef.current) setError(callback.message);
           return;
         }
 
         if (callback.kind === "missing_code") {
           if (mountedRef.current) {
-            setError("Google authentication returned without an authorization code.");
+            setError("Authentication returned without an authorization code.");
           }
           return;
         }
@@ -205,7 +207,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         });
       } catch {
         if (!cancelled) {
-          setError("Smalltalk could not start its secure Google sign-in callback listener.");
+          setError("Smalltalk could not start its secure sign-in callback listener.");
         }
       }
 
@@ -326,6 +328,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const signInWithEmail = useCallback(async (email: string) => {
+    if (loginInFlightRef.current) return false;
+    loginInFlightRef.current = true;
+    setLoading(true);
+    setError(null);
+
+    try {
+      const client = getSupabaseClient();
+      const redirectTo = await invoke<string>("get_auth_redirect_url");
+      await requestPasswordlessEmail(client, email, redirectTo);
+      return true;
+    } catch (signInError) {
+      setError(errorMessage(signInError, "Email authentication could not be started"));
+      return false;
+    } finally {
+      loginInFlightRef.current = false;
+      setLoading(false);
+    }
+  }, []);
+
   const signOut = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -351,9 +373,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       profile,
       error,
       signInWithGoogle,
+      signInWithEmail,
       signOut,
     }),
-    [error, initialized, loading, profile, session, signInWithGoogle, signOut],
+    [
+      error,
+      initialized,
+      loading,
+      profile,
+      session,
+      signInWithEmail,
+      signInWithGoogle,
+      signOut,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
