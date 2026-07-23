@@ -5,18 +5,32 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const packageLock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
 const tauriConfig = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
 const cargoToml = fs.readFileSync(path.join(root, "src-tauri/Cargo.toml"), "utf8");
 const cargoVersion = cargoToml.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
+const cargoLock = fs.readFileSync(path.join(root, "src-tauri/Cargo.lock"), "utf8");
+const cargoLockVersion = cargoLock.match(
+  /^\[\[package\]\]\nname = "smalltalk"\nversion = "([^"]+)"/m,
+)?.[1];
 
 if (!cargoVersion) {
   throw new Error("Could not read the package version from src-tauri/Cargo.toml");
 }
+if (!packageLock.packages?.[""]?.version) {
+  throw new Error("Could not read the root package version from package-lock.json");
+}
+if (!cargoLockVersion) {
+  throw new Error("Could not read the Smalltalk package version from src-tauri/Cargo.lock");
+}
 
 const versions = new Map([
   ["package.json", packageJson.version],
+  ["package-lock.json", packageLock.version],
+  ['package-lock.json packages[""]', packageLock.packages[""].version],
   ["src-tauri/tauri.conf.json", tauriConfig.version],
   ["src-tauri/Cargo.toml", cargoVersion],
+  ["src-tauri/Cargo.lock", cargoLockVersion],
 ]);
 const uniqueVersions = new Set(versions.values());
 

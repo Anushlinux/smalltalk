@@ -16,12 +16,16 @@
   --permission-accent: #126a5a;
   --permission-accent-strong: #0a4b40;
   --permission-accent-soft: #e2f2ed;
-  display: grid;
+  display: flex;
+  height: 100dvh;
   width: 100%;
   min-width: 320px;
-  min-height: 100dvh;
-  place-items: center;
-  overflow: auto;
+  min-height: 0;
+  align-items: center;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 32px;
   color: var(--permission-ink);
   background:
@@ -64,6 +68,8 @@
 .permissions-shell {
   display: grid;
   width: min(780px, 100%);
+  flex: 0 0 auto;
+  margin-block: auto;
   overflow: hidden;
   border: 1px solid rgba(196, 206, 201, 0.9);
   border-radius: 18px;
@@ -473,7 +479,7 @@
 
 @media (max-width: 680px) {
   .permissions-screen {
-    place-items: start center;
+    align-items: center;
     padding: 16px;
   }
 
@@ -545,6 +551,29 @@
 
   .permissions-footer {
     display: grid;
+  }
+}
+
+@media (max-height: 680px) {
+  .permissions-screen {
+    padding-block: 16px;
+  }
+
+  .permissions-intro {
+    padding-block: 20px 16px;
+  }
+
+  .permissions-intro h1 {
+    font-size: 26px;
+  }
+
+  .permission-row {
+    min-height: 102px;
+    padding-block: 14px;
+  }
+
+  .permissions-footer {
+    padding-block: 16px 18px;
   }
 }
 

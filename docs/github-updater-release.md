@@ -32,18 +32,26 @@ The `Anushlinux/smalltalk` repository and its Releases must be public before dis
 
 ## Publish a release
 
-Keep the version identical in:
+Set the next version in every release file with one command:
+
+```bash
+npm run release:set-version -- 0.1.5
+```
+
+The command updates and verifies:
 
 - `package.json`
+- `package-lock.json`
 - `src-tauri/Cargo.toml`
+- `src-tauri/Cargo.lock`
 - `src-tauri/tauri.conf.json`
 
-For example, after synchronizing the desktop app version and lockfiles to `0.1.3`, commit that change, then create and push the matching tag:
+Commit that version change before creating the matching `v`-prefixed Git tag:
 
 ```bash
 npm run release:check-version
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 Pushing the tag starts `.github/workflows/publish-macos.yml`. The workflow runs deterministic webview tests and builds both Apple Silicon and Intel versions. It publishes the DMGs, updater archives, signatures, and `latest.json` in one non-draft GitHub Release.

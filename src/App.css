@@ -6723,26 +6723,47 @@ button[aria-busy="true"] {
   .primary-nav button:hover,
   .secondary-nav button:hover {
     color: var(--ink);
-    background: rgba(255, 255, 255, 0.48);
+    background: rgba(29, 29, 27, 0.055);
+  }
+
+  .capture-shell.continue-mode .secondary-button:hover:not(:disabled),
+  .capture-shell.developer-mode .secondary-button:hover:not(:disabled) {
+    border-color: var(--line-strong);
+    background: #f1f0ec;
   }
 
   .toolbar-icon-button:hover:not(:disabled) {
     color: var(--ink);
-    background: #fff;
+    background: #efeee9;
   }
 
   .sidebar-memory-toggle:hover:not(:disabled) {
-    border-color: rgba(0, 105, 60, 0.24);
-    background: rgba(255, 255, 255, 0.82);
+    border-color: var(--line-strong);
+    background: #e9e8e3;
   }
 
   .toolbar-memory-toggle:hover:not(:disabled) {
-    border-color: rgba(0, 105, 60, 0.24);
-    background: #fff;
+    border-color: var(--line-strong);
+    background: #efeee9;
+  }
+
+  .product-sidebar .capture-menu summary:hover {
+    border-color: var(--line-strong);
+    background: rgba(29, 29, 27, 0.055);
+  }
+
+  .settings-actions .primary-button:hover:not(:disabled) {
+    background: #2a2926;
+  }
+
+  .memory-start-button:hover:not(:disabled) {
+    border-color: #f0eee9;
+    background: #ebe9e4;
   }
 
   .continue-mode .answer-primary-actions .primary-button:hover:not(:disabled) {
-    background: #ffffff;
+    border-color: #efede7;
+    background: #efede7;
   }
 
   .continue-mode .answer-primary-actions .secondary-button:hover:not(:disabled),
@@ -6752,12 +6773,57 @@ button[aria-busy="true"] {
   }
 
   .answer-more-menu > div button:hover:not(:disabled) {
-    background: #f1eee8;
+    background: rgba(29, 29, 27, 0.055);
   }
 
   .history-row:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.72);
+    background: rgba(29, 29, 27, 0.035);
   }
+
+  .history-back:hover:not(:disabled),
+  .history-load-more:hover:not(:disabled),
+  .continuation-context-trigger:hover:not(:disabled) {
+    background: rgba(29, 29, 27, 0.05);
+  }
+}
+
+.capture-shell.continue-mode .secondary-button:active:not(:disabled),
+.capture-shell.developer-mode .secondary-button:active:not(:disabled) {
+  border-color: var(--line-strong);
+  background: #e8e6e0;
+}
+
+.primary-nav button:active:not(:disabled),
+.secondary-nav button:active:not(:disabled),
+.toolbar-icon-button:active:not(:disabled),
+.sidebar-memory-toggle:active:not(:disabled),
+.toolbar-memory-toggle:active:not(:disabled),
+.product-sidebar .capture-menu summary:active {
+  background: rgba(29, 29, 27, 0.085);
+}
+
+.settings-actions .primary-button:active:not(:disabled) {
+  background: #35332f;
+}
+
+.memory-start-button:active:not(:disabled),
+.continue-mode .answer-primary-actions .primary-button:active:not(:disabled) {
+  border-color: #e7e4dd;
+  background: #e7e4dd;
+}
+
+.continue-mode .answer-primary-actions .secondary-button:active:not(:disabled),
+.answer-more-menu summary:active {
+  border-color: rgba(255, 255, 255, 0.27);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.answer-more-menu > div button:active:not(:disabled),
+.history-row:active:not(:disabled),
+.history-back:active:not(:disabled),
+.history-load-more:active:not(:disabled),
+.continuation-context-trigger:active:not(:disabled) {
+  background: rgba(29, 29, 27, 0.085);
 }
 
 @media (max-width: 860px) {
@@ -7049,6 +7115,16 @@ button[aria-busy="true"] {
   padding: 0 10px 10px;
   background: #f5f4f1;
   transition: grid-template-columns 140ms var(--ease-in-out);
+}
+
+.capture-shell button {
+  appearance: none;
+  -webkit-appearance: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.capture-shell summary {
+  -webkit-tap-highlight-color: transparent;
 }
 
 .capture-shell.sidebar-collapsed {

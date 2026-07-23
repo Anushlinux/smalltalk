@@ -23,6 +23,21 @@
   box-shadow: 0 3px 9px rgba(22, 22, 20, 0.025);
 }
 
+.auth-heading {
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.auth-heading h1 {
+  margin: 0;
+  color: #101010;
+  font-size: 26px;
+  font-weight: 680;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+
 .auth-google-button,
 .auth-email-input,
 .auth-email-button {
@@ -166,6 +181,10 @@
 @media (max-height: 440px) {
   .auth-card {
     padding: 24px;
+  }
+
+  .auth-heading {
+    margin-bottom: 18px;
   }
 
   .auth-divider {

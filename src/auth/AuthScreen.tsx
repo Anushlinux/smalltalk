@@ -18,7 +18,11 @@ export function AuthScreen() {
 
   return (
     <main className="auth-screen">
-      <section className="auth-card" aria-label="Sign in to Smalltalk">
+      <section className="auth-card" aria-labelledby="auth-title">
+        <header className="auth-heading">
+          <h1 id="auth-title">Sign in to Smalltalk</h1>
+        </header>
+
         <button
           className="auth-google-button"
           type="button"
