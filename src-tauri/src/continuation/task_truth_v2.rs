@@ -334,6 +334,7 @@ pub(super) fn record_manual_continue_shadow(
     manual_continue_frame_id: Option<&str>,
     manual_continue_preflight_failure: Option<&str>,
     manual_continue_started_at_ms: Option<i64>,
+    cloud_auth: Option<&crate::cloud_auth::CloudAuthSession>,
 ) -> Result<audit::ShadowAuditSummaryV2, String> {
     record_manual_continue_shadow_with_lookback(
         conn,
@@ -344,6 +345,7 @@ pub(super) fn record_manual_continue_shadow(
         manual_continue_frame_id,
         manual_continue_preflight_failure,
         manual_continue_started_at_ms,
+        cloud_auth,
     )
 }
 
@@ -364,6 +366,7 @@ fn record_manual_continue_shadow_with_lookback(
     manual_continue_frame_id: Option<&str>,
     manual_continue_preflight_failure: Option<&str>,
     manual_continue_started_at_ms: Option<i64>,
+    cloud_auth: Option<&crate::cloud_auth::CloudAuthSession>,
 ) -> Result<audit::ShadowAuditSummaryV2, String> {
     let started = std::time::Instant::now();
     let capture_to_packet_started = std::time::Instant::now();
@@ -451,6 +454,7 @@ fn record_manual_continue_shadow_with_lookback(
         resolved_session_id.as_deref(),
         &packet,
         preflight_failure.as_deref(),
+        cloud_auth,
     ) {
         // Compact inference failures must not crash Continue. The public
         // projection below will return a typed unresolved answer instead.
@@ -3664,6 +3668,7 @@ mod tests {
             None,
             None,
             Some(&boundary_frame_id),
+            None,
             None,
             None,
         )

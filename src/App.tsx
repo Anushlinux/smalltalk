@@ -33,6 +33,7 @@ import {
   OpenAiLogo,
   ShieldCheck,
   SidebarSimple,
+  SignOut,
   SlackLogo,
   SlidersHorizontal,
   TerminalWindow,
@@ -76,6 +77,9 @@ import {
   withContinueRequestTimeout,
 } from "./continueRequest";
 import { MosaicLeafBackground } from "./MosaicLeafBackground";
+import { useAuth } from "./auth/AuthProvider";
+import { useAppUpdate } from "./updates/AppUpdateProvider";
+import { appUpdateStatusCopy } from "./updates/updatePresentation";
 import smalltalkLogo from "./assets/smalltalk-logo.png";
 import "@fontsource/instrument-serif/400.css";
 import "./App.css";
@@ -1537,6 +1541,13 @@ const emptyTimeline: Timeline = {
 };
 
 function App() {
+  const {
+    profile,
+    user,
+    loading: authLoading,
+    error: authError,
+    signOut,
+  } = useAuth();
   const [status, setStatus] = useState<CaptureStatus>(initialStatus);
   const [screenCapturePermission, setScreenCapturePermission] =
     useState<ScreenCapturePermissionStatus | null>(null);
@@ -2868,6 +2879,7 @@ function App() {
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No evidence selected";
   const showInspectEntry = import.meta.env.DEV;
+  const greetingName = profile?.full_name?.trim().split(/\s+/)[0] || "there";
   const openProductView = useCallback((nextView: Exclude<ViewMode, "developer">) => {
     setMemoryMenuOpen(false);
     setEvidenceOpen(false);
@@ -3137,6 +3149,18 @@ function App() {
               <span>Inspect</span>
             </button>
           ) : null}
+          <button
+            className="logout-nav-button"
+            type="button"
+            disabled={authLoading}
+            aria-busy={authLoading}
+            aria-label="Log out"
+            title="Log out"
+            onClick={() => void signOut()}
+          >
+            <ProductIcon name="logout" />
+            <span>{authLoading ? "Logging out" : "Log out"}</span>
+          </button>
         </nav>
       </aside>
 
@@ -3150,7 +3174,7 @@ function App() {
       <header className={`product-toolbar ${viewMode === "continue" ? "continue-toolbar" : ""}`}>
         {viewMode === "continue" ? (
           <h1 className="continue-greeting">
-            Hey Anushrut, pick up where you left off
+            Hey {greetingName}, pick up where you left off
           </h1>
         ) : (
           <div>
@@ -3289,10 +3313,14 @@ function App() {
           busyAction={busyAction}
           hasEvidence={continueHasEvidence}
           showInspectEntry={showInspectEntry}
+          accountEmail={user?.email || profile?.email || "Signed in"}
+          authBusy={authLoading}
+          authError={authError}
           onOpenPrivacy={openPrivacyPanel}
           onRequestPermission={() => void requestScreenCapturePermission()}
           onDeleteMemory={deleteAllFrames}
           onInspect={openDeveloperMode}
+          onSignOut={() => void signOut()}
         />
       ) : null}
 
@@ -3903,6 +3931,7 @@ type ProductIconName =
   | "continue"
   | "history"
   | "settings"
+  | "logout"
   | "inspect"
   | "refresh"
   | "chevron"
@@ -3921,6 +3950,7 @@ function ProductIcon({ name }: { name: ProductIconName }) {
   if (name === "continue") return <ArrowBendDownRight {...common} />;
   if (name === "history") return <ClockCounterClockwise {...common} />;
   if (name === "settings") return <SlidersHorizontal {...common} />;
+  if (name === "logout") return <SignOut {...common} />;
   if (name === "inspect") return <Eye {...common} />;
   if (name === "refresh") return <ArrowsClockwise {...common} />;
   if (name === "chevron") return <CaretRight {...common} />;
@@ -4061,10 +4091,14 @@ function SettingsHome({
   busyAction,
   hasEvidence,
   showInspectEntry,
+  accountEmail,
+  authBusy,
+  authError,
   onOpenPrivacy,
   onRequestPermission,
   onDeleteMemory,
   onInspect,
+  onSignOut,
 }: {
   memoryProductStatus: MemoryProductStatus;
   memoryProduct: { label: string; detail: string };
@@ -4074,11 +4108,19 @@ function SettingsHome({
   busyAction: string | null;
   hasEvidence: boolean;
   showInspectEntry: boolean;
+  accountEmail: string;
+  authBusy: boolean;
+  authError: string | null;
   onOpenPrivacy: () => void;
   onRequestPermission: () => void;
   onDeleteMemory: () => void;
   onInspect: () => void;
+  onSignOut: () => void;
 }) {
+  const update = useAppUpdate();
+  const updateCopy = appUpdateStatusCopy(update);
+  const updateBusy = ["checking", "downloading", "installing", "restarting"].includes(update.phase);
+
   return (
     <section className="settings-screen" aria-label="Settings">
       <div className="screen-intro">
@@ -4090,6 +4132,29 @@ function SettingsHome({
       </div>
 
       <div className="settings-stack">
+        <section className="settings-section">
+          <div className="settings-icon"><ProductIcon name="settings" /></div>
+          <div className="settings-section-copy">
+            <span>Account</span>
+            <h3>{accountEmail}</h3>
+            <p>
+              Your Smalltalk account is signed in with Google. Signing out does not delete local memory or captures.
+              {authError ? ` ${authError}` : ""}
+            </p>
+          </div>
+          <div className="settings-actions">
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={authBusy}
+              aria-busy={authBusy}
+              onClick={onSignOut}
+            >
+              {authBusy ? "Signing out" : "Sign out"}
+            </button>
+          </div>
+        </section>
+
         <section className="settings-section">
           <div className="settings-icon"><ProductIcon name="memory" /></div>
           <div className="settings-section-copy">
@@ -4124,6 +4189,36 @@ function SettingsHome({
               <button className="secondary-button" type="button" disabled={busyAction !== null} onClick={onRequestPermission}>Review permission</button>
             </div>
           ) : null}
+        </section>
+
+        <section className={`settings-section ${update.phase === "available" || update.phase === "error" ? "needs-attention" : ""}`}>
+          <div className="settings-icon"><ProductIcon name="refresh" /></div>
+          <div className="settings-section-copy">
+            <span>Software update</span>
+            <h3>{updateCopy.title}</h3>
+            <p>{updateCopy.detail}</p>
+          </div>
+          <div className="settings-actions">
+            {update.phase === "available" ? (
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => void update.installUpdate()}
+              >
+                Update and restart
+              </button>
+            ) : (
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={updateBusy || update.phase === "unavailable"}
+                aria-busy={update.phase === "checking"}
+                onClick={() => void update.checkForUpdates(true)}
+              >
+                {update.phase === "checking" ? "Checking" : "Check for updates"}
+              </button>
+            )}
+          </div>
         </section>
 
         <section className="settings-section danger-zone">
@@ -5126,6 +5221,7 @@ function ContinuationAnswer({
             </button>
           </div>
         </div>
+        <ContinuationDetailsPlaceholder hasEvidence={hasEvidence} running={running} />
       </section>
     );
   }

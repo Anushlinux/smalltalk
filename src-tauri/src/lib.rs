@@ -1,27 +1,27 @@
 #![recursion_limit = "256"]
 
+use tauri::Manager;
+
+mod auth_callback;
 mod capture;
 mod capture_core;
+mod cloud_auth;
 mod continuation;
 mod session_island;
+mod system_permissions;
 mod workload;
 
 #[cfg(target_os = "macos")]
 fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
     use objc2_app_kit::{NSColor, NSWindow};
-    use tauri::Manager;
 
     let window = app.get_webview_window("main").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "main window is unavailable")
     })?;
     let ns_window = window.ns_window().map_err(std::io::Error::other)? as *mut NSWindow;
     let ns_window = unsafe { &*ns_window };
-    let background = NSColor::colorWithRed_green_blue_alpha(
-        245.0 / 255.0,
-        244.0 / 255.0,
-        241.0 / 255.0,
-        1.0,
-    );
+    let background =
+        NSColor::colorWithRed_green_blue_alpha(245.0 / 255.0, 244.0 / 255.0, 241.0 / 255.0, 1.0);
 
     unsafe { ns_window.setBackgroundColor(Some(&background)) };
     Ok(())
@@ -30,9 +30,14 @@ fn set_main_window_background(app: &tauri::App) -> Result<(), std::io::Error> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(capture::CaptureState::default())
+        .manage(cloud_auth::CloudAuthState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            app.manage(auth_callback::start(app.handle().clone()));
             #[cfg(target_os = "macos")]
             set_main_window_background(app)?;
             capture::initialize_runtime_database(app.handle()).map_err(std::io::Error::other)?;
@@ -51,9 +56,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            auth_callback::get_auth_redirect_url,
+            cloud_auth::set_cloud_auth_session,
             capture::start_capture,
             capture::get_screen_capture_permission_status,
             capture::request_screen_capture_permission,
+            system_permissions::get_app_permissions_status,
+            system_permissions::request_app_permission,
+            system_permissions::open_app_permission_settings,
             capture::stop_capture,
             capture::capture_once,
             capture::capture_status,
@@ -143,6 +153,7 @@ pub fn run() {
 }
 
 /// Public, side-effect-bounded entry point used by the repository accuracy CLI.
+#[cfg(feature = "eval-binaries")]
 pub fn run_continue_accuracy_eval_cli(
     fixture_root: Option<String>,
     output_path: Option<String>,
@@ -166,6 +177,7 @@ pub fn run_continue_accuracy_eval_cli(
 }
 
 /// Local-only Task Truth v2.02 evaluator. This is deliberately separate from the P6 report.
+#[cfg(feature = "eval-binaries")]
 pub fn run_task_truth_v2_eval_cli(
     fixture_root: Option<String>,
     output_path: Option<String>,
@@ -185,6 +197,7 @@ pub fn run_task_truth_v2_eval_cli(
 }
 
 /// Stable content identity used to bind TT2-05 budgets to the frozen baseline bytes.
+#[cfg(feature = "eval-binaries")]
 pub fn task_truth_v2_baseline_sha256(bytes: &[u8]) -> String {
     format!(
         "sha256:{}",
@@ -193,6 +206,7 @@ pub fn task_truth_v2_baseline_sha256(bytes: &[u8]) -> String {
 }
 
 /// Local-only, default-deny corpus builder used before any candidate is reviewed for commit.
+#[cfg(feature = "eval-binaries")]
 pub fn build_task_truth_v2_candidate_cli(
     input_path: String,
     output_path: Option<String>,
@@ -207,6 +221,7 @@ pub fn build_task_truth_v2_candidate_cli(
 }
 
 /// Arm one private PFTU-01 case before its model output exists.
+#[cfg(feature = "eval-binaries")]
 pub fn arm_pftu_01_case_cli(
     database_path: String,
     input_path: String,
@@ -218,6 +233,7 @@ pub fn arm_pftu_01_case_cli(
 }
 
 /// Export a private, local-only PFTU-01 review bundle. The caller chooses the path.
+#[cfg(feature = "eval-binaries")]
 pub fn export_pftu_01_review_cli(
     database_path: String,
     output_path: String,
@@ -229,6 +245,7 @@ pub fn export_pftu_01_review_cli(
 }
 
 /// Evaluate only redacted, human-reviewed PFTU-01 corpus rows.
+#[cfg(feature = "eval-binaries")]
 pub fn evaluate_pftu_01_corpus_cli(
     input_path: String,
     output_path: Option<String>,

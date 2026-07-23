@@ -1551,6 +1551,8 @@ pub struct ContinueDecisionRequest {
     pub manual_continue_preflight_failure: Option<String>,
     #[serde(default)]
     pub manual_continue_started_at_ms: Option<i64>,
+    #[serde(skip)]
+    pub cloud_auth: Option<crate::cloud_auth::CloudAuthSession>,
 }
 
 impl Default for ContinueDecisionRequest {
@@ -1573,6 +1575,7 @@ impl Default for ContinueDecisionRequest {
             manual_continue_frame_id: None,
             manual_continue_preflight_failure: None,
             manual_continue_started_at_ms: None,
+            cloud_auth: None,
         }
     }
 }
@@ -4421,6 +4424,7 @@ pub fn get_continue_decision(
         manual_continue_frame_id: request.manual_continue_frame_id,
         manual_continue_preflight_failure: request.manual_continue_preflight_failure,
         manual_continue_started_at_ms: request.manual_continue_started_at_ms,
+        cloud_auth: request.cloud_auth,
     };
     let effective_mode = effective_continue_decision_mode(
         request.mode.as_deref(),
@@ -5859,6 +5863,7 @@ pub fn get_continue_decision(
             request.manual_continue_frame_id.as_deref(),
             request.manual_continue_preflight_failure.as_deref(),
             request.manual_continue_started_at_ms,
+            request.cloud_auth.as_ref(),
         ) {
             warnings.push(format!("task_truth_v2_shadow_audit_failed:{error}"));
         }
@@ -22568,6 +22573,74 @@ fn call_openai_responses_with_timeout(
     serde_json::from_slice(&output.stdout).map_err(to_string)
 }
 
+pub(crate) fn call_smalltalk_gateway_with_timeout(
+    access_token: &str,
+    request: &Value,
+    max_time_seconds: u64,
+) -> Result<Value, String> {
+    let gateway_url = std::env::var("SMALLTALK_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| option_env!("SMALLTALK_API_URL").map(str::to_string))
+        .unwrap_or_else(|| {
+            "https://smalltalk-api.anushrutpandit.workers.dev/v1/continue".to_string()
+        });
+    let valid_url = gateway_url.starts_with("https://")
+        || (cfg!(debug_assertions)
+            && (gateway_url.starts_with("http://127.0.0.1:")
+                || gateway_url.starts_with("http://localhost:")));
+    if !valid_url || !gateway_url.ends_with("/v1/continue") {
+        return Err("Smalltalk inference gateway URL is invalid".to_string());
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "smalltalk-continue-gateway-{}",
+        current_time_millis()
+    ));
+    fs::create_dir_all(&temp_dir).map_err(to_string)?;
+    #[cfg(unix)]
+    fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700)).map_err(to_string)?;
+    let request_path = temp_dir.join("request.json");
+    let config_path = temp_dir.join("curl.conf");
+    write_private_file(
+        &request_path,
+        &serde_json::to_vec(request).map_err(to_string)?,
+    )?;
+    let config = format!(
+        "url = \"{}\"\nrequest = \"POST\"\nsilent\nshow-error\nfail-with-body\nconnect-timeout = 20\nmax-time = {}\nheader = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer {}\"\n",
+        curl_config_escape(&gateway_url),
+        max_time_seconds.clamp(5, 120),
+        curl_config_escape(access_token)
+    );
+    write_private_file(&config_path, config.as_bytes())?;
+    let output = Command::new("/usr/bin/curl")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--data-binary")
+        .arg(format!("@{}", request_path.to_string_lossy()))
+        .output()
+        .map_err(to_string);
+    let _ = fs::remove_dir_all(&temp_dir);
+    let output = output?;
+    if !output.status.success() {
+        let safe_body = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|body| {
+                body.pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        return Err(format!(
+            "Smalltalk gateway request failed: {}{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            safe_body
+                .map(|code| format!(" code={code}"))
+                .unwrap_or_default()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(to_string)
+}
+
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(path, bytes).map_err(to_string)?;
     #[cfg(unix)]
@@ -22580,15 +22653,23 @@ fn curl_config_escape(value: &str) -> String {
 }
 
 fn project_dotenv_values() -> Result<HashMap<String, String>, String> {
-    let env_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| "failed to resolve project root".to_string())?
-        .join(".env");
-    if !env_path.exists() {
-        return Ok(HashMap::new());
+    #[cfg(debug_assertions)]
+    {
+        let env_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "failed to resolve project root".to_string())?
+            .join(".env");
+        if !env_path.exists() {
+            return Ok(HashMap::new());
+        }
+        let raw = fs::read_to_string(env_path).map_err(to_string)?;
+        return Ok(parse_dotenv_values(&raw));
     }
-    let raw = fs::read_to_string(env_path).map_err(to_string)?;
-    Ok(parse_dotenv_values(&raw))
+
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(HashMap::new())
+    }
 }
 
 fn parse_dotenv_values(raw: &str) -> HashMap<String, String> {

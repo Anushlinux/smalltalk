@@ -600,6 +600,7 @@ pub(crate) fn run_fixture_once(
             manual_continue_frame_id: None,
             manual_continue_preflight_failure: None,
             manual_continue_started_at_ms: None,
+            cloud_auth: None,
         },
     )?;
     let mut actual = collect_checkpoints(&conn, &decision)?;

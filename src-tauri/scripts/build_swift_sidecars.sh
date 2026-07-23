@@ -1,19 +1,29 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ "${TAURI_ENV_PLATFORM:-macos}" != "macos" ]]; then
-  exit 0
-fi
+case "${TAURI_ENV_PLATFORM:-macos}" in
+  macos|darwin)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
 
-# A packaged release without a certificate-backed identity recreates the TCC
-# bug this hook exists to prevent. Debug bundles remain available for local
-# structural checks, but every release bundle must name an installed identity.
+# A normal packaged QA or release build without a certificate-backed identity
+# recreates the TCC bug this hook exists to prevent. The separately named
+# unsigned-alpha lane is an explicit distribution exception and remains
+# distinguishable from signed QA or release evidence.
 if [[ "${TAURI_ENV_DEBUG:-false}" != "true" ]]; then
   if [[ "${SMALLTALK_VERIFIED_MACOS_BUILD:-}" != "1" ]]; then
-    echo "macOS release bundles must be built through npm run tauri:build:macos:qa so stale bundle contents are removed and signatures are verified." >&2
+    echo "macOS release bundles must be built through an approved macOS bundle script so stale bundle contents are removed and the result is verified." >&2
     exit 1
   fi
-  if [[ -z "${APPLE_SIGNING_IDENTITY:-}" || "${APPLE_SIGNING_IDENTITY}" == "-" ]]; then
+  if [[ "${SMALLTALK_UNSIGNED_ALPHA_BUILD:-}" == "1" ]]; then
+    if [[ -n "${APPLE_SIGNING_IDENTITY:-}" && "${APPLE_SIGNING_IDENTITY}" != "-" ]]; then
+      echo "Unsigned alpha builds must not use a certificate-backed APPLE_SIGNING_IDENTITY." >&2
+      exit 1
+    fi
+  elif [[ -z "${APPLE_SIGNING_IDENTITY:-}" || "${APPLE_SIGNING_IDENTITY}" == "-" ]]; then
     echo "macOS release bundles require APPLE_SIGNING_IDENTITY to be set to an Apple Development or Developer ID Application certificate." >&2
     echo "Use npm run tauri:build:macos:qa for the verified packaged build." >&2
     exit 1

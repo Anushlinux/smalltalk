@@ -2613,8 +2613,24 @@ fn parse_probe_response(
 
 fn classify_transport_failure(error: &str) -> (ProbeDiagnosticStatus, String) {
     let normalized = error.to_ascii_lowercase();
+    let gateway_code = normalized
+        .split_once("code=")
+        .map(|(_, suffix)| {
+            suffix
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || *character == '_'
+                })
+                .take(80)
+                .collect::<String>()
+        })
+        .filter(|code| !code.is_empty());
     if normalized.contains("timed out") || normalized.contains("timeout") {
         (ProbeDiagnosticStatus::Timeout, "provider_timeout".into())
+    } else if let Some(code) = gateway_code {
+        (ProbeDiagnosticStatus::ProviderRejected, code)
     } else if normalized.contains("400")
         || normalized.contains("401")
         || normalized.contains("403")
@@ -2678,6 +2694,95 @@ pub(crate) fn run_probe(
     model_name: &str,
     api_key: Option<&str>,
 ) -> (ProbeAttempt, Option<BTreeMap<String, SupportSlot>>) {
+    run_probe_with_cloud_auth(packet, model_name, api_key, None)
+}
+
+fn gateway_request(
+    request: &ProbeRequest,
+    auth: &crate::cloud_auth::CloudAuthSession,
+) -> Result<Value, String> {
+    let content = request
+        .body
+        .pointer("/input/1/content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "gateway_evidence_content_missing".to_string())?;
+    let structured_text = content
+        .first()
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "gateway_structured_evidence_missing".to_string())?;
+    let mut images = Vec::new();
+    let mut index = 1;
+    while index + 1 < content.len() {
+        let label = content[index]
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "gateway_image_label_missing".to_string())?;
+        let mut parts = label.split_whitespace();
+        let support_slot = parts
+            .next()
+            .and_then(|part| part.strip_prefix("support_slot="))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "gateway_image_support_slot_missing".to_string())?;
+        let observed_at_ms = parts
+            .next()
+            .and_then(|part| part.strip_prefix("observed_at_ms="))
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| "gateway_image_timestamp_missing".to_string())?;
+        let data_url = content[index + 1]
+            .get("image_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "gateway_image_data_missing".to_string())?;
+        images.push(json!({
+            "support_slot": support_slot,
+            "observed_at_ms": observed_at_ms,
+            "data_url": data_url,
+        }));
+        index += 2;
+    }
+    if images.len() != request.audit.image_count {
+        return Err("gateway_image_count_mismatch".to_string());
+    }
+    Ok(json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "installation_id": auth.installation_id,
+        "app_version": auth.app_version,
+        "contract_version": "smalltalk.continue.v1",
+        "evidence": {
+            "structured_text": structured_text,
+            "images": images,
+        }
+    }))
+}
+
+fn provider_response_from_gateway(response: Value) -> Result<Value, String> {
+    if response.get("status").and_then(Value::as_str) != Some("success") {
+        return Err("gateway_response_not_successful".to_string());
+    }
+    let output_text = response
+        .pointer("/result/output_text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "gateway_response_output_missing".to_string())?;
+    let provider = response
+        .get("provider")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "gateway_provider_metadata_missing".to_string())?;
+    Ok(json!({
+        "id": provider.get("response_id").cloned().unwrap_or(Value::Null),
+        "request_id": provider.get("request_id").cloned().unwrap_or(Value::Null),
+        "model": provider.get("model").cloned().unwrap_or(Value::Null),
+        "usage": provider.get("usage").cloned().unwrap_or_else(|| json!({})),
+        "output_text": output_text,
+    }))
+}
+
+fn run_probe_with_cloud_auth(
+    packet: &ObservationPacketV2,
+    model_name: &str,
+    api_key: Option<&str>,
+    cloud_auth: Option<&crate::cloud_auth::CloudAuthSession>,
+) -> (ProbeAttempt, Option<BTreeMap<String, SupportSlot>>) {
     let started = Instant::now();
     if model_name != DEFAULT_LUNA_MODEL {
         return (
@@ -2731,7 +2836,8 @@ pub(crate) fn run_probe(
         }
     };
     let slots = request.slots.clone();
-    let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+    let usable_api_key = api_key.filter(|value| !value.trim().is_empty());
+    if cloud_auth.is_none() && usable_api_key.is_none() {
         return (
             ProbeAttempt {
                 diagnostic_status: ProbeDiagnosticStatus::ProviderUnavailable,
@@ -2754,13 +2860,26 @@ pub(crate) fn run_probe(
             },
             Some(slots),
         );
+    }
+    let response_result = if let Some(auth) = cloud_auth {
+        gateway_request(&request, auth)
+            .and_then(|gateway_request| {
+                super::super::call_smalltalk_gateway_with_timeout(
+                    &auth.access_token,
+                    &gateway_request,
+                    110,
+                )
+            })
+            .and_then(provider_response_from_gateway)
+    } else {
+        super::super::call_openai_responses_with_timeout(
+            usable_api_key.expect("checked above"),
+            &request.body,
+            90,
+            MANUAL_PROVIDER_RETRIES,
+        )
     };
-    let response = match super::super::call_openai_responses_with_timeout(
-        api_key,
-        &request.body,
-        90,
-        MANUAL_PROVIDER_RETRIES,
-    ) {
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
             let (diagnostic_status, failure_reason) = classify_transport_failure(&error);
@@ -3271,6 +3390,7 @@ pub(crate) fn run_manual_probe(
     session_id: Option<&str>,
     packet: &ObservationPacketV2,
     preflight_failure: Option<&str>,
+    cloud_auth: Option<&crate::cloud_auth::CloudAuthSession>,
 ) -> Result<(), String> {
     ensure_schema(conn)?;
     if decision_already_has_compact_run(conn, decision_id)? {
@@ -3285,7 +3405,13 @@ pub(crate) fn run_manual_probe(
     } else {
         ensure_production_runtime_case(conn, decision_id, now_ms)?
     };
-    let (api_key, model_name) = configured_model()?;
+    let (api_key, model_name) = if cloud_auth.is_some() {
+        // Authenticated release inference is owned by smalltalk-api. The
+        // desktop must not load or require the provider credential.
+        (None, configured_model_name())
+    } else {
+        configured_model()?
+    };
     let (attempt, slots) = if let Some(reason) = preflight_failure {
         let normalized = reason.to_ascii_lowercase();
         let diagnostic_status = if normalized.contains("private")
@@ -3322,7 +3448,7 @@ pub(crate) fn run_manual_probe(
             None,
         )
     } else {
-        run_probe(packet, &model_name, api_key.as_deref())
+        run_probe_with_cloud_auth(packet, &model_name, api_key.as_deref(), cloud_auth)
     };
     persist_attempt(
         conn,
@@ -5577,6 +5703,7 @@ mod tests {
             packet.session_id.as_deref(),
             &packet,
             None,
+            None,
         )
         .expect("reuse exact decision");
         let run_count: i64 = conn
@@ -6161,6 +6288,15 @@ mod tests {
             classify_transport_failure("model returned HTTP 404").0,
             ProbeDiagnosticStatus::ProviderUnavailable
         );
+        assert_eq!(
+            classify_transport_failure(
+                "Smalltalk gateway request failed: curl error 22 code=invalid_access_token"
+            ),
+            (
+                ProbeDiagnosticStatus::ProviderRejected,
+                "invalid_access_token".into()
+            )
+        );
     }
 
     #[test]
@@ -6419,5 +6555,54 @@ mod tests {
         let report = evaluate_proof_corpus(&corpus);
         assert!(!report.passed);
         assert_eq!(report.metrics.confident_wrong_primary_task_count, 1);
+    }
+
+    #[test]
+    fn gateway_request_contains_evidence_without_provider_controls() {
+        let request = build_probe_request(&packet(false), DEFAULT_LUNA_MODEL).expect("request");
+        let auth = crate::cloud_auth::CloudAuthSession {
+            access_token: "header.payload.signature".into(),
+            installation_id: "019f89a1-4ef5-7b88-8db4-32f19a9cd222".into(),
+            app_version: "0.1.0".into(),
+        };
+        let gateway = gateway_request(&request, &auth).expect("gateway evidence");
+        assert_eq!(
+            gateway.get("contract_version").and_then(Value::as_str),
+            Some("smalltalk.continue.v1")
+        );
+        assert!(gateway.get("model").is_none());
+        assert!(gateway.get("instructions").is_none());
+        assert!(gateway.get("text").is_none());
+        assert!(gateway.get("max_output_tokens").is_none());
+        assert!(gateway.pointer("/evidence/structured_text").is_some());
+        assert_eq!(
+            gateway
+                .pointer("/evidence/images")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(request.audit.image_count)
+        );
+        assert!(!gateway.to_string().contains(&auth.access_token));
+    }
+
+    #[test]
+    fn gateway_response_is_reduced_to_the_existing_local_parser_shape() {
+        let normalized = provider_response_from_gateway(json!({
+            "request_id":"019f89a1-4ef5-7b88-8db4-32f19a9cd111",
+            "status":"success",
+            "result":{"output_text":"{\"status\":\"unresolved\"}"},
+            "provider":{
+                "response_id":"resp_1",
+                "request_id":"req_1",
+                "model":"gpt-5.6-luna",
+                "usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}
+            }
+        }))
+        .expect("normalized provider response");
+        assert_eq!(normalized.get("id").and_then(Value::as_str), Some("resp_1"));
+        assert_eq!(
+            normalized.get("output_text").and_then(Value::as_str),
+            Some("{\"status\":\"unresolved\"}")
+        );
     }
 }

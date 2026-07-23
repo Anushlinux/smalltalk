@@ -3822,7 +3822,7 @@ button[aria-busy="true"] {
 
 @media (hover: hover) and (pointer: fine) {
   .sidebar-shell-toggle:hover {
-    border-color: rgba(141, 57, 125, 0.22);
+    border-color: rgba(0, 105, 60, 0.22);
     color: var(--ink);
     background: rgba(255, 255, 255, 0.88);
   }
@@ -4116,14 +4116,14 @@ button[aria-busy="true"] {
   --quiet: #85817e;
   --line: #30302f;
   --line-strong: #494846;
-  --accent: #f5bfef;
-  --accent-strong: #f5bfef;
-  --accent-soft: rgba(245, 191, 239, 0.12);
+  --accent: #00693C;
+  --accent-strong: #00693C;
+  --accent-soft: rgba(0, 105, 60, 0.12);
   --warn: #e3b978;
   --warn-soft: rgba(227, 185, 120, 0.1);
   --bad: #ff9187;
   --bad-soft: rgba(255, 145, 135, 0.1);
-  --focus: 0 0 0 3px rgba(245, 191, 239, 0.28);
+  --focus: 0 0 0 3px rgba(0, 105, 60, 0.28);
   gap: 12px;
   padding: 14px 16px 16px;
   color: var(--ink);
@@ -4160,7 +4160,7 @@ button[aria-busy="true"] {
   border-radius: 50%;
   color: transparent;
   background: var(--accent);
-  box-shadow: 0 0 0 4px rgba(245, 191, 239, 0.08);
+  box-shadow: 0 0 0 4px rgba(0, 105, 60, 0.08);
   font-size: 0;
 }
 
@@ -4214,7 +4214,7 @@ button[aria-busy="true"] {
 .continue-mode .memory-dot.starting::before,
 .continue-mode .memory-dot.freshness-current::before {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(245, 191, 239, 0.08);
+  box-shadow: 0 0 0 3px rgba(0, 105, 60, 0.08);
   animation: none;
 }
 
@@ -4231,10 +4231,10 @@ button[aria-busy="true"] {
 
 @keyframes continueEvidenceBloom {
   0% {
-    box-shadow: 0 0 0 0 rgba(245, 191, 239, 0.28);
+    box-shadow: 0 0 0 0 rgba(0, 105, 60, 0.28);
   }
   55% {
-    box-shadow: 0 0 0 7px rgba(245, 191, 239, 0.1);
+    box-shadow: 0 0 0 7px rgba(0, 105, 60, 0.1);
   }
   100% {
     box-shadow: 0 0 0 3px rgba(227, 185, 120, 0.08);
@@ -4499,9 +4499,9 @@ button[aria-busy="true"] {
 
 .continue-mode .answer-eyebrow span {
   min-height: 26px;
-  border-color: rgba(245, 191, 239, 0.2);
+  border-color: rgba(0, 105, 60, 0.2);
   color: var(--accent);
-  background: rgba(245, 191, 239, 0.08);
+  background: rgba(0, 105, 60, 0.08);
   font-size: 11px;
   font-weight: 650;
 }
@@ -4557,7 +4557,7 @@ button[aria-busy="true"] {
 }
 
 .continue-mode .answer-context-list li.current .surface-glyph {
-  box-shadow: 0 0 0 4px rgba(245, 191, 239, 0.1);
+  box-shadow: 0 0 0 4px rgba(0, 105, 60, 0.1);
 }
 
 .continue-mode .answer-target,
@@ -4653,7 +4653,7 @@ button[aria-busy="true"] {
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: rgba(245, 191, 239, 0.12);
+  background: rgba(0, 105, 60, 0.12);
 }
 
 .continue-mode .continue-dot-matrix > span.perimeter {
@@ -4796,8 +4796,8 @@ button[aria-busy="true"] {
 }
 
 .continue-mode .privacy-status-card.private_or_excluded {
-  border-color: rgba(245, 191, 239, 0.3);
-  background: rgba(245, 191, 239, 0.06);
+  border-color: rgba(0, 105, 60, 0.3);
+  background: rgba(0, 105, 60, 0.06);
 }
 
 .continue-mode .privacy-status-card.needs_permission,
@@ -4986,14 +4986,14 @@ button[aria-busy="true"] {
   --quiet: #918d85;
   --line: #dedbd3;
   --line-strong: #c9c5bc;
-  --accent: #873e7e;
-  --accent-strong: #6f2f67;
-  --accent-soft: #f4ddf0;
+  --accent: #00693C;
+  --accent-strong: #00693C;
+  --accent-soft: rgba(0, 105, 60, 0.1);
   --warn: #9a621e;
   --warn-soft: #f7ead6;
   --bad: #ae4b45;
   --bad-soft: #f8e3e0;
-  --focus: 0 0 0 3px rgba(135, 62, 126, 0.2);
+  --focus: 0 0 0 3px rgba(0, 105, 60, 0.2);
   display: grid;
   grid-template-columns: 212px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
@@ -5122,6 +5122,16 @@ button[aria-busy="true"] {
   transform: scale(0.97);
 }
 
+.secondary-nav .logout-nav-button {
+  color: #7d4b46;
+}
+
+.secondary-nav .logout-nav-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+  transform: none;
+}
+
 .product-sidebar .topbar-status {
   display: none;
 }
@@ -5185,7 +5195,7 @@ button[aria-busy="true"] {
 .sidebar-memory-toggle.on i,
 .sidebar-memory-toggle.starting i {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(141, 57, 125, 0.1);
+  box-shadow: 0 0 0 3px rgba(0, 105, 60, 0.1);
 }
 
 .sidebar-memory-toggle.needs_attention i,
@@ -5288,7 +5298,7 @@ button[aria-busy="true"] {
   min-width: 0;
   max-width: 100%;
   color: var(--ink);
-  font-size: clamp(19px, 2.2vw, 25px);
+  font-size: 25px;
   font-weight: 610;
   letter-spacing: -0.035em;
   line-height: 1.2;
@@ -5309,7 +5319,7 @@ button[aria-busy="true"] {
   background: rgba(255, 255, 255, 0.7);
   box-shadow: 0 1px 0 rgba(95, 85, 75, 0.08);
   font-family: "Geist Mono", monospace;
-  font-size: 15px;
+  font-size: 25px;
   font-weight: 570;
   letter-spacing: 0;
 }
@@ -5327,7 +5337,7 @@ button[aria-busy="true"] {
   text-transform: uppercase;
 }
 
-.product-toolbar h1 {
+.product-toolbar h1:not(.continue-greeting) {
   color: var(--ink);
   font-size: 22px;
   font-weight: 680;
@@ -5371,7 +5381,7 @@ button[aria-busy="true"] {
 .toolbar-memory-toggle.on i,
 .toolbar-memory-toggle.starting i {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(141, 57, 125, 0.1);
+  box-shadow: 0 0 0 3px rgba(0, 105, 60, 0.1);
 }
 
 .toolbar-memory-toggle.needs_attention i,
@@ -5432,7 +5442,7 @@ button[aria-busy="true"] {
 .toolbar-memory-status.on i,
 .toolbar-memory-status.starting i {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(135, 62, 126, 0.1);
+  box-shadow: 0 0 0 3px rgba(0, 105, 60, 0.1);
 }
 
 .toolbar-memory-status.needs_attention i,
@@ -5471,7 +5481,7 @@ button[aria-busy="true"] {
   --quiet: #7f7b74;
   --line: #34322e;
   --line-strong: #4d4943;
-  --accent: #f2bdeb;
+  --accent: #00693C;
   --warn: #d7a35f;
   position: relative;
   isolation: isolate;
@@ -5535,10 +5545,10 @@ button[aria-busy="true"] {
 .continue-mode .surface-glyph {
   width: 35px;
   height: 35px;
-  border: 1px solid rgba(242, 189, 235, 0.18);
+  border: 1px solid rgba(0, 105, 60, 0.18);
   border-radius: 11px;
-  color: #1b1519;
-  background: #f2bdeb;
+  color: #ffffff;
+  background: #00693C;
 }
 
 .continue-mode .answer-destination span,
@@ -5555,9 +5565,9 @@ button[aria-busy="true"] {
 
 .continue-mode .answer-eyebrow span {
   min-height: 27px;
-  border: 1px solid rgba(242, 189, 235, 0.13);
-  color: #ecc8e8;
-  background: rgba(242, 189, 235, 0.07);
+  border: 1px solid rgba(0, 105, 60, 0.32);
+  color: #8ecbb0;
+  background: rgba(0, 105, 60, 0.16);
 }
 
 .continue-mode .answer-hero {
@@ -5626,7 +5636,7 @@ button[aria-busy="true"] {
 }
 
 .memory-start-button:focus-visible {
-  outline: 2px solid #f2bdeb;
+  outline: 2px solid #00693C;
   outline-offset: 3px;
 }
 
@@ -5885,7 +5895,7 @@ button[aria-busy="true"] {
 
 .continue-mode .answer-context-list li.current .surface-glyph {
   box-shadow:
-    0 0 0 4px rgba(141, 57, 125, 0.1),
+    0 0 0 4px rgba(0, 105, 60, 0.1),
     0 8px 18px rgba(57, 49, 43, 0.12);
 }
 
@@ -6013,9 +6023,9 @@ button[aria-busy="true"] {
 }
 
 .continue-mode .continuation-context-content .surface-glyph {
-  border-color: rgba(141, 57, 125, 0.12);
+  border-color: rgba(0, 105, 60, 0.12);
   color: var(--accent);
-  background: rgba(141, 57, 125, 0.075);
+  background: rgba(0, 105, 60, 0.075);
   box-shadow: none;
 }
 
@@ -6086,7 +6096,7 @@ button[aria-busy="true"] {
 @media (hover: hover) and (pointer: fine) {
   .continuation-context-trigger:hover {
     color: var(--accent);
-    background: rgba(135, 62, 126, 0.065);
+    background: rgba(0, 105, 60, 0.065);
   }
 }
 
@@ -6158,7 +6168,7 @@ button[aria-busy="true"] {
   flex: 0 0 auto;
   width: 34px;
   height: 34px;
-  border-color: rgba(141, 57, 125, 0.16);
+  border-color: rgba(0, 105, 60, 0.16);
   border-radius: 50%;
   color: var(--accent);
   background: #fffefa;
@@ -6270,7 +6280,7 @@ button[aria-busy="true"] {
 }
 
 .continue-mode .continue-dot-matrix > span.perimeter {
-  background: #f2bdeb;
+  background: #00693C;
 }
 
 .screen-intro {
@@ -6722,12 +6732,12 @@ button[aria-busy="true"] {
   }
 
   .sidebar-memory-toggle:hover:not(:disabled) {
-    border-color: rgba(141, 57, 125, 0.24);
+    border-color: rgba(0, 105, 60, 0.24);
     background: rgba(255, 255, 255, 0.82);
   }
 
   .toolbar-memory-toggle:hover:not(:disabled) {
-    border-color: rgba(141, 57, 125, 0.24);
+    border-color: rgba(0, 105, 60, 0.24);
     background: #fff;
   }
 
@@ -6857,6 +6867,7 @@ button[aria-busy="true"] {
 
   .continue-toolbar .continue-greeting {
     flex-basis: 100%;
+    font-size: clamp(24px, 6.5vw, 30px);
   }
 
   .continue-toolbar .toolbar-memory-toggle {

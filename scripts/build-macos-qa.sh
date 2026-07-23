@@ -17,6 +17,23 @@ if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
   exit 1
 fi
 
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  TAURI_SIGNING_PRIVATE_KEY=$TAURI_SIGNING_PRIVATE_KEY_PATH
+  export TAURI_SIGNING_PRIVATE_KEY
+fi
+
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  DEFAULT_UPDATER_KEY=${SMALLTALK_UPDATER_KEY_PATH:-"$HOME/.tauri/smalltalk.key"}
+  if [ ! -f "$DEFAULT_UPDATER_KEY" ]; then
+    echo "A Tauri updater key is required at $DEFAULT_UPDATER_KEY or through TAURI_SIGNING_PRIVATE_KEY." >&2
+    exit 1
+  fi
+  TAURI_SIGNING_PRIVATE_KEY=$DEFAULT_UPDATER_KEY
+  export TAURI_SIGNING_PRIVATE_KEY
+fi
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${TAURI_SIGNING_PRIVATE_KEY_PASSWORD-}
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+
 if ! security find-identity -v -p codesigning | grep -F -- "$APPLE_SIGNING_IDENTITY" >/dev/null; then
   echo "APPLE_SIGNING_IDENTITY does not match an available code-signing identity." >&2
   exit 1

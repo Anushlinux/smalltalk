@@ -154,48 +154,39 @@ func textForNode(_ node: AxNodePayload) -> String? {
   return clean(unique.joined(separator: " "))
 }
 
-func browserUrl(appName: String?, document: String?) -> String? {
-  if let document, document.hasPrefix("http://") || document.hasPrefix("https://") {
-    return document
-  }
-
-  guard let appName else { return nil }
-  let script: String?
-  if appName.localizedCaseInsensitiveContains("Safari") {
-    script = #"tell application "Safari" to get URL of front document"#
-  } else if appName.localizedCaseInsensitiveContains("Brave") {
-    script = #"tell application "Brave Browser" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Microsoft Edge") {
-    script = #"tell application "Microsoft Edge" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Arc") {
-    script = #"tell application "Arc" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Vivaldi") {
-    script = #"tell application "Vivaldi" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Opera") {
-    script = #"tell application "Opera" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Chromium") {
-    script = #"tell application "Chromium" to get URL of active tab of front window"#
-  } else if appName.localizedCaseInsensitiveContains("Chrome") {
-    script = #"tell application "Google Chrome" to get URL of active tab of front window"#
-  } else {
-    script = nil
-  }
-
-  guard let script else { return nil }
-  let process = Process()
-  let pipe = Pipe()
-  process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-  process.arguments = ["-e", script]
-  process.standardOutput = pipe
-  process.standardError = Pipe()
-  do {
-    try process.run()
-    process.waitUntilExit()
-  } catch {
+func normalizedWebUrl(_ value: String?) -> String? {
+  guard let value = clean(value),
+        let components = URLComponents(string: value),
+        let scheme = components.scheme?.lowercased(),
+        scheme == "http" || scheme == "https" else {
     return nil
   }
-  let data = pipe.fileHandleForReading.readDataToEndOfFile()
-  return clean(String(data: data, encoding: .utf8))
+  return value
+}
+
+func browserUrl(document: String?, nodes: [AxNodePayload]) -> String? {
+  if let documentUrl = normalizedWebUrl(document) {
+    return documentUrl
+  }
+
+  if let focusedUrl = nodes
+    .filter({ $0.focused == true })
+    .lazy
+    .compactMap({ normalizedWebUrl($0.url) ?? normalizedWebUrl($0.value) })
+    .first {
+    return focusedUrl
+  }
+
+  return nodes.lazy.compactMap { node -> String? in
+    let identity = [node.identifier, node.role_description, node.title]
+      .compactMap { $0 }
+      .joined(separator: " ")
+      .lowercased()
+    guard identity.contains("address") || identity.contains("location") || identity.contains("url") else {
+      return nil
+    }
+    return normalizedWebUrl(node.url) ?? normalizedWebUrl(node.value)
+  }.first
 }
 
 func collectNode(
@@ -268,21 +259,23 @@ let windowTitle = focusedWindow.flatMap { stringAttr($0, kAXTitleAttribute) }
 let document = focusedWindow.flatMap { stringAttr($0, kAXDocumentAttribute) }
 let windowNumber = focusedWindow.flatMap { intAttr($0, "AXWindowNumber") }
 
+var nodes: [AxNodePayload] = []
+if focusedWindowResult == .success, let focusedWindow {
+  collectNode(focusedWindow, id: "root", parentId: nil, depth: 0, output: &nodes)
+}
+
 printField("APP", frontApp.localizedName)
 printField("APP_PID", "\(pid)")
 printField("APP_BUNDLE_ID", frontApp.bundleIdentifier)
 printField("WINDOW", windowTitle)
 printField("WINDOW_ID", windowNumber.map(String.init))
-printField("BROWSER_URL", browserUrl(appName: frontApp.localizedName, document: document))
+printField("BROWSER_URL", browserUrl(document: document, nodes: nodes))
 printField("DOCUMENT", document)
 
-guard focusedWindowResult == .success, let focusedWindow else {
+guard focusedWindowResult == .success, focusedWindow != nil else {
   print("ERROR\tFocused window unavailable")
   exit(0)
 }
-
-var nodes: [AxNodePayload] = []
-collectNode(focusedWindow, id: "root", parentId: nil, depth: 0, output: &nodes)
 
 for node in nodes {
   if let data = try? encoder.encode(node),

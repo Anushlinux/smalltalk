@@ -16,7 +16,6 @@ const PROCESS_FAULT_OPERATIONS: &[&str] = &[
     "screencapture_display_fallback",
     "screencapture_active_window_fallback",
     "accessibility_snapshot",
-    "accessibility_applescript_fallback",
     "window_snapshot",
     "vision_ocr",
     "tesseract_ocr_fallback",

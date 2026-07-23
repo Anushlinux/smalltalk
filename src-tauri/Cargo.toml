@@ -17,32 +17,32 @@ path = "src/main.rs"
 
 [[bin]]
 name = "continue_accuracy_eval"
-path = "src/bin/continue_accuracy_eval.rs"
+path = "eval-cli/src/bin/continue_accuracy_eval.rs"
 required-features = ["eval-binaries"]
 
 [[bin]]
 name = "task_truth_v2_eval"
-path = "src/bin/task_truth_v2_eval.rs"
+path = "eval-cli/src/bin/task_truth_v2_eval.rs"
 required-features = ["eval-binaries"]
 
 [[bin]]
 name = "task_truth_v2_release_gate"
-path = "src/bin/task_truth_v2_release_gate.rs"
+path = "eval-cli/src/bin/task_truth_v2_release_gate.rs"
 required-features = ["eval-binaries"]
 
 [[bin]]
 name = "mfti_04_release_gate"
-path = "src/bin/mfti_04_release_gate.rs"
+path = "eval-cli/src/bin/mfti_04_release_gate.rs"
 required-features = ["eval-binaries"]
 
 [[bin]]
 name = "mfti_04_performance_report"
-path = "src/bin/mfti_04_performance_report.rs"
+path = "eval-cli/src/bin/mfti_04_performance_report.rs"
 required-features = ["eval-binaries"]
 
 [[bin]]
 name = "pftu_01_probe"
-path = "src/bin/pftu_01_probe.rs"
+path = "eval-cli/src/bin/pftu_01_probe.rs"
 required-features = ["eval-binaries"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -61,11 +61,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
 libc = "0.2"
+tauri-plugin-deep-link = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
