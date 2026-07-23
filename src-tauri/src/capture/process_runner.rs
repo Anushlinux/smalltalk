@@ -280,9 +280,8 @@ pub(super) fn run_process(spec: ProcessSpec, cancellation: &CancellationToken) -
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Each helper is its own process group. Killing the group also terminates
-    // nested tools such as the osascript process used by the Accessibility
-    // helper, so Stop cannot leave an orphan behind.
+    // Each helper is its own process group, so cancellation cannot leave a
+    // child or any nested helper process behind.
     configure_process_group(&mut command);
 
     let mut child = match command.spawn() {

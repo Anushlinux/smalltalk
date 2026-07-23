@@ -2,8 +2,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 
 use super::super::{stable_hash, ContinueEvidencePreview, ContinueReturnTarget, ContinueWorkTruth};
 use super::checkpoint;
@@ -381,21 +383,36 @@ fn inference_diagnostic(
     }))
 }
 
-fn release_report_path() -> PathBuf {
-    std::env::var("SMALLTALK_TASK_TRUTH_RELEASE_REPORT")
+const EMBEDDED_RELEASE_REPORT: &[u8] = include_bytes!(
+    "../../../tests/fixtures/continue_accuracy/task_truth_v2/model_first/final-release-report.v1.json"
+);
+
+fn release_report_payload() -> Result<(Vec<u8>, String), String> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var("SMALLTALK_TASK_TRUTH_RELEASE_REPORT")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/continue_accuracy/task_truth_v2/model_first/final-release-report.v1.json")
-        })
+    {
+        let bytes = fs::read(&path).map_err(|_| "release_report_unreadable".to_string())?;
+        return Ok((bytes, path.to_string_lossy().to_string()));
+    }
+
+    Ok((
+        EMBEDDED_RELEASE_REPORT.to_vec(),
+        "embedded:final-release-report.v1.json".to_string(),
+    ))
 }
 
 fn release_report_identity(source: Option<&str>) -> Option<String> {
-    source
-        .and_then(|path| fs::read(path).ok())
-        .map(|bytes| stable_hash(&bytes))
+    match source {
+        Some(source) if source.starts_with("embedded:") => {
+            Some(stable_hash(EMBEDDED_RELEASE_REPORT))
+        }
+        #[cfg(debug_assertions)]
+        Some(path) => fs::read(path).ok().map(|bytes| stable_hash(&bytes)),
+        _ => None,
+    }
 }
 
 #[allow(dead_code)]
@@ -728,11 +745,14 @@ fn final_release_report_is_complete(value: &serde_json::Value) -> bool {
 }
 
 fn read_release_gate() -> (bool, Option<String>, Vec<String>) {
-    let path = release_report_path();
-    let source = Some(path.to_string_lossy().to_string());
-    let Ok(bytes) = fs::read(&path) else {
-        return (false, source, vec!["release_report_unreadable".into()]);
+    let Ok((bytes, source)) = release_report_payload() else {
+        return (
+            false,
+            std::env::var("SMALLTALK_TASK_TRUTH_RELEASE_REPORT").ok(),
+            vec!["release_report_unreadable".into()],
+        );
     };
+    let source = Some(source);
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return (false, source, vec!["release_report_invalid_json".into()]);
     };

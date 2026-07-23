@@ -37,21 +37,22 @@ pub(super) fn resolve(name: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // Cargo installs development helpers into one profile-stable directory.
-    // OUT_DIR is deliberately only a final fallback because its hash changes
-    // across rebuilds and would create a moving Screen Recording identity.
-    if let Some(directory) = option_env!("SMALLTALK_DEV_HELPER_DIR") {
-        let stable_helper = Path::new(directory).join(name);
-        if stable_helper.is_file() {
-            return Ok(stable_helper);
+    #[cfg(debug_assertions)]
+    {
+        // Cargo installs development helpers into one profile-stable directory.
+        // Packaged builds never fall back to a repository or build directory.
+        if let Some(directory) = option_env!("SMALLTALK_DEV_HELPER_DIR") {
+            let stable_helper = Path::new(directory).join(name);
+            if stable_helper.is_file() {
+                return Ok(stable_helper);
+            }
         }
-    }
 
-    // This fallback supports unusual Cargo test layouts. Packaged builds must
-    // have returned the signed Contents/MacOS sidecar above.
-    let build_helper = Path::new(env!("OUT_DIR")).join("swift-helpers").join(name);
-    if build_helper.is_file() {
-        return Ok(build_helper);
+        // This fallback supports unusual Cargo test layouts.
+        let build_helper = Path::new(env!("OUT_DIR")).join("swift-helpers").join(name);
+        if build_helper.is_file() {
+            return Ok(build_helper);
+        }
     }
 
     Err(format!("packaged Swift helper is missing: {name}"))

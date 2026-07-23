@@ -54,7 +54,6 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const SCK_DISPLAY_DEADLINE: Duration = Duration::from_secs(6);
 const SCK_ACTIVE_WINDOW_DEADLINE: Duration = Duration::from_secs(6);
 const ACCESSIBILITY_DEADLINE: Duration = Duration::from_secs(4);
-const ACCESSIBILITY_APPLESCRIPT_DEADLINE: Duration = Duration::from_secs(3);
 const WINDOW_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
 const VISION_OCR_DEADLINE: Duration = Duration::from_secs(8);
 const TESSERACT_DEADLINE: Duration = Duration::from_secs(8);
@@ -69,145 +68,6 @@ const SCREEN_CAPTURE_PERMISSION_REQUESTED_AT_KEY_PREFIX: &str =
 const SCREEN_CAPTURE_SETTINGS_HINT: &str =
     "System Settings > Privacy & Security > Screen & System Audio Recording";
 static SCREEN_CAPTURE_IDENTITY: OnceLock<ScreenCapturePermissionIdentity> = OnceLock::new();
-const ACCESSIBILITY_SCRIPT: &str = r#"
-on replaceText(sourceText, oldText, newText)
-  set oldDelims to AppleScript's text item delimiters
-  set AppleScript's text item delimiters to oldText
-  set parts to every text item of sourceText
-  set AppleScript's text item delimiters to newText
-  set joinedText to parts as text
-  set AppleScript's text item delimiters to oldDelims
-  return joinedText
-end replaceText
-
-on cleanText(rawValue)
-  try
-    if rawValue is missing value then return ""
-    set cleaned to rawValue as text
-  on error
-    return ""
-  end try
-  set cleaned to my replaceText(cleaned, return, " ")
-  set cleaned to my replaceText(cleaned, linefeed, " ")
-  set cleaned to my replaceText(cleaned, tab, " ")
-  return cleaned
-end cleanText
-
-on appendPiece(pieceList, rawValue)
-  set cleaned to my cleanText(rawValue)
-  if cleaned is "" then return pieceList
-  if pieceList does not contain cleaned then set end of pieceList to cleaned
-  return pieceList
-end appendPiece
-
-on joinPieces(pieceList)
-  if (count of pieceList) is 0 then return ""
-  set oldDelims to AppleScript's text item delimiters
-  set AppleScript's text item delimiters to " "
-  set joinedText to pieceList as text
-  set AppleScript's text item delimiters to oldDelims
-  return joinedText
-end joinPieces
-
-on collectElement(theElement, depth)
-  if depth > 6 then return ""
-  set outputText to ""
-  try
-    set roleText to ""
-    try
-      set roleText to role of theElement as text
-    end try
-
-    set pieces to {}
-    try
-      set pieces to my appendPiece(pieces, name of theElement)
-    end try
-    try
-      set pieces to my appendPiece(pieces, value of theElement)
-    end try
-    try
-      set pieces to my appendPiece(pieces, description of theElement)
-    end try
-    try
-      set pieces to my appendPiece(pieces, value of attribute "AXSelectedText" of theElement)
-    end try
-
-    set nodeText to my joinPieces(pieces)
-    if nodeText is not "" then
-      set outputText to outputText & "NODE" & tab & (depth as text) & tab & my cleanText(roleText) & tab & nodeText & linefeed
-    end if
-
-    if depth < 6 then
-      try
-        set childElements to UI elements of theElement
-        repeat with childElement in childElements
-          set outputText to outputText & my collectElement(childElement, depth + 1)
-        end repeat
-      end try
-    end if
-  end try
-  return outputText
-end collectElement
-
-on getBrowserUrl(appName)
-  set foundUrl to ""
-  try
-    ignoring case
-      if appName contains "Safari" then
-        tell application "Safari" to set foundUrl to URL of front document
-      else if appName contains "Google Chrome" then
-        tell application "Google Chrome" to set foundUrl to URL of active tab of front window
-      else if appName contains "Chrome" then
-        tell application "Google Chrome" to set foundUrl to URL of active tab of front window
-      else if appName contains "Brave" then
-        tell application "Brave Browser" to set foundUrl to URL of active tab of front window
-      else if appName contains "Microsoft Edge" then
-        tell application "Microsoft Edge" to set foundUrl to URL of active tab of front window
-      else if appName contains "Arc" then
-        tell application "Arc" to set foundUrl to URL of active tab of front window
-      else if appName contains "Chromium" then
-        tell application "Chromium" to set foundUrl to URL of active tab of front window
-      else if appName contains "Vivaldi" then
-        tell application "Vivaldi" to set foundUrl to URL of active tab of front window
-      else if appName contains "Opera" then
-        tell application "Opera" to set foundUrl to URL of active tab of front window
-      end if
-    end ignoring
-  end try
-  return my cleanText(foundUrl)
-end getBrowserUrl
-
-tell application "System Events"
-  set frontProc to first application process whose frontmost is true
-  set appName to my cleanText(name of frontProc)
-  set windowName to ""
-  set documentValue to ""
-
-  try
-    set windowName to my cleanText(name of front window of frontProc)
-  end try
-
-  try
-    set documentValue to my cleanText(value of attribute "AXDocument" of front window of frontProc)
-  end try
-
-  set browserUrl to my getBrowserUrl(appName)
-  if browserUrl is "" then
-    if documentValue starts with "http://" or documentValue starts with "https://" then set browserUrl to documentValue
-  end if
-
-  set outputText to "APP" & tab & appName & linefeed
-  set outputText to outputText & "WINDOW" & tab & windowName & linefeed
-  set outputText to outputText & "BROWSER_URL" & tab & browserUrl & linefeed
-  set outputText to outputText & "DOCUMENT" & tab & documentValue & linefeed
-
-  try
-    set outputText to outputText & my collectElement(front window of frontProc, 0)
-  end try
-
-  return outputText
-end tell
-"#;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static SCHEMA_INITIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2419,7 +2279,7 @@ fn restore_permission_request_markers(
     Ok(())
 }
 
-fn screen_capture_permission_status(
+pub(crate) fn screen_capture_permission_status(
     app: &AppHandle,
 ) -> Result<ScreenCapturePermissionStatus, String> {
     let identity = running_screen_capture_identity();
@@ -2717,7 +2577,7 @@ pub(crate) fn stop_capture_impl(
             let conn = open_db(&app)?;
             match build_resume_query_bundle_from_conn(
                 &conn,
-                &project_resume_query_root()?,
+                &runtime_resume_query_root(&app)?,
                 Some(ResumeQueryBundleInput {
                     session_id: Some(session.id.clone()),
                     current_frame_id: latest_frame_id,
@@ -2906,9 +2766,9 @@ pub fn dev_reset_local_memory(
         .and_then(|input| input.include_debug_exports)
         .unwrap_or(true)
     {
-        clear_project_output_dir()?;
-        clear_project_resume_query_dir()?;
-        clear_project_continue_outputs_dir()?;
+        clear_runtime_output_dir(&app)?;
+        clear_runtime_resume_query_dir(&app)?;
+        clear_runtime_continue_outputs_dir(&app)?;
     }
 
     {
@@ -3646,7 +3506,7 @@ pub fn build_resume_query_bundle(
     input: Option<ResumeQueryBundleInput>,
 ) -> Result<ResumeQueryBundleResult, String> {
     let conn = open_db(&app)?;
-    build_resume_query_bundle_from_conn(&conn, &project_resume_query_root()?, input)
+    build_resume_query_bundle_from_conn(&conn, &runtime_resume_query_root(&app)?, input)
 }
 
 #[tauri::command]
@@ -3657,7 +3517,7 @@ pub fn build_session_index(
     let conn = open_db(&app)?;
     let bundle = build_resume_query_bundle_from_conn(
         &conn,
-        &project_resume_query_root()?,
+        &runtime_resume_query_root(&app)?,
         Some(ResumeQueryBundleInput {
             session_id: input.as_ref().and_then(|input| input.session_id.clone()),
             current_frame_id: input.as_ref().and_then(|input| input.current_frame_id),
@@ -3694,7 +3554,7 @@ pub fn run_cloud_resume(
         .unwrap_or(true);
 
     if let Some(cached) =
-        cached_cloud_resume_result(&project_resume_query_root()?, &request_summary)?
+        cached_cloud_resume_result(&runtime_resume_query_root(&app)?, &request_summary)?
     {
         let paths = capture_paths(&app)?;
         let local_card = get_native_resume_card_from_conn(
@@ -3716,7 +3576,7 @@ pub fn run_cloud_resume(
 
     let query_bundle = build_resume_query_bundle_from_conn(
         &conn,
-        &project_resume_query_root()?,
+        &runtime_resume_query_root(&app)?,
         Some(ResumeQueryBundleInput {
             session_id: Some(requested_session_id),
             current_frame_id,
@@ -4588,9 +4448,11 @@ pub fn get_continue_decision(
             crate::continuation::ContinueAuditMode::MftiReview
         )
     {
-        if let Err(error) =
-            crate::continuation::task_truth_v2::review::write_mfti_review_artifact(&conn, &result)
-        {
+        if let Err(error) = crate::continuation::task_truth_v2::review::write_mfti_review_artifact(
+            &conn,
+            &result,
+            &runtime_continue_outputs_root(&app)?.join("mfti_review"),
+        ) {
             eprintln!("[mfti_review] artifact write failed: {error}");
         }
     }
@@ -4879,14 +4741,10 @@ fn collect_accessibility_context_with_timeout(
     }
     // The old wrapper abandoned a detached thread after recv_timeout. The
     // bounded runner now owns the real child deadline, kill, and reap path.
-    let native_deadline = timeout.min(ACCESSIBILITY_DEADLINE) / 2;
-    let fallback_deadline = timeout
-        .saturating_sub(native_deadline)
-        .min(ACCESSIBILITY_APPLESCRIPT_DEADLINE);
+    let native_deadline = timeout.min(ACCESSIBILITY_DEADLINE);
     let context = collect_accessibility_context_bounded(
         &paths,
         native_deadline.max(Duration::from_millis(1)),
-        fallback_deadline.max(Duration::from_millis(1)),
         None,
     );
     let timed_out = context
@@ -5075,6 +4933,12 @@ pub fn run_continue_eval(
     _app: AppHandle,
     eval_file_path: Option<String>,
 ) -> Result<crate::continuation::ContinueEvalReport, String> {
+    if !cfg!(debug_assertions) && eval_file_path.is_some() {
+        return Err(
+            "Packaged Smalltalk does not read external eval files. Run eval tooling from a development build."
+                .to_string(),
+        );
+    }
     crate::continuation::run_continue_eval(eval_file_path)
 }
 
@@ -5091,6 +4955,12 @@ pub fn run_continue_replay_eval(
 pub fn run_continue_accuracy_eval(
     input: Option<crate::continuation::accuracy_eval::ContinueAccuracyEvalOptions>,
 ) -> Result<crate::continuation::accuracy_eval::ContinueAccuracyEvalReport, String> {
+    if !cfg!(debug_assertions) {
+        return Err(
+            "Packaged Smalltalk does not read repository eval fixtures. Run accuracy tooling from a development build."
+                .to_string(),
+        );
+    }
     crate::continuation::accuracy_eval::run_committed_continue_accuracy_eval(
         input.unwrap_or_default(),
     )
@@ -7652,7 +7522,6 @@ struct TaskTruthOpenContractRow {
 struct ContinueOpenArtifactRow {
     id: String,
     browser_url: Option<String>,
-    document_path: Option<String>,
     display_title: Option<String>,
     last_seen_frame_id: Option<String>,
     openability: String,
@@ -7708,7 +7577,7 @@ fn open_resume_point_impl(
     let cloud_file = if island_primary_open_source(&input) {
         None
     } else {
-        load_cloud_resume_file_for_open(&conn, &input)?
+        load_cloud_resume_file_for_open(app, &conn, &input)?
     };
 
     if cloud_file.is_none()
@@ -7794,12 +7663,11 @@ fn open_resume_point_impl(
         Err(error) => {
             warnings.push(error);
             warnings.push(
-                "Smalltalk could not complete native browser automation; showing the resume trail."
-                    .to_string(),
+                "Smalltalk could not open the captured URL; showing the resume trail.".to_string(),
             );
             focus_main_window_for_resume(app);
             let result = OpenResumePointResult {
-                strategy: "smalltalk_automation_fallback".to_string(),
+                strategy: "smalltalk_url_open_fallback".to_string(),
                 frame_id: Some(resolved.frame_id),
                 opened_url: Some(url),
                 anchor_text: resolved.anchor_text,
@@ -7889,6 +7757,7 @@ fn blocked_open_resume_point_result(warnings: &[String]) -> OpenResumePointResul
 }
 
 fn load_cloud_resume_file_for_open(
+    app: &AppHandle,
     conn: &Connection,
     input: &OpenResumePointInput,
 ) -> Result<Option<OpenResumeCloudFile>, String> {
@@ -7897,7 +7766,10 @@ fn load_cloud_resume_file_for_open(
         .as_deref()
         .and_then(|value| non_empty(value.to_string()))
     {
-        let path = normalize_cloud_resume_result_path(PathBuf::from(path));
+        let path = restrict_cloud_resume_read_path(
+            app,
+            normalize_cloud_resume_result_path(PathBuf::from(path)),
+        )?;
         return read_open_resume_cloud_file(&path).map(Some);
     }
 
@@ -7916,7 +7788,31 @@ fn load_cloud_resume_file_for_open(
         return Ok(None);
     };
 
-    latest_open_resume_cloud_file_for_session(&project_resume_query_root()?, &session_id)
+    latest_open_resume_cloud_file_for_session(&runtime_resume_query_root(app)?, &session_id)
+}
+
+fn restrict_cloud_resume_read_path(app: &AppHandle, path: PathBuf) -> Result<PathBuf, String> {
+    if cfg!(debug_assertions) {
+        return Ok(path);
+    }
+
+    let allowed_root = runtime_resume_query_root(app)?;
+    let canonical_root = fs::canonicalize(&allowed_root).map_err(|error| {
+        format!(
+            "Smalltalk's private resume folder is unavailable ({}): {}",
+            allowed_root.display(),
+            error
+        )
+    })?;
+    let canonical_path = fs::canonicalize(&path)
+        .map_err(|error| format!("resume result could not be opened: {error}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(
+            "Packaged Smalltalk only reads resume artifacts from its private Application Support folder."
+                .to_string(),
+        );
+    }
+    Ok(canonical_path)
 }
 
 fn normalize_cloud_resume_result_path(path: PathBuf) -> PathBuf {
@@ -8534,7 +8430,7 @@ fn continue_open_artifact_by_id(
     artifact_id: &str,
 ) -> Result<Option<ContinueOpenArtifactRow>, String> {
     conn.query_row(
-        "SELECT id, browser_url, document_path, display_title, last_seen_frame_id, openability
+        "SELECT id, browser_url, display_title, last_seen_frame_id, openability
          FROM continue_artifacts
          WHERE id = ?1",
         params![artifact_id],
@@ -8542,10 +8438,9 @@ fn continue_open_artifact_by_id(
             Ok(ContinueOpenArtifactRow {
                 id: row.get(0)?,
                 browser_url: row.get(1)?,
-                document_path: row.get(2)?,
-                display_title: row.get(3)?,
-                last_seen_frame_id: row.get(4)?,
-                openability: row.get(5)?,
+                display_title: row.get(2)?,
+                last_seen_frame_id: row.get(3)?,
+                openability: row.get(4)?,
             })
         },
     )
@@ -8565,18 +8460,14 @@ fn resolve_strict_continue_artifact_for_open(
         !url.chars().any(char::is_whitespace)
             && (url.starts_with("https://") || url.starts_with("http://"))
     });
-    let valid_document_path = artifact.document_path.as_deref().is_some_and(|path| {
-        let path = path.trim();
-        path.starts_with('/') && path.len() > 1 && !path.contains('\0')
-    });
-    let has_direct_locator = valid_browser_url || valid_document_path;
+    let has_direct_locator = valid_browser_url;
     if artifact.openability != "openable" || !has_direct_locator {
         let label = artifact
             .display_title
             .as_deref()
             .unwrap_or(artifact.id.as_str());
         warnings.push(format!(
-            "Strict Continue target {} ({}) is not directly openable; openability={} and no URL or document path was captured. Staying in Smalltalk instead of using a fallback target.",
+            "Strict Continue target {} ({}) is not directly openable without another macOS permission; openability={} and no web URL was captured. Staying in Smalltalk instead of opening a local document.",
             artifact.id, label, artifact.openability
         ));
         return Ok(None);
@@ -8585,7 +8476,7 @@ fn resolve_strict_continue_artifact_for_open(
     let frame = strict_continue_artifact_frame(conn, artifact)?;
     let Some(frame) = frame else {
         warnings.push(format!(
-            "Strict Continue target {} has no local frame for its captured URL or document path. Staying in Smalltalk instead of using a fallback target.",
+            "Strict Continue target {} has no local frame for its captured web URL. Staying in Smalltalk instead of using a fallback target.",
             artifact.id
         ));
         return Ok(None);
@@ -8622,17 +8513,13 @@ fn strict_continue_artifact_frame(
         }
     }
 
-    let Some(locator) = artifact
-        .browser_url
-        .as_deref()
-        .or(artifact.document_path.as_deref())
-    else {
+    let Some(locator) = artifact.browser_url.as_deref() else {
         return Ok(None);
     };
     let frame_id = conn
         .query_row(
             "SELECT id FROM frames
-             WHERE COALESCE(browser_url, document_path, '') = ?1
+             WHERE browser_url = ?1
              ORDER BY captured_at DESC
              LIMIT 1",
             params![locator],
@@ -8648,10 +8535,6 @@ fn strict_frame_matches_artifact(frame: &CaptureFrame, artifact: &ContinueOpenAr
         .browser_url
         .as_deref()
         .is_some_and(|url| frame.browser_url.as_deref() == Some(url))
-        || artifact
-            .document_path
-            .as_deref()
-            .is_some_and(|path| frame.document_path.as_deref() == Some(path))
 }
 
 fn resolve_cloud_resume_target_for_open(
@@ -8856,8 +8739,7 @@ fn resolved_open_resume_point_from_frame(
             .browser_url
             .clone()
             .or(app_context_url)
-            .or(frame.document_path.clone())
-            .or(app_context_file_path)
+            .filter(|url| is_safe_web_url(url))
     } else {
         if (frame.browser_url.is_some()
             || app_context_url.is_some()
@@ -8955,31 +8837,23 @@ fn open_browser_resume_point(
     url: &str,
     anchor_text: Option<&str>,
 ) -> Result<BrowserOpenOutcome, String> {
-    let anchor_text = anchor_text.and_then(|value| non_empty(value.to_string()));
-    if let Some((script_app, family)) = scriptable_browser_app(app_name) {
-        match run_browser_applescript(script_app, family, url, anchor_text.as_deref()) {
-            Ok(outcome) => return Ok(outcome),
-            Err(error) => {
-                let mut warnings = vec![format!(
-                    "Browser AppleScript automation failed for {}: {}",
-                    script_app, error
-                )];
-                open_url_with_system_app(app_name, url, &mut warnings)?;
-                return Ok(BrowserOpenOutcome {
-                    strategy: "browser_url_only".to_string(),
-                    warnings,
-                });
-            }
-        }
-    }
-
-    let mut warnings = Vec::new();
-    if app_name.is_some() {
-        warnings.push(
-            "Captured app is not a scriptable browser in v1; opened the captured URL without anchor automation."
+    if !is_safe_web_url(url) {
+        return Err(
+            "Smalltalk refused to open a non-web target because doing so could require another macOS permission."
                 .to_string(),
         );
-    } else {
+    }
+    let mut warnings = Vec::new();
+    if anchor_text
+        .and_then(|value| non_empty(value.to_string()))
+        .is_some()
+    {
+        warnings.push(
+            "Opened the captured URL without controlling the browser or searching the page. This preserves Smalltalk's three-permission boundary."
+                .to_string(),
+        );
+    }
+    if app_name.is_none() {
         warnings.push(
             "Captured frame has a URL but no app name; opened the URL with the system default browser."
                 .to_string(),
@@ -8992,215 +8866,10 @@ fn open_browser_resume_point(
     })
 }
 
-fn scriptable_browser_app(app_name: Option<&str>) -> Option<(&'static str, &'static str)> {
-    let lower = app_name?.to_lowercase();
-    if lower.contains("safari") {
-        return Some(("Safari", "safari"));
-    }
-    if lower.contains("brave") {
-        return Some(("Brave Browser", "chrome"));
-    }
-    if lower.contains("microsoft edge") || lower == "edge" {
-        return Some(("Microsoft Edge", "chrome"));
-    }
-    if lower.contains("arc") {
-        return Some(("Arc", "chrome"));
-    }
-    if lower.contains("vivaldi") {
-        return Some(("Vivaldi", "chrome"));
-    }
-    if lower.contains("opera") {
-        return Some(("Opera", "chrome"));
-    }
-    if lower.contains("chromium") {
-        return Some(("Chromium", "chrome"));
-    }
-    if lower.contains("chrome") {
-        return Some(("Google Chrome", "chrome"));
-    }
-    None
-}
-
-fn run_browser_applescript(
-    app_name: &str,
-    family: &str,
-    url: &str,
-    anchor_text: Option<&str>,
-) -> Result<BrowserOpenOutcome, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("native resume-point opening is only implemented for macOS".to_string());
-    }
-
-    let script = browser_resume_applescript(app_name, family, url, anchor_text);
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("osascript failed to start: {}", error))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Err(if stderr.is_empty() {
-            format!("osascript exited with {}", output.status)
-        } else {
-            stderr
-        });
-    }
-    if script_field(&stdout, "RESULT").as_deref() == Some("error") {
-        return Err(script_field(&stdout, "ERROR")
-            .unwrap_or_else(|| "browser automation returned an unknown error".to_string()));
-    }
-
-    let anchor_found = script_field(&stdout, "ANCHOR_FOUND").as_deref() == Some("true");
-    let fallback_find_used = script_field(&stdout, "FALLBACK_FIND_USED").as_deref() == Some("true");
-    let strategy = if anchor_text
-        .and_then(|text| non_empty(text.to_string()))
-        .is_none()
-    {
-        "browser_url_only"
-    } else if anchor_found {
-        "browser_anchor"
-    } else if fallback_find_used {
-        "browser_find_fallback"
-    } else {
-        "browser_url_only"
-    };
-    let mut warnings = Vec::new();
-    if !stderr.is_empty() {
-        warnings.push(stderr);
-    }
-    if anchor_text.is_some() && !anchor_found && !fallback_find_used {
-        warnings.push(
-            "The page opened, but Smalltalk could not confirm that the anchor text was found."
-                .to_string(),
-        );
-    }
-    Ok(BrowserOpenOutcome {
-        strategy: strategy.to_string(),
-        warnings,
-    })
-}
-
-fn browser_resume_applescript(
-    app_name: &str,
-    family: &str,
-    url: &str,
-    anchor_text: Option<&str>,
-) -> String {
-    let app = applescript_quote(app_name);
-    let url = applescript_quote(url);
-    let anchor = applescript_quote(anchor_text.unwrap_or(""));
-    let js = applescript_quote(&format!(
-        "window.find({})",
-        js_string_literal(anchor_text.unwrap_or(""))
-    ));
-    let browser_body = if family == "safari" {
-        format!(
-            r#"
-tell application {app}
-  activate
-  set foundTab to false
-  repeat with w from 1 to count of windows
-    set theWindow to window w
-    repeat with i from 1 to count of tabs of theWindow
-      set theTab to tab i of theWindow
-      try
-        if URL of theTab is targetUrl then
-          set current tab of theWindow to theTab
-          set index of theWindow to 1
-          set foundTab to true
-          exit repeat
-        end if
-      end try
-    end repeat
-    if foundTab then exit repeat
-  end repeat
-  if foundTab is false then
-    if (count of windows) is 0 then
-      make new document with properties {{URL:targetUrl}}
-    else
-      tell front window
-        set current tab to (make new tab at end of tabs with properties {{URL:targetUrl}})
-      end tell
-    end if
-  end if
-  delay 0.8
-  if anchorText is not "" then
-    try
-      set anchorFound to do JavaScript jsScript in current tab of front window
-    end try
-  end if
-end tell
-"#
-        )
-    } else {
-        format!(
-            r#"
-tell application {app}
-  activate
-  set foundTab to false
-  repeat with w from 1 to count of windows
-    set theWindow to window w
-    repeat with i from 1 to count of tabs of theWindow
-      set theTab to tab i of theWindow
-      try
-        if URL of theTab is targetUrl then
-          set active tab index of theWindow to i
-          set index of theWindow to 1
-          set foundTab to true
-          exit repeat
-        end if
-      end try
-    end repeat
-    if foundTab then exit repeat
-  end repeat
-  if foundTab is false then
-    if (count of windows) is 0 then make new window
-    tell front window
-      make new tab at end of tabs with properties {{URL:targetUrl}}
-      set active tab index to (count of tabs)
-    end tell
-  end if
-  delay 0.8
-  if anchorText is not "" then
-    try
-      set anchorFound to execute active tab of front window javascript jsScript
-    end try
-  end if
-end tell
-"#
-        )
-    };
-
-    format!(
-        r#"
-set targetUrl to {url}
-set anchorText to {anchor}
-set jsScript to {js}
-set anchorFound to false
-set fallbackFindUsed to false
-try
-{browser_body}
-  if anchorText is not "" and anchorFound is false then
-    try
-      tell application "System Events"
-        keystroke "f" using command down
-        delay 0.15
-        keystroke anchorText
-        delay 0.35
-        key code 53
-      end tell
-      set fallbackFindUsed to true
-    on error findErr number findErrNo
-      return "RESULT" & tab & "error" & linefeed & "ERROR" & tab & findErr & linefeed & "ERROR_NUMBER" & tab & findErrNo
-    end try
-  end if
-  return "RESULT" & tab & "ok" & linefeed & "ANCHOR_FOUND" & tab & (anchorFound as text) & linefeed & "FALLBACK_FIND_USED" & tab & (fallbackFindUsed as text)
-on error errMsg number errNo
-  return "RESULT" & tab & "error" & linefeed & "ERROR" & tab & errMsg & linefeed & "ERROR_NUMBER" & tab & errNo
-end try
-"#
-    )
+fn is_safe_web_url(value: &str) -> bool {
+    let value = value.trim();
+    !value.chars().any(char::is_whitespace)
+        && (value.starts_with("https://") || value.starts_with("http://"))
 }
 
 fn open_url_with_system_app(
@@ -9245,33 +8914,6 @@ fn open_url_with_system_app(
         format!("open exited with {}", output.status)
     } else {
         detail
-    })
-}
-
-fn applescript_quote(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\r', " ")
-            .replace('\n', " ")
-    )
-}
-
-fn js_string_literal(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
-}
-
-fn script_field(output: &str, key: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        let mut parts = line.splitn(2, '\t');
-        let field = parts.next()?;
-        if field == key {
-            parts.next().map(|value| value.trim().to_string())
-        } else {
-            None
-        }
     })
 }
 
@@ -9598,14 +9240,23 @@ fn cloud_resume_config() -> Result<CloudResumeRuntimeConfig, String> {
 }
 
 fn project_dotenv_values() -> Result<HashMap<String, String>, String> {
-    let env_path = project_root()?.join(".env");
-    if !env_path.exists() {
-        return Ok(HashMap::new());
+    #[cfg(debug_assertions)]
+    {
+        let env_path = development_project_root()?.join(".env");
+        if !env_path.exists() {
+            return Ok(HashMap::new());
+        }
+        let raw = fs::read_to_string(env_path).map_err(to_string)?;
+        return Ok(parse_dotenv_values(&raw));
     }
-    let raw = fs::read_to_string(env_path).map_err(to_string)?;
-    Ok(parse_dotenv_values(&raw))
+
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(HashMap::new())
+    }
 }
 
+#[cfg(debug_assertions)]
 fn parse_dotenv_values(raw: &str) -> HashMap<String, String> {
     let mut values = HashMap::new();
     for line in raw.lines() {
@@ -9632,6 +9283,7 @@ fn parse_dotenv_values(raw: &str) -> HashMap<String, String> {
     values
 }
 
+#[cfg(debug_assertions)]
 fn parse_dotenv_value(value: &str) -> String {
     if value.len() >= 2 {
         let bytes = value.as_bytes();
@@ -9648,6 +9300,7 @@ fn parse_dotenv_value(value: &str) -> String {
     value.to_string()
 }
 
+#[cfg(debug_assertions)]
 fn unescape_dotenv_double_quoted(value: &str) -> String {
     let mut output = String::new();
     let mut chars = value.chars();
@@ -14128,6 +13781,12 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 
 #[tauri::command]
 pub fn run_resume_eval(app: AppHandle, eval_file_path: String) -> Result<ResumeEvalReport, String> {
+    if !cfg!(debug_assertions) {
+        return Err(
+            "Packaged Smalltalk does not read external eval files. Run eval tooling from a development build."
+                .to_string(),
+        );
+    }
     let raw = fs::read_to_string(&eval_file_path).map_err(to_string)?;
     let parsed: Value = serde_json::from_str(&raw).map_err(to_string)?;
     let cases = match parsed {
@@ -20259,7 +19918,7 @@ fn capture_status_snapshot_inner(
         data_dir: paths.root_dir.to_string_lossy().to_string(),
         database_path: paths.db_path.to_string_lossy().to_string(),
         screenshot_tool: Path::new("/usr/sbin/screencapture").exists(),
-        accessibility_tool: Path::new("/usr/bin/osascript").exists(),
+        accessibility_tool: swift_helpers::available("accessibility_snapshot"),
         ocr_tool: swift_helpers::available("vision_ocr") || command_in_path("tesseract"),
         runtime_diagnostics: runtime_diagnostics_from_conn(conn.as_ref(), Some(lifecycle)),
     };
@@ -22288,7 +21947,7 @@ fn schedule_continue_output_audit(
     effective_mode: &str,
     result: &mut crate::continuation::ContinueDecisionResult,
 ) -> Result<ContinueOutputExportSummary, String> {
-    let output_root = project_continue_outputs_root()?;
+    let output_root = runtime_continue_outputs_root(app)?;
     let plan = continue_output_audit_plan(conn, &output_root, request, effective_mode, result);
     result.continue_output_path = Some(plan.final_dir.to_string_lossy().to_string());
     let summary = ContinueOutputExportSummary {
@@ -22389,22 +22048,6 @@ fn short_sanitized_id(value: &str, max_chars: usize) -> String {
     } else {
         sanitized.chars().take(max_chars).collect()
     }
-}
-
-#[allow(dead_code)]
-fn export_continue_output_audit(
-    conn: &Connection,
-    request: &crate::continuation::ContinueDecisionRequest,
-    effective_mode: &str,
-    result: &mut crate::continuation::ContinueDecisionResult,
-) -> Result<ContinueOutputExportSummary, String> {
-    export_continue_output_audit_to_root(
-        conn,
-        request,
-        effective_mode,
-        result,
-        &project_continue_outputs_root()?,
-    )
 }
 
 #[allow(dead_code)]
@@ -25769,11 +25412,11 @@ fn collect_relative_file_index_inner(
 
 #[allow(dead_code)]
 fn write_session_export(
-    _app: &AppHandle,
+    app: &AppHandle,
     conn: &Connection,
     session: &CaptureSession,
 ) -> Result<SessionExportSummary, String> {
-    write_session_export_to_root(conn, session, &project_output_root()?)
+    write_session_export_to_root(conn, session, &runtime_output_root(app)?)
 }
 
 #[allow(dead_code)]
@@ -26697,7 +26340,8 @@ fn collect_directory_stats(path: &Path, stats: &mut ExportStats) -> Result<(), S
     Ok(())
 }
 
-fn project_root() -> Result<PathBuf, String> {
+#[cfg(any(debug_assertions, test))]
+fn development_project_root() -> Result<PathBuf, String> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
@@ -26705,16 +26349,20 @@ fn project_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not resolve project root from CARGO_MANIFEST_DIR".to_string())
 }
 
-fn project_output_root() -> Result<PathBuf, String> {
-    Ok(project_root()?.join("output"))
+fn runtime_artifact_root(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(capture_paths(app)?.root_dir.join("artifacts"))
 }
 
-fn project_resume_query_root() -> Result<PathBuf, String> {
-    Ok(project_root()?.join("resume_query_exports"))
+fn runtime_output_root(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_artifact_root(app)?.join("output"))
 }
 
-fn project_continue_outputs_root() -> Result<PathBuf, String> {
-    Ok(project_root()?.join("continue_outputs"))
+fn runtime_resume_query_root(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_artifact_root(app)?.join("resume_query_exports"))
+}
+
+fn runtime_continue_outputs_root(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_artifact_root(app)?.join("continue_outputs"))
 }
 
 fn session_folder_name(sequence: i64) -> String {
@@ -26843,9 +26491,9 @@ fn clear_capture_store(app: &AppHandle) -> Result<(), String> {
     }
     clear_snapshot_dir(&paths.snapshot_dir)?;
     clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
-    clear_project_output_dir()?;
-    clear_project_resume_query_dir()?;
-    clear_project_continue_outputs_dir()?;
+    clear_runtime_output_dir(app)?;
+    clear_runtime_resume_query_dir(app)?;
+    clear_runtime_continue_outputs_dir(app)?;
     Ok(())
 }
 
@@ -26888,7 +26536,7 @@ fn cleanup_local_memory_impl(
                 .unwrap_or(0),
         );
         reclaimed_bytes = reclaimed_bytes.saturating_add(
-            directory_stats(&project_continue_outputs_root()?)
+            directory_stats(&runtime_continue_outputs_root(app)?)
                 .map(|stats| stats.byte_size.max(0) as u64)
                 .unwrap_or(0),
         );
@@ -26936,9 +26584,9 @@ fn cleanup_local_memory_impl(
     prune_continue_refresh_rows(&conn)?;
     if input.include_debug_exports.unwrap_or(false) {
         clear_directory_contents(&paths.root_dir.join("safe-ai-exports"))?;
-        clear_project_output_dir()?;
-        clear_project_resume_query_dir()?;
-        clear_project_continue_outputs_dir()?;
+        clear_runtime_output_dir(app)?;
+        clear_runtime_resume_query_dir(app)?;
+        clear_runtime_continue_outputs_dir(app)?;
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(to_string)?;
@@ -27990,16 +27638,16 @@ fn clear_snapshot_dir(snapshot_dir: &Path) -> Result<(), String> {
     clear_directory_contents(snapshot_dir)
 }
 
-fn clear_project_output_dir() -> Result<(), String> {
-    clear_directory_contents(&project_output_root()?)
+fn clear_runtime_output_dir(app: &AppHandle) -> Result<(), String> {
+    clear_directory_contents(&runtime_output_root(app)?)
 }
 
-fn clear_project_resume_query_dir() -> Result<(), String> {
-    clear_directory_contents(&project_resume_query_root()?)
+fn clear_runtime_resume_query_dir(app: &AppHandle) -> Result<(), String> {
+    clear_directory_contents(&runtime_resume_query_root(app)?)
 }
 
-fn clear_project_continue_outputs_dir() -> Result<(), String> {
-    clear_directory_contents(&project_continue_outputs_root()?)
+fn clear_runtime_continue_outputs_dir(app: &AppHandle) -> Result<(), String> {
+    clear_directory_contents(&runtime_continue_outputs_root(app)?)
 }
 
 fn clear_directory_contents(dir: &Path) -> Result<(), String> {
@@ -30182,60 +29830,29 @@ fn collect_accessibility_context(
     paths: &CapturePaths,
     cancellation: Option<&CancellationToken>,
 ) -> AccessibilityContext {
-    collect_accessibility_context_bounded(
-        paths,
-        ACCESSIBILITY_DEADLINE,
-        ACCESSIBILITY_APPLESCRIPT_DEADLINE,
-        cancellation,
-    )
+    collect_accessibility_context_bounded(paths, ACCESSIBILITY_DEADLINE, cancellation)
 }
 
 fn collect_accessibility_context_bounded(
     paths: &CapturePaths,
     native_deadline: Duration,
-    fallback_deadline: Duration,
     cancellation: Option<&CancellationToken>,
 ) -> AccessibilityContext {
     let decision = provider_health::with_registry(|health| {
         health.decision(OperationClass::AccessibilitySnapshot, Instant::now())
     });
     if decision == AttemptDecision::Skip {
-        return collect_accessibility_context_applescript(fallback_deadline, cancellation);
+        return AccessibilityContext {
+            error: Some("native accessibility provider is temporarily unavailable".to_string()),
+            ..AccessibilityContext::default()
+        };
     }
     match collect_accessibility_context_native(paths, native_deadline, cancellation) {
-        Ok(context) if context_has_accessibility_signal(&context) => return context,
-        Ok(context) if context.error.is_none() => return context,
-        Ok(native_context) => {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return native_context;
-            }
-            let mut fallback =
-                collect_accessibility_context_applescript(fallback_deadline, cancellation);
-            if !context_has_accessibility_signal(&fallback) {
-                fallback.error = native_context.error.or(fallback.error);
-            }
-            fallback
-        }
-        Err(native_error) => {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return AccessibilityContext {
-                    error: Some(native_error),
-                    ..AccessibilityContext::default()
-                };
-            }
-            let mut fallback =
-                collect_accessibility_context_applescript(fallback_deadline, cancellation);
-            if !context_has_accessibility_signal(&fallback) {
-                fallback.error = Some(match fallback.error {
-                    Some(fallback_error) => format!(
-                        "native accessibility: {}; applescript: {}",
-                        native_error, fallback_error
-                    ),
-                    None => native_error,
-                });
-            }
-            fallback
-        }
+        Ok(context) => context,
+        Err(error) => AccessibilityContext {
+            error: Some(error),
+            ..AccessibilityContext::default()
+        },
     }
 }
 
@@ -30296,51 +29913,6 @@ fn collect_accessibility_context_native(
         }
         Ok(context)
     }
-}
-
-fn collect_accessibility_context_applescript(
-    deadline: Duration,
-    cancellation: Option<&CancellationToken>,
-) -> AccessibilityContext {
-    let no_cancellation = CancellationToken::default();
-    let mut output = run_process(
-        ProcessSpec::new(
-            "accessibility_applescript_fallback",
-            "/usr/bin/osascript",
-            deadline,
-        )
-        .args([OsString::from("-e"), OsString::from(ACCESSIBILITY_SCRIPT)])
-        .output_limits(8 * 1024 * 1024, 128 * 1024),
-        cancellation.unwrap_or(&no_cancellation),
-    );
-
-    if !output.success() {
-        return AccessibilityContext {
-            error: Some(if output.stderr_text().is_empty() {
-                format!(
-                    "accessibility AppleScript failed ({})",
-                    output.category.as_str()
-                )
-            } else {
-                output.stderr_text()
-            }),
-            ..AccessibilityContext::default()
-        };
-    }
-
-    let context = parse_accessibility_output(&output.stdout_text());
-    if !context_has_accessibility_signal(&context) && context.error.is_none() {
-        output.reclassify(HelperExitCategory::InvalidResponse);
-    } else if context_has_accessibility_signal(&context) {
-        provider_health::with_registry(|health| {
-            health.record_provider(
-                OperationClass::AccessibilitySnapshot,
-                "applescript_fallback",
-                true,
-            )
-        });
-    }
-    context
 }
 
 fn context_has_accessibility_signal(context: &AccessibilityContext) -> bool {
@@ -39750,6 +39322,17 @@ mod tests {
     }
 
     #[test]
+    fn production_resume_opening_accepts_web_urls_only() {
+        assert!(is_safe_web_url("https://example.com/work"));
+        assert!(is_safe_web_url("http://localhost:1420"));
+        assert!(!is_safe_web_url("file:///Users/example/Documents/plan.md"));
+        assert!(!is_safe_web_url("/Users/example/Documents/plan.md"));
+        assert!(!is_safe_web_url(
+            "x-apple.systempreferences:com.apple.preference.security"
+        ));
+    }
+
+    #[test]
     fn island_open_rejects_session_target() {
         let input = OpenResumePointInput {
             session_id: Some("session-legacy".to_string()),
@@ -39915,17 +39498,6 @@ mod tests {
             .any(|warning| warning.contains("local resume query candidate")));
 
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn open_resume_escaping_handles_quotes_backslashes_and_newlines() {
-        assert_eq!(js_string_literal("a\"b\nc"), "\"a\\\"b\\nc\"");
-        let quoted = applescript_quote("a\"b\\c\n");
-        assert!(quoted.starts_with('"'));
-        assert!(quoted.ends_with('"'));
-        assert!(quoted.contains("\\\""));
-        assert!(quoted.contains("\\\\"));
-        assert!(!quoted.contains('\n'));
     }
 
     #[test]
@@ -41641,7 +41213,7 @@ mod tests {
             .ok()
             .and_then(non_empty)
             .is_some()
-            || fs::read_to_string(project_root().unwrap().join(".env"))
+            || fs::read_to_string(development_project_root().unwrap().join(".env"))
                 .unwrap_or_default()
                 .lines()
                 .any(|line| {
@@ -41801,7 +41373,8 @@ mod tests {
 
     #[test]
     fn gitignore_excludes_continue_outputs() {
-        let gitignore = fs::read_to_string(project_root().unwrap().join(".gitignore")).unwrap();
+        let gitignore =
+            fs::read_to_string(development_project_root().unwrap().join(".gitignore")).unwrap();
         assert!(gitignore
             .lines()
             .any(|line| line.trim() == "continue_outputs/"));

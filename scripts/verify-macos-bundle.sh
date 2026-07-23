@@ -25,6 +25,21 @@ ACTUAL_IDENTIFIER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP
 [ "$ACTUAL_IDENTIFIER" = "$EXPECTED_IDENTIFIER" ] ||
   fail "expected bundle identifier $EXPECTED_IDENTIFIER, found $ACTUAL_IDENTIFIER"
 
+/usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1 ||
+  fail "NSScreenCaptureUsageDescription is missing"
+for FORBIDDEN_PRIVACY_KEY in \
+  NSAppleEventsUsageDescription \
+  NSDocumentsFolderUsageDescription \
+  NSDownloadsFolderUsageDescription \
+  NSDesktopFolderUsageDescription \
+  NSMicrophoneUsageDescription \
+  NSAudioCaptureUsageDescription
+do
+  if /usr/libexec/PlistBuddy -c "Print :$FORBIDDEN_PRIVACY_KEY" "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1; then
+    fail "unexpected privacy declaration $FORBIDDEN_PRIVACY_KEY"
+  fi
+done
+
 codesign --verify --deep --strict --verbose=2 "$APP_PATH" >/dev/null 2>&1 ||
   fail "codesign deep verification failed"
 
@@ -97,6 +112,8 @@ do
     fail "could not inspect the $EXECUTABLE_NAME designated requirement"
   echo "$EXECUTABLE_REQUIREMENT" | grep -q '# designated => cdhash ' &&
     fail "$EXECUTABLE_NAME has a CDHash-only designated requirement"
+  strings "$EXECUTABLE_PATH" | grep -E -q '/usr/bin/osascript|System Events|tell application' &&
+    fail "$EXECUTABLE_NAME contains forbidden Automation code"
 done
 
 echo "Verified $APP_PATH"

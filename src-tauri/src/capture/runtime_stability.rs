@@ -650,7 +650,7 @@ fn collect_sample(
         snapshot_bytes: directory_stats(&paths.snapshot_dir)
             .map(|stats| stats.byte_size.max(0) as u64)
             .unwrap_or(0),
-        audit_bytes: project_continue_outputs_root()
+        audit_bytes: runtime_continue_outputs_root(app)
             .ok()
             .and_then(|path| directory_stats(&path).ok())
             .map(|stats| stats.byte_size.max(0) as u64)

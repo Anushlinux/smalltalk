@@ -78,6 +78,8 @@ import {
 } from "./continueRequest";
 import { MosaicLeafBackground } from "./MosaicLeafBackground";
 import { useAuth } from "./auth/AuthProvider";
+import { useAppUpdate } from "./updates/AppUpdateProvider";
+import { appUpdateStatusCopy } from "./updates/updatePresentation";
 import smalltalkLogo from "./assets/smalltalk-logo.png";
 import "@fontsource/instrument-serif/400.css";
 import "./App.css";
@@ -4115,6 +4117,10 @@ function SettingsHome({
   onInspect: () => void;
   onSignOut: () => void;
 }) {
+  const update = useAppUpdate();
+  const updateCopy = appUpdateStatusCopy(update);
+  const updateBusy = ["checking", "downloading", "installing", "restarting"].includes(update.phase);
+
   return (
     <section className="settings-screen" aria-label="Settings">
       <div className="screen-intro">
@@ -4183,6 +4189,36 @@ function SettingsHome({
               <button className="secondary-button" type="button" disabled={busyAction !== null} onClick={onRequestPermission}>Review permission</button>
             </div>
           ) : null}
+        </section>
+
+        <section className={`settings-section ${update.phase === "available" || update.phase === "error" ? "needs-attention" : ""}`}>
+          <div className="settings-icon"><ProductIcon name="refresh" /></div>
+          <div className="settings-section-copy">
+            <span>Software update</span>
+            <h3>{updateCopy.title}</h3>
+            <p>{updateCopy.detail}</p>
+          </div>
+          <div className="settings-actions">
+            {update.phase === "available" ? (
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => void update.installUpdate()}
+              >
+                Update and restart
+              </button>
+            ) : (
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={updateBusy || update.phase === "unavailable"}
+                aria-busy={update.phase === "checking"}
+                onClick={() => void update.checkForUpdates(true)}
+              >
+                {update.phase === "checking" ? "Checking" : "Check for updates"}
+              </button>
+            )}
+          </div>
         </section>
 
         <section className="settings-section danger-zone">

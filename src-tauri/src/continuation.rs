@@ -22653,15 +22653,23 @@ fn curl_config_escape(value: &str) -> String {
 }
 
 fn project_dotenv_values() -> Result<HashMap<String, String>, String> {
-    let env_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| "failed to resolve project root".to_string())?
-        .join(".env");
-    if !env_path.exists() {
-        return Ok(HashMap::new());
+    #[cfg(debug_assertions)]
+    {
+        let env_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "failed to resolve project root".to_string())?
+            .join(".env");
+        if !env_path.exists() {
+            return Ok(HashMap::new());
+        }
+        let raw = fs::read_to_string(env_path).map_err(to_string)?;
+        return Ok(parse_dotenv_values(&raw));
     }
-    let raw = fs::read_to_string(env_path).map_err(to_string)?;
-    Ok(parse_dotenv_values(&raw))
+
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(HashMap::new())
+    }
 }
 
 fn parse_dotenv_values(raw: &str) -> HashMap<String, String> {

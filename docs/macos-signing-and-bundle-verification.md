@@ -37,6 +37,11 @@ then runs the signature and executable allowlist checks. This prevents a
 direct `tauri build` from retaining a stale helper or evaluator binary inside
 an otherwise newly signed app.
 
+The explicitly named `npm run tauri:build:macos:unsigned-alpha` command is the
+only exception. It creates an ad-hoc-signed technical-alpha package for teams
+without Apple Developer membership. It is not signed QA or release evidence,
+and testers must follow [the unsigned alpha installation guide](unsigned-macos-alpha.md).
+
 The build command removes only the generated release `smalltalk.app` before
 bundling. This prevents stale development binaries from surviving inside a new
 bundle. It then verifies the signature and bundle contents.

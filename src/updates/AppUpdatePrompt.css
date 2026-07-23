@@ -1,0 +1,180 @@
+.app-update-prompt {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 3000;
+  width: min(390px, calc(100vw - 36px));
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 28px;
+  gap: 12px;
+  padding: 16px;
+  color: #1e1c19;
+  background: color-mix(in srgb, #fff 94%, #f5bfef 6%);
+  border: 1px solid rgba(65, 55, 46, 0.13);
+  border-radius: 17px;
+  box-shadow: 0 18px 60px rgba(37, 31, 25, 0.18), 0 3px 12px rgba(37, 31, 25, 0.08);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  animation: app-update-enter 240ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.app-update-prompt-icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  color: #382e35;
+  background: #f5bfef;
+  border-radius: 11px;
+}
+
+.app-update-prompt-icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.app-update-prompt-copy {
+  min-width: 0;
+}
+
+.app-update-prompt-copy > span {
+  display: block;
+  margin: 1px 0 3px;
+  color: #7d746d;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.app-update-prompt-copy strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.app-update-prompt-copy p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 5px 0 0;
+  color: #6f6761;
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.app-update-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #847c75;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.app-update-close:hover {
+  color: #27221f;
+  background: rgba(39, 34, 31, 0.06);
+}
+
+.app-update-close svg {
+  width: 15px;
+  height: 15px;
+}
+
+.app-update-prompt-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.app-update-prompt-actions button {
+  min-height: 31px;
+  padding: 0 11px;
+  border-radius: 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.app-update-later {
+  color: #5f5751;
+  background: transparent;
+  border: 1px solid rgba(61, 53, 47, 0.14);
+}
+
+.app-update-install {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #fff;
+  background: #27211e;
+  border: 1px solid #27211e;
+}
+
+.app-update-install svg {
+  width: 13px;
+  height: 13px;
+}
+
+.app-update-progress {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  margin-top: 11px;
+  background: rgba(39, 33, 30, 0.1);
+  border-radius: 999px;
+}
+
+.app-update-progress i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: block;
+  min-width: 3px;
+  background: #b35aa6;
+  border-radius: inherit;
+  transition: width 180ms ease-out;
+}
+
+.app-update-progress.is-indeterminate i {
+  width: 42%;
+  animation: app-update-progress 1.1s ease-in-out infinite;
+}
+
+.app-update-busy-label {
+  color: #7d746d;
+  font-size: 11px;
+}
+
+@keyframes app-update-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes app-update-progress {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(340%); }
+}
+
+@media (max-width: 640px) {
+  .app-update-prompt {
+    right: 14px;
+    bottom: 14px;
+    width: calc(100vw - 28px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-update-prompt,
+  .app-update-progress.is-indeterminate i {
+    animation: none;
+  }
+}

@@ -442,16 +442,6 @@ fn review_artifact(
     })
 }
 
-fn default_review_root() -> Result<PathBuf, String> {
-    if let Some(root) = std::env::var_os("SMALLTALK_MFTI_REVIEW_ROOT") {
-        return Ok(PathBuf::from(root));
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|root| root.join("continue_outputs").join("mfti_review"))
-        .ok_or_else(|| "mfti_review_project_root_unavailable".to_string())
-}
-
 fn write_artifact_to(
     conn: &Connection,
     decision: &ContinueDecisionResult,
@@ -471,8 +461,9 @@ fn write_artifact_to(
 pub(crate) fn write_mfti_review_artifact(
     conn: &Connection,
     decision: &ContinueDecisionResult,
+    root: &Path,
 ) -> Result<(), String> {
-    write_artifact_to(conn, decision, &default_review_root()?).map(|_| ())
+    write_artifact_to(conn, decision, root).map(|_| ())
 }
 
 #[cfg(test)]
