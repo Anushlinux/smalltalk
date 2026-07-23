@@ -1,7 +1,7 @@
 {
   "name": "smalltalk",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "test:updates": "node --experimental-strip-types --test scripts/appUpdates.test.mjs",
     "test:webview": "npm run test:continue-presentation && npm run test:auth && npm run test:updates",
     "release:check-version": "node scripts/checkReleaseVersion.mjs",
+    "release:set-version": "node scripts/setReleaseVersion.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev:mfti": "./scripts/tauri-dev-mfti.sh",
