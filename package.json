@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "auth:check-config": "node scripts/checkAuthConfig.mjs",
     "test:auth": "node --experimental-strip-types --test scripts/authCallback.test.mjs",
     "test:continue-presentation": "node --experimental-strip-types --test scripts/continuePresentation.test.mjs scripts/continueRequest.test.mjs",
     "test:updates": "node --experimental-strip-types --test scripts/appUpdates.test.mjs",

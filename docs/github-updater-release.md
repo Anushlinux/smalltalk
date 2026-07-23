@@ -18,6 +18,16 @@ Add its contents to the `Anushlinux/smalltalk` repository as an Actions secret n
 gh secret set TAURI_SIGNING_PRIVATE_KEY --repo Anushlinux/smalltalk < /Users/bhaskarpandit/.tauri/smalltalk.key
 ```
 
+Add these public client values as Actions repository variables:
+
+- `VITE_SUPABASE_URL`: the HTTPS URL for the Smalltalk Supabase project.
+- `VITE_SUPABASE_PUBLISHABLE_KEY`: the project's public browser client key.
+
+These values are embedded in the desktop app, so never substitute a Supabase
+service-role key. The release workflow validates both variables and stops before
+packaging if either is missing. Local builds read the same names from the
+ignored root `.env` file.
+
 The `Anushlinux/smalltalk` repository and its Releases must be public before distributing the updater-enabled build. Installed apps read `latest.json` and the update archive without receiving a GitHub credential. A private repository would return an authorization error to customer installations.
 
 ## Publish a release

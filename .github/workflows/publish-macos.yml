@@ -28,6 +28,8 @@ jobs:
       SMALLTALK_VERIFIED_MACOS_BUILD: "1"
       SMALLTALK_UNSIGNED_ALPHA_BUILD: "1"
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -63,7 +65,7 @@ jobs:
       - name: Verify release version
         run: npm run release:check-version -- "${{ github.ref_name }}"
 
-      - name: Verify release secrets
+      - name: Verify release configuration
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -72,6 +74,7 @@ jobs:
             echo "The TAURI_SIGNING_PRIVATE_KEY repository secret is missing." >&2
             exit 1
           fi
+          npm run auth:check-config
 
       - name: Test webview behavior
         run: npm run test:webview

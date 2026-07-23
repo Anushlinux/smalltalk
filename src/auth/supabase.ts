@@ -14,7 +14,7 @@ function requiredEnvironmentValue(name: string, value: string | undefined) {
   const normalized = value?.trim();
   if (!normalized) {
     throw new AuthConfigurationError(
-      `Smalltalk authentication is not configured. Add ${name} to the local .env file and restart the app.`,
+      `This Smalltalk build is missing ${name}. Install a correctly configured build or contact the release owner.`,
     );
   }
   return normalized;
