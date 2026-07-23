@@ -6,7 +6,7 @@ it with testers who understand and accept that limitation.
 
 ## Install
 
-1. Open `smalltalk_0.1.0_aarch64.dmg` and copy `smalltalk.app` to Applications.
+1. Open `smalltalk_0.1.3_aarch64.dmg` and copy `smalltalk.app` to Applications.
 2. Open Terminal and run:
 
    ```bash

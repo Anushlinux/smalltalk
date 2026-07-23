@@ -28,12 +28,12 @@ Keep the version identical in:
 - `src-tauri/Cargo.toml`
 - `src-tauri/tauri.conf.json`
 
-For example, change all three from `0.1.0` to `0.1.1`, commit that change, then create and push the matching tag:
+For example, after synchronizing the desktop app version and lockfiles to `0.1.3`, commit that change, then create and push the matching tag:
 
 ```bash
 npm run release:check-version
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 Pushing the tag starts `.github/workflows/publish-macos.yml`. The workflow runs deterministic webview tests and builds both Apple Silicon and Intel versions. It publishes the DMGs, updater archives, signatures, and `latest.json` in one non-draft GitHub Release.
