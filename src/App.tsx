@@ -2879,7 +2879,20 @@ function App() {
   const activeTransition = frameDetail?.transitions[0];
   const selectedTitle = selectedFrame ? frameTitle(selectedFrame) : "No evidence selected";
   const showInspectEntry = import.meta.env.DEV;
-  const greetingName = profile?.full_name?.trim().split(/\s+/)[0] || "there";
+  const googleGivenName =
+    typeof user?.user_metadata?.given_name === "string"
+      ? user.user_metadata.given_name.trim()
+      : "";
+  const profileFirstName = profile?.full_name?.trim().split(/\s+/)[0] || "";
+  const googleFullName =
+    typeof user?.user_metadata?.full_name === "string"
+      ? user.user_metadata.full_name.trim()
+      : typeof user?.user_metadata?.name === "string"
+        ? user.user_metadata.name.trim()
+        : "";
+  const googleFirstName = googleFullName.split(/\s+/)[0] || "";
+  const greetingName =
+    googleGivenName || profileFirstName || googleFirstName || "there";
   const openProductView = useCallback((nextView: Exclude<ViewMode, "developer">) => {
     setMemoryMenuOpen(false);
     setEvidenceOpen(false);
